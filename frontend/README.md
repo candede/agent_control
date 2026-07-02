@@ -76,7 +76,7 @@ npm install
 
 ## Start the Backend
 
-Open a terminal and go to the backend folder:
+Open a terminal and start the backend:
 
 ```bash
 cd backend
@@ -87,7 +87,7 @@ By default, the backend runs on `http://localhost:3001`.
 
 ## Start the Frontend
 
-Open a second terminal and go to the frontend folder:
+Open a second terminal and start the frontend:
 
 ```bash
 cd frontend
@@ -96,7 +96,7 @@ npm run dev
 
 By default, the frontend runs on `http://localhost:5173`.
 
-Keep both terminals running while using the app. The frontend depends on the backend for sign-in, session state, and all Copilot package actions.
+For local testing, use `npm run dev` in both folders and keep both terminals running. The frontend depends on the backend for sign-in, session state, and all Copilot package actions.
 
 ## How To Use The App
 
