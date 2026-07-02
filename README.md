@@ -61,3 +61,9 @@ npm run dev --workspace frontend
 - `POST /api/agents/unblock-all` unblocks all currently listed blocked agents.
 
 Bulk actions are best effort. The backend skips packages already in the requested state and returns succeeded, skipped, and failed entries so partial failures are visible.
+
+## Disclaimer
+
+This project is provided as-is, without warranty of any kind. Use it at your own discretion and validate it in your own environment before relying on it for administrative workflows.
+
+For more information, visit https://candede.com.

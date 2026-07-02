@@ -117,3 +117,9 @@ For local testing, use `npm run dev` in both folders and keep both terminals run
 - Microsoft Graph package block and unblock operations depend on Graph API availability and tenant licensing.
 - If sign-in fails, confirm the redirect URI in Entra ID matches `REDIRECT_URI` in `.env`.
 - If package listing or block/unblock fails, confirm the app registration has delegated `CopilotPackages.ReadWrite.All` and admin consent has been granted.
+
+## Disclaimer
+
+This project is provided as-is, without warranty of any kind. Use it at your own discretion and validate it in your own environment before relying on it for administrative workflows.
+
+For more information, visit https://candede.com.
