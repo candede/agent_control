@@ -292,6 +292,100 @@ button.danger {
   border-color: var(--danger);
 }
 
+button.secondary {
+  color: var(--text-h);
+  background: #fff;
+}
+
+button.secondary:hover {
+  background: #f5f2e9;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(16, 33, 31, 0.34);
+  backdrop-filter: blur(4px);
+}
+
+.confirm-modal {
+  width: min(560px, 100%);
+  display: grid;
+  gap: 18px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 22px 70px rgba(16, 33, 31, 0.24);
+}
+
+.confirm-modal p {
+  color: var(--muted);
+}
+
+.confirm-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.confirm-summary span {
+  display: grid;
+  gap: 2px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  background: #fff;
+  font-size: 13px;
+}
+
+.confirm-summary strong {
+  color: var(--text-h);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.confirm-agent-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.confirm-agent-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.confirm-agent-list span {
+  color: var(--text-h);
+  font-weight: 700;
+}
+
+.confirm-agent-list small,
+.confirm-muted {
+  color: var(--muted);
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .table-shell {
   overflow-x: auto;
   border: 1px solid var(--border);
@@ -400,8 +494,18 @@ tr:last-child td {
   }
 
   .user-menu,
-  .bulk-buttons {
+  .bulk-buttons,
+  .confirm-actions {
     align-items: stretch;
+    flex-direction: column;
+  }
+
+  .confirm-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .confirm-agent-list li {
+    align-items: flex-start;
     flex-direction: column;
   }
 

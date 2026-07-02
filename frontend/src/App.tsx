@@ -33,6 +33,7 @@ function App() {
   const [busyBulkAction, setBusyBulkAction] = useState<"block" | "unblock">();
   const [bulkProgress, setBulkProgress] = useState<BulkProgress>();
   const [bulkResult, setBulkResult] = useState<BulkActionResult>();
+  const [bulkConfirmation, setBulkConfirmation] = useState<BulkConfirmation>();
   const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
@@ -145,6 +146,7 @@ function App() {
     setUser(undefined);
     setAgents([]);
     setSelectedAgentIds(new Set());
+    setBulkConfirmation(undefined);
     setBulkResult(undefined);
   }
 
@@ -171,7 +173,7 @@ function App() {
     }
   }
 
-  async function handleBulkAction(targetBlockedState: boolean) {
+  function requestBulkAction(targetBlockedState: boolean) {
     const label = targetBlockedState ? "block" : "unblock";
     const scope = selectedAgents;
 
@@ -186,13 +188,27 @@ function App() {
     const skipped = scope.filter(
       (agent) => agent.isBlocked === targetBlockedState,
     );
-    const confirmed = window.confirm(
-      `This will ${label} ${candidates.length} selected Copilot agents. ${skipped.length} selected agents already match the target state and will be skipped. Continue?`,
+
+    setError(undefined);
+    setBulkConfirmation({
+      action: label,
+      targetBlockedState,
+      scope,
+      actionableCount: candidates.length,
+      skippedCount: skipped.length,
+    });
+  }
+
+  async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
+    const { action: label, scope, targetBlockedState } = confirmation;
+    const candidates = scope.filter(
+      (agent) => agent.isBlocked !== targetBlockedState,
+    );
+    const skipped = scope.filter(
+      (agent) => agent.isBlocked === targetBlockedState,
     );
 
-    if (!confirmed) {
-      return;
-    }
+    setBulkConfirmation(undefined);
 
     setBusyBulkAction(label);
     setBulkProgress({
@@ -390,8 +406,8 @@ function App() {
         progress={bulkProgress}
         result={bulkResult}
         selectedCount={selectedAgentIds.size}
-        onBlockAll={() => void handleBulkAction(true)}
-        onUnblockAll={() => void handleBulkAction(false)}
+        onBlockAll={() => requestBulkAction(true)}
+        onUnblockAll={() => requestBulkAction(false)}
       />
 
       <section className="controls" aria-label="Filters">
@@ -460,6 +476,14 @@ function App() {
           onUnblock={(agent) => void handleAgentAction(agent, false)}
         />
       )}
+
+      {bulkConfirmation ? (
+        <BulkConfirmModal
+          confirmation={bulkConfirmation}
+          onCancel={() => setBulkConfirmation(undefined)}
+          onConfirm={() => void runConfirmedBulkAction(bulkConfirmation)}
+        />
+      ) : null}
     </main>
   );
 }
@@ -477,6 +501,14 @@ type BulkProgress = {
   currentAgentName?: string;
 };
 
+type BulkConfirmation = {
+  action: "block" | "unblock";
+  targetBlockedState: boolean;
+  scope: CopilotPackage[];
+  actionableCount: number;
+  skippedCount: number;
+};
+
 function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -486,6 +518,93 @@ function Metric({ label, value }: { label: string; value: number }) {
     <div className="metric">
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function BulkConfirmModal({
+  confirmation,
+  onCancel,
+  onConfirm,
+}: {
+  confirmation: BulkConfirmation;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const actionLabel = confirmation.targetBlockedState ? "Block" : "Unblock";
+  const sampleAgents = confirmation.scope.slice(0, 4);
+  const hiddenCount = Math.max(
+    0,
+    confirmation.scope.length - sampleAgents.length,
+  );
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onCancel();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
+      <section
+        className="confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bulk-confirm-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div>
+          <p className="eyebrow">Confirm bulk change</p>
+          <h2 id="bulk-confirm-title">{actionLabel} selected agents?</h2>
+        </div>
+        <p>
+          This will {confirmation.action} {confirmation.actionableCount}{" "}
+          selected Copilot agents. {confirmation.skippedCount} selected agents
+          already match the target state and will be skipped.
+        </p>
+        <div className="confirm-summary" aria-label="Bulk action summary">
+          <span>
+            <strong>{confirmation.scope.length}</strong> selected
+          </span>
+          <span>
+            <strong>{confirmation.actionableCount}</strong> to change
+          </span>
+          <span>
+            <strong>{confirmation.skippedCount}</strong> skipped
+          </span>
+        </div>
+        <ul className="confirm-agent-list" aria-label="Selected agents preview">
+          {sampleAgents.map((agent) => (
+            <li key={agent.id}>
+              <span>{agent.displayName}</span>
+              <small>{agent.publisher || "Unknown publisher"}</small>
+            </li>
+          ))}
+        </ul>
+        {hiddenCount > 0 ? (
+          <p className="confirm-muted">
+            {hiddenCount} more selected agents are included.
+          </p>
+        ) : null}
+        <div className="confirm-actions">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={confirmation.targetBlockedState ? "danger" : undefined}
+            onClick={onConfirm}
+          >
+            {actionLabel} selected
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
