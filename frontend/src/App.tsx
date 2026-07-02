@@ -26,9 +26,6 @@ function App() {
     "all" | "allowed" | "blocked"
   >("all");
   const [publisherFilter, setPublisherFilter] = useState("all");
-  const [ownershipFilter, setOwnershipFilter] =
-    useState<OwnershipFilter>("all");
-  const [companyPublisher, setCompanyPublisher] = useState("");
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -62,13 +59,6 @@ function App() {
       .sort((first, second) => first.label.localeCompare(second.label));
   }, [agents]);
 
-  const companyPublisherKeyword = useMemo(
-    () =>
-      normalizeCompanyValue(companyPublisher) ||
-      inferCompanyKeyword(user?.username),
-    [companyPublisher, user?.username],
-  );
-
   const filteredAgents = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLowerCase();
 
@@ -81,14 +71,6 @@ function App() {
         publisherFilter === "all" ||
         agent.publisher === publisherFilter ||
         (!agent.publisher && publisherFilter === unknownPublisherValue);
-      const companyDeveloped = isCompanyDevelopedAgent(
-        agent,
-        companyPublisherKeyword,
-      );
-      const matchesOwnership =
-        ownershipFilter === "all" ||
-        (ownershipFilter === "company" && companyDeveloped) ||
-        (ownershipFilter === "thirdParty" && !companyDeveloped);
 
       const searchableText = [
         agent.displayName,
@@ -104,18 +86,10 @@ function App() {
       return (
         matchesStatus &&
         matchesPublisher &&
-        matchesOwnership &&
         (!normalizedQuery || searchableText.includes(normalizedQuery))
       );
     });
-  }, [
-    agents,
-    companyPublisherKeyword,
-    deferredQuery,
-    ownershipFilter,
-    publisherFilter,
-    statusFilter,
-  ]);
+  }, [agents, deferredQuery, publisherFilter, statusFilter]);
 
   const selectedAgents = useMemo(
     () => agents.filter((agent) => selectedAgentIds.has(agent.id)),
@@ -459,28 +433,6 @@ function App() {
             ))}
           </select>
         </label>
-        <label>
-          <span>Developed by</span>
-          <select
-            value={ownershipFilter}
-            onChange={(event) =>
-              setOwnershipFilter(event.target.value as OwnershipFilter)
-            }
-          >
-            <option value="all">All developers</option>
-            <option value="company">Your company</option>
-            <option value="thirdParty">Third party</option>
-          </select>
-        </label>
-        <label>
-          <span>Company publisher</span>
-          <input
-            type="search"
-            value={companyPublisher}
-            onChange={(event) => setCompanyPublisher(event.target.value)}
-            placeholder={companyPublisherKeyword || "Contoso"}
-          />
-        </label>
         <button
           type="button"
           disabled={loadingAgents}
@@ -514,8 +466,6 @@ function App() {
 
 const unknownPublisherValue = "__unknown__";
 
-type OwnershipFilter = "all" | "company" | "thirdParty";
-
 type BulkProgress = {
   action: "block" | "unblock";
   targetBlockedState: boolean;
@@ -529,43 +479,6 @@ type BulkProgress = {
 
 function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-function isCompanyDevelopedAgent(
-  agent: CopilotPackage,
-  companyPublisherKeyword: string,
-) {
-  if (!companyPublisherKeyword) {
-    return false;
-  }
-
-  return normalizeCompanyValue(agent.publisher).includes(
-    companyPublisherKeyword,
-  );
-}
-
-function inferCompanyKeyword(username?: string) {
-  const domain = username?.split("@")[1];
-
-  if (!domain) {
-    return "";
-  }
-
-  const labels = domain.toLowerCase().split(".").filter(Boolean);
-
-  if (labels.length === 0) {
-    return "";
-  }
-
-  if (domain.toLowerCase().endsWith(".onmicrosoft.com")) {
-    return normalizeCompanyValue(labels[0]);
-  }
-
-  return normalizeCompanyValue(labels.at(-2) ?? labels[0]);
-}
-
-function normalizeCompanyValue(value?: string) {
-  return value?.trim().toLowerCase() ?? "";
 }
 
 function Metric({ label, value }: { label: string; value: number }) {

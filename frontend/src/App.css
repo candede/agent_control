@@ -211,8 +211,8 @@
 .controls {
   display: grid;
   grid-template-columns:
-    minmax(220px, 1.2fr) minmax(150px, 0.75fr) minmax(190px, 1fr)
-    minmax(170px, 0.85fr) minmax(200px, 1fr) auto;
+    minmax(220px, 280px) minmax(180px, 220px) minmax(220px, 280px) auto
+    1fr;
   align-items: end;
   column-gap: 16px;
   row-gap: 12px;
@@ -272,12 +272,6 @@ button.danger {
   color: #fff8f2;
   background: var(--danger);
   border-color: var(--danger);
-}
-
-@media (max-width: 1180px) {
-  .controls {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
 }
 
 .table-shell {
