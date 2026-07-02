@@ -1,4 +1,5 @@
 import type { CopilotPackage } from "../api/client";
+import { formatBuiltWithLabel } from "../agentDisplay";
 
 type AgentTableProps = {
   agents: CopilotPackage[];
@@ -86,7 +87,7 @@ export function AgentTable({
                 </td>
                 <td>{agent.publisher || "Unknown"}</td>
                 <td>{formatList(agent.supportedHosts)}</td>
-                <td>{formatPlatform(agent.platform)}</td>
+                <td>{formatBuiltWithLabel(agent)}</td>
                 <td>{formatLabel(agent.availableTo)}</td>
                 <td>
                   <span
@@ -164,23 +165,6 @@ function formatList(values?: string[]) {
   }
 
   return values.slice(0, 3).join(", ");
-}
-
-function formatPlatform(platform?: string) {
-  if (!platform) {
-    return "Unknown";
-  }
-
-  const normalizedPlatform = platform.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  if (normalizedPlatform.includes("copilotstudio")) {
-    return "Copilot Studio";
-  }
-
-  return platform
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .trim();
 }
 
 function formatLabel(value?: string) {

@@ -13,6 +13,7 @@ import {
   type CopilotPackageDetail,
   type SessionUser,
 } from "./api/client";
+import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { AgentTable } from "./components/AgentTable";
 import { BulkActions } from "./components/BulkActions";
@@ -87,8 +88,11 @@ function App() {
     const platforms = new Map<string, string>();
 
     for (const agent of agents) {
-      if (agent.platform) {
-        platforms.set(agent.platform, formatPlatformLabel(agent.platform));
+      const value = getBuiltWithFilterValue(agent);
+      const label = getBuiltWithLabel(agent);
+
+      if (value && label) {
+        platforms.set(value, label);
       }
     }
 
@@ -96,6 +100,12 @@ function App() {
       .map(([value, label]) => ({ value, label }))
       .sort((first, second) => first.label.localeCompare(second.label));
   }, [agents]);
+
+  const effectivePlatformFilter =
+    platformFilter === "all" ||
+    platformOptions.some((platform) => platform.value === platformFilter)
+      ? platformFilter
+      : "all";
 
   const filteredAgents = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLowerCase();
@@ -112,13 +122,15 @@ function App() {
       const matchesHost =
         hostFilter === "all" || agent.supportedHosts?.includes(hostFilter);
       const matchesPlatform =
-        platformFilter === "all" || agent.platform === platformFilter;
+        effectivePlatformFilter === "all" ||
+        getBuiltWithFilterValue(agent) === effectivePlatformFilter;
 
       const searchableText = [
         agent.displayName,
         agent.shortDescription,
         agent.publisher,
         agent.platform,
+        getBuiltWithLabel(agent),
         agent.id,
         agent.supportedHosts?.join(" "),
       ]
@@ -137,8 +149,8 @@ function App() {
   }, [
     agents,
     deferredQuery,
+    effectivePlatformFilter,
     hostFilter,
-    platformFilter,
     publisherFilter,
     statusFilter,
   ]);
@@ -569,7 +581,7 @@ function App() {
         <label>
           <span>Built with</span>
           <select
-            value={platformFilter}
+            value={effectivePlatformFilter}
             onChange={(event) => setPlatformFilter(event.target.value)}
           >
             <option value="all">All platforms</option>
@@ -731,16 +743,6 @@ function formatHostLabel(host: string) {
     .trim();
 }
 
-function formatPlatformLabel(platform: string) {
-  const normalizedPlatform = platform.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  if (normalizedPlatform.includes("copilotstudio")) {
-    return "Copilot Studio";
-  }
-
-  return formatHostLabel(platform);
-}
-
 function Metric({ label, value }: { label: string; value: number }) {
   return (
     <div className="metric">
@@ -807,10 +809,7 @@ function AgentDetailModal({
           />
           <DetailItem label="Version" value={agent.version} />
           <DetailItem label="Manifest version" value={agent.manifestVersion} />
-          <DetailItem
-            label="Built with"
-            value={formatPlatformLabel(agent.platform ?? "")}
-          />
+          <DetailItem label="Built with" value={getBuiltWithLabel(agent)} />
           <DetailItem
             label="Available to"
             value={formatDetailLabel(agent.availableTo)}
@@ -1114,7 +1113,7 @@ function toAgentExportRow(
     shortDescription: agent.shortDescription ?? "",
     version: agent.version ?? "",
     manifestVersion: agent.manifestVersion ?? "",
-    platform: agent.platform ? formatPlatformLabel(agent.platform) : "",
+    platform: getBuiltWithLabel(agent) ?? "",
     supportedHosts: formatList(agent.supportedHosts) ?? "",
     availableTo: formatDetailLabel(agent.availableTo) ?? "",
     deployedTo: formatDetailLabel(agent.deployedTo) ?? "",
