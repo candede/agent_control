@@ -9,6 +9,7 @@ type AgentTableProps = {
   selectedCount: number;
   onToggleAgentSelection: (agentId: string) => void;
   onToggleVisibleSelection: () => void;
+  onViewDetails: (agent: CopilotPackage) => void;
   onBlock: (agent: CopilotPackage) => void;
   onUnblock: (agent: CopilotPackage) => void;
 };
@@ -22,6 +23,7 @@ export function AgentTable({
   selectedCount,
   onToggleAgentSelection,
   onToggleVisibleSelection,
+  onViewDetails,
   onBlock,
   onUnblock,
 }: AgentTableProps) {
@@ -29,7 +31,7 @@ export function AgentTable({
     return (
       <div className="empty-state">
         <h2>No matching agents</h2>
-        <p>Try clearing the search or status filter.</p>
+        <p>Try clearing the search or filters.</p>
       </div>
     );
   }
@@ -54,7 +56,8 @@ export function AgentTable({
             <th scope="col">Agent</th>
             <th scope="col">Publisher</th>
             <th scope="col">Host</th>
-            <th scope="col">Deployment</th>
+            <th scope="col">Built with</th>
+            <th scope="col">Available to</th>
             <th scope="col">Status</th>
             <th scope="col">Action</th>
           </tr>
@@ -83,7 +86,8 @@ export function AgentTable({
                 </td>
                 <td>{agent.publisher || "Unknown"}</td>
                 <td>{formatList(agent.supportedHosts)}</td>
-                <td>{agent.deployedTo || "Unknown"}</td>
+                <td>{formatPlatform(agent.platform)}</td>
+                <td>{formatLabel(agent.availableTo)}</td>
                 <td>
                   <span
                     className={
@@ -94,24 +98,36 @@ export function AgentTable({
                   </span>
                 </td>
                 <td>
-                  {agent.isBlocked ? (
+                  <div className="row-actions">
                     <button
+                      className="icon-button"
                       type="button"
-                      disabled={busy || selectionDisabled}
-                      onClick={() => onUnblock(agent)}
+                      aria-label={`View details for ${agent.displayName}`}
+                      title="View details"
+                      disabled={selectionDisabled}
+                      onClick={() => onViewDetails(agent)}
                     >
-                      {busy ? "Working" : "Unblock"}
+                      <InfoIcon />
                     </button>
-                  ) : (
-                    <button
-                      className="danger"
-                      type="button"
-                      disabled={busy || selectionDisabled}
-                      onClick={() => onBlock(agent)}
-                    >
-                      {busy ? "Working" : "Block"}
-                    </button>
-                  )}
+                    {agent.isBlocked ? (
+                      <button
+                        type="button"
+                        disabled={busy || selectionDisabled}
+                        onClick={() => onUnblock(agent)}
+                      >
+                        {busy ? "Working" : "Unblock"}
+                      </button>
+                    ) : (
+                      <button
+                        className="danger"
+                        type="button"
+                        disabled={busy || selectionDisabled}
+                        onClick={() => onBlock(agent)}
+                      >
+                        {busy ? "Working" : "Block"}
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             );
@@ -122,10 +138,58 @@ export function AgentTable({
   );
 }
 
+function InfoIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      width="18"
+      height="18"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
+    </svg>
+  );
+}
+
 function formatList(values?: string[]) {
   if (!values?.length) {
     return "Unknown";
   }
 
   return values.slice(0, 3).join(", ");
+}
+
+function formatPlatform(platform?: string) {
+  if (!platform) {
+    return "Unknown";
+  }
+
+  const normalizedPlatform = platform.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  if (normalizedPlatform.includes("copilotstudio")) {
+    return "Copilot Studio";
+  }
+
+  return platform
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .trim();
+}
+
+function formatLabel(value?: string) {
+  if (!value) {
+    return "Unknown";
+  }
+
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .trim();
 }

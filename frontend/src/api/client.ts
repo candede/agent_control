@@ -19,6 +19,32 @@ export type CopilotPackage = {
   elementTypes?: string[];
   platform?: string;
   version?: string;
+  manifestVersion?: string;
+  manifestId?: string;
+  appId?: string;
+  assetId?: string;
+};
+
+export type PackageAccessEntity = {
+  resourceId: string;
+  resourceType: "user" | "group" | string;
+};
+
+export type PackageElementDetail = {
+  elementType: string;
+  elements: Array<{
+    id: string;
+    definition: string;
+  }>;
+};
+
+export type CopilotPackageDetail = CopilotPackage & {
+  longDescription?: string;
+  categories?: string[];
+  sensitivity?: string;
+  allowedUsersAndGroups?: PackageAccessEntity[];
+  acquireUsersAndGroups?: PackageAccessEntity[];
+  elementDetails?: PackageElementDetail[];
 };
 
 export type BulkPackageResult = {
@@ -54,6 +80,10 @@ export async function getCurrentUser() {
 
 export async function getAgents() {
   return request<{ value: CopilotPackage[] }>("/api/agents");
+}
+
+export async function getAgentDetails(id: string) {
+  return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}`);
 }
 
 export async function blockAgent(id: string) {
