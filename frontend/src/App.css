@@ -619,6 +619,28 @@ button.icon-button:hover {
   background: #fff0ea;
 }
 
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.app-footer a {
+  color: var(--ink);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.app-footer a:hover {
+  text-decoration: underline;
+}
+
 .empty-state,
 .screen-state {
   padding: 42px;
@@ -665,5 +687,10 @@ button.icon-button:hover {
   button,
   .primary-link {
     width: 100%;
+  }
+
+  .app-footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

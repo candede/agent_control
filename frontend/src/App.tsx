@@ -479,6 +479,7 @@ function App() {
             Sign in with Entra ID
           </a>
         </section>
+        <AppFooter />
       </main>
     );
   }
@@ -655,6 +656,8 @@ function App() {
           onConfirm={() => void runConfirmedBulkAction(bulkConfirmation)}
         />
       ) : null}
+
+      <AppFooter />
     </main>
   );
 }
@@ -749,6 +752,20 @@ function Metric({ label, value }: { label: string; value: number }) {
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function AppFooter() {
+  return (
+    <footer className="app-footer">
+      <span>
+        Provided as-is, without warranty of any kind. Use at your own
+        discretion.
+      </span>
+      <a href="https://candede.com" target="_blank" rel="noreferrer">
+        candede.com
+      </a>
+    </footer>
   );
 }
 
