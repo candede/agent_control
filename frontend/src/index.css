@@ -1,0 +1,67 @@
+:root {
+  --text: #3d4745;
+  --text-h: #10211f;
+  --muted: #6f7b75;
+  --bg: #f8f5ec;
+  --surface: #fffdf7;
+  --border: #ded7c8;
+  --ink: #284a45;
+  --danger: #a84633;
+
+  --sans: Aptos, "Avenir Next", "Trebuchet MS", sans-serif;
+  --heading: Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 16px/145% var(--sans);
+  letter-spacing: 0;
+  color-scheme: light;
+  color: var(--text);
+  background:
+    linear-gradient(rgba(16, 33, 31, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16, 33, 31, 0.035) 1px, transparent 1px),
+    var(--bg);
+  background-size: 28px 28px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: clamp(36px, 6vw, 68px);
+  line-height: 0.95;
+  margin: 0;
+
+  @media (max-width: 1024px) {
+    font-size: 36px;
+  }
+}
+
+h2 {
+  font-size: 22px;
+  line-height: 1.1;
+  margin: 0 0 8px;
+
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+
+p {
+  margin: 0;
+}
