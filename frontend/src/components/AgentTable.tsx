@@ -6,6 +6,7 @@ type AgentTableProps = {
   busyAgentId?: string;
   selectedIds: Set<string>;
   selectionDisabled: boolean;
+  usageByAgentId: Map<string, AgentTableUsage>;
   allVisibleSelected: boolean;
   selectedCount: number;
   onToggleAgentSelection: (agentId: string) => void;
@@ -15,11 +16,19 @@ type AgentTableProps = {
   onUnblock: (agent: CopilotPackage) => void;
 };
 
+type AgentTableUsage = {
+  creatorType: string;
+  activeUsersTotal: number;
+  responsesSentToUsers: number;
+  lastActivityDateUtc?: string;
+};
+
 export function AgentTable({
   agents,
   busyAgentId,
   selectedIds,
   selectionDisabled,
+  usageByAgentId,
   allVisibleSelected,
   selectedCount,
   onToggleAgentSelection,
@@ -59,6 +68,8 @@ export function AgentTable({
             <th scope="col">Host</th>
             <th scope="col">Built with</th>
             <th scope="col">Available to</th>
+            <th scope="col">Creator type</th>
+            <th scope="col">Usage</th>
             <th scope="col">Status</th>
             <th scope="col">Action</th>
           </tr>
@@ -67,6 +78,7 @@ export function AgentTable({
           {agents.map((agent) => {
             const busy = busyAgentId === agent.id;
             const selected = selectedIds.has(agent.id);
+            const usage = usageByAgentId.get(agent.id);
 
             return (
               <tr key={agent.id}>
@@ -89,6 +101,10 @@ export function AgentTable({
                 <td>{formatList(agent.supportedHosts)}</td>
                 <td>{formatBuiltWithLabel(agent)}</td>
                 <td>{formatLabel(agent.availableTo)}</td>
+                <td>{usage?.creatorType || "No import"}</td>
+                <td>
+                  <UsageCell usage={usage} />
+                </td>
                 <td>
                   <span
                     className={
@@ -139,6 +155,29 @@ export function AgentTable({
   );
 }
 
+function UsageCell({ usage }: { usage?: AgentTableUsage }) {
+  if (!usage) {
+    return <span className="muted-cell">No import</span>;
+  }
+
+  return (
+    <dl className="usage-cell">
+      <div>
+        <dt>Last</dt>
+        <dd>{formatUsageDate(usage.lastActivityDateUtc)}</dd>
+      </div>
+      <div>
+        <dt>Users</dt>
+        <dd>{formatNumber(usage.activeUsersTotal)}</dd>
+      </div>
+      <div>
+        <dt>Resp</dt>
+        <dd>{formatNumber(usage.responsesSentToUsers)}</dd>
+      </div>
+    </dl>
+  );
+}
+
 function InfoIcon() {
   return (
     <svg
@@ -176,4 +215,19 @@ function formatLabel(value?: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
+}
+
+function formatUsageDate(value?: string) {
+  if (!value) {
+    return "No import";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeZone: "UTC",
+  }).format(new Date(value));
+}
+
+function formatNumber(value?: number) {
+  return value === undefined ? "No import" : value.toLocaleString();
 }

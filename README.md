@@ -11,6 +11,7 @@ The browser talks only to the Express backend. Express handles Microsoft Entra I
 - Microsoft Agent 365 licensing in the tenant.
 - Delegated Microsoft Graph permission `CopilotPackages.ReadWrite.All` with admin consent.
 - A work or school account with tenant permissions to manage Copilot packages.
+- Optional usage enrichment requires access to export Microsoft 365 admin center usage reports, but it does not require any additional Microsoft Graph permissions.
 
 The supplied Microsoft Graph docs note that block and unblock use `/beta` endpoints and are available only in the global cloud.
 
@@ -23,6 +24,8 @@ Create an app registration in Microsoft Entra ID with these settings:
 - Client secret: create one and store it only in your local `.env`
 - API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`
 - Admin consent: granted for the tenant
+
+No additional API permission is needed for usage report import. The usage data is loaded from CSV files that an admin manually exports from the Microsoft 365 admin center.
 
 ## Local Setup
 
@@ -40,6 +43,28 @@ npm run dev
 ```
 
 Then open `http://localhost:5173`.
+
+## Usage Report Import
+
+Agent Control works without report files. If no usage reports are imported, the app lists Copilot packages and supports block/unblock exactly as before.
+
+To enrich the package list with last activity, active users, responses sent, creator type, and user drilldown data:
+
+1. Go to `https://admin.microsoft.com`.
+2. Open **Reports** > **Usage**.
+3. Select **Microsoft 365 Copilot**.
+4. Open the **Agents** report.
+5. Export these three report tabs for the same period, typically 30 days:
+   - **Agents**: agent-level metrics used for table enrichment and inactive-agent filtering.
+   - **Users & agents**: per-user, per-agent rows shown in agent details.
+   - **Users**: user-level summary rows used for imported report context.
+6. In Agent Control, use **Import CSVs** and select one, two, or all three exported CSV files.
+
+The **Agents** CSV is the canonical source for agent-level metrics. The **Users & agents** CSV is used for drilldown and as a fallback if the Agents CSV has not been imported. The **Users** CSV is used for user summary context.
+
+The app matches imported report rows to listed packages by `Agent ID`. Report-only rows that do not match a package are shown as unmatched diagnostics and are not blockable. Package rows without imported report data remain visible and manageable.
+
+The inactive filter uses **Last activity date (UTC)** from the imported report. Active user and response counts belong to the selected report period, so an agent can have `0` responses in a 30-day export while still having a known older last activity date.
 
 ## Useful Commands
 
@@ -59,6 +84,8 @@ npm run dev --workspace frontend
 - `POST /api/agents/:id/unblock` unblocks one package.
 - `POST /api/agents/block-all` blocks all currently listed unblocked agents.
 - `POST /api/agents/unblock-all` unblocks all currently listed blocked agents.
+
+Usage report import is handled in the browser from local CSV files. It does not add backend report endpoints and does not call Microsoft Graph for report data.
 
 Bulk actions are best effort. The backend skips packages already in the requested state and returns succeeded, skipped, and failed entries so partial failures are visible.
 

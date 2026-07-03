@@ -1,4 +1,11 @@
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import DOMPurify from "dompurify";
 import {
   ApiError,
   blockAgent,
@@ -17,6 +24,49 @@ import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { AgentTable } from "./components/AgentTable";
 import { BulkActions } from "./components/BulkActions";
+import {
+  parseUsageReport,
+  type AgentUsageReport,
+  type AgentUsageRow,
+  type ParsedUsageReport,
+  type UserAgentUsageReport,
+  type UserAgentUsageRow,
+  type UserUsageReport,
+  type UsageReportKind,
+} from "./reportImports";
+
+type UsageReportsState = {
+  agents?: AgentUsageReport;
+  userAgents?: UserAgentUsageReport;
+  users?: UserUsageReport;
+};
+
+type PendingUsageImport = {
+  reports: ParsedUsageReport[];
+  failures: UsageImportFailure[];
+  warnings: string[];
+  totalFiles: number;
+};
+
+type UsageImportFailure = {
+  fileName: string;
+  message: string;
+};
+
+type UsageImportStatus = {
+  kind: "success" | "error";
+  message: string;
+};
+
+type AgentUsageSummary = AgentUsageRow & {
+  fileName: string;
+  importedAt: string;
+  periodDays?: number;
+  sourceReport: "agents" | "userAgents";
+  userRows: UserAgentUsageRow[];
+};
+
+const emptyUsageReports = (): UsageReportsState => ({});
 
 function App() {
   const [user, setUser] = useState<SessionUser>();
@@ -29,6 +79,7 @@ function App() {
     "all" | "allowed" | "blocked"
   >("all");
   const [publisherFilter, setPublisherFilter] = useState("all");
+  const [availableToFilter, setAvailableToFilter] = useState("all");
   const [hostFilter, setHostFilter] = useState("all");
   const [platformFilter, setPlatformFilter] = useState("all");
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(
@@ -44,6 +95,14 @@ function App() {
   const [agentDetailError, setAgentDetailError] = useState<string>();
   const [exportingCsv, setExportingCsv] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [usageReports, setUsageReports] =
+    useState<UsageReportsState>(emptyUsageReports);
+  const [pendingUsageImport, setPendingUsageImport] =
+    useState<PendingUsageImport>();
+  const [usageImportStatus, setUsageImportStatus] =
+    useState<UsageImportStatus>();
+  const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
+  const [inactiveDays, setInactiveDays] = useState(30);
   const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
@@ -55,6 +114,45 @@ function App() {
       void loadAgents();
     }
   }, [user]);
+
+  const userAgentRowsByAgentId = useMemo(() => {
+    const rowsByAgentId = new Map<string, UserAgentUsageRow[]>();
+
+    for (const row of usageReports.userAgents?.rows ?? []) {
+      const rows = rowsByAgentId.get(row.agentId) ?? [];
+      rows.push(row);
+      rowsByAgentId.set(row.agentId, rows);
+    }
+
+    return rowsByAgentId;
+  }, [usageReports.userAgents]);
+
+  const usageByAgentId = useMemo(
+    () => buildUsageByAgentId(usageReports, userAgentRowsByAgentId),
+    [usageReports, userAgentRowsByAgentId],
+  );
+
+  const unmatchedReportAgentCount = useMemo(() => {
+    const packageIds = new Set(agents.map((agent) => agent.id));
+    const reportIds = new Set(
+      [
+        ...(usageReports.agents?.rows ?? []),
+        ...(usageReports.userAgents?.rows ?? []),
+      ]
+        .map((row) => row.agentId)
+        .filter(Boolean),
+    );
+
+    return [...reportIds].filter((agentId) => !packageIds.has(agentId)).length;
+  }, [agents, usageReports.agents, usageReports.userAgents]);
+
+  const inactiveAgentCount = useMemo(
+    () =>
+      agents.filter((agent) =>
+        isInactiveUsage(usageByAgentId.get(agent.id), inactiveDays),
+      ).length,
+    [agents, inactiveDays, usageByAgentId],
+  );
 
   const publisherOptions = useMemo(() => {
     const publishers = new Map<string, string>();
@@ -80,6 +178,20 @@ function App() {
     }
 
     return [...hosts]
+      .map(([value, label]) => ({ value, label }))
+      .sort((first, second) => first.label.localeCompare(second.label));
+  }, [agents]);
+
+  const availableToOptions = useMemo(() => {
+    const availability = new Map<string, string>();
+
+    for (const agent of agents) {
+      const value = agent.availableTo || unknownAvailableToValue;
+      const label = formatDetailLabel(agent.availableTo) ?? "Unknown";
+      availability.set(value, label);
+    }
+
+    return [...availability]
       .map(([value, label]) => ({ value, label }))
       .sort((first, second) => first.label.localeCompare(second.label));
   }, [agents]);
@@ -119,18 +231,28 @@ function App() {
         publisherFilter === "all" ||
         agent.publisher === publisherFilter ||
         (!agent.publisher && publisherFilter === unknownPublisherValue);
+      const matchesAvailability =
+        availableToFilter === "all" ||
+        agent.availableTo === availableToFilter ||
+        (!agent.availableTo && availableToFilter === unknownAvailableToValue);
       const matchesHost =
         hostFilter === "all" || agent.supportedHosts?.includes(hostFilter);
       const matchesPlatform =
         effectivePlatformFilter === "all" ||
         getBuiltWithFilterValue(agent) === effectivePlatformFilter;
+      const usage = usageByAgentId.get(agent.id);
+      const matchesUsage = matchesUsageFilter(usage, usageFilter, inactiveDays);
 
       const searchableText = [
         agent.displayName,
         agent.shortDescription,
         agent.publisher,
+        formatDetailLabel(agent.availableTo),
         agent.platform,
         getBuiltWithLabel(agent),
+        usage?.agentName,
+        usage?.creatorType,
+        usage?.agentId,
         agent.id,
         agent.supportedHosts?.join(" "),
       ]
@@ -141,18 +263,24 @@ function App() {
       return (
         matchesStatus &&
         matchesPublisher &&
+        matchesAvailability &&
         matchesHost &&
         matchesPlatform &&
+        matchesUsage &&
         (!normalizedQuery || searchableText.includes(normalizedQuery))
       );
     });
   }, [
     agents,
+    availableToFilter,
     deferredQuery,
     effectivePlatformFilter,
     hostFilter,
+    inactiveDays,
     publisherFilter,
     statusFilter,
+    usageByAgentId,
+    usageFilter,
   ]);
 
   const selectedAgents = useMemo(
@@ -214,6 +342,85 @@ function App() {
     setExportingCsv(false);
     setExportProgress(0);
     setBulkResult(undefined);
+    setUsageReports(emptyUsageReports());
+    setPendingUsageImport(undefined);
+    setUsageImportStatus(undefined);
+  }
+
+  async function handleSelectUsageReports(files: FileList | null) {
+    if (!files?.length) {
+      return;
+    }
+
+    const parsedReports: ParsedUsageReport[] = [];
+    const failures: UsageImportFailure[] = [];
+    const warnings: string[] = [];
+
+    for (const file of [...files]) {
+      try {
+        const report = parseUsageReport(file.name, await file.text());
+        parsedReports.push(report);
+
+        for (const warning of report.warnings) {
+          warnings.push(`${file.name}: ${warning}`);
+        }
+      } catch (importError) {
+        failures.push({
+          fileName: file.name,
+          message:
+            importError instanceof Error
+              ? importError.message
+              : "Import failed.",
+        });
+      }
+    }
+
+    setUsageImportStatus(undefined);
+    setPendingUsageImport({
+      reports: parsedReports,
+      failures,
+      warnings,
+      totalFiles: files.length,
+    });
+  }
+
+  function handleConfirmUsageImport() {
+    if (!pendingUsageImport) {
+      return;
+    }
+
+    if (pendingUsageImport.reports.length === 0) {
+      setUsageImportStatus({
+        kind: "error",
+        message: "No recognized usage report CSV files were selected.",
+      });
+      setPendingUsageImport(undefined);
+      return;
+    }
+
+    setUsageReports((current) =>
+      mergeUsageReports(current, pendingUsageImport.reports),
+    );
+
+    const counts = summarizeParsedUsageReports(pendingUsageImport.reports);
+    const issueCount =
+      pendingUsageImport.failures.length + pendingUsageImport.warnings.length;
+
+    setUsageImportStatus({
+      kind: "success",
+      message: `Import successful: ${formatImportRowSummary(counts)}${
+        issueCount
+          ? `, with ${issueCount} issue${issueCount === 1 ? "" : "s"}`
+          : ""
+      }.`,
+    });
+    setPendingUsageImport(undefined);
+  }
+
+  function handleClearUsageReports() {
+    setUsageReports(emptyUsageReports());
+    setPendingUsageImport(undefined);
+    setUsageImportStatus(undefined);
   }
 
   async function handleViewAgentDetails(agent: CopilotPackage) {
@@ -268,9 +475,15 @@ function App() {
       for (const [index, agent] of agents.entries()) {
         try {
           const detail = await getAgentDetails(agent.id);
-          rows.push(toAgentExportRow(detail));
+          rows.push(toAgentExportRow(detail, "", usageByAgentId.get(agent.id)));
         } catch (requestError) {
-          rows.push(toAgentExportRow(agent, errorMessage(requestError)));
+          rows.push(
+            toAgentExportRow(
+              agent,
+              errorMessage(requestError),
+              usageByAgentId.get(agent.id),
+            ),
+          );
         }
 
         setExportProgress(index + 1);
@@ -511,7 +724,10 @@ function App() {
           label="Blocked"
           value={agents.filter((agent) => agent.isBlocked).length}
         />
-        <Metric label="Visible" value={filteredAgents.length} />
+        <Metric
+          label={`Inactive >${inactiveDays}d`}
+          value={inactiveAgentCount}
+        />
       </section>
 
       <BulkActions
@@ -526,8 +742,16 @@ function App() {
         onUnblockAll={() => requestBulkAction(false)}
       />
 
+      <ReportImportPanel
+        reports={usageReports}
+        status={usageImportStatus}
+        unmatchedReportAgentCount={unmatchedReportAgentCount}
+        onImport={(files) => void handleSelectUsageReports(files)}
+        onClear={handleClearUsageReports}
+      />
+
       <section className="controls" aria-label="Filters">
-        <label>
+        <label className="filter-search">
           <span>Search</span>
           <input
             type="search"
@@ -566,6 +790,20 @@ function App() {
           </select>
         </label>
         <label>
+          <span>Available to</span>
+          <select
+            value={availableToFilter}
+            onChange={(event) => setAvailableToFilter(event.target.value)}
+          >
+            <option value="all">All availability</option>
+            {availableToOptions.map((availability) => (
+              <option key={availability.value} value={availability.value}>
+                {availability.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
           <span>Host</span>
           <select
             value={hostFilter}
@@ -593,23 +831,63 @@ function App() {
             ))}
           </select>
         </label>
-        <button
-          type="button"
-          disabled={loadingAgents}
-          onClick={() => void loadAgents()}
-        >
-          {loadingAgents ? "Refreshing" : "Refresh"}
-        </button>
-        <button
-          type="button"
-          className="secondary export-button"
-          disabled={loadingAgents || exportingCsv || agents.length === 0}
-          onClick={() => void handleExportCsv()}
-        >
-          {exportingCsv
-            ? `Exporting ${exportProgress}/${agents.length}`
-            : "Export CSV"}
-        </button>
+        <label>
+          <span>Usage</span>
+          <select
+            value={usageFilter}
+            onChange={(event) =>
+              setUsageFilter(event.target.value as UsageFilter)
+            }
+          >
+            <option value="all">All usage states</option>
+            <option value="with-usage">Has imported usage</option>
+            <option value="without-usage">No imported usage</option>
+            <option value="recent">Active within threshold</option>
+            <option value="inactive">Inactive beyond threshold</option>
+          </select>
+        </label>
+        <label>
+          <span>Number of days</span>
+          <input
+            type="number"
+            min="1"
+            max="365"
+            value={inactiveDays}
+            onChange={(event) =>
+              setInactiveDays(clampNumber(event.target.value, 1, 365, 30))
+            }
+          />
+        </label>
+        <div className="filter-actions" aria-label="Table actions">
+          <button
+            type="button"
+            className="icon-button control-icon-button"
+            aria-label={loadingAgents ? "Refreshing agents" : "Refresh agents"}
+            title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
+            disabled={loadingAgents}
+            onClick={() => void loadAgents()}
+          >
+            <RefreshIcon />
+          </button>
+          <button
+            type="button"
+            className="secondary icon-button control-icon-button"
+            aria-label={
+              exportingCsv
+                ? `Exporting ${exportProgress} of ${agents.length} agents`
+                : "Export agents CSV"
+            }
+            title={
+              exportingCsv
+                ? `Exporting ${exportProgress}/${agents.length}`
+                : "Export CSV"
+            }
+            disabled={loadingAgents || exportingCsv || agents.length === 0}
+            onClick={() => void handleExportCsv()}
+          >
+            <ExportIcon />
+          </button>
+        </div>
       </section>
 
       {loadingAgents ? (
@@ -620,6 +898,7 @@ function App() {
           busyAgentId={busyAgentId}
           selectedIds={selectedAgentIds}
           selectionDisabled={Boolean(busyBulkAction)}
+          usageByAgentId={usageByAgentId}
           allVisibleSelected={allVisibleSelected}
           selectedCount={selectedAgentIds.size}
           onToggleAgentSelection={toggleAgentSelection}
@@ -645,6 +924,8 @@ function App() {
       {agentDetail ? (
         <AgentDetailModal
           agent={agentDetail}
+          usage={usageByAgentId.get(agentDetail.id)}
+          userRows={userAgentRowsByAgentId.get(agentDetail.id) ?? []}
           onClose={() => setAgentDetail(undefined)}
         />
       ) : null}
@@ -657,12 +938,28 @@ function App() {
         />
       ) : null}
 
+      {pendingUsageImport ? (
+        <UsageImportReviewModal
+          pendingImport={pendingUsageImport}
+          onCancel={() => setPendingUsageImport(undefined)}
+          onConfirm={handleConfirmUsageImport}
+        />
+      ) : null}
+
       <AppFooter />
     </main>
   );
 }
 
 const unknownPublisherValue = "__unknown__";
+const unknownAvailableToValue = "__unknown__";
+
+type UsageFilter =
+  | "all"
+  | "with-usage"
+  | "without-usage"
+  | "recent"
+  | "inactive";
 
 type BulkProgress = {
   action: "block" | "unblock";
@@ -700,6 +997,19 @@ type AgentExportRow = {
   categories: string;
   elementTypes: string;
   lastModified: string;
+  reportAgentId: string;
+  reportAgentName: string;
+  creatorType: string;
+  activeUsersLicensed: string;
+  activeUsersUnlicensed: string;
+  activeUsersTotal: string;
+  responsesSentToUsers: string;
+  lastActivity: string;
+  usageSource: string;
+  usageReportPeriodDays: string;
+  usageReportFile: string;
+  usageImportedAt: string;
+  userAgentRows: string;
   appId: string;
   manifestId: string;
   assetId: string;
@@ -726,6 +1036,19 @@ const csvHeaders: Array<{ key: keyof AgentExportRow; label: string }> = [
   { key: "categories", label: "Categories" },
   { key: "elementTypes", label: "Element types" },
   { key: "lastModified", label: "Last modified" },
+  { key: "reportAgentId", label: "Report Agent ID" },
+  { key: "reportAgentName", label: "Report agent name" },
+  { key: "creatorType", label: "Creator type" },
+  { key: "activeUsersLicensed", label: "Active users licensed" },
+  { key: "activeUsersUnlicensed", label: "Active users unlicensed" },
+  { key: "activeUsersTotal", label: "Active users total" },
+  { key: "responsesSentToUsers", label: "Responses sent to users" },
+  { key: "lastActivity", label: "Last activity date UTC" },
+  { key: "usageSource", label: "Usage source" },
+  { key: "usageReportPeriodDays", label: "Usage report period days" },
+  { key: "usageReportFile", label: "Usage report file" },
+  { key: "usageImportedAt", label: "Usage imported at" },
+  { key: "userAgentRows", label: "User-agent rows" },
   { key: "appId", label: "App ID" },
   { key: "manifestId", label: "Manifest ID" },
   { key: "assetId", label: "Asset ID" },
@@ -755,6 +1078,47 @@ function Metric({ label, value }: { label: string; value: number }) {
   );
 }
 
+function RefreshIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      width="18"
+      height="18"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M21 12a9 9 0 0 1-15.3 6.4" />
+      <path d="M3 12A9 9 0 0 1 18.3 5.6" />
+      <path d="M18 2v4h-4" />
+      <path d="M6 22v-4h4" />
+    </svg>
+  );
+}
+
+function ExportIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      width="18"
+      height="18"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="M7 10l5 5 5-5" />
+      <path d="M12 15V3" />
+    </svg>
+  );
+}
+
 function AppFooter() {
   return (
     <footer className="app-footer">
@@ -762,23 +1126,57 @@ function AppFooter() {
         Provided as-is, without warranty of any kind. Use at your own
         discretion.
       </span>
-      <a href="https://candede.com" target="_blank" rel="noreferrer">
+      <a href="https://candede.com" target="_blank" rel="noreferrer noopener">
         candede.com
       </a>
     </footer>
   );
 }
 
+function getAgentDescription(agent: CopilotPackageDetail) {
+  return (
+    agent.longDescription ||
+    agent.shortDescription ||
+    "No description provided."
+  );
+}
+
+function getSanitizedDescriptionHtml(description: string) {
+  if (!hasHtmlMarkup(description)) {
+    return undefined;
+  }
+
+  const sanitized = DOMPurify.sanitize(description, {
+    USE_PROFILES: { html: true },
+  }).trim();
+
+  return sanitized || undefined;
+}
+
+function hasHtmlMarkup(value: string) {
+  return /<\/?[a-z][\s\S]*>/i.test(value);
+}
+
 function AgentDetailModal({
   agent,
+  usage,
+  userRows,
   onClose,
 }: {
   agent: CopilotPackageDetail;
+  usage?: AgentUsageSummary;
+  userRows: UserAgentUsageRow[];
   onClose: () => void;
 }) {
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
   const connectedServices = extractConnectedServices(agent.elementDetails);
+  const assignmentCount = allowedSummary.total + acquireSummary.total;
+  const statusLabel = agent.isBlocked ? "Blocked" : "Allowed";
+  const visibleUserRows = userRows.slice(0, 6);
+  const hiddenUserRows = userRows.length - visibleUserRows.length;
+  const description = getAgentDescription(agent);
+  const sanitizedDescriptionHtml = getSanitizedDescriptionHtml(description);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -802,127 +1200,435 @@ function AgentDetailModal({
         onClick={(event) => event.stopPropagation()}
       >
         <header className="detail-header">
-          <div>
+          <div className="detail-title-block">
             <p className="eyebrow">Agent details</p>
             <h2 id="agent-detail-title">{agent.displayName}</h2>
           </div>
-          <button type="button" className="secondary" onClick={onClose}>
-            Close
-          </button>
+          <div className="detail-header-actions">
+            <span
+              className={
+                agent.isBlocked
+                  ? "detail-status is-blocked"
+                  : "detail-status is-allowed"
+              }
+            >
+              {statusLabel}
+            </span>
+            <button type="button" className="secondary" onClick={onClose}>
+              Close
+            </button>
+          </div>
         </header>
 
-        <p>
-          {agent.longDescription ||
-            agent.shortDescription ||
-            "No description provided."}
-        </p>
+        {sanitizedDescriptionHtml ? (
+          <div
+            className="detail-description rich-description"
+            dangerouslySetInnerHTML={{ __html: sanitizedDescriptionHtml }}
+          />
+        ) : (
+          <p className="detail-description">{description}</p>
+        )}
 
-        <div className="detail-grid">
-          <DetailItem label="Publisher" value={agent.publisher} />
-          <DetailItem label="Type" value={agent.type} />
-          <DetailItem
+        <div className="detail-stat-grid">
+          <SummaryStat
             label="Status"
-            value={agent.isBlocked ? "Blocked" : "Allowed"}
+            value={statusLabel}
+            tone={agent.isBlocked ? "danger" : "success"}
           />
-          <DetailItem label="Version" value={agent.version} />
-          <DetailItem label="Manifest version" value={agent.manifestVersion} />
-          <DetailItem label="Built with" value={getBuiltWithLabel(agent)} />
-          <DetailItem
-            label="Available to"
-            value={formatDetailLabel(agent.availableTo)}
+          <SummaryStat
+            label="Active users"
+            value={
+              usage ? usage.activeUsersTotal.toLocaleString() : "No import"
+            }
+            tone="usage"
           />
-          <DetailItem
-            label="Sensitivity"
-            value={formatDetailLabel(agent.sensitivity)}
+          <SummaryStat
+            label="Responses sent"
+            value={
+              usage ? usage.responsesSentToUsers.toLocaleString() : "No import"
+            }
+            tone="usage"
           />
-          <DetailItem
-            label="Last modified"
-            value={formatDate(agent.lastModifiedDateTime)}
-          />
-          <DetailItem
-            label="Supported hosts"
-            value={formatList(agent.supportedHosts)}
-          />
-          <DetailItem label="Categories" value={formatList(agent.categories)} />
-          <DetailItem
-            label="Element types"
-            value={formatList(agent.elementTypes)}
+          <SummaryStat
+            label="Connected services"
+            value={
+              connectedServices.length
+                ? connectedServices.length.toLocaleString()
+                : "None"
+            }
           />
         </div>
 
-        <section className="detail-section">
-          <h3>Sharing and connected services</h3>
-          <div className="detail-grid">
-            <DetailItem
-              label="Allowed assignments"
-              value={formatAccessSummary(allowedSummary)}
-            />
-            <DetailItem
-              label="Acquire assignments"
-              value={formatAccessSummary(acquireSummary)}
-            />
-            <DetailItem
-              label="Detected services"
-              value={
-                connectedServices.length
-                  ? `${connectedServices.length} detected`
-                  : "None returned"
+        <div className="detail-layout">
+          <div className="detail-column">
+            <DetailSection
+              title="Package details"
+              countLabel={`${assignmentCount.toLocaleString()} access assignments`}
+              tone="metadata"
+            >
+              <DetailList
+                items={[
+                  { label: "Publisher", value: agent.publisher },
+                  { label: "Type", value: agent.type },
+                  { label: "Built with", value: getBuiltWithLabel(agent) },
+                  { label: "Version", value: agent.version },
+                  { label: "Manifest", value: agent.manifestVersion },
+                  {
+                    label: "Last modified",
+                    value: formatDate(agent.lastModifiedDateTime),
+                  },
+                  {
+                    label: "Available to",
+                    value: formatDetailLabel(agent.availableTo),
+                  },
+                  {
+                    label: "Sensitivity",
+                    value: formatDetailLabel(agent.sensitivity),
+                  },
+                  {
+                    label: "Hosts",
+                    value: formatList(agent.supportedHosts),
+                  },
+                  { label: "Categories", value: formatList(agent.categories) },
+                  {
+                    label: "Element types",
+                    value: formatList(agent.elementTypes),
+                  },
+                  {
+                    label: "Allowed assignments",
+                    value: formatAccessSummary(allowedSummary),
+                  },
+                  {
+                    label: "Acquire assignments",
+                    value: formatAccessSummary(acquireSummary),
+                  },
+                  {
+                    label: "Detected services",
+                    value: connectedServices.length
+                      ? `${connectedServices.length} detected`
+                      : "None returned",
+                  },
+                  { label: "Package ID", value: agent.id, variant: "code" },
+                  { label: "App ID", value: agent.appId, variant: "code" },
+                  {
+                    label: "Manifest ID",
+                    value: agent.manifestId,
+                    variant: "code",
+                  },
+                  { label: "Asset ID", value: agent.assetId, variant: "code" },
+                ]}
+              />
+              <div className="access-grid">
+                <AccessList
+                  label="Allowed users and groups"
+                  values={agent.allowedUsersAndGroups}
+                />
+                <AccessList
+                  label="Acquire users and groups"
+                  values={agent.acquireUsersAndGroups}
+                />
+              </div>
+            </DetailSection>
+          </div>
+
+          <div className="detail-column">
+            <DetailSection
+              title="Usage import"
+              countLabel={
+                usage ? formatReportKind(usage.sourceReport) : "No import"
               }
+              tone="usage"
+            >
+              <div className="detail-grid">
+                <DetailItem
+                  label="Report Agent ID"
+                  value={usage?.agentId}
+                  variant="code"
+                />
+                <DetailItem
+                  label="Report agent name"
+                  value={usage?.agentName}
+                />
+                <DetailItem label="Creator type" value={usage?.creatorType} />
+                <DetailItem
+                  label="Last activity"
+                  value={formatReportDate(usage?.lastActivityDateUtc)}
+                />
+                <DetailItem
+                  label="Licensed users"
+                  value={usage?.activeUsersLicensed.toLocaleString()}
+                />
+                <DetailItem
+                  label="Unlicensed users"
+                  value={usage?.activeUsersUnlicensed.toLocaleString()}
+                />
+              </div>
+            </DetailSection>
+
+            <DetailSection
+              title="User activity"
+              countLabel={`${userRows.length.toLocaleString()} rows`}
+              tone="activity"
+            >
+              {visibleUserRows.length ? (
+                <ul className="detail-list user-activity-list">
+                  {visibleUserRows.map((row) => (
+                    <li key={`${row.agentId}-${row.username}`}>
+                      <span>{row.username}</span>
+                      <small>
+                        {row.responsesSentToUsers.toLocaleString()} responses,
+                        last activity{" "}
+                        {formatReportDate(row.lastActivityDateUtc) ?? "Unknown"}
+                      </small>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>No user-agent report rows imported for this package.</p>
+              )}
+              {hiddenUserRows > 0 ? (
+                <p className="detail-overflow-note">
+                  {hiddenUserRows.toLocaleString()} more user rows hidden.
+                </p>
+              ) : null}
+            </DetailSection>
+
+            <DetailSection
+              title="Elements"
+              countLabel={`${agent.elementDetails?.length ?? 0} groups`}
+            >
+              {agent.elementDetails?.length ? (
+                <ul className="detail-list compact-list">
+                  {agent.elementDetails.map((detail) => (
+                    <li key={detail.elementType}>
+                      <span>{formatDetailLabel(detail.elementType)}</span>
+                      <small>{detail.elements.length} elements</small>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>No element metadata was returned for this package.</p>
+              )}
+            </DetailSection>
+
+            <DetailSection
+              title="Connected services"
+              countLabel={`${connectedServices.length} detected`}
+              tone="services"
+            >
+              {connectedServices.length ? (
+                <ul className="detail-list service-list">
+                  {connectedServices.map((service) => (
+                    <li key={`${service.source}-${service.value}`}>
+                      <span>{service.value}</span>
+                      <small>{service.source}</small>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>
+                  No connected service metadata was returned for this package.
+                </p>
+              )}
+            </DetailSection>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ReportImportPanel({
+  reports,
+  status,
+  unmatchedReportAgentCount,
+  onImport,
+  onClear,
+}: {
+  reports: UsageReportsState;
+  status?: UsageImportStatus;
+  unmatchedReportAgentCount: number;
+  onImport: (files: FileList | null) => void;
+  onClear: () => void;
+}) {
+  const importedReports = [reports.agents, reports.userAgents, reports.users]
+    .filter((report): report is ParsedUsageReport => Boolean(report))
+    .map((report) => ({
+      key: report.kind,
+      label: formatReportKind(report.kind),
+      rows: report.rows.length,
+      fileName: report.fileName,
+      periodDays: report.periodDays,
+    }));
+
+  return (
+    <section className="report-panel" aria-label="Usage report import">
+      <div className="report-panel-header">
+        <div>
+          <strong>Usage reports</strong>
+          <span>
+            Import the Agents, Users & agents, and Users CSV exports to enrich
+            this view.
+          </span>
+        </div>
+        <div className="report-actions">
+          <label className="file-button">
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              multiple
+              onChange={(event) => {
+                onImport(event.currentTarget.files);
+                event.currentTarget.value = "";
+              }}
             />
+            Import CSVs
+          </label>
+          <button
+            type="button"
+            className="secondary"
+            disabled={importedReports.length === 0 && !status}
+            onClick={onClear}
+          >
+            Clear reports
+          </button>
+        </div>
+      </div>
+
+      {importedReports.length ? (
+        <div className="report-summary-grid">
+          {importedReports.map((report) => (
+            <div key={report.key} className="report-summary-card">
+              <span>{report.label}</span>
+              <strong>{report.rows.toLocaleString()} rows</strong>
+              <small>
+                {report.periodDays
+                  ? `${report.periodDays}-day export`
+                  : "CSV import"}
+              </small>
+            </div>
+          ))}
+          <div className="report-summary-card">
+            <span>Unmatched report agents</span>
+            <strong>{unmatchedReportAgentCount.toLocaleString()}</strong>
+            <small>Report rows without a listed package ID</small>
           </div>
-        </section>
+        </div>
+      ) : null}
 
-        <section className="detail-section">
-          <h3>Access assignments</h3>
-          <AccessList
-            label="Allowed users and groups"
-            values={agent.allowedUsersAndGroups}
-          />
-          <AccessList
-            label="Acquire users and groups"
-            values={agent.acquireUsersAndGroups}
-          />
-        </section>
+      {status ? (
+        <div className={`report-status ${status.kind}`} aria-live="polite">
+          {status.message}
+        </div>
+      ) : null}
+    </section>
+  );
+}
 
-        <section className="detail-section">
-          <h3>Identifiers</h3>
-          <div className="detail-grid identifiers">
-            <DetailItem label="Package ID" value={agent.id} />
-            <DetailItem label="App ID" value={agent.appId} />
-            <DetailItem label="Manifest ID" value={agent.manifestId} />
-            <DetailItem label="Asset ID" value={agent.assetId} />
-          </div>
-        </section>
+function UsageImportReviewModal({
+  pendingImport,
+  onCancel,
+  onConfirm,
+}: {
+  pendingImport: PendingUsageImport;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const counts = summarizeParsedUsageReports(pendingImport.reports);
+  const importDisabled = pendingImport.reports.length === 0;
 
-        {agent.elementDetails?.length ? (
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
+      <section
+        className="confirm-modal usage-import-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="usage-import-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div>
+          <p className="eyebrow">CSV import</p>
+          <h2 id="usage-import-title">Review usage reports</h2>
+        </div>
+
+        <p>
+          Parsed {pendingImport.totalFiles.toLocaleString()} selected file
+          {pendingImport.totalFiles === 1 ? "" : "s"}. Confirm to apply these
+          usage metrics to the agent table.
+        </p>
+
+        <div className="confirm-summary usage-import-summary">
+          <span>
+            Agents
+            <strong>{counts.agents.toLocaleString()}</strong>
+          </span>
+          <span>
+            Users & agents
+            <strong>{counts.userAgents.toLocaleString()}</strong>
+          </span>
+          <span>
+            Users
+            <strong>{counts.users.toLocaleString()}</strong>
+          </span>
+        </div>
+
+        {pendingImport.reports.length ? (
           <section className="detail-section">
-            <h3>Elements</h3>
+            <h3>Recognized reports</h3>
             <ul className="detail-list">
-              {agent.elementDetails.map((detail) => (
-                <li key={detail.elementType}>
-                  <span>{formatDetailLabel(detail.elementType)}</span>
-                  <small>{detail.elements.length} elements</small>
+              {pendingImport.reports.map((report) => (
+                <li key={`${report.kind}-${report.fileName}`}>
+                  <span>{formatReportKind(report.kind)}</span>
+                  <small>
+                    {report.rows.length.toLocaleString()} rows
+                    {report.periodDays
+                      ? `, ${report.periodDays}-day export`
+                      : ""}
+                  </small>
                 </li>
               ))}
             </ul>
           </section>
         ) : null}
 
-        <section className="detail-section">
-          <h3>Connected services</h3>
-          {connectedServices.length ? (
-            <ul className="detail-list service-list">
-              {connectedServices.map((service) => (
-                <li key={`${service.source}-${service.value}`}>
-                  <span>{service.value}</span>
-                  <small>{service.source}</small>
+        {pendingImport.failures.length ? (
+          <section className="detail-section">
+            <h3>Files that need attention</h3>
+            <ul className="detail-list">
+              {pendingImport.failures.map((failure) => (
+                <li key={failure.fileName}>
+                  <span>{failure.fileName}</span>
+                  <small>{failure.message}</small>
                 </li>
               ))}
             </ul>
-          ) : (
-            <p>No connected service metadata was returned for this package.</p>
-          )}
-        </section>
+          </section>
+        ) : null}
+
+        {pendingImport.warnings.length ? (
+          <section className="detail-section">
+            <h3>Warnings</h3>
+            <ul className="detail-list">
+              {pendingImport.warnings.slice(0, 6).map((warning) => (
+                <li key={warning}>
+                  <small>{warning}</small>
+                </li>
+              ))}
+            </ul>
+            {pendingImport.warnings.length > 6 ? (
+              <p>{pendingImport.warnings.length - 6} more warnings hidden.</p>
+            ) : null}
+          </section>
+        ) : null}
+
+        <div className="confirm-actions">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" disabled={importDisabled} onClick={onConfirm}>
+            Import reports
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -940,11 +1646,87 @@ type ConnectedService = {
   source: string;
 };
 
-function DetailItem({ label, value }: { label: string; value?: string }) {
+function DetailSection({
+  title,
+  countLabel,
+  tone,
+  children,
+}: {
+  title: string;
+  countLabel?: string;
+  tone?:
+    | "activity"
+    | "governance"
+    | "metadata"
+    | "services"
+    | "technical"
+    | "usage";
+  children: ReactNode;
+}) {
+  return (
+    <section className={tone ? `detail-section ${tone}` : "detail-section"}>
+      <div className="detail-section-header">
+        <h3>{title}</h3>
+        {countLabel ? <span>{countLabel}</span> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function SummaryStat({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone?: "danger" | "success" | "usage";
+}) {
+  return (
+    <div className={tone ? `summary-stat ${tone}` : "summary-stat"}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+type DetailListItem = {
+  label: string;
+  value?: string;
+  variant?: "code";
+};
+
+function DetailList({ items }: { items: DetailListItem[] }) {
+  return (
+    <dl className="compact-detail-list">
+      {items.map((item) => (
+        <div key={item.label}>
+          <dt>{item.label}</dt>
+          <dd className={item.variant === "code" ? "detail-code" : undefined}>
+            {item.value || "Unknown"}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function DetailItem({
+  label,
+  value,
+  variant,
+}: {
+  label: string;
+  value?: string;
+  variant?: "code";
+}) {
   return (
     <div className="detail-item">
       <span>{label}</span>
-      <strong>{value || "Unknown"}</strong>
+      <strong className={variant === "code" ? "detail-code" : undefined}>
+        {value || "Unknown"}
+      </strong>
     </div>
   );
 }
@@ -1115,9 +1897,209 @@ function formatDate(value?: string) {
   }).format(new Date(value));
 }
 
+function formatReportDate(value?: string) {
+  if (!value) {
+    return undefined;
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeZone: "UTC",
+  }).format(new Date(value));
+}
+
+function mergeUsageReports(
+  current: UsageReportsState,
+  reports: ParsedUsageReport[],
+): UsageReportsState {
+  const next: UsageReportsState = {
+    ...current,
+  };
+
+  for (const report of reports) {
+    if (report.kind === "agents") {
+      next.agents = report;
+    } else if (report.kind === "userAgents") {
+      next.userAgents = report;
+    } else {
+      next.users = report;
+    }
+  }
+
+  return next;
+}
+
+function buildUsageByAgentId(
+  reports: UsageReportsState,
+  userAgentRowsByAgentId: Map<string, UserAgentUsageRow[]>,
+) {
+  const usageByAgentId = new Map<string, AgentUsageSummary>();
+  const agentReport = reports.agents;
+
+  if (agentReport) {
+    for (const row of agentReport.rows) {
+      usageByAgentId.set(row.agentId, {
+        ...row,
+        fileName: agentReport.fileName,
+        importedAt: agentReport.importedAt,
+        periodDays: agentReport.periodDays,
+        sourceReport: "agents",
+        userRows: userAgentRowsByAgentId.get(row.agentId) ?? [],
+      });
+    }
+
+    return usageByAgentId;
+  }
+
+  for (const [agentId, rows] of userAgentRowsByAgentId) {
+    const usernames = new Set(rows.map((row) => row.username).filter(Boolean));
+    const latestActivity = latestDate(
+      rows.map((row) => row.lastActivityDateUtc),
+    );
+    const responsesSentToUsers = rows.reduce(
+      (total, row) => total + row.responsesSentToUsers,
+      0,
+    );
+    const firstRow = rows[0];
+
+    usageByAgentId.set(agentId, {
+      agentId,
+      agentName: firstRow?.agentName ?? "",
+      creatorType: firstRow?.creatorType ?? "",
+      activeUsersLicensed: 0,
+      activeUsersUnlicensed: 0,
+      activeUsersTotal: usernames.size,
+      responsesSentToUsers,
+      lastActivityDateUtc: latestActivity,
+      fileName: reports.userAgents?.fileName ?? "",
+      importedAt: reports.userAgents?.importedAt ?? "",
+      periodDays: reports.userAgents?.periodDays,
+      sourceReport: "userAgents",
+      userRows: rows,
+    });
+  }
+
+  return usageByAgentId;
+}
+
+function latestDate(values: Array<string | undefined>) {
+  return values
+    .filter((value): value is string => Boolean(value))
+    .sort((first, second) => Date.parse(second) - Date.parse(first))[0];
+}
+
+function matchesUsageFilter(
+  usage: AgentUsageSummary | undefined,
+  filter: UsageFilter,
+  inactiveDays: number,
+) {
+  if (filter === "all") {
+    return true;
+  }
+
+  if (filter === "with-usage") {
+    return Boolean(usage);
+  }
+
+  if (filter === "without-usage") {
+    return !usage;
+  }
+
+  if (!usage?.lastActivityDateUtc) {
+    return false;
+  }
+
+  const inactive = isInactiveUsage(usage, inactiveDays);
+  return filter === "inactive" ? inactive : !inactive;
+}
+
+function isInactiveUsage(
+  usage: AgentUsageSummary | undefined,
+  inactiveDays: number,
+) {
+  if (!usage?.lastActivityDateUtc) {
+    return false;
+  }
+
+  const today = startOfUtcDay(new Date());
+  const activityDate = startOfUtcDay(new Date(usage.lastActivityDateUtc));
+  const elapsedDays = Math.floor(
+    (today.getTime() - activityDate.getTime()) / 86_400_000,
+  );
+
+  return elapsedDays > inactiveDays;
+}
+
+function startOfUtcDay(date: Date) {
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+  );
+}
+
+function clampNumber(
+  value: string,
+  minimum: number,
+  maximum: number,
+  fallback: number,
+) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+}
+
+function formatReportKind(kind: UsageReportKind) {
+  if (kind === "agents") {
+    return "Agents";
+  }
+
+  if (kind === "userAgents") {
+    return "Users & agents";
+  }
+
+  return "Users";
+}
+
+function summarizeParsedUsageReports(reports: ParsedUsageReport[]) {
+  return reports.reduce(
+    (counts, report) => {
+      counts[report.kind] += report.rows.length;
+      return counts;
+    },
+    { agents: 0, userAgents: 0, users: 0 } satisfies Record<
+      UsageReportKind,
+      number
+    >,
+  );
+}
+
+function formatImportRowSummary(counts: Record<UsageReportKind, number>) {
+  const parts = [
+    counts.agents ? `${counts.agents.toLocaleString()} agent rows` : undefined,
+    counts.userAgents
+      ? `${counts.userAgents.toLocaleString()} user-agent rows`
+      : undefined,
+    counts.users ? `${counts.users.toLocaleString()} user rows` : undefined,
+  ].filter((part): part is string => Boolean(part));
+
+  if (parts.length === 0) {
+    return "0 rows";
+  }
+
+  if (parts.length === 1) {
+    return parts[0];
+  }
+
+  return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
+}
+
 function toAgentExportRow(
   agent: CopilotPackage | CopilotPackageDetail,
   detailError = "",
+  usage?: AgentUsageSummary,
 ): AgentExportRow {
   const detail = agent as CopilotPackageDetail;
 
@@ -1138,6 +2120,19 @@ function toAgentExportRow(
     categories: formatList(detail.categories) ?? "",
     elementTypes: formatList(agent.elementTypes) ?? "",
     lastModified: formatDate(agent.lastModifiedDateTime) ?? "",
+    reportAgentId: usage?.agentId ?? "",
+    reportAgentName: usage?.agentName ?? "",
+    creatorType: usage?.creatorType ?? "",
+    activeUsersLicensed: usage?.activeUsersLicensed.toString() ?? "",
+    activeUsersUnlicensed: usage?.activeUsersUnlicensed.toString() ?? "",
+    activeUsersTotal: usage?.activeUsersTotal.toString() ?? "",
+    responsesSentToUsers: usage?.responsesSentToUsers.toString() ?? "",
+    lastActivity: formatReportDate(usage?.lastActivityDateUtc) ?? "",
+    usageSource: usage ? formatReportKind(usage.sourceReport) : "",
+    usageReportPeriodDays: usage?.periodDays?.toString() ?? "",
+    usageReportFile: usage?.fileName ?? "",
+    usageImportedAt: formatDate(usage?.importedAt) ?? "",
+    userAgentRows: usage?.userRows.length.toString() ?? "",
     appId: agent.appId ?? "",
     manifestId: agent.manifestId ?? "",
     assetId: agent.assetId ?? "",
