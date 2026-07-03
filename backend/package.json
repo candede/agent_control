@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",

@@ -34,6 +34,7 @@ import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AgentTable } from "./components/AgentTable";
+import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
@@ -71,7 +72,7 @@ type UsageImportStatus = {
   message: string;
 };
 
-type ActiveView = "agents" | "users" | "reports";
+type ActiveView = "agents" | "users" | "reports" | "audit";
 
 const emptyUsageReports = (): UsageReportsState => ({});
 
@@ -605,6 +606,7 @@ function App() {
       status: "skipped",
       message: targetBlockedState ? "Already blocked" : "Already unblocked",
     }));
+    const actionGroupId = createActionGroupId();
     let succeeded = 0;
     let failed = 0;
 
@@ -621,9 +623,9 @@ function App() {
 
         try {
           if (targetBlockedState) {
-            await blockAgent(agent.id);
+            await blockAgent(agent.id, { actionGroupId });
           } else {
-            await unblockAgent(agent.id);
+            await unblockAgent(agent.id, { actionGroupId });
           }
 
           succeeded += 1;
@@ -784,6 +786,15 @@ function App() {
                 onClick={() => setActiveView("reports")}
               >
                 Reports
+              </button>
+              <button
+                type="button"
+                className={
+                  activeView === "audit" ? "view-button active" : "view-button"
+                }
+                onClick={() => setActiveView("audit")}
+              >
+                Audit log
               </button>
             </nav>
           </div>
@@ -1021,7 +1032,7 @@ function App() {
           inactiveDays={inactiveDays}
           reports={usageReports}
         />
-      ) : (
+      ) : activeView === "reports" ? (
         <ReportingView
           activityWindowDays={reportActivityWindowDays}
           agents={agents}
@@ -1029,6 +1040,8 @@ function App() {
           onActivityWindowDaysChange={setReportActivityWindowDays}
           reports={usageReports}
         />
+      ) : (
+        <AuditLogView agents={agents} />
       )}
 
       {loadingAgentDetailId ? (
@@ -1102,6 +1115,10 @@ type BulkConfirmation = {
 
 function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function createActionGroupId() {
+  return window.crypto.randomUUID();
 }
 
 function formatHostLabel(host: string) {

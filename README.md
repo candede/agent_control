@@ -6,7 +6,7 @@ The browser talks only to the Express backend. Express handles Microsoft Entra I
 
 ## Prerequisites
 
-- Node.js 22 or newer.
+- Node.js 24 or newer. The backend uses the built-in `node:sqlite` module for local audit storage.
 - A Microsoft Entra app registration configured as a web app.
 - Microsoft Agent 365 licensing in the tenant.
 - Delegated Microsoft Graph permission `CopilotPackages.ReadWrite.All` with admin consent.
@@ -35,6 +35,8 @@ cp .env.example .env
 ```
 
 Edit `.env` with your tenant ID, client ID, client secret, and a long random session secret.
+
+By default, audit events are stored in `backend/data/agent-control.sqlite`. That directory is ignored by Git so normal pulls and code updates do not overwrite local audit data. For production or Azure App Service, set `AGENT_CONTROL_DATA_DIR` to a persistent host-owned directory, such as `/home/data/agent-control`. Set `AUDIT_LOG_ENABLED=false` only if you need to disable local audit logging.
 
 Run both apps:
 
@@ -86,10 +88,21 @@ npm run dev --workspace frontend
 - `POST /api/agents/:id/unblock` unblocks one package.
 - `POST /api/agents/block-all` blocks all currently listed unblocked agents.
 - `POST /api/agents/unblock-all` unblocks all currently listed blocked agents.
+- `GET /api/audit/events` lists persisted block/unblock audit events for the signed-in session.
 
 Usage report import is handled in the browser from local CSV files. It does not add backend report endpoints and does not call Microsoft Graph for report data.
 
 Bulk actions are best effort. The backend skips packages already in the requested state and returns succeeded, skipped, and failed entries so partial failures are visible.
+
+## Audit Log
+
+The backend records block and unblock attempts at the route boundary before calling Microsoft Graph. Each audit event includes the agent ID, optional display name when available, action, target blocked state, signed-in actor, tenant ID, timestamps, final status, and failure message when Graph rejects the change.
+
+Signed-in users can review these records in the **Audit log** tab. The tab loads the newest events from `GET /api/audit/events`, supports refresh, and filters by action, result, agent, user, or operation ID.
+
+The audit log is a local SQLite database. This keeps development and a first Azure deployment simple, but it assumes a single writable backend instance. For Azure production usage with this storage mode, deploy the backend as a single-instance App Service and point `AGENT_CONTROL_DATA_DIR` at persistent App Service storage under `/home`. If you later need backend scale-out, multiple container replicas, or stronger compliance retention, move the audit service to Azure Table Storage or append blobs instead of sharing one SQLite file across instances.
+
+The default `backend/data/` location survives normal `git pull` operations because it is ignored by Git. It will not survive deployment processes that delete the entire repository directory, so use an outside-repo or Azure persistent path for anything important.
 
 ## Disclaimer
 

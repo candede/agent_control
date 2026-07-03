@@ -63,6 +63,40 @@ export type BulkActionResult = {
   results: BulkPackageResult[];
 };
 
+export type AuditAction = "block" | "unblock";
+
+export type AuditStatus = "started" | "succeeded" | "failed" | "skipped";
+
+export type AuditEvent = {
+  id: string;
+  operationId: string;
+  scope: "single" | "bulk";
+  action: AuditAction;
+  targetBlockedState: boolean;
+  agentId: string;
+  agentDisplayName?: string;
+  actor: SessionUser;
+  startedAt: string;
+  completedAt?: string;
+  status: AuditStatus;
+  message?: string;
+  errorCode?: string;
+  requestPath: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AuditEventsQuery = {
+  limit?: number;
+  agentId?: string;
+  actorUsername?: string;
+  action?: AuditAction;
+  status?: AuditStatus;
+};
+
+export type AuditRequestContext = {
+  actionGroupId?: string;
+};
+
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -86,15 +120,17 @@ export async function getAgentDetails(id: string) {
   return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}`);
 }
 
-export async function blockAgent(id: string) {
+export async function blockAgent(id: string, context?: AuditRequestContext) {
   await request<void>(`/api/agents/${encodeURIComponent(id)}/block`, {
     method: "POST",
+    headers: auditContextHeaders(context),
   });
 }
 
-export async function unblockAgent(id: string) {
+export async function unblockAgent(id: string, context?: AuditRequestContext) {
   await request<void>(`/api/agents/${encodeURIComponent(id)}/unblock`, {
     method: "POST",
+    headers: auditContextHeaders(context),
   });
 }
 
@@ -108,8 +144,43 @@ export async function unblockAllAgents() {
   });
 }
 
+export async function getAuditEvents(query: AuditEventsQuery = {}) {
+  const searchParams = new URLSearchParams();
+
+  if (query.limit) {
+    searchParams.set("limit", query.limit.toString());
+  }
+
+  if (query.agentId) {
+    searchParams.set("agentId", query.agentId);
+  }
+
+  if (query.actorUsername) {
+    searchParams.set("actorUsername", query.actorUsername);
+  }
+
+  if (query.action) {
+    searchParams.set("action", query.action);
+  }
+
+  if (query.status) {
+    searchParams.set("status", query.status);
+  }
+
+  const queryString = searchParams.toString();
+  return request<{ value: AuditEvent[] }>(
+    `/api/audit/events${queryString ? `?${queryString}` : ""}`,
+  );
+}
+
 export async function signOut() {
   await request<void>("/auth/logout", { method: "POST" });
+}
+
+function auditContextHeaders(context: AuditRequestContext | undefined) {
+  return context?.actionGroupId
+    ? { "x-agent-control-action-group-id": context.actionGroupId }
+    : undefined;
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

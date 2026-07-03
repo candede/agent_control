@@ -1352,7 +1352,8 @@ button.icon-button:hover {
 
 .user-access-view,
 .user-access-layout,
-.user-detail-panel {
+.user-detail-panel,
+.audit-view {
   display: grid;
   gap: 16px;
 }
@@ -1528,6 +1529,40 @@ button.icon-button:hover {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.audit-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.audit-controls {
+  grid-template-columns:
+    minmax(220px, 1fr) minmax(150px, 0.44fr) minmax(150px, 0.44fr)
+    auto;
+}
+
+.audit-controls .filter-search {
+  grid-column: auto;
+}
+
+.audit-controls .filter-actions {
+  grid-column: auto;
+}
+
+.audit-table-shell table {
+  min-width: 980px;
+}
+
+.audit-group-label {
+  color: var(--text-h);
+  font-weight: 750;
+}
+
+.audit-group-reference {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .user-controls {
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }
@@ -1698,6 +1733,8 @@ button.icon-button:hover {
   .user-detail-header,
   .user-detail-stats,
   .user-summary-grid,
+  .audit-summary-grid,
+  .audit-controls,
   .usage-report-list,
   .report-summary-grid,
   .report-chart-grid,

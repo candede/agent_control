@@ -15,6 +15,10 @@ loadEnv({
 });
 
 const port = Number.parseInt(process.env.PORT ?? "3001", 10);
+const auditLogEnabled =
+  optionalEnv("AUDIT_LOG_ENABLED")?.toLowerCase() !== "false";
+const auditDataDir =
+  optionalEnv("AGENT_CONTROL_DATA_DIR") ?? resolve(configDirectory, "../data");
 
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? "development",
@@ -28,6 +32,11 @@ export const config = {
   sessionSecret:
     process.env.SESSION_SECRET ??
     "dev-only-change-me-agent-control-session-secret",
+  auditLog: {
+    enabled: auditLogEnabled,
+    dataDir: auditDataDir,
+    databasePath: resolve(auditDataDir, "agent-control.sqlite"),
+  },
 };
 
 export const authConfigured = Boolean(
@@ -45,3 +54,8 @@ export const loginScopes = [
   "offline_access",
   ...graphScopes,
 ];
+
+function optionalEnv(name: string) {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}

@@ -30,6 +30,8 @@ type RetryPolicy = typeof defaultRetryPolicy;
 type BulkSetBlockedStateOptions = {
   writeConcurrency?: number;
   writePauseMs?: number;
+  onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
+  onPackageResult?: (result: BulkPackageResult) => void | Promise<void>;
 };
 
 export class GraphPackagesClient {
@@ -157,27 +159,40 @@ export async function bulkSetBlockedState(
 ): Promise<BulkActionResult> {
   const packages = await client.listCopilotAgents(accessToken);
   const results: BulkPackageResult[] = [];
-  const writeConcurrency = options.writeConcurrency ?? bulkWriteConcurrency;
+  const writeConcurrency = normalizePositiveInteger(
+    options.writeConcurrency,
+    bulkWriteConcurrency,
+  );
   const writePauseMs = options.writePauseMs ?? bulkWritePauseMs;
+  const recordSkippedResult = async (result: BulkPackageResult) => {
+    results.push(result);
+    await options.onPackageResult?.(result);
+  };
 
-  const actionable = packages.filter((agent) => {
+  const actionable: CopilotPackage[] = [];
+
+  for (const agent of packages) {
     if (agent.isBlocked === targetBlockedState) {
-      results.push({
+      await options.onPackageStart?.(agent);
+      await recordSkippedResult({
         id: agent.id,
         displayName: agent.displayName,
         status: "skipped",
         message: targetBlockedState ? "Already blocked" : "Already unblocked",
       });
-      return false;
+      continue;
     }
 
-    return true;
-  });
+    actionable.push(agent);
+  }
 
   const taskResults = await mapWithConcurrency(
     actionable,
     writeConcurrency,
     async (agent) => {
+      await options.onPackageStart?.(agent);
+      let result: BulkPackageResult;
+
       try {
         if (writePauseMs > 0) {
           await delay(writePauseMs);
@@ -189,13 +204,13 @@ export async function bulkSetBlockedState(
           await client.unblockPackage(accessToken, agent.id);
         }
 
-        return {
+        result = {
           id: agent.id,
           displayName: agent.displayName,
           status: "succeeded" as const,
         };
       } catch (error) {
-        return {
+        result = {
           id: agent.id,
           displayName: agent.displayName,
           status: "failed" as const,
@@ -203,6 +218,9 @@ export async function bulkSetBlockedState(
             error instanceof Error ? error.message : "Unknown Graph error",
         };
       }
+
+      await options.onPackageResult?.(result);
+      return result;
     },
   );
 
@@ -329,4 +347,15 @@ async function mapWithConcurrency<T, U>(
   );
 
   return results;
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const normalized = Math.trunc(value);
+  return Number.isSafeInteger(normalized) && normalized > 0
+    ? normalized
+    : fallback;
 }

@@ -4,6 +4,7 @@ import session from "express-session";
 import helmet from "helmet";
 import { config, authConfigured } from "./config.js";
 import { errorHandler } from "./errors.js";
+import { auditRouter } from "./routes/audit.js";
 import { agentsRouter } from "./routes/agents.js";
 import { authRouter } from "./routes/auth.js";
 import "./types/session.js";
@@ -38,6 +39,7 @@ app.get("/api/health", (_request, response) => {
 });
 
 app.use(authRouter);
+app.use("/api", auditRouter);
 app.use("/api", agentsRouter);
 app.use(errorHandler);
 

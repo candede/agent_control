@@ -86,4 +86,45 @@ describe("GraphPackagesClient", () => {
       "succeeded",
     ]);
   });
+
+  it("reports bulk package starts before package results", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async listCopilotAgents() {
+        return [{ id: "P_1", displayName: "Ready", isBlocked: false }];
+      }
+
+      override async blockPackage() {}
+    }
+
+    const events: string[] = [];
+
+    await bulkSetBlockedState(new FakeClient(), "token", true, {
+      writePauseMs: 0,
+      onPackageStart: (agent) => {
+        events.push(`start:${agent.id}`);
+      },
+      onPackageResult: (result) => {
+        events.push(`result:${result.id}:${result.status}`);
+      },
+    });
+
+    expect(events).toEqual(["start:P_1", "result:P_1:succeeded"]);
+  });
+
+  it("falls back to the default concurrency for invalid values", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async listCopilotAgents() {
+        return [{ id: "P_1", displayName: "Ready", isBlocked: false }];
+      }
+
+      override async blockPackage() {}
+    }
+
+    const result = await bulkSetBlockedState(new FakeClient(), "token", true, {
+      writeConcurrency: 0,
+      writePauseMs: 0,
+    });
+
+    expect(result.succeeded).toBe(1);
+  });
 });
