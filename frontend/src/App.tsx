@@ -113,8 +113,13 @@ function App() {
   const [inactiveDays, setInactiveDays] = useState(30);
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
   const [activeView, setActiveView] = useState<ActiveView>("agents");
+  const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
+  const [recentlyChangedAgentIds, setRecentlyChangedAgentIds] = useState<
+    Set<string>
+  >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
+  const stateChangeTimers = useRef(new Map<string, number>());
 
   useEffect(() => {
     void loadSession();
@@ -125,6 +130,15 @@ function App() {
       void loadAgents();
     }
   }, [user]);
+
+  useEffect(
+    () => () => {
+      for (const timerId of stateChangeTimers.current.values()) {
+        window.clearTimeout(timerId);
+      }
+    },
+    [],
+  );
 
   const userAgentRowsByAgentId = useMemo(() => {
     const rowsByAgentId = new Map<string, UserAgentUsageRow[]>();
@@ -348,6 +362,7 @@ function App() {
     try {
       const response = await getAgents();
       setAgents(response.value);
+      setLastAgentListRefreshAt(new Date());
       setSelectedAgentIds((current) => {
         const availableIds = new Set(response.value.map((agent) => agent.id));
         const next = new Set(
@@ -373,6 +388,8 @@ function App() {
     setAgentDetail(undefined);
     setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
+    setLastAgentListRefreshAt(undefined);
+    setRecentlyChangedAgentIds(new Set());
     setExportingCsv(false);
     setExportProgress(0);
     setBulkResult(undefined);
@@ -499,7 +516,7 @@ function App() {
         await unblockAgent(agent.id);
       }
 
-      await loadAgents();
+      updateCachedAgentBlockedState(agent.id, targetBlockedState);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -634,13 +651,7 @@ function App() {
             displayName: agent.displayName,
             status: "succeeded",
           });
-          setAgents((currentAgents) =>
-            currentAgents.map((currentAgent) =>
-              currentAgent.id === agent.id
-                ? { ...currentAgent, isBlocked: targetBlockedState }
-                : currentAgent,
-            ),
-          );
+          updateCachedAgentBlockedState(agent.id, targetBlockedState);
         } catch (requestError) {
           failed += 1;
           results.push({
@@ -675,7 +686,6 @@ function App() {
         skipped: skipped.length,
         results,
       });
-      await loadAgents();
       setSelectedAgentIds(
         new Set(
           results
@@ -689,6 +699,52 @@ function App() {
       setBusyBulkAction(undefined);
       setBulkProgress(undefined);
     }
+  }
+
+  function updateCachedAgentBlockedState(
+    agentId: string,
+    targetBlockedState: boolean,
+  ) {
+    setAgents((currentAgents) =>
+      currentAgents.map((currentAgent) =>
+        currentAgent.id === agentId &&
+        currentAgent.isBlocked !== targetBlockedState
+          ? { ...currentAgent, isBlocked: targetBlockedState }
+          : currentAgent,
+      ),
+    );
+    setAgentDetail((currentDetail) =>
+      currentDetail?.id === agentId &&
+      currentDetail.isBlocked !== targetBlockedState
+        ? { ...currentDetail, isBlocked: targetBlockedState }
+        : currentDetail,
+    );
+    markAgentStateChanged(agentId);
+  }
+
+  function markAgentStateChanged(agentId: string) {
+    const currentTimerId = stateChangeTimers.current.get(agentId);
+
+    if (currentTimerId) {
+      window.clearTimeout(currentTimerId);
+    }
+
+    setRecentlyChangedAgentIds((current) => {
+      const next = new Set(current);
+      next.add(agentId);
+      return next;
+    });
+
+    const timerId = window.setTimeout(() => {
+      stateChangeTimers.current.delete(agentId);
+      setRecentlyChangedAgentIds((current) => {
+        const next = new Set(current);
+        next.delete(agentId);
+        return next;
+      });
+    }, 1600);
+
+    stateChangeTimers.current.set(agentId, timerId);
   }
 
   function toggleAgentSelection(agentId: string) {
@@ -970,38 +1026,47 @@ function App() {
               />
             </label>
             <div className="filter-actions" aria-label="Table actions">
-              <button
-                type="button"
-                className="icon-button control-icon-button"
-                aria-label={
-                  loadingAgents ? "Refreshing agents" : "Refresh agents"
-                }
-                title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
-                disabled={loadingAgents}
-                onClick={() => void loadAgents()}
-              >
-                <RefreshIcon />
-              </button>
-              <button
-                type="button"
-                className="secondary icon-button control-icon-button"
-                aria-label={
-                  exportingCsv
-                    ? `Exporting ${exportProgress} of ${exportableAgentCount} filtered agents`
-                    : "Export filtered agents CSV"
-                }
-                title={
-                  exportingCsv
-                    ? `Exporting ${exportProgress}/${exportableAgentCount}`
-                    : "Export filtered CSV"
-                }
-                disabled={
-                  loadingAgents || exportingCsv || exportableAgentCount === 0
-                }
-                onClick={() => void handleExportCsv()}
-              >
-                <ExportIcon />
-              </button>
+              <div className="filter-action-buttons">
+                <button
+                  type="button"
+                  className="icon-button control-icon-button"
+                  aria-label={
+                    loadingAgents ? "Refreshing agents" : "Refresh agents"
+                  }
+                  title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
+                  disabled={loadingAgents}
+                  onClick={() => void loadAgents()}
+                >
+                  <RefreshIcon />
+                </button>
+                <button
+                  type="button"
+                  className="secondary icon-button control-icon-button"
+                  aria-label={
+                    exportingCsv
+                      ? `Exporting ${exportProgress} of ${exportableAgentCount} filtered agents`
+                      : "Export filtered agents CSV"
+                  }
+                  title={
+                    exportingCsv
+                      ? `Exporting ${exportProgress}/${exportableAgentCount}`
+                      : "Export filtered CSV"
+                  }
+                  disabled={
+                    loadingAgents || exportingCsv || exportableAgentCount === 0
+                  }
+                  onClick={() => void handleExportCsv()}
+                >
+                  <ExportIcon />
+                </button>
+              </div>
+              <span className="last-refresh" aria-live="polite">
+                {lastAgentListRefreshAt
+                  ? `Last full refresh ${formatRefreshTime(
+                      lastAgentListRefreshAt,
+                    )}`
+                  : ""}
+              </span>
             </div>
           </section>
 
@@ -1012,6 +1077,7 @@ function App() {
               agents={filteredAgents}
               busyAgentId={busyAgentId}
               selectedIds={selectedAgentIds}
+              recentlyChangedIds={recentlyChangedAgentIds}
               selectionDisabled={Boolean(busyBulkAction)}
               usageByAgentId={usageByAgentId}
               allVisibleSelected={allVisibleSelected}
@@ -1126,6 +1192,13 @@ function formatHostLabel(host: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
+}
+
+function formatRefreshTime(date: Date) {
+  return date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function Metric({

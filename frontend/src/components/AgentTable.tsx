@@ -7,6 +7,7 @@ type AgentTableProps = {
   agents: CopilotPackage[];
   busyAgentId?: string;
   selectedIds: Set<string>;
+  recentlyChangedIds: Set<string>;
   selectionDisabled: boolean;
   usageByAgentId: Map<string, AgentTableUsage>;
   allVisibleSelected: boolean;
@@ -34,6 +35,7 @@ export function AgentTable({
   agents,
   busyAgentId,
   selectedIds,
+  recentlyChangedIds,
   selectionDisabled,
   usageByAgentId,
   allVisibleSelected,
@@ -85,10 +87,14 @@ export function AgentTable({
           {agents.map((agent) => {
             const busy = busyAgentId === agent.id;
             const selected = selectedIds.has(agent.id);
+            const recentlyChanged = recentlyChangedIds.has(agent.id);
             const usage = usageByAgentId.get(agent.id);
 
             return (
-              <tr key={agent.id}>
+              <tr
+                key={agent.id}
+                className={recentlyChanged ? "agent-state-changed" : undefined}
+              >
                 <td className="select-cell">
                   <input
                     type="checkbox"
@@ -114,11 +120,17 @@ export function AgentTable({
                 </td>
                 <td>
                   <span
-                    className={
-                      agent.isBlocked ? "status blocked" : "status allowed"
-                    }
+                    className={`status-carousel ${
+                      agent.isBlocked ? "show-blocked" : "show-allowed"
+                    }`}
+                    aria-label={`Status: ${
+                      agent.isBlocked ? "Blocked" : "Allowed"
+                    }`}
                   >
-                    {agent.isBlocked ? "Blocked" : "Allowed"}
+                    <span className="status-carousel-track" aria-hidden="true">
+                      <span className="status allowed">Allowed</span>
+                      <span className="status blocked">Blocked</span>
+                    </span>
                   </span>
                 </td>
                 <td>

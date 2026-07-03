@@ -98,9 +98,43 @@ export function UserAccessView({
 
   if (!reports.users && !reports.userAgents) {
     return (
-      <div className="empty-state">
+      <div className="empty-state user-report-empty-state">
         <h2>No user usage reports imported</h2>
-        <p>Import the Users and Users & agents CSV reports to use User view.</p>
+        <p>
+          Import the <strong className="report-name">Agents</strong>,{" "}
+          <strong className="report-name">Users</strong>, and{" "}
+          <strong className="report-name">Users & agents</strong> CSV reports to
+          use User view.
+        </p>
+        <div
+          className="admin-download-guide"
+          aria-label="Where to download user usage reports"
+        >
+          <strong>Download the CSVs from Microsoft 365 admin center</strong>
+          <ol>
+            <li>
+              Open{" "}
+              <a
+                href="https://admin.microsoft.com/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Microsoft 365 admin center
+              </a>{" "}
+              with an account that can view usage reports.
+            </li>
+            <li>
+              Go to Reports &gt; Usage &gt; Microsoft 365 Copilot &gt; Agent
+              usage.
+            </li>
+            <li>
+              Export the <strong className="report-name">Agents</strong>,{" "}
+              <strong className="report-name">Users</strong>, and{" "}
+              <strong className="report-name">Users & agents</strong> reports as
+              CSV, then import all three files here.
+            </li>
+          </ol>
+        </div>
       </div>
     );
   }

@@ -368,10 +368,25 @@ button.view-button.active {
 
 .filter-actions {
   grid-column: 6;
+  display: grid;
+  align-content: end;
+  justify-items: end;
+  gap: 6px;
+}
+
+.filter-action-buttons {
   display: flex;
-  align-items: end;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.last-refresh {
+  min-height: 15px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .controls label {
@@ -1224,6 +1239,10 @@ tr:last-child td {
   border-bottom: none;
 }
 
+tr.agent-state-changed td {
+  animation: agent-row-state-changed 1.35s ease-out;
+}
+
 .agent-name {
   color: var(--text-h);
   font-weight: 750;
@@ -1322,12 +1341,38 @@ button.icon-button:hover {
 
 .status {
   display: inline-flex;
+  align-items: center;
   min-width: 84px;
+  width: 84px;
+  box-sizing: border-box;
   justify-content: center;
   padding: 4px 9px;
   border-radius: 999px;
   font-size: 13px;
   font-weight: 700;
+}
+
+.status-carousel {
+  display: inline-flex;
+  width: 84px;
+  overflow: hidden;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.status-carousel-track {
+  display: flex;
+  width: 200%;
+  transform: translateX(0);
+  transition: transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.status-carousel.show-blocked .status-carousel-track {
+  transform: translateX(-50%);
+}
+
+.status-carousel .status {
+  flex: 0 0 50%;
 }
 
 .status.allowed {
@@ -1348,6 +1393,32 @@ button.icon-button:hover {
 .status.warning {
   color: #74520f;
   background: #f8e7b8;
+}
+
+@keyframes agent-row-state-changed {
+  0% {
+    background: #fff3c6;
+  }
+  45% {
+    background: #f3f8e8;
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  tr.agent-state-changed td {
+    animation: none;
+  }
+
+  .status-carousel-track {
+    transition: none;
+  }
+
+  tr.agent-state-changed td {
+    background: #fff7dc;
+  }
 }
 
 .user-access-view,
@@ -1529,6 +1600,46 @@ button.icon-button:hover {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.user-report-empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+}
+
+.admin-download-guide {
+  width: min(100%, 720px);
+  margin-top: 8px;
+  padding: 16px 18px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: rgba(241, 248, 245, 0.72);
+  color: var(--text);
+  text-align: left;
+}
+
+.admin-download-guide > strong {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-h);
+}
+
+.report-name {
+  color: #061210;
+  font-weight: 950;
+}
+
+.admin-download-guide ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.admin-download-guide a {
+  color: var(--ink);
+  font-weight: 800;
+}
+
 .audit-summary-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -1545,6 +1656,10 @@ button.icon-button:hover {
 
 .audit-controls .filter-actions {
   grid-column: auto;
+  display: flex;
+  align-items: end;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .audit-table-shell table {
@@ -1793,9 +1908,19 @@ button.icon-button:hover {
   }
 
   .filter-actions {
-    flex-direction: column;
-    align-items: stretch;
+    justify-items: stretch;
+  }
+
+  .filter-action-buttons {
     justify-content: stretch;
+  }
+
+  .filter-action-buttons .control-icon-button {
+    flex: 1;
+  }
+
+  .last-refresh {
+    text-align: left;
   }
 
   .app-footer {
