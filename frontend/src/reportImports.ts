@@ -56,6 +56,14 @@ export type UserUsageRow = {
   lastActivityDateUtc?: string;
 };
 
+export type AgentUsageSummary = AgentUsageRow & {
+  fileName: string;
+  importedAt: string;
+  periodDays?: number;
+  sourceReport: "agents" | "userAgents";
+  userRows: UserAgentUsageRow[];
+};
+
 type CsvRecord = Record<string, string>;
 
 const agentHeaders = [

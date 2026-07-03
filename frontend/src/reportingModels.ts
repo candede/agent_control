@@ -1,8 +1,8 @@
 import type { CopilotPackage } from "./api/client";
 import { getBuiltWithLabel } from "./agentDisplay";
 import type {
+  AgentUsageSummary,
   AgentUsageReport,
-  AgentUsageRow,
   UserAgentUsageReport,
   UserAgentUsageRow,
   UserUsageReport,
@@ -85,11 +85,6 @@ export type ReportingSummary = {
     mismatchCount: number;
     topUsersByResponses: ReportingTopUser[];
   };
-};
-
-type AgentUsageSummary = AgentUsageRow & {
-  sourceReport: "agents" | "userAgents";
-  userRows: UserAgentUsageRow[];
 };
 
 type DateRange = {
@@ -326,6 +321,9 @@ function buildUsageByAgentId(
 
       usageByAgentId.set(row.agentId, {
         ...row,
+        fileName: reports.agents.fileName,
+        importedAt: reports.agents.importedAt,
+        periodDays: reports.agents.periodDays,
         sourceReport: "agents",
         userRows: userAgentRowsByAgentId.get(row.agentId) ?? [],
       });
@@ -352,6 +350,9 @@ function buildUsageByAgentId(
       lastActivityDateUtc: latestDate(
         rows.map((row) => row.lastActivityDateUtc),
       ),
+      fileName: reports.userAgents?.fileName ?? "",
+      importedAt: reports.userAgents?.importedAt ?? "",
+      periodDays: reports.userAgents?.periodDays,
       sourceReport: "userAgents",
       userRows: rows,
     });

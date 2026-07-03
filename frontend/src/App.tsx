@@ -1,11 +1,4 @@
-import {
-  type ReactNode,
-  useDeferredValue,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
-import DOMPurify from "dompurify";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   ExternalLink,
@@ -31,16 +24,23 @@ import {
   type CopilotPackageDetail,
   type SessionUser,
 } from "./api/client";
+import {
+  downloadCsv,
+  getExportFilename,
+  toAgentExportRow,
+  toCsv,
+} from "./agentExport";
 import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
+import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AgentTable } from "./components/AgentTable";
 import { BulkActions } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
 import {
   parseUsageReport,
+  type AgentUsageSummary,
   type AgentUsageReport,
-  type AgentUsageRow,
   type ParsedUsageReport,
   type UserAgentUsageReport,
   type UserAgentUsageRow,
@@ -69,14 +69,6 @@ type UsageImportFailure = {
 type UsageImportStatus = {
   kind: "success" | "error";
   message: string;
-};
-
-type AgentUsageSummary = AgentUsageRow & {
-  fileName: string;
-  importedAt: string;
-  periodDays?: number;
-  sourceReport: "agents" | "userAgents";
-  userRows: UserAgentUsageRow[];
 };
 
 type ActiveView = "agents" | "users" | "reports";
@@ -121,6 +113,7 @@ function App() {
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
   const [activeView, setActiveView] = useState<ActiveView>("agents");
   const deferredQuery = useDeferredValue(query);
+  const agentDetailRequestId = useRef(0);
 
   useEffect(() => {
     void loadSession();
@@ -370,12 +363,15 @@ function App() {
   }
 
   async function handleSignOut() {
+    agentDetailRequestId.current += 1;
     await signOut();
     setUser(undefined);
     setAgents([]);
     setSelectedAgentIds(new Set());
     setBulkConfirmation(undefined);
     setAgentDetail(undefined);
+    setLoadingAgentDetailId(undefined);
+    setAgentDetailError(undefined);
     setExportingCsv(false);
     setExportProgress(0);
     setBulkResult(undefined);
@@ -463,16 +459,27 @@ function App() {
   }
 
   async function handleViewAgentDetails(agent: CopilotPackage) {
+    const requestId = agentDetailRequestId.current + 1;
+    agentDetailRequestId.current = requestId;
+
     setAgentDetailError(undefined);
+    setAgentDetail(undefined);
     setLoadingAgentDetailId(agent.id);
 
     try {
       const detail = await getAgentDetails(agent.id);
-      setAgentDetail(detail);
+
+      if (agentDetailRequestId.current === requestId) {
+        setAgentDetail(detail);
+      }
     } catch (requestError) {
-      setAgentDetailError(errorMessage(requestError));
+      if (agentDetailRequestId.current === requestId) {
+        setAgentDetailError(errorMessage(requestError));
+      }
     } finally {
-      setLoadingAgentDetailId(undefined);
+      if (agentDetailRequestId.current === requestId) {
+        setLoadingAgentDetailId(undefined);
+      }
     }
   }
 
@@ -511,10 +518,27 @@ function App() {
     setExportProgress(0);
 
     try {
-      const rows = agentsToExport.map((agent) =>
-        toAgentExportRow(agent, "", usageByAgentId.get(agent.id)),
-      );
-      setExportProgress(agentsToExport.length);
+      const rows = [];
+
+      for (const [index, agent] of agentsToExport.entries()) {
+        let packageForExport: CopilotPackage | CopilotPackageDetail = agent;
+        let detailError = "";
+
+        try {
+          packageForExport = await getAgentDetails(agent.id);
+        } catch (requestError) {
+          detailError = errorMessage(requestError);
+        }
+
+        rows.push(
+          toAgentExportRow(
+            packageForExport,
+            detailError,
+            usageByAgentId.get(agent.id),
+          ),
+        );
+        setExportProgress(index + 1);
+      }
 
       downloadCsv(getExportFilename(hasActiveAgentFilters), toCsv(rows));
     } catch (requestError) {
@@ -1076,84 +1100,6 @@ type BulkConfirmation = {
   skippedCount: number;
 };
 
-type AgentExportRow = {
-  packageId: string;
-  displayName: string;
-  status: string;
-  publisher: string;
-  type: string;
-  shortDescription: string;
-  version: string;
-  manifestVersion: string;
-  platform: string;
-  supportedHosts: string;
-  availableTo: string;
-  deployedTo: string;
-  sensitivity: string;
-  categories: string;
-  elementTypes: string;
-  lastModified: string;
-  reportAgentId: string;
-  reportAgentName: string;
-  creatorType: string;
-  activeUsersLicensed: string;
-  activeUsersUnlicensed: string;
-  activeUsersTotal: string;
-  responsesSentToUsers: string;
-  lastActivity: string;
-  usageSource: string;
-  usageReportPeriodDays: string;
-  usageReportFile: string;
-  usageImportedAt: string;
-  userAgentRows: string;
-  appId: string;
-  manifestId: string;
-  assetId: string;
-  allowedUsersAndGroups: string;
-  acquireUsersAndGroups: string;
-  elementDetails: string;
-  detailError: string;
-};
-
-const csvHeaders: Array<{ key: keyof AgentExportRow; label: string }> = [
-  { key: "packageId", label: "Package ID" },
-  { key: "displayName", label: "Display name" },
-  { key: "status", label: "Status" },
-  { key: "publisher", label: "Publisher" },
-  { key: "type", label: "Type" },
-  { key: "shortDescription", label: "Short description" },
-  { key: "version", label: "Version" },
-  { key: "manifestVersion", label: "Manifest version" },
-  { key: "platform", label: "Built with" },
-  { key: "supportedHosts", label: "Supported hosts" },
-  { key: "availableTo", label: "Available to" },
-  { key: "deployedTo", label: "Acquired for" },
-  { key: "sensitivity", label: "Sensitivity" },
-  { key: "categories", label: "Categories" },
-  { key: "elementTypes", label: "Element types" },
-  { key: "lastModified", label: "Last modified" },
-  { key: "reportAgentId", label: "Report Agent ID" },
-  { key: "reportAgentName", label: "Report agent name" },
-  { key: "creatorType", label: "Creator type" },
-  { key: "activeUsersLicensed", label: "Active users licensed" },
-  { key: "activeUsersUnlicensed", label: "Active users unlicensed" },
-  { key: "activeUsersTotal", label: "Active users total" },
-  { key: "responsesSentToUsers", label: "Responses sent to users" },
-  { key: "lastActivity", label: "Last activity date UTC" },
-  { key: "usageSource", label: "Usage source" },
-  { key: "usageReportPeriodDays", label: "Usage report period days" },
-  { key: "usageReportFile", label: "Usage report file" },
-  { key: "usageImportedAt", label: "Usage imported at" },
-  { key: "userAgentRows", label: "User-agent rows" },
-  { key: "appId", label: "App ID" },
-  { key: "manifestId", label: "Manifest ID" },
-  { key: "assetId", label: "Asset ID" },
-  { key: "allowedUsersAndGroups", label: "Allowed users and groups" },
-  { key: "acquireUsersAndGroups", label: "Acquire users and groups" },
-  { key: "elementDetails", label: "Element details" },
-  { key: "detailError", label: "Detail error" },
-];
-
 function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -1273,298 +1219,6 @@ function AppFooter() {
         </nav>
       </div>
     </footer>
-  );
-}
-
-function getAgentDescription(agent: CopilotPackageDetail) {
-  return (
-    agent.longDescription ||
-    agent.shortDescription ||
-    "No description provided."
-  );
-}
-
-function getSanitizedDescriptionHtml(description: string) {
-  if (!hasHtmlMarkup(description)) {
-    return undefined;
-  }
-
-  const sanitized = DOMPurify.sanitize(description, {
-    USE_PROFILES: { html: true },
-  }).trim();
-
-  return sanitized || undefined;
-}
-
-function hasHtmlMarkup(value: string) {
-  return /<\/?[a-z][\s\S]*>/i.test(value);
-}
-
-function AgentDetailModal({
-  agent,
-  usage,
-  userRows,
-  onClose,
-}: {
-  agent: CopilotPackageDetail;
-  usage?: AgentUsageSummary;
-  userRows: UserAgentUsageRow[];
-  onClose: () => void;
-}) {
-  const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
-  const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
-  const connectedServices = extractConnectedServices(agent.elementDetails);
-  const elementDetails = agent.elementDetails ?? [];
-  const elementCount = elementDetails.reduce(
-    (total, detail) => total + detail.elements.length,
-    0,
-  );
-  const assignmentCount = allowedSummary.total + acquireSummary.total;
-  const statusLabel = agent.isBlocked ? "Blocked" : "Allowed";
-  const visibleUserRows = userRows.slice(0, 6);
-  const hiddenUserRows = userRows.length - visibleUserRows.length;
-  const description = getAgentDescription(agent);
-  const sanitizedDescriptionHtml = getSanitizedDescriptionHtml(description);
-
-  useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="detail-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-detail-title"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header className="detail-header">
-          <div className="detail-title-block">
-            <p className="eyebrow">Agent details</p>
-            <h2 id="agent-detail-title">{agent.displayName}</h2>
-          </div>
-          <div className="detail-header-actions">
-            <button type="button" className="secondary" onClick={onClose}>
-              Close
-            </button>
-          </div>
-        </header>
-
-        {sanitizedDescriptionHtml ? (
-          <div
-            className="detail-description rich-description"
-            dangerouslySetInnerHTML={{ __html: sanitizedDescriptionHtml }}
-          />
-        ) : (
-          <p className="detail-description">{description}</p>
-        )}
-
-        <div className="detail-stat-grid">
-          <SummaryStat
-            label="Status"
-            value={statusLabel}
-            tone={agent.isBlocked ? "danger" : "success"}
-          />
-          <SummaryStat
-            label="Active users"
-            value={
-              usage ? usage.activeUsersTotal.toLocaleString() : "No import"
-            }
-            tone="usage"
-          />
-          <SummaryStat
-            label="Responses sent"
-            value={
-              usage ? usage.responsesSentToUsers.toLocaleString() : "No import"
-            }
-            tone="usage"
-          />
-          <SummaryStat
-            label="Connected services"
-            value={
-              connectedServices.length
-                ? connectedServices.length.toLocaleString()
-                : "None"
-            }
-          />
-        </div>
-
-        <div className="detail-layout">
-          <DetailSection
-            title="Package details"
-            countLabel={`${assignmentCount.toLocaleString()} access assignments`}
-            tone="metadata"
-          >
-            <DetailList
-              items={[
-                { label: "Publisher", value: agent.publisher },
-                { label: "Type", value: agent.type },
-                { label: "Built with", value: getBuiltWithLabel(agent) },
-                { label: "Version", value: agent.version },
-                { label: "Manifest", value: agent.manifestVersion },
-                {
-                  label: "Last modified",
-                  value: formatDate(agent.lastModifiedDateTime),
-                },
-                {
-                  label: "Available to",
-                  value: formatDetailLabel(agent.availableTo),
-                },
-                {
-                  label: "Sensitivity",
-                  value: formatDetailLabel(agent.sensitivity),
-                },
-                {
-                  label: "Hosts",
-                  value: formatList(agent.supportedHosts),
-                },
-                { label: "Categories", value: formatList(agent.categories) },
-                {
-                  label: "Element types",
-                  value: formatList(agent.elementTypes),
-                },
-                {
-                  label: "Elements",
-                  value: elementDetails.length
-                    ? `${elementDetails.length} groups, ${elementCount} elements`
-                    : "No element metadata returned",
-                },
-                {
-                  label: "Allowed assignments",
-                  value: formatAccessSummary(allowedSummary),
-                },
-                {
-                  label: "Acquire assignments",
-                  value: formatAccessSummary(acquireSummary),
-                },
-                {
-                  label: "Detected services",
-                  value: connectedServices.length
-                    ? `${connectedServices.length} detected`
-                    : "None returned",
-                },
-                { label: "Package ID", value: agent.id, variant: "code" },
-                { label: "App ID", value: agent.appId, variant: "code" },
-                {
-                  label: "Manifest ID",
-                  value: agent.manifestId,
-                  variant: "code",
-                },
-                { label: "Asset ID", value: agent.assetId, variant: "code" },
-              ]}
-            />
-            {elementDetails.length ? (
-              <ul className="detail-list compact-list package-elements-list">
-                {elementDetails.map((detail) => (
-                  <li key={detail.elementType}>
-                    <span>{formatDetailLabel(detail.elementType)}</span>
-                    <small>{detail.elements.length} elements</small>
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-            <div className="access-grid">
-              <AccessList
-                label="Allowed users and groups"
-                values={agent.allowedUsersAndGroups}
-              />
-              <AccessList
-                label="Acquire users and groups"
-                values={agent.acquireUsersAndGroups}
-              />
-            </div>
-          </DetailSection>
-
-          <DetailSection
-            title="Usage import"
-            countLabel={
-              usage ? formatReportKind(usage.sourceReport) : "No import"
-            }
-            tone="usage"
-          >
-            <div className="detail-grid">
-              <DetailItem
-                label="Report Agent ID"
-                value={usage?.agentId}
-                variant="code"
-              />
-              <DetailItem label="Report agent name" value={usage?.agentName} />
-              <DetailItem label="Creator type" value={usage?.creatorType} />
-              <DetailItem
-                label="Last activity"
-                value={formatReportDate(usage?.lastActivityDateUtc)}
-              />
-              <DetailItem
-                label="Licensed users"
-                value={usage?.activeUsersLicensed.toLocaleString()}
-              />
-              <DetailItem
-                label="Unlicensed users"
-                value={usage?.activeUsersUnlicensed.toLocaleString()}
-              />
-            </div>
-          </DetailSection>
-
-          <DetailSection
-            title="Connected services"
-            countLabel={`${connectedServices.length} detected`}
-            tone="services"
-          >
-            {connectedServices.length ? (
-              <ul className="detail-list service-list expanded-detail-list">
-                {connectedServices.map((service) => (
-                  <li key={`${service.source}-${service.value}`}>
-                    <span>{service.value}</span>
-                    <small>{service.source}</small>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>
-                No connected service metadata was returned for this package.
-              </p>
-            )}
-          </DetailSection>
-
-          <DetailSection
-            title="User activity"
-            countLabel={`${userRows.length.toLocaleString()} rows`}
-            tone="activity"
-          >
-            {visibleUserRows.length ? (
-              <ul className="detail-list user-activity-list expanded-detail-list">
-                {visibleUserRows.map((row) => (
-                  <li key={`${row.agentId}-${row.username}`}>
-                    <span>{row.username}</span>
-                    <small>
-                      {row.responsesSentToUsers.toLocaleString()} responses,
-                      last activity{" "}
-                      {formatReportDate(row.lastActivityDateUtc) ?? "Unknown"}
-                    </small>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>No user-agent report rows imported for this package.</p>
-            )}
-            {hiddenUserRows > 0 ? (
-              <p className="detail-overflow-note">
-                {hiddenUserRows.toLocaleString()} more user rows hidden.
-              </p>
-            ) : null}
-          </DetailSection>
-        </div>
-      </section>
-    </div>
   );
 }
 
@@ -1788,247 +1442,6 @@ function UsageImportReviewModal({
   );
 }
 
-type AccessSummary = {
-  total: number;
-  users: number;
-  groups: number;
-  other: number;
-};
-
-type ConnectedService = {
-  value: string;
-  source: string;
-};
-
-function DetailSection({
-  title,
-  countLabel,
-  tone,
-  children,
-}: {
-  title: string;
-  countLabel?: string;
-  tone?:
-    | "activity"
-    | "governance"
-    | "metadata"
-    | "services"
-    | "technical"
-    | "usage";
-  children: ReactNode;
-}) {
-  return (
-    <section className={tone ? `detail-section ${tone}` : "detail-section"}>
-      <div className="detail-section-header">
-        <h3>{title}</h3>
-        {countLabel ? <span>{countLabel}</span> : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function SummaryStat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "danger" | "success" | "usage";
-}) {
-  return (
-    <div className={tone ? `summary-stat ${tone}` : "summary-stat"}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-type DetailListItem = {
-  label: string;
-  value?: string;
-  variant?: "code";
-};
-
-function DetailList({ items }: { items: DetailListItem[] }) {
-  return (
-    <dl className="compact-detail-list">
-      {items.map((item) => (
-        <div key={item.label}>
-          <dt>{item.label}</dt>
-          <dd className={item.variant === "code" ? "detail-code" : undefined}>
-            {item.value || "Unknown"}
-          </dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-function DetailItem({
-  label,
-  value,
-  variant,
-}: {
-  label: string;
-  value?: string;
-  variant?: "code";
-}) {
-  return (
-    <div className="detail-item">
-      <span>{label}</span>
-      <strong className={variant === "code" ? "detail-code" : undefined}>
-        {value || "Unknown"}
-      </strong>
-    </div>
-  );
-}
-
-function summarizeAccess(
-  values?: CopilotPackageDetail["allowedUsersAndGroups"],
-): AccessSummary {
-  const summary = { total: 0, users: 0, groups: 0, other: 0 };
-
-  for (const entry of values ?? []) {
-    summary.total += 1;
-
-    if (entry.resourceType === "user") {
-      summary.users += 1;
-    } else if (entry.resourceType === "group") {
-      summary.groups += 1;
-    } else {
-      summary.other += 1;
-    }
-  }
-
-  return summary;
-}
-
-function formatAccessSummary(summary: AccessSummary) {
-  if (summary.total === 0) {
-    return "No explicit assignments";
-  }
-
-  return `${summary.total} total (${summary.users} users, ${summary.groups} groups, ${summary.other} other)`;
-}
-
-function extractConnectedServices(
-  elementDetails?: CopilotPackageDetail["elementDetails"],
-): ConnectedService[] {
-  const services = new Map<string, ConnectedService>();
-
-  for (const detail of elementDetails ?? []) {
-    for (const element of detail.elements) {
-      const source = `${formatDetailLabel(detail.elementType) ?? detail.elementType} ${element.id}`;
-
-      for (const service of extractServiceCandidates(element.definition)) {
-        const key = `${source}:${service}`;
-        services.set(key, { value: service, source });
-      }
-    }
-  }
-
-  return [...services.values()].slice(0, 20);
-}
-
-function extractServiceCandidates(definition: string) {
-  const candidates = new Set<string>();
-  const urlMatches = definition.matchAll(
-    /https?:\/\/([^\s"'<>/]+)[^\s"'<>]*/gi,
-  );
-
-  for (const match of urlMatches) {
-    candidates.add(match[1]);
-  }
-
-  const parsed = parseJson(definition);
-
-  if (parsed !== undefined) {
-    collectServiceCandidates(parsed, candidates);
-  }
-
-  return [...candidates];
-}
-
-function collectServiceCandidates(value: unknown, candidates: Set<string>) {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectServiceCandidates(item, candidates);
-    }
-    return;
-  }
-
-  if (!value || typeof value !== "object") {
-    return;
-  }
-
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string" && isServiceLikeKey(key)) {
-      const candidate = item.trim();
-
-      if (candidate && candidate.length <= 120) {
-        candidates.add(candidate);
-      }
-    } else {
-      collectServiceCandidates(item, candidates);
-    }
-  }
-}
-
-function isServiceLikeKey(key: string) {
-  return /(api|connector|connection|endpoint|host|name|resource|service|url)/i.test(
-    key,
-  );
-}
-
-function parseJson(value: string) {
-  const trimmed = value.trim();
-
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-function AccessList({
-  label,
-  values,
-}: {
-  label: string;
-  values?: CopilotPackageDetail["allowedUsersAndGroups"];
-}) {
-  return (
-    <div className="access-list">
-      <span>{label}</span>
-      {values?.length ? (
-        <ul>
-          {values.slice(0, 8).map((entry) => (
-            <li key={`${entry.resourceType}-${entry.resourceId}`}>
-              <strong>{formatDetailLabel(entry.resourceType)}</strong>
-              <small>{entry.resourceId}</small>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p>No explicit users or groups returned.</p>
-      )}
-      {values && values.length > 8 ? (
-        <p>{values.length - 8} more entries hidden.</p>
-      ) : null}
-    </div>
-  );
-}
-
-function formatList(values?: string[]) {
-  return values?.length ? values.map(formatDetailLabel).join(", ") : undefined;
-}
-
 function formatDetailLabel(value?: string) {
   if (!value) {
     return undefined;
@@ -2038,28 +1451,6 @@ function formatDetailLabel(value?: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
-}
-
-function formatDate(value?: string) {
-  if (!value) {
-    return undefined;
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value));
-}
-
-function formatReportDate(value?: string) {
-  if (!value) {
-    return undefined;
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeZone: "UTC",
-  }).format(new Date(value));
 }
 
 function mergeUsageReports(
@@ -2283,121 +1674,6 @@ function formatImportRowSummary(counts: Record<UsageReportKind, number>) {
   }
 
   return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
-}
-
-function toAgentExportRow(
-  agent: CopilotPackage | CopilotPackageDetail,
-  detailError = "",
-  usage?: AgentUsageSummary,
-): AgentExportRow {
-  const detail = agent as CopilotPackageDetail;
-
-  return {
-    packageId: agent.id,
-    displayName: agent.displayName,
-    status: agent.isBlocked ? "Blocked" : "Allowed",
-    publisher: agent.publisher ?? "",
-    type: formatDetailLabel(agent.type) ?? "",
-    shortDescription: agent.shortDescription ?? "",
-    version: agent.version ?? "",
-    manifestVersion: agent.manifestVersion ?? "",
-    platform: getBuiltWithLabel(agent) ?? "",
-    supportedHosts: formatList(agent.supportedHosts) ?? "",
-    availableTo: formatDetailLabel(agent.availableTo) ?? "",
-    deployedTo: formatDetailLabel(agent.deployedTo) ?? "",
-    sensitivity: formatDetailLabel(detail.sensitivity) ?? "",
-    categories: formatList(detail.categories) ?? "",
-    elementTypes: formatList(agent.elementTypes) ?? "",
-    lastModified: formatDate(agent.lastModifiedDateTime) ?? "",
-    reportAgentId: usage?.agentId ?? "",
-    reportAgentName: usage?.agentName ?? "",
-    creatorType: usage?.creatorType ?? "",
-    activeUsersLicensed: usage?.activeUsersLicensed.toString() ?? "",
-    activeUsersUnlicensed: usage?.activeUsersUnlicensed.toString() ?? "",
-    activeUsersTotal: usage?.activeUsersTotal.toString() ?? "",
-    responsesSentToUsers: usage?.responsesSentToUsers.toString() ?? "",
-    lastActivity: formatReportDate(usage?.lastActivityDateUtc) ?? "",
-    usageSource: usage ? formatReportKind(usage.sourceReport) : "",
-    usageReportPeriodDays: usage?.periodDays?.toString() ?? "",
-    usageReportFile: usage?.fileName ?? "",
-    usageImportedAt: formatDate(usage?.importedAt) ?? "",
-    userAgentRows: usage?.userRows.length.toString() ?? "",
-    appId: agent.appId ?? "",
-    manifestId: agent.manifestId ?? "",
-    assetId: agent.assetId ?? "",
-    allowedUsersAndGroups: formatAccessEntries(detail.allowedUsersAndGroups),
-    acquireUsersAndGroups: formatAccessEntries(detail.acquireUsersAndGroups),
-    elementDetails: formatElementDetails(detail.elementDetails),
-    detailError,
-  };
-}
-
-function formatAccessEntries(
-  values?: CopilotPackageDetail["allowedUsersAndGroups"],
-) {
-  return (
-    values
-      ?.map(
-        (entry) =>
-          `${formatDetailLabel(entry.resourceType) ?? entry.resourceType}:${entry.resourceId}`,
-      )
-      .join("; ") ?? ""
-  );
-}
-
-function formatElementDetails(values?: CopilotPackageDetail["elementDetails"]) {
-  return (
-    values
-      ?.map(
-        (detail) =>
-          `${formatDetailLabel(detail.elementType) ?? detail.elementType}:${detail.elements.length}`,
-      )
-      .join("; ") ?? ""
-  );
-}
-
-function toCsv(rows: AgentExportRow[]) {
-  const header = csvHeaders.map((header) => csvCell(header.label)).join(",");
-  const body = rows.map((row) =>
-    csvHeaders.map((header) => csvCell(row[header.key])).join(","),
-  );
-
-  return [header, ...body].join("\r\n");
-}
-
-function csvCell(value: string) {
-  return `"${value.replace(/"/g, '""')}"`;
-}
-
-function getExportFilename(isFiltered: boolean) {
-  const filteredSuffix = isFiltered ? "-filtered" : "";
-
-  return `copilot-agents${filteredSuffix}-${formatExportTimestamp()}.csv`;
-}
-
-function formatExportTimestamp(date = new Date()) {
-  const pad = (value: number) => value.toString().padStart(2, "0");
-
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
-    date.getDate(),
-  )}-${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(
-    date.getSeconds(),
-  )}`;
-}
-
-function downloadCsv(filename: string, csv: string) {
-  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.href = url;
-  link.download = filename;
-  document.body.append(link);
-  link.click();
-  window.setTimeout(() => {
-    link.remove();
-    URL.revokeObjectURL(url);
-  }, 0);
 }
 
 function BulkConfirmModal({
