@@ -493,30 +493,13 @@ function App() {
     setExportingCsv(true);
     setExportProgress(0);
 
-    const rows: AgentExportRow[] = [];
-
     try {
-      for (const [index, agent] of agentsToExport.entries()) {
-        try {
-          const detail = await getAgentDetails(agent.id);
-          rows.push(toAgentExportRow(detail, "", usageByAgentId.get(agent.id)));
-        } catch (requestError) {
-          rows.push(
-            toAgentExportRow(
-              agent,
-              errorMessage(requestError),
-              usageByAgentId.get(agent.id),
-            ),
-          );
-        }
-
-        setExportProgress(index + 1);
-      }
-
-      downloadCsv(
-        `copilot-agents-${new Date().toISOString().slice(0, 10)}.csv`,
-        toCsv(rows),
+      const rows = agentsToExport.map((agent) =>
+        toAgentExportRow(agent, "", usageByAgentId.get(agent.id)),
       );
+      setExportProgress(agentsToExport.length);
+
+      downloadCsv(getExportFilename(hasActiveAgentFilters), toCsv(rows));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -2261,6 +2244,22 @@ function csvCell(value: string) {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+function getExportFilename(isFiltered: boolean) {
+  const filteredSuffix = isFiltered ? "-filtered" : "";
+
+  return `copilot-agents${filteredSuffix}-${formatExportTimestamp()}.csv`;
+}
+
+function formatExportTimestamp(date = new Date()) {
+  const pad = (value: number) => value.toString().padStart(2, "0");
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )}-${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(
+    date.getSeconds(),
+  )}`;
+}
+
 function downloadCsv(filename: string, csv: string) {
   const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -2270,8 +2269,10 @@ function downloadCsv(filename: string, csv: string) {
   link.download = filename;
   document.body.append(link);
   link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => {
+    link.remove();
+    URL.revokeObjectURL(url);
+  }, 0);
 }
 
 function BulkConfirmModal({
