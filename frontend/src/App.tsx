@@ -24,6 +24,7 @@ import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { AgentTable } from "./components/AgentTable";
 import { BulkActions } from "./components/BulkActions";
+import { UserAccessView } from "./components/UserAccessView";
 import {
   parseUsageReport,
   type AgentUsageReport,
@@ -66,6 +67,8 @@ type AgentUsageSummary = AgentUsageRow & {
   userRows: UserAgentUsageRow[];
 };
 
+type ActiveView = "agents" | "users";
+
 const emptyUsageReports = (): UsageReportsState => ({});
 
 function App() {
@@ -103,6 +106,7 @@ function App() {
     useState<UsageImportStatus>();
   const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
   const [inactiveDays, setInactiveDays] = useState(30);
+  const [activeView, setActiveView] = useState<ActiveView>("agents");
   const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
@@ -132,26 +136,22 @@ function App() {
     [usageReports, userAgentRowsByAgentId],
   );
 
-  const unmatchedReportAgentCount = useMemo(() => {
-    const packageIds = new Set(agents.map((agent) => agent.id));
-    const reportIds = new Set(
-      [
-        ...(usageReports.agents?.rows ?? []),
-        ...(usageReports.userAgents?.rows ?? []),
-      ]
-        .map((row) => row.agentId)
-        .filter(Boolean),
-    );
-
-    return [...reportIds].filter((agentId) => !packageIds.has(agentId)).length;
-  }, [agents, usageReports.agents, usageReports.userAgents]);
-
   const inactiveAgentCount = useMemo(
     () =>
       agents.filter((agent) =>
         isInactiveUsage(usageByAgentId.get(agent.id), inactiveDays),
       ).length,
     [agents, inactiveDays, usageByAgentId],
+  );
+
+  const allowedAgentCount = useMemo(
+    () => agents.filter((agent) => !agent.isBlocked).length,
+    [agents],
+  );
+
+  const blockedAgentCount = useMemo(
+    () => agents.filter((agent) => agent.isBlocked).length,
+    [agents],
   );
 
   const publisherOptions = useMemo(() => {
@@ -288,11 +288,31 @@ function App() {
     [agents, selectedAgentIds],
   );
 
+  const filteredAllowedAgentCount = filteredAgents.filter(
+    (agent) => !agent.isBlocked,
+  ).length;
+  const filteredBlockedAgentCount = filteredAgents.filter(
+    (agent) => agent.isBlocked,
+  ).length;
+  const filteredInactiveAgentCount = filteredAgents.filter((agent) =>
+    isInactiveUsage(usageByAgentId.get(agent.id), inactiveDays),
+  ).length;
+
+  const hasActiveAgentFilters =
+    deferredQuery.trim().length > 0 ||
+    statusFilter !== "all" ||
+    publisherFilter !== "all" ||
+    availableToFilter !== "all" ||
+    hostFilter !== "all" ||
+    effectivePlatformFilter !== "all" ||
+    usageFilter !== "all";
+
   const visibleSelectedCount = filteredAgents.filter((agent) =>
     selectedAgentIds.has(agent.id),
   ).length;
   const allVisibleSelected =
     filteredAgents.length > 0 && visibleSelectedCount === filteredAgents.length;
+  const exportableAgentCount = filteredAgents.length;
 
   async function loadSession() {
     setLoadingSession(true);
@@ -375,9 +395,11 @@ function App() {
       }
     }
 
+    const reports = coalesceUsageReportsByKind(parsedReports, warnings);
+
     setUsageImportStatus(undefined);
     setPendingUsageImport({
-      reports: parsedReports,
+      reports,
       failures,
       warnings,
       totalFiles: files.length,
@@ -461,7 +483,9 @@ function App() {
   }
 
   async function handleExportCsv() {
-    if (agents.length === 0 || exportingCsv) {
+    const agentsToExport = filteredAgents;
+
+    if (agentsToExport.length === 0 || exportingCsv) {
       return;
     }
 
@@ -472,7 +496,7 @@ function App() {
     const rows: AgentExportRow[] = [];
 
     try {
-      for (const [index, agent] of agents.entries()) {
+      for (const [index, agent] of agentsToExport.entries()) {
         try {
           const detail = await getAgentDetails(agent.id);
           rows.push(toAgentExportRow(detail, "", usageByAgentId.get(agent.id)));
@@ -680,17 +704,20 @@ function App() {
   if (!user) {
     return (
       <main className="signed-out">
-        <section className="signin-panel">
+        <section className="signin-panel" aria-labelledby="signin-title">
           <p className="eyebrow">Microsoft 365 Copilot administration</p>
-          <h1>Agent Control</h1>
-          <p>
+          <h1 id="signin-title">Agent Control</h1>
+          <p className="signin-lede">
             Sign in with a work or school account that has delegated access to
-            manage Copilot packages.
+            manage Copilot packages, tenant availability, and agent status.
           </p>
           {error ? <div className="error-banner">{error}</div> : null}
-          <a className="primary-link" href="/auth/login">
-            Sign in with Entra ID
-          </a>
+          <div className="signin-actions">
+            <a className="primary-link signin-button" href="/auth/login">
+              Sign in with Entra ID
+            </a>
+            <span>Delegated admin access required</span>
+          </div>
         </section>
         <AppFooter />
       </main>
@@ -700,9 +727,31 @@ function App() {
   return (
     <main className="app-shell">
       <header className="top-bar">
-        <div>
+        <div className="title-block">
           <p className="eyebrow">Tenant package controls</p>
-          <h1>Copilot agents</h1>
+          <div className="title-row">
+            <h1>Agent Control</h1>
+            <nav className="view-switcher" aria-label="Primary views">
+              <button
+                type="button"
+                className={
+                  activeView === "agents" ? "view-button active" : "view-button"
+                }
+                onClick={() => setActiveView("agents")}
+              >
+                Agent view
+              </button>
+              <button
+                type="button"
+                className={
+                  activeView === "users" ? "view-button active" : "view-button"
+                }
+                onClick={() => setActiveView("users")}
+              >
+                User view
+              </button>
+            </nav>
+          </div>
         </div>
         <div className="user-menu">
           <span>{user.displayName || user.username}</span>
@@ -714,200 +763,228 @@ function App() {
 
       {error ? <div className="error-banner">{error}</div> : null}
 
-      <section className="summary-grid" aria-label="Agent summary">
-        <Metric label="Total" value={agents.length} />
-        <Metric
-          label="Allowed"
-          value={agents.filter((agent) => !agent.isBlocked).length}
-        />
-        <Metric
-          label="Blocked"
-          value={agents.filter((agent) => agent.isBlocked).length}
-        />
-        <Metric
-          label={`Inactive >${inactiveDays}d`}
-          value={inactiveAgentCount}
-        />
-      </section>
-
-      <BulkActions
-        disabled={
-          loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
-        }
-        busyAction={busyBulkAction}
-        progress={bulkProgress}
-        result={bulkResult}
-        selectedCount={selectedAgentIds.size}
-        onBlockAll={() => requestBulkAction(true)}
-        onUnblockAll={() => requestBulkAction(false)}
-      />
-
       <ReportImportPanel
         reports={usageReports}
         status={usageImportStatus}
-        unmatchedReportAgentCount={unmatchedReportAgentCount}
         onImport={(files) => void handleSelectUsageReports(files)}
         onClear={handleClearUsageReports}
       />
 
-      <section className="controls" aria-label="Filters">
-        <label className="filter-search">
-          <span>Search</span>
-          <input
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Name, publisher, ID"
-          />
-        </label>
-        <label>
-          <span>Status</span>
-          <select
-            value={statusFilter}
-            onChange={(event) =>
-              setStatusFilter(
-                event.target.value as "all" | "allowed" | "blocked",
-              )
-            }
-          >
-            <option value="all">All</option>
-            <option value="allowed">Allowed</option>
-            <option value="blocked">Blocked</option>
-          </select>
-        </label>
-        <label>
-          <span>Publisher</span>
-          <select
-            value={publisherFilter}
-            onChange={(event) => setPublisherFilter(event.target.value)}
-          >
-            <option value="all">All publishers</option>
-            {publisherOptions.map((publisher) => (
-              <option key={publisher.value} value={publisher.value}>
-                {publisher.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Available to</span>
-          <select
-            value={availableToFilter}
-            onChange={(event) => setAvailableToFilter(event.target.value)}
-          >
-            <option value="all">All availability</option>
-            {availableToOptions.map((availability) => (
-              <option key={availability.value} value={availability.value}>
-                {availability.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Host</span>
-          <select
-            value={hostFilter}
-            onChange={(event) => setHostFilter(event.target.value)}
-          >
-            <option value="all">All hosts</option>
-            {hostOptions.map((host) => (
-              <option key={host.value} value={host.value}>
-                {host.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Built with</span>
-          <select
-            value={effectivePlatformFilter}
-            onChange={(event) => setPlatformFilter(event.target.value)}
-          >
-            <option value="all">All platforms</option>
-            {platformOptions.map((platform) => (
-              <option key={platform.value} value={platform.value}>
-                {platform.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Usage</span>
-          <select
-            value={usageFilter}
-            onChange={(event) =>
-              setUsageFilter(event.target.value as UsageFilter)
-            }
-          >
-            <option value="all">All usage states</option>
-            <option value="with-usage">Has imported usage</option>
-            <option value="without-usage">No imported usage</option>
-            <option value="recent">Active within threshold</option>
-            <option value="inactive">Inactive beyond threshold</option>
-          </select>
-        </label>
-        <label>
-          <span>Number of days</span>
-          <input
-            type="number"
-            min="1"
-            max="365"
-            value={inactiveDays}
-            onChange={(event) =>
-              setInactiveDays(clampNumber(event.target.value, 1, 365, 30))
-            }
-          />
-        </label>
-        <div className="filter-actions" aria-label="Table actions">
-          <button
-            type="button"
-            className="icon-button control-icon-button"
-            aria-label={loadingAgents ? "Refreshing agents" : "Refresh agents"}
-            title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
-            disabled={loadingAgents}
-            onClick={() => void loadAgents()}
-          >
-            <RefreshIcon />
-          </button>
-          <button
-            type="button"
-            className="secondary icon-button control-icon-button"
-            aria-label={
-              exportingCsv
-                ? `Exporting ${exportProgress} of ${agents.length} agents`
-                : "Export agents CSV"
-            }
-            title={
-              exportingCsv
-                ? `Exporting ${exportProgress}/${agents.length}`
-                : "Export CSV"
-            }
-            disabled={loadingAgents || exportingCsv || agents.length === 0}
-            onClick={() => void handleExportCsv()}
-          >
-            <ExportIcon />
-          </button>
-        </div>
-      </section>
+      {activeView === "agents" ? (
+        <>
+          <section className="summary-grid" aria-label="Agent summary">
+            <Metric
+              label="Total"
+              value={agents.length}
+              filteredValue={
+                hasActiveAgentFilters ? filteredAgents.length : undefined
+              }
+            />
+            <Metric
+              label="Allowed"
+              value={allowedAgentCount}
+              filteredValue={
+                hasActiveAgentFilters ? filteredAllowedAgentCount : undefined
+              }
+            />
+            <Metric
+              label="Blocked"
+              value={blockedAgentCount}
+              filteredValue={
+                hasActiveAgentFilters ? filteredBlockedAgentCount : undefined
+              }
+            />
+            <Metric
+              label={`Inactive >${inactiveDays}d`}
+              value={inactiveAgentCount}
+              filteredValue={
+                hasActiveAgentFilters ? filteredInactiveAgentCount : undefined
+              }
+            />
+          </section>
 
-      {loadingAgents ? (
-        <div className="screen-state">Loading Copilot agents...</div>
+          <BulkActions
+            disabled={
+              loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
+            }
+            busyAction={busyBulkAction}
+            progress={bulkProgress}
+            result={bulkResult}
+            selectedCount={selectedAgentIds.size}
+            onBlockAll={() => requestBulkAction(true)}
+            onUnblockAll={() => requestBulkAction(false)}
+          />
+
+          <section className="controls" aria-label="Filters">
+            <label className="filter-search">
+              <span>Search</span>
+              <input
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Name, publisher, ID"
+              />
+            </label>
+            <label>
+              <span>Status</span>
+              <select
+                value={statusFilter}
+                onChange={(event) =>
+                  setStatusFilter(
+                    event.target.value as "all" | "allowed" | "blocked",
+                  )
+                }
+              >
+                <option value="all">All</option>
+                <option value="allowed">Allowed</option>
+                <option value="blocked">Blocked</option>
+              </select>
+            </label>
+            <label>
+              <span>Publisher</span>
+              <select
+                value={publisherFilter}
+                onChange={(event) => setPublisherFilter(event.target.value)}
+              >
+                <option value="all">All publishers</option>
+                {publisherOptions.map((publisher) => (
+                  <option key={publisher.value} value={publisher.value}>
+                    {publisher.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Available to</span>
+              <select
+                value={availableToFilter}
+                onChange={(event) => setAvailableToFilter(event.target.value)}
+              >
+                <option value="all">All availability</option>
+                {availableToOptions.map((availability) => (
+                  <option key={availability.value} value={availability.value}>
+                    {availability.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Host</span>
+              <select
+                value={hostFilter}
+                onChange={(event) => setHostFilter(event.target.value)}
+              >
+                <option value="all">All hosts</option>
+                {hostOptions.map((host) => (
+                  <option key={host.value} value={host.value}>
+                    {host.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Built with</span>
+              <select
+                value={effectivePlatformFilter}
+                onChange={(event) => setPlatformFilter(event.target.value)}
+              >
+                <option value="all">All platforms</option>
+                {platformOptions.map((platform) => (
+                  <option key={platform.value} value={platform.value}>
+                    {platform.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Usage</span>
+              <select
+                value={usageFilter}
+                onChange={(event) =>
+                  setUsageFilter(event.target.value as UsageFilter)
+                }
+              >
+                <option value="all">All usage states</option>
+                <option value="with-usage">Has imported usage</option>
+                <option value="without-usage">No imported usage</option>
+                <option value="recent">Active within threshold</option>
+                <option value="inactive">Inactive beyond threshold</option>
+              </select>
+            </label>
+            <label>
+              <span>Number of days</span>
+              <input
+                type="number"
+                min="1"
+                max="365"
+                value={inactiveDays}
+                onChange={(event) =>
+                  setInactiveDays(clampNumber(event.target.value, 1, 365, 30))
+                }
+              />
+            </label>
+            <div className="filter-actions" aria-label="Table actions">
+              <button
+                type="button"
+                className="icon-button control-icon-button"
+                aria-label={
+                  loadingAgents ? "Refreshing agents" : "Refresh agents"
+                }
+                title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
+                disabled={loadingAgents}
+                onClick={() => void loadAgents()}
+              >
+                <RefreshIcon />
+              </button>
+              <button
+                type="button"
+                className="secondary icon-button control-icon-button"
+                aria-label={
+                  exportingCsv
+                    ? `Exporting ${exportProgress} of ${exportableAgentCount} filtered agents`
+                    : "Export filtered agents CSV"
+                }
+                title={
+                  exportingCsv
+                    ? `Exporting ${exportProgress}/${exportableAgentCount}`
+                    : "Export filtered CSV"
+                }
+                disabled={
+                  loadingAgents || exportingCsv || exportableAgentCount === 0
+                }
+                onClick={() => void handleExportCsv()}
+              >
+                <ExportIcon />
+              </button>
+            </div>
+          </section>
+
+          {loadingAgents ? (
+            <div className="screen-state">Loading Copilot agents...</div>
+          ) : (
+            <AgentTable
+              agents={filteredAgents}
+              busyAgentId={busyAgentId}
+              selectedIds={selectedAgentIds}
+              selectionDisabled={Boolean(busyBulkAction)}
+              usageByAgentId={usageByAgentId}
+              allVisibleSelected={allVisibleSelected}
+              selectedCount={selectedAgentIds.size}
+              onToggleAgentSelection={toggleAgentSelection}
+              onToggleVisibleSelection={() =>
+                toggleVisibleSelection(filteredAgents)
+              }
+              onViewDetails={(agent) => void handleViewAgentDetails(agent)}
+              onBlock={(agent) => void handleAgentAction(agent, true)}
+              onUnblock={(agent) => void handleAgentAction(agent, false)}
+            />
+          )}
+        </>
       ) : (
-        <AgentTable
-          agents={filteredAgents}
-          busyAgentId={busyAgentId}
-          selectedIds={selectedAgentIds}
-          selectionDisabled={Boolean(busyBulkAction)}
-          usageByAgentId={usageByAgentId}
-          allVisibleSelected={allVisibleSelected}
-          selectedCount={selectedAgentIds.size}
-          onToggleAgentSelection={toggleAgentSelection}
-          onToggleVisibleSelection={() =>
-            toggleVisibleSelection(filteredAgents)
-          }
-          onViewDetails={(agent) => void handleViewAgentDetails(agent)}
-          onBlock={(agent) => void handleAgentAction(agent, true)}
-          onUnblock={(agent) => void handleAgentAction(agent, false)}
+        <UserAccessView
+          agents={agents}
+          inactiveDays={inactiveDays}
+          reports={usageReports}
         />
       )}
 
@@ -1069,11 +1146,29 @@ function formatHostLabel(host: string) {
     .trim();
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({
+  label,
+  value,
+  filteredValue,
+}: {
+  label: string;
+  value: number;
+  filteredValue?: number;
+}) {
+  const isFiltered = filteredValue !== undefined;
+
   return (
     <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
+      <span>{isFiltered ? `${label} / Filtered` : label}</span>
+      <strong>
+        {value.toLocaleString()}
+        {isFiltered ? (
+          <>
+            {" / "}
+            {filteredValue.toLocaleString()}
+          </>
+        ) : null}
+      </strong>
     </div>
   );
 }
@@ -1171,6 +1266,11 @@ function AgentDetailModal({
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
   const connectedServices = extractConnectedServices(agent.elementDetails);
+  const elementDetails = agent.elementDetails ?? [];
+  const elementCount = elementDetails.reduce(
+    (total, detail) => total + detail.elements.length,
+    0,
+  );
   const assignmentCount = allowedSummary.total + acquireSummary.total;
   const statusLabel = agent.isBlocked ? "Blocked" : "Allowed";
   const visibleUserRows = userRows.slice(0, 6);
@@ -1260,178 +1360,169 @@ function AgentDetailModal({
         </div>
 
         <div className="detail-layout">
-          <div className="detail-column">
-            <DetailSection
-              title="Package details"
-              countLabel={`${assignmentCount.toLocaleString()} access assignments`}
-              tone="metadata"
-            >
-              <DetailList
-                items={[
-                  { label: "Publisher", value: agent.publisher },
-                  { label: "Type", value: agent.type },
-                  { label: "Built with", value: getBuiltWithLabel(agent) },
-                  { label: "Version", value: agent.version },
-                  { label: "Manifest", value: agent.manifestVersion },
-                  {
-                    label: "Last modified",
-                    value: formatDate(agent.lastModifiedDateTime),
-                  },
-                  {
-                    label: "Available to",
-                    value: formatDetailLabel(agent.availableTo),
-                  },
-                  {
-                    label: "Sensitivity",
-                    value: formatDetailLabel(agent.sensitivity),
-                  },
-                  {
-                    label: "Hosts",
-                    value: formatList(agent.supportedHosts),
-                  },
-                  { label: "Categories", value: formatList(agent.categories) },
-                  {
-                    label: "Element types",
-                    value: formatList(agent.elementTypes),
-                  },
-                  {
-                    label: "Allowed assignments",
-                    value: formatAccessSummary(allowedSummary),
-                  },
-                  {
-                    label: "Acquire assignments",
-                    value: formatAccessSummary(acquireSummary),
-                  },
-                  {
-                    label: "Detected services",
-                    value: connectedServices.length
-                      ? `${connectedServices.length} detected`
-                      : "None returned",
-                  },
-                  { label: "Package ID", value: agent.id, variant: "code" },
-                  { label: "App ID", value: agent.appId, variant: "code" },
-                  {
-                    label: "Manifest ID",
-                    value: agent.manifestId,
-                    variant: "code",
-                  },
-                  { label: "Asset ID", value: agent.assetId, variant: "code" },
-                ]}
+          <DetailSection
+            title="Package details"
+            countLabel={`${assignmentCount.toLocaleString()} access assignments`}
+            tone="metadata"
+          >
+            <DetailList
+              items={[
+                { label: "Publisher", value: agent.publisher },
+                { label: "Type", value: agent.type },
+                { label: "Built with", value: getBuiltWithLabel(agent) },
+                { label: "Version", value: agent.version },
+                { label: "Manifest", value: agent.manifestVersion },
+                {
+                  label: "Last modified",
+                  value: formatDate(agent.lastModifiedDateTime),
+                },
+                {
+                  label: "Available to",
+                  value: formatDetailLabel(agent.availableTo),
+                },
+                {
+                  label: "Sensitivity",
+                  value: formatDetailLabel(agent.sensitivity),
+                },
+                {
+                  label: "Hosts",
+                  value: formatList(agent.supportedHosts),
+                },
+                { label: "Categories", value: formatList(agent.categories) },
+                {
+                  label: "Element types",
+                  value: formatList(agent.elementTypes),
+                },
+                {
+                  label: "Elements",
+                  value: elementDetails.length
+                    ? `${elementDetails.length} groups, ${elementCount} elements`
+                    : "No element metadata returned",
+                },
+                {
+                  label: "Allowed assignments",
+                  value: formatAccessSummary(allowedSummary),
+                },
+                {
+                  label: "Acquire assignments",
+                  value: formatAccessSummary(acquireSummary),
+                },
+                {
+                  label: "Detected services",
+                  value: connectedServices.length
+                    ? `${connectedServices.length} detected`
+                    : "None returned",
+                },
+                { label: "Package ID", value: agent.id, variant: "code" },
+                { label: "App ID", value: agent.appId, variant: "code" },
+                {
+                  label: "Manifest ID",
+                  value: agent.manifestId,
+                  variant: "code",
+                },
+                { label: "Asset ID", value: agent.assetId, variant: "code" },
+              ]}
+            />
+            {elementDetails.length ? (
+              <ul className="detail-list compact-list package-elements-list">
+                {elementDetails.map((detail) => (
+                  <li key={detail.elementType}>
+                    <span>{formatDetailLabel(detail.elementType)}</span>
+                    <small>{detail.elements.length} elements</small>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <div className="access-grid">
+              <AccessList
+                label="Allowed users and groups"
+                values={agent.allowedUsersAndGroups}
               />
-              <div className="access-grid">
-                <AccessList
-                  label="Allowed users and groups"
-                  values={agent.allowedUsersAndGroups}
-                />
-                <AccessList
-                  label="Acquire users and groups"
-                  values={agent.acquireUsersAndGroups}
-                />
-              </div>
-            </DetailSection>
-          </div>
+              <AccessList
+                label="Acquire users and groups"
+                values={agent.acquireUsersAndGroups}
+              />
+            </div>
+          </DetailSection>
 
-          <div className="detail-column">
-            <DetailSection
-              title="Usage import"
-              countLabel={
-                usage ? formatReportKind(usage.sourceReport) : "No import"
-              }
-              tone="usage"
-            >
-              <div className="detail-grid">
-                <DetailItem
-                  label="Report Agent ID"
-                  value={usage?.agentId}
-                  variant="code"
-                />
-                <DetailItem
-                  label="Report agent name"
-                  value={usage?.agentName}
-                />
-                <DetailItem label="Creator type" value={usage?.creatorType} />
-                <DetailItem
-                  label="Last activity"
-                  value={formatReportDate(usage?.lastActivityDateUtc)}
-                />
-                <DetailItem
-                  label="Licensed users"
-                  value={usage?.activeUsersLicensed.toLocaleString()}
-                />
-                <DetailItem
-                  label="Unlicensed users"
-                  value={usage?.activeUsersUnlicensed.toLocaleString()}
-                />
-              </div>
-            </DetailSection>
+          <DetailSection
+            title="Usage import"
+            countLabel={
+              usage ? formatReportKind(usage.sourceReport) : "No import"
+            }
+            tone="usage"
+          >
+            <div className="detail-grid">
+              <DetailItem
+                label="Report Agent ID"
+                value={usage?.agentId}
+                variant="code"
+              />
+              <DetailItem label="Report agent name" value={usage?.agentName} />
+              <DetailItem label="Creator type" value={usage?.creatorType} />
+              <DetailItem
+                label="Last activity"
+                value={formatReportDate(usage?.lastActivityDateUtc)}
+              />
+              <DetailItem
+                label="Licensed users"
+                value={usage?.activeUsersLicensed.toLocaleString()}
+              />
+              <DetailItem
+                label="Unlicensed users"
+                value={usage?.activeUsersUnlicensed.toLocaleString()}
+              />
+            </div>
+          </DetailSection>
 
-            <DetailSection
-              title="User activity"
-              countLabel={`${userRows.length.toLocaleString()} rows`}
-              tone="activity"
-            >
-              {visibleUserRows.length ? (
-                <ul className="detail-list user-activity-list">
-                  {visibleUserRows.map((row) => (
-                    <li key={`${row.agentId}-${row.username}`}>
-                      <span>{row.username}</span>
-                      <small>
-                        {row.responsesSentToUsers.toLocaleString()} responses,
-                        last activity{" "}
-                        {formatReportDate(row.lastActivityDateUtc) ?? "Unknown"}
-                      </small>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p>No user-agent report rows imported for this package.</p>
-              )}
-              {hiddenUserRows > 0 ? (
-                <p className="detail-overflow-note">
-                  {hiddenUserRows.toLocaleString()} more user rows hidden.
-                </p>
-              ) : null}
-            </DetailSection>
+          <DetailSection
+            title="Connected services"
+            countLabel={`${connectedServices.length} detected`}
+            tone="services"
+          >
+            {connectedServices.length ? (
+              <ul className="detail-list service-list expanded-detail-list">
+                {connectedServices.map((service) => (
+                  <li key={`${service.source}-${service.value}`}>
+                    <span>{service.value}</span>
+                    <small>{service.source}</small>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>
+                No connected service metadata was returned for this package.
+              </p>
+            )}
+          </DetailSection>
 
-            <DetailSection
-              title="Elements"
-              countLabel={`${agent.elementDetails?.length ?? 0} groups`}
-            >
-              {agent.elementDetails?.length ? (
-                <ul className="detail-list compact-list">
-                  {agent.elementDetails.map((detail) => (
-                    <li key={detail.elementType}>
-                      <span>{formatDetailLabel(detail.elementType)}</span>
-                      <small>{detail.elements.length} elements</small>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p>No element metadata was returned for this package.</p>
-              )}
-            </DetailSection>
-
-            <DetailSection
-              title="Connected services"
-              countLabel={`${connectedServices.length} detected`}
-              tone="services"
-            >
-              {connectedServices.length ? (
-                <ul className="detail-list service-list">
-                  {connectedServices.map((service) => (
-                    <li key={`${service.source}-${service.value}`}>
-                      <span>{service.value}</span>
-                      <small>{service.source}</small>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p>
-                  No connected service metadata was returned for this package.
-                </p>
-              )}
-            </DetailSection>
-          </div>
+          <DetailSection
+            title="User activity"
+            countLabel={`${userRows.length.toLocaleString()} rows`}
+            tone="activity"
+          >
+            {visibleUserRows.length ? (
+              <ul className="detail-list user-activity-list expanded-detail-list">
+                {visibleUserRows.map((row) => (
+                  <li key={`${row.agentId}-${row.username}`}>
+                    <span>{row.username}</span>
+                    <small>
+                      {row.responsesSentToUsers.toLocaleString()} responses,
+                      last activity{" "}
+                      {formatReportDate(row.lastActivityDateUtc) ?? "Unknown"}
+                    </small>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>No user-agent report rows imported for this package.</p>
+            )}
+            {hiddenUserRows > 0 ? (
+              <p className="detail-overflow-note">
+                {hiddenUserRows.toLocaleString()} more user rows hidden.
+              </p>
+            ) : null}
+          </DetailSection>
         </div>
       </section>
     </div>
@@ -1441,25 +1532,17 @@ function AgentDetailModal({
 function ReportImportPanel({
   reports,
   status,
-  unmatchedReportAgentCount,
   onImport,
   onClear,
 }: {
   reports: UsageReportsState;
   status?: UsageImportStatus;
-  unmatchedReportAgentCount: number;
   onImport: (files: FileList | null) => void;
   onClear: () => void;
 }) {
-  const importedReports = [reports.agents, reports.userAgents, reports.users]
-    .filter((report): report is ParsedUsageReport => Boolean(report))
-    .map((report) => ({
-      key: report.kind,
-      label: formatReportKind(report.kind),
-      rows: report.rows.length,
-      fileName: report.fileName,
-      periodDays: report.periodDays,
-    }));
+  const hasImportedReports = Boolean(
+    reports.agents || reports.userAgents || reports.users,
+  );
 
   return (
     <section className="report-panel" aria-label="Usage report import">
@@ -1487,34 +1570,13 @@ function ReportImportPanel({
           <button
             type="button"
             className="secondary"
-            disabled={importedReports.length === 0 && !status}
+            disabled={!hasImportedReports && !status}
             onClick={onClear}
           >
             Clear reports
           </button>
         </div>
       </div>
-
-      {importedReports.length ? (
-        <div className="report-summary-grid">
-          {importedReports.map((report) => (
-            <div key={report.key} className="report-summary-card">
-              <span>{report.label}</span>
-              <strong>{report.rows.toLocaleString()} rows</strong>
-              <small>
-                {report.periodDays
-                  ? `${report.periodDays}-day export`
-                  : "CSV import"}
-              </small>
-            </div>
-          ))}
-          <div className="report-summary-card">
-            <span>Unmatched report agents</span>
-            <strong>{unmatchedReportAgentCount.toLocaleString()}</strong>
-            <small>Report rows without a listed package ID</small>
-          </div>
-        </div>
-      ) : null}
 
       {status ? (
         <div className={`report-status ${status.kind}`} aria-live="polite">
@@ -1927,6 +1989,25 @@ function mergeUsageReports(
   }
 
   return next;
+}
+
+function coalesceUsageReportsByKind(
+  reports: ParsedUsageReport[],
+  warnings: string[],
+) {
+  const reportsByKind = new Map<UsageReportKind, ParsedUsageReport>();
+
+  for (const report of reports) {
+    if (reportsByKind.has(report.kind)) {
+      warnings.push(
+        `Multiple ${formatReportKind(report.kind)} reports were selected; using ${report.fileName}.`,
+      );
+    }
+
+    reportsByKind.set(report.kind, report);
+  }
+
+  return [...reportsByKind.values()];
 }
 
 function buildUsageByAgentId(

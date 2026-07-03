@@ -48,23 +48,25 @@ Then open `http://localhost:5173`.
 
 Agent Control works without report files. If no usage reports are imported, the app lists Copilot packages and supports block/unblock exactly as before.
 
-To enrich the package list with last activity, active users, responses sent, creator type, and user drilldown data:
+To enrich the package list and user access view with last activity, active users, responses sent, creator type, and user drilldown data:
 
 1. Go to `https://admin.microsoft.com`.
 2. Open **Reports** > **Usage**.
 3. Select **Microsoft 365 Copilot**.
 4. Open the **Agents** report.
 5. Export these three report tabs for the same period, typically 30 days:
-   - **Agents**: agent-level metrics used for table enrichment and inactive-agent filtering.
-   - **Users & agents**: per-user, per-agent rows shown in agent details.
-   - **Users**: user-level summary rows used for imported report context.
+   - **Agents**: agent-level metrics used for Agent view enrichment and inactive-agent filtering.
+   - **Users & agents**: per-user, per-agent rows used by agent details and User view access history.
+   - **Users**: user-level summary rows used by User view summary metrics.
 6. In Agent Control, use **Import CSVs** and select one, two, or all three exported CSV files.
 
-The **Agents** CSV is the canonical source for agent-level metrics. The **Users & agents** CSV is used for drilldown and as a fallback if the Agents CSV has not been imported. The **Users** CSV is used for user summary context.
+The app has two primary views. **Agent view** lists current Copilot packages from the Graph package API, enriched with imported report data when available. **User view** starts with users, then shows every agent access row found for the selected user in the **Users & agents** CSV. The User view combines the **Users** CSV with bridge-only usernames from the **Users & agents** CSV so a user is not hidden just because they are missing from one export.
+
+The **Agents** CSV is the canonical source for agent-level metrics. The **Users & agents** CSV is used for drilldown, User view access history, and as a fallback if the Agents CSV has not been imported. The **Users** CSV is used for user summary context.
 
 The app matches imported report rows to listed packages by `Agent ID`. Report-only rows that do not match a package are shown as unmatched diagnostics and are not blockable. Package rows without imported report data remain visible and manageable.
 
-The inactive filter uses **Last activity date (UTC)** from the imported report. Active user and response counts belong to the selected report period, so an agent can have `0` responses in a 30-day export while still having a known older last activity date.
+The inactive filter uses **Last activity date (UTC)** from the imported report. Active user and response counts belong to the selected report period, so an agent can have `0` responses in a 30-day export while still having a known older last activity date. User view includes `0`-response **Users & agents** rows as access history by default and separately shows response-producing agent counts.
 
 ## Useful Commands
 
