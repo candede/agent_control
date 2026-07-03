@@ -54,7 +54,7 @@ export function buildUserAccessSummaries(
   }
 
   for (const row of reports.userAgents?.rows ?? []) {
-    if (!row.username) {
+    if (!row.username || !row.agentId) {
       continue;
     }
 

@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { Mail, MailCheck } from "lucide-react";
 import type { CopilotPackage } from "../api/client";
 import { formatBuiltWithLabel } from "../agentDisplay";
 
@@ -21,6 +23,11 @@ type AgentTableUsage = {
   activeUsersTotal: number;
   responsesSentToUsers: number;
   lastActivityDateUtc?: string;
+  userRows: AgentUsageUserRow[];
+};
+
+type AgentUsageUserRow = {
+  username: string;
 };
 
 export function AgentTable({
@@ -156,8 +163,29 @@ export function AgentTable({
 }
 
 function UsageCell({ usage }: { usage?: AgentTableUsage }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+
   if (!usage) {
     return <span className="muted-cell">No import</span>;
+  }
+
+  const userEmails = uniqueUserEmails(usage.userRows);
+
+  async function copyUserEmails() {
+    if (userEmails.length === 0) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(userEmails.join("; "));
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1800);
+    } catch {
+      setCopyState("failed");
+      window.setTimeout(() => setCopyState("idle"), 2400);
+    }
   }
 
   return (
@@ -168,7 +196,20 @@ function UsageCell({ usage }: { usage?: AgentTableUsage }) {
       </div>
       <div>
         <dt>Users</dt>
-        <dd>{formatNumber(usage.activeUsersTotal)}</dd>
+        <dd className="usage-value-with-action">
+          <span>{formatNumber(usage.activeUsersTotal)}</span>
+          {userEmails.length > 0 ? (
+            <button
+              className="icon-button usage-copy-button"
+              type="button"
+              aria-label={copyStateLabel(copyState, userEmails.length)}
+              title={copyStateLabel(copyState, userEmails.length)}
+              onClick={() => void copyUserEmails()}
+            >
+              {copyState === "copied" ? <MailCheck /> : <Mail />}
+            </button>
+          ) : null}
+        </dd>
       </div>
       <div>
         <dt>Resp</dt>
@@ -176,6 +217,26 @@ function UsageCell({ usage }: { usage?: AgentTableUsage }) {
       </div>
     </dl>
   );
+}
+
+function uniqueUserEmails(rows: AgentUsageUserRow[]) {
+  return [
+    ...new Set(
+      rows.map((row) => row.username.trim().toLowerCase()).filter(Boolean),
+    ),
+  ].sort((first, second) => first.localeCompare(second));
+}
+
+function copyStateLabel(state: "idle" | "copied" | "failed", count: number) {
+  if (state === "copied") {
+    return `Copied ${count} user email${count === 1 ? "" : "s"}`;
+  }
+
+  if (state === "failed") {
+    return "Could not copy user emails";
+  }
+
+  return `Copy ${count} user email${count === 1 ? "" : "s"} for Outlook`;
 }
 
 function InfoIcon() {

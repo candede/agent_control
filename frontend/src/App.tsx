@@ -7,6 +7,17 @@ import {
 } from "react";
 import DOMPurify from "dompurify";
 import {
+  Bot,
+  ExternalLink,
+  FileCheck2,
+  FileWarning,
+  Globe2,
+  TriangleAlert,
+  UserRound,
+  UsersRound,
+  type LucideIcon,
+} from "lucide-react";
+import {
   ApiError,
   blockAgent,
   getAgentDetails,
@@ -24,6 +35,7 @@ import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { AgentTable } from "./components/AgentTable";
 import { BulkActions } from "./components/BulkActions";
+import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
 import {
   parseUsageReport,
@@ -67,7 +79,7 @@ type AgentUsageSummary = AgentUsageRow & {
   userRows: UserAgentUsageRow[];
 };
 
-type ActiveView = "agents" | "users";
+type ActiveView = "agents" | "users" | "reports";
 
 const emptyUsageReports = (): UsageReportsState => ({});
 
@@ -106,6 +118,7 @@ function App() {
     useState<UsageImportStatus>();
   const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
   const [inactiveDays, setInactiveDays] = useState(30);
+  const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
   const [activeView, setActiveView] = useState<ActiveView>("agents");
   const deferredQuery = useDeferredValue(query);
 
@@ -123,6 +136,10 @@ function App() {
     const rowsByAgentId = new Map<string, UserAgentUsageRow[]>();
 
     for (const row of usageReports.userAgents?.rows ?? []) {
+      if (!row.agentId) {
+        continue;
+      }
+
       const rows = rowsByAgentId.get(row.agentId) ?? [];
       rows.push(row);
       rowsByAgentId.set(row.agentId, rows);
@@ -733,6 +750,17 @@ function App() {
               >
                 User view
               </button>
+              <button
+                type="button"
+                className={
+                  activeView === "reports"
+                    ? "view-button active"
+                    : "view-button"
+                }
+                onClick={() => setActiveView("reports")}
+              >
+                Reports
+              </button>
             </nav>
           </div>
         </div>
@@ -963,10 +991,18 @@ function App() {
             />
           )}
         </>
-      ) : (
+      ) : activeView === "users" ? (
         <UserAccessView
           agents={agents}
           inactiveDays={inactiveDays}
+          reports={usageReports}
+        />
+      ) : (
+        <ReportingView
+          activityWindowDays={reportActivityWindowDays}
+          agents={agents}
+          inactiveDays={inactiveDays}
+          onActivityWindowDaysChange={setReportActivityWindowDays}
           reports={usageReports}
         />
       )}
@@ -1204,9 +1240,38 @@ function AppFooter() {
         Provided as-is, without warranty of any kind. Use at your own
         discretion.
       </span>
-      <a href="https://candede.com" target="_blank" rel="noreferrer noopener">
-        candede.com
-      </a>
+      <div className="app-footer-meta">
+        <span className="app-footer-credit">
+          <Bot size={15} strokeWidth={2.2} aria-hidden="true" />
+          Developed by{" "}
+          <strong className="app-footer-email">
+            <em>candede@microsoft.com</em>
+          </strong>{" "}
+          on GitHub Copilot
+        </span>
+        <nav className="app-footer-links" aria-label="Creator links">
+          <a
+            className="app-footer-link"
+            href="https://candede.com"
+            target="_blank"
+            rel="noreferrer noopener"
+            aria-label="Open candede.com"
+          >
+            <Globe2 size={15} strokeWidth={2.2} aria-hidden="true" />
+            candede.com
+          </a>
+          <a
+            className="app-footer-link"
+            href="https://www.linkedin.com/in/candede/"
+            target="_blank"
+            rel="noreferrer noopener"
+            aria-label="Open LinkedIn profile"
+          >
+            <ExternalLink size={15} strokeWidth={2.2} aria-hidden="true" />
+            LinkedIn
+          </a>
+        </nav>
+      </div>
     </footer>
   );
 }
@@ -1288,15 +1353,6 @@ function AgentDetailModal({
             <h2 id="agent-detail-title">{agent.displayName}</h2>
           </div>
           <div className="detail-header-actions">
-            <span
-              className={
-                agent.isBlocked
-                  ? "detail-status is-blocked"
-                  : "detail-status is-allowed"
-              }
-            >
-              {statusLabel}
-            </span>
             <button type="button" className="secondary" onClick={onClose}>
               Close
             </button>
@@ -1581,6 +1637,21 @@ function UsageImportReviewModal({
 }) {
   const counts = summarizeParsedUsageReports(pendingImport.reports);
   const importDisabled = pendingImport.reports.length === 0;
+  const summaryItems: Array<{
+    label: string;
+    value: number;
+    icon: LucideIcon;
+    tone: UsageReportKind;
+  }> = [
+    { label: "Agents", value: counts.agents, icon: Bot, tone: "agents" },
+    {
+      label: "Users & agents",
+      value: counts.userAgents,
+      icon: UsersRound,
+      tone: "userAgents",
+    },
+    { label: "Users", value: counts.users, icon: UserRound, tone: "users" },
+  ];
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onCancel}>
@@ -1591,59 +1662,92 @@ function UsageImportReviewModal({
         aria-labelledby="usage-import-title"
         onClick={(event) => event.stopPropagation()}
       >
-        <div>
-          <p className="eyebrow">CSV import</p>
-          <h2 id="usage-import-title">Review usage reports</h2>
+        <div className="usage-import-header">
+          <span className="usage-import-header-icon" aria-hidden="true">
+            <FileCheck2 size={22} strokeWidth={2.2} />
+          </span>
+          <div>
+            <p className="eyebrow">CSV import</p>
+            <h2 id="usage-import-title">Review usage reports</h2>
+          </div>
         </div>
 
-        <p>
+        <p className="usage-import-copy">
           Parsed {pendingImport.totalFiles.toLocaleString()} selected file
           {pendingImport.totalFiles === 1 ? "" : "s"}. Confirm to apply these
           usage metrics to the agent table.
         </p>
 
-        <div className="confirm-summary usage-import-summary">
-          <span>
-            Agents
-            <strong>{counts.agents.toLocaleString()}</strong>
-          </span>
-          <span>
-            Users & agents
-            <strong>{counts.userAgents.toLocaleString()}</strong>
-          </span>
-          <span>
-            Users
-            <strong>{counts.users.toLocaleString()}</strong>
-          </span>
+        <div
+          className="confirm-summary usage-import-summary"
+          aria-label="Parsed report rows"
+        >
+          {summaryItems.map((item) => {
+            const Icon = item.icon;
+
+            return (
+              <span
+                key={item.tone}
+                className={`usage-import-stat ${item.tone}`}
+              >
+                <span className="usage-import-stat-label">
+                  <Icon size={18} strokeWidth={2.15} aria-hidden="true" />
+                  {item.label}
+                </span>
+                <strong>{item.value.toLocaleString()}</strong>
+              </span>
+            );
+          })}
         </div>
 
         {pendingImport.reports.length ? (
-          <section className="detail-section">
+          <section className="detail-section usage-import-section">
             <h3>Recognized reports</h3>
-            <ul className="detail-list">
-              {pendingImport.reports.map((report) => (
-                <li key={`${report.kind}-${report.fileName}`}>
-                  <span>{formatReportKind(report.kind)}</span>
-                  <small>
-                    {report.rows.length.toLocaleString()} rows
-                    {report.periodDays
-                      ? `, ${report.periodDays}-day export`
-                      : ""}
-                  </small>
-                </li>
-              ))}
+            <ul className="detail-list usage-report-list">
+              {pendingImport.reports.map((report) => {
+                const Icon = getUsageReportIcon(report.kind);
+
+                return (
+                  <li
+                    key={`${report.kind}-${report.fileName}`}
+                    className={`usage-report-card ${report.kind}`}
+                  >
+                    <span className="usage-report-icon" aria-hidden="true">
+                      <Icon size={18} strokeWidth={2.15} />
+                    </span>
+                    <span className="usage-report-copy">
+                      <strong>{formatReportKind(report.kind)}</strong>
+                      <small>
+                        {report.rows.length.toLocaleString()} rows
+                        {report.periodDays
+                          ? `, ${report.periodDays}-day export`
+                          : ""}
+                      </small>
+                    </span>
+                    <span className="usage-report-pill">Ready</span>
+                  </li>
+                );
+              })}
             </ul>
           </section>
         ) : null}
 
         {pendingImport.failures.length ? (
-          <section className="detail-section">
+          <section className="detail-section usage-import-section attention">
             <h3>Files that need attention</h3>
-            <ul className="detail-list">
+            <ul className="detail-list usage-attention-list">
               {pendingImport.failures.map((failure) => (
-                <li key={failure.fileName}>
-                  <span>{failure.fileName}</span>
-                  <small>{failure.message}</small>
+                <li
+                  key={failure.fileName}
+                  className="usage-report-card attention"
+                >
+                  <span className="usage-report-icon" aria-hidden="true">
+                    <FileWarning size={18} strokeWidth={2.15} />
+                  </span>
+                  <span className="usage-report-copy">
+                    <strong>{failure.fileName}</strong>
+                    <small>{failure.message}</small>
+                  </span>
                 </li>
               ))}
             </ul>
@@ -1651,12 +1755,17 @@ function UsageImportReviewModal({
         ) : null}
 
         {pendingImport.warnings.length ? (
-          <section className="detail-section">
+          <section className="detail-section usage-import-section warning">
             <h3>Warnings</h3>
-            <ul className="detail-list">
+            <ul className="detail-list usage-attention-list">
               {pendingImport.warnings.slice(0, 6).map((warning) => (
-                <li key={warning}>
-                  <small>{warning}</small>
+                <li key={warning} className="usage-report-card warning">
+                  <span className="usage-report-icon" aria-hidden="true">
+                    <TriangleAlert size={18} strokeWidth={2.15} />
+                  </span>
+                  <span className="usage-report-copy">
+                    <small>{warning}</small>
+                  </span>
                 </li>
               ))}
             </ul>
@@ -2002,6 +2111,10 @@ function buildUsageByAgentId(
 
   if (agentReport) {
     for (const row of agentReport.rows) {
+      if (!row.agentId) {
+        continue;
+      }
+
       usageByAgentId.set(row.agentId, {
         ...row,
         fileName: agentReport.fileName,
@@ -2125,6 +2238,18 @@ function formatReportKind(kind: UsageReportKind) {
   }
 
   return "Users";
+}
+
+function getUsageReportIcon(kind: UsageReportKind): LucideIcon {
+  if (kind === "agents") {
+    return Bot;
+  }
+
+  if (kind === "userAgents") {
+    return UsersRound;
+  }
+
+  return UserRound;
 }
 
 function summarizeParsedUsageReports(reports: ParsedUsageReport[]) {

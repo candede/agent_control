@@ -144,6 +144,11 @@ function parseAgentUsageRow(
   index: number,
   warnings: string[],
 ): AgentUsageRow {
+  const agentId = parseRequiredText(record["agent id"], {
+    field: "Agent ID",
+    index,
+    warnings,
+  });
   const activeUsersLicensed = parseNumber(record["active users (licensed)"], {
     field: "Active users (licensed)",
     index,
@@ -159,7 +164,7 @@ function parseAgentUsageRow(
   );
 
   return {
-    agentId: record["agent id"]?.trim() ?? "",
+    agentId,
     agentName: record["agent name"]?.trim() ?? "",
     creatorType: record["creator type"]?.trim() ?? "",
     activeUsersLicensed,
@@ -184,10 +189,18 @@ function parseUserAgentUsageRow(
   warnings: string[],
 ): UserAgentUsageRow {
   return {
-    agentId: record["agent id"]?.trim() ?? "",
+    agentId: parseRequiredText(record["agent id"], {
+      field: "Agent ID",
+      index,
+      warnings,
+    }),
     agentName: record["agent name"]?.trim() ?? "",
     creatorType: record["creator type"]?.trim() ?? "",
-    username: normalizeUsername(record.username),
+    username: parseRequiredText(record.username, {
+      field: "Username",
+      index,
+      warnings,
+    }).toLowerCase(),
     responsesSentToUsers: parseNumber(record["responses sent to users"], {
       field: "Responses sent to users",
       index,
@@ -207,7 +220,11 @@ function parseUserUsageRow(
   warnings: string[],
 ): UserUsageRow {
   return {
-    username: normalizeUsername(record.username),
+    username: parseRequiredText(record.username, {
+      field: "Username",
+      index,
+      warnings,
+    }).toLowerCase(),
     displayName: record["display name"]?.trim() ?? "",
     numberOfAgentsUsed: parseNumber(record["number of agents used"], {
       field: "Number of agents used",
@@ -309,10 +326,6 @@ function normalizeHeader(value: string) {
     .toLowerCase();
 }
 
-function normalizeUsername(value?: string) {
-  return value?.trim().toLowerCase() ?? "";
-}
-
 function parseNumber(
   value: string | undefined,
   context: { field: string; index: number; warnings: string[] },
@@ -328,6 +341,21 @@ function parseNumber(
       `Row ${context.index + 2} has an invalid ${context.field} value: ${value}.`,
     );
     return 0;
+  }
+
+  return parsed;
+}
+
+function parseRequiredText(
+  value: string | undefined,
+  context: { field: string; index: number; warnings: string[] },
+) {
+  const parsed = value?.trim() ?? "";
+
+  if (!parsed) {
+    context.warnings.push(
+      `Row ${context.index + 2} is missing ${context.field}.`,
+    );
   }
 
   return parsed;
