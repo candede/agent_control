@@ -117,7 +117,7 @@ export function UserAccessView({
               <a
                 href="https://admin.microsoft.com/"
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
               >
                 Microsoft 365 admin center
               </a>{" "}
@@ -251,7 +251,6 @@ function UserSummaryTable({
             <th scope="col">Agents with responses</th>
             <th scope="col">Responses</th>
             <th scope="col">Last activity</th>
-            <th scope="col">Data status</th>
             <th scope="col">Action</th>
           </tr>
         </thead>
@@ -290,9 +289,6 @@ function UserSummaryTable({
                   </div>
                 </td>
                 <td>{formatReportDate(user.latestActivityDateUtc)}</td>
-                <td>
-                  <DataStatus user={user} />
-                </td>
                 <td>
                   <button
                     type="button"
@@ -428,18 +424,6 @@ function UserAgentDetail({
       )}
     </section>
   );
-}
-
-function DataStatus({ user }: { user: UserAccessSummary }) {
-  if (user.missingUserReport) {
-    return <span className="status report-only">Bridge only</span>;
-  }
-
-  if (user.hasReportMismatch) {
-    return <span className="status warning">Check totals</span>;
-  }
-
-  return <span className="status allowed">Matched</span>;
 }
 
 function Metric({ label, value }: { label: string; value: number }) {
