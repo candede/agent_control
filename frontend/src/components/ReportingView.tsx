@@ -61,7 +61,7 @@ export function ReportingView({
   const hasCatalog = summary.catalog.totalAgents > 0;
 
   return (
-    <section className="reporting-view" aria-label="Reporting dashboard">
+    <section className="reporting-view" aria-label="Agent insights dashboard">
       <section
         className="summary-grid report-summary-grid"
         aria-label="Report summary"

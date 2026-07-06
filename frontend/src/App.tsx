@@ -841,7 +841,7 @@ function App() {
                 }
                 onClick={() => setActiveView("reports")}
               >
-                Reports
+                Insights
               </button>
               <button
                 type="button"
