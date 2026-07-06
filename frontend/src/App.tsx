@@ -917,115 +917,148 @@ function App() {
             onUnblockAll={() => requestBulkAction(false)}
           />
 
-          <section className="controls" aria-label="Filters">
-            <label className="filter-search">
-              <span>Search</span>
-              <input
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Name, publisher, ID"
-              />
-            </label>
-            <label>
-              <span>Status</span>
-              <select
-                value={statusFilter}
-                onChange={(event) =>
-                  setStatusFilter(
-                    event.target.value as "all" | "allowed" | "blocked",
-                  )
-                }
-              >
-                <option value="all">All</option>
-                <option value="allowed">Allowed</option>
-                <option value="blocked">Blocked</option>
-              </select>
-            </label>
-            <label>
-              <span>Publisher</span>
-              <select
-                value={publisherFilter}
-                onChange={(event) => setPublisherFilter(event.target.value)}
-              >
-                <option value="all">All publishers</option>
-                {publisherOptions.map((publisher) => (
-                  <option key={publisher.value} value={publisher.value}>
-                    {publisher.label}
+          <section className="controls catalog-controls" aria-label="Filters">
+            <div
+              className="filter-section filter-section-primary"
+              aria-label="Find agents"
+            >
+              <span className="filter-section-title">Find agents</span>
+              <label className="filter-search">
+                <span>Search</span>
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Name, publisher, ID"
+                />
+              </label>
+              <label>
+                <span>Status</span>
+                <select
+                  value={statusFilter}
+                  onChange={(event) =>
+                    setStatusFilter(
+                      event.target.value as "all" | "allowed" | "blocked",
+                    )
+                  }
+                >
+                  <option value="all">All</option>
+                  <option value="allowed">Allowed</option>
+                  <option value="blocked">Blocked</option>
+                </select>
+              </label>
+              <label>
+                <span>Available to</span>
+                <select
+                  value={availableToFilter}
+                  onChange={(event) => setAvailableToFilter(event.target.value)}
+                >
+                  <option value="all">All availability</option>
+                  {availableToOptions.map((availability) => (
+                    <option key={availability.value} value={availability.value}>
+                      {availability.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div
+              className="filter-section filter-section-metadata"
+              aria-label="Catalog details"
+            >
+              <span className="filter-section-title">Catalog details</span>
+              <label>
+                <span>Publisher</span>
+                <select
+                  value={publisherFilter}
+                  onChange={(event) => setPublisherFilter(event.target.value)}
+                >
+                  <option value="all">All publishers</option>
+                  {publisherOptions.map((publisher) => (
+                    <option key={publisher.value} value={publisher.value}>
+                      {publisher.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Host</span>
+                <select
+                  value={hostFilter}
+                  onChange={(event) => setHostFilter(event.target.value)}
+                >
+                  <option value="all">All hosts</option>
+                  {hostOptions.map((host) => (
+                    <option key={host.value} value={host.value}>
+                      {host.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Built with</span>
+                <select
+                  value={effectivePlatformFilter}
+                  onChange={(event) => setPlatformFilter(event.target.value)}
+                >
+                  <option value="all">All platforms</option>
+                  {platformOptions.map((platform) => (
+                    <option key={platform.value} value={platform.value}>
+                      {platform.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div
+              className="filter-section filter-section-usage"
+              aria-label="Usage window"
+            >
+              <span className="filter-section-title">Usage window</span>
+              <label>
+                <span>Usage state</span>
+                <select
+                  value={usageFilter}
+                  onChange={(event) =>
+                    setUsageFilter(event.target.value as UsageFilter)
+                  }
+                >
+                  <option value="all">All usage states</option>
+                  <option value="with-usage">Has imported usage</option>
+                  <option value="without-usage">No imported usage</option>
+                  <option value="recent">
+                    Active in last {inactiveDays} days
                   </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Available to</span>
-              <select
-                value={availableToFilter}
-                onChange={(event) => setAvailableToFilter(event.target.value)}
-              >
-                <option value="all">All availability</option>
-                {availableToOptions.map((availability) => (
-                  <option key={availability.value} value={availability.value}>
-                    {availability.label}
+                  <option value="inactive">
+                    Inactive over {inactiveDays} days
                   </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Host</span>
-              <select
-                value={hostFilter}
-                onChange={(event) => setHostFilter(event.target.value)}
-              >
-                <option value="all">All hosts</option>
-                {hostOptions.map((host) => (
-                  <option key={host.value} value={host.value}>
-                    {host.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Built with</span>
-              <select
-                value={effectivePlatformFilter}
-                onChange={(event) => setPlatformFilter(event.target.value)}
-              >
-                <option value="all">All platforms</option>
-                {platformOptions.map((platform) => (
-                  <option key={platform.value} value={platform.value}>
-                    {platform.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Usage</span>
-              <select
-                value={usageFilter}
-                onChange={(event) =>
-                  setUsageFilter(event.target.value as UsageFilter)
-                }
-              >
-                <option value="all">All usage states</option>
-                <option value="with-usage">Has imported usage</option>
-                <option value="without-usage">No imported usage</option>
-                <option value="recent">Active within threshold</option>
-                <option value="inactive">Inactive beyond threshold</option>
-              </select>
-            </label>
-            <label>
-              <span>Number of days</span>
-              <input
-                type="number"
-                min="1"
-                max="365"
-                value={inactiveDays}
-                onChange={(event) =>
-                  setInactiveDays(clampNumber(event.target.value, 1, 365, 30))
-                }
-              />
-            </label>
-            <div className="filter-actions" aria-label="Table actions">
+                </select>
+              </label>
+              <label className="threshold-filter">
+                <span>Inactive threshold</span>
+                <div className="number-with-unit">
+                  <input
+                    type="number"
+                    min="1"
+                    max="365"
+                    value={inactiveDays}
+                    onChange={(event) =>
+                      setInactiveDays(
+                        clampNumber(event.target.value, 1, 365, 30),
+                      )
+                    }
+                  />
+                  <span>days</span>
+                </div>
+              </label>
+            </div>
+
+            <div
+              className="filter-actions catalog-filter-actions"
+              aria-label="Table actions"
+            >
               <div className="filter-action-buttons">
                 <button
                   type="button"
