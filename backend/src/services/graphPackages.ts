@@ -14,8 +14,8 @@ const graphV1 = "https://graph.microsoft.com/v1.0";
 const graphBeta = "https://graph.microsoft.com/beta";
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
-const bulkWriteConcurrency = 1;
-const bulkWritePauseMs = 750;
+const bulkWriteConcurrency = 4;
+const bulkWritePauseMs = 250;
 const defaultRetryPolicy = {
   maxAttempts: 5,
   baseDelayMs: 2_000,
@@ -31,6 +31,7 @@ export type FetchLike = (
 type RetryPolicy = typeof defaultRetryPolicy;
 
 type BulkSetBlockedStateOptions = {
+  packageIds?: string[];
   writeConcurrency?: number;
   writePauseMs?: number;
   onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
@@ -165,6 +166,12 @@ export async function bulkSetBlockedState(
   options: BulkSetBlockedStateOptions = {},
 ): Promise<BulkActionResult> {
   const packages = await client.listCopilotAgents(accessToken);
+  const requestedIds = options.packageIds
+    ? new Set(options.packageIds)
+    : undefined;
+  const scopedPackages = requestedIds
+    ? packages.filter((agent) => requestedIds.has(agent.id))
+    : packages;
   const results: BulkPackageResult[] = [];
   const writeConcurrency = normalizePositiveInteger(
     options.writeConcurrency,
@@ -178,7 +185,22 @@ export async function bulkSetBlockedState(
 
   const actionable: CopilotPackage[] = [];
 
-  for (const agent of packages) {
+  if (requestedIds) {
+    const packageIds = new Set(packages.map((agent) => agent.id));
+
+    for (const id of requestedIds) {
+      if (!packageIds.has(id)) {
+        await recordSkippedResult({
+          id,
+          displayName: id,
+          status: "failed",
+          message: "Package was not found in the Copilot catalog.",
+        });
+      }
+    }
+  }
+
+  for (const agent of scopedPackages) {
     if (agent.isBlocked === targetBlockedState) {
       await options.onPackageStart?.(agent);
       await recordSkippedResult({
@@ -235,7 +257,7 @@ export async function bulkSetBlockedState(
 
   return {
     targetBlockedState,
-    total: packages.length,
+    total: requestedIds?.size ?? packages.length,
     succeeded: results.filter((result) => result.status === "succeeded").length,
     failed: results.filter((result) => result.status === "failed").length,
     skipped: results.filter((result) => result.status === "skipped").length,

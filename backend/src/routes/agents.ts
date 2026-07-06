@@ -6,6 +6,14 @@ import { AppError } from "../errors.js";
 import { requireSession } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import {
+  completeBulkActionJob,
+  createBulkActionJob,
+  failBulkActionJob,
+  getBulkActionJob,
+  recordBulkActionPackageResult,
+  startBulkActionPackage,
+} from "../services/bulkJobs.js";
+import {
   bulkGetPackageDetails,
   bulkSetBlockedState,
   GraphPackagesClient,
@@ -24,6 +32,7 @@ export const agentsRouter = Router();
 const graphPackages = new GraphPackagesClient();
 const actionGroupHeader = "x-agent-control-action-group-id";
 const detailBatchLimit = 100;
+const bulkActionLimit = 5_000;
 
 agentsRouter.use(requireSession);
 
@@ -61,6 +70,20 @@ agentsRouter.get("/agents/:id", async (request, response, next) => {
   }
 });
 
+agentsRouter.get("/agents/bulk-jobs/:id", (request, response, next) => {
+  try {
+    const job = getBulkActionJob(routeParam(request.params.id));
+
+    if (!job) {
+      throw new AppError(404, "not_found", "Bulk action job was not found.");
+    }
+
+    response.json(job);
+  } catch (error) {
+    next(error);
+  }
+});
+
 agentsRouter.post("/agents/block-all", async (request, response, next) => {
   try {
     const accessToken = await acquireGraphToken(request.session.accountId!);
@@ -68,6 +91,19 @@ agentsRouter.post("/agents/block-all", async (request, response, next) => {
       ...createBulkAuditHooks(request, "block", true),
     });
     response.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+agentsRouter.post("/agents/block", async (request, response, next) => {
+  try {
+    const accessToken = await acquireGraphToken(request.session.accountId!);
+    const ids = parseBulkActionIds(request.body);
+    const job = createBulkActionJob("block", true, ids.length);
+
+    runBulkActionJob(job.id, accessToken, true, ids, request, "block");
+    response.status(202).json(job);
   } catch (error) {
     next(error);
   }
@@ -85,6 +121,19 @@ agentsRouter.post("/agents/unblock-all", async (request, response, next) => {
       },
     );
     response.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+agentsRouter.post("/agents/unblock", async (request, response, next) => {
+  try {
+    const accessToken = await acquireGraphToken(request.session.accountId!);
+    const ids = parseBulkActionIds(request.body);
+    const job = createBulkActionJob("unblock", false, ids.length);
+
+    runBulkActionJob(job.id, accessToken, false, ids, request, "unblock");
+    response.status(202).json(job);
   } catch (error) {
     next(error);
   }
@@ -235,6 +284,61 @@ function parsePackageDetailIds(body: unknown) {
   }
 
   return uniqueIds;
+}
+
+function parseBulkActionIds(body: unknown) {
+  const ids = (body as { ids?: unknown })?.ids;
+
+  if (!Array.isArray(ids)) {
+    throw new AppError(400, "invalid_request", "Expected ids to be an array.");
+  }
+
+  const uniqueIds = [...new Set(ids.map((id) => routeParam(String(id)).trim()))]
+    .filter(Boolean)
+    .slice(0, bulkActionLimit + 1);
+
+  if (uniqueIds.length === 0) {
+    throw new AppError(400, "invalid_request", "At least one id is required.");
+  }
+
+  if (uniqueIds.length > bulkActionLimit) {
+    throw new AppError(
+      400,
+      "invalid_request",
+      `A maximum of ${bulkActionLimit} ids can be requested at once.`,
+    );
+  }
+
+  return uniqueIds;
+}
+
+function runBulkActionJob(
+  jobId: string,
+  accessToken: string,
+  targetBlockedState: boolean,
+  packageIds: string[],
+  request: Request,
+  action: AuditAction,
+) {
+  const auditHooks = createBulkAuditHooks(request, action, targetBlockedState);
+
+  void bulkSetBlockedState(graphPackages, accessToken, targetBlockedState, {
+    packageIds,
+    onPackageStart: async (agent) => {
+      startBulkActionPackage(jobId, agent.displayName);
+      await auditHooks.onPackageStart(agent);
+    },
+    onPackageResult: async (result) => {
+      recordBulkActionPackageResult(jobId, result);
+      await auditHooks.onPackageResult(result);
+    },
+  })
+    .then((result) => {
+      completeBulkActionJob(jobId, result);
+    })
+    .catch((error: unknown) => {
+      failBulkActionJob(jobId, error);
+    });
 }
 
 function completeAuditEvent(

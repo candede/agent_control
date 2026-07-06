@@ -63,6 +63,27 @@ export type BulkActionResult = {
   results: BulkPackageResult[];
 };
 
+export type BulkJobStatus = "queued" | "running" | "completed" | "failed";
+
+export type BulkActionJob = {
+  id: string;
+  action: AuditAction;
+  targetBlockedState: boolean;
+  status: BulkJobStatus;
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  results: BulkPackageResult[];
+  result?: BulkActionResult;
+  currentAgentName?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+};
+
 export type BulkPackageDetailResult =
   | {
       id: string;
@@ -159,6 +180,28 @@ export async function unblockAgent(id: string, context?: AuditRequestContext) {
     method: "POST",
     headers: auditContextHeaders(context),
   });
+}
+
+export async function blockAgents(ids: string[]) {
+  return request<BulkActionJob>("/api/agents/block", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export async function unblockAgents(ids: string[]) {
+  return request<BulkActionJob>("/api/agents/unblock", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export async function getBulkActionJob(id: string) {
+  return request<BulkActionJob>(
+    `/api/agents/bulk-jobs/${encodeURIComponent(id)}`,
+  );
 }
 
 export async function blockAllAgents() {

@@ -1,4 +1,11 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useDeferredValue,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Bot,
   ExternalLink,
@@ -13,13 +20,16 @@ import {
 import {
   ApiError,
   blockAgent,
+  blockAgents,
   getAgentDetails,
   getAgentDetailsBatch,
   getAgents,
+  getBulkActionJob,
   getCurrentUser,
   signOut,
   unblockAgent,
-  type BulkPackageResult,
+  unblockAgents,
+  type BulkActionJob,
   type BulkActionResult,
   type CopilotPackage,
   type CopilotPackageDetail,
@@ -76,6 +86,8 @@ type UsageImportStatus = {
 type ActiveView = "agents" | "users" | "reports" | "audit";
 
 const usageReportsStorageKey = "agent-control:usage-reports:v1";
+const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
+const bulkJobPollIntervalMs = 1_000;
 
 const emptyUsageReports = (): UsageReportsState => ({});
 
@@ -239,8 +251,13 @@ function App() {
   >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
+  const bulkJobPollRequestId = useRef(0);
+  const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
   const stateChangeTimers = useRef(new Map<string, number>());
+  const resumeBulkJob = useEffectEvent((jobId: string) => {
+    void followBulkJob(jobId);
+  });
 
   useEffect(() => {
     void loadSession();
@@ -250,6 +267,21 @@ function App() {
     if (user) {
       void loadAgents();
     }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+
+    const jobId = loadStoredActiveBulkJobId();
+
+    if (!jobId || resumedBulkJobIds.current.has(jobId)) {
+      return;
+    }
+
+    resumedBulkJobIds.current.add(jobId);
+    resumeBulkJob(jobId);
   }, [user]);
 
   useEffect(
@@ -528,6 +560,8 @@ function App() {
     setExportProgressTotal(0);
     agentDetailsCache.current.clear();
     setBulkResult(undefined);
+    clearStoredActiveBulkJobId();
+    bulkJobPollRequestId.current += 1;
     clearStoredUsageReports();
     setUsageReports(emptyUsageReports());
     setPendingUsageImport(undefined);
@@ -785,12 +819,6 @@ function App() {
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
     const { action: label, scope, targetBlockedState } = confirmation;
-    const candidates = scope.filter(
-      (agent) => agent.isBlocked !== targetBlockedState,
-    );
-    const skipped = scope.filter(
-      (agent) => agent.isBlocked === targetBlockedState,
-    );
 
     setBulkConfirmation(undefined);
 
@@ -799,96 +827,88 @@ function App() {
       action: label,
       targetBlockedState,
       total: scope.length,
-      completed: skipped.length,
+      completed: 0,
       succeeded: 0,
       failed: 0,
-      skipped: skipped.length,
+      skipped: 0,
+      currentAgentName: "starting server-side bulk job",
     });
     setError(undefined);
     setBulkResult(undefined);
 
-    const results: BulkPackageResult[] = skipped.map((agent) => ({
-      id: agent.id,
-      displayName: agent.displayName,
-      status: "skipped",
-      message: targetBlockedState ? "Already blocked" : "Already unblocked",
-    }));
-    const actionGroupId = createActionGroupId();
-    let succeeded = 0;
-    let failed = 0;
+    try {
+      const job = targetBlockedState
+        ? await blockAgents(scope.map((agent) => agent.id))
+        : await unblockAgents(scope.map((agent) => agent.id));
+
+      saveStoredActiveBulkJobId(job.id);
+      await followBulkJob(job.id, job);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setBusyBulkAction(undefined);
+      setBulkProgress(undefined);
+      clearStoredActiveBulkJobId();
+    }
+  }
+
+  async function followBulkJob(jobId: string, initialJob?: BulkActionJob) {
+    const requestId = bulkJobPollRequestId.current + 1;
+    bulkJobPollRequestId.current = requestId;
 
     try {
-      for (const [index, agent] of candidates.entries()) {
-        setBulkProgress((current) =>
-          current
-            ? {
-                ...current,
-                currentAgentName: agent.displayName,
-              }
-            : current,
-        );
+      let job = initialJob ?? (await getBulkActionJob(jobId));
 
-        try {
-          if (targetBlockedState) {
-            await blockAgent(agent.id, { actionGroupId });
-          } else {
-            await unblockAgent(agent.id, { actionGroupId });
-          }
+      setBusyBulkAction(job.action);
+      setBulkProgress(toBulkProgress(job));
+      saveStoredActiveBulkJobId(job.id);
 
-          succeeded += 1;
-          results.push({
-            id: agent.id,
-            displayName: agent.displayName,
-            status: "succeeded",
-          });
-          updateCachedAgentBlockedState(agent.id, targetBlockedState);
-        } catch (requestError) {
-          failed += 1;
-          results.push({
-            id: agent.id,
-            displayName: agent.displayName,
-            status: "failed",
-            message: errorMessage(requestError),
-          });
+      while (job.status === "queued" || job.status === "running") {
+        await wait(bulkJobPollIntervalMs);
+
+        if (bulkJobPollRequestId.current !== requestId) {
+          return;
         }
 
-        setBulkProgress((current) =>
-          current
-            ? {
-                ...current,
-                completed: skipped.length + index + 1,
-                succeeded,
-                failed,
-              }
-            : current,
-        );
+        job = await getBulkActionJob(jobId);
 
-        if (index < candidates.length - 1) {
-          await wait(750);
+        if (bulkJobPollRequestId.current !== requestId) {
+          return;
         }
+
+        setBulkProgress(toBulkProgress(job));
       }
 
-      setBulkResult({
-        targetBlockedState,
-        total: scope.length,
-        succeeded,
-        failed,
-        skipped: skipped.length,
-        results,
-      });
-      setSelectedAgentIds(
-        new Set(
-          results
-            .filter((result) => result.status === "failed")
-            .map((result) => result.id),
-        ),
-      );
+      if (job.status === "completed" && job.result) {
+        applyBulkActionResult(job.result);
+      } else {
+        setError(job.error ?? "Bulk action failed before it completed.");
+      }
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
-      setBusyBulkAction(undefined);
-      setBulkProgress(undefined);
+      if (bulkJobPollRequestId.current === requestId) {
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+        clearStoredActiveBulkJobId();
+      }
     }
+  }
+
+  function applyBulkActionResult(result: BulkActionResult) {
+    for (const item of result.results) {
+      if (item.status === "succeeded") {
+        updateCachedAgentBlockedState(item.id, result.targetBlockedState);
+      }
+    }
+
+    setBulkResult(result);
+    setSelectedAgentIds(
+      new Set(
+        result.results
+          .filter((result) => result.status === "failed")
+          .map((result) => result.id),
+      ),
+    );
   }
 
   function updateCachedAgentBlockedState(
@@ -1438,12 +1458,41 @@ type BulkConfirmation = {
   skippedCount: number;
 };
 
+function toBulkProgress(job: BulkActionJob): BulkProgress {
+  return {
+    action: job.action,
+    targetBlockedState: job.targetBlockedState,
+    total: job.total,
+    completed: job.completed,
+    succeeded: job.succeeded,
+    failed: job.failed,
+    skipped: job.skipped,
+    currentAgentName: job.currentAgentName,
+  };
+}
+
 function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-function createActionGroupId() {
-  return window.crypto.randomUUID();
+function loadStoredActiveBulkJobId() {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
+  return window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined;
+}
+
+function saveStoredActiveBulkJobId(jobId: string) {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(activeBulkJobStorageKey, jobId);
+  }
+}
+
+function clearStoredActiveBulkJobId() {
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(activeBulkJobStorageKey);
+  }
 }
 
 function formatHostLabel(host: string) {

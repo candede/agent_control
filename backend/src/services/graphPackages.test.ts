@@ -129,6 +129,40 @@ describe("GraphPackagesClient", () => {
     expect(result.succeeded).toBe(1);
   });
 
+  it("limits bulk writes to selected packages", async () => {
+    const blockedIds: string[] = [];
+
+    class FakeClient extends GraphPackagesClient {
+      override async listCopilotAgents() {
+        return [
+          { id: "P_1", displayName: "Ready", isBlocked: false },
+          { id: "P_2", displayName: "Already blocked", isBlocked: true },
+          { id: "P_3", displayName: "Not selected", isBlocked: false },
+        ];
+      }
+
+      override async blockPackage(_accessToken: string, id: string) {
+        blockedIds.push(id);
+      }
+    }
+
+    const result = await bulkSetBlockedState(new FakeClient(), "token", true, {
+      packageIds: ["P_1", "P_2", "P_missing"],
+      writePauseMs: 0,
+    });
+
+    expect(blockedIds).toEqual(["P_1"]);
+    expect(result.total).toBe(3);
+    expect(result.succeeded).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.results.map((item) => item.id).sort()).toEqual([
+      "P_1",
+      "P_2",
+      "P_missing",
+    ]);
+  });
+
   it("summarizes best-effort bulk detail results", async () => {
     class FakeClient extends GraphPackagesClient {
       override async getPackageDetails(_accessToken: string, id: string) {

@@ -46,8 +46,8 @@ export function BulkActions({
       <div>
         <h2>Tenant-wide controls</h2>
         <p>
-          Select agents in the table, then run a one-at-a-time bulk change with
-          live progress.
+          Select agents in the table, then run a server-side bulk change with
+          throttling-aware retries.
         </p>
         <span className="selected-count">{selectedCount} selected</span>
       </div>
