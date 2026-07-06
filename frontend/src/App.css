@@ -320,11 +320,14 @@
 }
 
 .report-status {
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: 1px solid #c9ddd8;
   border-radius: 8px;
   color: #13493f;
   background: #f1f8f5;
+}
+
+.report-status-message {
   font-weight: 700;
 }
 
@@ -332,6 +335,63 @@
   color: #7c211b;
   border-color: #f0c9bf;
   background: #fff6f2;
+}
+
+.report-status-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.report-status-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.report-source-stamp {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.report-age {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 7px 11px;
+  border: 1px solid rgba(19, 73, 63, 0.22);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 1px 0 rgba(19, 73, 63, 0.08);
+}
+
+.report-age span {
+  color: #284a45;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.report-age strong {
+  color: var(--text-h);
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.3;
+}
+
+.report-age.stale {
+  border-color: rgba(181, 53, 43, 0.28);
+  background: #fff6f2;
+}
+
+.report-age.stale strong {
+  color: var(--danger);
 }
 
 .view-switcher {

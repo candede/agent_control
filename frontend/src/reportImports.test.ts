@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { parseUsageReport } from "./reportImports";
+import {
+  parseUsageReport,
+  parseUsageReportFileTimestamp,
+} from "./reportImports";
 
 const expectedDate = "2026-07-06T00:00:00.000Z";
 
@@ -17,6 +20,23 @@ function csvField(value: string) {
 
 describe("parseUsageReport", () => {
   it.each([
+    [
+      "DeclarativeAgents_Agents_30_2026-07-06T11-49-14.csv",
+      "2026-07-06T11:49:14.000Z",
+    ],
+    [
+      "Microsoft 365 Copilot users and agents usage_30_2026-07-06T00_00_00Z.csv",
+      "2026-07-06T00:00:00.000Z",
+    ],
+  ])("parses supported report filename timestamp %s", (fileName, timestamp) => {
+    expect(parseUsageReportFileTimestamp(fileName)).toBe(timestamp);
+  });
+
+  it("leaves the source timestamp empty when the filename has no report stamp", () => {
+    expect(parseUsageReportFileTimestamp("agents.csv")).toBeUndefined();
+  });
+
+  it.each([
     "Jul 6, 2026",
     "July 6, 2026",
     "6 Jul 2026",
@@ -32,6 +52,7 @@ describe("parseUsageReport", () => {
     );
 
     expect(report.kind).toBe("userAgents");
+    expect(report.sourceGeneratedAt).toBe("2026-07-06T00:00:00.000Z");
     expect(report.warnings).toEqual([]);
     expect(report.rows[0].lastActivityDateUtc).toBe(expectedDate);
   });

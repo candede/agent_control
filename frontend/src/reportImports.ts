@@ -9,6 +9,7 @@ export type BaseUsageReport = {
   kind: UsageReportKind;
   fileName: string;
   importedAt: string;
+  sourceGeneratedAt?: string;
   periodDays?: number;
   warnings: string[];
 };
@@ -100,6 +101,7 @@ export function parseUsageReport(
 ): ParsedUsageReport {
   const table = parseCsv(text);
   const headers = table.headers.map(normalizeHeader);
+  const sourceGeneratedAt = parseUsageReportFileTimestamp(fileName);
   const periodDays = parsePeriodDays(fileName);
   const warnings = [...table.warnings];
 
@@ -108,6 +110,7 @@ export function parseUsageReport(
       kind: "agents",
       fileName,
       importedAt,
+      sourceGeneratedAt,
       periodDays,
       warnings,
       rows: table.records.map((record, index) =>
@@ -121,6 +124,7 @@ export function parseUsageReport(
       kind: "userAgents",
       fileName,
       importedAt,
+      sourceGeneratedAt,
       periodDays,
       warnings,
       rows: table.records.map((record, index) =>
@@ -134,6 +138,7 @@ export function parseUsageReport(
       kind: "users",
       fileName,
       importedAt,
+      sourceGeneratedAt,
       periodDays,
       warnings,
       rows: table.records.map((record, index) =>
@@ -145,6 +150,31 @@ export function parseUsageReport(
   throw new Error(
     `Could not recognize ${fileName}. Expected an Agents, Users & agents, or Users report export.`,
   );
+}
+
+export function parseUsageReportFileTimestamp(fileName: string) {
+  const match = fileName.match(
+    /(?:^|_)(\d{4})-(\d{2})-(\d{2})T(\d{2})[-_:](\d{2})[-_:](\d{2})(?:Z)?(?=\.csv$|[^0-9]|$)/i,
+  );
+
+  if (!match) {
+    return undefined;
+  }
+
+  const [, year, month, day, hour, minute, second] = match.map(Number);
+
+  if (
+    !isValidUtcDate(year, month - 1, day) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return undefined;
+  }
+
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second),
+  ).toISOString();
 }
 
 function parseAgentUsageRow(

@@ -51,6 +51,7 @@ import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
 import {
   parseUsageReport,
+  parseUsageReportFileTimestamp,
   type AgentUsageSummary,
   type AgentUsageReport,
   type ParsedUsageReport,
@@ -1716,6 +1717,9 @@ function ReportImportPanel({
   const hasImportedReports = Boolean(
     reports.agents || reports.userAgents || reports.users,
   );
+  const reportTiming = summarizeUsageReportTiming(reports);
+  const now = new Date();
+  const reportSourceAge = getReportSourceAgeDetails(reportTiming, now);
 
   return (
     <section className="report-panel" aria-label="Usage report import">
@@ -1754,9 +1758,32 @@ function ReportImportPanel({
         </div>
       </div>
 
-      {status ? (
-        <div className={`report-status ${status.kind}`} aria-live="polite">
-          {status.message}
+      {status || hasImportedReports ? (
+        <div
+          className={`report-status ${status?.kind ?? "success"}`}
+          aria-live="polite"
+        >
+          <div className="report-status-row">
+            <div className="report-status-copy">
+              {status ? (
+                <span className="report-status-message">{status.message}</span>
+              ) : null}
+              {hasImportedReports && reportSourceAge.sourceStamp ? (
+                <span className="report-source-stamp">
+                  Latest source stamp: {reportSourceAge.sourceStamp}
+                </span>
+              ) : null}
+            </div>
+            {hasImportedReports ? (
+              <div
+                className={`report-age${reportSourceAge.isStale ? " stale" : ""}`}
+                aria-label="Usage report age"
+              >
+                <span>Report age</span>
+                <strong>{reportSourceAge.value}</strong>
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
     </section>
@@ -2145,6 +2172,103 @@ function summarizeUsageReportsState(reports: UsageReportsState) {
     userAgents: reports.userAgents?.rows.length ?? 0,
     users: reports.users?.rows.length ?? 0,
   } satisfies Record<UsageReportKind, number>;
+}
+
+function summarizeUsageReportTiming(reports: UsageReportsState) {
+  const reportList = [reports.agents, reports.userAgents, reports.users].filter(
+    (report): report is ParsedUsageReport => Boolean(report),
+  );
+  const sourceGeneratedAtValues = reportList
+    .map(
+      (report) =>
+        report.sourceGeneratedAt ??
+        parseUsageReportFileTimestamp(report.fileName),
+    )
+    .filter(isValidDateString);
+
+  return {
+    newestSourceGeneratedAt: latestTimestamp(sourceGeneratedAtValues),
+    oldestSourceGeneratedAt: earliestTimestamp(sourceGeneratedAtValues),
+    sourceGeneratedAtCount: sourceGeneratedAtValues.length,
+    reportCount: reportList.length,
+  };
+}
+
+function latestTimestamp(values: string[]) {
+  return values.sort(
+    (first, second) => Date.parse(second) - Date.parse(first),
+  )[0];
+}
+
+function earliestTimestamp(values: string[]) {
+  return values.sort(
+    (first, second) => Date.parse(first) - Date.parse(second),
+  )[0];
+}
+
+function isValidDateString(value: string | undefined): value is string {
+  return Boolean(value && Number.isFinite(Date.parse(value)));
+}
+
+function getReportSourceAgeDetails(
+  timing: ReturnType<typeof summarizeUsageReportTiming>,
+  now: Date,
+) {
+  if (!timing.newestSourceGeneratedAt) {
+    return {
+      value: "Unavailable",
+      sourceStamp: "No filename timestamp detected.",
+      isStale: false,
+    };
+  }
+
+  const newestAge = formatAgeInHours(timing.newestSourceGeneratedAt, now);
+  const oldestAge = timing.oldestSourceGeneratedAt
+    ? formatAgeInHours(timing.oldestSourceGeneratedAt, now)
+    : newestAge;
+  const ageLabel =
+    timing.oldestSourceGeneratedAt &&
+    timing.oldestSourceGeneratedAt !== timing.newestSourceGeneratedAt &&
+    oldestAge !== newestAge
+      ? `${newestAge} to ${oldestAge}`
+      : newestAge;
+  const missingStampCount = timing.reportCount - timing.sourceGeneratedAtCount;
+  const oldestSourceAgeMs = timing.oldestSourceGeneratedAt
+    ? now.getTime() - Date.parse(timing.oldestSourceGeneratedAt)
+    : 0;
+
+  return {
+    value: `${ageLabel} old`,
+    sourceStamp: `${formatUtcDateTime(timing.newestSourceGeneratedAt)}${
+      missingStampCount > 0
+        ? `; ${missingStampCount} report${missingStampCount === 1 ? "" : "s"} without a filename timestamp`
+        : ""
+    }`,
+    isStale: oldestSourceAgeMs > 86_400_000,
+  };
+}
+
+function formatAgeInHours(value: string, now: Date) {
+  const elapsedMs = Math.max(0, now.getTime() - Date.parse(value));
+  const elapsedHours = Math.floor(elapsedMs / 3_600_000);
+
+  if (elapsedHours < 1) {
+    return "less than 1 hour";
+  }
+
+  return `${elapsedHours.toLocaleString()} hour${elapsedHours === 1 ? "" : "s"}`;
+}
+
+function formatUtcDateTime(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).format(new Date(value));
 }
 
 function formatImportRowSummary(counts: Record<UsageReportKind, number>) {
