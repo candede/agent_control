@@ -24,6 +24,7 @@ import {
   getAgentDetails,
   getAgentDetailsBatch,
   getAgents,
+  getAuditEvents,
   getBulkActionJob,
   getCurrentUser,
   signOut,
@@ -43,6 +44,7 @@ import {
 } from "./agentExport";
 import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
+import { parseBulkRefSearch } from "./bulkRefSearch";
 import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AgentTable } from "./components/AgentTable";
 import { AuditLogView } from "./components/AuditLogView";
@@ -85,6 +87,12 @@ type UsageImportStatus = {
 };
 
 type ActiveView = "agents" | "users" | "reports" | "audit";
+
+type BulkRefSearchState = {
+  ref: string;
+  agentIds: Set<string>;
+  error?: string;
+};
 
 const usageReportsStorageKey = "agent-control:usage-reports:v1";
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
@@ -253,12 +261,14 @@ function App() {
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
   const bulkJobPollRequestId = useRef(0);
+  const bulkRefSearchRequestId = useRef(0);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
   const stateChangeTimers = useRef(new Map<string, number>());
   const resumeBulkJob = useEffectEvent((jobId: string) => {
     void followBulkJob(jobId);
   });
+  const [bulkRefSearch, setBulkRefSearch] = useState<BulkRefSearchState>();
 
   useEffect(() => {
     void loadSession();
@@ -408,6 +418,47 @@ function App() {
       ? platformFilter
       : "all";
 
+  const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
+
+  useEffect(() => {
+    const requestId = ++bulkRefSearchRequestId.current;
+
+    if (!normalizedBulkRefQuery) {
+      return;
+    }
+
+    getAuditEvents({
+      limit: 5_000,
+      scope: "bulk",
+      operationIdPrefix: normalizedBulkRefQuery,
+    })
+      .then((response) => {
+        if (requestId !== bulkRefSearchRequestId.current) {
+          return;
+        }
+
+        setBulkRefSearch({
+          ref: normalizedBulkRefQuery,
+          agentIds: new Set(response.value.map((event) => event.agentId)),
+        });
+      })
+      .catch((requestError: unknown) => {
+        if (requestId !== bulkRefSearchRequestId.current) {
+          return;
+        }
+
+        setBulkRefSearch({
+          ref: normalizedBulkRefQuery,
+          agentIds: new Set(),
+          error: errorMessage(requestError),
+        });
+      });
+  }, [normalizedBulkRefQuery]);
+
+  const loadingBulkRefSearch = Boolean(
+    normalizedBulkRefQuery && bulkRefSearch?.ref !== normalizedBulkRefQuery,
+  );
+
   const filteredAgents = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLowerCase();
 
@@ -431,6 +482,10 @@ function App() {
         getBuiltWithFilterValue(agent) === effectivePlatformFilter;
       const usage = usageByAgentId.get(agent.id);
       const matchesUsage = matchesUsageFilter(usage, usageFilter, inactiveDays);
+      const matchesBulkRef = normalizedBulkRefQuery
+        ? bulkRefSearch?.ref === normalizedBulkRefQuery &&
+          bulkRefSearch.agentIds.has(agent.id)
+        : true;
 
       const searchableText = [
         agent.displayName,
@@ -456,12 +511,16 @@ function App() {
         matchesHost &&
         matchesPlatform &&
         matchesUsage &&
-        (!normalizedQuery || searchableText.includes(normalizedQuery))
+        matchesBulkRef &&
+        (normalizedBulkRefQuery ||
+          !normalizedQuery ||
+          searchableText.includes(normalizedQuery))
       );
     });
   }, [
     agents,
     availableToFilter,
+    bulkRefSearch,
     deferredQuery,
     effectivePlatformFilter,
     hostFilter,
@@ -470,6 +529,7 @@ function App() {
     statusFilter,
     usageByAgentId,
     usageFilter,
+    normalizedBulkRefQuery,
   ]);
 
   const selectedAgents = useMemo(
@@ -567,6 +627,16 @@ function App() {
     setUsageReports(emptyUsageReports());
     setPendingUsageImport(undefined);
     setUsageImportStatus(undefined);
+  }
+
+  function handleSearchQueryChange(nextQuery: string) {
+    const nextRef = parseBulkRefSearch(nextQuery);
+
+    setQuery(nextQuery);
+
+    if (bulkRefSearch && bulkRefSearch.ref !== nextRef) {
+      setBulkRefSearch(undefined);
+    }
   }
 
   async function handleSelectUsageReports(files: FileList | null) {
@@ -1157,8 +1227,10 @@ function App() {
                 <input
                   type="search"
                   value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Name, publisher, ID"
+                  onChange={(event) =>
+                    handleSearchQueryChange(event.target.value)
+                  }
+                  placeholder="Name, publisher, ID, ref"
                 />
               </label>
               <label>
@@ -1331,6 +1403,15 @@ function App() {
               </span>
             </div>
           </section>
+
+          {loadingBulkRefSearch ? (
+            <div className="screen-state compact-state">
+              Resolving bulk ref {normalizedBulkRefQuery}...
+            </div>
+          ) : null}
+          {normalizedBulkRefQuery && bulkRefSearch?.error ? (
+            <div className="error-banner">{bulkRefSearch.error}</div>
+          ) : null}
 
           {loadingAgents ? (
             <div className="screen-state">Loading Copilot agents...</div>

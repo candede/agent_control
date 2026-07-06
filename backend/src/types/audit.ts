@@ -50,6 +50,8 @@ export type ListAuditEventsQuery = {
   limit?: number;
   agentId?: string;
   actorUsername?: string;
+  scope?: AuditScope;
   action?: AuditAction;
   status?: AuditStatus;
+  operationIdPrefix?: string;
 };

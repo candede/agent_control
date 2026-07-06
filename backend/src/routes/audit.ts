@@ -2,7 +2,7 @@ import { Router } from "express";
 import { AppError } from "../errors.js";
 import { requireSession } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
-import type { AuditAction, AuditStatus } from "../types/audit.js";
+import type { AuditAction, AuditScope, AuditStatus } from "../types/audit.js";
 
 export const auditRouter = Router();
 
@@ -13,6 +13,7 @@ const auditStatuses = new Set<AuditStatus>([
   "failed",
   "skipped",
 ]);
+const auditScopes = new Set<AuditScope>(["single", "bulk"]);
 
 auditRouter.use(requireSession);
 
@@ -38,8 +39,12 @@ export function parseAuditEventsQuery(query: Record<string, unknown>) {
     limit: parseLimit(firstQueryValue(query.limit)),
     agentId: firstQueryValue(query.agentId),
     actorUsername: firstQueryValue(query.actorUsername),
+    scope: parseScope(firstQueryValue(query.scope)),
     action: parseAction(firstQueryValue(query.action)),
     status: parseStatus(firstQueryValue(query.status)),
+    operationIdPrefix: parseOperationIdPrefix(
+      firstQueryValue(query.operationIdPrefix),
+    ),
   };
 }
 
@@ -81,6 +86,18 @@ function parseAction(value: string | undefined) {
   return value as AuditAction;
 }
 
+function parseScope(value: string | undefined) {
+  if (!value) {
+    return undefined;
+  }
+
+  if (!auditScopes.has(value as AuditScope)) {
+    throw new AppError(400, "invalid_audit_scope", "Audit scope is invalid.");
+  }
+
+  return value as AuditScope;
+}
+
 function parseStatus(value: string | undefined) {
   if (!value) {
     return undefined;
@@ -91,4 +108,22 @@ function parseStatus(value: string | undefined) {
   }
 
   return value as AuditStatus;
+}
+
+function parseOperationIdPrefix(value: string | undefined) {
+  const normalized = value?.trim();
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.length > 64 || !/^[a-zA-Z0-9-]+$/.test(normalized)) {
+    throw new AppError(
+      400,
+      "invalid_operation_id_prefix",
+      "Operation ID prefix is invalid.",
+    );
+  }
+
+  return normalized;
 }

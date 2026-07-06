@@ -320,7 +320,12 @@ function runBulkActionJob(
   request: Request,
   action: AuditAction,
 ) {
-  const auditHooks = createBulkAuditHooks(request, action, targetBlockedState);
+  const auditHooks = createBulkAuditHooks(
+    request,
+    action,
+    targetBlockedState,
+    jobId,
+  );
 
   void bulkSetBlockedState(graphPackages, accessToken, targetBlockedState, {
     packageIds,
@@ -360,9 +365,9 @@ function createBulkAuditHooks(
   request: Request,
   action: AuditAction,
   targetBlockedState: boolean,
+  operationId: string = randomUUID(),
 ) {
   const auditLog = getAuditLog();
-  const operationId = randomUUID();
   const auditEvents = new Map<string, AuditEvent>();
 
   return {

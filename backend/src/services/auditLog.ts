@@ -11,7 +11,7 @@ import type {
 } from "../types/audit.js";
 
 const defaultListLimit = 100;
-const maxListLimit = 500;
+const maxListLimit = 5_000;
 
 type AuditEventRow = {
   id: string;
@@ -147,6 +147,16 @@ export class AuditLog {
       values.push(query.actorUsername);
     }
 
+    if (query.scope) {
+      clauses.push("scope = ?");
+      values.push(query.scope);
+    }
+
+    if (query.operationIdPrefix) {
+      clauses.push("operation_id LIKE ? ESCAPE '\\'");
+      values.push(`${escapeLikePrefix(query.operationIdPrefix)}%`);
+    }
+
     if (query.action) {
       clauses.push("action = ?");
       values.push(query.action);
@@ -246,6 +256,13 @@ function parseMetadata(metadataJson: string | null) {
   } catch {
     return { raw: metadataJson };
   }
+}
+
+function escapeLikePrefix(value: string) {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("%", "\\%")
+    .replaceAll("_", "\\_");
 }
 
 function toAuditEvent(row: AuditEventRow): AuditEvent {

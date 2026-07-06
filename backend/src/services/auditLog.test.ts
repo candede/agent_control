@@ -95,6 +95,90 @@ describe("AuditLog", () => {
     });
   });
 
+  it("filters bulk audit events by operation id prefix", () => {
+    const auditLog = createAuditLog();
+
+    auditLog.startEvent({
+      operationId: "a5331a93-1111-4222-8333-111111111111",
+      scope: "bulk",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:00:00.000Z",
+      requestPath: "/api/agents/block",
+    });
+    auditLog.startEvent({
+      operationId: "a5331a93-1111-4222-8333-111111111111",
+      scope: "bulk",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-2",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:01:00.000Z",
+      requestPath: "/api/agents/block",
+    });
+    auditLog.startEvent({
+      operationId: "b6442b04-1111-4222-8333-111111111111",
+      scope: "bulk",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-3",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:02:00.000Z",
+      requestPath: "/api/agents/block",
+    });
+    auditLog.startEvent({
+      operationId: "a5331a93-1111-4222-8333-111111111111",
+      scope: "single",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-4",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:03:00.000Z",
+      requestPath: "/api/agents/agent-4/block",
+    });
+
+    const events = auditLog.listEvents({
+      scope: "bulk",
+      operationIdPrefix: "a5331a93",
+    });
+
+    expect(events.map((event) => event.agentId)).toEqual([
+      "agent-2",
+      "agent-1",
+    ]);
+  });
+
+  it("treats operation id prefix wildcards as literal characters", () => {
+    const auditLog = createAuditLog();
+
+    auditLog.startEvent({
+      operationId: "batch_100",
+      scope: "bulk",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:00:00.000Z",
+      requestPath: "/api/agents/block",
+    });
+    auditLog.startEvent({
+      operationId: "batchA100",
+      scope: "bulk",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-2",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:01:00.000Z",
+      requestPath: "/api/agents/block",
+    });
+
+    const events = auditLog.listEvents({ operationIdPrefix: "batch_" });
+
+    expect(events.map((event) => event.agentId)).toEqual(["agent-1"]);
+  });
+
   it("rejects completion for an unknown audit event", () => {
     const auditLog = createAuditLog();
 

@@ -9,15 +9,19 @@ describe("parseAuditEventsQuery", () => {
         limit: "25",
         agentId: "agent-1",
         actorUsername: "admin@example.com",
+        scope: "bulk",
         action: "block",
         status: "failed",
+        operationIdPrefix: "a5331a93",
       }),
     ).toEqual({
       limit: 25,
       agentId: "agent-1",
       actorUsername: "admin@example.com",
+      scope: "bulk",
       action: "block",
       status: "failed",
+      operationIdPrefix: "a5331a93",
     });
   });
 
@@ -27,8 +31,15 @@ describe("parseAuditEventsQuery", () => {
     expect(() => parseAuditEventsQuery({ limit: "0" })).toThrow(AppError);
   });
 
-  it("rejects unsupported actions and statuses", () => {
+  it("rejects unsupported actions, statuses, and scopes", () => {
     expect(() => parseAuditEventsQuery({ action: "delete" })).toThrow(AppError);
     expect(() => parseAuditEventsQuery({ status: "done" })).toThrow(AppError);
+    expect(() => parseAuditEventsQuery({ scope: "team" })).toThrow(AppError);
+  });
+
+  it("rejects invalid operation id prefixes", () => {
+    expect(() =>
+      parseAuditEventsQuery({ operationIdPrefix: "a5331a93%" }),
+    ).toThrow(AppError);
   });
 });

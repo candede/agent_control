@@ -105,12 +105,14 @@ export type BulkPackageDetailsResult = {
 
 export type AuditAction = "block" | "unblock";
 
+export type AuditScope = "single" | "bulk";
+
 export type AuditStatus = "started" | "succeeded" | "failed" | "skipped";
 
 export type AuditEvent = {
   id: string;
   operationId: string;
-  scope: "single" | "bulk";
+  scope: AuditScope;
   action: AuditAction;
   targetBlockedState: boolean;
   agentId: string;
@@ -129,8 +131,10 @@ export type AuditEventsQuery = {
   limit?: number;
   agentId?: string;
   actorUsername?: string;
+  scope?: AuditScope;
   action?: AuditAction;
   status?: AuditStatus;
+  operationIdPrefix?: string;
 };
 
 export type AuditRequestContext = {
@@ -229,12 +233,20 @@ export async function getAuditEvents(query: AuditEventsQuery = {}) {
     searchParams.set("actorUsername", query.actorUsername);
   }
 
+  if (query.scope) {
+    searchParams.set("scope", query.scope);
+  }
+
   if (query.action) {
     searchParams.set("action", query.action);
   }
 
   if (query.status) {
     searchParams.set("status", query.status);
+  }
+
+  if (query.operationIdPrefix) {
+    searchParams.set("operationIdPrefix", query.operationIdPrefix);
   }
 
   const queryString = searchParams.toString();
