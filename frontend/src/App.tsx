@@ -216,8 +216,18 @@ function App() {
       availability.set(value, label);
     }
 
+    if ([...availability.keys()].some(isAvailableToSomeOrAllValue)) {
+      availability.set(someOrAllAvailableToValue, "allowed For Some or All");
+    }
+
     return [...availability]
-      .map(([value, label]) => ({ value, label }))
+      .map(([value, label]) => ({
+        value:
+          value === someOrAllAvailableToValue
+            ? value
+            : encodeAvailableToFilterValue(value),
+        label,
+      }))
       .sort((first, second) => first.label.localeCompare(second.label));
   }, [agents]);
 
@@ -256,10 +266,10 @@ function App() {
         publisherFilter === "all" ||
         agent.publisher === publisherFilter ||
         (!agent.publisher && publisherFilter === unknownPublisherValue);
-      const matchesAvailability =
-        availableToFilter === "all" ||
-        agent.availableTo === availableToFilter ||
-        (!agent.availableTo && availableToFilter === unknownAvailableToValue);
+      const matchesAvailability = matchesAvailableToFilter(
+        agent.availableTo,
+        availableToFilter,
+      );
       const matchesHost =
         hostFilter === "all" || agent.supportedHosts?.includes(hostFilter);
       const matchesPlatform =
@@ -1185,6 +1195,12 @@ function App() {
 
 const unknownPublisherValue = "__unknown__";
 const unknownAvailableToValue = "__unknown__";
+const someOrAllAvailableToValue = "__some_or_all__";
+const availableToFilterValuePrefix = "available:";
+const someOrAllAvailableToNormalizedValues = new Set([
+  "allowedforall",
+  "allowedforsome",
+]);
 
 type UsageFilter =
   | "all"
@@ -1225,6 +1241,44 @@ function formatHostLabel(host: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
+}
+
+function matchesAvailableToFilter(value: string | undefined, filter: string) {
+  if (filter === "all") {
+    return true;
+  }
+
+  if (filter === someOrAllAvailableToValue) {
+    return isAvailableToSomeOrAllValue(value);
+  }
+
+  const expectedValue = decodeAvailableToFilterValue(filter);
+  return (
+    value === expectedValue ||
+    (!value && expectedValue === unknownAvailableToValue)
+  );
+}
+
+function encodeAvailableToFilterValue(value: string) {
+  return `${availableToFilterValuePrefix}${value}`;
+}
+
+function decodeAvailableToFilterValue(value: string) {
+  return value.startsWith(availableToFilterValuePrefix)
+    ? value.slice(availableToFilterValuePrefix.length)
+    : value;
+}
+
+function isAvailableToSomeOrAllValue(value: string | undefined) {
+  if (!value) {
+    return false;
+  }
+
+  return someOrAllAvailableToNormalizedValues.has(normalizeFilterValue(value));
+}
+
+function normalizeFilterValue(value: string) {
+  return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
 function formatRefreshTime(date: Date) {
