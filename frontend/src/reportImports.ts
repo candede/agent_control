@@ -377,27 +377,65 @@ function parseReportDate(
     return undefined;
   }
 
-  const match = value.trim().match(/^([A-Za-z]{3,})\s+(\d{1,2}),\s*(\d{4})$/);
+  const parsed = parseReportDateParts(value);
 
-  if (!match) {
+  if (!parsed || !isValidUtcDate(parsed.year, parsed.month, parsed.day)) {
     context.warnings.push(
       `Row ${context.index + 2} has an invalid ${context.field} value: ${value}.`,
     );
     return undefined;
   }
 
-  const month = monthIndex(match[1]);
-  const day = Number(match[2]);
-  const year = Number(match[3]);
+  return new Date(
+    Date.UTC(parsed.year, parsed.month, parsed.day),
+  ).toISOString();
+}
 
-  if (month === -1 || !isValidUtcDate(year, month, day)) {
-    context.warnings.push(
-      `Row ${context.index + 2} has an invalid ${context.field} value: ${value}.`,
-    );
-    return undefined;
+function parseReportDateParts(value: string) {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  const monthFirstMatch = normalized.match(
+    /^([A-Za-z]{3,})\.?\s+(\d{1,2}),?\s*(\d{4})$/,
+  );
+
+  if (monthFirstMatch) {
+    const month = monthIndex(monthFirstMatch[1]);
+
+    return month === -1
+      ? undefined
+      : {
+          year: Number(monthFirstMatch[3]),
+          month,
+          day: Number(monthFirstMatch[2]),
+        };
   }
 
-  return new Date(Date.UTC(year, month, day)).toISOString();
+  const dayFirstMatch = normalized.match(
+    /^(\d{1,2})\s+([A-Za-z]{3,})\.?[,]?\s*(\d{4})$/,
+  );
+
+  if (dayFirstMatch) {
+    const month = monthIndex(dayFirstMatch[2]);
+
+    return month === -1
+      ? undefined
+      : {
+          year: Number(dayFirstMatch[3]),
+          month,
+          day: Number(dayFirstMatch[1]),
+        };
+  }
+
+  const isoLikeMatch = normalized.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+
+  if (isoLikeMatch) {
+    return {
+      year: Number(isoLikeMatch[1]),
+      month: Number(isoLikeMatch[2]) - 1,
+      day: Number(isoLikeMatch[3]),
+    };
+  }
+
+  return undefined;
 }
 
 function isValidUtcDate(year: number, month: number, day: number) {
