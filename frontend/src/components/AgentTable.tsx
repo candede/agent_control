@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Mail, MailCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Info, Mail, MailCheck } from "lucide-react";
 import type { CopilotPackage } from "../api/client";
 import { formatBuiltWithLabel } from "../agentDisplay";
 
@@ -143,7 +143,7 @@ export function AgentTable({
                       disabled={selectionDisabled}
                       onClick={() => onViewDetails(agent)}
                     >
-                      <InfoIcon />
+                      <Info aria-hidden="true" />
                     </button>
                     {agent.isBlocked ? (
                       <button
@@ -178,6 +178,16 @@ function UsageCell({ usage }: { usage?: AgentTableUsage }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
     "idle",
   );
+  const resetTimerId = useRef<number | undefined>(undefined);
+
+  useEffect(
+    () => () => {
+      if (resetTimerId.current) {
+        window.clearTimeout(resetTimerId.current);
+      }
+    },
+    [],
+  );
 
   if (!usage) {
     return <span className="muted-cell">No import</span>;
@@ -192,12 +202,25 @@ function UsageCell({ usage }: { usage?: AgentTableUsage }) {
 
     try {
       await navigator.clipboard.writeText(userEmails.join("; "));
-      setCopyState("copied");
-      window.setTimeout(() => setCopyState("idle"), 1800);
+      scheduleCopyStateReset("copied", 1800);
     } catch {
-      setCopyState("failed");
-      window.setTimeout(() => setCopyState("idle"), 2400);
+      scheduleCopyStateReset("failed", 2400);
     }
+  }
+
+  function scheduleCopyStateReset(
+    nextState: "copied" | "failed",
+    timeoutMs: number,
+  ) {
+    if (resetTimerId.current) {
+      window.clearTimeout(resetTimerId.current);
+    }
+
+    setCopyState(nextState);
+    resetTimerId.current = window.setTimeout(() => {
+      resetTimerId.current = undefined;
+      setCopyState("idle");
+    }, timeoutMs);
   }
 
   return (
@@ -249,26 +272,6 @@ function copyStateLabel(state: "idle" | "copied" | "failed", count: number) {
   }
 
   return `Copy ${count} user email${count === 1 ? "" : "s"} for Outlook`;
-}
-
-function InfoIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      width="18"
-      height="18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <circle cx="12" cy="12" r="10" />
-      <path d="M12 16v-4" />
-      <path d="M12 8h.01" />
-    </svg>
-  );
 }
 
 function formatList(values?: string[]) {

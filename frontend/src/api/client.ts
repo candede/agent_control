@@ -54,6 +54,12 @@ export type BulkPackageResult = {
   message?: string;
 };
 
+export type BulkSideEffectError = {
+  phase: "start" | "result";
+  agentId: string;
+  message: string;
+};
+
 export type BulkActionResult = {
   targetBlockedState: boolean;
   total: number;
@@ -61,6 +67,7 @@ export type BulkActionResult = {
   failed: number;
   skipped: number;
   results: BulkPackageResult[];
+  sideEffectErrors?: BulkSideEffectError[];
 };
 
 export type BulkJobStatus = "queued" | "running" | "completed" | "failed";

@@ -605,7 +605,14 @@ function App() {
 
   async function handleSignOut() {
     agentDetailRequestId.current += 1;
-    await signOut();
+
+    try {
+      await signOut();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      return;
+    }
+
     setUser(undefined);
     setAgents([]);
     setSelectedAgentIds(new Set());
@@ -1562,7 +1569,11 @@ function loadStoredActiveBulkJobId() {
     return undefined;
   }
 
-  return window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined;
+  try {
+    return window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function saveStoredActiveBulkJobId(jobId: string) {

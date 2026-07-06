@@ -67,8 +67,13 @@ authRouter.get("/auth/callback", async (request, response, next) => {
   }
 });
 
-authRouter.post("/auth/logout", (request, response) => {
-  request.session.destroy(() => {
+authRouter.post("/auth/logout", (request, response, next) => {
+  request.session.destroy((error) => {
+    if (error) {
+      next(error);
+      return;
+    }
+
     response.clearCookie("agent-control.sid");
     response.status(204).end();
   });
@@ -76,11 +81,9 @@ authRouter.post("/auth/logout", (request, response) => {
 
 authRouter.get("/api/me", (request, response) => {
   if (!request.session.user) {
-    response
-      .status(401)
-      .json({
-        error: { code: "unauthorized", message: "Sign in is required" },
-      });
+    response.status(401).json({
+      error: { code: "unauthorized", message: "Sign in is required" },
+    });
     return;
   }
 

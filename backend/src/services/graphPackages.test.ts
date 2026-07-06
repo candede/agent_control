@@ -112,6 +112,43 @@ describe("GraphPackagesClient", () => {
     expect(events).toEqual(["start:P_1", "result:P_1:succeeded"]);
   });
 
+  it("keeps package results stable when progress hooks fail", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async listCopilotAgents() {
+        return [
+          { id: "P_1", displayName: "Ready", isBlocked: false },
+          { id: "P_2", displayName: "Already blocked", isBlocked: true },
+        ];
+      }
+
+      override async blockPackage() {}
+    }
+
+    const result = await bulkSetBlockedState(new FakeClient(), "token", true, {
+      writePauseMs: 0,
+      onPackageStart: () => {
+        throw new Error("progress unavailable");
+      },
+      onPackageResult: () => {
+        throw new Error("audit unavailable");
+      },
+    });
+
+    expect(result.succeeded).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.results.map((item) => item.status).sort()).toEqual([
+      "skipped",
+      "succeeded",
+    ]);
+    expect(result.sideEffectErrors).toEqual([
+      { phase: "start", agentId: "P_2", message: "progress unavailable" },
+      { phase: "result", agentId: "P_2", message: "audit unavailable" },
+      { phase: "start", agentId: "P_1", message: "progress unavailable" },
+      { phase: "result", agentId: "P_1", message: "audit unavailable" },
+    ]);
+  });
+
   it("falls back to the default concurrency for invalid values", async () => {
     class FakeClient extends GraphPackagesClient {
       override async listCopilotAgents() {

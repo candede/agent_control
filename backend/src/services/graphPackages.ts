@@ -5,6 +5,7 @@ import type {
   BulkPackageDetailResult,
   BulkPackageDetailsResult,
   BulkPackageResult,
+  BulkSideEffectError,
   CopilotPackage,
   CopilotPackageDetail,
   GraphCollectionResponse,
@@ -173,6 +174,7 @@ export async function bulkSetBlockedState(
     ? packages.filter((agent) => requestedIds.has(agent.id))
     : packages;
   const results: BulkPackageResult[] = [];
+  const sideEffectErrors: BulkSideEffectError[] = [];
   const writeConcurrency = normalizePositiveInteger(
     options.writeConcurrency,
     bulkWriteConcurrency,
@@ -180,7 +182,7 @@ export async function bulkSetBlockedState(
   const writePauseMs = options.writePauseMs ?? bulkWritePauseMs;
   const recordSkippedResult = async (result: BulkPackageResult) => {
     results.push(result);
-    await options.onPackageResult?.(result);
+    await emitPackageResult(options, result, sideEffectErrors);
   };
 
   const actionable: CopilotPackage[] = [];
@@ -202,7 +204,7 @@ export async function bulkSetBlockedState(
 
   for (const agent of scopedPackages) {
     if (agent.isBlocked === targetBlockedState) {
-      await options.onPackageStart?.(agent);
+      await emitPackageStart(options, agent, sideEffectErrors);
       await recordSkippedResult({
         id: agent.id,
         displayName: agent.displayName,
@@ -219,7 +221,7 @@ export async function bulkSetBlockedState(
     actionable,
     writeConcurrency,
     async (agent) => {
-      await options.onPackageStart?.(agent);
+      await emitPackageStart(options, agent, sideEffectErrors);
       let result: BulkPackageResult;
 
       try {
@@ -248,7 +250,7 @@ export async function bulkSetBlockedState(
         };
       }
 
-      await options.onPackageResult?.(result);
+      await emitPackageResult(options, result, sideEffectErrors);
       return result;
     },
   );
@@ -262,7 +264,45 @@ export async function bulkSetBlockedState(
     failed: results.filter((result) => result.status === "failed").length,
     skipped: results.filter((result) => result.status === "skipped").length,
     results,
+    sideEffectErrors:
+      sideEffectErrors.length > 0 ? sideEffectErrors : undefined,
   };
+}
+
+async function emitPackageStart(
+  options: BulkSetBlockedStateOptions,
+  agent: CopilotPackage,
+  sideEffectErrors: BulkSideEffectError[],
+) {
+  try {
+    await options.onPackageStart?.(agent);
+  } catch (error) {
+    sideEffectErrors.push({
+      phase: "start",
+      agentId: agent.id,
+      message: errorMessage(error),
+    });
+  }
+}
+
+async function emitPackageResult(
+  options: BulkSetBlockedStateOptions,
+  result: BulkPackageResult,
+  sideEffectErrors: BulkSideEffectError[],
+) {
+  try {
+    await options.onPackageResult?.(result);
+  } catch (error) {
+    sideEffectErrors.push({
+      phase: "result",
+      agentId: result.id,
+      message: errorMessage(error),
+    });
+  }
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown side-effect error";
 }
 
 export async function bulkGetPackageDetails(

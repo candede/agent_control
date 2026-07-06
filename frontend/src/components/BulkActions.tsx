@@ -40,6 +40,7 @@ export function BulkActions({
     0,
     failedResults.length - visibleFailures.length,
   );
+  const sideEffectErrors = result?.sideEffectErrors ?? [];
 
   return (
     <section className="bulk-panel" aria-label="Bulk actions">
@@ -81,6 +82,9 @@ export function BulkActions({
           <span>{result.succeeded} succeeded</span>
           <span>{result.skipped} skipped</span>
           <span>{result.failed} failed</span>
+          {sideEffectErrors.length > 0 ? (
+            <span>{sideEffectErrors.length} audit/progress errors</span>
+          ) : null}
           {failedResults.length > 0 ? (
             <details className="bulk-failures">
               <summary>Review {failedResults.length} failed changes</summary>
