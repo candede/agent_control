@@ -161,6 +161,9 @@ export function UserAccessView({
         <label>
           <span>Creator type</span>
           <select
+            className={
+              creatorTypeFilter === "all" ? undefined : "active-filter-select"
+            }
             value={creatorTypeFilter}
             onChange={(event) => setCreatorTypeFilter(event.target.value)}
           >
@@ -175,6 +178,9 @@ export function UserAccessView({
         <label>
           <span>Activity</span>
           <select
+            className={
+              activityFilter === "all" ? undefined : "active-filter-select"
+            }
             value={activityFilter}
             onChange={(event) =>
               setActivityFilter(event.target.value as ActivityFilter)
@@ -189,6 +195,9 @@ export function UserAccessView({
         <label>
           <span>Access rows</span>
           <select
+            className={
+              accessRowFilter === "all" ? undefined : "active-filter-select"
+            }
             value={accessRowFilter}
             onChange={(event) =>
               setAccessRowFilter(event.target.value as AccessRowFilter)

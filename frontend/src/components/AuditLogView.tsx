@@ -111,6 +111,9 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
         <label>
           <span>Action</span>
           <select
+            className={
+              actionFilter === "all" ? undefined : "active-filter-select"
+            }
             value={actionFilter}
             onChange={(event) =>
               setActionFilter(event.target.value as AuditFilter)
@@ -124,6 +127,9 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
         <label>
           <span>Result</span>
           <select
+            className={
+              statusFilter === "all" ? undefined : "active-filter-select"
+            }
             value={statusFilter}
             onChange={(event) =>
               setStatusFilter(event.target.value as StatusFilter)

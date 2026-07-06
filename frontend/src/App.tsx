@@ -1243,6 +1243,9 @@ function App() {
               <label>
                 <span>Status</span>
                 <select
+                  className={
+                    statusFilter === "all" ? undefined : "active-filter-select"
+                  }
                   value={statusFilter}
                   onChange={(event) =>
                     setStatusFilter(
@@ -1258,6 +1261,11 @@ function App() {
               <label>
                 <span>Available to</span>
                 <select
+                  className={
+                    availableToFilter === "all"
+                      ? undefined
+                      : "active-filter-select"
+                  }
                   value={availableToFilter}
                   onChange={(event) => setAvailableToFilter(event.target.value)}
                 >
@@ -1279,6 +1287,11 @@ function App() {
               <label>
                 <span>Publisher</span>
                 <select
+                  className={
+                    publisherFilter === "all"
+                      ? undefined
+                      : "active-filter-select"
+                  }
                   value={publisherFilter}
                   onChange={(event) => setPublisherFilter(event.target.value)}
                 >
@@ -1293,6 +1306,9 @@ function App() {
               <label>
                 <span>Host</span>
                 <select
+                  className={
+                    hostFilter === "all" ? undefined : "active-filter-select"
+                  }
                   value={hostFilter}
                   onChange={(event) => setHostFilter(event.target.value)}
                 >
@@ -1307,6 +1323,11 @@ function App() {
               <label>
                 <span>Built with</span>
                 <select
+                  className={
+                    effectivePlatformFilter === "all"
+                      ? undefined
+                      : "active-filter-select"
+                  }
                   value={effectivePlatformFilter}
                   onChange={(event) => setPlatformFilter(event.target.value)}
                 >
@@ -1328,6 +1349,9 @@ function App() {
               <label>
                 <span>Usage state</span>
                 <select
+                  className={
+                    usageFilter === "all" ? undefined : "active-filter-select"
+                  }
                   value={usageFilter}
                   onChange={(event) =>
                     setUsageFilter(event.target.value as UsageFilter)

@@ -575,6 +575,12 @@ select {
   cursor: pointer;
 }
 
+select.active-filter-select {
+  border-color: #b66a2c;
+  background-color: #fff8ec;
+  box-shadow: inset 0 0 0 1px #b66a2c;
+}
+
 input:focus-visible,
 select:focus-visible {
   border-color: var(--ink);
