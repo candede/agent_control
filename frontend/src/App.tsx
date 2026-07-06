@@ -75,7 +75,119 @@ type UsageImportStatus = {
 
 type ActiveView = "agents" | "users" | "reports" | "audit";
 
+const usageReportsStorageKey = "agent-control:usage-reports:v1";
+
 const emptyUsageReports = (): UsageReportsState => ({});
+
+function loadStoredUsageReports(): UsageReportsState {
+  if (typeof window === "undefined") {
+    return emptyUsageReports();
+  }
+
+  try {
+    const storedReports = window.localStorage.getItem(usageReportsStorageKey);
+
+    if (!storedReports) {
+      return emptyUsageReports();
+    }
+
+    const parsedReports: unknown = JSON.parse(storedReports);
+    return isStoredUsageReports(parsedReports)
+      ? parsedReports
+      : emptyUsageReports();
+  } catch {
+    return emptyUsageReports();
+  }
+}
+
+function loadInitialUsageReportsState(): {
+  reports: UsageReportsState;
+  status?: UsageImportStatus;
+} {
+  const reports = loadStoredUsageReports();
+
+  if (!hasUsageReports(reports)) {
+    return { reports };
+  }
+
+  return {
+    reports,
+    status: {
+      kind: "success",
+      message: `Restored saved usage reports: ${formatImportRowSummary(
+        summarizeUsageReportsState(reports),
+      )}.`,
+    },
+  };
+}
+
+function saveStoredUsageReports(reports: UsageReportsState) {
+  if (typeof window === "undefined") {
+    return true;
+  }
+
+  try {
+    if (hasUsageReports(reports)) {
+      window.localStorage.setItem(
+        usageReportsStorageKey,
+        JSON.stringify(reports),
+      );
+    } else {
+      window.localStorage.removeItem(usageReportsStorageKey);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearStoredUsageReports() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(usageReportsStorageKey);
+  } catch {
+    // Clearing reports should never fail the visible user action.
+  }
+}
+
+function hasUsageReports(reports: UsageReportsState) {
+  return Boolean(reports.agents || reports.userAgents || reports.users);
+}
+
+function isStoredUsageReports(value: unknown): value is UsageReportsState {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    isStoredReport(value.agents, "agents") &&
+    isStoredReport(value.userAgents, "userAgents") &&
+    isStoredReport(value.users, "users")
+  );
+}
+
+function isStoredReport(value: unknown, kind: UsageReportKind) {
+  if (value === undefined) {
+    return true;
+  }
+
+  return (
+    isRecord(value) &&
+    value.kind === kind &&
+    typeof value.fileName === "string" &&
+    typeof value.importedAt === "string" &&
+    Array.isArray(value.warnings) &&
+    Array.isArray(value.rows)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 function App() {
   const [user, setUser] = useState<SessionUser>();
@@ -108,12 +220,15 @@ function App() {
   const [exportProgressTotal, setExportProgressTotal] = useState(0);
   const [exportProgressMode, setExportProgressMode] =
     useState<ExportMode>("full");
-  const [usageReports, setUsageReports] =
-    useState<UsageReportsState>(emptyUsageReports);
+  const [initialUsageReportsState] = useState(loadInitialUsageReportsState);
+  const [usageReports, setUsageReports] = useState<UsageReportsState>(
+    () => initialUsageReportsState.reports,
+  );
   const [pendingUsageImport, setPendingUsageImport] =
     useState<PendingUsageImport>();
-  const [usageImportStatus, setUsageImportStatus] =
-    useState<UsageImportStatus>();
+  const [usageImportStatus, setUsageImportStatus] = useState<
+    UsageImportStatus | undefined
+  >(() => initialUsageReportsState.status);
   const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
   const [inactiveDays, setInactiveDays] = useState(30);
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
@@ -413,6 +528,7 @@ function App() {
     setExportProgressTotal(0);
     agentDetailsCache.current.clear();
     setBulkResult(undefined);
+    clearStoredUsageReports();
     setUsageReports(emptyUsageReports());
     setPendingUsageImport(undefined);
     setUsageImportStatus(undefined);
@@ -471,26 +587,37 @@ function App() {
       return;
     }
 
-    setUsageReports((current) =>
-      mergeUsageReports(current, pendingUsageImport.reports),
+    const nextUsageReports = mergeUsageReports(
+      usageReports,
+      pendingUsageImport.reports,
     );
+    const persisted = saveStoredUsageReports(nextUsageReports);
+
+    setUsageReports(nextUsageReports);
 
     const counts = summarizeParsedUsageReports(pendingUsageImport.reports);
     const issueCount =
-      pendingUsageImport.failures.length + pendingUsageImport.warnings.length;
+      pendingUsageImport.failures.length +
+      pendingUsageImport.warnings.length +
+      (persisted ? 0 : 1);
 
     setUsageImportStatus({
-      kind: "success",
+      kind: persisted ? "success" : "error",
       message: `Import successful: ${formatImportRowSummary(counts)}${
         issueCount
           ? `, with ${issueCount} issue${issueCount === 1 ? "" : "s"}`
           : ""
-      }.`,
+      }.${
+        persisted
+          ? ""
+          : " Reports will stay available for this session, but could not be saved for reload."
+      }`,
     });
     setPendingUsageImport(undefined);
   }
 
   function handleClearUsageReports() {
+    clearStoredUsageReports();
     setUsageReports(emptyUsageReports());
     setPendingUsageImport(undefined);
     setUsageImportStatus(undefined);
@@ -1547,8 +1674,11 @@ function ReportImportPanel({
         <div>
           <strong>Usage reports</strong>
           <span>
-            Import the Agents, Users & agents, and Users CSV exports to enrich
-            this view.
+            {hasImportedReports
+              ? `Saved: ${formatImportRowSummary(
+                  summarizeUsageReportsState(reports),
+                )}`
+              : "Import the Agents, Users & agents, and Users CSV exports to enrich this view."}
           </span>
         </div>
         <div className="report-actions">
@@ -1958,6 +2088,14 @@ function summarizeParsedUsageReports(reports: ParsedUsageReport[]) {
       number
     >,
   );
+}
+
+function summarizeUsageReportsState(reports: UsageReportsState) {
+  return {
+    agents: reports.agents?.rows.length ?? 0,
+    userAgents: reports.userAgents?.rows.length ?? 0,
+    users: reports.users?.rows.length ?? 0,
+  } satisfies Record<UsageReportKind, number>;
 }
 
 function formatImportRowSummary(counts: Record<UsageReportKind, number>) {
