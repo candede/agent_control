@@ -95,6 +95,18 @@ export function UserAccessView({
       summary.rows.filter((row) => row.packageStatus === "report-only").length,
     0,
   );
+  const hasActiveUserFilters =
+    query.trim().length > 0 ||
+    creatorTypeFilter !== "all" ||
+    activityFilter !== "all" ||
+    accessRowFilter !== "all";
+
+  function handleClearUserFilters() {
+    setQuery("");
+    setCreatorTypeFilter("all");
+    setActivityFilter("all");
+    setAccessRowFilter("all");
+  }
 
   if (!reports.users && !reports.userAgents) {
     return (
@@ -207,6 +219,16 @@ export function UserAccessView({
             <option value="responses">Responses only</option>
           </select>
         </label>
+        <div className="filter-actions" aria-label="User filter actions">
+          <button
+            type="button"
+            className="secondary clear-filters-button"
+            disabled={!hasActiveUserFilters}
+            onClick={handleClearUserFilters}
+          >
+            Clear filters
+          </button>
+        </div>
       </section>
 
       {filteredUsers.length === 0 ? (

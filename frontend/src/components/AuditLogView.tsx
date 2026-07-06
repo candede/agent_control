@@ -58,6 +58,14 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
   const skippedCount = events.filter(
     (event) => event.status === "skipped",
   ).length;
+  const hasActiveAuditFilters =
+    query.trim().length > 0 || actionFilter !== "all" || statusFilter !== "all";
+
+  function handleClearAuditFilters() {
+    setQuery("");
+    setActionFilter("all");
+    setStatusFilter("all");
+  }
 
   async function loadEvents() {
     setLoading(true);
@@ -143,6 +151,14 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
           </select>
         </label>
         <div className="filter-actions" aria-label="Audit actions">
+          <button
+            type="button"
+            className="secondary clear-filters-button"
+            disabled={!hasActiveAuditFilters}
+            onClick={handleClearAuditFilters}
+          >
+            Clear filters
+          </button>
           <button
             type="button"
             className="icon-button control-icon-button"

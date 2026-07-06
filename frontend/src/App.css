@@ -502,6 +502,22 @@ button.view-button.active {
   gap: 8px;
 }
 
+.clear-filters-button {
+  min-width: 108px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.catalog-clear-filters-button {
+  grid-column: 13 / 14;
+  grid-row: 2;
+  align-self: end;
+  justify-self: end;
+  width: 100%;
+}
+
 .last-refresh {
   min-height: 15px;
   color: var(--muted);
@@ -635,6 +651,12 @@ button:disabled {
     grid-column: 1 / -1;
     grid-row: auto;
     justify-items: end;
+  }
+
+  .catalog-clear-filters-button {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    justify-self: end;
   }
 }
 
@@ -1899,7 +1921,15 @@ button.icon-button:hover {
 }
 
 .user-controls {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: minmax(220px, 1.4fr) repeat(3, minmax(150px, 1fr)) auto;
+}
+
+.user-controls .filter-search {
+  grid-column: auto;
+}
+
+.user-controls .filter-actions {
+  grid-column: auto;
 }
 
 .user-table-shell {

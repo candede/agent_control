@@ -989,6 +989,16 @@ function App() {
     );
   }
 
+  function handleClearAgentFilters() {
+    handleSearchQueryChange("");
+    setStatusFilter("all");
+    setPublisherFilter("all");
+    setAvailableToFilter("all");
+    setHostFilter("all");
+    setPlatformFilter("all");
+    setUsageFilter("all");
+  }
+
   function updateCachedAgentBlockedState(
     agentId: string,
     targetBlockedState: boolean,
@@ -1433,6 +1443,14 @@ function App() {
                   : ""}
               </span>
             </div>
+            <button
+              type="button"
+              className="secondary clear-filters-button catalog-clear-filters-button"
+              disabled={!hasActiveAgentFilters}
+              onClick={handleClearAgentFilters}
+            >
+              Clear filters
+            </button>
           </section>
 
           {loadingBulkRefSearch ? (
