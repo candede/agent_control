@@ -56,6 +56,25 @@ export type BulkActionResult = {
   results: BulkPackageResult[];
 };
 
+export type BulkPackageDetailResult =
+  | {
+      id: string;
+      status: "succeeded";
+      package: CopilotPackageDetail;
+    }
+  | {
+      id: string;
+      status: "failed";
+      message: string;
+    };
+
+export type BulkPackageDetailsResult = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: BulkPackageDetailResult[];
+};
+
 export type GraphCollectionResponse<T> = {
   value: T[];
   "@odata.nextLink"?: string;

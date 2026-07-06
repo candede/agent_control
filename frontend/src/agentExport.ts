@@ -136,10 +136,14 @@ export function toCsv(rows: AgentExportRow[]) {
   return [header, ...body].join("\r\n");
 }
 
-export function getExportFilename(isFiltered: boolean) {
+export function getExportFilename(
+  isFiltered: boolean,
+  mode: "fast" | "full" = "full",
+) {
+  const modeSuffix = mode === "fast" ? "-fast" : "";
   const filteredSuffix = isFiltered ? "-filtered" : "";
 
-  return `copilot-agents${filteredSuffix}-${formatExportTimestamp()}.csv`;
+  return `copilot-agents${modeSuffix}${filteredSuffix}-${formatExportTimestamp()}.csv`;
 }
 
 export function downloadCsv(filename: string, csv: string) {

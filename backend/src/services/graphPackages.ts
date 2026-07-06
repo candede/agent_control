@@ -2,6 +2,8 @@ import { AppError } from "../errors.js";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
   BulkActionResult,
+  BulkPackageDetailResult,
+  BulkPackageDetailsResult,
   BulkPackageResult,
   CopilotPackage,
   CopilotPackageDetail,
@@ -11,6 +13,7 @@ import type {
 const graphV1 = "https://graph.microsoft.com/v1.0";
 const graphBeta = "https://graph.microsoft.com/beta";
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
+const bulkDetailConcurrency = 6;
 const bulkWriteConcurrency = 1;
 const bulkWritePauseMs = 750;
 const defaultRetryPolicy = {
@@ -32,6 +35,10 @@ type BulkSetBlockedStateOptions = {
   writePauseMs?: number;
   onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
   onPackageResult?: (result: BulkPackageResult) => void | Promise<void>;
+};
+
+type BulkGetPackageDetailsOptions = {
+  detailConcurrency?: number;
 };
 
 export class GraphPackagesClient {
@@ -232,6 +239,45 @@ export async function bulkSetBlockedState(
     succeeded: results.filter((result) => result.status === "succeeded").length,
     failed: results.filter((result) => result.status === "failed").length,
     skipped: results.filter((result) => result.status === "skipped").length,
+    results,
+  };
+}
+
+export async function bulkGetPackageDetails(
+  client: GraphPackagesClient,
+  accessToken: string,
+  ids: string[],
+  options: BulkGetPackageDetailsOptions = {},
+): Promise<BulkPackageDetailsResult> {
+  const detailConcurrency = normalizePositiveInteger(
+    options.detailConcurrency,
+    bulkDetailConcurrency,
+  );
+  const results = await mapWithConcurrency(
+    ids,
+    detailConcurrency,
+    async (id): Promise<BulkPackageDetailResult> => {
+      try {
+        return {
+          id,
+          status: "succeeded",
+          package: await client.getPackageDetails(accessToken, id),
+        };
+      } catch (error) {
+        return {
+          id,
+          status: "failed",
+          message:
+            error instanceof Error ? error.message : "Unknown Graph error",
+        };
+      }
+    },
+  );
+
+  return {
+    total: ids.length,
+    succeeded: results.filter((result) => result.status === "succeeded").length,
+    failed: results.filter((result) => result.status === "failed").length,
     results,
   };
 }

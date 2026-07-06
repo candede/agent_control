@@ -63,6 +63,25 @@ export type BulkActionResult = {
   results: BulkPackageResult[];
 };
 
+export type BulkPackageDetailResult =
+  | {
+      id: string;
+      status: "succeeded";
+      package: CopilotPackageDetail;
+    }
+  | {
+      id: string;
+      status: "failed";
+      message: string;
+    };
+
+export type BulkPackageDetailsResult = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: BulkPackageDetailResult[];
+};
+
 export type AuditAction = "block" | "unblock";
 
 export type AuditStatus = "started" | "succeeded" | "failed" | "skipped";
@@ -118,6 +137,14 @@ export async function getAgents() {
 
 export async function getAgentDetails(id: string) {
   return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}`);
+}
+
+export async function getAgentDetailsBatch(ids: string[]) {
+  return request<BulkPackageDetailsResult>("/api/agents/details", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
 }
 
 export async function blockAgent(id: string, context?: AuditRequestContext) {

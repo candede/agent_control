@@ -6,6 +6,7 @@ import { AppError } from "../errors.js";
 import { requireSession } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import {
+  bulkGetPackageDetails,
   bulkSetBlockedState,
   GraphPackagesClient,
 } from "../services/graphPackages.js";
@@ -22,6 +23,7 @@ import type {
 export const agentsRouter = Router();
 const graphPackages = new GraphPackagesClient();
 const actionGroupHeader = "x-agent-control-action-group-id";
+const detailBatchLimit = 100;
 
 agentsRouter.use(requireSession);
 
@@ -30,6 +32,17 @@ agentsRouter.get("/agents", async (request, response, next) => {
     const accessToken = await acquireGraphToken(request.session.accountId!);
     const agents = await graphPackages.listCopilotAgents(accessToken);
     response.json({ value: agents });
+  } catch (error) {
+    next(error);
+  }
+});
+
+agentsRouter.post("/agents/details", async (request, response, next) => {
+  try {
+    const accessToken = await acquireGraphToken(request.session.accountId!);
+    const ids = parsePackageDetailIds(request.body);
+    const result = await bulkGetPackageDetails(graphPackages, accessToken, ids);
+    response.json(result);
   } catch (error) {
     next(error);
   }
@@ -196,6 +209,32 @@ function getAuditOperationContext(request: Request) {
 
 function routeParam(value: string | string[]) {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function parsePackageDetailIds(body: unknown) {
+  const ids = (body as { ids?: unknown })?.ids;
+
+  if (!Array.isArray(ids)) {
+    throw new AppError(400, "invalid_request", "Expected ids to be an array.");
+  }
+
+  const uniqueIds = [...new Set(ids.map((id) => routeParam(String(id)).trim()))]
+    .filter(Boolean)
+    .slice(0, detailBatchLimit + 1);
+
+  if (uniqueIds.length === 0) {
+    throw new AppError(400, "invalid_request", "At least one id is required.");
+  }
+
+  if (uniqueIds.length > detailBatchLimit) {
+    throw new AppError(
+      400,
+      "invalid_request",
+      `A maximum of ${detailBatchLimit} ids can be requested at once.`,
+    );
+  }
+
+  return uniqueIds;
 }
 
 function completeAuditEvent(

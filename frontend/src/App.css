@@ -205,6 +205,10 @@
   color: var(--muted);
 }
 
+.export-progress {
+  grid-column: 1 / -1;
+}
+
 .selected-count {
   display: inline-flex;
   margin-top: 6px;
@@ -619,6 +623,45 @@ button.secondary:hover {
   background:
     linear-gradient(180deg, rgba(240, 247, 244, 0.92), transparent 180px),
     var(--surface);
+}
+
+.export-choice-modal {
+  width: min(680px, 100%);
+}
+
+.export-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+button.export-choice-card {
+  min-height: 156px;
+  display: grid;
+  align-content: start;
+  justify-items: start;
+  gap: 8px;
+  padding: 16px;
+  color: #fdfbf6;
+  text-align: left;
+}
+
+button.export-choice-card.secondary {
+  color: var(--text-h);
+}
+
+.export-choice-card strong {
+  font-size: 18px;
+}
+
+.export-choice-card span {
+  line-height: 1.35;
+}
+
+.export-choice-card small {
+  color: inherit;
+  opacity: 0.78;
+  font-weight: 800;
 }
 
 .usage-import-header {
@@ -1988,6 +2031,10 @@ button.icon-button:hover {
   }
 
   .confirm-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .export-choice-grid {
     grid-template-columns: 1fr;
   }
 

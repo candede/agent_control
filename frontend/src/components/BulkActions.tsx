@@ -1,4 +1,5 @@
 import type { BulkActionResult } from "../api/client";
+import type { ReactNode } from "react";
 
 type BulkProgress = {
   action: "block" | "unblock";
@@ -13,6 +14,7 @@ type BulkProgress = {
 
 type BulkActionsProps = {
   disabled: boolean;
+  activityProgress?: ReactNode;
   busyAction?: "block" | "unblock";
   progress?: BulkProgress;
   result?: BulkActionResult;
@@ -23,6 +25,7 @@ type BulkActionsProps = {
 
 export function BulkActions({
   disabled,
+  activityProgress,
   busyAction,
   progress,
   result,
@@ -68,6 +71,7 @@ export function BulkActions({
         </button>
       </div>
       {progress ? <BulkProgressMeter progress={progress} /> : null}
+      {activityProgress}
       {result ? (
         <div className="bulk-result">
           <strong>

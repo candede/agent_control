@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildCopilotAgentsListUrl,
+  bulkGetPackageDetails,
   bulkSetBlockedState,
   GraphPackagesClient,
   type FetchLike,
@@ -126,5 +127,38 @@ describe("GraphPackagesClient", () => {
     });
 
     expect(result.succeeded).toBe(1);
+  });
+
+  it("summarizes best-effort bulk detail results", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async getPackageDetails(_accessToken: string, id: string) {
+        if (id === "P_2") {
+          throw new Error("detail unavailable");
+        }
+
+        return {
+          id,
+          displayName: id === "P_1" ? "First" : "Third",
+          isBlocked: false,
+          sensitivity: "Unspecified",
+        };
+      }
+    }
+
+    const result = await bulkGetPackageDetails(
+      new FakeClient(),
+      "token",
+      ["P_1", "P_2", "P_3"],
+      { detailConcurrency: 2 },
+    );
+
+    expect(result.total).toBe(3);
+    expect(result.succeeded).toBe(2);
+    expect(result.failed).toBe(1);
+    expect(result.results.map((item) => item.status)).toEqual([
+      "succeeded",
+      "failed",
+      "succeeded",
+    ]);
   });
 });

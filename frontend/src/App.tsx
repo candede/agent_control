@@ -14,6 +14,7 @@ import {
   ApiError,
   blockAgent,
   getAgentDetails,
+  getAgentDetailsBatch,
   getAgents,
   getCurrentUser,
   signOut,
@@ -101,8 +102,12 @@ function App() {
   const [agentDetail, setAgentDetail] = useState<CopilotPackageDetail>();
   const [loadingAgentDetailId, setLoadingAgentDetailId] = useState<string>();
   const [agentDetailError, setAgentDetailError] = useState<string>();
+  const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
   const [exportingCsv, setExportingCsv] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportProgressTotal, setExportProgressTotal] = useState(0);
+  const [exportProgressMode, setExportProgressMode] =
+    useState<ExportMode>("full");
   const [usageReports, setUsageReports] =
     useState<UsageReportsState>(emptyUsageReports);
   const [pendingUsageImport, setPendingUsageImport] =
@@ -119,6 +124,7 @@ function App() {
   >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
+  const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
   const stateChangeTimers = useRef(new Map<string, number>());
 
   useEffect(() => {
@@ -373,6 +379,7 @@ function App() {
       const response = await getAgents();
       setAgents(response.value);
       setLastAgentListRefreshAt(new Date());
+      agentDetailsCache.current.clear();
       setSelectedAgentIds((current) => {
         const availableIds = new Set(response.value.map((agent) => agent.id));
         const next = new Set(
@@ -398,10 +405,13 @@ function App() {
     setAgentDetail(undefined);
     setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
+    setExportChoiceOpen(false);
     setLastAgentListRefreshAt(undefined);
     setRecentlyChangedAgentIds(new Set());
     setExportingCsv(false);
     setExportProgress(0);
+    setExportProgressTotal(0);
+    agentDetailsCache.current.clear();
     setBulkResult(undefined);
     setUsageReports(emptyUsageReports());
     setPendingUsageImport(undefined);
@@ -498,6 +508,7 @@ function App() {
       const detail = await getAgentDetails(agent.id);
 
       if (agentDetailRequestId.current === requestId) {
+        agentDetailsCache.current.set(agent.id, detail);
         setAgentDetail(detail);
       }
     } catch (requestError) {
@@ -534,47 +545,89 @@ function App() {
     }
   }
 
-  async function handleExportCsv() {
+  function requestExportCsv() {
+    if (exportableAgentCount === 0 || exportingCsv) {
+      return;
+    }
+
+    setExportChoiceOpen(true);
+  }
+
+  async function handleExportCsv(mode: ExportMode) {
     const agentsToExport = filteredAgents;
 
     if (agentsToExport.length === 0 || exportingCsv) {
       return;
     }
 
+    setExportChoiceOpen(false);
     setError(undefined);
     setExportingCsv(true);
+    setExportProgressMode(mode);
     setExportProgress(0);
+    setExportProgressTotal(agentsToExport.length);
 
     try {
-      const rows = [];
+      const rows =
+        mode === "fast"
+          ? agentsToExport.map((agent) =>
+              toAgentExportRow(agent, "", usageByAgentId.get(agent.id)),
+            )
+          : await buildFullExportRows(agentsToExport);
 
-      for (const [index, agent] of agentsToExport.entries()) {
-        let packageForExport: CopilotPackage | CopilotPackageDetail = agent;
-        let detailError = "";
-
-        try {
-          packageForExport = await getAgentDetails(agent.id);
-        } catch (requestError) {
-          detailError = errorMessage(requestError);
-        }
-
-        rows.push(
-          toAgentExportRow(
-            packageForExport,
-            detailError,
-            usageByAgentId.get(agent.id),
-          ),
-        );
-        setExportProgress(index + 1);
+      if (mode === "fast") {
+        setExportProgress(agentsToExport.length);
       }
 
-      downloadCsv(getExportFilename(hasActiveAgentFilters), toCsv(rows));
+      downloadCsv(getExportFilename(hasActiveAgentFilters, mode), toCsv(rows));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setExportingCsv(false);
       setExportProgress(0);
+      setExportProgressTotal(0);
     }
+  }
+
+  async function buildFullExportRows(agentsToExport: CopilotPackage[]) {
+    const detailsById = new Map<string, CopilotPackageDetail>();
+    const detailErrorsById = new Map<string, string>();
+    const missingIds: string[] = [];
+
+    for (const agent of agentsToExport) {
+      const cachedDetail = agentDetailsCache.current.get(agent.id);
+
+      if (cachedDetail) {
+        detailsById.set(agent.id, cachedDetail);
+      } else {
+        missingIds.push(agent.id);
+      }
+    }
+
+    setExportProgress(detailsById.size);
+
+    for (const batchIds of chunks(missingIds, detailBatchSize)) {
+      const response = await getAgentDetailsBatch(batchIds);
+
+      for (const result of response.results) {
+        if (result.status === "succeeded") {
+          agentDetailsCache.current.set(result.id, result.package);
+          detailsById.set(result.id, result.package);
+        } else {
+          detailErrorsById.set(result.id, result.message);
+        }
+      }
+
+      setExportProgress((current) => current + response.results.length);
+    }
+
+    return agentsToExport.map((agent) =>
+      toAgentExportRow(
+        detailsById.get(agent.id) ?? agent,
+        detailErrorsById.get(agent.id) ?? "",
+        usageByAgentId.get(agent.id),
+      ),
+    );
   }
 
   function requestBulkAction(targetBlockedState: boolean) {
@@ -715,6 +768,15 @@ function App() {
     agentId: string,
     targetBlockedState: boolean,
   ) {
+    const cachedDetail = agentDetailsCache.current.get(agentId);
+
+    if (cachedDetail && cachedDetail.isBlocked !== targetBlockedState) {
+      agentDetailsCache.current.set(agentId, {
+        ...cachedDetail,
+        isBlocked: targetBlockedState,
+      });
+    }
+
     setAgents((currentAgents) =>
       currentAgents.map((currentAgent) =>
         currentAgent.id === agentId &&
@@ -919,6 +981,15 @@ function App() {
             disabled={
               loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
             }
+            activityProgress={
+              exportingCsv ? (
+                <ExportProgressMeter
+                  completed={exportProgress}
+                  mode={exportProgressMode}
+                  total={exportProgressTotal || exportableAgentCount}
+                />
+              ) : undefined
+            }
             busyAction={busyBulkAction}
             progress={bulkProgress}
             result={bulkResult}
@@ -1098,7 +1169,7 @@ function App() {
                   disabled={
                     loadingAgents || exportingCsv || exportableAgentCount === 0
                   }
-                  onClick={() => void handleExportCsv()}
+                  onClick={requestExportCsv}
                 >
                   <ExportIcon />
                 </button>
@@ -1180,6 +1251,15 @@ function App() {
         />
       ) : null}
 
+      {exportChoiceOpen ? (
+        <ExportChoiceModal
+          agentCount={exportableAgentCount}
+          isFiltered={hasActiveAgentFilters}
+          onCancel={() => setExportChoiceOpen(false)}
+          onExport={(mode) => void handleExportCsv(mode)}
+        />
+      ) : null}
+
       {pendingUsageImport ? (
         <UsageImportReviewModal
           pendingImport={pendingUsageImport}
@@ -1197,10 +1277,13 @@ const unknownPublisherValue = "__unknown__";
 const unknownAvailableToValue = "__unknown__";
 const someOrAllAvailableToValue = "__some_or_all__";
 const availableToFilterValuePrefix = "available:";
+const detailBatchSize = 100;
 const someOrAllAvailableToNormalizedValues = new Set([
   "allowedforall",
   "allowedforsome",
 ]);
+
+type ExportMode = "fast" | "full";
 
 type UsageFilter =
   | "all"
@@ -1313,6 +1396,50 @@ function Metric({
       </strong>
     </div>
   );
+}
+
+function ExportProgressMeter({
+  completed,
+  mode,
+  total,
+}: {
+  completed: number;
+  mode: ExportMode;
+  total: number;
+}) {
+  const completedPercent =
+    total === 0 ? 100 : Math.round((completed / total) * 100);
+  const modeLabel = mode === "fast" ? "fast export" : "full export";
+
+  return (
+    <div
+      className="bulk-progress export-progress"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="bulk-progress-header">
+        <strong>
+          Preparing {modeLabel}: {completed} of {total} agents
+        </strong>
+        <span>{completedPercent}%</span>
+      </div>
+      <progress value={completed} max={total || 1} />
+      <div className="bulk-progress-meta">
+        <span>{completed} finished</span>
+        <span>{Math.max(total - completed, 0)} remaining</span>
+      </div>
+    </div>
+  );
+}
+
+function chunks<T>(items: T[], size: number) {
+  const result: T[][] = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+
+  return result;
 }
 
 function RefreshIcon() {
@@ -1933,6 +2060,79 @@ function BulkConfirmModal({
             onClick={onConfirm}
           >
             {actionLabel} selected
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExportChoiceModal({
+  agentCount,
+  isFiltered,
+  onCancel,
+  onExport,
+}: {
+  agentCount: number;
+  isFiltered: boolean;
+  onCancel: () => void;
+  onExport: (mode: ExportMode) => void;
+}) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onCancel();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
+      <section
+        className="confirm-modal export-choice-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-choice-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div>
+          <p className="eyebrow">Export agents</p>
+          <h2 id="export-choice-title">Choose CSV export type</h2>
+        </div>
+        <p>
+          Export {agentCount.toLocaleString()}{" "}
+          {isFiltered ? "filtered" : "loaded"} agents. Full export includes
+          detail-only fields and may take longer.
+        </p>
+        <div className="export-choice-grid">
+          <button
+            type="button"
+            className="secondary export-choice-card"
+            onClick={() => onExport("fast")}
+          >
+            <strong>Fast export</strong>
+            <span>Use the current table data and imported usage reports.</span>
+            <small>No per-agent detail lookups.</small>
+          </button>
+          <button
+            type="button"
+            className="export-choice-card"
+            onClick={() => onExport("full")}
+          >
+            <strong>Full details</strong>
+            <span>
+              Include categories, sensitivity, access, and element details.
+            </span>
+            <small>Uses cached details and batched API calls.</small>
+          </button>
+        </div>
+        <div className="confirm-actions">
+          <button type="button" className="secondary" onClick={onCancel}>
+            Cancel
           </button>
         </div>
       </section>
