@@ -23,7 +23,7 @@ The browser does not call Microsoft Graph directly. It calls the local Express b
 
 ## Requirements
 
-- Node.js 22 or newer.
+- Node.js 24 or newer.
 - An Agents 365 license in the Microsoft 365 tenant.
 - A Microsoft Entra ID app registration.
 - Microsoft Graph delegated permission `CopilotPackages.ReadWrite.All` with admin consent.
@@ -37,7 +37,7 @@ Register an application in Microsoft Entra ID before running the app.
 Use these settings:
 
 - Platform type: Web.
-- Redirect URI: `http://localhost:3001/auth/callback`.
+- Redirect URI: `http://localhost:3001/api/auth/callback`.
 - Client secret: create a client secret and keep it private.
 - API permission: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`.
 - Admin consent: grant tenant-wide admin consent for the delegated permission.
@@ -59,7 +59,7 @@ TENANT_ID=your-tenant-id
 CLIENT_ID=your-entra-app-client-id
 CLIENT_SECRET=your-entra-app-client-secret
 SESSION_SECRET=use-a-long-random-value
-REDIRECT_URI=http://localhost:3001/auth/callback
+REDIRECT_URI=http://localhost:3001/api/auth/callback
 FRONTEND_ORIGIN=http://localhost:5173
 PORT=3001
 ```

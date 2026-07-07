@@ -263,7 +263,7 @@ export async function getAuditEvents(query: AuditEventsQuery = {}) {
 }
 
 export async function signOut() {
-  await request<void>("/auth/logout", { method: "POST" });
+  await request<void>("/api/auth/logout", { method: "POST" });
 }
 
 function auditContextHeaders(context: AuditRequestContext | undefined) {

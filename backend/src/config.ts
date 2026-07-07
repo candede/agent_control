@@ -27,7 +27,7 @@ export const config = {
   clientId: process.env.CLIENT_ID,
   clientSecret: process.env.CLIENT_SECRET,
   redirectUri:
-    process.env.REDIRECT_URI ?? "http://localhost:3001/auth/callback",
+    process.env.REDIRECT_URI ?? "http://localhost:3001/api/auth/callback",
   frontendOrigin: process.env.FRONTEND_ORIGIN ?? "http://localhost:5173",
   sessionSecret:
     process.env.SESSION_SECRET ??

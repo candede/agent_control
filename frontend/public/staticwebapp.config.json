@@ -1,0 +1,15 @@
+{
+    "navigationFallback": {
+        "rewrite": "/index.html",
+        "exclude": [
+            "/api/*",
+            "/assets/*",
+            "/*.{css,js,map,json,png,jpg,jpeg,gif,svg,ico,txt,webmanifest}"
+        ]
+    },
+    "globalHeaders": {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+    }
+}

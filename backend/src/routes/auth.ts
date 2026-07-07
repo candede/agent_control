@@ -79,7 +79,7 @@ authRouter.post("/auth/logout", (request, response, next) => {
   });
 });
 
-authRouter.get("/api/me", (request, response) => {
+authRouter.get("/me", (request, response) => {
   if (!request.session.user) {
     response.status(401).json({
       error: { code: "unauthorized", message: "Sign in is required" },

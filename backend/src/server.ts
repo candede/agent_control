@@ -11,6 +11,10 @@ import "./types/session.js";
 
 const app = express();
 
+if (config.nodeEnv === "production") {
+  app.set("trust proxy", 1);
+}
+
 app.use(helmet());
 app.use(
   cors({
@@ -38,7 +42,7 @@ app.get("/api/health", (_request, response) => {
   response.json({ ok: true, authConfigured });
 });
 
-app.use(authRouter);
+app.use("/api", authRouter);
 app.use("/api", auditRouter);
 app.use("/api", agentsRouter);
 app.use(errorHandler);

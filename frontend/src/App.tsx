@@ -1102,7 +1102,7 @@ function App() {
           </p>
           {error ? <div className="error-banner">{error}</div> : null}
           <div className="signin-actions">
-            <a className="primary-link signin-button" href="/auth/login">
+            <a className="primary-link signin-button" href="/api/auth/login">
               Sign in with Entra ID
             </a>
             <span>Delegated admin access required</span>
