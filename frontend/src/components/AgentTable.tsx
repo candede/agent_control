@@ -1,7 +1,41 @@
 import { useEffect, useRef, useState } from "react";
-import { Info, Mail, MailCheck } from "lucide-react";
+import { Eye, Info, Mail, MailCheck } from "lucide-react";
 import type { CopilotPackage } from "../api/client";
 import { formatBuiltWithLabel } from "../agentDisplay";
+
+const agentTableColumnStorageKey = "agent-control:agent-table-columns:v1";
+
+type AgentTableColumnId =
+  | "publisher"
+  | "host"
+  | "builtWith"
+  | "availableTo"
+  | "created"
+  | "creatorType"
+  | "usage"
+  | "status";
+
+const agentTableColumns: readonly {
+  id: AgentTableColumnId;
+  label: string;
+}[] = [
+  { id: "publisher", label: "Publisher" },
+  { id: "host", label: "Host" },
+  { id: "builtWith", label: "Built with" },
+  { id: "availableTo", label: "Available to" },
+  { id: "created", label: "Created" },
+  { id: "creatorType", label: "Creator type" },
+  { id: "usage", label: "Usage" },
+  { id: "status", label: "Status" },
+];
+
+const defaultVisibleAgentTableColumns = agentTableColumns.map(
+  (column) => column.id,
+);
+
+const agentTableColumnIds = new Set<AgentTableColumnId>(
+  defaultVisibleAgentTableColumns,
+);
 
 type AgentTableProps = {
   agents: CopilotPackage[];
@@ -46,6 +80,69 @@ export function AgentTable({
   onBlock,
   onUnblock,
 }: AgentTableProps) {
+  const [columnPickerOpen, setColumnPickerOpen] = useState(false);
+  const [visibleColumnIds, setVisibleColumnIds] = useState<
+    AgentTableColumnId[]
+  >(loadStoredVisibleAgentTableColumns);
+  const columnPickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    saveStoredVisibleAgentTableColumns(visibleColumnIds);
+  }, [visibleColumnIds]);
+
+  useEffect(() => {
+    if (!columnPickerOpen) {
+      return;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      if (
+        columnPickerRef.current &&
+        !columnPickerRef.current.contains(event.target as Node)
+      ) {
+        setColumnPickerOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setColumnPickerOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [columnPickerOpen]);
+
+  const visibleColumns = new Set(visibleColumnIds);
+
+  function isColumnVisible(columnId: AgentTableColumnId) {
+    return visibleColumns.has(columnId);
+  }
+
+  function toggleColumn(columnId: AgentTableColumnId) {
+    setVisibleColumnIds((currentColumnIds) =>
+      currentColumnIds.includes(columnId)
+        ? currentColumnIds.filter(
+            (currentColumnId) => currentColumnId !== columnId,
+          )
+        : [
+            ...agentTableColumns
+              .map((column) => column.id)
+              .filter(
+                (currentColumnId) =>
+                  currentColumnId === columnId ||
+                  currentColumnIds.includes(currentColumnId),
+              ),
+          ],
+    );
+  }
+
   if (agents.length === 0) {
     return (
       <div className="empty-state">
@@ -60,7 +157,10 @@ export function AgentTable({
       <div className="selection-summary">
         <span>{selectedCount} selected</span>
       </div>
-      <table>
+      <table
+        className="agent-table"
+        style={{ minWidth: getAgentTableMinWidth(visibleColumnIds.length) }}
+      >
         <thead>
           <tr>
             <th scope="col" className="select-cell">
@@ -73,14 +173,71 @@ export function AgentTable({
               />
             </th>
             <th scope="col">Agent</th>
-            <th scope="col">Publisher</th>
-            <th scope="col">Host</th>
-            <th scope="col">Built with</th>
-            <th scope="col">Available to</th>
-            <th scope="col">Creator type</th>
-            <th scope="col">Usage</th>
-            <th scope="col">Status</th>
-            <th scope="col">Action</th>
+            {isColumnVisible("publisher") ? (
+              <th scope="col">Publisher</th>
+            ) : null}
+            {isColumnVisible("host") ? <th scope="col">Host</th> : null}
+            {isColumnVisible("builtWith") ? (
+              <th scope="col">Built with</th>
+            ) : null}
+            {isColumnVisible("availableTo") ? (
+              <th scope="col">Available to</th>
+            ) : null}
+            {isColumnVisible("created") ? <th scope="col">Created</th> : null}
+            {isColumnVisible("creatorType") ? (
+              <th scope="col">Creator type</th>
+            ) : null}
+            {isColumnVisible("usage") ? <th scope="col">Usage</th> : null}
+            {isColumnVisible("status") ? <th scope="col">Status</th> : null}
+            <th scope="col">
+              <div className="action-header">
+                <span>Action</span>
+                <div className="column-view-menu" ref={columnPickerRef}>
+                  <button
+                    type="button"
+                    className="secondary column-view-button"
+                    aria-haspopup="dialog"
+                    aria-expanded={columnPickerOpen}
+                    onClick={() => setColumnPickerOpen((isOpen) => !isOpen)}
+                  >
+                    <Eye aria-hidden="true" />
+                    View
+                  </button>
+                  {columnPickerOpen ? (
+                    <div
+                      className="column-view-popover"
+                      role="dialog"
+                      aria-label="Choose table columns"
+                    >
+                      <div className="column-view-popover-header">
+                        <strong>Columns</strong>
+                        <button
+                          type="button"
+                          className="secondary column-reset-button"
+                          onClick={() =>
+                            setVisibleColumnIds(defaultVisibleAgentTableColumns)
+                          }
+                        >
+                          Reset
+                        </button>
+                      </div>
+                      <div className="column-view-options">
+                        {agentTableColumns.map((column) => (
+                          <label key={column.id} className="column-view-option">
+                            <input
+                              type="checkbox"
+                              checked={isColumnVisible(column.id)}
+                              onChange={() => toggleColumn(column.id)}
+                            />
+                            <span>{column.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -110,29 +267,49 @@ export function AgentTable({
                     {agent.shortDescription || agent.id}
                   </div>
                 </td>
-                <td>{agent.publisher || "Unknown"}</td>
-                <td>{formatList(agent.supportedHosts)}</td>
-                <td>{formatBuiltWithLabel(agent)}</td>
-                <td>{formatLabel(agent.availableTo)}</td>
-                <td>{usage?.creatorType || "No import"}</td>
-                <td>
-                  <UsageCell usage={usage} />
-                </td>
-                <td>
-                  <span
-                    className={`status-carousel ${
-                      agent.isBlocked ? "show-blocked" : "show-allowed"
-                    }`}
-                    aria-label={`Status: ${
-                      agent.isBlocked ? "Blocked" : "Allowed"
-                    }`}
-                  >
-                    <span className="status-carousel-track" aria-hidden="true">
-                      <span className="status allowed">Allowed</span>
-                      <span className="status blocked">Blocked</span>
+                {isColumnVisible("publisher") ? (
+                  <td>{agent.publisher || "Unknown"}</td>
+                ) : null}
+                {isColumnVisible("host") ? (
+                  <td>{formatList(agent.supportedHosts)}</td>
+                ) : null}
+                {isColumnVisible("builtWith") ? (
+                  <td>{formatBuiltWithLabel(agent)}</td>
+                ) : null}
+                {isColumnVisible("availableTo") ? (
+                  <td>{formatLabel(agent.availableTo)}</td>
+                ) : null}
+                {isColumnVisible("created") ? (
+                  <td>{formatDate(agent.createdDateTime)}</td>
+                ) : null}
+                {isColumnVisible("creatorType") ? (
+                  <td>{usage?.creatorType || "No import"}</td>
+                ) : null}
+                {isColumnVisible("usage") ? (
+                  <td>
+                    <UsageCell usage={usage} />
+                  </td>
+                ) : null}
+                {isColumnVisible("status") ? (
+                  <td>
+                    <span
+                      className={`status-carousel ${
+                        agent.isBlocked ? "show-blocked" : "show-allowed"
+                      }`}
+                      aria-label={`Status: ${
+                        agent.isBlocked ? "Blocked" : "Allowed"
+                      }`}
+                    >
+                      <span
+                        className="status-carousel-track"
+                        aria-hidden="true"
+                      >
+                        <span className="status allowed">Allowed</span>
+                        <span className="status blocked">Blocked</span>
+                      </span>
                     </span>
-                  </span>
-                </td>
+                  </td>
+                ) : null}
                 <td>
                   <div className="row-actions">
                     <button
@@ -172,6 +349,59 @@ export function AgentTable({
       </table>
     </div>
   );
+}
+
+function loadStoredVisibleAgentTableColumns(): AgentTableColumnId[] {
+  if (typeof window === "undefined") {
+    return defaultVisibleAgentTableColumns;
+  }
+
+  try {
+    const storedColumns = window.localStorage.getItem(
+      agentTableColumnStorageKey,
+    );
+
+    if (!storedColumns) {
+      return defaultVisibleAgentTableColumns;
+    }
+
+    const parsedColumns: unknown = JSON.parse(storedColumns);
+
+    if (!Array.isArray(parsedColumns)) {
+      return defaultVisibleAgentTableColumns;
+    }
+
+    return agentTableColumns
+      .map((column) => column.id)
+      .filter((columnId) =>
+        parsedColumns.some(
+          (parsedColumnId) =>
+            parsedColumnId === columnId &&
+            agentTableColumnIds.has(parsedColumnId),
+        ),
+      );
+  } catch {
+    return defaultVisibleAgentTableColumns;
+  }
+}
+
+function saveStoredVisibleAgentTableColumns(columnIds: AgentTableColumnId[]) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      agentTableColumnStorageKey,
+      JSON.stringify(columnIds),
+    );
+  } catch {
+    // Table view preferences are best effort only.
+  }
+}
+
+function getAgentTableMinWidth(visibleColumnCount: number) {
+  return Math.max(760, 560 + visibleColumnCount * 110);
 }
 
 function UsageCell({ usage }: { usage?: AgentTableUsage }) {
@@ -302,6 +532,23 @@ function formatUsageDate(value?: string) {
     dateStyle: "medium",
     timeZone: "UTC",
   }).format(new Date(value));
+}
+
+function formatDate(value?: string) {
+  if (!value) {
+    return "Unknown";
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Unknown";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeZone: "UTC",
+  }).format(date);
 }
 
 function formatNumber(value?: number) {

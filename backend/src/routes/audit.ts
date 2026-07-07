@@ -20,14 +20,16 @@ auditRouter.use(requireSession);
 auditRouter.get("/audit/events", (request, response, next) => {
   try {
     const auditLog = getAuditLog();
+    const query = parseAuditEventsQuery(request.query);
 
     if (!auditLog) {
-      response.json({ value: [] });
+      response.json({ value: [], count: 0 });
       return;
     }
 
     response.json({
-      value: auditLog.listEvents(parseAuditEventsQuery(request.query)),
+      value: auditLog.listEvents(query),
+      count: auditLog.countEvents(query),
     });
   } catch (error) {
     next(error);
@@ -37,6 +39,7 @@ auditRouter.get("/audit/events", (request, response, next) => {
 export function parseAuditEventsQuery(query: Record<string, unknown>) {
   return {
     limit: parseLimit(firstQueryValue(query.limit)),
+    offset: parseOffset(firstQueryValue(query.offset)),
     agentId: firstQueryValue(query.agentId),
     actorUsername: firstQueryValue(query.actorUsername),
     scope: parseScope(firstQueryValue(query.scope)),
@@ -45,6 +48,7 @@ export function parseAuditEventsQuery(query: Record<string, unknown>) {
     operationIdPrefix: parseOperationIdPrefix(
       firstQueryValue(query.operationIdPrefix),
     ),
+    search: parseSearch(firstQueryValue(query.search)),
   };
 }
 
@@ -72,6 +76,24 @@ function parseLimit(value: string | undefined) {
   }
 
   return limit;
+}
+
+function parseOffset(value: string | undefined) {
+  if (!value) {
+    return undefined;
+  }
+
+  if (!/^\d+$/.test(value)) {
+    throw new AppError(400, "invalid_audit_offset", "Audit offset is invalid.");
+  }
+
+  const offset = Number.parseInt(value, 10);
+
+  if (!Number.isSafeInteger(offset)) {
+    throw new AppError(400, "invalid_audit_offset", "Audit offset is invalid.");
+  }
+
+  return offset;
 }
 
 function parseAction(value: string | undefined) {
@@ -123,6 +145,20 @@ function parseOperationIdPrefix(value: string | undefined) {
       "invalid_operation_id_prefix",
       "Operation ID prefix is invalid.",
     );
+  }
+
+  return normalized;
+}
+
+function parseSearch(value: string | undefined) {
+  const normalized = value?.trim();
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.length > 200) {
+    throw new AppError(400, "invalid_audit_search", "Audit search is invalid.");
   }
 
   return normalized;

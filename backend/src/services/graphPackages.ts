@@ -247,6 +247,8 @@ export async function bulkSetBlockedState(
           status: "failed" as const,
           message:
             error instanceof Error ? error.message : "Unknown Graph error",
+          errorCode: error instanceof AppError ? error.code : undefined,
+          errorDetails: error instanceof AppError ? error.details : undefined,
         };
       }
 

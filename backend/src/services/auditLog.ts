@@ -13,6 +13,11 @@ import type {
 const defaultListLimit = 100;
 const maxListLimit = 5_000;
 
+type AuditEventsFilter = {
+  where: string;
+  values: Array<string | number>;
+};
+
 type AuditEventRow = {
   id: string;
   operation_id: string;
@@ -134,51 +139,30 @@ export class AuditLog {
   }
 
   listEvents(query: ListAuditEventsQuery = {}) {
-    const clauses: string[] = [];
-    const values: Array<string | number> = [];
-
-    if (query.agentId) {
-      clauses.push("agent_id = ?");
-      values.push(query.agentId);
-    }
-
-    if (query.actorUsername) {
-      clauses.push("actor_username = ?");
-      values.push(query.actorUsername);
-    }
-
-    if (query.scope) {
-      clauses.push("scope = ?");
-      values.push(query.scope);
-    }
-
-    if (query.operationIdPrefix) {
-      clauses.push("operation_id LIKE ? ESCAPE '\\'");
-      values.push(`${escapeLikePrefix(query.operationIdPrefix)}%`);
-    }
-
-    if (query.action) {
-      clauses.push("action = ?");
-      values.push(query.action);
-    }
-
-    if (query.status) {
-      clauses.push("status = ?");
-      values.push(query.status);
-    }
-
-    values.push(normalizeLimit(query.limit));
-
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const filter = auditEventsFilter(query);
+    const values = [
+      ...filter.values,
+      normalizeLimit(query.limit),
+      normalizeOffset(query.offset),
+    ];
     const rows = this.database
       .prepare(
-        `SELECT * FROM audit_events ${where}
+        `SELECT * FROM audit_events ${filter.where}
         ORDER BY started_at DESC, id DESC
-        LIMIT ?`,
+        LIMIT ? OFFSET ?`,
       )
       .all(...values) as AuditEventRow[];
 
     return rows.map(toAuditEvent);
+  }
+
+  countEvents(query: ListAuditEventsQuery = {}) {
+    const filter = auditEventsFilter(query);
+    const row = this.database
+      .prepare(`SELECT COUNT(*) AS count FROM audit_events ${filter.where}`)
+      .get(...filter.values) as { count: number };
+
+    return row.count;
   }
 
   close() {
@@ -242,8 +226,113 @@ function normalizeLimit(limit: number | undefined) {
   return Math.min(Math.max(Math.trunc(limit), 1), maxListLimit);
 }
 
+function normalizeOffset(offset: number | undefined) {
+  if (!offset || Number.isNaN(offset)) {
+    return 0;
+  }
+
+  return Math.max(Math.trunc(offset), 0);
+}
+
+function auditEventsFilter(query: ListAuditEventsQuery): AuditEventsFilter {
+  const clauses: string[] = [];
+  const values: Array<string | number> = [];
+
+  if (query.agentId) {
+    clauses.push("agent_id = ?");
+    values.push(query.agentId);
+  }
+
+  if (query.actorUsername) {
+    clauses.push("actor_username = ?");
+    values.push(query.actorUsername);
+  }
+
+  if (query.scope) {
+    clauses.push("scope = ?");
+    values.push(query.scope);
+  }
+
+  if (query.operationIdPrefix) {
+    clauses.push("operation_id LIKE ? ESCAPE '\\'");
+    values.push(`${escapeLikePrefix(query.operationIdPrefix)}%`);
+  }
+
+  if (query.action) {
+    clauses.push("action = ?");
+    values.push(query.action);
+  }
+
+  if (query.status) {
+    clauses.push("status = ?");
+    values.push(query.status);
+  }
+
+  if (query.search) {
+    clauses.push(`(
+      agent_id LIKE ? ESCAPE '\\'
+      OR agent_display_name LIKE ? ESCAPE '\\'
+      OR actor_username LIKE ? ESCAPE '\\'
+      OR actor_display_name LIKE ? ESCAPE '\\'
+      OR operation_id LIKE ? ESCAPE '\\'
+      OR message LIKE ? ESCAPE '\\'
+      OR error_code LIKE ? ESCAPE '\\'
+    )`);
+    const searchPattern = `%${escapeLikePrefix(query.search)}%`;
+    values.push(
+      searchPattern,
+      searchPattern,
+      searchPattern,
+      searchPattern,
+      searchPattern,
+      searchPattern,
+      searchPattern,
+    );
+  }
+
+  return {
+    where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "",
+    values,
+  };
+}
+
 function stringifyMetadata(metadata: Record<string, unknown> | undefined) {
-  return metadata ? JSON.stringify(metadata) : null;
+  if (!metadata) {
+    return null;
+  }
+
+  const seen = new WeakSet<object>();
+
+  try {
+    return JSON.stringify(metadata, (_key, value) => {
+      if (typeof value === "bigint") {
+        return value.toString();
+      }
+
+      if (value instanceof Error) {
+        return {
+          name: value.name,
+          message: value.message,
+          stack: value.stack,
+        };
+      }
+
+      if (typeof value === "object" && value !== null) {
+        if (seen.has(value)) {
+          return "[Circular]";
+        }
+
+        seen.add(value);
+      }
+
+      return value;
+    });
+  } catch (error) {
+    return JSON.stringify({
+      serializationError:
+        error instanceof Error ? error.message : "Unable to serialize metadata",
+    });
+  }
 }
 
 function parseMetadata(metadataJson: string | null) {

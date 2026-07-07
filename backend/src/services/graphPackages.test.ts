@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { AppError } from "../errors.js";
 import {
   buildCopilotAgentsListUrl,
   bulkGetPackageDetails,
@@ -68,7 +69,11 @@ describe("GraphPackagesClient", () => {
 
       override async blockPackage(_accessToken: string, id: string) {
         if (id === "P_3") {
-          throw new Error("blocked by policy");
+          throw new AppError(403, "Forbidden", "blocked by policy", {
+            graph: {
+              error: { code: "Forbidden", message: "blocked by policy" },
+            },
+          });
         }
       }
     }
@@ -86,6 +91,14 @@ describe("GraphPackagesClient", () => {
       "skipped",
       "succeeded",
     ]);
+    expect(result.results.find((item) => item.id === "P_3")).toMatchObject({
+      status: "failed",
+      message: "blocked by policy",
+      errorCode: "Forbidden",
+      errorDetails: {
+        graph: { error: { code: "Forbidden", message: "blocked by policy" } },
+      },
+    });
   });
 
   it("reports bulk package starts before package results", async () => {

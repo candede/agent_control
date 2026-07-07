@@ -12,6 +12,7 @@ export type CopilotPackage = {
   shortDescription?: string;
   isBlocked: boolean;
   supportedHosts?: string[];
+  createdDateTime?: string;
   lastModifiedDateTime?: string;
   publisher?: string;
   availableTo?: string;
@@ -52,6 +53,8 @@ export type BulkPackageResult = {
   displayName: string;
   status: "succeeded" | "failed" | "skipped";
   message?: string;
+  errorCode?: string;
+  errorDetails?: unknown;
 };
 
 export type BulkSideEffectError = {
@@ -136,12 +139,19 @@ export type AuditEvent = {
 
 export type AuditEventsQuery = {
   limit?: number;
+  offset?: number;
   agentId?: string;
   actorUsername?: string;
   scope?: AuditScope;
   action?: AuditAction;
   status?: AuditStatus;
   operationIdPrefix?: string;
+  search?: string;
+};
+
+export type AuditEventsResponse = {
+  value: AuditEvent[];
+  count: number;
 };
 
 export type AuditRequestContext = {
@@ -232,6 +242,10 @@ export async function getAuditEvents(query: AuditEventsQuery = {}) {
     searchParams.set("limit", query.limit.toString());
   }
 
+  if (query.offset !== undefined) {
+    searchParams.set("offset", query.offset.toString());
+  }
+
   if (query.agentId) {
     searchParams.set("agentId", query.agentId);
   }
@@ -256,8 +270,12 @@ export async function getAuditEvents(query: AuditEventsQuery = {}) {
     searchParams.set("operationIdPrefix", query.operationIdPrefix);
   }
 
+  if (query.search) {
+    searchParams.set("search", query.search);
+  }
+
   const queryString = searchParams.toString();
-  return request<{ value: AuditEvent[] }>(
+  return request<AuditEventsResponse>(
     `/api/audit/events${queryString ? `?${queryString}` : ""}`,
   );
 }

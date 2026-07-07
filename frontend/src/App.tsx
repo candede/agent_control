@@ -224,6 +224,7 @@ function App() {
   const [availableToFilter, setAvailableToFilter] = useState("all");
   const [hostFilter, setHostFilter] = useState("all");
   const [platformFilter, setPlatformFilter] = useState("all");
+  const [createdWithinDays, setCreatedWithinDays] = useState("");
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -461,6 +462,7 @@ function App() {
 
   const filteredAgents = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLowerCase();
+    const creationWindowDays = parseOptionalPositiveInteger(createdWithinDays);
 
     return agents.filter((agent) => {
       const matchesStatus =
@@ -480,6 +482,9 @@ function App() {
       const matchesPlatform =
         effectivePlatformFilter === "all" ||
         getBuiltWithFilterValue(agent) === effectivePlatformFilter;
+      const matchesCreationAge = creationWindowDays
+        ? isCreatedWithinDays(agent.createdDateTime, creationWindowDays)
+        : true;
       const usage = usageByAgentId.get(agent.id);
       const matchesUsage = matchesUsageFilter(usage, usageFilter, inactiveDays);
       const matchesBulkRef = normalizedBulkRefQuery
@@ -497,6 +502,7 @@ function App() {
         usage?.agentName,
         usage?.creatorType,
         usage?.agentId,
+        agent.createdDateTime,
         agent.id,
         agent.supportedHosts?.join(" "),
       ]
@@ -510,6 +516,7 @@ function App() {
         matchesAvailability &&
         matchesHost &&
         matchesPlatform &&
+        matchesCreationAge &&
         matchesUsage &&
         matchesBulkRef &&
         (normalizedBulkRefQuery ||
@@ -521,6 +528,7 @@ function App() {
     agents,
     availableToFilter,
     bulkRefSearch,
+    createdWithinDays,
     deferredQuery,
     effectivePlatformFilter,
     hostFilter,
@@ -554,6 +562,7 @@ function App() {
     availableToFilter !== "all" ||
     hostFilter !== "all" ||
     effectivePlatformFilter !== "all" ||
+    parseOptionalPositiveInteger(createdWithinDays) !== undefined ||
     usageFilter !== "all";
 
   const visibleSelectedCount = filteredAgents.filter((agent) =>
@@ -996,6 +1005,7 @@ function App() {
     setAvailableToFilter("all");
     setHostFilter("all");
     setPlatformFilter("all");
+    setCreatedWithinDays("");
     setUsageFilter("all");
   }
 
@@ -1348,6 +1358,27 @@ function App() {
                     </option>
                   ))}
                 </select>
+              </label>
+              <label className="threshold-filter">
+                <span>Created in last</span>
+                <div className="number-with-unit">
+                  <input
+                    className={
+                      parseOptionalPositiveInteger(createdWithinDays)
+                        ? "active-filter-input"
+                        : undefined
+                    }
+                    type="number"
+                    min="1"
+                    max="3650"
+                    value={createdWithinDays}
+                    onChange={(event) =>
+                      setCreatedWithinDays(event.target.value)
+                    }
+                    placeholder="Any"
+                  />
+                  <span>days</span>
+                </div>
               </label>
             </div>
 
@@ -2242,6 +2273,21 @@ function isInactiveUsage(
   return elapsedDays > inactiveDays;
 }
 
+function isCreatedWithinDays(value: string | undefined, days: number) {
+  if (!value) {
+    return false;
+  }
+
+  const createdAt = new Date(value).getTime();
+
+  if (Number.isNaN(createdAt)) {
+    return false;
+  }
+
+  const elapsedMs = Date.now() - createdAt;
+  return elapsedMs >= 0 && elapsedMs <= days * 86_400_000;
+}
+
 function startOfUtcDay(date: Date) {
   return new Date(
     Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
@@ -2261,6 +2307,16 @@ function clampNumber(
   }
 
   return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+}
+
+function parseOptionalPositiveInteger(value: string) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return undefined;
+  }
+
+  return Math.floor(parsed);
 }
 
 function formatReportKind(kind: UsageReportKind) {

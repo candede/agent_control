@@ -61,6 +61,113 @@ describe("AuditLog", () => {
     expect(completed.completedAt).toBeDefined();
   });
 
+  it("records failure messages and error codes", () => {
+    const auditLog = createAuditLog();
+
+    const started = auditLog.startEvent({
+      operationId: "operation-1",
+      scope: "single",
+      action: "unblock",
+      targetBlockedState: false,
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      requestPath: "/api/agents/agent-1/unblock",
+    });
+
+    const completed = auditLog.completeEvent(started.id, {
+      status: "failed",
+      message: "Insufficient privileges to complete the operation.",
+      errorCode: "Authorization_RequestDenied",
+      metadata: {
+        errorDetails: {
+          graph: {
+            error: {
+              code: "Authorization_RequestDenied",
+              message: "Insufficient privileges to complete the operation.",
+            },
+          },
+        },
+      },
+    });
+
+    expect(completed).toMatchObject({
+      status: "failed",
+      message: "Insufficient privileges to complete the operation.",
+      errorCode: "Authorization_RequestDenied",
+      metadata: {
+        errorDetails: {
+          graph: {
+            error: {
+              code: "Authorization_RequestDenied",
+              message: "Insufficient privileges to complete the operation.",
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it("serializes non-JSON metadata without masking audit completion", () => {
+    const auditLog = createAuditLog();
+    const circularMetadata: Record<string, unknown> = {
+      retryAfterMs: 1000n,
+      cause: new Error("Graph payload unavailable"),
+    };
+    circularMetadata.self = circularMetadata;
+
+    const started = auditLog.startEvent({
+      operationId: "operation-1",
+      scope: "single",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      requestPath: "/api/agents/agent-1/block",
+    });
+
+    const completed = auditLog.completeEvent(started.id, {
+      status: "failed",
+      metadata: circularMetadata,
+    });
+
+    expect(completed.metadata).toMatchObject({
+      retryAfterMs: "1000",
+      cause: {
+        name: "Error",
+        message: "Graph payload unavailable",
+      },
+      self: "[Circular]",
+    });
+  });
+
+  it("records a serialization error when metadata cannot be stringified", () => {
+    const auditLog = createAuditLog();
+    const started = auditLog.startEvent({
+      operationId: "operation-1",
+      scope: "single",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      requestPath: "/api/agents/agent-1/block",
+    });
+
+    const completed = auditLog.completeEvent(started.id, {
+      status: "failed",
+      metadata: {
+        payload: {
+          toJSON() {
+            throw new Error("broken serializer");
+          },
+        },
+      },
+    });
+
+    expect(completed.metadata).toEqual({
+      serializationError: "broken serializer",
+    });
+  });
+
   it("filters newest audit events", () => {
     const auditLog = createAuditLog();
 
@@ -93,6 +200,65 @@ describe("AuditLog", () => {
       action: "unblock",
       agentId: "agent-2",
     });
+  });
+
+  it("paginates audit events and counts the filtered result", () => {
+    const auditLog = createAuditLog();
+
+    for (let index = 0; index < 5; index += 1) {
+      auditLog.startEvent({
+        operationId: `operation-${index}`,
+        scope: "single",
+        action: index % 2 === 0 ? "block" : "unblock",
+        targetBlockedState: index % 2 === 0,
+        agentId: `agent-${index}`,
+        actor: actor("admin@example.com"),
+        startedAt: `2026-07-03T10:0${index}:00.000Z`,
+        requestPath: `/api/agents/agent-${index}/block`,
+      });
+    }
+
+    const query = { action: "block" as const, limit: 2, offset: 1 };
+    const events = auditLog.listEvents(query);
+
+    expect(auditLog.countEvents(query)).toBe(3);
+    expect(events.map((event) => event.agentId)).toEqual([
+      "agent-2",
+      "agent-0",
+    ]);
+  });
+
+  it("searches audit events before paginating", () => {
+    const auditLog = createAuditLog();
+
+    auditLog.startEvent({
+      operationId: "operation-1",
+      scope: "single",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-1",
+      agentDisplayName: "Research Agent",
+      actor: actor("admin@example.com"),
+      startedAt: "2026-07-03T10:00:00.000Z",
+      requestPath: "/api/agents/agent-1/block",
+    });
+    auditLog.startEvent({
+      operationId: "operation-2",
+      scope: "single",
+      action: "block",
+      targetBlockedState: true,
+      agentId: "agent-2",
+      agentDisplayName: "Sales Agent",
+      actor: actor("owner@example.com"),
+      startedAt: "2026-07-03T10:01:00.000Z",
+      requestPath: "/api/agents/agent-2/block",
+    });
+
+    const query = { search: "research", limit: 1, offset: 0 };
+    const events = auditLog.listEvents(query);
+
+    expect(auditLog.countEvents(query)).toBe(1);
+    expect(events[0]).toMatchObject({ agentId: "agent-1" });
   });
 
   it("filters bulk audit events by operation id prefix", () => {

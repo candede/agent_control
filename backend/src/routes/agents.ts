@@ -209,6 +209,10 @@ async function runAuditedAgentAction(
       status: "failed",
       message: error instanceof Error ? error.message : "Unknown error",
       errorCode: error instanceof AppError ? error.code : undefined,
+      metadata:
+        error instanceof AppError && error.details !== undefined
+          ? { errorDetails: error.details }
+          : undefined,
     });
     throw error;
   }
@@ -393,6 +397,11 @@ function createBulkAuditHooks(
       completeAuditEvent(auditEvents.get(result.id), {
         status: result.status,
         message: result.message,
+        errorCode: result.errorCode,
+        metadata:
+          result.errorDetails !== undefined
+            ? { errorDetails: result.errorDetails }
+            : undefined,
       });
     },
   };

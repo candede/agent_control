@@ -48,10 +48,12 @@ export type CompleteAuditEvent = {
 
 export type ListAuditEventsQuery = {
   limit?: number;
+  offset?: number;
   agentId?: string;
   actorUsername?: string;
   scope?: AuditScope;
   action?: AuditAction;
   status?: AuditStatus;
   operationIdPrefix?: string;
+  search?: string;
 };

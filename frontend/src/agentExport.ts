@@ -18,6 +18,7 @@ type AgentExportRow = {
   sensitivity: string;
   categories: string;
   elementTypes: string;
+  created: string;
   lastModified: string;
   reportAgentId: string;
   reportAgentName: string;
@@ -57,6 +58,7 @@ const csvHeaders: Array<{ key: keyof AgentExportRow; label: string }> = [
   { key: "sensitivity", label: "Sensitivity" },
   { key: "categories", label: "Categories" },
   { key: "elementTypes", label: "Element types" },
+  { key: "created", label: "Created" },
   { key: "lastModified", label: "Last modified" },
   { key: "reportAgentId", label: "Report Agent ID" },
   { key: "reportAgentName", label: "Report agent name" },
@@ -103,6 +105,7 @@ export function toAgentExportRow(
     sensitivity: formatDetailLabel(detail.sensitivity) ?? "",
     categories: formatList(detail.categories) ?? "",
     elementTypes: formatList(agent.elementTypes) ?? "",
+    created: formatDate(agent.createdDateTime) ?? "",
     lastModified: formatDate(agent.lastModifiedDateTime) ?? "",
     reportAgentId: usage?.agentId ?? "",
     reportAgentName: usage?.agentName ?? "",

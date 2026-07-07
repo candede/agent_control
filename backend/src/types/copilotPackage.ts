@@ -18,6 +18,7 @@ export type CopilotPackage = {
   shortDescription?: string;
   isBlocked: boolean;
   supportedHosts?: string[];
+  createdDateTime?: string;
   lastModifiedDateTime?: string;
   publisher?: string;
   availableTo?: string;
@@ -45,6 +46,8 @@ export type BulkPackageResult = {
   displayName: string;
   status: "succeeded" | "failed" | "skipped";
   message?: string;
+  errorCode?: string;
+  errorDetails?: unknown;
 };
 
 export type BulkSideEffectError = {
