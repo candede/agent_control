@@ -44,10 +44,10 @@ type AgentTableProps = {
   recentlyChangedIds: Set<string>;
   selectionDisabled: boolean;
   usageByAgentId: Map<string, AgentTableUsage>;
-  allVisibleSelected: boolean;
+  allMatchingSelected: boolean;
   selectedCount: number;
   onToggleAgentSelection: (agentId: string) => void;
-  onToggleVisibleSelection: () => void;
+  onToggleMatchingSelection: () => void;
   onViewDetails: (agent: CopilotPackage) => void;
   onBlock: (agent: CopilotPackage) => void;
   onUnblock: (agent: CopilotPackage) => void;
@@ -72,10 +72,10 @@ export function AgentTable({
   recentlyChangedIds,
   selectionDisabled,
   usageByAgentId,
-  allVisibleSelected,
+  allMatchingSelected,
   selectedCount,
   onToggleAgentSelection,
-  onToggleVisibleSelection,
+  onToggleMatchingSelection,
   onViewDetails,
   onBlock,
   onUnblock,
@@ -120,6 +120,11 @@ export function AgentTable({
   }, [columnPickerOpen]);
 
   const visibleColumns = new Set(visibleColumnIds);
+  const columnCountClassName = `agent-table-columns-${visibleColumnIds.length}`;
+
+  function toggleColumnPickerOpen() {
+    setColumnPickerOpen((isOpen) => !isOpen);
+  }
 
   function isColumnVisible(columnId: AgentTableColumnId) {
     return visibleColumns.has(columnId);
@@ -157,19 +162,16 @@ export function AgentTable({
       <div className="selection-summary">
         <span>{selectedCount} selected</span>
       </div>
-      <table
-        className="agent-table"
-        style={{ minWidth: getAgentTableMinWidth(visibleColumnIds.length) }}
-      >
+      <table className={`agent-table ${columnCountClassName}`}>
         <thead>
           <tr>
             <th scope="col" className="select-cell">
               <input
                 type="checkbox"
-                aria-label="Select all visible agents"
-                checked={allVisibleSelected}
+                aria-label="Select all matching agents"
+                checked={allMatchingSelected}
                 disabled={selectionDisabled || agents.length === 0}
-                onChange={onToggleVisibleSelection}
+                onChange={onToggleMatchingSelection}
               />
             </th>
             <th scope="col">Agent</th>
@@ -193,16 +195,29 @@ export function AgentTable({
               <div className="action-header">
                 <span>Action</span>
                 <div className="column-view-menu" ref={columnPickerRef}>
-                  <button
-                    type="button"
-                    className="secondary column-view-button"
-                    aria-haspopup="dialog"
-                    aria-expanded={columnPickerOpen}
-                    onClick={() => setColumnPickerOpen((isOpen) => !isOpen)}
-                  >
-                    <Eye aria-hidden="true" />
-                    View
-                  </button>
+                  {columnPickerOpen ? (
+                    <button
+                      type="button"
+                      className="secondary column-view-button"
+                      aria-haspopup="dialog"
+                      aria-expanded="true"
+                      onClick={toggleColumnPickerOpen}
+                    >
+                      <Eye aria-hidden="true" />
+                      View
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="secondary column-view-button"
+                      aria-haspopup="dialog"
+                      aria-expanded="false"
+                      onClick={toggleColumnPickerOpen}
+                    >
+                      <Eye aria-hidden="true" />
+                      View
+                    </button>
+                  )}
                   {columnPickerOpen ? (
                     <div
                       className="column-view-popover"
@@ -398,10 +413,6 @@ function saveStoredVisibleAgentTableColumns(columnIds: AgentTableColumnId[]) {
   } catch {
     // Table view preferences are best effort only.
   }
-}
-
-function getAgentTableMinWidth(visibleColumnCount: number) {
-  return Math.max(760, 560 + visibleColumnCount * 110);
 }
 
 function UsageCell({ usage }: { usage?: AgentTableUsage }) {

@@ -97,6 +97,7 @@ type BulkRefSearchState = {
 const usageReportsStorageKey = "agent-control:usage-reports:v1";
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
+const agentDisplayPageSize = 1_000;
 
 const emptyUsageReports = (): UsageReportsState => ({});
 
@@ -256,6 +257,10 @@ function App() {
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
   const [activeView, setActiveView] = useState<ActiveView>("agents");
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
+  const [agentDisplayWindow, setAgentDisplayWindow] = useState({
+    key: "",
+    limit: agentDisplayPageSize,
+  });
   const [recentlyChangedAgentIds, setRecentlyChangedAgentIds] = useState<
     Set<string>
   >(() => new Set());
@@ -460,6 +465,22 @@ function App() {
     normalizedBulkRefQuery && bulkRefSearch?.ref !== normalizedBulkRefQuery,
   );
 
+  const agentDisplayWindowKey = [
+    availableToFilter,
+    createdWithinDays,
+    deferredQuery,
+    effectivePlatformFilter,
+    hostFilter,
+    inactiveDays,
+    publisherFilter,
+    statusFilter,
+    usageFilter,
+  ].join("\u001f");
+  const visibleAgentLimit =
+    agentDisplayWindow.key === agentDisplayWindowKey
+      ? agentDisplayWindow.limit
+      : agentDisplayPageSize;
+
   const filteredAgents = useMemo(() => {
     const normalizedQuery = deferredQuery.trim().toLowerCase();
     const creationWindowDays = parseOptionalPositiveInteger(createdWithinDays);
@@ -545,6 +566,11 @@ function App() {
     [agents, selectedAgentIds],
   );
 
+  const displayedAgents = useMemo(
+    () => filteredAgents.slice(0, visibleAgentLimit),
+    [filteredAgents, visibleAgentLimit],
+  );
+
   const filteredAllowedAgentCount = filteredAgents.filter(
     (agent) => !agent.isBlocked,
   ).length;
@@ -565,12 +591,14 @@ function App() {
     parseOptionalPositiveInteger(createdWithinDays) !== undefined ||
     usageFilter !== "all";
 
-  const visibleSelectedCount = filteredAgents.filter((agent) =>
+  const matchingSelectedCount = filteredAgents.filter((agent) =>
     selectedAgentIds.has(agent.id),
   ).length;
-  const allVisibleSelected =
-    filteredAgents.length > 0 && visibleSelectedCount === filteredAgents.length;
+  const allMatchingSelected =
+    filteredAgents.length > 0 &&
+    matchingSelectedCount === filteredAgents.length;
   const exportableAgentCount = filteredAgents.length;
+  const hasMoreDisplayedAgents = displayedAgents.length < filteredAgents.length;
 
   async function loadSession() {
     setLoadingSession(true);
@@ -1078,13 +1106,13 @@ function App() {
     });
   }
 
-  function toggleVisibleSelection(visibleAgents: CopilotPackage[]) {
+  function toggleMatchingSelection(matchingAgents: CopilotPackage[]) {
     setSelectedAgentIds((current) => {
       const next = new Set(current);
-      const visibleIds = visibleAgents.map((agent) => agent.id);
-      const allSelected = visibleIds.every((agentId) => next.has(agentId));
+      const matchingIds = matchingAgents.map((agent) => agent.id);
+      const allSelected = matchingIds.every((agentId) => next.has(agentId));
 
-      for (const agentId of visibleIds) {
+      for (const agentId of matchingIds) {
         if (allSelected) {
           next.delete(agentId);
         } else {
@@ -1496,23 +1524,43 @@ function App() {
           {loadingAgents ? (
             <div className="screen-state">Loading Copilot agents...</div>
           ) : (
-            <AgentTable
-              agents={filteredAgents}
-              busyAgentId={busyAgentId}
-              selectedIds={selectedAgentIds}
-              recentlyChangedIds={recentlyChangedAgentIds}
-              selectionDisabled={Boolean(busyBulkAction)}
-              usageByAgentId={usageByAgentId}
-              allVisibleSelected={allVisibleSelected}
-              selectedCount={selectedAgentIds.size}
-              onToggleAgentSelection={toggleAgentSelection}
-              onToggleVisibleSelection={() =>
-                toggleVisibleSelection(filteredAgents)
-              }
-              onViewDetails={(agent) => void handleViewAgentDetails(agent)}
-              onBlock={(agent) => void handleAgentAction(agent, true)}
-              onUnblock={(agent) => void handleAgentAction(agent, false)}
-            />
+            <div className="agent-table-stack">
+              <AgentTable
+                agents={displayedAgents}
+                busyAgentId={busyAgentId}
+                selectedIds={selectedAgentIds}
+                recentlyChangedIds={recentlyChangedAgentIds}
+                selectionDisabled={Boolean(busyBulkAction)}
+                usageByAgentId={usageByAgentId}
+                allMatchingSelected={allMatchingSelected}
+                selectedCount={selectedAgentIds.size}
+                onToggleAgentSelection={toggleAgentSelection}
+                onToggleMatchingSelection={() =>
+                  toggleMatchingSelection(filteredAgents)
+                }
+                onViewDetails={(agent) => void handleViewAgentDetails(agent)}
+                onBlock={(agent) => void handleAgentAction(agent, true)}
+                onUnblock={(agent) => void handleAgentAction(agent, false)}
+              />
+              <AgentDisplayWindowControls
+                displayedCount={displayedAgents.length}
+                totalCount={filteredAgents.length}
+                hasMore={hasMoreDisplayedAgents}
+                onLoadMore={() =>
+                  setAgentDisplayWindow((currentWindow) => {
+                    const currentLimit =
+                      currentWindow.key === agentDisplayWindowKey
+                        ? currentWindow.limit
+                        : agentDisplayPageSize;
+
+                    return {
+                      key: agentDisplayWindowKey,
+                      limit: currentLimit + agentDisplayPageSize,
+                    };
+                  })
+                }
+              />
+            </div>
           )}
         </>
       ) : activeView === "users" ? (
@@ -1770,6 +1818,39 @@ function ExportProgressMeter({
         <span>{completed} finished</span>
         <span>{Math.max(total - completed, 0)} remaining</span>
       </div>
+    </div>
+  );
+}
+
+function AgentDisplayWindowControls({
+  displayedCount,
+  totalCount,
+  hasMore,
+  onLoadMore,
+}: {
+  displayedCount: number;
+  totalCount: number;
+  hasMore: boolean;
+  onLoadMore: () => void;
+}) {
+  if (totalCount === 0) {
+    return null;
+  }
+
+  const remainingCount = Math.max(0, totalCount - displayedCount);
+  const nextCount = Math.min(agentDisplayPageSize, remainingCount);
+
+  return (
+    <div className="agent-display-window" aria-live="polite">
+      <span>
+        Showing {displayedCount.toLocaleString()} of{" "}
+        {totalCount.toLocaleString()} matching agents
+      </span>
+      {hasMore ? (
+        <button type="button" className="secondary" onClick={onLoadMore}>
+          Load {nextCount.toLocaleString()} more
+        </button>
+      ) : null}
     </div>
   );
 }

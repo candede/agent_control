@@ -1440,6 +1440,34 @@ button.export-choice-card.secondary {
   border-bottom: 1px solid var(--border);
 }
 
+.agent-table-stack {
+  display: grid;
+  gap: 0;
+}
+
+.agent-table-stack .table-shell {
+  border-bottom-right-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.agent-display-window {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 8px;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  background: #fff;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .action-header {
   display: flex;
   align-items: center;
@@ -1540,6 +1568,39 @@ table {
 
 .agent-table {
   min-width: 1320px;
+}
+
+.agent-table.agent-table-columns-0,
+.agent-table.agent-table-columns-1 {
+  min-width: 760px;
+}
+
+.agent-table.agent-table-columns-2 {
+  min-width: 780px;
+}
+
+.agent-table.agent-table-columns-3 {
+  min-width: 890px;
+}
+
+.agent-table.agent-table-columns-4 {
+  min-width: 1000px;
+}
+
+.agent-table.agent-table-columns-5 {
+  min-width: 1110px;
+}
+
+.agent-table.agent-table-columns-6 {
+  min-width: 1220px;
+}
+
+.agent-table.agent-table-columns-7 {
+  min-width: 1330px;
+}
+
+.agent-table.agent-table-columns-8 {
+  min-width: 1440px;
 }
 
 .select-cell {
