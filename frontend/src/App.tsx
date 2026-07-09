@@ -98,6 +98,7 @@ const usageReportsStorageKey = "agent-control:usage-reports:v1";
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
 const agentDisplayPageSize = 1_000;
+const maxTransientChangedRows = 50;
 
 const emptyUsageReports = (): UsageReportsState => ({});
 
@@ -270,7 +271,8 @@ function App() {
   const bulkRefSearchRequestId = useRef(0);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
-  const stateChangeTimers = useRef(new Map<string, number>());
+  const stateChangeVersions = useRef(new Map<string, number>());
+  const stateChangeTimerIds = useRef(new Set<number>());
   const resumeBulkJob = useEffectEvent((jobId: string) => {
     void followBulkJob(jobId);
   });
@@ -303,7 +305,7 @@ function App() {
 
   useEffect(
     () => () => {
-      for (const timerId of stateChangeTimers.current.values()) {
+      for (const timerId of stateChangeTimerIds.current) {
         window.clearTimeout(timerId);
       }
     },
@@ -367,7 +369,11 @@ function App() {
     const hosts = new Map<string, string>();
 
     for (const agent of agents) {
-      for (const host of agent.supportedHosts ?? []) {
+      if (hasUnknownHostValue(agent)) {
+        hosts.set(unknownHostValue, "Unknown");
+      }
+
+      for (const host of getKnownHostValues(agent)) {
         hosts.set(host, formatHostLabel(host));
       }
     }
@@ -480,95 +486,91 @@ function App() {
     agentDisplayWindow.key === agentDisplayWindowKey
       ? agentDisplayWindow.limit
       : agentDisplayPageSize;
+  const agentFilterCriteria = useMemo<AgentFilterCriteria>(
+    () => ({
+      availableToFilter,
+      bulkRefSearch,
+      creationWindowDays: parseOptionalPositiveInteger(createdWithinDays),
+      effectivePlatformFilter,
+      hostFilter,
+      inactiveDays,
+      normalizedBulkRefQuery,
+      normalizedQuery: deferredQuery.trim().toLowerCase(),
+      publisherFilter,
+      statusFilter,
+      usageByAgentId,
+      usageFilter,
+    }),
+    [
+      availableToFilter,
+      bulkRefSearch,
+      createdWithinDays,
+      deferredQuery,
+      effectivePlatformFilter,
+      hostFilter,
+      inactiveDays,
+      normalizedBulkRefQuery,
+      publisherFilter,
+      statusFilter,
+      usageByAgentId,
+      usageFilter,
+    ],
+  );
 
   const filteredAgents = useMemo(() => {
-    const normalizedQuery = deferredQuery.trim().toLowerCase();
-    const creationWindowDays = parseOptionalPositiveInteger(createdWithinDays);
-
-    return agents.filter((agent) => {
-      const matchesStatus =
-        statusFilter === "all" ||
-        (statusFilter === "blocked" && agent.isBlocked) ||
-        (statusFilter === "allowed" && !agent.isBlocked);
-      const matchesPublisher =
-        publisherFilter === "all" ||
-        agent.publisher === publisherFilter ||
-        (!agent.publisher && publisherFilter === unknownPublisherValue);
-      const matchesAvailability = matchesAvailableToFilter(
-        agent.availableTo,
-        availableToFilter,
-      );
-      const matchesHost =
-        hostFilter === "all" || agent.supportedHosts?.includes(hostFilter);
-      const matchesPlatform =
-        effectivePlatformFilter === "all" ||
-        getBuiltWithFilterValue(agent) === effectivePlatformFilter;
-      const matchesCreationAge = creationWindowDays
-        ? isCreatedWithinDays(agent.createdDateTime, creationWindowDays)
-        : true;
-      const usage = usageByAgentId.get(agent.id);
-      const matchesUsage = matchesUsageFilter(usage, usageFilter, inactiveDays);
-      const matchesBulkRef = normalizedBulkRefQuery
-        ? bulkRefSearch?.ref === normalizedBulkRefQuery &&
-          bulkRefSearch.agentIds.has(agent.id)
-        : true;
-
-      const searchableText = [
-        agent.displayName,
-        agent.shortDescription,
-        agent.publisher,
-        formatDetailLabel(agent.availableTo),
-        agent.platform,
-        getBuiltWithLabel(agent),
-        usage?.agentName,
-        usage?.creatorType,
-        usage?.agentId,
-        agent.createdDateTime,
-        agent.id,
-        agent.supportedHosts?.join(" "),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-
-      return (
-        matchesStatus &&
-        matchesPublisher &&
-        matchesAvailability &&
-        matchesHost &&
-        matchesPlatform &&
-        matchesCreationAge &&
-        matchesUsage &&
-        matchesBulkRef &&
-        (normalizedBulkRefQuery ||
-          !normalizedQuery ||
-          searchableText.includes(normalizedQuery))
-      );
-    });
-  }, [
-    agents,
-    availableToFilter,
-    bulkRefSearch,
-    createdWithinDays,
-    deferredQuery,
-    effectivePlatformFilter,
-    hostFilter,
-    inactiveDays,
-    publisherFilter,
-    statusFilter,
-    usageByAgentId,
-    usageFilter,
-    normalizedBulkRefQuery,
-  ]);
+    return agents.filter((agent) =>
+      agentMatchesFilters(agent, agentFilterCriteria, true),
+    );
+  }, [agents, agentFilterCriteria]);
 
   const selectedAgents = useMemo(
     () => agents.filter((agent) => selectedAgentIds.has(agent.id)),
     [agents, selectedAgentIds],
   );
 
-  const displayedAgents = useMemo(
+  const displayedFilteredAgents = useMemo(
     () => filteredAgents.slice(0, visibleAgentLimit),
     [filteredAgents, visibleAgentLimit],
+  );
+  const recentlyChangedFilteredOutAgents = useMemo(() => {
+    if (statusFilter === "all" || recentlyChangedAgentIds.size === 0) {
+      return [];
+    }
+
+    const filteredAgentIds = new Set(filteredAgents.map((agent) => agent.id));
+
+    const transientAgents: CopilotPackage[] = [];
+
+    for (const agent of agents) {
+      if (
+        recentlyChangedAgentIds.has(agent.id) &&
+        !filteredAgentIds.has(agent.id) &&
+        agentMatchesFilters(agent, agentFilterCriteria, false)
+      ) {
+        transientAgents.push(agent);
+
+        if (transientAgents.length >= maxTransientChangedRows) {
+          break;
+        }
+      }
+    }
+
+    return transientAgents;
+  }, [
+    agents,
+    agentFilterCriteria,
+    filteredAgents,
+    recentlyChangedAgentIds,
+    statusFilter,
+  ]);
+  const displayedAgents = useMemo(
+    () =>
+      mergeAgentRowsInCatalogOrder(
+        agents,
+        displayedFilteredAgents,
+        recentlyChangedFilteredOutAgents,
+      ),
+    [agents, displayedFilteredAgents, recentlyChangedFilteredOutAgents],
   );
 
   const filteredAllowedAgentCount = filteredAgents.filter(
@@ -598,7 +600,8 @@ function App() {
     filteredAgents.length > 0 &&
     matchingSelectedCount === filteredAgents.length;
   const exportableAgentCount = filteredAgents.length;
-  const hasMoreDisplayedAgents = displayedAgents.length < filteredAgents.length;
+  const hasMoreDisplayedAgents =
+    displayedFilteredAgents.length < filteredAgents.length;
 
   async function loadSession() {
     setLoadingSession(true);
@@ -1010,11 +1013,12 @@ function App() {
   }
 
   function applyBulkActionResult(result: BulkActionResult) {
-    for (const item of result.results) {
-      if (item.status === "succeeded") {
-        updateCachedAgentBlockedState(item.id, result.targetBlockedState);
-      }
-    }
+    updateCachedAgentBlockedStates(
+      result.results
+        .filter((item) => item.status === "succeeded")
+        .map((item) => item.id),
+      result.targetBlockedState,
+    );
 
     setBulkResult(result);
     setSelectedAgentIds(
@@ -1041,55 +1045,101 @@ function App() {
     agentId: string,
     targetBlockedState: boolean,
   ) {
-    const cachedDetail = agentDetailsCache.current.get(agentId);
+    updateCachedAgentBlockedStates([agentId], targetBlockedState);
+  }
 
-    if (cachedDetail && cachedDetail.isBlocked !== targetBlockedState) {
-      agentDetailsCache.current.set(agentId, {
-        ...cachedDetail,
-        isBlocked: targetBlockedState,
-      });
+  function updateCachedAgentBlockedStates(
+    agentIds: string[],
+    targetBlockedState: boolean,
+  ) {
+    const changedAgentIds = new Set(agentIds);
+
+    if (changedAgentIds.size === 0) {
+      return;
     }
 
-    setAgents((currentAgents) =>
-      currentAgents.map((currentAgent) =>
-        currentAgent.id === agentId &&
-        currentAgent.isBlocked !== targetBlockedState
-          ? { ...currentAgent, isBlocked: targetBlockedState }
-          : currentAgent,
-      ),
-    );
+    for (const agentId of changedAgentIds) {
+      const cachedDetail = agentDetailsCache.current.get(agentId);
+
+      if (cachedDetail && cachedDetail.isBlocked !== targetBlockedState) {
+        agentDetailsCache.current.set(agentId, {
+          ...cachedDetail,
+          isBlocked: targetBlockedState,
+        });
+      }
+    }
+
+    setAgents((currentAgents) => {
+      let updatedAnyAgent = false;
+      const nextAgents = currentAgents.map((currentAgent) => {
+        if (
+          !changedAgentIds.has(currentAgent.id) ||
+          currentAgent.isBlocked === targetBlockedState
+        ) {
+          return currentAgent;
+        }
+
+        updatedAnyAgent = true;
+        return { ...currentAgent, isBlocked: targetBlockedState };
+      });
+
+      return updatedAnyAgent ? nextAgents : currentAgents;
+    });
     setAgentDetail((currentDetail) =>
-      currentDetail?.id === agentId &&
+      currentDetail &&
+      changedAgentIds.has(currentDetail.id) &&
       currentDetail.isBlocked !== targetBlockedState
         ? { ...currentDetail, isBlocked: targetBlockedState }
         : currentDetail,
     );
-    markAgentStateChanged(agentId);
+    markAgentStatesChanged([...changedAgentIds]);
   }
 
-  function markAgentStateChanged(agentId: string) {
-    const currentTimerId = stateChangeTimers.current.get(agentId);
-
-    if (currentTimerId) {
-      window.clearTimeout(currentTimerId);
-    }
+  function markAgentStatesChanged(agentIds: string[]) {
+    const changedAgentIds = [...new Set(agentIds)];
 
     setRecentlyChangedAgentIds((current) => {
       const next = new Set(current);
-      next.add(agentId);
-      return next;
+      let addedAnyAgent = false;
+
+      for (const agentId of changedAgentIds) {
+        if (!next.has(agentId)) {
+          next.add(agentId);
+          addedAnyAgent = true;
+        }
+      }
+
+      return addedAnyAgent ? next : current;
     });
 
+    const versions = new Map(
+      changedAgentIds.map((agentId) => {
+        const version = (stateChangeVersions.current.get(agentId) ?? 0) + 1;
+        stateChangeVersions.current.set(agentId, version);
+        return [agentId, version] as const;
+      }),
+    );
+
     const timerId = window.setTimeout(() => {
-      stateChangeTimers.current.delete(agentId);
+      stateChangeTimerIds.current.delete(timerId);
+
       setRecentlyChangedAgentIds((current) => {
         const next = new Set(current);
-        next.delete(agentId);
-        return next;
+        let removedAnyAgent = false;
+
+        for (const [agentId, version] of versions) {
+          if (stateChangeVersions.current.get(agentId) === version) {
+            stateChangeVersions.current.delete(agentId);
+            next.delete(agentId);
+            removedAnyAgent = true;
+          }
+        }
+
+        return removedAnyAgent ? next : current;
       });
     }, 1600);
 
-    stateChangeTimers.current.set(agentId, timerId);
+    stateChangeTimerIds.current.add(timerId);
   }
 
   function toggleAgentSelection(agentId: string) {
@@ -1543,7 +1593,7 @@ function App() {
                 onUnblock={(agent) => void handleAgentAction(agent, false)}
               />
               <AgentDisplayWindowControls
-                displayedCount={displayedAgents.length}
+                displayedCount={displayedFilteredAgents.length}
                 totalCount={filteredAgents.length}
                 hasMore={hasMoreDisplayedAgents}
                 onLoadMore={() =>
@@ -1631,6 +1681,7 @@ function App() {
 }
 
 const unknownPublisherValue = "__unknown__";
+const unknownHostValue = "__unknown_host__";
 const unknownAvailableToValue = "__unknown__";
 const someOrAllAvailableToValue = "__some_or_all__";
 const availableToFilterValuePrefix = "available:";
@@ -1667,6 +1718,115 @@ type BulkConfirmation = {
   actionableCount: number;
   skippedCount: number;
 };
+
+type AgentFilterCriteria = {
+  availableToFilter: string;
+  bulkRefSearch?: BulkRefSearchState;
+  creationWindowDays?: number;
+  effectivePlatformFilter: string;
+  hostFilter: string;
+  inactiveDays: number;
+  normalizedBulkRefQuery?: string;
+  normalizedQuery: string;
+  publisherFilter: string;
+  statusFilter: "all" | "allowed" | "blocked";
+  usageByAgentId: Map<string, AgentUsageSummary>;
+  usageFilter: UsageFilter;
+};
+
+function agentMatchesFilters(
+  agent: CopilotPackage,
+  criteria: AgentFilterCriteria,
+  includeStatus: boolean,
+) {
+  const usage = criteria.usageByAgentId.get(agent.id);
+  const matchesStatus =
+    !includeStatus ||
+    criteria.statusFilter === "all" ||
+    (criteria.statusFilter === "blocked" && agent.isBlocked) ||
+    (criteria.statusFilter === "allowed" && !agent.isBlocked);
+  const matchesPublisher =
+    criteria.publisherFilter === "all" ||
+    agent.publisher === criteria.publisherFilter ||
+    (!agent.publisher && criteria.publisherFilter === unknownPublisherValue);
+  const matchesAvailability = matchesAvailableToFilter(
+    agent.availableTo,
+    criteria.availableToFilter,
+  );
+  const matchesHost =
+    criteria.hostFilter === "all" ||
+    (criteria.hostFilter === unknownHostValue
+      ? hasUnknownHostValue(agent)
+      : getKnownHostValues(agent).includes(criteria.hostFilter));
+  const matchesPlatform =
+    criteria.effectivePlatformFilter === "all" ||
+    getBuiltWithFilterValue(agent) === criteria.effectivePlatformFilter;
+  const matchesCreationAge = criteria.creationWindowDays
+    ? isCreatedWithinDays(agent.createdDateTime, criteria.creationWindowDays)
+    : true;
+  const matchesUsage = matchesUsageFilter(
+    usage,
+    criteria.usageFilter,
+    criteria.inactiveDays,
+  );
+  const matchesBulkRef = criteria.normalizedBulkRefQuery
+    ? criteria.bulkRefSearch?.ref === criteria.normalizedBulkRefQuery &&
+      criteria.bulkRefSearch.agentIds.has(agent.id)
+    : true;
+
+  return (
+    matchesStatus &&
+    matchesPublisher &&
+    matchesAvailability &&
+    matchesHost &&
+    matchesPlatform &&
+    matchesCreationAge &&
+    matchesUsage &&
+    matchesBulkRef &&
+    (criteria.normalizedBulkRefQuery ||
+      !criteria.normalizedQuery ||
+      getAgentSearchableText(agent, usage).includes(criteria.normalizedQuery))
+  );
+}
+
+function getAgentSearchableText(
+  agent: CopilotPackage,
+  usage: AgentUsageSummary | undefined,
+) {
+  return [
+    agent.displayName,
+    agent.shortDescription,
+    agent.publisher,
+    formatDetailLabel(agent.availableTo),
+    agent.platform,
+    getBuiltWithLabel(agent),
+    usage?.agentName,
+    usage?.creatorType,
+    usage?.agentId,
+    agent.createdDateTime,
+    agent.id,
+    getKnownHostValues(agent).join(" "),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function mergeAgentRowsInCatalogOrder(
+  catalogAgents: CopilotPackage[],
+  primaryAgents: CopilotPackage[],
+  additionalAgents: CopilotPackage[],
+) {
+  if (additionalAgents.length === 0) {
+    return primaryAgents;
+  }
+
+  const displayedAgentIds = new Set(
+    [...primaryAgents, ...additionalAgents].map((agent) => agent.id),
+  );
+
+  return catalogAgents.filter((agent) => displayedAgentIds.has(agent.id));
+}
 
 function toBulkProgress(job: BulkActionJob): BulkProgress {
   return {
@@ -1714,6 +1874,23 @@ function formatHostLabel(host: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
+}
+
+function getKnownHostValues(agent: Pick<CopilotPackage, "supportedHosts">) {
+  return [...new Set((agent.supportedHosts ?? []).map(normalizeHostValue))]
+    .filter(Boolean)
+    .sort((first, second) => first.localeCompare(second));
+}
+
+function hasUnknownHostValue(agent: Pick<CopilotPackage, "supportedHosts">) {
+  return (
+    !agent.supportedHosts?.length ||
+    agent.supportedHosts.some((host) => !normalizeHostValue(host))
+  );
+}
+
+function normalizeHostValue(host: string | null | undefined) {
+  return typeof host === "string" ? host.trim() : "";
 }
 
 function matchesAvailableToFilter(value: string | undefined, filter: string) {
