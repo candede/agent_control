@@ -53,9 +53,10 @@ The repo includes a Bicep template and a cross-platform PowerShell deployment sc
 - Frontend: Azure Static Web Apps Standard.
 - Backend: single-instance Azure App Service for Linux.
 - Secrets: existing Azure Key Vault secrets are referenced from App Service settings.
+- Key Vault networking: public access by default, or an optional private endpoint with App Service VNet integration.
 - App registration: provide an existing Microsoft Entra app registration client ID. The deployment script does not create or modify app registrations.
 
-The Bicep file provisions Azure hosting resources and configuration. It creates the Static Web Apps resource, App Service plan, backend App Service, Application Insights, App Service settings, the Static Web Apps linked backend, and a `Key Vault Secrets User` role assignment for the backend managed identity. It does not upload frontend or backend code by itself. The `deploy-production.ps1` script runs Bicep first, then packages and deploys the backend and uploads the built frontend.
+The Bicep file provisions Azure hosting resources and configuration. It creates the Static Web Apps resource, App Service plan, backend App Service, Application Insights, App Service settings, the Static Web Apps linked backend, and a `Key Vault Secrets User` role assignment for the backend managed identity. In private mode it also creates the virtual network, subnets, private endpoint, and private DNS resources. It does not upload frontend or backend code by itself. The `deploy-production.ps1` script runs Bicep first, validates Key Vault references, then packages and deploys the backend and uploads the built frontend.
 
 Static Web Apps proxies linked backends only through `/api/*`, so the auth endpoints are under `/api/auth/*`. Use this production redirect URI after the Static Web Apps resource exists:
 
@@ -70,6 +71,47 @@ Before production deployment, the platform or application administrator must pre
 - Microsoft Graph delegated `CopilotPackages.ReadWrite.All` on that app registration, with tenant-wide admin consent granted.
 - An existing RBAC-enabled Azure Key Vault in the deployment resource group.
 - Existing Key Vault secrets for the Entra app client secret and Express session secret. The script defaults to `agent-control-client-secret` and `agent-control-session-secret`, but you can pass different secret names when running it.
+
+### Create the production Key Vault
+
+Create the vault in the same resource group that you will pass to `deploy-production.ps1`, then use these settings:
+
+- **Basics**: use the deployment subscription and resource group. Standard pricing is sufficient. Enable purge protection for a production vault if it matches your organization's recovery policy; after it is enabled, it cannot be disabled.
+- **Access configuration**: select **Azure role-based access control**. Leave **Azure Virtual Machines for deployment**, **Azure Resource Manager for template deployment**, and **Azure Disk Encryption for volume encryption** unchecked. Agent Control does not use those legacy resource-access options.
+- **Networking**: choose the deployment mode that matches your organization's policy.
+
+| Mode    | Script parameter                                      | Key Vault configuration                                             | Additional resources                                                                               |
+| ------- | ----------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Public  | `-KeyVaultNetworkAccess Public` or omit the parameter | Public access enabled from all networks                             | None                                                                                               |
+| Private | `-KeyVaultNetworkAccess Private`                      | Public access disabled by the script after private resources deploy | VNet, two subnets, private endpoint, private DNS zone, VNet link, and App Service VNet integration |
+
+Public mode is the backward-compatible default. Public reachability does not make secrets anonymous: Microsoft Entra authentication and Key Vault RBAC are still required. Private mode adds network isolation so the Key Vault data-plane endpoint is reachable by the application through the VNet and private endpoint. It has a small additional Azure cost for the private endpoint and Private DNS usage.
+
+Private mode uses `10.42.0.0/24` by default, with `10.42.0.0/26` delegated to App Service and `10.42.0.64/27` used for private endpoints. Override all three prefixes when those ranges conflict with connected or peered networks. The subnets must be contained by the VNet address space and must not overlap.
+
+Organizational Azure Policy may force Key Vault public access to remain disabled. Use private mode in that environment. Tenant-specific policy exemptions or bypass tags are not created, removed, or relied upon by this repository.
+
+After the vault is created:
+
+1. Give the administrator who will add the secret values a data-plane role such as **Key Vault Secrets Officer** on the vault. Creating the vault or having resource deployment permissions does not necessarily grant permission to create secrets when Azure RBAC is selected.
+2. Under **Objects** > **Secrets**, create `agent-control-client-secret`. Use the Entra app registration client secret **Value**, not its Secret ID.
+3. Create `agent-control-session-secret` with a separate cryptographically random value. A generated value of at least 32 random bytes is appropriate; do not reuse the Entra client secret. Generate a Base64-encoded value on macOS, Linux, WSL, or Git Bash with OpenSSL installed:
+
+   ```bash
+   openssl rand -base64 32
+   ```
+
+   On native Windows, use PowerShell 7 (`pwsh`):
+
+   ```powershell
+   [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+   ```
+
+   Store the command output as the Key Vault secret value.
+
+4. Keep both secrets enabled. The deployment script references the latest enabled version because the Bicep references do not pin a secret version.
+
+You do not need to grant the future App Service access manually. During deployment, Bicep enables its system-assigned managed identity and assigns that identity the least-privilege **Key Vault Secrets User** role on this vault.
 
 ### Recommended deployment: PowerShell script
 
@@ -92,7 +134,7 @@ Use `deploy-production.ps1` for normal deployments. It works from Windows, macOS
 
 4. Confirm your Azure permissions.
 
-   The account that runs the script needs permission to deploy into the target resource group and grant the backend App Service managed identity `Key Vault Secrets User` on the existing vault, such as Owner or User Access Administrator at the vault or resource-group scope. It does not need permissions to create Key Vaults, write Key Vault secrets, create app registrations, change app registration redirect URIs, add Graph permissions, or grant tenant-wide admin consent.
+   The account that runs the script needs permission to deploy into the target resource group and grant the backend App Service managed identity `Key Vault Secrets User` on the existing vault, such as Owner or User Access Administrator at the vault or resource-group scope. Private mode also requires permission to create virtual network, private endpoint, and private DNS resources and to disable public network access on the existing vault. The script does not need permissions to create Key Vaults, write Key Vault secrets, create app registrations, change app registration redirect URIs, add Graph permissions, or grant tenant-wide admin consent.
 
 5. Run the deployment script.
 
@@ -100,7 +142,15 @@ Use `deploy-production.ps1` for normal deployments. It works from Windows, macOS
 
    `NamePrefix` is used to generate Azure resource names, such as `<prefix>-prod-swa` and `<prefix>-prod-api`. The script defaults to `agent-control`, so you can omit `-NamePrefix` for a simple first deployment. If Azure reports a resource-name collision, or if your organization requires a naming convention, rerun the script with a short lowercase prefix such as `<org>-agent-control`.
 
-   `Location` defaults to the Azure region of the target resource group. Omit `-Location` unless you need the app resources in a different supported Azure region.
+   `Location` defaults to the Azure region of the target resource group and controls the backend App Service, App Service plan, and Application Insights. `StaticWebAppLocation` is independent and defaults to `westeurope`, one of the regions supported by Azure Static Web Apps. The template does not create an Azure Function App; the Static Web Apps resource still requires its own supported location even though staging environments are disabled and the backend is a linked App Service.
+
+   Azure validates App Service worker quota during the Bicep deployment preflight. If the subscription does not have enough B1 quota in `Location`, the script stops with region-specific `az quota` commands and the minimum limit reported by Azure. It does not request quota automatically: quota changes require subscription-level permissions, may be governed centrally, and can require Azure approval. Quota allocation is free, but the App Service plan created after approval is billable.
+
+   On the first deployment, App Service can briefly start before ZipDeploy has populated `/home/site/wwwroot`. Azure CLI's Linux startup tracker may retain that empty-site failure even after OneDeploy succeeds and the packaged backend starts. Kudu can also recycle while handling a synchronous deployment request and return a transient 502 after accepting the ZIP. The script submits ZipDeploy asynchronously, retries only transient 502/503/504 submission failures, and polls Kudu's deployment record for up to 15 minutes. After Kudu reports success, it deploys the frontend and retries `https://<static-web-app-host>/api/health` for up to 10 minutes. The health check must return `{ "ok": true }` before deployment is reported as complete.
+
+   Frontend deployment does not change or override npm configuration. The script reads Microsoft's stable native `StaticSitesClient` release metadata from `https://aka.ms/swalocaldeploy`, downloads the platform binary from the published Azure Front Door URL, verifies its SHA-256 checksum, and caches it in the operating system's temporary directory by build ID. The Static Web Apps deployment token is passed through a temporary process environment variable and is removed or restored immediately afterward; it is never included in the command line or deployment exception text.
+
+   The linked backend enables App Service Authentication for the Azure Static Web Apps provider. A direct request to `https://<backend-app>.azurewebsites.net/api/health` returning `401` is expected; use the Static Web Apps URL to test the application. This prevents callers from bypassing the frontend route to access the backend directly.
 
    ```powershell
    pwsh ./deploy-production.ps1 `
@@ -113,6 +163,14 @@ Use `deploy-production.ps1` for normal deployments. It works from Windows, macOS
       -ClientSecretName "agent-control-client-secret" `
       -SessionSecretName "agent-control-session-secret"
    ```
+
+   For private Key Vault access, add:
+
+   ```powershell
+   -KeyVaultNetworkAccess Private
+   ```
+
+   To override the dedicated network ranges, also pass `-VirtualNetworkAddressPrefix`, `-AppServiceIntegrationSubnetPrefix`, and `-PrivateEndpointSubnetPrefix`. The script creates the private network path first, disables the vault public endpoint, and then requires both App Service Key Vault references to report `Resolved` before application deployment continues.
 
    On Windows PowerShell 7, use the same command from the repository root. If your shell starts in Windows PowerShell 5.1, run `pwsh` first or launch **PowerShell 7** from the Start menu.
 
@@ -146,13 +204,17 @@ az deployment group create \
    --parameters \
       environmentName=<dev|test|prod> \
       location=<azure-region> \
+      staticWebAppLocation=<static-web-apps-region> \
       namePrefix=<globally-unique-prefix> \
       tenantId=<tenant-id> \
       appRegistrationClientId=<existing-entra-app-client-id> \
       keyVaultName=<existing-key-vault-name> \
+      keyVaultNetworkAccess=<Public|Private> \
       clientSecretName=<client-secret-name> \
       sessionSecretName=<session-secret-name>
 ```
+
+When using direct Bicep deployment with `keyVaultNetworkAccess=Private`, Bicep creates the private network path but does not modify the existing Key Vault resource. After the deployment succeeds, disable its public endpoint with `az keyvault update --public-network-access Disabled`, refresh the App Service Key Vault references, and confirm both report `Resolved`. The PowerShell deployment script performs these steps automatically.
 
 You can also copy or edit [infra/main.bicepparam](infra/main.bicepparam) and pass it instead of inline parameters:
 
@@ -163,7 +225,7 @@ az deployment group create \
    --parameters infra/main.bicepparam
 ```
 
-The Bicep deployment outputs `staticWebAppName`, `staticWebAppUrl`, `backendAppName`, `backendAppUrl`, and `redirectUri`. It does not deploy `frontend/dist` or `backend/dist`.
+The Bicep deployment outputs `staticWebAppName`, `staticWebAppUrl`, `backendAppName`, `backendAppResourceId`, `backendAppUrl`, `redirectUri`, and `keyVaultNetworkAccess`. It does not deploy `frontend/dist` or `backend/dist`.
 
 If you deploy code manually after running Bicep, build first:
 
@@ -196,19 +258,7 @@ az webapp deploy \
    --type zip
 ```
 
-Deploy the frontend to Static Web Apps:
-
-```bash
-SWA_DEPLOYMENT_TOKEN="$(az staticwebapp secrets list \
-   --name <staticWebAppName-output> \
-   --resource-group <resource-group-name> \
-   --query properties.apiKey \
-   -o tsv)"
-
-npx @azure/static-web-apps-cli deploy frontend/dist \
-   --deployment-token "$SWA_DEPLOYMENT_TOKEN" \
-   --env production
-```
+For production frontend deployment, use `deploy-production.ps1` rather than invoking the npm-distributed Static Web Apps CLI manually. The script performs the frontend build and uploads `frontend/dist` with the checksum-verified native client described above.
 
 The backend keeps the current SQLite audit log for this first deployment. It is configured to write under `/home/data/agent-control`, which is persistent App Service storage. Keep the App Service scaled to one instance unless you move audit logging and session state to shared Azure services.
 

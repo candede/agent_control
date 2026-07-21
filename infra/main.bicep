@@ -5,8 +5,11 @@ targetScope = 'resourceGroup'
 @maxLength(8)
 param environmentName string
 
-@description('Azure region for regional resources. Static Web Apps supports a subset of Azure regions; choose a supported SWA region.')
+@description('Azure region for the backend App Service, App Service plan, and Application Insights.')
 param location string = resourceGroup().location
+
+@description('Azure Static Web Apps control-plane region. This is independent of the backend region and must be supported by Microsoft.Web/staticSites.')
+param staticWebAppLocation string = 'westeurope'
 
 @description('Globally unique resource name prefix. Use lowercase letters, numbers, and hyphens.')
 @minLength(3)
@@ -21,6 +24,22 @@ param appRegistrationClientId string
 
 @description('Existing RBAC-enabled Key Vault name that already contains the configured client and session secrets.')
 param keyVaultName string
+
+@description('Key Vault network access mode. Private creates dedicated networking; Public expects the existing vault public endpoint to be reachable.')
+@allowed([
+  'Public'
+  'Private'
+])
+param keyVaultNetworkAccess string = 'Public'
+
+@description('Address space for the dedicated virtual network created in Private mode.')
+param virtualNetworkAddressPrefix string = '10.42.0.0/24'
+
+@description('Subnet prefix delegated to App Service regional VNet integration in Private mode.')
+param appServiceIntegrationSubnetPrefix string = '10.42.0.0/26'
+
+@description('Subnet prefix used by the Key Vault private endpoint in Private mode.')
+param privateEndpointSubnetPrefix string = '10.42.0.64/27'
 
 @description('Frontend origin. Leave empty to derive from the Static Web Apps default hostname.')
 param frontendOrigin string = ''
@@ -59,6 +78,12 @@ var staticWebAppName = take('${resourceToken}-swa', 40)
 var appServicePlanName = take('${resourceToken}-plan', 40)
 var backendAppName = take('${resourceToken}-api', 60)
 var appInsightsName = take('${resourceToken}-appi', 255)
+var virtualNetworkName = take('${resourceToken}-vnet', 64)
+var appServiceIntegrationSubnetName = 'app-service-integration'
+var privateEndpointSubnetName = 'private-endpoints'
+var keyVaultPrivateEndpointName = take('${resourceToken}-kv-pe', 80)
+var keyVaultPrivateDnsZoneName = 'privatelink.vaultcore.azure.net'
+var privateKeyVaultAccess = keyVaultNetworkAccess == 'Private'
 var resolvedFrontendOrigin = empty(frontendOrigin) ? 'https://${staticSite.properties.defaultHostname}' : frontendOrigin
 var resolvedRedirectUri = empty(redirectUri) ? '${resolvedFrontendOrigin}/api/auth/callback' : redirectUri
 var commonTags = union(tags, {
@@ -74,9 +99,103 @@ resource keyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing = {
   name: keyVaultName
 }
 
+resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = if (privateKeyVaultAccess) {
+  name: virtualNetworkName
+  location: location
+  properties: {
+    addressSpace: {
+      addressPrefixes: [
+        virtualNetworkAddressPrefix
+      ]
+    }
+  }
+  tags: commonTags
+}
+
+resource appServiceIntegrationSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (privateKeyVaultAccess) {
+  parent: virtualNetwork
+  name: appServiceIntegrationSubnetName
+  properties: {
+    addressPrefix: appServiceIntegrationSubnetPrefix
+    delegations: [
+      {
+        name: 'app-service-delegation'
+        properties: {
+          serviceName: 'Microsoft.Web/serverFarms'
+        }
+      }
+    ]
+  }
+}
+
+resource privateEndpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (privateKeyVaultAccess) {
+  parent: virtualNetwork
+  name: privateEndpointSubnetName
+  properties: {
+    addressPrefix: privateEndpointSubnetPrefix
+    privateEndpointNetworkPolicies: 'Disabled'
+  }
+}
+
+resource keyVaultPrivateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = if (privateKeyVaultAccess) {
+  name: keyVaultPrivateDnsZoneName
+  location: 'global'
+  tags: commonTags
+}
+
+resource keyVaultPrivateDnsVnetLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = if (privateKeyVaultAccess) {
+  parent: keyVaultPrivateDnsZone
+  name: '${resourceToken}-kv-dns-link'
+  location: 'global'
+  properties: {
+    registrationEnabled: false
+    virtualNetwork: {
+      id: virtualNetwork.id
+    }
+  }
+  tags: commonTags
+}
+
+resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = if (privateKeyVaultAccess) {
+  name: keyVaultPrivateEndpointName
+  location: location
+  properties: {
+    privateLinkServiceConnections: [
+      {
+        name: 'key-vault'
+        properties: {
+          privateLinkServiceId: keyVault.id
+          groupIds: [
+            'vault'
+          ]
+        }
+      }
+    ]
+    subnet: {
+      id: privateEndpointSubnet.id
+    }
+  }
+  tags: commonTags
+}
+
+resource keyVaultPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = if (privateKeyVaultAccess) {
+  parent: keyVaultPrivateEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'key-vault'
+        properties: {
+          privateDnsZoneId: keyVaultPrivateDnsZone.id
+        }
+      }
+    ]
+  }
+}
+
 resource staticSite 'Microsoft.Web/staticSites@2025-03-01' = {
   name: staticWebAppName
-  location: location
+  location: staticWebAppLocation
   sku: {
     name: staticWebAppSkuName
     tier: staticWebAppSkuName
@@ -129,19 +248,27 @@ resource backendApp 'Microsoft.Web/sites@2024-11-01' = {
   identity: {
     type: 'SystemAssigned'
   }
-  properties: {
-    serverFarmId: appServicePlan.id
-    httpsOnly: true
-    publicNetworkAccess: 'Enabled'
-    siteConfig: {
-      linuxFxVersion: backendLinuxFxVersion
-      alwaysOn: true
-      ftpsState: 'Disabled'
-      minTlsVersion: '1.2'
-      http20Enabled: true
-      appCommandLine: 'npm start --workspace backend'
-    }
-  }
+  properties: union(
+    {
+      serverFarmId: appServicePlan.id
+      httpsOnly: true
+      publicNetworkAccess: 'Enabled'
+      siteConfig: {
+        linuxFxVersion: backendLinuxFxVersion
+        alwaysOn: true
+        ftpsState: 'Disabled'
+        minTlsVersion: '1.2'
+        http20Enabled: true
+        appCommandLine: 'npm start --workspace backend'
+        vnetRouteAllEnabled: privateKeyVaultAccess
+      }
+    },
+    privateKeyVaultAccess
+      ? {
+          virtualNetworkSubnetId: appServiceIntegrationSubnet.id
+        }
+      : {}
+  )
   tags: commonTags
 }
 
@@ -186,6 +313,7 @@ output staticWebAppName string = staticSite.name
 output staticWebAppDefaultHostname string = staticSite.properties.defaultHostname
 output staticWebAppUrl string = 'https://${staticSite.properties.defaultHostname}'
 output backendAppName string = backendApp.name
+output backendAppResourceId string = backendApp.id
 output backendAppUrl string = 'https://${backendApp.properties.defaultHostName}'
 output keyVaultName string = keyVaultName
 output appInsightsName string = appInsights.name
@@ -193,3 +321,4 @@ output redirectUri string = resolvedRedirectUri
 output frontendOrigin string = resolvedFrontendOrigin
 output clientSecretName string = clientSecretName
 output sessionSecretName string = sessionSecretName
+output keyVaultNetworkAccess string = keyVaultNetworkAccess
