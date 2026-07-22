@@ -1434,6 +1434,9 @@ function App() {
               <label className="filter-search">
                 <span>Search</span>
                 <input
+                  className={
+                    query.trim().length > 0 ? "active-filter-input" : undefined
+                  }
                   type="search"
                   value={query}
                   onChange={(event) =>
