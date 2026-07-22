@@ -120,27 +120,16 @@ export function UserAccessView({
         </p>
         <div
           className="admin-download-guide"
-          aria-label="Where to download user usage reports"
+          aria-label="Required user usage reports"
         >
-          <strong>Download the CSVs from Microsoft 365 admin center</strong>
+          <strong>Import Microsoft 365 Copilot usage CSVs</strong>
           <ol>
             <li>
-              Open{" "}
-              <a
-                href="https://admin.microsoft.com/"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Microsoft 365 admin center
-              </a>{" "}
-              with an account that can view usage reports.
+              Obtain the reports through your organization&apos;s approved
+              reporting and export workflow.
             </li>
             <li>
-              Go to Reports &gt; Usage &gt; Microsoft 365 Copilot &gt; Agent
-              usage.
-            </li>
-            <li>
-              Export the <strong className="report-name">Agents</strong>,{" "}
+              Provide the <strong className="report-name">Agents</strong>,{" "}
               <strong className="report-name">Users</strong>, and{" "}
               <strong className="report-name">Users & agents</strong> reports as
               CSV, then import all three files here.

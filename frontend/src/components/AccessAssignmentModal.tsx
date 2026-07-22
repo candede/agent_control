@@ -5,10 +5,15 @@ import {
   type DirectoryPrincipal,
   type PackageAccessEntity,
   type PackageAccessMutationMode,
-  type PackageAccessScope,
+  type PackageStatus,
   type PackageAccessTarget,
   type PackageAccessUpdate,
 } from "../api/client";
+import {
+  formatAccessScope,
+  getInitialAccessScope,
+  type AccessScopeSelection,
+} from "../accessScope";
 import { PrincipalPicker } from "./PrincipalPicker";
 
 type AccessAssignmentModalProps = {
@@ -16,6 +21,7 @@ type AccessAssignmentModalProps = {
   agentCount: number;
   initialTarget?: PackageAccessTarget;
   initialPrincipals?: PackageAccessEntity[];
+  initialStatus?: PackageStatus;
   busy?: boolean;
   onCancel: () => void;
   onSubmit: (update: PackageAccessUpdate) => Promise<void>;
@@ -26,17 +32,21 @@ export function AccessAssignmentModal({
   agentCount,
   initialTarget = "availability",
   initialPrincipals = [],
+  initialStatus,
   busy = false,
   onCancel,
   onSubmit,
 }: AccessAssignmentModalProps) {
+  const initialScope = getInitialAccessScope(initialStatus, initialPrincipals);
   const [target, setTarget] = useState<PackageAccessTarget>(initialTarget);
   const [mode, setMode] = useState<PackageAccessMutationMode>("replace");
-  const [scope, setScope] = useState<PackageAccessScope | undefined>(
-    initialPrincipals.length > 0 ? "specific" : undefined,
+  const [scope, setScope] = useState<AccessScopeSelection | undefined>(
+    initialScope,
   );
   const [selected, setSelected] = useState<DirectoryPrincipal[]>([]);
-  const [resolving, setResolving] = useState(initialPrincipals.length > 0);
+  const [resolving, setResolving] = useState(
+    initialScope === "specific" && initialPrincipals.length > 0,
+  );
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
@@ -71,7 +81,7 @@ export function AccessAssignmentModal({
   }, [busy, onCancel, submitting]);
 
   useEffect(() => {
-    if (initialPrincipals.length === 0) {
+    if (initialScope !== "specific" || initialPrincipals.length === 0) {
       return;
     }
 
@@ -98,7 +108,7 @@ export function AccessAssignmentModal({
     return () => {
       cancelled = true;
     };
-  }, [initialPrincipals]);
+  }, [initialPrincipals, initialScope]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
@@ -116,6 +126,11 @@ export function AccessAssignmentModal({
 
     if (scope === "specific" && selected.length === 0) {
       setError("Select at least one user or group.");
+      return;
+    }
+
+    if (scope === "all") {
+      setError("Microsoft Graph does not document an All users write payload.");
       return;
     }
 
@@ -265,13 +280,29 @@ export function AccessAssignmentModal({
             </div>
 
             <fieldset className="access-scope-fieldset">
-              <legend>Access scope</legend>
+              <legend>
+                Access scope
+                {context === "single" ? (
+                  <span className="access-current-setting">
+                    Current:{" "}
+                    {formatAccessScope(initialStatus, initialPrincipals)}
+                  </span>
+                ) : null}
+              </legend>
               <div className="access-scope-options">
                 <label className="disabled-option">
-                  <input type="radio" name="access-scope" disabled />
+                  <input
+                    type="radio"
+                    name="access-scope"
+                    checked={scope === "all"}
+                    disabled
+                    readOnly
+                  />
                   <span>
                     <strong>All users</strong>
-                    <small>Available after tenant payload verification.</small>
+                    <small>
+                      No supported Graph write payload is documented.
+                    </small>
                   </span>
                 </label>
                 <label
@@ -340,14 +371,14 @@ export function AccessAssignmentModal({
                   />
                 )}
               </section>
-            ) : (
+            ) : scope === "none" ? (
               <div className="access-empty-scope">
                 <strong>No users will have this access.</strong>
                 <p>
                   Applying this option removes the current users and groups.
                 </p>
               </div>
-            )}
+            ) : null}
 
             {confirming ? (
               <div className="access-confirmation" role="alert">
@@ -384,6 +415,7 @@ export function AccessAssignmentModal({
               submitting ||
               resolving ||
               !scope ||
+              scope === "all" ||
               (scope === "specific" && selected.length === 0)
             }
             onClick={() => void handleApply()}

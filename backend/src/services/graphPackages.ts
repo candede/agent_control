@@ -38,6 +38,13 @@ const noAccessScopeIndicators = new Set([
   "notavailable",
   "notdeployed",
 ]);
+const specificAccessScopeIndicators = new Set([
+  "some",
+  "allowedforsome",
+  "availabletosome",
+  "deployedtosome",
+  "installedforsome",
+]);
 const defaultRetryPolicy = {
   maxAttempts: 5,
   baseDelayMs: 2_000,
@@ -208,6 +215,7 @@ export async function updatePackageAccess(
   accessToken: string,
   id: string,
   update: PackageAccessUpdate,
+  currentDetails?: CopilotPackageDetail,
 ): Promise<PackageAccessUpdateResult> {
   const property = accessCollectionProperty(update.target);
   const requested = deduplicateAccessEntities(update.principals);
@@ -228,17 +236,18 @@ export async function updatePackageAccess(
     );
   }
 
-  const details = await client.getPackageDetails(accessToken, id);
+  const details =
+    currentDetails ?? (await client.getPackageDetails(accessToken, id));
   const previous = deduplicateAccessEntities(details[property] ?? []);
+  const currentScope = inferCurrentAccessScope(
+    details,
+    update.target,
+    previous,
+  );
+  const desiredScope = update.scope === "none" ? "none" : "specific";
   let resulting = update.scope === "none" ? [] : requested;
 
   if (update.mode === "add") {
-    const currentScope = inferCurrentAccessScope(
-      details,
-      update.target,
-      previous,
-    );
-
     if (currentScope === "all") {
       return {
         changed: false,
@@ -259,7 +268,10 @@ export async function updatePackageAccess(
     resulting = deduplicateAccessEntities([...previous, ...requested]);
   }
 
-  if (sameAccessEntities(previous, resulting)) {
+  if (
+    currentScope === desiredScope &&
+    sameAccessEntities(previous, resulting)
+  ) {
     return {
       changed: false,
       previousCount: previous.length,
@@ -268,7 +280,29 @@ export async function updatePackageAccess(
     };
   }
 
-  await client.patchPackageAccess(accessToken, id, { [property]: resulting });
+  const unselectedProperty =
+    update.target === "availability"
+      ? ("acquireUsersAndGroups" as const)
+      : ("allowedUsersAndGroups" as const);
+
+  if (details[unselectedProperty] === undefined) {
+    throw new AppError(
+      409,
+      "incomplete_package_access_state",
+      `Microsoft Graph did not return ${unselectedProperty}, so the documented full access payload cannot be sent safely.`,
+    );
+  }
+
+  await client.patchPackageAccess(accessToken, id, {
+    allowedUsersAndGroups:
+      update.target === "availability"
+        ? resulting
+        : deduplicateAccessEntities(details.allowedUsersAndGroups ?? []),
+    acquireUsersAndGroups:
+      update.target === "installation"
+        ? resulting
+        : deduplicateAccessEntities(details.acquireUsersAndGroups ?? []),
+  });
 
   return {
     changed: true,
@@ -276,6 +310,70 @@ export async function updatePackageAccess(
     resultingCount: resulting.length,
     principals: resulting,
   };
+}
+
+export function verifyPackageAccessApplied(
+  details: CopilotPackageDetail,
+  update: PackageAccessUpdate,
+  expectedPrincipals: PackageAccessEntity[],
+  previousDetails: CopilotPackageDetail,
+) {
+  const property = accessCollectionProperty(update.target);
+  const actualPrincipals = deduplicateAccessEntities(details[property] ?? []);
+  const actualScope = inferCurrentAccessScope(
+    details,
+    update.target,
+    actualPrincipals,
+  );
+  const expectedScope = update.scope === "none" ? "none" : "specific";
+  const preservedTarget = otherAccessTarget(update.target);
+  const preservedProperty = accessCollectionProperty(preservedTarget);
+  const expectedPreservedPrincipals = deduplicateAccessEntities(
+    previousDetails[preservedProperty] ?? [],
+  );
+  const actualPreservedPrincipals = deduplicateAccessEntities(
+    details[preservedProperty] ?? [],
+  );
+  const expectedPreservedScope = inferCurrentAccessScope(
+    previousDetails,
+    preservedTarget,
+    expectedPreservedPrincipals,
+  );
+  const actualPreservedScope = inferCurrentAccessScope(
+    details,
+    preservedTarget,
+    actualPreservedPrincipals,
+  );
+  const requestedAccessApplied =
+    actualScope === expectedScope &&
+    sameAccessEntities(actualPrincipals, expectedPrincipals);
+  const otherAccessPreserved =
+    actualPreservedScope === expectedPreservedScope &&
+    sameAccessEntities(actualPreservedPrincipals, expectedPreservedPrincipals);
+
+  if (requestedAccessApplied && otherAccessPreserved) {
+    return;
+  }
+
+  throw new AppError(
+    409,
+    "access_update_not_applied",
+    requestedAccessApplied
+      ? `Microsoft Graph accepted the request but changed the unselected ${formatAccessTarget(preservedTarget)} access setting.`
+      : `Microsoft Graph accepted the request but did not apply the requested ${formatAccessScope(expectedScope)} access scope. Effective access is still ${formatAccessScope(actualScope)}.`,
+    {
+      target: update.target,
+      expectedScope,
+      actualScope,
+      expectedPrincipals,
+      actualPrincipals,
+      preservedTarget,
+      expectedPreservedScope,
+      actualPreservedScope,
+      expectedPreservedPrincipals,
+      actualPreservedPrincipals,
+    },
+  );
 }
 
 function sameAccessEntities(
@@ -306,15 +404,17 @@ function accessCollectionProperty(target: PackageAccessUpdate["target"]) {
     : ("acquireUsersAndGroups" as const);
 }
 
+function otherAccessTarget(target: PackageAccessUpdate["target"]) {
+  return target === "availability"
+    ? ("installation" as const)
+    : ("availability" as const);
+}
+
 function inferCurrentAccessScope(
   details: CopilotPackageDetail,
   target: PackageAccessUpdate["target"],
   principals: PackageAccessEntity[],
 ) {
-  if (principals.length > 0) {
-    return "specific" as const;
-  }
-
   const indicator = normalizeAccessScopeIndicator(
     target === "availability" ? details.availableTo : details.deployedTo,
   );
@@ -327,11 +427,39 @@ function inferCurrentAccessScope(
     return "none" as const;
   }
 
+  if (specificAccessScopeIndicators.has(indicator)) {
+    return "specific" as const;
+  }
+
+  if (principals.length > 0) {
+    return "specific" as const;
+  }
+
   return "unknown" as const;
 }
 
 function normalizeAccessScopeIndicator(value: string | undefined) {
   return value?.replace(/[^a-z0-9]/gi, "").toLowerCase() ?? "";
+}
+
+function formatAccessScope(scope: "all" | "specific" | "none" | "unknown") {
+  if (scope === "all") {
+    return "All users";
+  }
+
+  if (scope === "specific") {
+    return "Specific users or groups";
+  }
+
+  if (scope === "none") {
+    return "No users";
+  }
+
+  return "Unknown";
+}
+
+function formatAccessTarget(target: PackageAccessUpdate["target"]) {
+  return target === "availability" ? "Available to" : "Installed for";
 }
 
 function deduplicateAccessEntities(entities: PackageAccessEntity[]) {
@@ -517,12 +645,31 @@ export async function bulkUpdatePackageAccess(
           await delay(writePauseMs);
         }
 
+        const currentDetails = await client.getPackageDetails(
+          accessToken,
+          agent.id,
+        );
         const accessResult = await updatePackageAccess(
           client,
           accessToken,
           agent.id,
           update,
+          currentDetails,
         );
+
+        if (accessResult.changed) {
+          const updatedDetails = await client.getPackageDetails(
+            accessToken,
+            agent.id,
+          );
+          verifyPackageAccessApplied(
+            updatedDetails,
+            update,
+            accessResult.principals,
+            currentDetails,
+          );
+        }
+
         result = {
           id: agent.id,
           displayName: agent.displayName,

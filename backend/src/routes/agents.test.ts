@@ -46,7 +46,7 @@ describe("parsePackageAccessUpdate", () => {
     });
   });
 
-  it("rejects all users until the tenant payload is verified", () => {
+  it("rejects all users while Graph has no documented write payload", () => {
     expect(() =>
       parsePackageAccessUpdate({
         target: "availability",
@@ -54,7 +54,7 @@ describe("parsePackageAccessUpdate", () => {
         scope: "all",
         principals: [],
       }),
-    ).toThrow("All users has not been verified");
+    ).toThrow("does not document a supported write payload");
   });
 
   it("rejects add mode with no users", () => {

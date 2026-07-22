@@ -213,6 +213,17 @@ function isStoredReport(value: unknown, kind: UsageReportKind) {
   );
 }
 
+function withPackageSummaryFallback(
+  detail: CopilotPackageDetail,
+  summary: CopilotPackage,
+): CopilotPackageDetail {
+  return {
+    ...detail,
+    availableTo: detail.availableTo ?? summary.availableTo,
+    deployedTo: detail.deployedTo ?? summary.deployedTo,
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -242,6 +253,8 @@ function App() {
   const [bulkConfirmation, setBulkConfirmation] = useState<BulkConfirmation>();
   const [bulkAccessAgentIds, setBulkAccessAgentIds] = useState<string[]>();
   const [agentDetail, setAgentDetail] = useState<CopilotPackageDetail>();
+  const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
+    useState<CopilotPackageDetail>();
   const [loadingAgentDetailId, setLoadingAgentDetailId] = useState<string>();
   const [agentDetailError, setAgentDetailError] = useState<string>();
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
@@ -665,6 +678,7 @@ function App() {
     setBulkConfirmation(undefined);
     setBulkAccessAgentIds(undefined);
     setAgentDetail(undefined);
+    setSingleAccessAgentDetail(undefined);
     setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
     setExportChoiceOpen(false);
@@ -791,11 +805,43 @@ function App() {
     setLoadingAgentDetailId(agent.id);
 
     try {
-      const detail = await getAgentDetails(agent.id);
+      const detail = withPackageSummaryFallback(
+        await getAgentDetails(agent.id),
+        agent,
+      );
 
       if (agentDetailRequestId.current === requestId) {
         agentDetailsCache.current.set(agent.id, detail);
         setAgentDetail(detail);
+      }
+    } catch (requestError) {
+      if (agentDetailRequestId.current === requestId) {
+        setAgentDetailError(errorMessage(requestError));
+      }
+    } finally {
+      if (agentDetailRequestId.current === requestId) {
+        setLoadingAgentDetailId(undefined);
+      }
+    }
+  }
+
+  async function handleManageAgentAccess(agent: CopilotPackage) {
+    const requestId = agentDetailRequestId.current + 1;
+    agentDetailRequestId.current = requestId;
+
+    setAgentDetailError(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setLoadingAgentDetailId(agent.id);
+
+    try {
+      const detail = withPackageSummaryFallback(
+        await getAgentDetails(agent.id),
+        agent,
+      );
+
+      if (agentDetailRequestId.current === requestId) {
+        agentDetailsCache.current.set(agent.id, detail);
+        setSingleAccessAgentDetail(detail);
       }
     } catch (requestError) {
       if (agentDetailRequestId.current === requestId) {
@@ -836,14 +882,26 @@ function App() {
       throw new Error("Agent details are no longer open.");
     }
 
+    await updateSingleAgentAccess(agentDetail.id, update);
+  }
+
+  async function updateSingleAgentAccess(
+    agentId: string,
+    update: PackageAccessUpdate,
+  ) {
     if (update.mode !== "replace") {
       throw new Error("Single-agent access updates must replace assignments.");
     }
 
     setError(undefined);
-    const response = await updateAgentAccess(agentDetail.id, update);
+    const response = await updateAgentAccess(agentId, update);
     agentDetailsCache.current.set(response.agent.id, response.agent);
-    setAgentDetail(response.agent);
+    setAgentDetail((current) =>
+      current?.id === response.agent.id ? response.agent : current,
+    );
+    setSingleAccessAgentDetail((current) =>
+      current?.id === response.agent.id ? response.agent : current,
+    );
     setAgents((current) =>
       current.map((agent) =>
         agent.id === response.agent.id
@@ -1119,6 +1177,13 @@ function App() {
         setAgentDetail(undefined);
       }
 
+      if (
+        singleAccessAgentDetail &&
+        changedIds.includes(singleAccessAgentDetail.id)
+      ) {
+        setSingleAccessAgentDetail(undefined);
+      }
+
       markAgentStatesChanged(changedIds);
       void loadAgents();
     }
@@ -1189,6 +1254,13 @@ function App() {
       return updatedAnyAgent ? nextAgents : currentAgents;
     });
     setAgentDetail((currentDetail) =>
+      currentDetail &&
+      changedAgentIds.has(currentDetail.id) &&
+      currentDetail.isBlocked !== targetBlockedState
+        ? { ...currentDetail, isBlocked: targetBlockedState }
+        : currentDetail,
+    );
+    setSingleAccessAgentDetail((currentDetail) =>
       currentDetail &&
       changedAgentIds.has(currentDetail.id) &&
       currentDetail.isBlocked !== targetBlockedState
@@ -1696,6 +1768,7 @@ function App() {
                   toggleMatchingSelection(filteredAgents)
                 }
                 onViewDetails={(agent) => void handleViewAgentDetails(agent)}
+                onManageAccess={(agent) => void handleManageAgentAccess(agent)}
                 onBlock={(agent) => void handleAgentAction(agent, true)}
                 onUnblock={(agent) => void handleAgentAction(agent, false)}
               />
@@ -1758,6 +1831,21 @@ function App() {
         />
       ) : null}
 
+      {singleAccessAgentDetail ? (
+        <AccessAssignmentModal
+          context="single"
+          agentCount={1}
+          initialTarget="availability"
+          initialStatus={singleAccessAgentDetail.availableTo}
+          initialPrincipals={singleAccessAgentDetail.allowedUsersAndGroups}
+          onCancel={() => setSingleAccessAgentDetail(undefined)}
+          onSubmit={async (update) => {
+            await updateSingleAgentAccess(singleAccessAgentDetail.id, update);
+            setSingleAccessAgentDetail(undefined);
+          }}
+        />
+      ) : null}
+
       {bulkAccessAgentIds ? (
         <AccessAssignmentModal
           context="bulk"
@@ -1804,6 +1892,8 @@ const someOrAllAvailableToValue = "__some_or_all__";
 const availableToFilterValuePrefix = "available:";
 const detailBatchSize = 100;
 const someOrAllAvailableToNormalizedValues = new Set([
+  "all",
+  "some",
   "allowedforall",
   "allowedforsome",
 ]);

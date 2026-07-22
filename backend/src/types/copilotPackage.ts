@@ -9,6 +9,15 @@ export type PackageAccessMutationMode = "add" | "replace";
 
 export type PackageAccessScope = "specific" | "none";
 
+export type PackageStatus =
+  | "all"
+  | "some"
+  | "none"
+  | "allowedForAll"
+  | "allowedForSome"
+  | "allowedForNoOne"
+  | "unknownFutureValue";
+
 export type PackageAccessUpdate =
   | {
       target: PackageAccessTarget;
@@ -48,8 +57,8 @@ export type CopilotPackage = {
   createdDateTime?: string;
   lastModifiedDateTime?: string;
   publisher?: string;
-  availableTo?: string;
-  deployedTo?: string;
+  availableTo?: PackageStatus;
+  deployedTo?: PackageStatus;
   elementTypes?: string[];
   platform?: string;
   version?: string;

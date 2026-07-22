@@ -302,6 +302,11 @@ export function AgentDetailModal({
             context="single"
             agentCount={1}
             initialTarget={editingAccessTarget}
+            initialStatus={
+              editingAccessTarget === "availability"
+                ? agent.availableTo
+                : agent.deployedTo
+            }
             initialPrincipals={
               editingAccessTarget === "availability"
                 ? agent.allowedUsersAndGroups

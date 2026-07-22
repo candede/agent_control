@@ -11,9 +11,11 @@ The browser talks only to the Express backend. Express handles Microsoft Entra I
 - Microsoft Agent 365 licensing in the tenant.
 - Delegated Microsoft Graph permissions `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` with admin consent.
 - A work or school account with tenant permissions to manage Copilot packages.
-- Optional usage enrichment requires access to export Microsoft 365 admin center usage reports, but it does not require any additional Microsoft Graph permissions.
+- Optional usage enrichment requires Microsoft 365 Copilot usage report CSV exports, but it does not require any additional Microsoft Graph permissions.
 
 The supplied Microsoft Graph docs note that block, unblock, and package access updates use `/beta` endpoints and are available only in the global cloud. Microsoft does not support beta APIs for production workloads; validate this dependency against your organization's risk policy.
+
+The **Manage access** buttons in agent table rows and the bulk actions section are temporarily hidden because the underlying Microsoft Graph access-update endpoint is not working reliably. The buttons will remain hidden until Microsoft fixes the endpoint.
 
 ## Entra App Registration
 
@@ -25,7 +27,7 @@ Create an app registration in Microsoft Entra ID with these settings:
 - API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All`
 - Admin consent: granted for the tenant
 
-No additional API permission is needed for usage report import. The usage data is loaded from CSV files that an admin manually exports from the Microsoft 365 admin center.
+No additional API permission is needed for usage report import. The usage data is loaded from user-provided Microsoft 365 Copilot usage report CSV files.
 
 ## Local Setup
 
@@ -268,15 +270,11 @@ Agent Control works without report files. If no usage reports are imported, the 
 
 To enrich the package list and user access view with last activity, active users, responses sent, creator type, and user drilldown data:
 
-1. Go to `https://admin.microsoft.com`.
-2. Open **Reports** > **Usage**.
-3. Select **Microsoft 365 Copilot**.
-4. Open the **Agents** report.
-5. Export these three report tabs for the same period, typically 30 days:
+1. Obtain these three Microsoft 365 Copilot usage report CSV exports for the same period, typically 30 days:
    - **Agents**: agent-level metrics used for Agent view enrichment and inactive-agent filtering.
    - **Users & agents**: per-user, per-agent rows used by agent details and User view access history.
    - **Users**: user-level summary rows used by User view summary metrics.
-6. In Agent Control, use **Import CSVs** and select one, two, or all three exported CSV files.
+2. In Agent Control, use **Import CSVs** and select one, two, or all three exported CSV files.
 
 The app has two primary views. **Agent view** lists current Copilot packages from the Graph package API, enriched with imported report data when available. **User view** starts with users, then shows every agent access row found for the selected user in the **Users & agents** CSV. The User view combines the **Users** CSV with bridge-only usernames from the **Users & agents** CSV so a user is not hidden just because they are missing from one export.
 
@@ -316,9 +314,11 @@ npm run dev --workspace frontend
 
 Usage report import is handled in the browser from local CSV files. It does not add backend report endpoints and does not call Microsoft Graph for report data.
 
-Bulk actions are best effort. The backend returns succeeded, skipped, and failed entries so partial failures are visible. Access **Add** reads each package, merges and deduplicates the selected principals, and skips packages that already contain them. It also skips an all-user scope because the selected principals already have access, and fails safely when Graph does not return enough information to distinguish an empty scope from a broad one. **Replace** sends exactly the selected collection. Available to and Installed for are independent: an operation never sends or reconciles the unselected collection.
+Bulk actions are best effort. The backend returns succeeded, skipped, and failed entries so partial failures are visible. Access **Add** reads each package, merges and deduplicates the selected principals, and skips packages that already contain them. It also skips an all-user scope because the selected principals already have access, and fails safely when Graph does not return enough information to distinguish an empty scope from a broad one. To match the documented beta API example, each PATCH sends both writable collections: the selected collection is changed and the other collection is preserved from the package detail response. If Graph omits the unselected collection, the app refuses the write rather than risk clearing it.
 
-The access editor supports individual users, security groups, Microsoft 365 groups, and clearing a collection with **No users**. **All users** remains disabled until a live tenant probe establishes a supported beta payload; the app does not substitute a tenant-wide group for that state.
+After Graph returns `204 No Content` for an access PATCH, Agent Control reads the package again, verifies the requested effective `all`/`some`/`none` scope and principal collection, and confirms that the unselected access setting was preserved. Graph can accept a collection update without changing an existing All users scope. In that case, Agent Control reports `access_update_not_applied`, keeps the editor open, and records a failed audit event instead of claiming success. The documented API does not provide a writable `availableTo` or `deployedTo` property to force that scope transition.
+
+The access editor supports individual users, security groups, Microsoft 365 groups, and clearing a collection with **No users**. Microsoft Graph reports `all`, `some`, or `none` through `availableTo` and `deployedTo`, but the update API documents only the user/group collections as writable. **All users** remains disabled because Microsoft does not document a supported write payload; the app does not substitute a tenant-wide group for that state.
 
 ## Audit Log
 

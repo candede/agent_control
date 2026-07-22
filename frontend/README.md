@@ -119,8 +119,9 @@ For local testing, use `npm run dev` in both folders and keep both terminals run
 
 - The app is intended for local admin use during development or tenant administration workflows.
 - Microsoft Graph package block and unblock operations depend on Graph API availability and tenant licensing.
-- Package access updates use a Microsoft Graph beta endpoint. Available to and Installed for are changed independently; the app sends only the selected collection.
-- All users is disabled until its write payload is verified in a live tenant. No users, specific users, security groups, and Microsoft 365 groups are supported.
+- Package access updates use a Microsoft Graph beta endpoint. To match its documented request example, the app sends both writable collections while changing the selected collection and preserving the other from package detail.
+- Access updates are verified with a fresh package read after Graph returns `204`. If the requested effective scope or principals did not change, or if the unselected access setting changed, the editor remains open and reports that Graph did not apply the request safely.
+- Microsoft Graph reports access as `all`, `some`, or `none`, but its update API does not document a supported All users write payload. All users remains disabled; No users, specific users, security groups, and Microsoft 365 groups are supported.
 - If sign-in fails, confirm the redirect URI in Entra ID matches `REDIRECT_URI` in `.env`.
 - If package or directory operations fail, confirm all three delegated Graph permissions have admin consent and the signed-in account is authorized by Microsoft Graph.
 

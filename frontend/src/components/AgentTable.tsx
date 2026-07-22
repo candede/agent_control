@@ -1,9 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, Info, Mail, MailCheck } from "lucide-react";
+import {
+  Eye,
+  Info,
+  Lock,
+  LockOpen,
+  Mail,
+  MailCheck,
+  ShieldCheck,
+} from "lucide-react";
 import type { CopilotPackage } from "../api/client";
 import { formatBuiltWithLabel } from "../agentDisplay";
 
 const agentTableColumnStorageKey = "agent-control:agent-table-columns:v1";
+const showManageAccessActions = false;
 
 type AgentTableColumnId =
   | "publisher"
@@ -49,6 +58,7 @@ type AgentTableProps = {
   onToggleAgentSelection: (agentId: string) => void;
   onToggleMatchingSelection: () => void;
   onViewDetails: (agent: CopilotPackage) => void;
+  onManageAccess: (agent: CopilotPackage) => void;
   onBlock: (agent: CopilotPackage) => void;
   onUnblock: (agent: CopilotPackage) => void;
 };
@@ -77,6 +87,7 @@ export function AgentTable({
   onToggleAgentSelection,
   onToggleMatchingSelection,
   onViewDetails,
+  onManageAccess,
   onBlock,
   onUnblock,
 }: AgentTableProps) {
@@ -337,22 +348,39 @@ export function AgentTable({
                     >
                       <Info aria-hidden="true" />
                     </button>
+                    {showManageAccessActions ? (
+                      <button
+                        className="icon-button"
+                        type="button"
+                        aria-label={`Manage access for ${agent.displayName}`}
+                        title="Manage access"
+                        disabled={selectionDisabled}
+                        onClick={() => onManageAccess(agent)}
+                      >
+                        <ShieldCheck aria-hidden="true" />
+                      </button>
+                    ) : null}
                     {agent.isBlocked ? (
                       <button
+                        className="icon-button"
                         type="button"
+                        aria-label={`Unblock ${agent.displayName}`}
+                        title={busy ? "Updating status" : "Unblock"}
                         disabled={busy || selectionDisabled}
                         onClick={() => onUnblock(agent)}
                       >
-                        {busy ? "Working" : "Unblock"}
+                        <LockOpen aria-hidden="true" />
                       </button>
                     ) : (
                       <button
-                        className="danger"
+                        className="icon-button danger"
                         type="button"
+                        aria-label={`Block ${agent.displayName}`}
+                        title={busy ? "Updating status" : "Block"}
                         disabled={busy || selectionDisabled}
                         onClick={() => onBlock(agent)}
                       >
-                        {busy ? "Working" : "Block"}
+                        <Lock aria-hidden="true" />
                       </button>
                     )}
                   </div>

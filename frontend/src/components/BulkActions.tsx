@@ -7,6 +7,8 @@ import type {
 } from "../api/client";
 import type { ReactNode } from "react";
 
+const showManageAccessActions = false;
+
 type BulkProgressBase = {
   total: number;
   completed: number;
@@ -90,17 +92,19 @@ export function BulkActions({
             ? "Unblocking selected"
             : "Unblock selected"}
         </button>
-        <button
-          type="button"
-          className="secondary"
-          disabled={disabled || selectedCount === 0}
-          onClick={onManageAccess}
-        >
-          {busyAction === "update-availability" ||
-          busyAction === "update-installation"
-            ? "Updating access"
-            : "Manage access"}
-        </button>
+        {showManageAccessActions ? (
+          <button
+            type="button"
+            className="secondary"
+            disabled={disabled || selectedCount === 0}
+            onClick={onManageAccess}
+          >
+            {busyAction === "update-availability" ||
+            busyAction === "update-installation"
+              ? "Updating access"
+              : "Manage access"}
+          </button>
+        ) : null}
       </div>
       {progress ? <BulkProgressMeter progress={progress} /> : null}
       {activityProgress}

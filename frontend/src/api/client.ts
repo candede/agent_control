@@ -5,6 +5,15 @@ export type SessionUser = {
   tenantId?: string;
 };
 
+export type PackageStatus =
+  | "all"
+  | "some"
+  | "none"
+  | "allowedForAll"
+  | "allowedForSome"
+  | "allowedForNoOne"
+  | "unknownFutureValue";
+
 export type CopilotPackage = {
   id: string;
   displayName: string;
@@ -15,8 +24,8 @@ export type CopilotPackage = {
   createdDateTime?: string;
   lastModifiedDateTime?: string;
   publisher?: string;
-  availableTo?: string;
-  deployedTo?: string;
+  availableTo?: PackageStatus;
+  deployedTo?: PackageStatus;
   elementTypes?: string[];
   platform?: string;
   version?: string;

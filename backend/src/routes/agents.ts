@@ -21,10 +21,12 @@ import {
   bulkUpdatePackageAccess,
   GraphPackagesClient,
   updatePackageAccess,
+  verifyPackageAccessApplied,
 } from "../services/graphPackages.js";
 import type {
   BulkPackageResult,
   CopilotPackage,
+  CopilotPackageDetail,
   PackageAccessEntity,
   PackageAccessUpdate,
 } from "../types/copilotPackage.js";
@@ -280,17 +282,40 @@ agentsRouter.patch("/agents/:id/access", async (request, response, next) => {
 
     const current = await graphPackages.getPackageDetails(accessToken, agentId);
     const action = accessAuditAction(accessUpdate.target);
+    let updatedAgent: CopilotPackageDetail | undefined;
     const result = await runAuditedAccessAction(
       request,
       action,
       agentId,
       current.displayName,
       accessUpdate,
-      () =>
-        updatePackageAccess(graphPackages, accessToken, agentId, accessUpdate),
+      async () => {
+        const accessResult = await updatePackageAccess(
+          graphPackages,
+          accessToken,
+          agentId,
+          accessUpdate,
+          current,
+        );
+
+        updatedAgent = await graphPackages.getPackageDetails(
+          accessToken,
+          agentId,
+        );
+
+        if (accessResult.changed) {
+          verifyPackageAccessApplied(
+            updatedAgent,
+            accessUpdate,
+            accessResult.principals,
+            current,
+          );
+        }
+
+        return accessResult;
+      },
     );
-    const agent = await graphPackages.getPackageDetails(accessToken, agentId);
-    response.json({ agent, result });
+    response.json({ agent: updatedAgent ?? current, result });
   } catch (error) {
     next(error);
   }
@@ -503,7 +528,7 @@ export function parsePackageAccessUpdate(body: unknown): PackageAccessUpdate {
     throw new AppError(
       400,
       "all_users_unverified",
-      "The Microsoft Graph payload for All users has not been verified for this tenant.",
+      "Microsoft Graph documents All users as a read status but does not document a supported write payload.",
     );
   }
 

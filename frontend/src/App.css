@@ -860,6 +860,12 @@ button.secondary:hover {
   font-weight: 800;
 }
 
+.access-current-setting {
+  margin-left: 8px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
 .access-section-heading {
   display: flex;
   align-items: start;
@@ -2245,12 +2251,24 @@ button.icon-button.usage-copy-button svg {
 
 button.icon-button {
   width: 40px;
+  min-width: 40px;
   padding: 0;
   color: var(--ink);
   background: #fff;
 }
 
 button.icon-button:hover {
+  background: #f5f2e9;
+}
+
+button.icon-button.danger {
+  color: var(--danger);
+  background: #fff;
+  border-color: var(--danger);
+}
+
+button.icon-button.danger:hover {
+  color: var(--danger);
   background: #f5f2e9;
 }
 
