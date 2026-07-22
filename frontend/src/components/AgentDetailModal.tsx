@@ -1,14 +1,20 @@
-import { type ReactNode, useEffect, useRef } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
-import type { CopilotPackageDetail } from "../api/client";
+import type {
+  CopilotPackageDetail,
+  PackageAccessTarget,
+  PackageAccessUpdate,
+} from "../api/client";
 import { getBuiltWithLabel } from "../agentDisplay";
 import type { AgentUsageSummary, UserAgentUsageRow } from "../reportImports";
+import { AccessAssignmentModal } from "./AccessAssignmentModal";
 
 type AgentDetailModalProps = {
   agent: CopilotPackageDetail;
   usage?: AgentUsageSummary;
   userRows: UserAgentUsageRow[];
   onClose: () => void;
+  onUpdateAccess: (update: PackageAccessUpdate) => Promise<void>;
 };
 
 type AccessSummary = {
@@ -28,7 +34,10 @@ export function AgentDetailModal({
   usage,
   userRows,
   onClose,
+  onUpdateAccess,
 }: AgentDetailModalProps) {
+  const [editingAccessTarget, setEditingAccessTarget] =
+    useState<PackageAccessTarget>();
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
   const connectedServices = extractConnectedServices(agent.elementDetails);
@@ -49,7 +58,7 @@ export function AgentDetailModal({
     dialogRef.current?.focus();
 
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !editingAccessTarget) {
         onClose();
       }
     }
@@ -57,7 +66,7 @@ export function AgentDetailModal({
     window.addEventListener("keydown", handleKeyDown);
 
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [editingAccessTarget, onClose]);
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
@@ -197,12 +206,14 @@ export function AgentDetailModal({
             ) : null}
             <div className="access-grid">
               <AccessList
-                label="Allowed users and groups"
+                label="Available to"
                 values={agent.allowedUsersAndGroups}
+                onEdit={() => setEditingAccessTarget("availability")}
               />
               <AccessList
-                label="Acquire users and groups"
+                label="Installed for"
                 values={agent.acquireUsersAndGroups}
+                onEdit={() => setEditingAccessTarget("installation")}
               />
             </div>
           </DetailSection>
@@ -286,6 +297,23 @@ export function AgentDetailModal({
             ) : null}
           </DetailSection>
         </div>
+        {editingAccessTarget ? (
+          <AccessAssignmentModal
+            context="single"
+            agentCount={1}
+            initialTarget={editingAccessTarget}
+            initialPrincipals={
+              editingAccessTarget === "availability"
+                ? agent.allowedUsersAndGroups
+                : agent.acquireUsersAndGroups
+            }
+            onCancel={() => setEditingAccessTarget(undefined)}
+            onSubmit={async (update) => {
+              await onUpdateAccess(update);
+              setEditingAccessTarget(undefined);
+            }}
+          />
+        ) : null}
       </section>
     </div>
   );
@@ -515,13 +543,20 @@ function parseJson(value: string) {
 function AccessList({
   label,
   values,
+  onEdit,
 }: {
   label: string;
   values?: CopilotPackageDetail["allowedUsersAndGroups"];
+  onEdit: () => void;
 }) {
   return (
     <div className="access-list">
-      <span>{label}</span>
+      <div className="access-list-header">
+        <span>{label}</span>
+        <button type="button" className="secondary" onClick={onEdit}>
+          Edit
+        </button>
+      </div>
       {values?.length ? (
         <ul>
           {values.slice(0, 8).map((entry) => (

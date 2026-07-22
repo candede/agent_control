@@ -45,6 +45,8 @@ export const authConfigured = Boolean(
 
 export const graphScopes = [
   "https://graph.microsoft.com/User.Read",
+  "https://graph.microsoft.com/User.ReadBasic.All",
+  "https://graph.microsoft.com/Group.Read.All",
   "https://graph.microsoft.com/CopilotPackages.ReadWrite.All",
 ];
 

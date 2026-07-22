@@ -31,6 +31,48 @@ export type PackageAccessEntity = {
   resourceType: "user" | "group" | string;
 };
 
+export type PackageAccessTarget = "availability" | "installation";
+export type PackageAccessMutationMode = "add" | "replace";
+export type PackageAccessScope = "specific" | "none";
+
+export type PackageAccessUpdate =
+  | {
+      target: PackageAccessTarget;
+      mode: "add";
+      scope: "specific";
+      principals: PackageAccessEntity[];
+    }
+  | {
+      target: PackageAccessTarget;
+      mode: "replace";
+      scope: "specific";
+      principals: PackageAccessEntity[];
+    }
+  | {
+      target: PackageAccessTarget;
+      mode: "replace";
+      scope: "none";
+      principals: never[];
+    };
+
+export type PackageAccessReplacement = Extract<
+  PackageAccessUpdate,
+  { mode: "replace" }
+>;
+
+export type PackageAccessUpdateResult = {
+  changed: boolean;
+  previousCount: number;
+  resultingCount: number;
+  principals: PackageAccessEntity[];
+};
+
+export type DirectoryPrincipal = PackageAccessEntity & {
+  displayName: string;
+  secondaryText?: string;
+  principalKind: "user" | "securityGroup" | "microsoft365Group" | "unknown";
+};
+
 export type PackageElementDetail = {
   elementType: string;
   elements: Array<{
@@ -55,6 +97,7 @@ export type BulkPackageResult = {
   message?: string;
   errorCode?: string;
   errorDetails?: unknown;
+  accessResult?: PackageAccessUpdateResult;
 };
 
 export type BulkSideEffectError = {
@@ -63,8 +106,7 @@ export type BulkSideEffectError = {
   message: string;
 };
 
-export type BulkActionResult = {
-  targetBlockedState: boolean;
+type BulkActionResultBase = {
   total: number;
   succeeded: number;
   failed: number;
@@ -73,12 +115,16 @@ export type BulkActionResult = {
   sideEffectErrors?: BulkSideEffectError[];
 };
 
+export type BulkActionResult = BulkActionResultBase &
+  (
+    | { targetBlockedState: boolean; accessUpdate?: never }
+    | { targetBlockedState?: never; accessUpdate: PackageAccessUpdate }
+  );
+
 export type BulkJobStatus = "queued" | "running" | "completed" | "failed";
 
-export type BulkActionJob = {
+type BulkActionJobBase = {
   id: string;
-  action: AuditAction;
-  targetBlockedState: boolean;
   status: BulkJobStatus;
   total: number;
   completed: number;
@@ -93,6 +139,20 @@ export type BulkActionJob = {
   updatedAt: string;
   completedAt?: string;
 };
+
+export type BulkActionJob = BulkActionJobBase &
+  (
+    | {
+        action: BlockAuditAction;
+        targetBlockedState: boolean;
+        accessUpdate?: never;
+      }
+    | {
+        action: AccessAuditAction;
+        targetBlockedState?: never;
+        accessUpdate: PackageAccessUpdate;
+      }
+  );
 
 export type BulkPackageDetailResult =
   | {
@@ -113,18 +173,18 @@ export type BulkPackageDetailsResult = {
   results: BulkPackageDetailResult[];
 };
 
-export type AuditAction = "block" | "unblock";
+export type BlockAuditAction = "block" | "unblock";
+export type AccessAuditAction = "update-availability" | "update-installation";
+export type AuditAction = BlockAuditAction | AccessAuditAction;
 
 export type AuditScope = "single" | "bulk";
 
 export type AuditStatus = "started" | "succeeded" | "failed" | "skipped";
 
-export type AuditEvent = {
+type AuditEventBase = {
   id: string;
   operationId: string;
   scope: AuditScope;
-  action: AuditAction;
-  targetBlockedState: boolean;
   agentId: string;
   agentDisplayName?: string;
   actor: SessionUser;
@@ -136,6 +196,12 @@ export type AuditEvent = {
   requestPath: string;
   metadata?: Record<string, unknown>;
 };
+
+export type AuditEvent = AuditEventBase &
+  (
+    | { action: BlockAuditAction; targetBlockedState: boolean }
+    | { action: AccessAuditAction; targetBlockedState?: never }
+  );
 
 export type AuditEventsQuery = {
   limit?: number;
@@ -186,6 +252,51 @@ export async function getAgentDetailsBatch(ids: string[]) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids }),
+  });
+}
+
+export async function searchDirectoryPrincipals(search: string, limit = 25) {
+  const params = new URLSearchParams({ search, limit: String(limit) });
+  return request<{ value: DirectoryPrincipal[] }>(
+    `/api/directory/principals?${params.toString()}`,
+  );
+}
+
+export async function resolveDirectoryPrincipals(
+  principals: PackageAccessEntity[],
+) {
+  return request<{ value: DirectoryPrincipal[] }>(
+    "/api/directory/principals/resolve",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ principals }),
+    },
+  );
+}
+
+export async function updateAgentAccess(
+  id: string,
+  update: PackageAccessReplacement,
+) {
+  return request<{
+    agent: CopilotPackageDetail;
+    result: PackageAccessUpdateResult;
+  }>(`/api/agents/${encodeURIComponent(id)}/access`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+}
+
+export async function updateAgentsAccess(
+  ids: string[],
+  update: PackageAccessUpdate,
+) {
+  return request<BulkActionJob>("/api/agents/access", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids, ...update }),
   });
 }
 

@@ -1,4 +1,5 @@
 import type { ErrorRequestHandler } from "express";
+import { config } from "./config.js";
 
 export class AppError extends Error {
   status: number;
@@ -32,6 +33,10 @@ export const errorHandler: ErrorRequestHandler = (
   response,
   _next,
 ) => {
+  if (!(error instanceof AppError)) {
+    console.error("Unexpected request error", error);
+  }
+
   const appError = normalizeError(error);
 
   response.status(appError.status).json({
@@ -43,13 +48,19 @@ export const errorHandler: ErrorRequestHandler = (
   });
 };
 
-function normalizeError(error: unknown) {
+export function normalizeError(error: unknown) {
   if (error instanceof AppError) {
     return error;
   }
 
   if (error instanceof Error) {
-    return new AppError(500, "internal_error", error.message);
+    return new AppError(
+      500,
+      "internal_error",
+      config.nodeEnv === "production"
+        ? "An unexpected error occurred"
+        : error.message,
+    );
   }
 
   return new AppError(500, "internal_error", "An unexpected error occurred");

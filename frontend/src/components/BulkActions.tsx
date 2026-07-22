@@ -1,9 +1,13 @@
-import type { BulkActionResult } from "../api/client";
+import type {
+  AccessAuditAction,
+  AuditAction,
+  BlockAuditAction,
+  BulkActionResult,
+  PackageAccessUpdate,
+} from "../api/client";
 import type { ReactNode } from "react";
 
-type BulkProgress = {
-  action: "block" | "unblock";
-  targetBlockedState: boolean;
+type BulkProgressBase = {
   total: number;
   completed: number;
   succeeded: number;
@@ -12,14 +16,29 @@ type BulkProgress = {
   currentAgentName?: string;
 };
 
+export type BulkProgress = BulkProgressBase &
+  (
+    | {
+        action: BlockAuditAction;
+        targetBlockedState: boolean;
+        accessUpdate?: never;
+      }
+    | {
+        action: AccessAuditAction;
+        targetBlockedState?: never;
+        accessUpdate: PackageAccessUpdate;
+      }
+  );
+
 type BulkActionsProps = {
   disabled: boolean;
   activityProgress?: ReactNode;
-  busyAction?: "block" | "unblock";
+  busyAction?: AuditAction;
   progress?: BulkProgress;
   result?: BulkActionResult;
   selectedCount: number;
   onBlockAll: () => void;
+  onManageAccess: () => void;
   onUnblockAll: () => void;
 };
 
@@ -31,6 +50,7 @@ export function BulkActions({
   result,
   selectedCount,
   onBlockAll,
+  onManageAccess,
   onUnblockAll,
 }: BulkActionsProps) {
   const failedResults =
@@ -70,15 +90,23 @@ export function BulkActions({
             ? "Unblocking selected"
             : "Unblock selected"}
         </button>
+        <button
+          type="button"
+          className="secondary"
+          disabled={disabled || selectedCount === 0}
+          onClick={onManageAccess}
+        >
+          {busyAction === "update-availability" ||
+          busyAction === "update-installation"
+            ? "Updating access"
+            : "Manage access"}
+        </button>
       </div>
       {progress ? <BulkProgressMeter progress={progress} /> : null}
       {activityProgress}
       {result ? (
         <div className="bulk-result">
-          <strong>
-            {result.targetBlockedState ? "Block selected" : "Unblock selected"}{" "}
-            result
-          </strong>
+          <strong>{bulkResultLabel(result)} result</strong>
           <span>{result.succeeded} succeeded</span>
           <span>{result.skipped} skipped</span>
           <span>{result.failed} failed</span>
@@ -111,7 +139,7 @@ export function BulkActions({
 }
 
 function BulkProgressMeter({ progress }: { progress: BulkProgress }) {
-  const actionLabel = progress.targetBlockedState ? "Blocking" : "Unblocking";
+  const actionLabel = bulkProgressLabel(progress);
   const completedPercent =
     progress.total === 0
       ? 100
@@ -136,4 +164,24 @@ function BulkProgressMeter({ progress }: { progress: BulkProgress }) {
       ) : null}
     </div>
   );
+}
+
+function bulkResultLabel(result: BulkActionResult) {
+  if (result.accessUpdate) {
+    return result.accessUpdate.target === "availability"
+      ? "Update availability"
+      : "Update installation";
+  }
+
+  return result.targetBlockedState ? "Block selected" : "Unblock selected";
+}
+
+function bulkProgressLabel(progress: BulkProgress) {
+  if (progress.accessUpdate) {
+    return progress.accessUpdate.target === "availability"
+      ? "Updating availability"
+      : "Updating installation";
+  }
+
+  return progress.targetBlockedState ? "Blocking" : "Unblocking";
 }

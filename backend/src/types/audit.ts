@@ -1,4 +1,8 @@
-export type AuditAction = "block" | "unblock";
+export type BlockAuditAction = "block" | "unblock";
+
+export type AccessAuditAction = "update-availability" | "update-installation";
+
+export type AuditAction = BlockAuditAction | AccessAuditAction;
 
 export type AuditScope = "single" | "bulk";
 
@@ -11,12 +15,10 @@ export type AuditActor = {
   tenantId?: string;
 };
 
-export type AuditEvent = {
+type AuditEventBase = {
   id: string;
   operationId: string;
   scope: AuditScope;
-  action: AuditAction;
-  targetBlockedState: boolean;
   agentId: string;
   agentDisplayName?: string;
   actor: AuditActor;
@@ -29,14 +31,27 @@ export type AuditEvent = {
   metadata?: Record<string, unknown>;
 };
 
+type AuditEventAction =
+  | {
+      action: BlockAuditAction;
+      targetBlockedState: boolean;
+    }
+  | {
+      action: AccessAuditAction;
+      targetBlockedState?: never;
+    };
+
+export type AuditEvent = AuditEventBase & AuditEventAction;
+
 export type StartAuditEvent = Omit<
-  AuditEvent,
+  AuditEventBase,
   "id" | "startedAt" | "completedAt" | "status"
-> & {
-  id?: string;
-  startedAt?: string;
-  status?: "started";
-};
+> &
+  AuditEventAction & {
+    id?: string;
+    startedAt?: string;
+    status?: "started";
+  };
 
 export type CompleteAuditEvent = {
   completedAt?: string;

@@ -3,6 +3,33 @@ export type PackageAccessEntity = {
   resourceType: "user" | "group" | string;
 };
 
+export type PackageAccessTarget = "availability" | "installation";
+
+export type PackageAccessMutationMode = "add" | "replace";
+
+export type PackageAccessScope = "specific" | "none";
+
+export type PackageAccessUpdate =
+  | {
+      target: PackageAccessTarget;
+      mode: PackageAccessMutationMode;
+      scope: "specific";
+      principals: PackageAccessEntity[];
+    }
+  | {
+      target: PackageAccessTarget;
+      mode: "replace";
+      scope: "none";
+      principals: never[];
+    };
+
+export type PackageAccessUpdateResult = {
+  changed: boolean;
+  previousCount: number;
+  resultingCount: number;
+  principals: PackageAccessEntity[];
+};
+
 export type PackageElementDetail = {
   elementType: string;
   elements: Array<{
@@ -48,6 +75,7 @@ export type BulkPackageResult = {
   message?: string;
   errorCode?: string;
   errorDetails?: unknown;
+  accessResult?: PackageAccessUpdateResult;
 };
 
 export type BulkSideEffectError = {
@@ -56,8 +84,7 @@ export type BulkSideEffectError = {
   message: string;
 };
 
-export type BulkActionResult = {
-  targetBlockedState: boolean;
+type BulkActionResultBase = {
   total: number;
   succeeded: number;
   failed: number;
@@ -65,6 +92,18 @@ export type BulkActionResult = {
   results: BulkPackageResult[];
   sideEffectErrors?: BulkSideEffectError[];
 };
+
+export type BulkActionResult = BulkActionResultBase &
+  (
+    | {
+        targetBlockedState: boolean;
+        accessUpdate?: never;
+      }
+    | {
+        targetBlockedState?: never;
+        accessUpdate: PackageAccessUpdate;
+      }
+  );
 
 export type BulkPackageDetailResult =
   | {

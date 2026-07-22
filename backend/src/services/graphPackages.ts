@@ -9,6 +9,9 @@ import type {
   CopilotPackage,
   CopilotPackageDetail,
   GraphCollectionResponse,
+  PackageAccessEntity,
+  PackageAccessUpdate,
+  PackageAccessUpdateResult,
 } from "../types/copilotPackage.js";
 
 const graphV1 = "https://graph.microsoft.com/v1.0";
@@ -17,6 +20,24 @@ const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
 const bulkWriteConcurrency = 4;
 const bulkWritePauseMs = 250;
+const allAccessScopeIndicators = new Set([
+  "all",
+  "everyone",
+  "allowedforall",
+  "availabletoall",
+  "deployedtoall",
+  "installedforall",
+]);
+const noAccessScopeIndicators = new Set([
+  "none",
+  "noone",
+  "allowedfornoone",
+  "availabletonoone",
+  "deployedtonoone",
+  "installedfornoone",
+  "notavailable",
+  "notdeployed",
+]);
 const defaultRetryPolicy = {
   maxAttempts: 5,
   baseDelayMs: 2_000,
@@ -29,10 +50,23 @@ export type FetchLike = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-type RetryPolicy = typeof defaultRetryPolicy;
+type RetryPolicy = {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  delay: (delayMs: number) => Promise<unknown>;
+};
 
 type BulkSetBlockedStateOptions = {
   packageIds?: string[];
+  writeConcurrency?: number;
+  writePauseMs?: number;
+  onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
+  onPackageResult?: (result: BulkPackageResult) => void | Promise<void>;
+};
+
+type BulkUpdatePackageAccessOptions = {
+  packageIds: string[];
   writeConcurrency?: number;
   writePauseMs?: number;
   onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
@@ -60,10 +94,8 @@ export class GraphPackagesClient {
     let nextUrl: string | undefined = buildCopilotAgentsListUrl();
 
     while (nextUrl) {
-      const page: GraphCollectionResponse<CopilotPackage> = await this.request(
-        nextUrl,
-        accessToken,
-      );
+      const page: GraphCollectionResponse<CopilotPackage> =
+        await this.requestWithRetry(nextUrl, accessToken, {});
       packages.push(...page.value);
       nextUrl = page["@odata.nextLink"];
     }
@@ -72,9 +104,10 @@ export class GraphPackagesClient {
   }
 
   async getPackageDetails(accessToken: string, id: string) {
-    return this.request<CopilotPackageDetail>(
+    return this.requestWithRetry<CopilotPackageDetail>(
       `${graphV1}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
       accessToken,
+      {},
     );
   }
 
@@ -91,6 +124,22 @@ export class GraphPackagesClient {
       `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}/unblock`,
       accessToken,
       { method: "POST" },
+    );
+  }
+
+  async patchPackageAccess(
+    accessToken: string,
+    id: string,
+    payload: Record<string, PackageAccessEntity[]>,
+  ) {
+    await this.requestWithRetry<void>(
+      `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
+      accessToken,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
     );
   }
 
@@ -152,6 +201,155 @@ export class GraphPackagesClient {
       "Retry attempts were exhausted.",
     );
   }
+}
+
+export async function updatePackageAccess(
+  client: GraphPackagesClient,
+  accessToken: string,
+  id: string,
+  update: PackageAccessUpdate,
+): Promise<PackageAccessUpdateResult> {
+  const property = accessCollectionProperty(update.target);
+  const requested = deduplicateAccessEntities(update.principals);
+
+  if (update.scope === "none") {
+    if (update.mode !== "replace" || requested.length > 0) {
+      throw new AppError(
+        400,
+        "invalid_access_update",
+        "No users requires replace mode and no principals.",
+      );
+    }
+  } else if (requested.length === 0) {
+    throw new AppError(
+      400,
+      "invalid_access_update",
+      "At least one principal is required for specific access.",
+    );
+  }
+
+  const details = await client.getPackageDetails(accessToken, id);
+  const previous = deduplicateAccessEntities(details[property] ?? []);
+  let resulting = update.scope === "none" ? [] : requested;
+
+  if (update.mode === "add") {
+    const currentScope = inferCurrentAccessScope(
+      details,
+      update.target,
+      previous,
+    );
+
+    if (currentScope === "all") {
+      return {
+        changed: false,
+        previousCount: previous.length,
+        resultingCount: previous.length,
+        principals: previous,
+      };
+    }
+
+    if (currentScope === "unknown") {
+      throw new AppError(
+        409,
+        "ambiguous_access_scope",
+        "Current access could not be determined safely. Use replace mode.",
+      );
+    }
+
+    resulting = deduplicateAccessEntities([...previous, ...requested]);
+  }
+
+  if (sameAccessEntities(previous, resulting)) {
+    return {
+      changed: false,
+      previousCount: previous.length,
+      resultingCount: resulting.length,
+      principals: resulting,
+    };
+  }
+
+  await client.patchPackageAccess(accessToken, id, { [property]: resulting });
+
+  return {
+    changed: true,
+    previousCount: previous.length,
+    resultingCount: resulting.length,
+    principals: resulting,
+  };
+}
+
+function sameAccessEntities(
+  left: PackageAccessEntity[],
+  right: PackageAccessEntity[],
+) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const rightKeys = new Set(
+    right.map(
+      (entity) =>
+        `${entity.resourceType.toLowerCase()}:${entity.resourceId.toLowerCase()}`,
+    ),
+  );
+
+  return left.every((entity) =>
+    rightKeys.has(
+      `${entity.resourceType.toLowerCase()}:${entity.resourceId.toLowerCase()}`,
+    ),
+  );
+}
+
+function accessCollectionProperty(target: PackageAccessUpdate["target"]) {
+  return target === "availability"
+    ? ("allowedUsersAndGroups" as const)
+    : ("acquireUsersAndGroups" as const);
+}
+
+function inferCurrentAccessScope(
+  details: CopilotPackageDetail,
+  target: PackageAccessUpdate["target"],
+  principals: PackageAccessEntity[],
+) {
+  if (principals.length > 0) {
+    return "specific" as const;
+  }
+
+  const indicator = normalizeAccessScopeIndicator(
+    target === "availability" ? details.availableTo : details.deployedTo,
+  );
+
+  if (allAccessScopeIndicators.has(indicator)) {
+    return "all" as const;
+  }
+
+  if (noAccessScopeIndicators.has(indicator)) {
+    return "none" as const;
+  }
+
+  return "unknown" as const;
+}
+
+function normalizeAccessScopeIndicator(value: string | undefined) {
+  return value?.replace(/[^a-z0-9]/gi, "").toLowerCase() ?? "";
+}
+
+function deduplicateAccessEntities(entities: PackageAccessEntity[]) {
+  const unique = new Map<string, PackageAccessEntity>();
+
+  for (const entity of entities) {
+    const resourceId = entity.resourceId.trim();
+    const resourceType = entity.resourceType.trim();
+
+    if (!resourceId || !resourceType) {
+      continue;
+    }
+
+    const key = `${resourceType.toLowerCase()}:${resourceId.toLowerCase()}`;
+    unique.set(key, { resourceId, resourceType });
+  }
+
+  return [...unique.values()];
 }
 
 export function buildCopilotAgentsListUrl() {
@@ -271,8 +469,100 @@ export async function bulkSetBlockedState(
   };
 }
 
+export async function bulkUpdatePackageAccess(
+  client: GraphPackagesClient,
+  accessToken: string,
+  update: PackageAccessUpdate,
+  options: BulkUpdatePackageAccessOptions,
+): Promise<BulkActionResult> {
+  const packages = await client.listCopilotAgents(accessToken);
+  const requestedIds = new Set(options.packageIds);
+  const packageById = new Map(packages.map((agent) => [agent.id, agent]));
+  const results: BulkPackageResult[] = [];
+  const sideEffectErrors: BulkSideEffectError[] = [];
+  const writeConcurrency = normalizePositiveInteger(
+    options.writeConcurrency,
+    bulkWriteConcurrency,
+  );
+  const writePauseMs = options.writePauseMs ?? bulkWritePauseMs;
+
+  for (const id of requestedIds) {
+    if (packageById.has(id)) {
+      continue;
+    }
+
+    const result: BulkPackageResult = {
+      id,
+      displayName: id,
+      status: "failed",
+      message: "Package was not found in the Copilot catalog.",
+    };
+    results.push(result);
+    await emitPackageResult(options, result, sideEffectErrors);
+  }
+
+  const scopedPackages = [...requestedIds].flatMap((id) => {
+    const agent = packageById.get(id);
+    return agent ? [agent] : [];
+  });
+  const taskResults = await mapWithConcurrency(
+    scopedPackages,
+    writeConcurrency,
+    async (agent): Promise<BulkPackageResult> => {
+      await emitPackageStart(options, agent, sideEffectErrors);
+      let result: BulkPackageResult;
+
+      try {
+        if (writePauseMs > 0) {
+          await delay(writePauseMs);
+        }
+
+        const accessResult = await updatePackageAccess(
+          client,
+          accessToken,
+          agent.id,
+          update,
+        );
+        result = {
+          id: agent.id,
+          displayName: agent.displayName,
+          status: accessResult.changed ? "succeeded" : "skipped",
+          message: accessResult.changed ? undefined : "Access already assigned",
+          accessResult,
+        };
+      } catch (error) {
+        result = {
+          id: agent.id,
+          displayName: agent.displayName,
+          status: "failed",
+          message:
+            error instanceof Error ? error.message : "Unknown Graph error",
+          errorCode: error instanceof AppError ? error.code : undefined,
+          errorDetails: error instanceof AppError ? error.details : undefined,
+        };
+      }
+
+      await emitPackageResult(options, result, sideEffectErrors);
+      return result;
+    },
+  );
+
+  results.push(...taskResults);
+
+  return {
+    accessUpdate: update,
+    total: requestedIds.size,
+    succeeded: results.filter((result) => result.status === "succeeded").length,
+    failed: results.filter((result) => result.status === "failed").length,
+    skipped: results.filter((result) => result.status === "skipped").length,
+    results,
+    sideEffectErrors:
+      sideEffectErrors.length > 0 ? sideEffectErrors : undefined,
+  };
+}
+
 async function emitPackageStart(
-  options: BulkSetBlockedStateOptions,
+  options: BulkSetBlockedStateOptions | BulkUpdatePackageAccessOptions,
   agent: CopilotPackage,
   sideEffectErrors: BulkSideEffectError[],
 ) {
@@ -288,7 +578,7 @@ async function emitPackageStart(
 }
 
 async function emitPackageResult(
-  options: BulkSetBlockedStateOptions,
+  options: BulkSetBlockedStateOptions | BulkUpdatePackageAccessOptions,
   result: BulkPackageResult,
   sideEffectErrors: BulkSideEffectError[],
 ) {
@@ -346,31 +636,30 @@ export async function bulkGetPackageDetails(
   };
 }
 
-async function graphError(response: Response) {
-  let details: unknown;
+export async function graphError(response: Response) {
+  const body = await response.text().catch(() => "");
+  let details: unknown = body || undefined;
   let message = `Microsoft Graph request failed with status ${response.status}.`;
   let code = "graph_error";
 
-  try {
-    details = await response.json();
-    const graphDetails = details as {
-      error?: { code?: string; message?: string };
-      Message?: string;
-      message?: string;
-      StatusCode?: number | string;
-    };
-    message =
-      graphDetails.error?.message ??
-      graphDetails.Message ??
-      graphDetails.message ??
-      message;
-    code =
-      graphDetails.error?.code ?? graphDetails.StatusCode?.toString() ?? code;
-  } catch {
-    const body = await response.text().catch(() => "");
-    if (body) {
+  if (body) {
+    try {
+      details = JSON.parse(body) as unknown;
+      const graphDetails = details as {
+        error?: { code?: string; message?: string };
+        Message?: string;
+        message?: string;
+        StatusCode?: number | string;
+      };
+      message =
+        graphDetails.error?.message ??
+        graphDetails.Message ??
+        graphDetails.message ??
+        message;
+      code =
+        graphDetails.error?.code ?? graphDetails.StatusCode?.toString() ?? code;
+    } catch {
       message = body;
-      details = body;
     }
   }
 

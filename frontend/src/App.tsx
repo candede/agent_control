@@ -30,10 +30,14 @@ import {
   signOut,
   unblockAgent,
   unblockAgents,
+  updateAgentAccess,
+  updateAgentsAccess,
   type BulkActionJob,
   type BulkActionResult,
+  type AuditAction,
   type CopilotPackage,
   type CopilotPackageDetail,
+  type PackageAccessUpdate,
   type SessionUser,
 } from "./api/client";
 import {
@@ -46,9 +50,10 @@ import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
 import "./App.css";
 import { parseBulkRefSearch } from "./bulkRefSearch";
 import { AgentDetailModal } from "./components/AgentDetailModal";
+import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { AgentTable } from "./components/AgentTable";
 import { AuditLogView } from "./components/AuditLogView";
-import { BulkActions } from "./components/BulkActions";
+import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
 import {
@@ -231,10 +236,11 @@ function App() {
     () => new Set(),
   );
   const [busyAgentId, setBusyAgentId] = useState<string>();
-  const [busyBulkAction, setBusyBulkAction] = useState<"block" | "unblock">();
+  const [busyBulkAction, setBusyBulkAction] = useState<AuditAction>();
   const [bulkProgress, setBulkProgress] = useState<BulkProgress>();
   const [bulkResult, setBulkResult] = useState<BulkActionResult>();
   const [bulkConfirmation, setBulkConfirmation] = useState<BulkConfirmation>();
+  const [bulkAccessAgentIds, setBulkAccessAgentIds] = useState<string[]>();
   const [agentDetail, setAgentDetail] = useState<CopilotPackageDetail>();
   const [loadingAgentDetailId, setLoadingAgentDetailId] = useState<string>();
   const [agentDetailError, setAgentDetailError] = useState<string>();
@@ -657,6 +663,7 @@ function App() {
     setAgents([]);
     setSelectedAgentIds(new Set());
     setBulkConfirmation(undefined);
+    setBulkAccessAgentIds(undefined);
     setAgentDetail(undefined);
     setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
@@ -824,6 +831,34 @@ function App() {
     }
   }
 
+  async function handleUpdateAgentAccess(update: PackageAccessUpdate) {
+    if (!agentDetail) {
+      throw new Error("Agent details are no longer open.");
+    }
+
+    if (update.mode !== "replace") {
+      throw new Error("Single-agent access updates must replace assignments.");
+    }
+
+    setError(undefined);
+    const response = await updateAgentAccess(agentDetail.id, update);
+    agentDetailsCache.current.set(response.agent.id, response.agent);
+    setAgentDetail(response.agent);
+    setAgents((current) =>
+      current.map((agent) =>
+        agent.id === response.agent.id
+          ? {
+              ...agent,
+              availableTo: response.agent.availableTo,
+              deployedTo: response.agent.deployedTo,
+              lastModifiedDateTime: response.agent.lastModifiedDateTime,
+            }
+          : agent,
+      ),
+    );
+    markAgentStatesChanged([response.agent.id]);
+  }
+
   function requestExportCsv() {
     if (exportableAgentCount === 0 || exportingCsv) {
       return;
@@ -969,6 +1004,55 @@ function App() {
     }
   }
 
+  function requestBulkAccessUpdate() {
+    if (selectedAgents.length === 0) {
+      setError("Select one or more agents before managing access.");
+      return;
+    }
+
+    setError(undefined);
+    setBulkAccessAgentIds(selectedAgents.map((agent) => agent.id));
+  }
+
+  async function runBulkAccessUpdate(update: PackageAccessUpdate) {
+    const ids = bulkAccessAgentIds ?? [];
+
+    if (ids.length === 0) {
+      throw new Error("The selected agents are no longer available.");
+    }
+
+    const action: AuditAction =
+      update.target === "availability"
+        ? "update-availability"
+        : "update-installation";
+    setBusyBulkAction(action);
+    setBulkProgress({
+      action,
+      accessUpdate: update,
+      total: ids.length,
+      completed: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      currentAgentName: "starting server-side bulk job",
+    });
+    setError(undefined);
+    setBulkResult(undefined);
+
+    try {
+      const job = await updateAgentsAccess(ids, update);
+      setBulkAccessAgentIds(undefined);
+      saveStoredActiveBulkJobId(job.id);
+      await followBulkJob(job.id, job);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setBusyBulkAction(undefined);
+      setBulkProgress(undefined);
+      clearStoredActiveBulkJobId();
+      throw requestError;
+    }
+  }
+
   async function followBulkJob(jobId: string, initialJob?: BulkActionJob) {
     const requestId = bulkJobPollRequestId.current + 1;
     bulkJobPollRequestId.current = requestId;
@@ -1013,12 +1097,31 @@ function App() {
   }
 
   function applyBulkActionResult(result: BulkActionResult) {
-    updateCachedAgentBlockedStates(
-      result.results
+    if (result.targetBlockedState !== undefined) {
+      updateCachedAgentBlockedStates(
+        result.results
+          .filter((item) => item.status === "succeeded")
+          .map((item) => item.id),
+        result.targetBlockedState,
+      );
+    }
+
+    if (result.accessUpdate) {
+      const changedIds = result.results
         .filter((item) => item.status === "succeeded")
-        .map((item) => item.id),
-      result.targetBlockedState,
-    );
+        .map((item) => item.id);
+
+      for (const id of changedIds) {
+        agentDetailsCache.current.delete(id);
+      }
+
+      if (agentDetail && changedIds.includes(agentDetail.id)) {
+        setAgentDetail(undefined);
+      }
+
+      markAgentStatesChanged(changedIds);
+      void loadAgents();
+    }
 
     setBulkResult(result);
     setSelectedAgentIds(
@@ -1318,6 +1421,7 @@ function App() {
             result={bulkResult}
             selectedCount={selectedAgentIds.size}
             onBlockAll={() => requestBulkAction(true)}
+            onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => requestBulkAction(false)}
           />
 
@@ -1563,7 +1667,7 @@ function App() {
           </section>
 
           {loadingBulkRefSearch ? (
-            <div className="screen-state compact-state">
+            <div className="screen-state">
               Resolving bulk ref {normalizedBulkRefQuery}...
             </div>
           ) : null}
@@ -1647,6 +1751,16 @@ function App() {
           usage={usageByAgentId.get(agentDetail.id)}
           userRows={userAgentRowsByAgentId.get(agentDetail.id) ?? []}
           onClose={() => setAgentDetail(undefined)}
+          onUpdateAccess={handleUpdateAgentAccess}
+        />
+      ) : null}
+
+      {bulkAccessAgentIds ? (
+        <AccessAssignmentModal
+          context="bulk"
+          agentCount={bulkAccessAgentIds.length}
+          onCancel={() => setBulkAccessAgentIds(undefined)}
+          onSubmit={runBulkAccessUpdate}
         />
       ) : null}
 
@@ -1699,17 +1813,6 @@ type UsageFilter =
   | "without-usage"
   | "recent"
   | "inactive";
-
-type BulkProgress = {
-  action: "block" | "unblock";
-  targetBlockedState: boolean;
-  total: number;
-  completed: number;
-  succeeded: number;
-  failed: number;
-  skipped: number;
-  currentAgentName?: string;
-};
 
 type BulkConfirmation = {
   action: "block" | "unblock";
@@ -1829,9 +1932,7 @@ function mergeAgentRowsInCatalogOrder(
 }
 
 function toBulkProgress(job: BulkActionJob): BulkProgress {
-  return {
-    action: job.action,
-    targetBlockedState: job.targetBlockedState,
+  const progress = {
     total: job.total,
     completed: job.completed,
     succeeded: job.succeeded,
@@ -1839,6 +1940,14 @@ function toBulkProgress(job: BulkActionJob): BulkProgress {
     skipped: job.skipped,
     currentAgentName: job.currentAgentName,
   };
+
+  return job.accessUpdate
+    ? { ...progress, action: job.action, accessUpdate: job.accessUpdate }
+    : {
+        ...progress,
+        action: job.action,
+        targetBlockedState: job.targetBlockedState,
+      };
 }
 
 function wait(milliseconds: number) {

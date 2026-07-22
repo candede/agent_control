@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { AuditLog } from "./auditLog.js";
 
@@ -59,6 +60,129 @@ describe("AuditLog", () => {
       metadata: { source: "test" },
     });
     expect(completed.completedAt).toBeDefined();
+  });
+
+  it("records an access update without block-specific state", () => {
+    const auditLog = createAuditLog();
+
+    const started = auditLog.startEvent({
+      operationId: "operation-access-1",
+      scope: "single",
+      action: "update-availability",
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      requestPath: "/api/agents/agent-1/access",
+      metadata: {
+        mode: "replace",
+        scope: "none",
+      },
+    });
+
+    const completed = auditLog.completeEvent(started.id, {
+      status: "succeeded",
+    });
+
+    expect(completed).toMatchObject({
+      action: "update-availability",
+      metadata: { mode: "replace", scope: "none" },
+    });
+    expect(completed).not.toHaveProperty("targetBlockedState");
+  });
+
+  it("migrates the legacy required blocked-state column without losing rows", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "agent-control-audit-legacy-"));
+    tempDirs.push(tempDir);
+    const databasePath = join(tempDir, "audit.sqlite");
+    const legacyDatabase = new DatabaseSync(databasePath);
+    legacyDatabase.exec(`
+      CREATE TABLE audit_events (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_blocked_state INTEGER NOT NULL,
+        agent_id TEXT NOT NULL,
+        agent_display_name TEXT,
+        actor_username TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        actor_home_account_id TEXT NOT NULL,
+        tenant_id TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL,
+        message TEXT,
+        error_code TEXT,
+        request_path TEXT NOT NULL,
+        metadata_json TEXT
+      );
+      INSERT INTO audit_events (
+        id, operation_id, scope, action, target_blocked_state, agent_id,
+        actor_username, actor_display_name, actor_home_account_id, started_at,
+        status, request_path
+      ) VALUES (
+        'legacy-1', 'operation-legacy', 'single', 'block', 1, 'agent-legacy',
+        'admin@example.com', 'Admin', 'account-1',
+        '2026-07-03T10:00:00.000Z', 'succeeded', '/api/agents/agent-legacy/block'
+      );
+    `);
+    legacyDatabase.close();
+
+    const auditLog = new AuditLog(databasePath);
+    auditLogs.push(auditLog);
+
+    expect(auditLog.getEvent("legacy-1")).toMatchObject({
+      agentId: "agent-legacy",
+      targetBlockedState: true,
+    });
+
+    const accessEvent = auditLog.startEvent({
+      operationId: "operation-access-after-migration",
+      scope: "single",
+      action: "update-installation",
+      agentId: "agent-1",
+      actor: actor("admin@example.com"),
+      requestPath: "/api/agents/agent-1/access",
+    });
+
+    expect(
+      auditLog.getEvent(accessEvent.id)?.targetBlockedState,
+    ).toBeUndefined();
+  });
+
+  it("excludes malformed rows without making the audit log unreadable", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "agent-control-audit-invalid-"));
+    tempDirs.push(tempDir);
+    const databasePath = join(tempDir, "audit.sqlite");
+    const auditLog = new AuditLog(databasePath);
+    auditLogs.push(auditLog);
+    const database = new DatabaseSync(databasePath);
+    database
+      .prepare(
+        `INSERT INTO audit_events (
+          id, operation_id, scope, action, target_blocked_state, agent_id,
+          actor_username, actor_display_name, actor_home_account_id, started_at,
+          status, request_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "invalid-1",
+        "operation-invalid",
+        "single",
+        "future-action",
+        null,
+        "agent-invalid",
+        "admin@example.com",
+        "Admin",
+        "account-1",
+        "2026-07-03T10:00:00.000Z",
+        "succeeded",
+        "/api/agents/agent-invalid/future",
+      );
+    database.close();
+
+    expect(auditLog.getEvent("invalid-1")).toBeUndefined();
+    expect(auditLog.listEvents()).toEqual([]);
+    expect(auditLog.countEvents()).toBe(0);
   });
 
   it("records failure messages and error codes", () => {

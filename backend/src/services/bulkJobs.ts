@@ -2,17 +2,16 @@ import { randomUUID } from "node:crypto";
 import type {
   BulkActionResult,
   BulkPackageResult,
+  PackageAccessUpdate,
 } from "../types/copilotPackage.js";
-import type { AuditAction } from "../types/audit.js";
+import type { AccessAuditAction, BlockAuditAction } from "../types/audit.js";
 
 const jobRetentionMs = 60 * 60 * 1000;
 
 export type BulkJobStatus = "queued" | "running" | "completed" | "failed";
 
-export type BulkActionJob = {
+type BulkActionJobBase = {
   id: string;
-  action: AuditAction;
-  targetBlockedState: boolean;
   status: BulkJobStatus;
   total: number;
   completed: number;
@@ -28,10 +27,25 @@ export type BulkActionJob = {
   completedAt?: string;
 };
 
-const jobs = new Map<string, BulkActionJob>();
+export type BulkActionJob = BulkActionJobBase &
+  (
+    | {
+        action: BlockAuditAction;
+        targetBlockedState: boolean;
+        accessUpdate?: never;
+      }
+    | {
+        action: AccessAuditAction;
+        targetBlockedState?: never;
+        accessUpdate: PackageAccessUpdate;
+      }
+  );
+
+const jobs = new Map<string, { ownerId: string; job: BulkActionJob }>();
 
 export function createBulkActionJob(
-  action: AuditAction,
+  ownerId: string,
+  action: BlockAuditAction,
   targetBlockedState: boolean,
   total: number,
 ) {
@@ -53,17 +67,46 @@ export function createBulkActionJob(
     updatedAt: now,
   };
 
-  jobs.set(job.id, job);
+  jobs.set(job.id, { ownerId, job });
   return job;
 }
 
-export function getBulkActionJob(id: string) {
+export function createBulkAccessJob(
+  ownerId: string,
+  action: AccessAuditAction,
+  accessUpdate: PackageAccessUpdate,
+  total: number,
+) {
   pruneExpiredJobs();
-  return jobs.get(id);
+
+  const now = new Date().toISOString();
+  const job: BulkActionJob = {
+    id: randomUUID(),
+    action,
+    accessUpdate,
+    status: "queued",
+    total,
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+    results: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  jobs.set(job.id, { ownerId, job });
+  return job;
+}
+
+export function getBulkActionJob(id: string, ownerId: string) {
+  pruneExpiredJobs();
+  const stored = jobs.get(id);
+  return stored?.ownerId === ownerId ? stored.job : undefined;
 }
 
 export function startBulkActionPackage(jobId: string, displayName: string) {
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId)?.job;
 
   if (!job || isTerminal(job.status)) {
     return;
@@ -78,14 +121,22 @@ export function recordBulkActionPackageResult(
   jobId: string,
   result: BulkPackageResult,
 ) {
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId)?.job;
 
   if (!job || isTerminal(job.status)) {
     return;
   }
 
   job.status = "running";
-  job.results.push(result);
+  const existingResultIndex = job.results.findIndex(
+    (item) => item.id === result.id,
+  );
+
+  if (existingResultIndex === -1) {
+    job.results.push(result);
+  } else {
+    job.results[existingResultIndex] = result;
+  }
   job.completed = job.results.length;
   job.succeeded = job.results.filter(
     (item) => item.status === "succeeded",
@@ -97,9 +148,9 @@ export function recordBulkActionPackageResult(
 }
 
 export function completeBulkActionJob(jobId: string, result: BulkActionResult) {
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId)?.job;
 
-  if (!job) {
+  if (!job || isTerminal(job.status)) {
     return;
   }
 
@@ -118,9 +169,9 @@ export function completeBulkActionJob(jobId: string, result: BulkActionResult) {
 }
 
 export function failBulkActionJob(jobId: string, error: unknown) {
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId)?.job;
 
-  if (!job) {
+  if (!job || isTerminal(job.status)) {
     return;
   }
 
@@ -139,7 +190,8 @@ function isTerminal(status: BulkJobStatus) {
 function pruneExpiredJobs() {
   const cutoff = Date.now() - jobRetentionMs;
 
-  for (const [id, job] of jobs) {
+  for (const [id, stored] of jobs) {
+    const { job } = stored;
     const updatedAt = Date.parse(job.updatedAt);
 
     if (!Number.isNaN(updatedAt) && updatedAt < cutoff) {

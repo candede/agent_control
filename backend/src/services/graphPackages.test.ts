@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
+import type { PackageAccessEntity } from "../types/copilotPackage.js";
 import {
   buildCopilotAgentsListUrl,
   bulkGetPackageDetails,
   bulkSetBlockedState,
+  bulkUpdatePackageAccess,
   GraphPackagesClient,
+  updatePackageAccess,
   type FetchLike,
 } from "./graphPackages.js";
 
@@ -55,6 +58,282 @@ describe("GraphPackagesClient", () => {
 
     expect(agents.map((agent) => agent.id)).toEqual(["P_1", "P_2"]);
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries transient failures while reading package details", async () => {
+    const fetcher = vi
+      .fn<FetchLike>()
+      .mockResolvedValueOnce(
+        Response.json(
+          { error: { code: "ServiceUnavailable", message: "Try again" } },
+          { status: 503 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ id: "P_1", displayName: "First", isBlocked: false }),
+      );
+    const retryDelay = vi.fn(async () => undefined);
+    const client = new GraphPackagesClient(fetcher, {
+      maxAttempts: 2,
+      delay: retryDelay,
+    });
+
+    await expect(
+      client.getPackageDetails("token", "P_1"),
+    ).resolves.toMatchObject({ id: "P_1" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(retryDelay).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces only the selected package access collection", async () => {
+    const fetcher = vi.fn<FetchLike>(async (_url, init) =>
+      init?.method === "PATCH"
+        ? new Response(null, { status: 204 })
+        : Response.json({
+            id: "P_1",
+            displayName: "First",
+            isBlocked: false,
+            allowedUsersAndGroups: [
+              { resourceType: "group", resourceId: "old-group" },
+            ],
+          }),
+    );
+    const client = new GraphPackagesClient(fetcher);
+
+    const result = await updatePackageAccess(client, "token", "P_1", {
+      target: "availability",
+      mode: "replace",
+      scope: "specific",
+      principals: [
+        { resourceType: "group", resourceId: "group-1" },
+        { resourceType: "user", resourceId: "user-1" },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      changed: true,
+      previousCount: 1,
+      resultingCount: 2,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const [url, init] = fetcher.mock.calls[1];
+    expect(url.toString()).toBe(
+      "https://graph.microsoft.com/beta/copilot/admin/catalog/packages/P_1",
+    );
+    expect(init).toMatchObject({ method: "PATCH" });
+    expect(JSON.parse(String(init?.body))).toEqual({
+      allowedUsersAndGroups: [
+        { resourceType: "group", resourceId: "group-1" },
+        { resourceType: "user", resourceId: "user-1" },
+      ],
+    });
+  });
+
+  it("skips a replace when the selected collection already matches", async () => {
+    class FakeClient extends GraphPackagesClient {
+      patchPackageAccess = vi.fn();
+
+      override async getPackageDetails() {
+        return {
+          id: "P_1",
+          displayName: "First",
+          isBlocked: false,
+          allowedUsersAndGroups: [
+            { resourceType: "user", resourceId: "user-1" },
+            { resourceType: "group", resourceId: "group-1" },
+          ],
+        };
+      }
+    }
+
+    const client = new FakeClient();
+    const result = await updatePackageAccess(client, "token", "P_1", {
+      target: "availability",
+      mode: "replace",
+      scope: "specific",
+      principals: [
+        { resourceType: "group", resourceId: "GROUP-1" },
+        { resourceType: "user", resourceId: "USER-1" },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      changed: false,
+      previousCount: 2,
+      resultingCount: 2,
+    });
+    expect(client.patchPackageAccess).not.toHaveBeenCalled();
+  });
+
+  it("merges package access for add mode and skips a no-op", async () => {
+    class FakeClient extends GraphPackagesClient {
+      patches: Array<Record<string, PackageAccessEntity[]>> = [];
+
+      override async getPackageDetails() {
+        return {
+          id: "P_1",
+          displayName: "First",
+          isBlocked: false,
+          acquireUsersAndGroups: [
+            { resourceType: "group", resourceId: "group-1" },
+          ],
+        };
+      }
+
+      override async patchPackageAccess(
+        _accessToken: string,
+        _id: string,
+        payload: Record<string, PackageAccessEntity[]>,
+      ) {
+        this.patches.push(payload);
+      }
+    }
+
+    const client = new FakeClient();
+    const noOp = await updatePackageAccess(client, "token", "P_1", {
+      target: "installation",
+      mode: "add",
+      scope: "specific",
+      principals: [{ resourceType: "group", resourceId: "group-1" }],
+    });
+    const changed = await updatePackageAccess(client, "token", "P_1", {
+      target: "installation",
+      mode: "add",
+      scope: "specific",
+      principals: [{ resourceType: "user", resourceId: "user-2" }],
+    });
+
+    expect(noOp.changed).toBe(false);
+    expect(changed).toMatchObject({
+      changed: true,
+      previousCount: 1,
+      resultingCount: 2,
+    });
+    expect(client.patches).toEqual([
+      {
+        acquireUsersAndGroups: [
+          { resourceType: "group", resourceId: "group-1" },
+          { resourceType: "user", resourceId: "user-2" },
+        ],
+      },
+    ]);
+  });
+
+  it("does not narrow all-user access in add mode", async () => {
+    class FakeClient extends GraphPackagesClient {
+      patchPackageAccess = vi.fn();
+
+      override async getPackageDetails() {
+        return {
+          id: "P_1",
+          displayName: "First",
+          isBlocked: false,
+          availableTo: "allowedForAll",
+        };
+      }
+    }
+
+    const client = new FakeClient();
+    const result = await updatePackageAccess(client, "token", "P_1", {
+      target: "availability",
+      mode: "add",
+      scope: "specific",
+      principals: [{ resourceType: "group", resourceId: "group-1" }],
+    });
+
+    expect(result.changed).toBe(false);
+    expect(client.patchPackageAccess).not.toHaveBeenCalled();
+  });
+
+  it("rejects add mode when the current access scope is ambiguous", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async getPackageDetails() {
+        return {
+          id: "P_1",
+          displayName: "First",
+          isBlocked: false,
+        };
+      }
+    }
+
+    await expect(
+      updatePackageAccess(new FakeClient(), "token", "P_1", {
+        target: "availability",
+        mode: "add",
+        scope: "specific",
+        principals: [{ resourceType: "group", resourceId: "group-1" }],
+      }),
+    ).rejects.toMatchObject({ status: 409, code: "ambiguous_access_scope" });
+  });
+
+  it("summarizes best-effort bulk access updates", async () => {
+    class FakeClient extends GraphPackagesClient {
+      override async listCopilotAgents() {
+        return [
+          { id: "P_1", displayName: "Already assigned", isBlocked: false },
+          { id: "P_2", displayName: "Updates", isBlocked: false },
+          { id: "P_3", displayName: "Fails", isBlocked: false },
+        ];
+      }
+
+      override async getPackageDetails(_accessToken: string, id: string) {
+        if (id === "P_3") {
+          throw new AppError(403, "Authorization_RequestDenied", "denied");
+        }
+
+        return {
+          id,
+          displayName: id,
+          isBlocked: false,
+          availableTo: "allowedForNoOne",
+          allowedUsersAndGroups:
+            id === "P_1"
+              ? [{ resourceType: "group", resourceId: "group-1" }]
+              : [],
+        };
+      }
+
+      override async patchPackageAccess() {}
+    }
+
+    const events: string[] = [];
+    const result = await bulkUpdatePackageAccess(
+      new FakeClient(),
+      "token",
+      {
+        target: "availability",
+        mode: "add",
+        scope: "specific",
+        principals: [{ resourceType: "group", resourceId: "group-1" }],
+      },
+      {
+        packageIds: ["P_1", "P_2", "P_3", "P_missing"],
+        writePauseMs: 0,
+        onPackageStart: (agent) => {
+          events.push(`start:${agent.id}`);
+        },
+        onPackageResult: (item) => {
+          events.push(`result:${item.id}:${item.status}`);
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      total: 4,
+      succeeded: 1,
+      skipped: 1,
+      failed: 2,
+      accessUpdate: { target: "availability", mode: "add" },
+    });
+    expect(result.results.find((item) => item.id === "P_1")).toMatchObject({
+      status: "skipped",
+      accessResult: { changed: false, previousCount: 1, resultingCount: 1 },
+    });
+    expect(result.results.find((item) => item.id === "P_3")).toMatchObject({
+      status: "failed",
+      errorCode: "Authorization_RequestDenied",
+    });
+    expect(events).toContain("result:P_missing:failed");
   });
 
   it("summarizes best-effort bulk block results", async () => {
@@ -177,6 +456,23 @@ describe("GraphPackagesClient", () => {
     });
 
     expect(result.succeeded).toBe(1);
+  });
+
+  it("preserves plain-text Graph error messages", async () => {
+    const client = new GraphPackagesClient(
+      async () =>
+        new Response("Service temporarily unavailable", { status: 503 }),
+      { maxAttempts: 1 },
+    );
+
+    await expect(client.listCopilotAgents("token")).rejects.toMatchObject({
+      status: 503,
+      code: "graph_error",
+      message: "Service temporarily unavailable",
+      details: {
+        graph: "Service temporarily unavailable",
+      },
+    });
   });
 
   it("limits bulk writes to selected packages", async () => {

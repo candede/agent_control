@@ -1,5 +1,18 @@
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
+import {
+  useDeferredValue,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  ExternalLink,
+  RefreshCw,
+} from "lucide-react";
 import {
   getAuditEvents,
   type AuditAction,
@@ -165,6 +178,8 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             <option value="all">All actions</option>
             <option value="block">Block</option>
             <option value="unblock">Unblock</option>
+            <option value="update-availability">Update availability</option>
+            <option value="update-installation">Update installation</option>
           </select>
         </label>
         <label>
@@ -203,7 +218,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             disabled={loading}
             onClick={handleRefreshAuditLog}
           >
-            <RefreshIcon />
+            <RefreshCw aria-hidden="true" />
           </button>
           <button
             type="button"
@@ -213,7 +228,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             disabled={loading || events.length === 0}
             onClick={handleExportAuditCsv}
           >
-            <ExportIcon />
+            <Download aria-hidden="true" />
           </button>
         </div>
       </section>
@@ -223,7 +238,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
       ) : events.length === 0 ? (
         <div className="empty-state">
           <h2>No audit events</h2>
-          <p>Block or unblock an agent, then refresh this view.</p>
+          <p>Run an agent control or access change, then refresh this view.</p>
         </div>
       ) : (
         <>
@@ -309,7 +324,7 @@ function AuditTable({
                     </div>
                   ) : null}
                 </td>
-                <td>{event.action === "block" ? "Block" : "Unblock"}</td>
+                <td>{formatAuditAction(event.action)}</td>
                 <td>
                   <AuditResultCell
                     event={event}
@@ -453,8 +468,8 @@ function AuditResultCell({
     <button
       type="button"
       className={`${className} audit-result-button`}
-      aria-label={`View error message: ${summary}`}
-      title={`View error message: ${summary}`}
+      aria-label={`View event details: ${summary}`}
+      title={`View event details: ${summary}`}
       onClick={() => onViewDetails(event)}
     >
       <span>{statusLabel}</span>
@@ -470,19 +485,37 @@ function AuditDetailsModal({
   event: AuditEvent;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeOnEscape = useEffectEvent(onClose);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+
+    function handleKeyDown(keyboardEvent: KeyboardEvent) {
+      if (keyboardEvent.key === "Escape") {
+        closeOnEscape();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
       <section
+        ref={dialogRef}
         className="confirm-modal audit-details-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="audit-details-title"
+        tabIndex={-1}
         onClick={(clickEvent) => clickEvent.stopPropagation()}
       >
         <div className="audit-details-modal-header">
           <div>
             <p className="eyebrow">Audit details</p>
-            <h2 id="audit-details-title">Error message</h2>
+            <h2 id="audit-details-title">Event details</h2>
           </div>
           <button type="button" className="secondary" onClick={onClose}>
             Close
@@ -493,7 +526,7 @@ function AuditDetailsModal({
           {hasAuditDetails(event) ? (
             <pre>{formatAuditDetailsMessage(event)}</pre>
           ) : (
-            <p>No error message was recorded for this event.</p>
+            <p>No additional details were recorded for this event.</p>
           )}
         </section>
       </section>
@@ -507,47 +540,6 @@ function AuditMetric({ label, value }: { label: string; value: number }) {
       <span>{label}</span>
       <strong>{value.toLocaleString()}</strong>
     </article>
-  );
-}
-
-function RefreshIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      width="18"
-      height="18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M21 12a9 9 0 0 1-15.3 6.4" />
-      <path d="M3 12A9 9 0 0 1 18.3 5.6" />
-      <path d="M18 2v4h-4" />
-      <path d="M6 22v-4h4" />
-    </svg>
-  );
-}
-
-function ExportIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      width="18"
-      height="18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-      <path d="M7 10l5 5 5-5" />
-      <path d="M12 15V3" />
-    </svg>
   );
 }
 
@@ -577,7 +569,7 @@ function toAuditCsv(events: AuditEvent[], agentNamesById: Map<string, string>) {
     formatDateTime(event.completedAt ?? event.startedAt),
     getAuditAgentDisplayName(event, agentNamesById) ?? "",
     event.agentId,
-    event.action === "block" ? "Block" : "Unblock",
+    formatAuditAction(event.action),
     formatStatus(event.status),
     event.message ?? "",
     event.errorCode ?? "",
@@ -599,6 +591,19 @@ function csvCell(value: string) {
 
 function formatActionGroup(event: AuditEvent) {
   return event.scope === "bulk" ? "Bulk run" : "Single action";
+}
+
+function formatAuditAction(action: AuditAction) {
+  switch (action) {
+    case "block":
+      return "Block";
+    case "unblock":
+      return "Unblock";
+    case "update-availability":
+      return "Update availability";
+    case "update-installation":
+      return "Update installation";
+  }
 }
 
 function shortOperationId(operationId: string) {
@@ -645,17 +650,22 @@ function statusClass(status: AuditStatus) {
 }
 
 function auditDetailsSummary(event: AuditEvent) {
-  return summarizeAuditMessage(event.message) ?? event.errorCode ?? "Details";
+  return (
+    summarizeAuditMessage(event.message) ??
+    accessMetadataSummary(event) ??
+    event.errorCode ??
+    "Details"
+  );
 }
 
 function fullAuditDetailsMessage(event: AuditEvent) {
   return event.message
     ? extractAuditErrorMessage(event.message)
-    : (event.errorCode ?? "Details");
+    : (accessMetadataSummary(event) ?? event.errorCode ?? "Details");
 }
 
 function hasAuditDetails(event: AuditEvent) {
-  return Boolean(event.message || event.errorCode);
+  return Boolean(event.message || event.errorCode || accessMetadata(event));
 }
 
 function summarizeAuditMessage(value: string | undefined) {
@@ -680,9 +690,47 @@ function formatAuditDetailsMessage(event: AuditEvent) {
     return JSON.stringify(errorDetails, null, 2);
   }
 
+  const accessDetails = accessMetadata(event);
+
+  if (accessDetails) {
+    return JSON.stringify(accessDetails, null, 2);
+  }
+
   return event.message
     ? formatJsonIfParseable(event.message)
     : (event.errorCode ?? "Details");
+}
+
+function accessMetadata(event: AuditEvent) {
+  if (
+    event.action !== "update-availability" &&
+    event.action !== "update-installation"
+  ) {
+    return undefined;
+  }
+
+  const metadata = event.metadata ?? {};
+  return {
+    setting:
+      event.action === "update-availability" ? "Available to" : "Installed for",
+    mode: metadata.mode,
+    scope: metadata.scope,
+    principals: metadata.principals,
+    previousCount: metadata.previousCount,
+    resultingCount: metadata.resultingCount,
+  };
+}
+
+function accessMetadataSummary(event: AuditEvent) {
+  const metadata = accessMetadata(event);
+
+  if (!metadata) {
+    return undefined;
+  }
+
+  const mode = typeof metadata.mode === "string" ? metadata.mode : "update";
+  const scope = typeof metadata.scope === "string" ? metadata.scope : "access";
+  return `${mode} ${scope}`;
 }
 
 function extractAuditErrorMessage(value: string) {

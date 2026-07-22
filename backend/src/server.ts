@@ -22,7 +22,7 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: "512kb" }));
 app.use(
   session({
     name: "agent-control.sid",

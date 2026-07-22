@@ -4,7 +4,9 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "../config.js";
 import type {
+  AccessAuditAction,
   AuditEvent,
+  BlockAuditAction,
   CompleteAuditEvent,
   ListAuditEventsQuery,
   StartAuditEvent,
@@ -21,9 +23,9 @@ type AuditEventsFilter = {
 type AuditEventRow = {
   id: string;
   operation_id: string;
-  scope: AuditEvent["scope"];
-  action: AuditEvent["action"];
-  target_blocked_state: 0 | 1;
+  scope: string;
+  action: string;
+  target_blocked_state: 0 | 1 | null;
   agent_id: string;
   agent_display_name: string | null;
   actor_username: string;
@@ -32,7 +34,7 @@ type AuditEventRow = {
   tenant_id: string | null;
   started_at: string;
   completed_at: string | null;
-  status: AuditEvent["status"];
+  status: string;
   message: string | null;
   error_code: string | null;
   request_path: string;
@@ -81,7 +83,11 @@ export class AuditLog {
         auditEvent.operationId,
         auditEvent.scope,
         auditEvent.action,
-        auditEvent.targetBlockedState ? 1 : 0,
+        auditEvent.targetBlockedState === undefined
+          ? null
+          : auditEvent.targetBlockedState
+            ? 1
+            : 0,
         auditEvent.agentId,
         auditEvent.agentDisplayName ?? null,
         auditEvent.actor.username,
@@ -153,7 +159,10 @@ export class AuditLog {
       )
       .all(...values) as AuditEventRow[];
 
-    return rows.map(toAuditEvent);
+    return rows.flatMap((row) => {
+      const event = toAuditEvent(row);
+      return event ? [event] : [];
+    });
   }
 
   countEvents(query: ListAuditEventsQuery = {}) {
@@ -179,7 +188,59 @@ export class AuditLog {
         operation_id TEXT NOT NULL,
         scope TEXT NOT NULL,
         action TEXT NOT NULL,
-        target_blocked_state INTEGER NOT NULL,
+        target_blocked_state INTEGER,
+        agent_id TEXT NOT NULL,
+        agent_display_name TEXT,
+        actor_username TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        actor_home_account_id TEXT NOT NULL,
+        tenant_id TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL,
+        message TEXT,
+        error_code TEXT,
+        request_path TEXT NOT NULL,
+        metadata_json TEXT
+      );
+    `);
+
+    this.ensureNullableTargetBlockedState();
+
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_audit_events_started_at
+        ON audit_events(started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_agent_id
+        ON audit_events(agent_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_actor_username
+        ON audit_events(actor_username, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_operation_id
+        ON audit_events(operation_id);
+    `);
+  }
+
+  private ensureNullableTargetBlockedState() {
+    const columns = this.database
+      .prepare("PRAGMA table_info(audit_events)")
+      .all() as Array<{ name: string; notnull: 0 | 1 }>;
+    const targetColumn = columns.find(
+      (column) => column.name === "target_blocked_state",
+    );
+
+    if (!targetColumn?.notnull) {
+      return;
+    }
+
+    this.database.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE audit_events RENAME TO audit_events_legacy;
+
+      CREATE TABLE audit_events (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_blocked_state INTEGER,
         agent_id TEXT NOT NULL,
         agent_display_name TEXT,
         actor_username TEXT NOT NULL,
@@ -195,14 +256,9 @@ export class AuditLog {
         metadata_json TEXT
       );
 
-      CREATE INDEX IF NOT EXISTS idx_audit_events_started_at
-        ON audit_events(started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_agent_id
-        ON audit_events(agent_id, started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_actor_username
-        ON audit_events(actor_username, started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_operation_id
-        ON audit_events(operation_id);
+      INSERT INTO audit_events SELECT * FROM audit_events_legacy;
+      DROP TABLE audit_events_legacy;
+      COMMIT;
     `);
   }
 }
@@ -235,7 +291,17 @@ function normalizeOffset(offset: number | undefined) {
 }
 
 function auditEventsFilter(query: ListAuditEventsQuery): AuditEventsFilter {
-  const clauses: string[] = [];
+  const clauses = [
+    `(
+      scope IN ('single', 'bulk')
+      AND status IN ('started', 'succeeded', 'failed', 'skipped')
+      AND (
+      (action IN ('block', 'unblock') AND target_blocked_state IN (0, 1))
+      OR
+      (action IN ('update-availability', 'update-installation') AND target_blocked_state IS NULL)
+      )
+    )`,
+  ];
   const values: Array<string | number> = [];
 
   if (query.agentId) {
@@ -354,13 +420,15 @@ function escapeLikePrefix(value: string) {
     .replaceAll("_", "\\_");
 }
 
-function toAuditEvent(row: AuditEventRow): AuditEvent {
-  return {
+function toAuditEvent(row: AuditEventRow): AuditEvent | undefined {
+  if (!isAuditScope(row.scope) || !isAuditStatus(row.status)) {
+    return undefined;
+  }
+
+  const event = {
     id: row.id,
     operationId: row.operation_id,
     scope: row.scope,
-    action: row.action,
-    targetBlockedState: row.target_blocked_state === 1,
     agentId: row.agent_id,
     agentDisplayName: row.agent_display_name ?? undefined,
     actor: {
@@ -377,4 +445,47 @@ function toAuditEvent(row: AuditEventRow): AuditEvent {
     requestPath: row.request_path,
     metadata: parseMetadata(row.metadata_json),
   };
+
+  if (isBlockAuditAction(row.action)) {
+    if (row.target_blocked_state === null) {
+      return undefined;
+    }
+
+    return {
+      ...event,
+      action: row.action,
+      targetBlockedState: row.target_blocked_state === 1,
+    };
+  }
+
+  if (isAccessAuditAction(row.action)) {
+    if (row.target_blocked_state !== null) {
+      return undefined;
+    }
+
+    return { ...event, action: row.action };
+  }
+
+  return undefined;
+}
+
+function isBlockAuditAction(action: string): action is BlockAuditAction {
+  return action === "block" || action === "unblock";
+}
+
+function isAccessAuditAction(action: string): action is AccessAuditAction {
+  return action === "update-availability" || action === "update-installation";
+}
+
+function isAuditScope(scope: string): scope is AuditEvent["scope"] {
+  return scope === "single" || scope === "bulk";
+}
+
+function isAuditStatus(status: string): status is AuditEvent["status"] {
+  return (
+    status === "started" ||
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "skipped"
+  );
 }

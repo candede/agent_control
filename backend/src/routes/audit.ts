@@ -6,7 +6,12 @@ import type { AuditAction, AuditScope, AuditStatus } from "../types/audit.js";
 
 export const auditRouter = Router();
 
-const auditActions = new Set<AuditAction>(["block", "unblock"]);
+const auditActions = new Set<AuditAction>([
+  "block",
+  "unblock",
+  "update-availability",
+  "update-installation",
+]);
 const auditStatuses = new Set<AuditStatus>([
   "started",
   "succeeded",

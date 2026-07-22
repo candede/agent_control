@@ -1,6 +1,6 @@
 # Agent Control
 
-Agent Control is a local Vite + Express app for Microsoft 365 admins who need to review Copilot agents in a tenant and block or unblock them through Microsoft Graph Package Management APIs.
+Agent Control is a local Vite + Express app for Microsoft 365 admins who need to review Copilot agents, block or unblock them, and manage who can access or acquire them through Microsoft Graph Package Management APIs.
 
 The browser talks only to the Express backend. Express handles Microsoft Entra ID sign-in, keeps the session in an httpOnly cookie, and calls Microsoft Graph on behalf of the signed-in work or school user.
 
@@ -9,11 +9,11 @@ The browser talks only to the Express backend. Express handles Microsoft Entra I
 - Node.js 24 or newer. The backend uses the built-in `node:sqlite` module for local audit storage.
 - A Microsoft Entra app registration configured as a web app.
 - Microsoft Agent 365 licensing in the tenant.
-- Delegated Microsoft Graph permission `CopilotPackages.ReadWrite.All` with admin consent.
+- Delegated Microsoft Graph permissions `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` with admin consent.
 - A work or school account with tenant permissions to manage Copilot packages.
 - Optional usage enrichment requires access to export Microsoft 365 admin center usage reports, but it does not require any additional Microsoft Graph permissions.
 
-The supplied Microsoft Graph docs note that block and unblock use `/beta` endpoints and are available only in the global cloud.
+The supplied Microsoft Graph docs note that block, unblock, and package access updates use `/beta` endpoints and are available only in the global cloud. Microsoft does not support beta APIs for production workloads; validate this dependency against your organization's risk policy.
 
 ## Entra App Registration
 
@@ -22,7 +22,7 @@ Create an app registration in Microsoft Entra ID with these settings:
 - Platform: Web
 - Redirect URI: `http://localhost:3001/api/auth/callback`
 - Client secret: create one and store it only in your local `.env`
-- API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`
+- API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All`
 - Admin consent: granted for the tenant
 
 No additional API permission is needed for usage report import. The usage data is loaded from CSV files that an admin manually exports from the Microsoft 365 admin center.
@@ -68,7 +68,7 @@ Before production deployment, the platform or application administrator must pre
 
 - An existing Microsoft Entra app registration configured as a web app.
 - A production redirect URI on that app registration: `https://<static-web-app-host>/api/auth/callback`.
-- Microsoft Graph delegated `CopilotPackages.ReadWrite.All` on that app registration, with tenant-wide admin consent granted.
+- Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` on that app registration, with tenant-wide admin consent granted.
 - An existing RBAC-enabled Azure Key Vault in the deployment resource group.
 - Existing Key Vault secrets for the Entra app client secret and Express session secret. The script defaults to `agent-control-client-secret` and `agent-control-session-secret`, but you can pass different secret names when running it.
 
@@ -300,20 +300,29 @@ npm run dev --workspace frontend
 
 - `GET /api/agents` lists packages filtered to `supportedHosts` containing `Copilot`.
 - `GET /api/agents/:id` gets package details.
+- `PATCH /api/agents/:id/access` replaces one package's Available to or Installed for collection.
+- `POST /api/agents/access` starts a bulk Add or Replace access job for selected packages.
+- `GET /api/directory/principals` searches users, security groups, and Microsoft 365 groups.
+- `POST /api/directory/principals/resolve` resolves package assignment IDs for display.
+- `GET /api/agents/bulk-jobs/:id` returns progress and results for a bulk job.
+- `POST /api/agents/block` starts a selected-ID bulk block job.
+- `POST /api/agents/unblock` starts a selected-ID bulk unblock job.
 - `POST /api/agents/:id/block` blocks one package.
 - `POST /api/agents/:id/unblock` unblocks one package.
 - `POST /api/agents/block-all` blocks all currently listed unblocked agents.
 - `POST /api/agents/unblock-all` unblocks all currently listed blocked agents.
-- `GET /api/audit/events` lists persisted block/unblock audit events for the signed-in session.
+- `GET /api/audit/events` lists persisted block, unblock, availability, and installation audit events.
 - `GET /api/auth/login`, `GET /api/auth/callback`, and `POST /api/auth/logout` handle sign-in and sign-out.
 
 Usage report import is handled in the browser from local CSV files. It does not add backend report endpoints and does not call Microsoft Graph for report data.
 
-Bulk actions are best effort. The backend skips packages already in the requested state and returns succeeded, skipped, and failed entries so partial failures are visible.
+Bulk actions are best effort. The backend returns succeeded, skipped, and failed entries so partial failures are visible. Access **Add** reads each package, merges and deduplicates the selected principals, and skips packages that already contain them. It also skips an all-user scope because the selected principals already have access, and fails safely when Graph does not return enough information to distinguish an empty scope from a broad one. **Replace** sends exactly the selected collection. Available to and Installed for are independent: an operation never sends or reconciles the unselected collection.
+
+The access editor supports individual users, security groups, Microsoft 365 groups, and clearing a collection with **No users**. **All users** remains disabled until a live tenant probe establishes a supported beta payload; the app does not substitute a tenant-wide group for that state.
 
 ## Audit Log
 
-The backend records block and unblock attempts at the route boundary before calling Microsoft Graph. Each audit event includes the agent ID, optional display name when available, action, target blocked state, signed-in actor, tenant ID, timestamps, final status, and failure message when Graph rejects the change.
+The backend records block, unblock, availability, and installation attempts before sending the corresponding Graph mutation. Each audit event includes the agent ID, optional display name when available, action, signed-in actor, tenant ID, timestamps, final status, and failure message when Graph rejects the change. Access events also record the target, mutation mode, scope, principals, and principal counts before and after the change.
 
 Signed-in users can review these records in the **Audit log** tab. The tab loads the newest events from `GET /api/audit/events`, supports refresh, and filters by action, result, agent, user, or operation ID.
 

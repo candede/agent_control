@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import { config } from "../config.js";
 import { AppError } from "../errors.js";
 import {
@@ -57,6 +57,7 @@ authRouter.get("/auth/callback", async (request, response, next) => {
     const result = await redeemAuthorizationCode(code);
     const user = toAuthenticatedUser(result);
 
+    await regenerateSession(request);
     request.session.accountId = user.homeAccountId;
     request.session.user = user;
     delete request.session.authState;
@@ -89,3 +90,16 @@ authRouter.get("/me", (request, response) => {
 
   response.json({ user: request.session.user });
 });
+
+function regenerateSession(request: Request) {
+  return new Promise<void>((resolve, reject) => {
+    request.session.regenerate((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
