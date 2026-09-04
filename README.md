@@ -4,6 +4,53 @@ Agent Control is a local Vite + Express app for Microsoft 365 admins who need to
 
 The browser talks only to the Express backend. Express handles Microsoft Entra ID sign-in, keeps the session in an httpOnly cookie, and calls Microsoft Graph on behalf of the signed-in work or school user.
 
+## Production Admin POC Roadmap
+
+The current application implements Microsoft Graph package inventory and controls, browser-local Microsoft 365 usage CSV enrichment, and a local audit log. The integrations below are **planned, not yet implemented on this branch**. The ordered, fresh-session implementation campaign is in [plans/admin-poc-production/README.md](plans/admin-poc-production/README.md).
+
+The completed admin POC will provide:
+
+- a Permission Center that groups every feature by exact app permission, token mode, internal app role, Microsoft administrator/security role, license, environment, preview state, and live capability probe;
+- normalized Microsoft 365 package, Power Platform, Copilot Studio, Agent Builder, and Defender/Agent 365 inventory with source identifiers, provenance, freshness, and conflict review;
+- verified package access, block/unblock, and ownership reassignment, kept separate from Copilot Studio quarantine;
+- durable import of the Microsoft 365 Copilot Agents **Agents**, **Users & agents**, and **Users** CSV exports as the only official per-agent/per-user usage authority;
+- bounded Microsoft Graph Purview Audit searches and optional continuous Office 365 Management Activity ingestion;
+- Defender advanced hunting for preview `AgentsInfo` inventory and Agent 365 activity in `CloudAppEvents`;
+- opt-in, environment-scoped Dataverse `conversationtranscripts` ingestion with application-level encryption, redacted default views, audited raw reveal, and retention controls;
+- a unified admin workbench, source-safe exports, durable jobs, operational diagnostics, and production Azure deployment backed by PostgreSQL.
+
+These capabilities are delivered in the linked phases 01-15; implementation status is recorded in each phase's completion record rather than inferred from this roadmap list.
+
+Unavailable features remain visible but disabled. The UI will state the exact unmet requirement and which features it unlocks. A granted API permission does not replace a Microsoft administrator role, Defender/Purview role, Dataverse environment role, license, tenant rollout, or internal Agent Control app role.
+
+### Planned permission and role groups
+
+| Feature group | Registered-app permission and token mode | Additional role, license, or environment requirement |
+| --- | --- | --- |
+| Package catalog read | Microsoft Graph delegated or application `CopilotPackages.Read.All` | Microsoft Agent 365 license. The endpoint docs name no additional human Entra role; availability is live-probed. |
+| Package update, block/unblock, and reassign | Microsoft Graph delegated `CopilotPackages.ReadWrite.All`; no application permission for mutations | Microsoft Agent 365 license; preview/global-cloud-only unless Microsoft promotes the APIs. The endpoint docs name no additional human Entra role. |
+| Directory principal lookup | Microsoft Graph delegated `User.ReadBasic.All`, `Group.Read.All` | Tenant admin consent and `AgentControl.Operator` for package assignment workflows. |
+| Power Platform inventory | Power Platform API delegated `ResourceQuery.Resources.Read` on app ID `8578e004-a5c6-46e7-913e-12f58912df43`; app-only remains unavailable unless Microsoft documents and a live probe proves an exact supported assignment | Global Administrator, Power Platform Administrator, Dynamics 365 Administrator, or Global Reader for full inventory; AI Administrator or AI Reader for AI-scoped inventory. Built-in Power Platform RBAC roles are not supported for inventory access. |
+| Copilot Studio quarantine | Power Platform API delegated `CopilotStudio.AdminActions.Invoke` | Global Administrator, AI Administrator, or Power Platform Administrator, plus `AgentControl.Operator`. Classic chatbots are unsupported. |
+| Purview Audit Search | Microsoft Graph delegated or application `AuditLogsQuery.Read.All` for cross-workload queries | Audit enabled and licensed. Delegated users also need Purview **Audit Logs** or **View-Only Audit Logs**, plus `AgentControl.SecurityReader`. The live contract is probe-gated because current Microsoft pages conflict on one permission/property name. |
+| Continuous audit feed | Office 365 Management APIs application `ActivityFeed.Read` | Tenant admin consent, unified audit logging, `Audit.General` subscription, and `AgentControl.Administrator` for collector administration. |
+| Defender/Agent 365 hunting | Microsoft Graph delegated or application `ThreatHunting.Read.All` | Applicable Defender/Agent 365 or Microsoft 365 E7 licensing and data-source onboarding. Delegated access is also constrained by Defender XDR RBAC; viewing requires `AgentControl.SecurityReader`. |
+| Dataverse transcript read as a user | Each environment's Dataverse delegated `user_impersonation` | **Bot Transcript Viewer** in each environment and `AgentControl.TranscriptReader` for content. Environment Maker is insufficient. |
+| Dataverse unattended transcript ingestion | No broad Entra application permission; create a Dataverse application user for each environment | Assign a custom role with organization-level **Read** on `ConversationTranscript` and only required metadata tables. Do not grant System Administrator. Collector setup requires `AgentControl.Administrator`. |
+| Official usage CSV import | No Microsoft API permission | An Agent Control administrator obtains and imports all three matching admin-center exports. Audit, hunting, and transcript counts never replace these official reports. |
+
+Agent Control's planned internal Entra app roles are `AgentControl.Reader`, `AgentControl.Operator`, `AgentControl.SecurityReader`, `AgentControl.TranscriptReader`, and `AgentControl.Administrator`. Provider permissions and provider-side roles are still enforced independently.
+
+### Planned usage flow
+
+1. Sign in with the minimum identity scopes, then open **Permissions** to request only the delegated capability groups needed for the current task.
+2. Review each live probe before using a provider. Missing application consent, human role, environment role, license, configuration, preview enablement, and provider failure are separate states.
+3. Use **Agents** for normalized inventory and source-specific controls. Every mutation identifies its provider target, requires confirmation, records a local audit event, and verifies the provider state afterward.
+4. Import the three matching Microsoft 365 admin-center usage exports for official reporting. Use Purview/Management Activity for audit evidence and Defender for security/observability, not official usage totals.
+5. Enable transcripts only for approved Dataverse environments after assigning the exact environment role and configuring purpose, redaction, encryption, content access, and retention.
+
+The campaign ends with mandatory production deployment and live qualification. Missing external tenant capabilities are deployed as disabled, diagnostic states rather than omitted or falsely reported as ready.
+
 ## Prerequisites
 
 - Node.js 24 or newer. The backend uses the built-in `node:sqlite` module for local audit storage.
