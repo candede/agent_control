@@ -6,9 +6,9 @@ Replace the single hard-coded Graph consent bundle with backend-owned multi-reso
 
 ## Prerequisites
 
-- Read the roadmap and `completions/01-domain-persistence-foundations.md`.
-- Phase 01 migrations, durable sessions, jobs, provider configuration, and capability repositories must exist.
-- Do not deploy in this phase.
+- Follow the roadmap's manual fresh-session contract and read `completions/01-domain-persistence-foundations.md`; use its actual delivered module/test paths.
+- Phase 01 PostgreSQL sessions/jobs, audit, scoped repositories, Docker-only local script and combined-app contract must exist. This phase owns minimal provider configuration, capability evidence, route/data-access policy and administrator setup guidance, not a credential-storage framework.
+- Do not deploy to Azure in this phase; local Docker deployment/validation is required.
 
 ## Read first
 
@@ -19,29 +19,31 @@ Replace the single hard-coded Graph consent bundle with backend-owned multi-reso
 - `backend/src/types/session.ts`
 - `frontend/src/api/client.ts`
 - Phase 01 persistence and migration code
-- Microsoft references linked from the roadmap permission matrix
+- Microsoft documentation referenced by each provider's owning prompt; verify permission/resource/role requirements before activating that adapter
 
 ## Required implementation
 
-1. Define stable capability IDs grouped by provider and permission set. Include at least:
+1. Define stable capability IDs for the retained scope, grouped by provider and permission set:
    - `graph.package.read.delegated`, `graph.package.read.application`, `graph.package.access.manage`, `graph.package.block.manage`, `graph.package.reassign.manage`, `graph.directory.read`;
    - `powerPlatform.inventory.read`, `powerPlatform.quarantine.manage`;
    - `purview.audit.search.delegated`, `purview.audit.search.application`;
-   - `managementActivity.ingest.application`;
    - `defender.hunting.delegated`, `defender.hunting.application`;
-   - `dataverse.transcripts.delegated`, `dataverse.transcripts.application`;
    - `reports.official.import`.
-2. For each capability define display name, purpose, features unlocked, provider, stable/preview state, cloud availability, resource audience, token mode, exact delegated/application permissions, exact user/environment roles, license prerequisites, configuration prerequisites, source links, privacy classification, and non-mutating probe.
+2. Define display name, purpose, provider/maturity, cloud, audience, mode, exact grants/provider roles, license/configuration, source links and data class. Provider definitions name a safe non-mutating probe where the actual API permits one; local-only definitions use local policy. Existing package routes use current read adapters; later integrations own their probes when delivered. Remote saved-query creation and mutation canaries are separate explicit qualifications, not routine probes.
 3. Use incremental delegated consent. Initial login requests only OIDC identity and the minimum baseline required to render the shell. Add CSRF-bound consent routes that request one capability group and return safely to the application. Never request all privileged scopes at initial sign-in.
-4. Support resource-specific delegated token acquisition for Microsoft Graph, Power Platform API, and configured Dataverse environment URLs. Use Power Platform API app ID `8578e004-a5c6-46e7-913e-12f58912df43` and scope names exactly as registered.
-5. Support client-credential token acquisition for Graph and Office 365 Management APIs, and for Dataverse environment audiences. Prefer certificate or managed-identity credentials in production; retain client-secret support only for the existing deployment until Phase 14 performs the infrastructure cutover.
-6. Persist the MSAL token cache encrypted at rest through a Key Vault-backed key reference or an authenticated-encryption key supplied via a Key Vault app setting. Never store tokens in ordinary provider configuration rows or logs.
-7. Define internal app roles `AgentControl.Reader`, `AgentControl.Operator`, `AgentControl.SecurityReader`, `AgentControl.TranscriptReader`, and `AgentControl.Administrator`. Enforce them server-side from Entra role claims. Make `infra/entra-app-manifest.json` the canonical no-secret role/permission manifest consumed by Phase 14. A configured bootstrap administrator is permitted only when `NODE_ENV=development`; production rejects that setting and never auto-promotes a user. If no production administrator is assigned, protected administration remains denied and diagnostics identify the manual Entra app-role assignment recovery path.
-8. Add `GET /api/capabilities` and a targeted refresh endpoint. Return grouped capability status, requirements, probe evidence, freshness, unlocked features, remediation steps, and current principal role status. Never return tokens or secrets.
-9. Implement status precedence and provider-error mapping. Distinguish missing app grant, missing delegated consent, missing internal app role, missing Microsoft admin role, missing Dataverse environment role, missing license/rollout, not configured, unsupported cloud, preview disabled, throttled/provider failure, and unknown.
+4. Acquire resource-specific delegated tokens for Microsoft Graph and Power Platform API only. Use Power Platform API app ID `8578e004-a5c6-46e7-913e-12f58912df43` and exact registered scope names. Environment/bot IDs used for quarantine do not imply a Dataverse integration.
+5. Support Graph application tokens for explicitly requested package reads, audit searches and hunting when separately enabled by an administrator. Keep the supported MSAL client-secret setup: consume Phase 01's restricted mounted local files and the README's exact native Key Vault app-setting references on Azure. Keep database admin credentials out of the app. Never expose credentials to the browser or logs. Managed identity may access Azure resources but must not replace the Entra app's provider grants silently. No scheduled collectors or mandatory certificate/federation migration.
+6. Use MSAL's in-memory cache and native acquisition APIs. Partition token selection by tenant, account, resource, scopes and delegated/application mode. Persist no access/refresh token, serialized MSAL cache or secret in sessions/database. Restart loses cached tokens: require reauthentication for delegated provider work and move affected durable jobs to `waiting_authorization`; never present token recovery as transparent. Define account-scoped logout/eviction and test isolation. No token-cache encryption/key-rotation subsystem is needed.
+7. Define `AgentControl.Reader`, `AgentControl.Operator`, `AgentControl.SecurityReader` and `AgentControl.Administrator`; use Entra role claims and the README matrix. Own `infra/entra-app-manifest.json` for Phase 12. Development-only bootstrap is rejected in production; absent administrator assignment is diagnosed without auto-promotion. No role for deferred features.
+8. Add `GET /api/capabilities` and CSRF-protected explicit probe refresh, with shared backend/frontend types. Return requirements, current decision/last success, freshness, preview qualification and remediation. Setup/probe routes require authentication, not the broken capability being repaired; they cannot target another account. Configuration requires `Administrator`. Register only retained integrations as their adapters are delivered; do not add future definitions or disabled placeholders. Local capabilities check local policy, not Microsoft probes.
+9. Map current capability statuses exactly as defined in the README. Separate app grant, delegated consent, internal/provider role, license/configuration, preview and provider-error evidence. Do not infer a particular missing role from an ambiguous 403.
 10. Token claims may prove a scope/app role is present but may not prove a service-side role or license. A successful non-mutating provider probe establishes availability. A 401/403 without a provider-specific diagnostic remains `unknown` or `provider_error`, with all plausible requirements shown; do not falsely assert one missing role.
-11. Cache probes with short TTLs, support manual refresh, serialize duplicate probes, enforce timeouts and retries, and retain the last successful result alongside current failure without presenting stale success as current availability. Return current status/evidence/observed time separately from last-success status/evidence/observed time and an explicit `stale` flag. Gates consume current status; read-only cached data may cite last success as historical evidence.
+11. Cache/serialize probes under the complete principal/resource/environment/token-mode/permission/configuration key from the README. Invalidate on consent/account/configuration/role changes; expire with a documented short TTL. Gates require current decision for provider actions, never another account's or stale successful probe. Cached-data reads require current internal/data-scope authorization but do not require a healthy live provider. Revalidate roles on a bounded session interval and support explicit session revocation; document the residual delay for external role revocation.
 12. Give independently disableable preview operations separate capability IDs even when they share one permission. A read probe may prove token/catalog access but cannot prove a mutation endpoint. Package access, block/unblock, and reassign retain separate contract/canary evidence so removal of one endpoint does not disable or falsely qualify the others.
+13. Enforce the README's role/data-scope matrix for private delegated versus explicitly shared application results. Stamp scope before persistence and filter before joins/counts/pagination/export. An exact identity match cannot widen visibility. Publish a small route-policy declaration/test helper; health, login/callback, shell and consent have explicit local policies.
+14. Complete Phase 01's delegated job reauthorization contract: reacquire through the initiating account's MSAL cache, recheck actor/tenant/role/capability at execution and before each unsent item, and move to `waiting_authorization` on interaction-required, logout, or expired/revoked access. Only the same authorized principal can resume; expiration/cancellation has a finite deadline. App-only jobs use the explicitly configured application capability and never substitute for unavailable delegated credentials. Reconciliation of already-sent work is read-only and does not replay it.
+15. Establish concise `docs/security-model.md` with role/data scope and the single-origin production trust boundary. Implement CSRF, state/nonce/PKCE, safe return URLs, secure sessions, trusted proxies, bounded requests and provider-origin/redirect/next-link checks. Never trust client-supplied identity headers. Protect credentials/tokens and render provider text inertly. Strengthen Phase 01's combined-app auth/origin behavior now; Phase 10 extends integrated static/browser proof and Phase 12 configures the exact Azure origin. Preserve the canonical local `localhost` URL across printed links, cookie and callback settings; its loopback bind address is not a second origin.
+16. Own `docs/deployment-setup.md`: explain the two script workflows and guide administrators to prepare an existing RBAC-enabled Key Vault with exactly the six README secret names, value formats, enabled/expiry requirements and separate admin/app database passwords. Give secure portal/tool preparation steps without example real secrets. Cover the full vault resource ID, approved tenant/subscription, operator secret-read and ARM template-deployment permissions, runtime access to only the five non-admin secrets and actual network prerequisites. No vault creation/secret writing by `deploy-azure.ps1`, secret-value prompts or automatic broad access. Document local Entra reply URL and production registration/roles preparation; Phase 12 validates/applies only approved changes. Consume Phase 01's SQL/bootstrap contract rather than defining DB roles here.
 
 ## Exact permission contract
 
@@ -52,30 +54,31 @@ Replace the single hard-coded Graph consent bundle with backend-owned multi-reso
 - Power Platform inventory: delegated `ResourceQuery.Resources.Read`; supported Entra roles are Global Administrator, Power Platform Administrator, Dynamics 365 Administrator, Global Reader, AI Administrator, or AI Reader, with AI roles limited to AI resources. Power Platform built-in RBAC roles do not grant inventory visibility.
 - Copilot Studio quarantine: delegated `CopilotStudio.AdminActions.Invoke`; user must be Global Administrator, AI Administrator, or Power Platform Administrator.
 - Purview Graph audit: delegated/application `AuditLogsQuery.Read.All` for cross-workload queries, subject to the Phase 07 live-contract probe; delegated users also need Purview Audit Logs or View-Only Audit Logs.
-- Management Activity: Office 365 Management APIs application `ActivityFeed.Read`; unified audit logging must be enabled.
 - Defender hunting: delegated/application `ThreatHunting.Read.All`; delegated data access is additionally constrained by Defender XDR RBAC/data-source assignment.
-- Dataverse delegated: the environment resource's delegated `user_impersonation`; user needs Bot Transcript Viewer in that environment.
-- Dataverse application: no broad Entra application permission substitutes for an application user. Create an application user per environment and assign a custom read-only ConversationTranscript role.
 
 ## Focused validation
 
 - Unit-test registry completeness and uniqueness, feature-to-capability mapping, status precedence, remediation rendering data, and secret redaction.
-- Test incremental consent state/nonce/CSRF, callback failures, expired account recovery, encrypted cache restart, app-role middleware, bootstrap rejection in production, and no-administrator diagnostics.
-- Acquire fixture tokens for Graph, Power Platform, and two distinct Dataverse environment audiences; prove cache keys cannot substitute a token across resources, tenants, accounts, delegated/application modes, or Dataverse hosts.
+- Test consent state/nonce/CSRF, callback failures, cache-loss reauthentication, app-role middleware, production bootstrap rejection and no-administrator diagnostics.
+- Use Graph and Power Platform fixture tokens to prove resource, tenant, account, scope and delegated/application isolation; no tokens enter persisted sessions or database.
 - Test delegated and application token acquisition with MSAL fixtures for consent required, invalid grant, missing app role, conditional access, tenant mismatch, and provider timeout.
-- Add a contract test requiring every privileged backend route to declare both an internal app role and a capability ID.
+- Require every privileged backend route to declare its app-role/data policy and, only for provider actions, the relevant capability. Local reports, saved data and setup routes declare explicit local policy without invented provider dependencies.
+- Test principal A probe success versus principal B failure, separate environment/application scopes, consent/configuration invalidation, cached-read authorization during provider outage, private-to-shared scope denial, and no implicit administrator access to content.
+- Test logout/cache isolation, delegated job restart/consent expiry/role revocation, application-mode substitution denial and resumption by the wrong principal.
+- Test CSRF, open redirects, state replay, cross-tenant sessions, next-link/redirect SSRF, and setup/probe routes without a healthy provider. Write a source-linked provider contract inventory with checked date; missing live credentials remain unavailable evidence.
+- Check setup-guide secret names against the README contract, local file consumers against Phase 01 and runtime settings against admin-secret exclusion. Test unconfigured local sign-in versus mandatory Azure auth configuration without enabling a bypass.
 
 ## Aggregate validation
 
-Run the global validation baseline. Where credentials exist, perform non-mutating token/probe checks for configured audiences and record only status, tenant, audience, and correlation IDs.
+Run the global validation baseline inside Phase 01's containers and verify login/callback configuration through `deploy-local.ps1`. Where credentials exist, perform non-mutating token/probe checks for configured audiences and record only status, tenant, audience, and correlation IDs.
 
 ## Production continuation
 
-Auth or provider-probe failures do not stop later implementation. Keep only the affected capability disabled, preserve exact remediation and telemetry, and carry the truthful result. Never broaden consent or assign a more privileged role just to make a probe pass.
+External identity/provider-probe unavailability is recorded with remediation, not fabricated success. A broken implemented core login/role boundary must be repaired before the phase is complete; only optional provider paths can remain disabled. Never broaden consent or assign a more privileged role just to make a probe pass.
 
 ## Scope guard
 
-Do not implement provider data ingestion or mutations. Do not expose transcript content. Do not deploy or modify the Entra app registration yet; produce the checked-in manifest/config contract consumed by Phase 14.
+Do not implement provider data retrieval/mutations, deferred capabilities or recurring probes. Do not deploy to Azure or modify Entra yet; produce the manifest/configuration contract consumed by Phase 12.
 
 ## Completion record
 
@@ -84,6 +87,7 @@ Create `plans/admin-poc-production/completions/02-auth-capability-registry.md` w
 ## Done conditions
 
 - Authentication supports each required resource and token mode without over-requesting at login.
-- Every privileged route has backend app-role and capability enforcement.
+- Every privileged route enforces its backend app-role/data policy, with capability enforcement for provider actions and explicit local-only policies otherwise.
 - Capability results are durable, refreshable, source-linked, and precise about uncertainty.
 - Phase 03 can render feature state without recreating authorization logic.
+- `docs/deployment-setup.md` gives the exact prepared-vault contract and local/Azure identity setup; Phase 12 can consume it without another credential design.

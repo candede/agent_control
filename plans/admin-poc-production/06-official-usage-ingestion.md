@@ -6,9 +6,9 @@ Preserve the Microsoft 365 admin-center Copilot Agents usage exports as the only
 
 ## Prerequisites
 
-- Read the roadmap and completion records for Phases 01-05.
-- Durable report-run persistence, normalized identities, app roles, Permission Center, and server-side upload limits must exist.
-- Do not deploy in this phase.
+- Follow the roadmap's manual fresh-session contract; read Phase 05's completion record, Phase 04 identity, Phase 02 data-access policy, and Phase 01 repository/migration artifacts.
+- PostgreSQL migrations/repositories, normalized identities, app roles, Permission Center, and server-side upload limits must exist. This phase owns report-run, staging, set/version, selection, and retention schema.
+- Do not deploy to Azure in this phase; use Phase 01's Docker deployment/test commands locally.
 
 ## Read first
 
@@ -18,7 +18,7 @@ Preserve the Microsoft 365 admin-center Copilot Agents usage exports as the only
 - `frontend/src/components/ReportingView.tsx`
 - `frontend/src/components/UserAccessView.tsx`
 - `frontend/src/App.tsx`
-- Phase 01 report-run schema and Phase 04 identity resolver
+- Phase 01 repository/migration contract and Phase 04 identity resolver
 - Current Microsoft Copilot Agents Usage Report documentation and current `copilotReportRoot` methods
 
 ## Source contract
@@ -30,17 +30,17 @@ Preserve the Microsoft 365 admin-center Copilot Agents usage exports as the only
 
 ## Required implementation
 
-1. Move the CSV parser and canonical report models into a shared or backend-owned TypeScript module. The backend must parse, validate, persist, and serve accepted reports; the browser must no longer be the production report authority. On first load after cutover, detect only whether legacy report keys exist, delete them without parsing or uploading their contents, and show a one-time notice to re-import the original three CSV files. Do not retain a legacy read path or silently promote untrusted browser rows.
+1. Move the CSV parser and canonical report models into a shared or backend-owned TypeScript module. The backend parses, validates, persists, and serves accepted reports; remove all browser report readers/writers in this cutover. A one-time cleanup may detect legacy key presence but never parse, upload, or automatically delete their values. Notify only affected browsers to re-import original exports; clear those keys after successful re-import and explicit confirmation, or an explicit discard acknowledgement. Preserve other local storage and never silently promote untrusted browser rows. Fresh browsers see no migration notice.
 2. Preserve current supported schemas and add a fixture-captured schema registry with normalized header aliases only for Microsoft-observed variations. Unknown required-column changes fail validation with a clear schema-drift report; do not silently map by column position.
-3. Add multipart upload endpoints protected by `AgentControl.Administrator` or a dedicated import entitlement, CSRF, MIME and extension checks, byte/row/field limits, UTF-8 validation, formula-injection-safe export handling, and temporary-file cleanup. Never log CSV rows.
-4. Parse into a staging transaction. Return a preview containing report kind, file hash, source timestamp, period, row count, warning/error counts, report identity, overlapping accepted versions, and reconciliation statistics. Require a second explicit accept request bound to the preview hash/revision.
-5. Persist immutable import artifact metadata, row data, parser/schema version, actor, timestamps, content hash, lineage, warnings, and acceptance/supersession events. Store the original CSV only when an explicit encrypted-artifact retention policy is enabled; default to no original-file retention.
-6. Define report-set identity using tenant, report kind, source-generated timestamp, period/window, and content hash. Exact duplicate import is idempotent. A corrected file becomes a new immutable version and may supersede, never mutate, the prior version.
-7. Add explicit active report-set selection. Do not combine mismatched generation times or periods as though one coherent snapshot. Show gaps, overlaps, stale files, missing companion exports, anonymized usernames, and cross-report count discrepancies.
-8. Reconcile usage agent IDs only through exact source identifiers and reviewed identity links. Retain report-only agents and unknown users as first-class unresolved rows. Never join by display name or creator string.
+3. Add multipart upload endpoints protected by `AgentControl.Administrator`, CSRF, byte/row/field limits, UTF-8/content validation, formula-injection-safe export handling, and temporary-file cleanup. MIME/extension are hints, not proof that input is safe CSV. Never log rows. Per-user usage APIs/exports additionally require `SecurityReader`; aggregate official metrics use the README matrix.
+4. Parse into durable staging with short transactions, tenant/actor ownership, finite expiry, and bounded storage. Never hold a database transaction or upload connection open while a user reviews a preview. Return kind, hash, source/as-of timestamp with confidence, reporting period, counts/warnings, overlapping versions, and reconciliation statistics. Require an idempotent second accept bound to actor/tenant, staging hash/revision, and the active-set revision; publish rows and active selection atomically. Expired/replaced previews cannot be accepted.
+5. Persist validated rows and minimal import metadata: kind, parser/schema version, actor, timestamps, content hash, warnings and acceptance/supersession. Original CSV files are never archived; delete temporary upload bytes on success, rejection, cancellation and expiry, including crash-recovery cleanup. Staged validated rows have finite expiry. No optional encrypted archive switch.
+6. Separate artifact identity (tenant, kind, file hash) from report-set identity (tenant, reporting period/as-of basis, bundle ID with one version of each kind). Exact duplicates are idempotent; corrections create immutable versions and an explicit superseding set. Allow an administrator to select a retained complete compatible set with preview/confirmation and the same revision-fenced transaction; never restore selection automatically. This permits controlled report-set recovery without reupload archives. Never sum overlapping versions/windows or distinct-user totals across agents.
+7. Require compatible reporting periods and documented source snapshot metadata across the three exports, not identical download timestamps. A filename timestamp is not a reporting period; accept explicit operator-supplied period/as-of when absent, label it operator-asserted, and show unknown source freshness. Missing companion files remain an incomplete set and do not replace an active complete set. Show gaps, overlaps, pseudonymized usernames, non-additive metrics, and count discrepancies without inventing corrections.
+8. Associate usage agent IDs only through Phase 04's exact documented identifier rules. Keep ambiguous/report-only agents and unknown users as separately visible rows. No manual identity review dependency; never join by display name or creator string.
 9. Rebuild reporting and user-access views from backend APIs while preserving all current metrics. Add lineage/freshness, source period, coverage, unresolved identity, report-only, superseded, and official-authority labels.
 10. Keep `creatorType` as a usage-report attribute with provenance; do not let it overwrite Power Platform authoring source. Show both when they disagree.
-11. Add safe deletion/retention workflows: deleting an accepted set requires confirmation, `AgentControl.Administrator`, audit, and a reason; default retention must preserve enough immutable versions for the POC audit trail.
+11. Provide ordinary finite report/staging retention and a confirmed administrator delete with audit. Removing an active set clears selection without silently choosing an older version and invalidates its derived rows/caches/exports. Keep only minimal non-content import/audit metadata after deletion; no legal holds, deletion ledger or backup-erasure subsystem. Pseudonymous identifiers remain dataset-scoped, never resolved through guessed names.
 12. Add a documented operator workflow that names the exact Microsoft admin-center navigation/export steps, all three files, expected freshness, and the fact that API automation is unavailable. Surface this in the import dialog without claiming the app can fetch the report.
 13. Model `never imported`, `incomplete three-file set`, `active`, and `stale` as distinct official-usage states. Staleness uses a documented configurable threshold based on the report period and last accepted set. The empty state links to the export/import workflow; removal or tenant unavailability of the admin-center export leaves official usage visibly unavailable rather than substituting another source.
 
@@ -48,8 +48,9 @@ Preserve the Microsoft 365 admin-center Copilot Agents usage exports as the only
 
 - Port all existing parser/reporting/user-access tests before deleting browser authority.
 - Add tests for large/empty/non-UTF8/malformed CSV, BOM/quotes/newlines, formula-leading cells, duplicate headers, unknown schema, row limits, duplicate imports, corrected versions, overlapping windows, mixed report sets, rollback, and cleanup.
-- Add reconciliation tests for exact IDs, reviewed links, collisions, report-only agents, anonymized users, and creator-type disagreement.
-- Route tests must cover CSRF, app roles, two-step acceptance revision, concurrent accept/delete, and log redaction.
+- Add association tests for exact IDs, collisions, separate report-only agents, anonymized users and creator-type disagreement.
+- Route tests cover CSRF, app roles, two-step acceptance revision, concurrent accept/select/delete, explicit selection of a retained complete set, rejected incomplete/deleted sets and log redaction.
+- Test sequential export timestamps with the same valid period, unknown period rejection, expired/wrong-actor previews, atomic three-file publication, distinct-user non-additivity, private per-user exports, original-byte cleanup on every exit/restart and legacy key preservation until confirmed cleanup.
 - UI tests must cover all three imports, preview, warnings, lineage, stale/missing sets, supersession, unresolved records, and responsive tables.
 
 ## Aggregate validation
@@ -62,11 +63,11 @@ Schema drift or one bad file does not stop the campaign and must not damage the 
 
 ## Scope guard
 
-Do not automate browser scraping or unsupported report APIs. Do not use audit/Defender/transcript data as official usage. Do not ingest transcript content. Do not deploy.
+Do not automate browser scraping or unsupported report APIs. Do not use audit/Defender/transcript data as official usage. Do not ingest transcript content. Do not deploy to Azure.
 
 ## Completion record
 
-Create `plans/admin-poc-production/completions/06-official-usage-ingestion.md` with schema versions, fixture evidence, legacy-key deletion and authority-cutover confirmation, retention/staleness settings, and Phase 07 preconditions.
+Create `plans/admin-poc-production/completions/06-official-usage-ingestion.md` with schema versions, fixture evidence, browser-authority removal and confirmed-cleanup behavior, retention/staleness settings, and Phase 07 preconditions.
 
 ## Done conditions
 

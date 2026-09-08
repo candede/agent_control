@@ -6,9 +6,9 @@ Build a first-class Permission Center and apply capability-aware disabled states
 
 ## Prerequisites
 
-- Read the roadmap and completion records for Phases 01-02.
+- Follow the roadmap's manual fresh-session contract; read Phase 02's completion record and its shared capability/security types. Consume Phase 01's container/test-origin/database commands and consult its affected persistence/job contracts.
 - `GET /api/capabilities`, grouped requirements, remediation, and server-side route enforcement must be available.
-- Do not deploy in this phase.
+- Do not deploy to Azure in this phase; local Docker deployment/validation is required.
 
 ## Read first
 
@@ -23,24 +23,26 @@ Build a first-class Permission Center and apply capability-aware disabled states
 
 ## Required implementation
 
-1. Add a top-level **Permissions** view that groups capabilities by Microsoft Graph, Power Platform, Purview, Office 365 Management Activity, Defender/Agent 365, Dataverse, official report import, and Agent Control internal roles.
+1. Add a **Permissions** view for package/directory Graph access, Power Platform inventory/quarantine, Purview search, Defender hunting, official report import and internal app roles. Deferred features are absent, not disabled teasers.
 2. Each capability row must show:
    - current state and last probe time;
    - exact delegated/application permission and resource audience;
-   - required Microsoft Entra, Purview, Defender, Power Platform, or Dataverse roles;
+   - required Microsoft Entra, Purview, Defender or Power Platform roles;
    - required internal Agent Control app role;
    - licensing, cloud, preview, environment, and configuration prerequisites;
    - the exact feature set unlocked;
    - provider-safe evidence and remediation actions;
    - links to current Microsoft documentation.
-3. Add actions for incremental consent, retry probe, open relevant admin portal, and copy setup instructions. Do not imply the app can self-assign admin roles, admin consent, licenses, Power Platform access, or Dataverse roles.
+3. Add consent, explicit retry-probe, admin-portal and setup-instruction actions. Never imply the app can self-assign roles, consent, licenses or provider access. No automatic recurring provider probes or refresh-on-navigation loops.
 4. Apply one shared `CapabilityGate` pattern to navigation, toolbar actions, row actions, bulk actions, dialogs, and provider views. Server authorization remains mandatory; frontend gates are explanatory UX only.
 5. Keep unavailable features visible and disabled when that visibility teaches the POC capability. The disabled control or adjacent status must say, for example: `Requires delegated CopilotStudio.AdminActions.Invoke and AI Administrator, Global Administrator, or Power Platform Administrator.` It must also distinguish missing app grant from missing user role when evidence supports that distinction.
 6. For capabilities not yet implemented by later phases, do not advertise them as working. Render only capabilities registered by active backend adapters. The Permission Center grows as phases add adapters.
+   Keep backend status values and local-role versus provider-action decisions distinct. Never disable the Permission Center, consent initiation, or current-principal probe refresh because the provider capability is unavailable. Authorized cached-data views stay readable with freshness labels; provider actions still fail closed.
 7. Add a compact global capability-health indicator that reports available/degraded/blocked counts and opens the Permission Center. Avoid noisy banners on every page.
 8. Make preview badges and metadata consistent. Tooltips must state that preview APIs can change and may be disabled by configuration; do not hide that status in documentation only.
 9. Handle loading, stale evidence, probe failure, consent cancellation, conditional access, unsupported cloud, and partial role visibility without layout shifts or generic `Forbidden` messages.
 10. Meet keyboard, focus, screen-reader, mobile, overflow, and color-contrast requirements. Permission text must remain readable at narrow widths. Use existing Lucide icons and design language.
+11. Establish missing frontend test infrastructure now: React Testing Library with a DOM environment for component tests, Playwright for browser workflows, and axe integration for accessibility. Install browsers/dependencies in a disposable Docker test target extending Phase 01's build/test contract, never on the host or in the production runtime. Publish exact container commands, network/base URL, isolated PostgreSQL setup and cleanup. Use a separate fixture-configured test app/database, not the running demo or Azure data; production artifacts reject fixture auth modes. Add checked-in scripts/configuration and deterministic HTTP fixtures without calling live providers. Reuse these suites in later UI phases; test through the existing API client rather than duplicating server policy. Temporary browser/test app containers exit after tests, leaving only the two normal services.
 
 ## UX state contract
 
@@ -49,7 +51,7 @@ Build a first-class Permission Center and apply capability-aware disabled states
 - `missing_internal_role`: disabled; name exact Agent Control app role.
 - `missing_role`: disabled; name provider roles only when probe evidence is conclusive.
 - `missing_license`, `not_configured`, `unsupported`, `preview_disabled`: disabled with exact next action.
-- `provider_error`, `unknown`, or stale evidence: disabled for mutations and sensitive content; read-only cached data may remain visible with freshness and uncertainty.
+- `provider_error`, `unknown`, or stale evidence: disable provider mutations; authorized saved data stays readable with freshness and an explicit refresh action.
 
 ## Focused validation
 
@@ -61,7 +63,7 @@ Build a first-class Permission Center and apply capability-aware disabled states
 
 ## Aggregate validation
 
-Run the global validation baseline. Start the local app and exercise the Permission Center against fixture capability responses for every status.
+Run the global validation baseline and new component/browser/axe commands inside Docker. Exercise every Permission Center state against the isolated fixture app; verify normal local startup still uses `deploy-local.ps1` with two services and no host Vite/Node process.
 
 ## Production continuation
 
@@ -69,7 +71,7 @@ Visual or browser-test residuals do not stop the campaign. Contain only affected
 
 ## Scope guard
 
-Do not implement provider adapters or data views from later phases. Do not duplicate permission requirements in component constants; consume the backend contract. Do not deploy.
+Do not implement provider adapters or data views from later phases. Do not duplicate permission requirements in component constants; consume the backend contract. Do not deploy to Azure.
 
 ## Completion record
 
