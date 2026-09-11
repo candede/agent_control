@@ -24,21 +24,29 @@ The browser does not call Microsoft Graph directly. It calls the local Express b
 
 ## Requirements
 
-Use the host and identity prerequisites in the [root runbook](../README.md): PowerShell 7, Docker with Compose v2, a browser, and an approved single-tenant Entra application when sign-in is required. Provider permissions are requested per capability rather than granted as one baseline bundle. Microsoft Agent 365 licensing applies to package APIs.
+Use the host and identity prerequisites in the [root runbook](../README.md): PowerShell 7, Docker with Compose v2, a browser, and an approved single-tenant Entra application's tenant ID, client ID and client secret for initial onboarding. Provider permissions are requested per capability rather than granted as one baseline bundle. Microsoft Agent 365 licensing applies to package APIs.
 
 ## Run Locally
 
 From the repository root:
 
 ```powershell
-pwsh -NoProfile -File ./deploy-local.ps1
+pwsh ./deploy-local.ps1 start
+# Omitting start is equivalent:
+pwsh ./deploy-local.ps1
 ```
 
-Open `http://localhost:3001`. Build, test, lint, browser automation, Node and npm all run in Docker. See the [root runbook](../README.md) for retained project names, restricted identity secret input, lifecycle actions and isolated database tests.
+The first or incomplete start prompts for tenant ID, client ID, hidden client secret and port (default `3001`). State is fixed at repository-root `.local/<lowercase-project>/`; there is no custom location. Use `pwsh ./deploy-local.ps1 start -Project newCustomer` to onboard or reuse `.local/newcustomer/`. Later starts reuse all saved values, including the port, without prompting. Open `http://localhost:<saved-port>` (default `http://localhost:3001`). Every `start` builds images, migrates, tests and starts the app. Build, test, lint, browser automation, Node and npm all run in Docker.
+
+The only public commands are positional `start` (default), `stop` and `edit-config`, plus `-Project` (default `agent-control`). `stop` preserves data and secrets. `edit-config` prompts for all four settings; Enter keeps each current value, and the current secret is never displayed. Unchanged settings are not rewritten and leave a running app untouched. Accepted client ID, client-secret or port changes safely stop the app and leave it stopped until an explicit `start`. A changed port requires the matching Entra Web callback `http://localhost:<saved-port>/api/auth/callback`. Input validation does not validate live credentials.
+
+The tenant ID can change before a database volume exists, and a previously missing tenant ID can be filled in. Changing a nonempty saved tenant ID on an existing volume is rejected before stopping the app or writing settings. Edits do not migrate data between tenants; use a separate project for another tenant. See the [root runbook](../README.md) and [operator-only maintenance helpers](../docs/operations.md#operator-only-local-helpers) for recovery and isolated database tests.
+
+Changing the saved client/application ID on an existing volume records `control/reauthenticate` while the app is stopped. The next `start` clears only persisted login sessions before reopening, requiring sign-in under the new app registration. The session-signing secret and all business data are preserved. Secret-only and port-only edits do not schedule this purge.
 
 ## How To Use The App
 
-1. Open `http://localhost:3001` and sign in when identity is configured.
+1. Open `http://localhost:<saved-port>` (default `http://localhost:3001`) and sign in when identity is configured.
 2. Request only the package read capability needed for the selected delegated/application mode.
 3. Explicitly refresh package observations; navigation itself never calls Microsoft Graph.
 4. Search/filter saved rows and inspect package source, freshness, deployment, block state and assignments according to the current app role.

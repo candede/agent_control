@@ -58,11 +58,7 @@ Exact retries use a finite content-free receipt containing tenant, actor, bundle
 | Minimal import audit | 90 days |
 | Operation confirmations | 10 minutes; at most 20 live per actor |
 
-Run ordinary operator retention at least daily while the POC is active:
-
-```powershell
-pwsh ./deploy-local.ps1 -Action Retain -Project agent-control-phase01
-```
+Run ordinary [operator retention](operations.md#retention) at least daily while the POC is active. Load the existing internal helper and use its exact project/database confirmation, preview and bounded-batch safeguards as documented there. Retention is not a `deploy-local.ps1` argument.
 
 `OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to 35 and accepts 1 through 365. A selected set is stale when either the report-period age or accepted-set age exceeds the threshold. Never treat `unknown` source freshness as current.
 

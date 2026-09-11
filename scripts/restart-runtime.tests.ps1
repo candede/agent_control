@@ -4,7 +4,8 @@ param([string]$Project='agent-control-phase01')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
-$context=New-LocalContext $root (Join-Path $root '.local') $Project 3001
+$context=New-LocalContext $root $Project
+$Project=$context.Project
 $container="$Project-restart-proof"
 $receipt=Join-Path $context.State 'runtime-fixture.json'
 $controlDatabase="agentcontrol_test_$([guid]::NewGuid().ToString('N'))"

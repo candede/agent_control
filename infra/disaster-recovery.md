@@ -4,17 +4,19 @@ Production recovery is an approved maintenance action, never normal initializati
 
 ## Local logical rehearsal
 
-Use only an isolated `agentcontrol_restore_*` database and a protected dump/receipt pair:
+Use only an isolated `agentcontrol_restore_*` database and a protected dump/receipt pair. These are existing operator-only PowerShell helpers, not `deploy-local.ps1` arguments or a separate maintenance executable. In PowerShell 7 at the repository root:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Restore -Project agent-control-phase01 -StateRoot ./.local -Port 3001 `
+. ./scripts/local-deployment.ps1
+$context = New-LocalContext -Root $PWD.Path -Project agent-control-phase01
+Invoke-LocalDeployment $context 'Restore' `
   -BackupFile "$PWD/.local/agent-control-phase01/backups/<protected>.dump" `
   -RestoreDatabase agentcontrol_restore_operator_review
-pwsh ./deploy-local.ps1 -Action Reopen -Project agent-control-phase01 -StateRoot ./.local -Port 3001 `
+Invoke-LocalDeployment $context 'Reopen' `
   -RestoreDatabase agentcontrol_restore_operator_review
 ```
 
-Restore verifies the archive checksum, table fingerprints and immutable migration prefix; migrates forward; invalidates sessions, provider qualifications, previews and execution owners; preserves uncertain sent writes as inconclusive; reconciles current deletion/access scope; runs retention to convergence; and leaves provider work disabled. Reopen repeats review transactionally. It never changes the retained app database. Remove only the exact reviewed synthetic target.
+The context reads the saved configuration and port from the fixed repository-root `.local/agent-control-phase01/` directory. Follow the [backup and restore runbook](../docs/operations.md#backup-and-isolated-restore), including operator review before `Reopen`. Restore verifies the archive checksum, table fingerprints and immutable migration prefix; migrates forward; invalidates sessions, provider qualifications, previews and execution owners; preserves uncertain sent writes as inconclusive; reconciles current deletion/access scope; runs retention to convergence; and leaves provider work disabled. Reopen repeats review transactionally. It never changes the retained app database. Remove only the exact reviewed synthetic target.
 
 ## Future native Azure PITR drill
 

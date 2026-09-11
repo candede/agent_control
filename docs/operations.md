@@ -5,18 +5,51 @@ This runbook operates the single Express/React application and PostgreSQL databa
 ## Identity, consent and roles
 
 1. Import only the four `appRoles` from `infra/entra-app-manifest.json` into the approved single-tenant Entra application. Preserve its existing registration and grants.
-2. Register exactly `http://localhost:3001/api/auth/callback` locally or the approved production origin plus `/api/auth/callback`.
+2. Register exactly `http://localhost:3001/api/auth/callback` locally (substitute the saved wizard port if different) or the approved production origin plus `/api/auth/callback`.
 3. Assign the independent Reader, Operator, SecurityReader or Administrator roles in Entra. Administrator does not inherit another role.
 4. Start the retained application:
 
    ```powershell
-   pwsh ./deploy-local.ps1 -Action Start -Project agent-control-phase01 -StateRoot ./.local -Port 3001
+   pwsh ./deploy-local.ps1 start -Project agent-control-phase01
    ```
+
+   `start` is also the default when omitted and runs the full build/migrate/test/start deployment for both new and retained installations. If settings are incomplete, complete the terminal wizard for tenant ID, client ID, hidden client secret and port (default `3001`); configured starts reuse all saved values, including the port. See [deployment setup](deployment-setup.md) for configuration and unattended-run prerequisites.
 
 5. Sign in and use Permission Center's explicit capability probe. Initial OIDC login requests only `openid profile`; approve provider scopes/roles separately under `docs/deployment-setup.md`. Never repair missing consent by editing capability evidence.
 6. After an app-role removal, wait no longer than the documented five-minute claims refresh and verify access is denied. For urgent revocation, sign out or invalidate that account's sessions through the existing logout/revocation path.
 
 Client-supplied identity headers never authenticate. A process restart loses the MSAL cache and requires provider token reacquisition; this is expected and does not authorize replay.
+
+## Local configuration changes
+
+The public interface is only positional `start`, `stop`, or `edit-config`, plus `-Project` (default `agent-control`). State is fixed at repository-root `.local/<lowercase-project>/`; neither port nor state location is a public command-line option.
+
+```powershell
+pwsh ./deploy-local.ps1 edit-config -Project agent-control-phase01
+```
+
+All four settings are prompted; Enter preserves each current value and the current secret is never displayed. Unchanged settings are not rewritten and do not stop a running app. Accepted client ID, client-secret or port changes safely stop the app and leave it stopped. Register the exact new Entra callback if the port changed, then run `start` explicitly. The wizard validates input, not live credentials, permissions or consent.
+
+The tenant ID is editable before a database volume exists, and a previously missing tenant ID can be filled in. Changing a nonempty saved tenant ID on an existing volume is rejected before stopping the app or writing settings. Edits do not migrate data between tenants; use a separate project for another tenant.
+
+Changing the saved client/application ID on an existing volume stops the app and records `.local/<lowercase-project>/control/reauthenticate`. On the next `start`, the deployment helper executes `DELETE FROM public.sessions` before reopening the app, clearing only persisted login sessions and requiring sign-in under the new app registration. The session-signing secret and all business data remain untouched. Secret-only and port-only edits do not schedule a session purge. Do not remove the pending marker to bypass this reauthentication step.
+
+## Operator-only local helpers
+
+Advanced maintenance is not part of the `deploy-local.ps1` argument surface. In a PowerShell 7 session at the repository root, load the existing internal functions and select the retained project:
+
+```powershell
+. ./scripts/local-deployment.ps1
+$context = New-LocalContext -Root $PWD.Path -Project agent-control-phase01
+```
+
+The helper reads this project's saved configuration, including its port, from the fixed `.local/agent-control-phase01/` directory. Run this setup in each new PowerShell session before the helper calls below, and recreate `$context` after a configuration edit. These are operator-only function calls, not a new maintenance executable. Their backup/restore, cleanup and reset switches belong to `Invoke-LocalDeployment`, never to `deploy-local.ps1`.
+
+To rebuild the operator image and run the aggregate test gate against an initialized installation:
+
+```powershell
+Invoke-LocalDeployment $context 'Test'
+```
 
 ## Status, safe diagnosis and provider incidents
 
@@ -37,19 +70,19 @@ An authenticated Administrator may call `GET /api/diagnostics`; it returns only 
 
 ## Retention
 
-Preview one bounded batch:
+After the [operator helper setup](#operator-only-local-helpers), preview one bounded batch:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Retain -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -ConfirmCleanup 'agent-control-phase01/agentcontrol' -CleanupBatchSize 1000 -DryRun
+Invoke-LocalDeployment $context 'Retain' -ConfirmCleanup 'agent-control-phase01/agentcontrol' -CleanupBatchSize 1000 -DryRun
 ```
 
 Apply one batch only after reviewing the per-class counts:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Retain -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -ConfirmCleanup 'agent-control-phase01/agentcontrol' -CleanupBatchSize 1000
+Invoke-LocalDeployment $context 'Retain' -ConfirmCleanup 'agent-control-phase01/agentcontrol' -CleanupBatchSize 1000
 ```
 
-Repeat explicitly until all affected counts are zero. Valid batch size is 1–5,000. One PostgreSQL advisory lock prevents competing cleanup; lock/statement timeouts are 5/15 seconds. A failure rolls back that batch and reports no content. There is no browser cleanup endpoint.
+The exact case-sensitive confirmation is `<lowercase-project>/agentcontrol`, including for preview. Repeat explicitly until all affected counts are zero, at least daily while the POC is active. Valid batch size is 1–5,000. One PostgreSQL advisory lock prevents competing cleanup; lock/statement timeouts are 5/15 seconds. A failure rolls back that batch and reports no content. Retention makes no provider calls. There is no browser cleanup endpoint.
 
 | Data class | Default / expiry | Single cleanup owner |
 | --- | --- | --- |
@@ -70,18 +103,18 @@ Dependent rows, report selection and source projections are invalidated before p
 
 ## Backup and isolated restore
 
-Create a restricted native dump and versioned checksum/fingerprint receipt:
+After the [operator helper setup](#operator-only-local-helpers), create a restricted native dump and versioned checksum/fingerprint receipt:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Backup -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -BackupFile "$PWD/.local/agent-control-phase01/backups/operator-verified.dump"
+Invoke-LocalDeployment $context 'Backup' -BackupFile "$PWD/.local/agent-control-phase01/backups/operator-verified.dump"
 ```
 
-Inventory the receipt before cleanup. A current verified backup does not resolve missing historical backup evidence. Backups contain sensitive retained data, provide no automatic cross-backup privacy suppression and must remain access-restricted.
+Omit `-BackupFile` to create a timestamped dump/receipt pair in the protected project backup directory. Explicit destinations must have an existing restricted parent directory; files are never overwritten. Inventory the receipt before cleanup. A current verified backup does not resolve missing historical backup evidence. Backups contain sensitive retained data, provide no automatic cross-backup privacy suppression and must remain access-restricted.
 
 Restore only to a new isolated database:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Restore -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -BackupFile "$PWD/.local/agent-control-phase01/backups/operator-verified.dump" -RestoreDatabase agentcontrol_restore_operator_review
+Invoke-LocalDeployment $context 'Restore' -BackupFile "$PWD/.local/agent-control-phase01/backups/operator-verified.dump" -RestoreDatabase agentcontrol_restore_operator_review
 ```
 
 Restore verifies the dump checksum, receipt table fingerprints and known migration prefix, migrates forward, invalidates sessions/provider qualifications and official staging/previews/confirmations, fences leases/owners, and marks sent work inconclusive. It repeats bounded retention until a zero-change pass, then compares exact current cache ownership and authority bindings with the live database, including current official set/version deletion and selection and exact Defender retained-scope revocation. Mismatches are purged rather than exposed. It leaves `operational_state.mode=maintenance` and provider work disabled. The restored database is not wired to the retained app by this command.
@@ -89,7 +122,7 @@ Restore verifies the dump checksum, receipt table fingerprints and known migrati
 After an operator reviews current deletions, role/scope changes, report selection, audit/job integrity and retained data scope, reopen the database:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Reopen -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -RestoreDatabase agentcontrol_restore_operator_review
+Invoke-LocalDeployment $context 'Reopen' -RestoreDatabase agentcontrol_restore_operator_review
 ```
 
 Reopen repeats retention to zero and repeats the current-state comparison from one read-only current-database snapshot while holding the restored operational-state row in a transaction. It refuses unavailable or over-bound current review, remaining sessions, Purview/Defender execution ownership, provider qualifications or mutation authority, and keeps provider work disabled. Any official or provider cache whose exact current owner/deletion/access binding cannot be proved is purged. Any future switch of the production app to this database is a separately approved maintenance action followed by restart, core smoke and fresh provider requalification. Never use restored authority to replay an uncertain write. Azure point-in-time restore is Phase 12 work and must use the same reopening checks.
@@ -101,45 +134,39 @@ Measure local recovery with elapsed time around `Backup`, `Restore`, review and 
 Stop admissions and both retained containers cleanly:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Stop -Project agent-control-phase01 -StateRoot ./.local -Port 3001
+pwsh ./deploy-local.ps1 stop -Project agent-control-phase01
 ```
 
-Start the same artifact, volume, network and secrets:
+Apply the current worktree and start with the same volume, network, secrets and saved port:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Start -Project agent-control-phase01 -StateRoot ./.local -Port 3001
+pwsh ./deploy-local.ps1 start -Project agent-control-phase01
 ```
 
-Apply the worktree through the one root local deployment path:
-
-```powershell
-pwsh ./deploy-local.ps1 -Action Deploy -Project agent-control-phase01 -StateRoot ./.local -Port 3001
-```
-
-Deploy stops the app, starts PostgreSQL, applies checksum-verified forward migrations, runs the aggregate Docker gate, then starts the app only when readiness succeeds. On migration failure, leave maintenance in place, preserve the database/backup, repair the forward migration or add a new migration, and rerun Deploy. Do not edit an applied migration or start an older artifact against an incompatible schema.
+Public `start` maps to the existing internal `Deploy` workflow: it builds operator/runtime images, stops the app, starts PostgreSQL, applies checksum-verified forward migrations, runs the aggregate Docker gate, then starts the app and verifies readiness. It is not an existing-image-only shortcut. On migration failure, leave maintenance in place, preserve the database/backup, repair the forward migration or add a new migration, and rerun `start`. Do not edit an applied migration or start an older artifact against an incompatible schema.
 
 Run lifecycle checks sequentially, never concurrently:
 
 ```powershell
 pwsh ./scripts/restart-runtime.tests.ps1 -Project agent-control-phase01
-pwsh ./scripts/persistence.tests.ps1 -Project agent-control-phase01 -Port 3001
+pwsh ./scripts/persistence.tests.ps1 -Project agent-control-phase01
 ```
 
 ## Local secret or volume recovery
 
-Local secrets are restricted files under `.local/agent-control-phase01/secrets`; the PostgreSQL volume is `agent-control-phase01_data`. If an existing-volume secret is missing/corrupt, stop. Restore the original state directory from approved secure storage; do not regenerate a password or reset the volume. Then rerun `Start` and verify health/readiness.
+Local secrets are restricted files under `.local/agent-control-phase01/secrets`; the PostgreSQL volume is `agent-control-phase01_data`. If an existing-volume DB/session secret is missing/corrupt, stop. Restore the original state directory from approved secure storage; do not regenerate a password or reset the volume. Then rerun `start` and verify health/readiness. A missing client secret is handled by the secure configuration wizard, not by replacing database/session secrets.
 
-An intentional destructive reset requires a verified backup and the exact target:
+An intentional destructive reset requires a verified backup outside the project state directory, the [operator helper setup](#operator-only-local-helpers), and the exact case-sensitive `<project>/<project>_data` confirmation:
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Reset -Project agent-control-phase01 -StateRoot ./.local -Port 3001 -ConfirmReset 'agent-control-phase01/agent-control-phase01_data'
+Invoke-LocalDeployment $context 'Reset' -ConfirmReset 'agent-control-phase01/agent-control-phase01_data'
 ```
 
-Reset destroys retained local data and secrets. It is not a credential recovery mechanism.
+Reset destroys that project's containers, volume and local state, including secrets and backups. It is not a credential recovery mechanism or a public deployment command.
 
 ## Credential expiry and separately approved replacement
 
-Follow the six-name/five-runtime-consumer contract in `docs/deployment-setup.md`. Before expiry, obtain separate administrator approval and a maintenance window. Add new secret versions directly in the prepared vault, preview references/role assignments, stop admissions and drain/reconcile jobs, back up, update native versioned references, use the administrator password only for short-lived bootstrap/migration input, remove that input, restart and verify least privilege. A session-secret replacement invalidates all sessions. A database-password replacement must coordinate the fixed `agentcontrol_admin` and `agentcontrol_app` PostgreSQL roles with their prepared vault versions; no managed-identity/password fallback exists. The deployment wizard never writes or silently rotates a value.
+Follow the six-name/five-runtime-consumer contract in `docs/deployment-setup.md`. Before expiry, obtain separate administrator approval and a maintenance window. Add new secret versions directly in the prepared vault, preview references/role assignments, stop admissions and drain/reconcile jobs, back up, update native versioned references, use the administrator password only for short-lived bootstrap/migration input, remove that input, restart and verify least privilege. A session-secret replacement invalidates all sessions. A database-password replacement must coordinate the fixed `agentcontrol_admin` and `agentcontrol_app` PostgreSQL roles with their prepared vault versions; no managed-identity/password fallback exists. The Azure deployment wizard never writes or silently rotates a vault value.
 
 ## Release, scanners and load
 

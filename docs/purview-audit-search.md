@@ -103,4 +103,4 @@ Cancel stops local polling/download and records that Microsoft Graph may continu
 
 Jobs and dependent records expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive, preserving whether an attempted remote create may continue. Qualification approval expires after one day; detached expired qualification history is removed after the additional finite cleanup window. View/export audit expires under the ordinary 90-day local audit policy. Microsoft source-event retention and any remote query lifetime are separate provider policies and are never inferred from local expiry.
 
-Run `pwsh ./deploy-local.ps1 -Action Retain -Project <project>` at least daily for an active installation. Retention is operator-only and makes no provider calls.
+Run [operator retention](operations.md#retention) at least daily for an active installation, using the existing internal helper and its exact project/database confirmation, preview and bounded-batch safeguards. Retention is not a `deploy-local.ps1` argument and makes no provider calls.

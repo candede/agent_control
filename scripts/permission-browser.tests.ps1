@@ -4,7 +4,8 @@ param([string]$Project = 'agent-control-phase01')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
-$context = New-LocalContext $root (Join-Path $root '.local') $Project 3001
+$context = New-LocalContext $root $Project
+$Project = $context.Project
 $database = "agentcontrol_test_$([guid]::NewGuid().ToString('N'))"
 $container = "$Project-permission-browser-$([guid]::NewGuid().ToString('N'))"
 $evidence = Join-Path $root 'artifacts/phase03'

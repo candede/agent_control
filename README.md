@@ -18,33 +18,53 @@ The local workbench can show truthful setup/disabled states without live provide
 
 ## Local Deployment
 
-Host prerequisites: PowerShell 7, company-approved Docker Engine/Desktop with Compose v2 or newer, and a browser. Node, npm, Vite, PostgreSQL, tests and browser automation run **inside Docker**. No Azure subscription, Key Vault or provider credentials are needed to start the sign-in-unconfigured app.
+Host prerequisites: PowerShell 7, company-approved Docker Engine/Desktop with Compose v2 or newer, and a browser. Node, npm, Vite, PostgreSQL, tests and browser automation run **inside Docker**. Initial onboarding also requires an approved single-tenant Entra application's tenant ID, client ID and client secret. No Azure subscription or Key Vault is required for local deployment.
+
+Local deployment does **not** load a repository `.env` file. [deploy-local.ps1](deploy-local.ps1) accepts only the positional commands `start` (the default), `stop`, and `edit-config`, plus `-Project` (default `agent-control`). On first start or when settings are missing, a wizard collects the tenant ID, client ID, hidden client secret and local port (default `3001`). Configuration is saved in the fixed repository-root `.local/<lowercase-project>/` directory; custom state locations are not supported. Configured starts reuse saved settings, including the port, without prompting. The script regenerates `compose.env` for Docker Compose; do not edit that generated file.
 
 From the repository root:
 
 ```powershell
-pwsh -NoProfile -File ./deploy-local.ps1
+pwsh ./deploy-local.ps1 start
+# Omitting start is equivalent:
+pwsh ./deploy-local.ps1
 ```
 
-Open **http://localhost:3001**. Use this canonical origin, not a second `127.0.0.1` browser origin. The script builds operator/runtime images, starts PostgreSQL, waits up to 90 seconds, runs serialized bootstrap/migrations and the full test baseline in disposable containers, then waits for healthy app/database/schema responses. Failure returns nonzero without resetting data or announcing success. Two long-running services remain: `app` and `postgres`.
+Open **http://localhost:3001**, or `http://localhost:<saved-port>` when configured differently. Use this canonical origin, not a second `127.0.0.1` browser origin. Every `start` runs the existing full deployment workflow: it builds operator/runtime images, starts PostgreSQL, waits up to 90 seconds, runs serialized bootstrap/migrations and the full test baseline in disposable containers, then waits for healthy app/database/schema responses. Failure returns nonzero without resetting data or announcing success. Two long-running services remain: `app` and `postgres`.
 
 - Default project: `agent-control`; volume: `agent-control_data`; network: `agent-control_default`.
-- The app listens on all interfaces **inside** its container but publishes only `127.0.0.1:3001`. PostgreSQL has no published host port. The project bridge permits normal outbound DNS/HTTPS for Entra/Graph.
-- Use `-Project <name>` for a separate installation and `-Port <1024-65535>` for an available host port. Keep the same project, state root and port on reruns. Paths with spaces are supported; newlines and single quotes are rejected.
+- The app listens on all interfaces **inside** its container but publishes only on loopback at the saved host port (default `127.0.0.1:3001`). PostgreSQL has no published host port. The project bridge permits normal outbound DNS/HTTPS for Entra/Graph.
+- Use `-Project <name>` for a separate installation and select an available host port from `1024` through `65535` in the wizard. Project names are 3-40 letters, digits or hyphens, starting with a letter, and are normalized to lowercase: `-Project newCustomer` uses `.local/newcustomer/` and Docker project `newcustomer`. Keep the same project on reruns; its port is saved automatically. Repository paths with spaces are supported; newlines and single quotes are rejected.
 - Normal redeployment preserves the volume and secrets. Before migrations it closes admissions and stops/drains the app, with a 130-second grace period. It never imports legacy data or resets storage automatically.
 - `GET /api/health` returns only liveness; `/api/ready` validates database and migration checksums; `/api/auth/status` describes setup. Diagnostics require authentication. Unknown API routes and missing assets return errors, not SPA HTML.
 
 ### Sign-In Setup
 
-Use an existing approved single-tenant Entra web application. Its default local Web reply URL is exactly `http://localhost:3001/api/auth/callback`. A different `-Port` requires a matching registered reply URL. The script does not modify app registrations or grants.
+Use an existing approved single-tenant Entra web application. Its default local Web reply URL is exactly `http://localhost:3001/api/auth/callback`. A different wizard port requires the matching registered Web reply URL `http://localhost:<saved-port>/api/auth/callback`. The script does not modify app registrations or grants.
 
 ```powershell
-pwsh -NoProfile -File ./deploy-local.ps1 -Project agent-control `
-  -TenantId "<tenant-guid>" -ClientId "<application-guid>" `
-  -ClientSecretFile "<existing-restricted-secret-file>"
+pwsh ./deploy-local.ps1 start -Project newCustomer
+# The default command also supports a project:
+pwsh ./deploy-local.ps1 -Project newCustomer
 ```
 
-On an initial configured setup, omitting `-ClientSecretFile` prompts securely in the terminal. Never enter a secret in AI/chat or a command argument. To configure an already unconfigured installation, supply the secret file explicitly. Missing identity configuration keeps the app healthy but disables the sign-in link and shows setup guidance. No fake identity or runtime auth bypass exists.
+For a new project, the wizard asks for the tenant GUID, client/application GUID, client secret **value** (not the secret ID), and port (Enter accepts `3001`). Secret input is hidden and stored only in the project's restricted `secrets/client-secret` file; IDs and port are saved in `settings.json`. Existing projects are prompted only for missing settings or an absent/empty secret. Existing values and database/session secrets are preserved. Use a separate project for another tenant.
+
+Before asking for settings, onboarding and `edit-config` display the registered-app permission checklist: basic sign-in scopes, feature-specific Graph and Power Platform delegated permissions, optional app-only permissions, administrator consent, app-role assignments and provider prerequisites. Grant only what your selected features need; the wizard neither grants permissions nor verifies live consent. Configured starts do not repeat this guidance.
+
+Run the same command next time to reuse the saved configuration. Identity and port command-line arguments are not accepted. Initial or incomplete onboarding requires an interactive terminal; required identity values cannot be blank, and malformed GUIDs or invalid ports are prompted again. Complete onboarding interactively before unattended `start` runs. `stop` and operator-only maintenance helpers do not prompt for identity. The wizard validates input format, not live Entra credentials, permissions or consent. No fake identity or runtime auth bypass exists.
+
+To review or change saved configuration:
+
+```powershell
+pwsh ./deploy-local.ps1 edit-config -Project newCustomer
+```
+
+`edit-config` prompts for all four values. Enter preserves each current value, including leaving an unconfigured identity field unset; the current secret is never displayed. To change only the port, press Enter at the tenant ID, client ID and client-secret prompts, then enter the new port. `start` still asks for any missing identity values before launching. If nothing changes, settings are not rewritten and a running app is left running. Accepted changes to the client ID, client secret or port stop the app safely and leave it stopped; run `start` explicitly afterward. Update the Entra Web reply URL before restarting with a changed port.
+
+The tenant ID can change before the project has a database volume, and a previously missing tenant ID can be filled in. Once a volume exists, changing a nonempty saved tenant ID is rejected before stopping the app or writing settings. Configuration edits never migrate existing data between tenants; use a separate project for another tenant.
+
+Changing the saved client/application ID on an existing volume stops the app and records `control/reauthenticate`. The next `start` clears only persisted login sessions before reopening the app, requiring sign-in under the new app registration. The session-signing secret and all business data remain untouched. Secret-only and port-only edits do not schedule a session purge.
 
 Initial sign-in requests only OIDC identity scopes: `openid` and `profile`. Provider permissions are requested incrementally for one capability group through authenticated, CSRF-protected consent. Package read requests least-privileged `CopilotPackages.Read.All`; package controls request delegated `CopilotPackages.ReadWrite.All` only when that separately qualified capability needs it. Power Platform inventory requests delegated `ResourceQuery.Resources.Read`; Copilot Studio quarantine separately requests delegated `CopilotStudio.AdminActions.Invoke`. Directory, Purview and Defender grants likewise stay resource- and capability-specific. Do not add broad grants to conceal an unavailable or unproven provider contract.
 
@@ -54,44 +74,41 @@ Authenticated users can read `GET /api/capabilities` and refresh their own capab
 
 ### Local Secrets
 
-Default state is the ignored `.local/<project>/` directory. `-StateRoot` changes its parent; use an ignored, private directory. Directories are mode `0700` and files `0600` on Unix; Windows uses an explicit current-user ACL with inheritance removed. Keep the state directory with the retained Docker volume in your recovery inventory.
+State is always the ignored repository-root `.local/<lowercase-project>/` directory; there is no custom state-root option. Directories are mode `0700` and files `0600` on Unix; Windows uses an explicit current-user ACL with inheritance removed. Keep the state directory with the retained Docker volume in your recovery inventory.
 
 | Relative path | Format / lifetime | Mounted consumer |
 | --- | --- | --- |
 | `secrets/postgres-admin` | 48 random bytes, 64-character Base64; generated once | PostgreSQL bootstrap and disposable operator only |
 | `secrets/postgres-app` | Independent value, same format; generated once | Bootstrap plus restricted app login |
 | `secrets/session` | Independent value, same format; generated once | App session-cookie signing only |
-| `secrets/client-secret` | Trimmed Entra client-secret text, or empty when unconfigured | App only |
+| `secrets/client-secret` | Trimmed Entra client-secret text from the wizard; legacy empty files trigger onboarding on `start` | App only |
 | `settings.json` | Non-secret tenant/client IDs and port | Local script |
 | `compose.env` | Non-secret paths, IDs, image names, port and UID/GID | Compose |
 | `control/maintenance` | Presence closes new work admissions | App read-only mount |
+| `control/reauthenticate` | Pending login-session purge after an existing-volume client ID change; processed on next `start` | Local script |
 | `backups/` | Native dump plus count/hash receipt | Operator only |
 
 Secrets are file mounts, never image layers, build arguments or logged values. The runtime receives no admin password or operator code and has a read-only root filesystem, dropped capabilities and no Docker socket. It uses the host UID/GID locally to read restricted bind-mounted files.
 
-With an existing volume, missing or corrupt DB/session secrets **stop deployment**. Restore their original bytes from the same installation's protected state backup; do not generate replacements. A valid-looking but incorrect password also fails actual authentication. Credential rotation is a coordinated operator action, not a deploy side effect. Keep project tenant and origin stable; create another project for another tenant.
+Managed Compose interpolation variables (`LOCAL_STATE_DIR`, `APP_PORT`, `APP_UID`, `APP_GID`, `APP_IMAGE`, `TENANT_ID`, and `CLIENT_ID`) are removed from the shell environment for managed Compose calls and restored afterward, preserving unset versus empty values. Exported values cannot override the selected project's saved configuration through those variables. Empty values must not be used to clear these overrides: Compose treats an empty `LOCAL_STATE_DIR` as an override and incorrectly resolves secrets under `/secrets/`. If an older script failed with that mount path, rerun `start` with the corrected script and the same `-Project`; retain the existing state directory and volume.
+
+With an existing volume, missing or corrupt DB/session secrets **stop deployment**. Restore their original bytes from the same installation's protected state backup; do not generate replacements. A valid-looking but incorrect password also fails actual authentication. Database/session credential rotation is a coordinated operator action, not a deploy side effect. Create another project for another tenant; coordinate origin changes with the Entra callback registration.
 
 ## Lifecycle And Recovery
 
 ```powershell
-pwsh ./deploy-local.ps1 -Action Stop
-pwsh ./deploy-local.ps1 -Action Start
-pwsh ./deploy-local.ps1 -Action Test
-pwsh ./deploy-local.ps1 -Action Retain
-pwsh ./deploy-local.ps1 -Action Backup
+pwsh ./deploy-local.ps1 stop
+pwsh ./deploy-local.ps1 start
+pwsh ./deploy-local.ps1 edit-config
 ```
 
-Add the same `-Project`, `-Port` and `-StateRoot` used at installation. Stop leaves storage intact; Start uses the existing image and verifies readiness, without migrations. After a failed build, the previous runtime is unchanged. After a migration/test/start failure, maintenance remains closed; fix the reported target/configuration/schema problem and rerun Deploy. Never remove the volume as a recovery shortcut. Health remains separate from provider availability.
+Add the same `-Project` used at installation. `stop` leaves data and secrets intact; `start` always builds, migrates, tests and starts, using the saved port. After a failed build, the previous runtime is unchanged unless a preceding configuration edit already stopped it. After a migration/test/start failure, maintenance remains closed; fix the reported target/configuration/schema problem and rerun `start`. Never remove the volume as a recovery shortcut. Health remains separate from provider availability.
 
-The Backup action writes a new timestamped `.dump` and `.dump.json` under the protected project backup directory, using a PostgreSQL repeatable-read snapshot and `pg_dump` custom format. The receipt records SHA-256, schema and per-table counts/content fingerprints, not row contents. Use `-BackupFile` for an explicit new filename in an existing restricted directory. Existing files are never overwritten.
+Advanced testing, retention, backup, restore, reopen and destructive reset use existing **operator-only PowerShell helpers**, not arguments to `deploy-local.ps1`. See [the operator helper setup](docs/operations.md#operator-only-local-helpers), [retention](docs/operations.md#retention), and [backup/restore](docs/operations.md#backup-and-isolated-restore). There is no separate maintenance executable.
 
-Restore always creates a **new isolated database**, never the source/default database:
+The internal `Backup` helper writes a new timestamped `.dump` and `.dump.json` under the protected project backup directory, using a PostgreSQL repeatable-read snapshot and `pg_dump` custom format. The receipt records SHA-256, schema and per-table counts/content fingerprints, not row contents. Its `-BackupFile` parameter selects an explicit new filename in an existing restricted directory. Existing files are never overwritten.
 
-```powershell
-pwsh ./deploy-local.ps1 -Action Restore `
-  -BackupFile ".local/agent-control/backups/<timestamp>.dump" `
-  -RestoreDatabase "agentcontrol_restore_check"
-```
+Restore always creates a **new isolated database**, never the source/default database. Follow the [operator restore and reopen procedure](docs/operations.md#backup-and-isolated-restore), selecting the exact project and an isolated target such as `agentcontrol_restore_check`.
 
 `pg_restore` runs transactionally, followed by schema/count/content validation and explicit grants. Existing targets and changed receipts fail. A failed restore target remains isolated for review; the source is unchanged. Review retained data and run operator retention before any separately approved promotion. Phase 01 does not switch the running app to a restored database. After a successful check, remove only that exact isolated target:
 
@@ -101,14 +118,9 @@ docker compose --env-file .local/agent-control/compose.env -p agent-control exec
   -c 'DROP DATABASE agentcontrol_restore_check WITH (FORCE)'
 ```
 
-Keep local dump/receipt pairs for at most **seven days** and remove expired pairs during routine operator maintenance (`-Action Retain`). Keep secret-file recovery copies under the organization's credential policy, separately protected from data dumps. Database retention removes expired sessions, capability evidence and package mutation qualification records, seven-day jobs/items/attempts, expired package snapshots/refresh jobs, 30-day Purview jobs/results, audit older than 90 days, old import receipts and unused source identifiers. Expired capability or qualification evidence stops authorizing immediately. Run Retain at least daily while actively using this POC; it never calls providers. Backups have a finite lifetime, not an instant deletion guarantee.
+Keep local dump/receipt pairs for at most **seven days** and remove expired pairs during routine operator maintenance (internal `Retain` helper). Keep secret-file recovery copies under the organization's credential policy, separately protected from data dumps. Database retention removes expired sessions, capability evidence and package mutation qualification records, seven-day jobs/items/attempts, expired package snapshots/refresh jobs, 30-day Purview jobs/results, audit older than 90 days, old import receipts and unused source identifiers. Expired capability or qualification evidence stops authorizing immediately. Run Retain at least daily while actively using this POC; it never calls providers. Backups have a finite lifetime, not an instant deletion guarantee.
 
-Destructive reset is a separate, explicit action, never a deploy step:
-
-```powershell
-pwsh ./deploy-local.ps1 -Action Reset -Project agent-control `
-  -ConfirmReset "agent-control/agent-control_data"
-```
+Destructive reset is a separate, explicit [operator-only helper action](docs/operations.md#local-secret-or-volume-recovery), never a deploy step or public command.
 
 This removes that project's containers, volume and local state including its backups. Back up anything needed outside that directory first. The exact case-sensitive project/volume confirmation is mandatory.
 
@@ -191,7 +203,7 @@ Accepted rows are immutable. Exact three-file retries return the original finite
 
 `AgentControl.Reader` can read/export aggregate official usage. `AgentControl.SecurityReader` can read/export user-level official usage. `AgentControl.Administrator` can stage, review, accept, select and delete operational report sets but does not inherit either content-read role. Report agent IDs remain report-only and unresolved unless an exact documented cross-source identifier contract exists; names and creator strings are never identity keys. Pseudonymous usernames remain case-distinct and explicitly scoped to their report set and Users/Users & agents versions. Licensed and unlicensed active-user categories are not additive even within one agent because license changes can place one person in both categories; their sum is never presented as a distinct-user total. Exact distinct totals use the case-sensitive Users plus Users & agents dataset identity union, while each source's response total remains independent. In Users & agents, last activity is the date the agent was last used by anyone, not that user's last interaction. User recency comes only from Users and is unknown when that row is absent. Source disagreements remain visible instead of being corrected or hidden.
 
-Staging rows expire after 30 minutes and startup plus periodic runtime cleanup removes abandoned preview rows; accepted content, artifacts, versions, sets and bundle receipts expire independently after 180 days; minimal report audit metadata expires after 90 days. Upload parsing and processing have an active 15-second wall-clock timeout, and disconnected work keeps its admission slot until parsing/database work has settled. Admission caps are 8 MiB and 50,000 rows per file, two concurrent uploads per process, nine retained staging rows/150,000 rows/96 MiB per actor, and 30 rows/500,000 rows/256 MiB per tenant. Run `pwsh ./deploy-local.ps1 -Action Retain -Project <project>` during ordinary maintenance. `OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to `35`, accepts 1 through 365, and marks a selected set stale when either report-period age or accepted-set age exceeds the threshold. `never imported`, `incomplete`, `active`, `stale`, `not selected` and `deleted` remain distinct and never trigger another source fallback.
+Staging rows expire after 30 minutes and startup plus periodic runtime cleanup removes abandoned preview rows; accepted content, artifacts, versions, sets and bundle receipts expire independently after 180 days; minimal report audit metadata expires after 90 days. Upload parsing and processing have an active 15-second wall-clock timeout, and disconnected work keeps its admission slot until parsing/database work has settled. Admission caps are 8 MiB and 50,000 rows per file, two concurrent uploads per process, nine retained staging rows/150,000 rows/96 MiB per actor, and 30 rows/500,000 rows/256 MiB per tenant. Run the internal [operator retention procedure](docs/operations.md#retention) during ordinary maintenance. `OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to `35`, accepts 1 through 365, and marks a selected set stale when either report-period age or accepted-set age exceeds the threshold. `never imported`, `incomplete`, `active`, `stale`, `not selected` and `deleted` remain distinct and never trigger another source fallback.
 
 The legacy browser key `agent-control:usage-reports:v1` is detected by key enumeration only. Its value is never read, parsed or uploaded. Every affected authenticated browser receives a content-free notice regardless of app role; only Administrator receives cleanup controls. The key survives sign-out, unmount and failed import. It is removed only after server-acknowledged successful original-file re-import confirmation or explicit discard acknowledgement; unrelated local-storage keys remain untouched. Storage at an older origin such as `http://localhost:5173` cannot be detected from `http://localhost:3001` and must be handled explicitly at that origin.
 
@@ -258,7 +270,7 @@ docker run --rm --entrypoint npm agent-control-phase01-operator:local \
   src/capabilityState.test.ts src/useCapabilities.test.tsx src/authorization.test.ts
 ```
 
-[frontend/vitest.config.ts](frontend/vitest.config.ts) runs React Testing Library in jsdom, with API-client HTTP fixtures. DOM axe disables only contrast, which Chromium checks. Native details/dialog keyboard behavior is qualified in Chromium, not simulated by jsdom. These tests are also part of the aggregate frontend suite. Run the normal aggregate with `pwsh ./deploy-local.ps1 -Action Test -Project agent-control-phase01`.
+[frontend/vitest.config.ts](frontend/vitest.config.ts) runs React Testing Library in jsdom, with API-client HTTP fixtures. DOM axe disables only contrast, which Chromium checks. Native details/dialog keyboard behavior is qualified in Chromium, not simulated by jsdom. These tests are also part of the aggregate frontend suite. Run the normal aggregate with the internal `Test` helper in [the operator runbook](docs/operations.md#operator-only-local-helpers); every public `start` also runs that gate.
 
 Normal success or assertion failure closes the fixture server/session store, drops its fixture database, removes the disposable container (`--rm`), and drops the control database in PowerShell `finally`. Only the two normal Compose services remain. On hard host/container interruption, use the printed `isolated_browser_fixture` database name and the exact control name from that run to inspect and remove those guarded targets only; never bulk-delete databases, volumes, or project secrets. Reruns use new database/container names.
 

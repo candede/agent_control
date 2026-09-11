@@ -6,7 +6,7 @@ Phase 02 defines the Entra, secret, and local runtime contract. It does not depl
 
 - Docker Desktop with Compose v2.
 - PowerShell 7 (`pwsh`).
-- A Microsoft Entra single-tenant app registration when interactive sign-in is being exercised.
+- A Microsoft Entra single-tenant app registration, with its tenant ID, client ID and client secret for local onboarding.
 - For Azure preparation, permission to edit the app registration, assign its app roles, read the six required Key Vault secrets, and deploy the later Bicep resources.
 
 ## Entra application
@@ -69,17 +69,39 @@ Map `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `SESSION_SECRET`, and `PGPASSWORD
 
 ## Local workflow
 
-The local workflow is Docker-only and preserves the retained Compose project, PostgreSQL volume, secrets, and backend-owned official usage reports:
+The local workflow is Docker-only and preserves the retained Compose project, PostgreSQL volume, secrets, and backend-owned official usage reports. The public interface accepts only positional `start` (default), `stop`, and `edit-config`, plus `-Project` (default `agent-control`):
 
 ```powershell
+pwsh ./deploy-local.ps1 start -Project agent-control-phase01
+# Omitting start is equivalent:
 pwsh ./deploy-local.ps1 -Project agent-control-phase01
 ```
 
-The canonical local origin is `http://localhost:3001`; `127.0.0.1` is only the bind address, not an alternative browser origin. A successful Deploy builds the image, bootstraps/migrates additively in disposable containers, runs the aggregate baseline, starts exactly `app` and `postgres`, and waits for readiness. Separate package/browser/restart checks are documented in [the local runbook](../README.md). Keep using the retained `agent-control-phase01` project name and volume; do not reset or rotate secrets on rerun. `-WhatIf` is not a supported parameter.
+The canonical local origin is `http://localhost:<saved-port>` (default `http://localhost:3001`); `127.0.0.1` is only the bind address, not an alternative browser origin. Every `start` invokes the full existing internal `Deploy` workflow: it builds operator/runtime images, bootstraps/migrates additively in disposable containers, runs the aggregate baseline, starts exactly `app` and `postgres`, and waits for readiness. It supports both new and retained installations. Separate package/browser/restart checks are documented in [the local runbook](../README.md). Keep using the retained `agent-control-phase01` project name and volume; do not reset or rotate database/session secrets on rerun. `stop` preserves data and secrets.
 
 Runtime configuration uses `FRONTEND_ORIGIN` for same-origin browser checks and `REDIRECT_URI` for the exact `/api/auth/callback` URL on that same origin. Local Compose bounds the `json-file` logs for both persistent services to three 10 MiB files each; rotation is finite local diagnostics, not a second telemetry service. The application completion logger runs before body parsing and admission so denied requests are counted without logging URLs, headers or bodies. Local Compose supplies both origin values from its selected port. Azure requires production mode, HTTPS for the single origin, complete `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET` configuration, and a session secret of at least 32 bytes. App Service identity selects the trusted Azure proxy boundary; role or administrator bootstrap environment variables are not supported and cannot assign authority.
 
-Supply the non-secret tenant/client GUIDs using `-TenantId` and `-ClientId`. Supply the client secret only through `-ClientSecretFile` pointing to an existing ignored restricted file, or enter it directly at the script's secure PowerShell terminal prompt. Never pass its value as a parameter or through chat. The existing helper copies it to `.local/<project>/secrets/client-secret` with owner-only permissions (Unix mode 0600); directories are restricted. Runtime mounts only that file, `session`, and `postgres-app`. The operator alone mounts `postgres-admin`. Generated DB/session secrets are reused, not silently rotated; missing/corrupt secrets with an existing volume stop for recovery. No provider token or MSAL cache file is created.
+Select the saved configuration with `-Project` (default `agent-control`). Project names are 3-40 letters, digits or hyphens, starting with a letter, and are normalized to lowercase, so `pwsh ./deploy-local.ps1 start -Project newCustomer` uses `.local/newcustomer/`. State is fixed beneath the repository root; custom locations are unsupported. First or incomplete `start` launches the wizard for missing tenant ID, client ID, client secret and port. Enter GUIDs and the secret value directly in the terminal; secret input is hidden. The port defaults to `3001` and accepts integers from `1024` through `65535`. Identity/port command-line arguments and a repository `.env` file are not supported. Configured starts reuse all saved values, including the port, without prompting. `stop` and internal maintenance helpers do not prompt for identity.
+
+The helper saves IDs and port in `.local/<lowercase-project>/settings.json` and the secret in `.local/<lowercase-project>/secrets/client-secret` with owner-only permissions (Unix mode 0600); directories are restricted. An absent, empty or whitespace-only client-secret file triggers a new secure prompt on `start`. Required identity input cannot be blank; Enter accepts the default port when none is saved. Malformed GUIDs and invalid ports are prompted again. Complete onboarding in an interactive terminal before unattended runs. Never enter secret values in chat or command arguments. The wizard validates input only: it does not verify live credentials, change app registrations or grant permissions.
+
+To change saved configuration:
+
+```powershell
+pwsh ./deploy-local.ps1 edit-config -Project agent-control-phase01
+```
+
+The wizard prompts for tenant ID, client ID, hidden client secret and port, with Enter preserving each current value, even if an identity field is currently unset. For a port-only edit, press Enter at the three identity prompts, then enter the port. Missing identity values remain required on the next `start`, not during `edit-config`. The wizard never displays the current secret. Unchanged settings are not rewritten and leave a running app untouched. Accepted changes to the client ID, client secret or port stop the app safely and leave it stopped; run `start` explicitly afterward. Before starting with a changed port, register exactly `http://localhost:<saved-port>/api/auth/callback` as an Entra Web reply URL.
+
+The tenant ID can change before the project has a database volume; a previously missing tenant ID can also be filled in. Changing a nonempty saved tenant ID when a volume exists is rejected before stopping the app or writing settings. Configuration edits do not migrate data between tenants; use a separate project for another tenant.
+
+Changing the saved client/application ID on an existing volume stops the app and writes `control/reauthenticate` in the project state directory. The next `start` clears only persisted login sessions before reopening, requiring sign-in under the new app registration. It preserves the session-signing secret and all business data. Secret-only or port-only edits do not schedule this purge.
+
+Managed Compose calls clear shell values for `LOCAL_STATE_DIR`, `APP_PORT`, `APP_UID`, `APP_GID`, `APP_IMAGE`, `TENANT_ID`, and `CLIENT_ID`, then restore them afterward. Those exported variables cannot override saved project configuration.
+
+Testing, retention, backup, isolated restore/reopen and destructive reset remain [operator-only helper calls](operations.md#operator-only-local-helpers), not public deployment arguments.
+
+Runtime mounts only `client-secret`, `session`, and `postgres-app`. The operator alone mounts `postgres-admin`. Existing identity values are preserved; use a separate project for another tenant. Generated DB/session secrets are reused, not silently rotated; missing/corrupt DB/session secrets with an existing volume stop for recovery before onboarding. No provider token or MSAL cache file is created.
 
 ## Azure workflow
 

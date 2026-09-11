@@ -1,10 +1,10 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param([string]$Project='agent-control-phase01',[int]$Port=3001)
+param([string]$Project='agent-control-phase01')
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
-$context=New-LocalContext $root (Join-Path $root '.local') $Project $Port
+$context=New-LocalContext $root $Project
 $receipt=Join-Path $context.State 'persistence-fixture.json'
 $controlDatabase="agentcontrol_test_$([guid]::NewGuid().ToString('N'))"
 $restoreDatabase="agentcontrol_restore_$([guid]::NewGuid().ToString('N'))"
