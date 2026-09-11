@@ -1,20 +1,26 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import type {
+  AppRole,
   CopilotPackageDetail,
   PackageAccessTarget,
   PackageAccessUpdate,
 } from "../api/client";
 import { getBuiltWithLabel } from "../agentDisplay";
-import type { AgentUsageSummary, UserAgentUsageRow } from "../reportImports";
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
+import { WorkbenchActionGate } from "../workbenchActionContext";
+
+const detailTabs = ["identities", "package", "power-platform", "reports", "audit-security", "controls"] as const;
+type DetailTab = typeof detailTabs[number];
 
 type AgentDetailModalProps = {
   agent: CopilotPackageDetail;
-  usage?: AgentUsageSummary;
-  userRows: UserAgentUsageRow[];
+  activeTab?: string;
+  onTabChange?: (tab: string) => void;
+  roles?: AppRole[];
   onClose: () => void;
   onUpdateAccess: (update: PackageAccessUpdate) => Promise<void>;
+  onSetBlocked?: (blocked: boolean) => Promise<void>;
 };
 
 type AccessSummary = {
@@ -31,13 +37,22 @@ type ConnectedService = {
 
 export function AgentDetailModal({
   agent,
-  usage,
-  userRows,
+  activeTab,
+  onTabChange,
+  roles = [],
   onClose,
   onUpdateAccess,
+  onSetBlocked,
 }: AgentDetailModalProps) {
+  const [internalTab, setInternalTab] = useState<DetailTab>("identities");
   const [editingAccessTarget, setEditingAccessTarget] =
     useState<PackageAccessTarget>();
+  const requestedTab = activeTab ?? internalTab;
+  const selectedTab: DetailTab = detailTabs.includes(requestedTab as DetailTab) ? requestedTab as DetailTab : "identities";
+  const selectTab = (tab: DetailTab) => {
+    setInternalTab(tab);
+    onTabChange?.(tab);
+  };
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
   const connectedServices = extractConnectedServices(agent.elementDetails);
@@ -48,15 +63,20 @@ export function AgentDetailModal({
   );
   const assignmentCount = allowedSummary.total + acquireSummary.total;
   const statusLabel = agent.isBlocked ? "Blocked" : "Allowed";
-  const visibleUserRows = userRows.slice(0, 6);
-  const hiddenUserRows = userRows.length - visibleUserRows.length;
   const description = getAgentDescription(agent);
   const sanitizedDescriptionHtml = getSanitizedDescriptionHtml(description);
   const dialogRef = useRef<HTMLElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    dialogRef.current?.focus();
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => { window.requestAnimationFrame(() => returnFocusRef.current?.focus()); };
+  }, []);
+  useEffect(() => {
+    dialogRef.current?.querySelector<HTMLElement>(`#agent-tab-${selectedTab}`)?.focus();
+  }, [selectedTab]);
 
+  useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape" && !editingAccessTarget) {
         onClose();
@@ -78,6 +98,23 @@ export function AgentDetailModal({
         aria-labelledby="agent-detail-title"
         tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && (event.target as HTMLElement).getAttribute("role") === "tab") {
+            event.preventDefault();
+            const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+            const current = tabs.indexOf(event.target as HTMLButtonElement);
+            const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+            tabs[next]?.focus();
+            tabs[next]?.click();
+            return;
+          }
+          if (event.key !== "Tab" || editingAccessTarget) return;
+          const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex="0"]')];
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        }}
       >
         <header className="detail-header">
           <div className="detail-title-block">
@@ -100,25 +137,18 @@ export function AgentDetailModal({
           <p className="detail-description">{description}</p>
         )}
 
+        <div className="detail-tabs" role="tablist" aria-label="Agent detail sources">
+          {detailTabs.map(tab => <button key={tab} id={`agent-tab-${tab}`} type="button" role="tab"
+            aria-selected={selectedTab === tab} aria-controls={`agent-${tab}-panel`} tabIndex={selectedTab === tab ? 0 : -1}
+            onClick={() => selectTab(tab)}>{detailTabLabel(tab)}</button>)}
+        </div>
+
+        {selectedTab === "package" ? <div id="agent-package-panel" role="tabpanel" aria-labelledby="agent-tab-package" tabIndex={0}>
         <div className="detail-stat-grid">
           <SummaryStat
-            label="Status"
+            label="Package block"
             value={statusLabel}
             tone={agent.isBlocked ? "danger" : "success"}
-          />
-          <SummaryStat
-            label="Active users"
-            value={
-              usage ? usage.activeUsersTotal.toLocaleString() : "No import"
-            }
-            tone="usage"
-          />
-          <SummaryStat
-            label="Responses sent"
-            value={
-              usage ? usage.responsesSentToUsers.toLocaleString() : "No import"
-            }
-            tone="usage"
           />
           <SummaryStat
             label="Connected services"
@@ -150,6 +180,30 @@ export function AgentDetailModal({
                 {
                   label: "Available to",
                   value: formatDetailLabel(agent.availableTo),
+                },
+                {
+                  label: "Installed for",
+                  value: formatDetailLabel(agent.deployedTo),
+                },
+                {
+                  label: "Package owner",
+                  value: "Not exposed by the Graph package detail contract",
+                },
+                {
+                  label: "Saved observation",
+                  value: formatDate(agent.observation?.observedAt),
+                },
+                {
+                  label: "Observation expires",
+                  value: formatDate(agent.observation?.expiresAt),
+                },
+                {
+                  label: "Source",
+                  value: agent.observation?.source ?? "Microsoft Graph package catalog",
+                },
+                {
+                  label: "API maturity",
+                  value: agent.observation?.apiMaturity ?? "v1.0 read; preview controls",
                 },
                 {
                   label: "Sensitivity",
@@ -216,36 +270,9 @@ export function AgentDetailModal({
                 onEdit={() => setEditingAccessTarget("installation")}
               />
             </div>
-          </DetailSection>
-
-          <DetailSection
-            title="Usage import"
-            countLabel={
-              usage ? formatReportKind(usage.sourceReport) : "No import"
-            }
-            tone="usage"
-          >
-            <div className="detail-grid">
-              <DetailItem
-                label="Report Agent ID"
-                value={usage?.agentId}
-                variant="code"
-              />
-              <DetailItem label="Report agent name" value={usage?.agentName} />
-              <DetailItem label="Creator type" value={usage?.creatorType} />
-              <DetailItem
-                label="Last activity"
-                value={formatReportDate(usage?.lastActivityDateUtc)}
-              />
-              <DetailItem
-                label="Licensed users"
-                value={usage?.activeUsersLicensed.toLocaleString()}
-              />
-              <DetailItem
-                label="Unlicensed users"
-                value={usage?.activeUsersUnlicensed.toLocaleString()}
-              />
-            </div>
+            <p className="detail-overflow-note">
+              Package block is Microsoft Graph package catalog state. It is not Copilot Studio quarantine.
+            </p>
           </DetailSection>
 
           <DetailSection
@@ -269,34 +296,48 @@ export function AgentDetailModal({
             )}
           </DetailSection>
 
-          <DetailSection
-            title="User activity"
-            countLabel={`${userRows.length.toLocaleString()} rows`}
-            tone="activity"
-          >
-            {visibleUserRows.length ? (
-              <ul className="detail-list user-activity-list expanded-detail-list">
-                {visibleUserRows.map((row, index) => (
-                  <li key={`${row.agentId}-${row.username}-${index}`}>
-                    <span>{row.username}</span>
-                    <small>
-                      {row.responsesSentToUsers.toLocaleString()} responses,
-                      last activity{" "}
-                      {formatReportDate(row.lastActivityDateUtc) ?? "Unknown"}
-                    </small>
+        </div>
+        </div> : selectedTab === "identities" ? (
+          <section id="agent-identities-panel" className="detail-section metadata" role="tabpanel" aria-labelledby="agent-tab-identities" tabIndex={0}>
+            <div className="detail-section-header">
+              <h3>Exact package identities and provenance</h3>
+              <span>{Object.keys(agent.provenance).length} fields</span>
+            </div>
+            <p>
+              These identifiers are authorized from the exact Microsoft Graph package observation. They are not substituted as another source's native target.
+            </p>
+            <DetailList items={[
+              { label: "Source system", value: agent.sourceSystem },
+              { label: "Package ID", value: agent.id, variant: "code" },
+              { label: "App ID", value: agent.appId, variant: "code" },
+              { label: "Manifest ID", value: agent.manifestId, variant: "code" },
+              { label: "Asset ID", value: agent.assetId, variant: "code" },
+              { label: "Observed", value: formatDate(agent.observation?.observedAt) },
+              { label: "Expires", value: formatDate(agent.observation?.expiresAt) },
+              { label: "Native identity", value: agent.identityConfidence },
+              { label: "Agent kind", value: agent.agentKind },
+              { label: "Authoring tool", value: agent.authoringTool ?? "Not independently observed" },
+              { label: "Creator type", value: agent.creatorType },
+              { label: "Lifecycle", value: agent.lifecycle },
+            ]} />
+            <ul className="detail-list expanded-detail-list">
+              {Object.entries(agent.provenance)
+                .sort(([left], [right]) => left.localeCompare(right))
+                .map(([field, provenance]) => (
+                  <li key={field}>
+                    <span>{field}</span>
+                    <small>{provenance.sourceSystem} · {provenance.maturity} · {provenance.path}</small>
                   </li>
                 ))}
-              </ul>
-            ) : (
-              <p>No user-agent report rows imported for this package.</p>
-            )}
-            {hiddenUserRows > 0 ? (
-              <p className="detail-overflow-note">
-                {hiddenUserRows.toLocaleString()} more user rows hidden.
-              </p>
-            ) : null}
-          </DetailSection>
-        </div>
+            </ul>
+          </section>
+        ) : selectedTab === "power-platform" ? <UnavailablePanel id="power-platform" title="Power Platform data">No documented package-to-Power-Platform identifier equivalence exists. Names, app IDs, manifest IDs, asset IDs, owners, and timestamps were not used as joins. Power Platform records remain usable in their authorized inventory view.</UnavailablePanel>
+          : selectedTab === "reports" ? <UnavailablePanel id="reports" title="Official reports">Official report agent IDs are report-only under the retained three-file contract. No documented exact relation to a Graph package ID exists, so no report lookup, metric substitution, or count was performed.</UnavailablePanel>
+          : selectedTab === "audit-security" ? <UnavailablePanel id="audit-security" title="Audit and security">{roles.includes("AgentControl.SecurityReader") ? "SecurityReader is authorized for source views, but Purview and Defender define exact Power Platform identifier associations only. No documented exact relation to this Graph package exists, so names were not queried." : "SecurityReader is not assigned. Audit and Defender records and counts were not requested. Their source views remain independently authorized."}</UnavailablePanel>
+          : <section id="agent-controls-panel" className="detail-section metadata" role="tabpanel" aria-labelledby="agent-tab-controls" tabIndex={0}><div className="detail-section-header"><h3>Native package controls</h3><span>{agent.id}</span></div><p>Block state and package access target only this exact Graph package ID. Copilot Studio quarantine remains a separate environment/CDS bot control.</p>
+            {onSetBlocked ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"}><button type="button" className="secondary" onClick={() => void onSetBlocked(!agent.isBlocked)}>{agent.isBlocked ? "Unblock exact package" : "Block exact package"}</button></WorkbenchActionGate> : null}
+            <WorkbenchActionGate actionId="packages.access"><button type="button" className="secondary" onClick={() => setEditingAccessTarget("availability")}>Manage package availability</button></WorkbenchActionGate>
+          </section>}
         {editingAccessTarget ? (
           <AccessAssignmentModal
             context="single"
@@ -376,6 +417,18 @@ function DetailSection({
   );
 }
 
+function UnavailablePanel({ id, title, children }: { id: string; title: string; children: ReactNode }) {
+  return <section id={`agent-${id}-panel`} className="detail-section metadata" role="tabpanel" aria-labelledby={`agent-tab-${id}`} tabIndex={0}>
+    <div className="detail-section-header"><h3>{title}</h3><span>No exact association</span></div>
+    <p>{children}</p>
+  </section>;
+}
+
+function detailTabLabel(value: DetailTab) {
+  const label = value.replaceAll("-", " ");
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)}`;
+}
+
 function SummaryStat({
   label,
   value,
@@ -411,25 +464,6 @@ function DetailList({ items }: { items: DetailListItem[] }) {
         </div>
       ))}
     </dl>
-  );
-}
-
-function DetailItem({
-  label,
-  value,
-  variant,
-}: {
-  label: string;
-  value?: string;
-  variant?: "code";
-}) {
-  return (
-    <div className="detail-item">
-      <span>{label}</span>
-      <strong className={variant === "code" ? "detail-code" : undefined}>
-        {value || "Unknown"}
-      </strong>
-    </div>
   );
 }
 
@@ -558,9 +592,11 @@ function AccessList({
     <div className="access-list">
       <div className="access-list-header">
         <span>{label}</span>
+        <WorkbenchActionGate actionId="packages.access">
         <button type="button" className="secondary" onClick={onEdit}>
           Edit
         </button>
+        </WorkbenchActionGate>
       </div>
       {values?.length ? (
         <ul>
@@ -613,19 +649,6 @@ function formatDate(value?: string) {
   }).format(date);
 }
 
-function formatReportDate(value?: string) {
-  const date = parseDate(value);
-
-  if (!date) {
-    return undefined;
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeZone: "UTC",
-  }).format(date);
-}
-
 function parseDate(value?: string) {
   if (!value) {
     return undefined;
@@ -634,12 +657,4 @@ function parseDate(value?: string) {
   const date = new Date(value);
 
   return Number.isNaN(date.getTime()) ? undefined : date;
-}
-
-function formatReportKind(kind: AgentUsageSummary["sourceReport"]) {
-  if (kind === "agents") {
-    return "Agents";
-  }
-
-  return "Users & agents";
 }

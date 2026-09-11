@@ -2,11 +2,25 @@ export type BlockAuditAction = "block" | "unblock";
 
 export type AccessAuditAction = "update-availability" | "update-installation";
 
-export type AuditAction = BlockAuditAction | AccessAuditAction;
+export type ReassignAuditAction = "reassign";
+
+export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
+
+export type HuntingReadAction = "view-hunting" | "export-hunting";
+
+export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
+
+export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
+
+export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory";
+export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
+export type AdministrativeExportAction = "export-administrative-audit";
+
+export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction;
 
 export type AuditScope = "single" | "bulk";
 
-export type AuditStatus = "started" | "succeeded" | "failed" | "skipped";
+export type AuditStatus = "requested" | "started" | "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
 
 export type AuditActor = {
   username: string;
@@ -37,7 +51,7 @@ type AuditEventAction =
       targetBlockedState: boolean;
     }
   | {
-      action: AccessAuditAction;
+      action: AccessAuditAction | ReassignAuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction;
       targetBlockedState?: never;
     };
 
@@ -67,7 +81,7 @@ export type ListAuditEventsQuery = {
   agentId?: string;
   actorUsername?: string;
   scope?: AuditScope;
-  action?: AuditAction;
+  action?: LocalAuditAction;
   status?: AuditStatus;
   operationIdPrefix?: string;
   search?: string;

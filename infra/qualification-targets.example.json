@@ -1,0 +1,28 @@
+{
+  "contractVersion": 1,
+  "isApproval": false,
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "entraApplicationId": "00000000-0000-0000-0000-000000000000",
+  "canonicalOrigin": "https://approved-app-name.azurewebsites.net",
+  "expiresAt": "YYYY-MM-DDTHH:MM:SSZ",
+  "restorationOwner": "approved-restoration-owner@example.invalid",
+  "personas": [
+    {
+      "principalObjectId": "00000000-0000-0000-0000-000000000000",
+      "appRoles": ["AgentControl.Reader"],
+      "purpose": "read-only qualification"
+    }
+  ],
+  "nativeCanaryTargets": [
+    {
+      "capability": "copilot_studio_quarantine",
+      "resourceNativeId": "approved-native-resource-id",
+      "environmentId": "approved-environment-id",
+      "botId": "approved-bot-id",
+      "allowedActions": ["quarantine", "unquarantine"],
+      "requiredFinalState": "recorded-prestate"
+    }
+  ],
+  "providerSearchTargets": [],
+  "notes": "Example structure only. Values, personas, actions, expiry and restoration ownership require separate current approval."
+}

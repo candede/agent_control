@@ -5,3 +5,6 @@ frontend/dist/
 backend/data/
 .env
 .DS_Store
+.local/
+artifacts/
+backups/

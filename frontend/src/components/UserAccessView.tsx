@@ -1,24 +1,25 @@
-import { useDeferredValue, useMemo, useState } from "react";
-import type { CopilotPackage } from "../api/client";
-import {
-  buildUserAccessSummaries,
-  type UserAccessReports,
-  type UserAccessSummary,
-} from "../usageModels";
+import { useDeferredValue, useEffect, useEffectEvent, useState } from "react";
+import type { OfficialUsageUserSummary, OfficialUsageUserView } from "../api/client";
 
 type UserAccessViewProps = {
-  agents: CopilotPackage[];
-  inactiveDays: number;
-  reports: UserAccessReports;
+  data?: OfficialUsageUserView;
+  onPageChange: (offset: number) => void;
+  onQueryChange: (query: {
+    search?: string;
+    creatorType?: string;
+    activity?: ActivityFilter;
+    responsesOnly?: boolean;
+  }) => void;
 };
 
 type ActivityFilter = "all" | "recent" | "inactive" | "no-activity";
 type AccessRowFilter = "all" | "responses";
+const emptyUserSummaries: OfficialUsageUserSummary[] = [];
 
 export function UserAccessView({
-  agents,
-  inactiveDays,
-  reports,
+  data,
+  onPageChange,
+  onQueryChange,
 }: UserAccessViewProps) {
   const [query, setQuery] = useState("");
   const [creatorTypeFilter, setCreatorTypeFilter] = useState("all");
@@ -27,59 +28,20 @@ export function UserAccessView({
     useState<AccessRowFilter>("all");
   const [selectedUsername, setSelectedUsername] = useState<string>();
   const deferredQuery = useDeferredValue(query);
+  const notifyQueryChange = useEffectEvent(onQueryChange);
 
-  const summaries = useMemo(
-    () => buildUserAccessSummaries(reports, agents),
-    [agents, reports],
-  );
+  const summaries = data?.users.value ?? emptyUserSummaries;
+  const creatorTypeOptions = data?.filters.creatorTypes ?? [];
+  const filteredUsers = summaries;
 
-  const creatorTypeOptions = useMemo(() => {
-    const creatorTypes = new Set<string>();
-
-    for (const summary of summaries) {
-      for (const creatorType of summary.creatorTypes) {
-        creatorTypes.add(creatorType);
-      }
-    }
-
-    return [...creatorTypes].sort((first, second) =>
-      first.localeCompare(second),
-    );
-  }, [summaries]);
-
-  const filteredUsers = useMemo(() => {
-    const normalizedQuery = deferredQuery.trim().toLowerCase();
-
-    return summaries.filter((summary) => {
-      const filteredRows = getFilteredAccessRows(summary, accessRowFilter);
-      const matchesQuery =
-        !normalizedQuery || summary.searchableText.includes(normalizedQuery);
-      const matchesCreatorType =
-        creatorTypeFilter === "all" ||
-        summary.rows.some((row) => row.creatorType === creatorTypeFilter);
-      const matchesAccessRows =
-        accessRowFilter === "all" || filteredRows.length > 0;
-      const matchesActivity = matchesActivityFilter(
-        summary,
-        activityFilter,
-        inactiveDays,
-      );
-
-      return (
-        matchesQuery &&
-        matchesCreatorType &&
-        matchesAccessRows &&
-        matchesActivity
-      );
+  useEffect(() => {
+    notifyQueryChange({
+      ...(deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+      ...(creatorTypeFilter !== "all" ? { creatorType: creatorTypeFilter } : {}),
+      ...(activityFilter !== "all" ? { activity: activityFilter } : {}),
+      ...(accessRowFilter === "responses" ? { responsesOnly: true } : {}),
     });
-  }, [
-    accessRowFilter,
-    activityFilter,
-    creatorTypeFilter,
-    deferredQuery,
-    inactiveDays,
-    summaries,
-  ]);
+  }, [accessRowFilter, activityFilter, creatorTypeFilter, deferredQuery]);
 
   const selectedUser =
     filteredUsers.find((summary) => summary.username === selectedUsername) ??
@@ -87,14 +49,9 @@ export function UserAccessView({
   const selectedRows = selectedUser
     ? getFilteredAccessRows(selectedUser, accessRowFilter)
     : [];
-  const importedUserCount = reports.users?.rows.length ?? 0;
-  const bridgeRowCount = reports.userAgents?.rows.length ?? 0;
-  const reportOnlyRowCount = summaries.reduce(
-    (total, summary) =>
-      total +
-      summary.rows.filter((row) => row.packageStatus === "report-only").length,
-    0,
-  );
+  const importedUserCount = data?.counts.userRows ?? 0;
+  const bridgeRowCount = data?.counts.accessRows ?? 0;
+  const reportOnlyRowCount = data?.counts.reportOnlyRows ?? 0;
   const hasActiveUserFilters =
     query.trim().length > 0 ||
     creatorTypeFilter !== "all" ||
@@ -108,42 +65,46 @@ export function UserAccessView({
     setAccessRowFilter("all");
   }
 
-  if (!reports.users && !reports.userAgents) {
+  if (!data) return <div className="screen-state">Loading official user usage...</div>;
+
+  if (!data.users.count) {
     return (
-      <div className="empty-state user-report-empty-state">
-        <h2>No user usage reports imported</h2>
-        <p>
-          Import the <strong className="report-name">Agents</strong>,{" "}
-          <strong className="report-name">Users</strong>, and{" "}
-          <strong className="report-name">Users & agents</strong> CSV reports to
-          use User view.
-        </p>
-        <div
-          className="admin-download-guide"
-          aria-label="Required user usage reports"
-        >
-          <strong>Import Microsoft 365 Copilot usage CSVs</strong>
-          <ol>
-            <li>
-              Obtain the reports through your organization&apos;s approved
-              reporting and export workflow.
-            </li>
-            <li>
-              Provide the <strong className="report-name">Agents</strong>,{" "}
-              <strong className="report-name">Users</strong>, and{" "}
-              <strong className="report-name">Users & agents</strong> reports as
-              CSV, then import all three files here.
-            </li>
-          </ol>
+      <section className="user-access-view" aria-label="User agent access">
+        <UserUsageLineage data={data} />
+        <div className="empty-state user-report-empty-state">
+          <h2>No published user usage rows</h2>
+          <p>
+            Official usage is {formatAvailability(data.availability)}. Import
+            and activate a compatible three-file set to use User view.
+          </p>
+          <div
+            className="admin-download-guide"
+            aria-label="Required user usage reports"
+          >
+            <strong>Import Microsoft Copilot Agents usage CSVs</strong>
+            <ol>
+              <li>
+                Obtain the reports through your organization&apos;s approved
+                reporting and export workflow.
+              </li>
+              <li>
+                Provide the <strong className="report-name">Agents</strong>,{" "}
+                <strong className="report-name">Users</strong>, and{" "}
+                <strong className="report-name">Users & agents</strong> reports as
+                CSV, then import all three files here.
+              </li>
+            </ol>
+          </div>
         </div>
-      </div>
+      </section>
     );
   }
 
   return (
     <section className="user-access-view" aria-label="User agent access">
+      <UserUsageLineage data={data} />
       <div className="summary-grid user-summary-grid" aria-label="User summary">
-        <Metric label="Users" value={summaries.length} />
+        <Metric label="Users" value={data.users.count} />
         <Metric label="User rows" value={importedUserCount} />
         <Metric label="Access rows" value={bridgeRowCount} />
         <Metric label="Report-only rows" value={reportOnlyRowCount} />
@@ -241,6 +202,13 @@ export function UserAccessView({
           ) : null}
         </div>
       )}
+      {data.users.count > data.users.limit ? (
+        <div className="pagination-controls" aria-label="User usage pages">
+          <button type="button" className="secondary" disabled={data.users.offset === 0} onClick={() => onPageChange(Math.max(0, data.users.offset - data.users.limit))}>Previous</button>
+          <span>{data.users.offset + 1}-{Math.min(data.users.offset + data.users.value.length, data.users.count)} of {data.users.count}</span>
+          <button type="button" className="secondary" disabled={data.users.offset + data.users.limit >= data.users.count} onClick={() => onPageChange(data.users.offset + data.users.limit)}>Next</button>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -250,7 +218,7 @@ function UserSummaryTable({
   selectedUsername,
   onSelectUser,
 }: {
-  users: UserAccessSummary[];
+  users: OfficialUsageUserSummary[];
   selectedUsername?: string;
   onSelectUser: (username: string) => void;
 }) {
@@ -259,6 +227,7 @@ function UserSummaryTable({
       className="table-shell user-table-shell"
       role="region"
       aria-label="Users"
+      tabIndex={0}
     >
       <div className="selection-summary">
         <span>{users.length.toLocaleString()} users</span>
@@ -270,7 +239,7 @@ function UserSummaryTable({
             <th scope="col">Agents accessed</th>
             <th scope="col">Agents with responses</th>
             <th scope="col">Responses</th>
-            <th scope="col">Last activity</th>
+            <th scope="col">User last activity (Users report)</th>
             <th scope="col">Action</th>
           </tr>
         </thead>
@@ -294,7 +263,7 @@ function UserSummaryTable({
                       {user.responseProducingAgentCount.toLocaleString()}
                     </strong>
                     <small>
-                      reported {user.reportedAgentsUsed.toLocaleString()}
+                      reported {user.missingUserReport ? "Unknown" : user.reportedAgentsUsed.toLocaleString()}
                     </small>
                   </div>
                 </td>
@@ -304,11 +273,11 @@ function UserSummaryTable({
                       {user.bridgeResponsesSentToUsers.toLocaleString()}
                     </strong>
                     <small>
-                      reported {user.reportedResponsesReceived.toLocaleString()}
+                      reported {user.missingUserReport ? "Unknown" : user.reportedResponsesReceived.toLocaleString()}
                     </small>
                   </div>
                 </td>
-                <td>{formatReportDate(user.latestActivityDateUtc)}</td>
+                <td>{formatReportDate(user.userLastActivityDateUtc)}</td>
                 <td>
                   <button
                     type="button"
@@ -334,7 +303,7 @@ function UserAgentDetail({
 }: {
   accessRowFilter: AccessRowFilter;
   rows: ReturnType<typeof getFilteredAccessRows>;
-  user: UserAccessSummary;
+  user: OfficialUsageUserSummary;
 }) {
   const emptyTitle =
     accessRowFilter === "responses"
@@ -343,7 +312,7 @@ function UserAgentDetail({
   const emptyMessage =
     accessRowFilter === "responses"
       ? "Switch Access rows back to all accessed agents to see 0-response history."
-      : "Import the Users & agents CSV report to show this user's agent access history.";
+      : "Import and activate Agents, Users & agents, and Users for one compatible period to show this user's agent access history.";
 
   return (
     <section
@@ -355,6 +324,7 @@ function UserAgentDetail({
           <p className="eyebrow">Selected user</p>
           <h2>{user.displayName}</h2>
           <p>{user.username}</p>
+          <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}</p>
         </div>
         <div className="user-detail-stats" aria-label="Selected user summary">
           <SummaryStat label="Access rows" value={rows.length} />
@@ -366,8 +336,8 @@ function UserAgentDetail({
             )}
           />
           <SummaryStat
-            label="Last activity"
-            value={formatReportDate(user.latestActivityDateUtc)}
+            label="User last activity"
+            value={formatReportDate(user.userLastActivityDateUtc)}
           />
         </div>
       </div>
@@ -382,6 +352,7 @@ function UserAgentDetail({
           className="table-shell nested-table-shell"
           role="region"
           aria-label="User accessed agents"
+          tabIndex={0}
         >
           <div className="selection-summary">
             <span>
@@ -395,10 +366,8 @@ function UserAgentDetail({
                 <th scope="col">Agent</th>
                 <th scope="col">Creator type</th>
                 <th scope="col">Usage</th>
-                <th scope="col">Publisher</th>
-                <th scope="col">Built with</th>
-                <th scope="col">Available to</th>
-                <th scope="col">Package status</th>
+                <th scope="col">Identity</th>
+                <th scope="col">Usage authority</th>
               </tr>
             </thead>
             <tbody>
@@ -413,11 +382,11 @@ function UserAgentDetail({
                       {row.agentId}
                     </div>
                   </td>
-                  <td>{row.creatorType || "Unknown"}</td>
+                  <td>{row.creatorType || "Unknown"}<small>Users &amp; agents report</small></td>
                   <td>
                     <dl className="usage-cell">
                       <div>
-                        <dt>Last</dt>
+                        <dt>Agent last used by anyone</dt>
                         <dd>{formatReportDate(row.lastActivityDateUtc)}</dd>
                       </div>
                       <div>
@@ -426,22 +395,29 @@ function UserAgentDetail({
                       </div>
                     </dl>
                   </td>
-                  <td>{row.publisher || "Report only"}</td>
-                  <td>{row.builtWith || "Unknown"}</td>
-                  <td>{formatDetailLabel(row.availableTo)}</td>
                   <td>
-                    <span
-                      className={`status ${statusClassName(row.packageStatus)}`}
-                    >
-                      {formatPackageStatus(row.packageStatus)}
-                    </span>
+                    <span className="status unknown">Report only / unresolved ID</span>
                   </td>
+                  <td>Official Microsoft 365 export</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
+    </section>
+  );
+}
+
+function UserUsageLineage({ data }: { data: OfficialUsageUserView }) {
+  return (
+    <section className="official-usage-lineage" aria-label="Official user usage lineage">
+      <div><span>Authority</span><strong>{data.authority}</strong></div>
+      <div><span>State</span><strong>{formatAvailability(data.availability)}</strong></div>
+      <div><span>Source period</span><strong>{data.activeSet ? `${data.activeSet.reportingPeriod.startDate} to ${data.activeSet.reportingPeriod.endDate}` : "Unavailable"}</strong></div>
+      <div><span>Age / staleness</span><strong>{data.periodAgeDays === null ? "Unknown" : `Period ${data.periodAgeDays} day(s); import ${data.acceptedAgeDays} day(s); threshold ${data.staleAfterDays}`}</strong></div>
+      <div><span>Versions</span><strong>{data.lineages.map(lineage => `${kindLabel(lineage.kind)} ${lineage.fileHash.slice(0, 10)} / ${lineage.schemaVersion} / ${lineage.sourceFreshness} / ${lineage.reportingPeriod.provenance}${lineage.warnings.length ? ` / ${lineage.warnings.length} warning(s)` : ""}`).join("; ") || "None"}</strong></div>
+      <div><span>Identity</span><strong>Dataset-scoped; exact IDs unresolved</strong></div>
     </section>
   );
 }
@@ -473,7 +449,7 @@ function SummaryStat({
 }
 
 function getFilteredAccessRows(
-  user: UserAccessSummary,
+  user: OfficialUsageUserSummary,
   accessRowFilter: AccessRowFilter,
 ) {
   if (accessRowFilter === "responses") {
@@ -481,40 +457,6 @@ function getFilteredAccessRows(
   }
 
   return user.rows;
-}
-
-function matchesActivityFilter(
-  user: UserAccessSummary,
-  filter: ActivityFilter,
-  inactiveDays: number,
-) {
-  if (filter === "all") {
-    return true;
-  }
-
-  if (!user.latestActivityDateUtc) {
-    return filter === "no-activity";
-  }
-
-  const inactive = isInactiveDate(user.latestActivityDateUtc, inactiveDays);
-
-  return filter === "inactive" ? inactive : !inactive;
-}
-
-function isInactiveDate(value: string, inactiveDays: number) {
-  const today = startOfUtcDay(new Date());
-  const activityDate = startOfUtcDay(new Date(value));
-  const elapsedDays = Math.floor(
-    (today.getTime() - activityDate.getTime()) / 86_400_000,
-  );
-
-  return elapsedDays > inactiveDays;
-}
-
-function startOfUtcDay(date: Date) {
-  return new Date(
-    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-  );
 }
 
 function formatReportDate(value?: string) {
@@ -528,39 +470,10 @@ function formatReportDate(value?: string) {
   }).format(new Date(value));
 }
 
-function formatDetailLabel(value?: string) {
-  if (!value) {
-    return "Unknown";
-  }
-
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .trim();
+function formatAvailability(value: OfficialUsageUserView["availability"]) {
+  return value.split("_").map(part => part[0].toUpperCase() + part.slice(1)).join(" ");
 }
 
-function statusClassName(status: UserAgentAccessRowStatus) {
-  if (status === "blocked") {
-    return "blocked";
-  }
-
-  if (status === "report-only") {
-    return "report-only";
-  }
-
-  return "allowed";
+function kindLabel(value: OfficialUsageUserView["lineages"][number]["kind"]) {
+  return value === "agents" ? "Agents" : value === "userAgents" ? "Users & agents" : "Users";
 }
-
-function formatPackageStatus(status: UserAgentAccessRowStatus) {
-  if (status === "blocked") {
-    return "Blocked";
-  }
-
-  if (status === "report-only") {
-    return "Report only";
-  }
-
-  return "Allowed";
-}
-
-type UserAgentAccessRowStatus = "allowed" | "blocked" | "report-only";

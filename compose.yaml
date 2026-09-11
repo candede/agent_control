@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: agentcontrol
+      POSTGRES_USER: agentcontrol_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-admin
+    secrets:
+      - postgres-admin
+    volumes:
+      - data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U agentcontrol_admin -d agentcontrol"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  app:
+    image: ${APP_IMAGE:-agent-control-app:local}
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      FRONTEND_ORIGIN: http://localhost:${APP_PORT:-3001}
+      REDIRECT_URI: http://localhost:${APP_PORT:-3001}/api/auth/callback
+      TENANT_ID: ${TENANT_ID:-}
+      CLIENT_ID: ${CLIENT_ID:-}
+      CLIENT_SECRET_FILE: /run/secrets/client-secret
+      SESSION_SECRET_FILE: /run/secrets/session
+      OFFICIAL_USAGE_STALE_AFTER_DAYS: ${OFFICIAL_USAGE_STALE_AFTER_DAYS:-35}
+      PGHOST: postgres
+      PGDATABASE: agentcontrol
+      PGUSER: agentcontrol_app
+      PGPASSWORD_FILE: /run/secrets/postgres-app
+      PGSSLMODE: disable
+      MAINTENANCE_FILE: /run/control/maintenance
+    secrets:
+      - postgres-app
+      - session
+      - client-secret
+    volumes:
+      - ${LOCAL_STATE_DIR}/control:/run/control:ro
+    ports:
+      - "127.0.0.1:${APP_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://localhost:3001/api/ready').then(response=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 6s
+      retries: 30
+    stop_grace_period: 130s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  data:
+secrets:
+  postgres-admin:
+    file: ${LOCAL_STATE_DIR}/secrets/postgres-admin
+  postgres-app:
+    file: ${LOCAL_STATE_DIR}/secrets/postgres-app
+  session:
+    file: ${LOCAL_STATE_DIR}/secrets/session
+  client-secret:
+    file: ${LOCAL_STATE_DIR}/secrets/client-secret

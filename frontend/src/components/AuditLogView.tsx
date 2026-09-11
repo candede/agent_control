@@ -15,14 +15,18 @@ import {
 } from "lucide-react";
 import {
   getAuditEvents,
-  type AuditAction,
+  downloadAdministrativeAuditCsv,
   type AuditEvent,
   type AuditStatus,
   type CopilotPackage,
+  type LocalAuditAction,
 } from "../api/client";
-import { downloadCsv } from "../agentExport";
+import { downloadBlob } from "../agentExport";
+import { WorkbenchActionGate } from "../workbenchActionContext";
+import { auditRouteSearch, parseAuditRoute, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
+import { PurviewAuditView } from "./PurviewAuditView";
 
-type AuditFilter = "all" | AuditAction;
+type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
 
 type AuditLogViewProps = {
@@ -32,17 +36,101 @@ type AuditLogViewProps = {
 const auditPageSize = 100;
 
 export function AuditLogView({ agents }: AuditLogViewProps) {
+  const [route, setRoute] = useState(() => parseAuditRoute(window.location.search));
+
+  function commitRoute(next: AuditRouteState, push = false) {
+    setRoute(next);
+    const url = workbenchUrl("audit", auditRouteSearch(next));
+    if (`${window.location.pathname}${window.location.search}` !== url) {
+      window.history[push ? "pushState" : "replaceState"]({ view: "audit" }, "", url);
+    }
+  }
+
+  useEffect(() => {
+    const restore = () => setRoute(parseAuditRoute(window.location.search));
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
+  return (
+    <section className="audit-source-view" aria-label="Audit evidence">
+      <div className="audit-source-tabs" role="tablist" aria-label="Audit source">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={route.source === "local"}
+          className={route.source === "local" ? "active" : undefined}
+          onClick={() => commitRoute({ ...route, source: "local", jobId: undefined }, true)}
+        >
+          Local control audit
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={route.source === "purview"}
+          className={route.source === "purview" ? "active" : undefined}
+          onClick={() => commitRoute({ ...route, source: "purview" }, true)}
+        >
+          Purview Audit Search
+        </button>
+      </div>
+      {route.source === "local" ? (
+        <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} />
+      ) : <PurviewAuditView
+        initialJobId={route.jobId}
+        onSelectedJobChange={jobId => commitRoute({ ...route, source: "purview", jobId }, true)}
+      />}
+    </section>
+  );
+}
+
+function LocalAuditLogView({
+  agents,
+  onRouteChange,
+  route,
+}: AuditLogViewProps & {
+  onRouteChange: (route: AuditRouteState, push?: boolean) => void;
+  route: AuditRouteState;
+}) {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [totalCount, setTotalCount] = useState(0);
-  const [pageIndex, setPageIndex] = useState(0);
+  const [pageIndex, setPageIndex] = useState(route.page);
   const [refreshToken, setRefreshToken] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
-  const [query, setQuery] = useState("");
-  const [actionFilter, setActionFilter] = useState<AuditFilter>("all");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [query, setQuery] = useState(route.search);
+  const [actionFilter, setActionFilter] = useState<AuditFilter>(route.action as AuditFilter);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(route.status as StatusFilter);
   const [detailEvent, setDetailEvent] = useState<AuditEvent>();
+  const [exporting, setExporting] = useState(false);
+  const exportRequest = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => exportRequest.current?.abort(), []);
   const deferredQuery = useDeferredValue(query);
+  const syncClampedPage = useEffectEvent((page: number) => {
+    onRouteChange({ ...route, page });
+  });
+
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (!active) return;
+      setQuery(route.search);
+      setActionFilter(route.action as AuditFilter);
+      setStatusFilter(route.status as StatusFilter);
+      setPageIndex(route.page);
+    });
+    return () => { active = false; };
+  }, [route.action, route.page, route.search, route.status]);
+
+  function updateRoute(next: Partial<Pick<AuditRouteState, "search" | "action" | "status" | "page">>) {
+    onRouteChange({
+      ...route,
+      search: next.search ?? query,
+      action: next.action ?? actionFilter,
+      status: next.status ?? statusFilter,
+      page: next.page ?? pageIndex,
+    });
+  }
 
   const agentNamesById = useMemo(
     () => new Map(agents.map((agent) => [agent.id, agent.displayName])),
@@ -77,6 +165,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
           setEvents([]);
           setTotalCount(response.count);
           setPageIndex(lastPageIndex);
+          syncClampedPage(lastPageIndex);
           return;
         }
 
@@ -122,18 +211,27 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
     setActionFilter("all");
     setStatusFilter("all");
     setPageIndex(0);
+    onRouteChange({ ...route, search: "", action: "all", status: "all", page: 0 });
   }
 
   function handleRefreshAuditLog() {
     setRefreshToken((current) => current + 1);
   }
 
-  function handleExportAuditCsv() {
-    if (events.length === 0) {
-      return;
+  async function handleExportAuditCsv() {
+    if (!events.length || exportRequest.current) return;
+    const controller = new AbortController();
+    exportRequest.current = controller;
+    setExporting(true);
+    try {
+      const blob = await downloadAdministrativeAuditCsv(events.map(event => event.id), controller.signal);
+      if (!controller.signal.aborted) downloadBlob("administrative-audit.csv", blob);
+    } catch (requestError) {
+      if (!controller.signal.aborted) setError(errorMessage(requestError));
+    } finally {
+      if (exportRequest.current === controller) exportRequest.current = undefined;
+      if (!controller.signal.aborted) setExporting(false);
     }
-
-    downloadCsv(getAuditExportFilename(), toAuditCsv(events, agentNamesById));
   }
 
   return (
@@ -159,6 +257,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             onChange={(event) => {
               setQuery(event.target.value);
               setPageIndex(0);
+              updateRoute({ search: event.target.value, page: 0 });
             }}
             placeholder="Agent, user, group"
           />
@@ -173,6 +272,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             onChange={(event) => {
               setActionFilter(event.target.value as AuditFilter);
               setPageIndex(0);
+              updateRoute({ action: event.target.value, page: 0 });
             }}
           >
             <option value="all">All actions</option>
@@ -180,6 +280,12 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             <option value="unblock">Unblock</option>
             <option value="update-availability">Update availability</option>
             <option value="update-installation">Update installation</option>
+            <option value="view-audit-search">View provider audit</option>
+            <option value="export-audit-search">Export provider audit</option>
+            <option value="view-hunting">View Defender hunting</option>
+            <option value="export-hunting">Export Defender hunting</option>
+            <option value="export-package-inventory">Export package inventory</option>
+            <option value="export-power-platform-inventory">Export Power Platform inventory</option>
           </select>
         </label>
         <label>
@@ -192,13 +298,17 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             onChange={(event) => {
               setStatusFilter(event.target.value as StatusFilter);
               setPageIndex(0);
+              updateRoute({ status: event.target.value, page: 0 });
             }}
           >
             <option value="all">All results</option>
+            <option value="requested">Requested</option>
+            <option value="started">Started</option>
             <option value="succeeded">Succeeded</option>
             <option value="failed">Failed</option>
             <option value="skipped">Skipped</option>
-            <option value="started">Started</option>
+            <option value="inconclusive">Inconclusive</option>
+            <option value="cancelled">Cancelled</option>
           </select>
         </label>
         <div className="filter-actions" aria-label="Audit actions">
@@ -220,16 +330,16 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
           >
             <RefreshCw aria-hidden="true" />
           </button>
-          <button
+          <WorkbenchActionGate actionId="audit.export" compact><button
             type="button"
             className="secondary icon-button control-icon-button"
             aria-label="Export current audit page CSV"
             title="Export current audit page CSV"
-            disabled={loading || events.length === 0}
-            onClick={handleExportAuditCsv}
+            disabled={loading || exporting || events.length === 0}
+            onClick={() => void handleExportAuditCsv()}
           >
             <Download aria-hidden="true" />
-          </button>
+          </button></WorkbenchActionGate>
         </div>
       </section>
 
@@ -249,13 +359,17 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
             pageEnd={pageEnd}
             totalCount={totalCount}
             loading={loading}
-            onPageChange={setPageIndex}
-            onPrevious={() =>
-              setPageIndex((current) => Math.max(current - 1, 0))
-            }
-            onNext={() =>
-              setPageIndex((current) => Math.min(current + 1, totalPages - 1))
-            }
+            onPageChange={next => { setPageIndex(next); updateRoute({ page: next }); }}
+            onPrevious={() => {
+              const next = Math.max(pageIndex - 1, 0);
+              setPageIndex(next);
+              updateRoute({ page: next });
+            }}
+            onNext={() => {
+              const next = Math.min(pageIndex + 1, totalPages - 1);
+              setPageIndex(next);
+              updateRoute({ page: next });
+            }}
           />
           <AuditTable
             events={events}
@@ -550,50 +664,11 @@ function getAuditAgentDisplayName(
   return event.agentDisplayName || agentNamesById.get(event.agentId);
 }
 
-function toAuditCsv(events: AuditEvent[], agentNamesById: Map<string, string>) {
-  const headers = [
-    "Time",
-    "Agent name",
-    "Agent ID",
-    "Action",
-    "Result",
-    "Message",
-    "Error code",
-    "Actor name",
-    "Actor username",
-    "Action group",
-    "Group ref",
-    "Operation ID",
-  ];
-  const rows = events.map((event) => [
-    formatDateTime(event.completedAt ?? event.startedAt),
-    getAuditAgentDisplayName(event, agentNamesById) ?? "",
-    event.agentId,
-    formatAuditAction(event.action),
-    formatStatus(event.status),
-    event.message ?? "",
-    event.errorCode ?? "",
-    event.actor.displayName,
-    event.actor.username,
-    formatActionGroup(event),
-    shortOperationId(event.operationId),
-    event.operationId,
-  ]);
-
-  return [headers, ...rows]
-    .map((row) => row.map((value) => csvCell(value)).join(","))
-    .join("\r\n");
-}
-
-function csvCell(value: string) {
-  return `"${value.replaceAll('"', '""')}"`;
-}
-
 function formatActionGroup(event: AuditEvent) {
   return event.scope === "bulk" ? "Bulk run" : "Single action";
 }
 
-function formatAuditAction(action: AuditAction) {
+function formatAuditAction(action: LocalAuditAction) {
   switch (action) {
     case "block":
       return "Block";
@@ -603,17 +678,37 @@ function formatAuditAction(action: AuditAction) {
       return "Update availability";
     case "update-installation":
       return "Update installation";
+    case "reassign":
+      return "Reassign owner";
+    case "view-audit-search":
+      return "View provider audit";
+    case "export-audit-search":
+      return "Export provider audit";
+    case "view-hunting":
+      return "View Defender hunting";
+    case "export-hunting":
+      return "Export Defender hunting";
+    case "export-package-inventory":
+      return "Export package inventory";
+    case "export-power-platform-inventory":
+      return "Export Power Platform inventory";
+    case "approve-hunting":
+      return "Approve Defender hunting qualification";
+    case "qualify-hunting":
+      return "Run Defender hunting qualification";
+    case "submit-hunting":
+      return "Submit Defender hunt";
+    case "query-hunting":
+      return "Query Defender hunting";
+    case "cancel-hunting":
+      return "Cancel Defender hunt";
+    case "delete-hunting":
+      return "Delete Defender hunt";
   }
 }
 
 function shortOperationId(operationId: string) {
   return operationId.split("-")[0] || operationId.slice(0, 8);
-}
-
-function getAuditExportFilename() {
-  return `copilot-audit-log-${new Date()
-    .toISOString()
-    .replaceAll(/[:.]/g, "-")}.csv`;
 }
 
 function formatDateTime(value: string) {

@@ -1,4 +1,8 @@
 import { AppError } from "../errors.js";
+import { allowlistedPackage } from "./packageObservation.js";
+import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
+import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
   BulkActionResult,
@@ -46,7 +50,7 @@ const specificAccessScopeIndicators = new Set([
   "installedforsome",
 ]);
 const defaultRetryPolicy = {
-  maxAttempts: 5,
+  maxAttempts: 3,
   baseDelayMs: 2_000,
   maxDelayMs: 30_000,
   delay,
@@ -84,6 +88,23 @@ type BulkGetPackageDetailsOptions = {
   detailConcurrency?: number;
 };
 
+export type PackageReadOptions = {
+  signal?: AbortSignal;
+  correlationId?: string;
+  onProgress?: (progress: { pages: number; observedCount: number }) => void | Promise<void>;
+};
+
+export type PackageMutationOptions = {
+  signal?: AbortSignal;
+  correlationId: string;
+};
+
+export type PackageReadbackOptions = PackageReadOptions & {
+  maxAttempts?: number;
+  delayMs?: number;
+  delay?: (delayMs: number) => Promise<unknown>;
+};
+
 export class GraphPackagesClient {
   private fetcher: FetchLike;
   private retryPolicy: RetryPolicy;
@@ -96,41 +117,50 @@ export class GraphPackagesClient {
     this.retryPolicy = { ...defaultRetryPolicy, ...retryPolicy };
   }
 
-  async listCopilotAgents(accessToken: string) {
+  async listCopilotAgents(accessToken: string, options: PackageReadOptions = {}) {
     const packages: CopilotPackage[] = [];
     let nextUrl: string | undefined = buildCopilotAgentsListUrl();
+    const visited = new Set<string>();
 
     while (nextUrl) {
+      if (visited.has(nextUrl) || visited.size >= 100 || packages.length >= 5000) {
+        throw new AppError(502, "provider_result_limit", "Package inventory exceeded the bounded page/result limit.");
+      }
+      visited.add(nextUrl);
       const page: GraphCollectionResponse<CopilotPackage> =
-        await this.requestWithRetry(nextUrl, accessToken, {});
-      packages.push(...page.value);
+        await this.requestReadWithRetry(nextUrl, accessToken, options);
+      if (!Array.isArray(page.value) || page.value.length + packages.length > 5000) throw new AppError(502, "provider_schema", "Package collection is invalid or oversized.");
+      packages.push(...page.value.map(allowlistedPackage));
+      await options.onProgress?.({ pages: visited.size, observedCount: packages.length });
       nextUrl = page["@odata.nextLink"];
     }
 
     return packages;
   }
 
-  async getPackageDetails(accessToken: string, id: string) {
-    return this.requestWithRetry<CopilotPackageDetail>(
+  async getPackageDetails(accessToken: string, id: string, options: PackageReadOptions = {}) {
+    return allowlistedPackage(await this.requestReadWithRetry<CopilotPackageDetail>(
       `${graphV1}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
       accessToken,
-      {},
-    );
+      options,
+    ));
   }
 
-  async blockPackage(accessToken: string, id: string) {
-    await this.requestWithRetry<void>(
+  async blockPackage(accessToken: string, id: string, options: PackageMutationOptions = { correlationId: randomUUID() }) {
+    await this.requestMutationOnce<void>(
       `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}/block`,
       accessToken,
       { method: "POST" },
+      options,
     );
   }
 
-  async unblockPackage(accessToken: string, id: string) {
-    await this.requestWithRetry<void>(
+  async unblockPackage(accessToken: string, id: string, options: PackageMutationOptions = { correlationId: randomUUID() }) {
+    await this.requestMutationOnce<void>(
       `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}/unblock`,
       accessToken,
       { method: "POST" },
+      options,
     );
   }
 
@@ -138,8 +168,9 @@ export class GraphPackagesClient {
     accessToken: string,
     id: string,
     payload: Record<string, PackageAccessEntity[]>,
+    options: PackageMutationOptions = { correlationId: randomUUID() },
   ) {
-    await this.requestWithRetry<void>(
+    await this.requestMutationOnce<void>(
       `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
       accessToken,
       {
@@ -147,6 +178,20 @@ export class GraphPackagesClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       },
+      options,
+    );
+  }
+
+  async reassignPackage(accessToken: string, id: string, userId: string, options: PackageMutationOptions = { correlationId: randomUUID() }) {
+    await this.requestMutationOnce<void>(
+      `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}/reassign`,
+      accessToken,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId }),
+      },
+      options,
     );
   }
 
@@ -154,12 +199,25 @@ export class GraphPackagesClient {
     url: string,
     accessToken: string,
     init: RequestInit = {},
+    options: PackageReadOptions | PackageMutationOptions = {},
   ): Promise<T> {
+    const target = new URL(url);
+    if (target.origin !== "https://graph.microsoft.com" || target.username || target.password || !/^\/(v1\.0|beta)\/copilot\/admin\/catalog\/packages(?:\/|$)/.test(target.pathname)) {
+      throw new AppError(502, "invalid_provider_link", "Provider pagination left the documented package endpoint.");
+    }
+    options.signal?.throwIfAborted();
+    const correlationId = options.correlationId ?? randomUUID();
+    const timeoutSignal = AbortSignal.timeout(10_000);
+    const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
     const response = await this.fetcher(url, {
       ...init,
+      signal,
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
+        "client-request-id": correlationId,
+        "return-client-request-id": "true",
         ...init.headers,
       },
     });
@@ -172,13 +230,13 @@ export class GraphPackagesClient {
       return undefined as T;
     }
 
-    return (await response.json()) as T;
+    return boundedProviderJson<T>(response);
   }
 
-  private async requestWithRetry<T>(
+  private async requestReadWithRetry<T>(
     url: string,
     accessToken: string,
-    init: RequestInit,
+    options: PackageReadOptions,
   ): Promise<T> {
     for (
       let attempt = 1;
@@ -186,7 +244,7 @@ export class GraphPackagesClient {
       attempt += 1
     ) {
       try {
-        return await this.request<T>(url, accessToken, init);
+        return await this.request<T>(url, accessToken, {}, options);
       } catch (error) {
         if (
           !(error instanceof AppError) ||
@@ -196,9 +254,7 @@ export class GraphPackagesClient {
           throw error;
         }
 
-        await this.retryPolicy.delay(
-          getRetryDelayMs(error, attempt, this.retryPolicy),
-        );
+        await waitForReadRetry(this.retryPolicy.delay, getRetryDelayMs(error, attempt, this.retryPolicy), options.signal);
       }
     }
 
@@ -208,6 +264,10 @@ export class GraphPackagesClient {
       "Retry attempts were exhausted.",
     );
   }
+
+  private requestMutationOnce<T>(url: string, accessToken: string, init: RequestInit, options: PackageMutationOptions) {
+    return this.request<T>(url, accessToken, init, options);
+  }
 }
 
 export async function updatePackageAccess(
@@ -216,6 +276,8 @@ export async function updatePackageAccess(
   id: string,
   update: PackageAccessUpdate,
   currentDetails?: CopilotPackageDetail,
+  beforeWrite?: () => Promise<string | void>,
+  mutationOptions?: PackageMutationOptions,
 ): Promise<PackageAccessUpdateResult> {
   const property = accessCollectionProperty(update.target);
   const requested = deduplicateAccessEntities(update.principals);
@@ -293,7 +355,8 @@ export async function updatePackageAccess(
     );
   }
 
-  await client.patchPackageAccess(accessToken, id, {
+  const dispatchToken = await beforeWrite?.() ?? accessToken;
+  const payload = {
     allowedUsersAndGroups:
       update.target === "availability"
         ? resulting
@@ -302,7 +365,9 @@ export async function updatePackageAccess(
       update.target === "installation"
         ? resulting
         : deduplicateAccessEntities(details.acquireUsersAndGroups ?? []),
-  });
+  };
+  if (mutationOptions) await client.patchPackageAccess(dispatchToken, id, payload, mutationOptions);
+  else await client.patchPackageAccess(dispatchToken, id, payload);
 
   return {
     changed: true,
@@ -310,6 +375,28 @@ export async function updatePackageAccess(
     resultingCount: resulting.length,
     principals: resulting,
   };
+}
+
+export async function verifyPackageMutationConverged(
+  client: Pick<GraphPackagesClient, "getPackageDetails">,
+  accessToken: string,
+  id: string,
+  action: "block" | "unblock" | "update-availability" | "update-installation",
+  expectedState: PackageMutationState,
+  options: PackageReadbackOptions = {},
+) {
+  const maxAttempts = Math.min(Math.max(Math.trunc(options.maxAttempts ?? 4), 1), 20);
+  const delayMs = Math.min(Math.max(Math.trunc(options.delayMs ?? 500), 0), 5_000);
+  const wait = options.delay ?? delay;
+  let lastState: PackageMutationState | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const details = await client.getPackageDetails(accessToken, id, options);
+    if (details.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
+    lastState = capturePackageMutationState(details, action);
+    if (packageMutationStatesEqual(lastState, expectedState)) return { details, state: lastState, readbackCount: attempt };
+    if (attempt < maxAttempts && delayMs > 0) await waitForReadRetry(wait, delayMs, options.signal);
+  }
+  throw new AppError(409, "verification_inconclusive", "Microsoft Graph accepted the request but the expected package state did not converge within the bounded readback window.", { expectedState, lastState, readbackCount: maxAttempts });
 }
 
 export function verifyPackageAccessApplied(
@@ -784,8 +871,8 @@ export async function bulkGetPackageDetails(
 }
 
 export async function graphError(response: Response) {
-  const body = await response.text().catch(() => "");
-  let details: unknown = body || undefined;
+  const body = await boundedProviderText(response, 65_536).catch(() => "");
+  let details: unknown;
   let message = `Microsoft Graph request failed with status ${response.status}.`;
   let code = "graph_error";
 
@@ -798,15 +885,19 @@ export async function graphError(response: Response) {
         message?: string;
         StatusCode?: number | string;
       };
-      message =
+      const providerMessage =
         graphDetails.error?.message ??
         graphDetails.Message ??
         graphDetails.message ??
         message;
-      code =
+      const providerCode =
         graphDetails.error?.code ?? graphDetails.StatusCode?.toString() ?? code;
+      if (typeof providerMessage === "string") message = providerMessage.slice(0, 1024);
+      if (typeof providerCode === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(providerCode)) code = providerCode;
+      details = { error: { code, message } };
     } catch {
-      message = body;
+      message = body.slice(0, 1024);
+      details = message;
     }
   }
 
@@ -870,6 +961,25 @@ function retryAfterMs(value: string | null) {
   }
 
   return undefined;
+}
+
+async function waitForReadRetry(wait: (delayMs: number) => Promise<unknown>, delayMs: number, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  if (!signal) {
+    await wait(delayMs);
+    return;
+  }
+  let removeAbort = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbort = () => signal.removeEventListener("abort", onAbort);
+  });
+  try {
+    await Promise.race([wait(delayMs), aborted]);
+  } finally {
+    removeAbort();
+  }
 }
 
 async function mapWithConcurrency<T, U>(

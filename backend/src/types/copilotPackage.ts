@@ -66,6 +66,13 @@ export type CopilotPackage = {
   manifestId?: string;
   appId?: string;
   assetId?: string;
+  sourceSystem: "graph_packages";
+  authoringTool: string | null;
+  creatorType: "unknown";
+  agentKind: "copilot_package";
+  lifecycle: "unknown";
+  identityConfidence: "exact_native";
+  provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: "ga" | "preview" }>;
 };
 
 export type CopilotPackageDetail = CopilotPackage & {

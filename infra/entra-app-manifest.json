@@ -1,0 +1,48 @@
+{
+  "appRoles": [
+    {
+      "allowedMemberTypes": [
+        "User"
+      ],
+      "description": "Read aggregate inventory and reporting data without user-level or exact-target details.",
+      "displayName": "Agent Control Reader",
+      "id": "4fe41fd5-e548-4d53-b687-c7a33ae80ce3",
+      "isEnabled": true,
+      "origin": "Application",
+      "value": "AgentControl.Reader"
+    },
+    {
+      "allowedMemberTypes": [
+        "User"
+      ],
+      "description": "Execute approved package operations against exact user and group targets.",
+      "displayName": "Agent Control Operator",
+      "id": "42af5a7b-ea7c-451e-a9f6-cb4fc75a7e63",
+      "isEnabled": true,
+      "origin": "Application",
+      "value": "AgentControl.Operator"
+    },
+    {
+      "allowedMemberTypes": [
+        "User"
+      ],
+      "description": "Read user-identifying reports, audit records, and security investigation data.",
+      "displayName": "Agent Control Security Reader",
+      "id": "7b7b910c-50e1-427d-b2a0-18091055c68b",
+      "isEnabled": true,
+      "origin": "Application",
+      "value": "AgentControl.SecurityReader"
+    },
+    {
+      "allowedMemberTypes": [
+        "User"
+      ],
+      "description": "Configure capability registrations, imports, and administrative metadata.",
+      "displayName": "Agent Control Administrator",
+      "id": "5f3c0ea2-2d98-44a3-bca1-4ae515556b34",
+      "isEnabled": true,
+      "origin": "Application",
+      "value": "AgentControl.Administrator"
+    }
+  ]
+}

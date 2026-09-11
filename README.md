@@ -1,285 +1,217 @@
 # Agent Control
 
-Agent Control is a local Vite + Express app for Microsoft 365 admins who need to review Copilot agents, block or unblock them, and manage who can access or acquire them through Microsoft Graph Package Management APIs.
+Agent Control is a Microsoft 365 package administration POC using Express, React, Microsoft Graph and the Power Platform Resource Query API. One Node process serves the API and built UI; PostgreSQL owns sessions, on-demand jobs, private inventory snapshots, minimized Purview audit-search results, official Microsoft 365 usage reports and append-only administrative audit.
 
-The browser talks only to the Express backend. Express handles Microsoft Entra ID sign-in, keeps the session in an httpOnly cookie, and calls Microsoft Graph on behalf of the signed-in work or school user.
+The binding [13-phase plan](plans/admin-poc-production/README.md) distinguishes delivered work from planned integrations. Phases 01-03 provide the local runtime, persistence, identity/capability contracts, Permissions and shared gates. Phase 04 adds explicit delegated Power Platform inventory refreshes, private normalized snapshots, exact typed identity association and the Inventory Explorer. Phase 05 adds saved package observations, explicit refresh jobs, confirmed/fenced block mutations, provider readback, read-only reconciliation and a role-separated durable canary restoration command. Phase 06 adds backend-owned ingestion of the three official Microsoft 365 admin-center usage exports. Phase 07 adds bounded, on-demand Microsoft Purview Audit Search with private minimized results and a separate local/Purview audit view. Phase 08 adds bounded Defender hunting. Phase 09 adds direct Copilot Studio quarantine status plus exact, confirmed, durable and separately qualified quarantine/restoration controls in Inventory Explorer. Phase 10 unifies these contracts under canonical `/agents`, `/power-platform`, `/users`, `/official-usage`, `/audit`, `/security`, `/permissions` and `/jobs` routes served by the same Express artifact. No live package or quarantine canary, quarantine status read, Purview lifecycle or Defender query was authorized in this unconfigured local environment, so those provider operations remain unavailable pending their separate evidence. Package access and reassignment also remain unavailable under their current lost-update/readback contracts. No transcripts, continuous collection or raw archives are implemented.
 
-## Production Admin POC Roadmap
+## Unified Workbench
 
-The current application implements Microsoft Graph package inventory and controls, browser-local Microsoft 365 usage CSV enrichment, and a local audit log. The integrations below are **planned, not yet implemented on this branch**. The ordered, fresh-session implementation campaign is in [plans/admin-poc-production/README.md](plans/admin-poc-production/README.md).
+The eight canonical views share the existing backend capability and source-read policies. Roles are additive, not hierarchical: Reader sees inventory and aggregate usage; Operator sees exact control targets; SecurityReader sees user reports and investigations; Administrator manages submitted imports without inheriting report or investigation reads.
 
-The completed admin POC will provide:
+- Agents uses server-side search, filters, stable sorting, totals and 50-row pages. URLs retain filters, page, exact selection and source-detail tabs. Power Platform retains its broader typed inventory explorer and independent native quarantine controls.
+- Source details show exact identifier kinds, observation times and authorized related observations. An undocumented association stays unmatched; a name, package ID, blueprint or Defender ID never becomes a quarantine target. Official usage is authoritative only from the three companion Microsoft exports.
+- Jobs shows minimized, authorized user-work status and explicit recovery. Navigation loads saved data only. Progress polling is sequential and finite; waiting-for-authorization work requires an explicit action. Uncertain writes offer GET-only reconciliation, never replay or automatic inverse operations.
+- Downloads are authenticated server exports tied to an exact source selection. Inventory exports are capped at 5,000 rows, official exports at 100,000 output rows, Defender at 200 rows, and local administrative audit at 100 exact selected events. CSV generation is bounded to 8 MB (2 MB for Defender; 1 MB for local administrative audit), with a 15-second publication deadline and disconnect handling. Oversize selections fail rather than silently truncate. Current session, role and source validity are checked again before publication; stale scope, deletion or revocation stops the download.
+- CSV formulas are neutralized and only approved fields leave the server. Audit records source/selection/count metadata, never exported rows. No export file, bearer link, original CSV archive, transcript viewer or maintenance console is created.
 
-- a Permission Center that groups every feature by exact app permission, token mode, internal app role, Microsoft administrator/security role, license, environment, preview state, and live capability probe;
-- normalized Microsoft 365 package, Power Platform, Copilot Studio, Agent Builder, and Defender/Agent 365 inventory with source identifiers, provenance, freshness, and conflict review;
-- verified package access, block/unblock, and ownership reassignment, kept separate from Copilot Studio quarantine;
-- durable import of the Microsoft 365 Copilot Agents **Agents**, **Users & agents**, and **Users** CSV exports as the only official per-agent/per-user usage authority;
-- bounded Microsoft Graph Purview Audit searches and optional continuous Office 365 Management Activity ingestion;
-- Defender advanced hunting for preview `AgentsInfo` inventory and Agent 365 activity in `CloudAppEvents`;
-- opt-in, environment-scoped Dataverse `conversationtranscripts` ingestion with application-level encryption, redacted default views, audited raw reveal, and retention controls;
-- a unified admin workbench, source-safe exports, durable jobs, operational diagnostics, and production Azure deployment backed by PostgreSQL.
+The local workbench can show truthful setup/disabled states without live provider credentials. Deterministic browser fixtures are isolated test tooling, not qualification or a production sign-in bypass. See the [Phase 10 completion](plans/admin-poc-production/completions/10-unified-admin-workbench.md) for exact tested commands and retained-environment evidence.
 
-These capabilities are delivered in the linked phases 01-15; implementation status is recorded in each phase's completion record rather than inferred from this roadmap list.
+## Local Deployment
 
-Unavailable features remain visible but disabled. The UI will state the exact unmet requirement and which features it unlocks. A granted API permission does not replace a Microsoft administrator role, Defender/Purview role, Dataverse environment role, license, tenant rollout, or internal Agent Control app role.
+Host prerequisites: PowerShell 7, company-approved Docker Engine/Desktop with Compose v2 or newer, and a browser. Node, npm, Vite, PostgreSQL, tests and browser automation run **inside Docker**. No Azure subscription, Key Vault or provider credentials are needed to start the sign-in-unconfigured app.
 
-### Planned permission and role groups
+From the repository root:
 
-| Feature group | Registered-app permission and token mode | Additional role, license, or environment requirement |
+```powershell
+pwsh -NoProfile -File ./deploy-local.ps1
+```
+
+Open **http://localhost:3001**. Use this canonical origin, not a second `127.0.0.1` browser origin. The script builds operator/runtime images, starts PostgreSQL, waits up to 90 seconds, runs serialized bootstrap/migrations and the full test baseline in disposable containers, then waits for healthy app/database/schema responses. Failure returns nonzero without resetting data or announcing success. Two long-running services remain: `app` and `postgres`.
+
+- Default project: `agent-control`; volume: `agent-control_data`; network: `agent-control_default`.
+- The app listens on all interfaces **inside** its container but publishes only `127.0.0.1:3001`. PostgreSQL has no published host port. The project bridge permits normal outbound DNS/HTTPS for Entra/Graph.
+- Use `-Project <name>` for a separate installation and `-Port <1024-65535>` for an available host port. Keep the same project, state root and port on reruns. Paths with spaces are supported; newlines and single quotes are rejected.
+- Normal redeployment preserves the volume and secrets. Before migrations it closes admissions and stops/drains the app, with a 130-second grace period. It never imports legacy data or resets storage automatically.
+- `GET /api/health` returns only liveness; `/api/ready` validates database and migration checksums; `/api/auth/status` describes setup. Diagnostics require authentication. Unknown API routes and missing assets return errors, not SPA HTML.
+
+### Sign-In Setup
+
+Use an existing approved single-tenant Entra web application. Its default local Web reply URL is exactly `http://localhost:3001/api/auth/callback`. A different `-Port` requires a matching registered reply URL. The script does not modify app registrations or grants.
+
+```powershell
+pwsh -NoProfile -File ./deploy-local.ps1 -Project agent-control `
+  -TenantId "<tenant-guid>" -ClientId "<application-guid>" `
+  -ClientSecretFile "<existing-restricted-secret-file>"
+```
+
+On an initial configured setup, omitting `-ClientSecretFile` prompts securely in the terminal. Never enter a secret in AI/chat or a command argument. To configure an already unconfigured installation, supply the secret file explicitly. Missing identity configuration keeps the app healthy but disables the sign-in link and shows setup guidance. No fake identity or runtime auth bypass exists.
+
+Initial sign-in requests only OIDC identity scopes: `openid` and `profile`. Provider permissions are requested incrementally for one capability group through authenticated, CSRF-protected consent. Package read requests least-privileged `CopilotPackages.Read.All`; package controls request delegated `CopilotPackages.ReadWrite.All` only when that separately qualified capability needs it. Power Platform inventory requests delegated `ResourceQuery.Resources.Read`; Copilot Studio quarantine separately requests delegated `CopilotStudio.AdminActions.Invoke`. Directory, Purview and Defender grants likewise stay resource- and capability-specific. Do not add broad grants to conceal an unavailable or unproven provider contract.
+
+Import [infra/entra-app-manifest.json](infra/entra-app-manifest.json) into the approved single-tenant app registration. Its four independent roles are `AgentControl.Reader`, `AgentControl.Operator`, `AgentControl.SecurityReader` and `AgentControl.Administrator`; Administrator does not inherit the other roles. A recognized user without an assigned role receives setup diagnostics and no protected data. [docs/security-model.md](docs/security-model.md) defines the role/data matrix and [docs/deployment-setup.md](docs/deployment-setup.md) defines local and prepared-vault setup.
+
+Authenticated users can read `GET /api/capabilities` and refresh their own capability evidence through the CSRF-protected probe route. Only Administrator can change capability configuration. Reader owns broad inventory; Operator can read exact targets needed for package controls but cannot list or batch-read the catalog. Registry requirements remain code-owned, all live provider capabilities start unavailable without credentialed evidence, and missing credentials never produce synthetic provider results. Microsoft access tokens are treated as opaque: MSAL response metadata and returned scopes/roles are authoritative, while readable JWT claims are used only to reject contradictions. The dated review is [docs/provider-contract-inventory-2026-09-08.md](docs/provider-contract-inventory-2026-09-08.md).
+
+### Local Secrets
+
+Default state is the ignored `.local/<project>/` directory. `-StateRoot` changes its parent; use an ignored, private directory. Directories are mode `0700` and files `0600` on Unix; Windows uses an explicit current-user ACL with inheritance removed. Keep the state directory with the retained Docker volume in your recovery inventory.
+
+| Relative path | Format / lifetime | Mounted consumer |
 | --- | --- | --- |
-| Package catalog read | Microsoft Graph delegated or application `CopilotPackages.Read.All` | Microsoft Agent 365 license. The endpoint docs name no additional human Entra role; availability is live-probed. |
-| Package update, block/unblock, and reassign | Microsoft Graph delegated `CopilotPackages.ReadWrite.All`; no application permission for mutations | Microsoft Agent 365 license; preview/global-cloud-only unless Microsoft promotes the APIs. The endpoint docs name no additional human Entra role. |
-| Directory principal lookup | Microsoft Graph delegated `User.ReadBasic.All`, `Group.Read.All` | Tenant admin consent and `AgentControl.Operator` for package assignment workflows. |
-| Power Platform inventory | Power Platform API delegated `ResourceQuery.Resources.Read` on app ID `8578e004-a5c6-46e7-913e-12f58912df43`; app-only remains unavailable unless Microsoft documents and a live probe proves an exact supported assignment | Global Administrator, Power Platform Administrator, Dynamics 365 Administrator, or Global Reader for full inventory; AI Administrator or AI Reader for AI-scoped inventory. Built-in Power Platform RBAC roles are not supported for inventory access. |
-| Copilot Studio quarantine | Power Platform API delegated `CopilotStudio.AdminActions.Invoke` | Global Administrator, AI Administrator, or Power Platform Administrator, plus `AgentControl.Operator`. Classic chatbots are unsupported. |
-| Purview Audit Search | Microsoft Graph delegated or application `AuditLogsQuery.Read.All` for cross-workload queries | Audit enabled and licensed. Delegated users also need Purview **Audit Logs** or **View-Only Audit Logs**, plus `AgentControl.SecurityReader`. The live contract is probe-gated because current Microsoft pages conflict on one permission/property name. |
-| Continuous audit feed | Office 365 Management APIs application `ActivityFeed.Read` | Tenant admin consent, unified audit logging, `Audit.General` subscription, and `AgentControl.Administrator` for collector administration. |
-| Defender/Agent 365 hunting | Microsoft Graph delegated or application `ThreatHunting.Read.All` | Applicable Defender/Agent 365 or Microsoft 365 E7 licensing and data-source onboarding. Delegated access is also constrained by Defender XDR RBAC; viewing requires `AgentControl.SecurityReader`. |
-| Dataverse transcript read as a user | Each environment's Dataverse delegated `user_impersonation` | **Bot Transcript Viewer** in each environment and `AgentControl.TranscriptReader` for content. Environment Maker is insufficient. |
-| Dataverse unattended transcript ingestion | No broad Entra application permission; create a Dataverse application user for each environment | Assign a custom role with organization-level **Read** on `ConversationTranscript` and only required metadata tables. Do not grant System Administrator. Collector setup requires `AgentControl.Administrator`. |
-| Official usage CSV import | No Microsoft API permission | An Agent Control administrator obtains and imports all three matching admin-center exports. Audit, hunting, and transcript counts never replace these official reports. |
+| `secrets/postgres-admin` | 48 random bytes, 64-character Base64; generated once | PostgreSQL bootstrap and disposable operator only |
+| `secrets/postgres-app` | Independent value, same format; generated once | Bootstrap plus restricted app login |
+| `secrets/session` | Independent value, same format; generated once | App session-cookie signing only |
+| `secrets/client-secret` | Trimmed Entra client-secret text, or empty when unconfigured | App only |
+| `settings.json` | Non-secret tenant/client IDs and port | Local script |
+| `compose.env` | Non-secret paths, IDs, image names, port and UID/GID | Compose |
+| `control/maintenance` | Presence closes new work admissions | App read-only mount |
+| `backups/` | Native dump plus count/hash receipt | Operator only |
 
-Agent Control's planned internal Entra app roles are `AgentControl.Reader`, `AgentControl.Operator`, `AgentControl.SecurityReader`, `AgentControl.TranscriptReader`, and `AgentControl.Administrator`. Provider permissions and provider-side roles are still enforced independently.
+Secrets are file mounts, never image layers, build arguments or logged values. The runtime receives no admin password or operator code and has a read-only root filesystem, dropped capabilities and no Docker socket. It uses the host UID/GID locally to read restricted bind-mounted files.
 
-### Planned usage flow
+With an existing volume, missing or corrupt DB/session secrets **stop deployment**. Restore their original bytes from the same installation's protected state backup; do not generate replacements. A valid-looking but incorrect password also fails actual authentication. Credential rotation is a coordinated operator action, not a deploy side effect. Keep project tenant and origin stable; create another project for another tenant.
 
-1. Sign in with the minimum identity scopes, then open **Permissions** to request only the delegated capability groups needed for the current task.
-2. Review each live probe before using a provider. Missing application consent, human role, environment role, license, configuration, preview enablement, and provider failure are separate states.
-3. Use **Agents** for normalized inventory and source-specific controls. Every mutation identifies its provider target, requires confirmation, records a local audit event, and verifies the provider state afterward.
-4. Import the three matching Microsoft 365 admin-center usage exports for official reporting. Use Purview/Management Activity for audit evidence and Defender for security/observability, not official usage totals.
-5. Enable transcripts only for approved Dataverse environments after assigning the exact environment role and configuring purpose, redaction, encryption, content access, and retention.
+## Lifecycle And Recovery
 
-The campaign ends with mandatory production deployment and live qualification. Missing external tenant capabilities are deployed as disabled, diagnostic states rather than omitted or falsely reported as ready.
-
-## Prerequisites
-
-- Node.js 24 or newer. The backend uses the built-in `node:sqlite` module for local audit storage.
-- A Microsoft Entra app registration configured as a web app.
-- Microsoft Agent 365 licensing in the tenant.
-- Delegated Microsoft Graph permissions `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` with admin consent.
-- A work or school account with tenant permissions to manage Copilot packages.
-- Optional usage enrichment requires Microsoft 365 Copilot usage report CSV exports, but it does not require any additional Microsoft Graph permissions.
-
-The supplied Microsoft Graph docs note that block, unblock, and package access updates use `/beta` endpoints and are available only in the global cloud. Microsoft does not support beta APIs for production workloads; validate this dependency against your organization's risk policy.
-
-The **Manage access** buttons in agent table rows and the bulk actions section are temporarily hidden because the underlying Microsoft Graph access-update endpoint is not working reliably. The buttons will remain hidden until Microsoft fixes the endpoint.
-
-## Entra App Registration
-
-Create an app registration in Microsoft Entra ID with these settings:
-
-- Platform: Web
-- Redirect URI: `http://localhost:3001/api/auth/callback`
-- Client secret: create one and store it only in your local `.env`
-- API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All`
-- Admin consent: granted for the tenant
-
-No additional API permission is needed for usage report import. The usage data is loaded from user-provided Microsoft 365 Copilot usage report CSV files.
-
-## Local Setup
-
-```bash
-npm install
-cp .env.example .env
+```powershell
+pwsh ./deploy-local.ps1 -Action Stop
+pwsh ./deploy-local.ps1 -Action Start
+pwsh ./deploy-local.ps1 -Action Test
+pwsh ./deploy-local.ps1 -Action Retain
+pwsh ./deploy-local.ps1 -Action Backup
 ```
 
-Edit `.env` with your tenant ID, client ID, client secret, and a long random session secret.
+Add the same `-Project`, `-Port` and `-StateRoot` used at installation. Stop leaves storage intact; Start uses the existing image and verifies readiness, without migrations. After a failed build, the previous runtime is unchanged. After a migration/test/start failure, maintenance remains closed; fix the reported target/configuration/schema problem and rerun Deploy. Never remove the volume as a recovery shortcut. Health remains separate from provider availability.
 
-By default, audit events are stored in `backend/data/agent-control.sqlite`. That directory is ignored by Git so normal pulls and code updates do not overwrite local audit data. For production or Azure App Service, set `AGENT_CONTROL_DATA_DIR` to a persistent host-owned directory, such as `/home/data/agent-control`. Set `AUDIT_LOG_ENABLED=false` only if you need to disable local audit logging.
+The Backup action writes a new timestamped `.dump` and `.dump.json` under the protected project backup directory, using a PostgreSQL repeatable-read snapshot and `pg_dump` custom format. The receipt records SHA-256, schema and per-table counts/content fingerprints, not row contents. Use `-BackupFile` for an explicit new filename in an existing restricted directory. Existing files are never overwritten.
 
-Run both apps:
+Restore always creates a **new isolated database**, never the source/default database:
 
-```bash
-npm run dev
+```powershell
+pwsh ./deploy-local.ps1 -Action Restore `
+  -BackupFile ".local/agent-control/backups/<timestamp>.dump" `
+  -RestoreDatabase "agentcontrol_restore_check"
 ```
 
-Then open `http://localhost:5173`.
+`pg_restore` runs transactionally, followed by schema/count/content validation and explicit grants. Existing targets and changed receipts fail. A failed restore target remains isolated for review; the source is unchanged. Review retained data and run operator retention before any separately approved promotion. Phase 01 does not switch the running app to a restored database. After a successful check, remove only that exact isolated target:
 
-## Azure Deployment Automation
+```bash
+docker compose --env-file .local/agent-control/compose.env -p agent-control exec -T postgres \
+  psql -U agentcontrol_admin -d agentcontrol -v ON_ERROR_STOP=1 \
+  -c 'DROP DATABASE agentcontrol_restore_check WITH (FORCE)'
+```
 
-The repo includes a Bicep template and a cross-platform PowerShell deployment script for a first Azure production deployment:
+Keep local dump/receipt pairs for at most **seven days** and remove expired pairs during routine operator maintenance (`-Action Retain`). Keep secret-file recovery copies under the organization's credential policy, separately protected from data dumps. Database retention removes expired sessions, capability evidence and package mutation qualification records, seven-day jobs/items/attempts, expired package snapshots/refresh jobs, 30-day Purview jobs/results, audit older than 90 days, old import receipts and unused source identifiers. Expired capability or qualification evidence stops authorizing immediately. Run Retain at least daily while actively using this POC; it never calls providers. Backups have a finite lifetime, not an instant deletion guarantee.
 
-- Frontend: Azure Static Web Apps Standard.
-- Backend: single-instance Azure App Service for Linux.
-- Secrets: existing Azure Key Vault secrets are referenced from App Service settings.
-- Key Vault networking: public access by default, or an optional private endpoint with App Service VNet integration.
-- App registration: provide an existing Microsoft Entra app registration client ID. The deployment script does not create or modify app registrations.
+Destructive reset is a separate, explicit action, never a deploy step:
 
-The Bicep file provisions Azure hosting resources and configuration. It creates the Static Web Apps resource, App Service plan, backend App Service, Application Insights, App Service settings, the Static Web Apps linked backend, and a `Key Vault Secrets User` role assignment for the backend managed identity. In private mode it also creates the virtual network, subnets, private endpoint, and private DNS resources. It does not upload frontend or backend code by itself. The `deploy-production.ps1` script runs Bicep first, validates Key Vault references, then packages and deploys the backend and uploads the built frontend.
+```powershell
+pwsh ./deploy-local.ps1 -Action Reset -Project agent-control `
+  -ConfirmReset "agent-control/agent-control_data"
+```
 
-Static Web Apps proxies linked backends only through `/api/*`, so the auth endpoints are under `/api/auth/*`. Use this production redirect URI after the Static Web Apps resource exists:
+This removes that project's containers, volume and local state including its backups. Back up anything needed outside that directory first. The exact case-sensitive project/volume confirmation is mandatory.
+
+## Persistence And Jobs
+
+PostgreSQL **17** is pinned in Compose. The fixed database is `agentcontrol`, operator login `agentcontrol_admin`, runtime login `agentcontrol_app`. Structural driver settings use `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD_FILE` (or injected `PGPASSWORD`); remote connections require TLS verification, while the private local container connection uses disabled SSL. Passwords are not concatenated into connection URLs. The app pool caps at four connections, 5-second connect and 15-second statement timeouts, with UTC timestamps.
+
+[backend/scripts/database.ts](backend/scripts/database.ts) owns bootstrap, explicit checksum-verified migrations and grants. [backend/src/db/schema.ts](backend/src/db/schema.ts) defines schema versions 1 through 22. Migrations 5-6 own private Power Platform inventory; migrations 7-12 own package observations, mutation confirmation/readback/reconciliation, and finite canary qualification; migrations 13-15 own official usage staging, immutable publication, selection and exact retry receipts. Migrations 16-17 own Purview qualification, durable minimized results, scoped execution fencing and request budgets. Migrations 18-21 own Defender hunting, qualification and retained scopes. Migration 22 owns Copilot Studio quarantine observations, durable jobs/items/attempts, append-only audit, separate canary approvals and finite qualification. Advisory transaction locks serialize migration attempts. Unknown/newer or modified applied migrations fail; upgrades are forward-only and an individual failed migration rolls back. Never edit an applied migration; add a new version. Bootstrap uses ordinary operator role/schema privileges, not a required cloud superuser. The app cannot create schema, own its objects, elevate roles or change/delete/truncate audit events, published inventory snapshots or accepted official usage content. Library auto-DDL is disabled.
+
+All available single, selected bulk and block-all mutation routes require a current server-issued preview with `risk: true`, a confirmation hash, and a durable `Idempotency-Key`, then return **202 durable jobs**. The preview includes operation, exact targets and current/requested state, Microsoft Graph endpoint/maturity, delegated permission, actor, affected principal count and rollback limits. Same-key/same-confirmation retries return the original job even after saved package state changes; another payload returns 409. Access and reassignment routes fail closed before dispatch. Job states are `queued`, `running`, `waiting_authorization`, `succeeded`, `failed`, `cancelled` and `partial`, with no `completed` alias. Items also distinguish `skipped` and `inconclusive`.
+
+- At most two in-process workers, five unfinished jobs per principal and 5,000 items per job. No recurring provider refresh or startup collection.
+- Database-time leases last 120 seconds with owner/version fences; up to ten claims, a 30-minute dispatch deadline and seven-day retention. Stale workers cannot commit outcomes or dispatch another item.
+- Intent/attempt audit is persisted before remote dispatch. A per-tenant/package advisory lock serializes local operations; under that lock the worker rereads the exact target and compares the frozen mutation-state hash. It then rechecks role/capability and reacquires the exact delegated tenant/account/resource authorization. Writes dispatch once and are never automatically retried. Successful outcomes require bounded provider readback; uncertain accepted writes remain `inconclusive`. `POST /api/agents/bulk-jobs/:id/reconcile` uses current `AgentControl.Operator` plus delegated `CopilotPackages.Read.All`, revalidates around each result, honors cancellation, performs provider reads only and never requires a still-qualified write capability.
+- Restart cannot recover MSAL tokens. Unsent delegated work waits for current authentication and explicit resume; completed/uncertain items never replay. Cancel stops unsent items, not an already accepted remote operation.
+- Poll `GET /api/agents/bulk-jobs/:id`; cancel with `POST .../:id/cancel`; resume unsent work with `POST .../:id/resume` and `{ "confirmed": true }`; reconcile inconclusive items with `POST .../:id/reconcile`. Tenant/principal filtering applies before job, session and audit access.
+- Sessions expire after eight hours, IDs regenerate at login, and only allowlisted account/user state plus a random authentication-transaction handle is serialized. OAuth state, nonce, PKCE verifier, tokens, and MSAL cache blobs never enter PostgreSQL. One-time process-local authentication transactions expire after ten minutes.
+- Administrative audit appends confirmed request, attempt start and outcome/reconciliation rows and reads a projection. Unknown legacy tenant attribution is not exposed by scoped app routes.
+
+Requests cap JSON at 512 KiB; package pages cap at 100/5,000 total rows and 2 MB per response; provider calls time out at ten seconds. Read retries cap at three with delays capped at 30 seconds; mutations never retry. Directory search returns at most 50 principals, resolves at most 500 native Entra UUIDs with concurrency eight, rejects duplicate/deleted/unresolved identities and rejects a Graph response whose ID differs from the exact requested ID. Unknown package fields are omitted with value-free schema diagnostics. Package responses are not archived; Power Platform snapshots contain only their validated allowlisted projection.
+
+Package list/detail reads use Graph v1.0 and save only allowlisted complete observations for seven days; failed or partial refreshes never replace the last complete broad snapshot. Navigation reads saved data only. **Refresh agents** explicitly submits and polls a delegated refresh job before reloading saved rows. A provider-verified block mutation updates only its touched state in the current UI; publishing a new persisted observation still requires that explicit refresh. Preview block/unblock use Graph beta and delegated `CopilotPackages.ReadWrite.All`; application permission is not supported. Microsoft documents global cloud and a Microsoft Agent 365 license, but no additional human Entra administrator role. Local serialization and immediate prestate hashing bound this application's block races but are not provider atomicity. Access replacement remains disabled even after generic qualification because Graph documents no ETag/`If-Match` or equivalent lost-update bound. Reassign remains visibly disabled because package detail exposes no owner field for readback and the operation exposes no conditional-write header. [docs/mutation-canaries.md](docs/mutation-canaries.md) defines the durable role-separated restoration command; no current record exists until an approved live canary is restored and verified.
+
+Power Platform inventory uses delegated `ResourceQuery.Resources.Read` against the global `api.powerplatform.com` Resource Query endpoint. Each explicit refresh uses code-owned structured clauses, `Top=100`, continuation tokens, a 50-page/5,000-row ceiling, 10-second requests, three read attempts, a 10-second retry ceiling and 2 MB response limit. Results are allowlisted and publish only after complete enumeration; raw provider responses, connection/sharing secrets and tokens are discarded. Failed or interrupted work preserves the prior snapshot. Restart converts running jobs to `waiting_authorization` without calling a provider; only an explicit current-user resume can reacquire authorization.
+
+Inventory snapshots are tenant/principal-private. Reader can query, filter, sort, page, inspect and export saved rows even when provider evidence is unavailable. Full inventory roles are Global Administrator, Power Platform Administrator, Dynamics 365 Administrator and Global Reader. AI Administrator/Reader coverage excludes ordinary canvas/model-driven apps and cloud flows as `not_authorized_scope`, never zero. Unknown role evidence remains unknown. Snapshot resources expire after 30 days and refresh jobs after seven days through operator retention. The app supports global cloud only; sovereign-cloud endpoint/support differences are reported as unsupported configuration rather than guessed.
+
+Inventory admits at most four active refreshes globally and five unfinished requests per principal. Queries have a 30-second overall deadline, active execution a 45-second bound, and unsent requests a 30-minute dispatch window. Saved scope selection and recent job discovery survive navigation/restart without submitting a scan. Explicit resume revalidates the current principal; logout cancels inventory work without waiting under the account-session lock. Publication rechecks authorization, refuses stale/superseded work, and preserves broad scopes when a narrow scope completes. Source freshness remains readable after its refresh job expires.
+
+Exact identifier outcomes are computed server-side from the complete selected private snapshot before paging. Resource type, identifier kind, tenant and required environment remain distinct; ambiguous candidate details are bounded to 20 identities with their total retained. Relationships never merge resources or redirect native mutation targets. The current package and Power Platform schemas document no cross-source package identifier relationship, so package associations remain explicitly unresolved. CSV exports apply the same Reader/private scope and neutralize spreadsheet formula prefixes.
+
+## Copilot Studio Quarantine
+
+Quarantine is delegated-only and global-cloud-only. It uses Power Platform audience `8578e004-a5c6-46e7-913e-12f58912df43`, scope `CopilotStudio.AdminActions.Invoke`, internal role `AgentControl.Operator`, and one current provider role: Global Administrator, AI Administrator or Power Platform Administrator. Built-in Power Platform RBAC, Environment Maker, Reader, application credentials, package IDs and display names are not substitutes. Classic/V1 bots remain unsupported.
+
+The implemented endpoint contract is `GET .../copilotstudio/environments/{EnvironmentId}/bots/{BotId}/api/botQuarantine?api-version=1`, with one-shot POSTs to `SetAsQuarantined` or `SetAsUnquarantined` using the same `api-version=1`. Microsoft documentation rechecked on 2026-09-10 is inconsistent: the Copilot Studio quarantine guide specifies `1`, while all three generated REST request examples specify `2024-10-01`. Agent Control follows the Phase 09 contract and guide with version `1`; it never retries against another version. An approved exact-target live probe must qualify that version before any live canary. Resource Query inventory separately remains `api-version=2024-10-01`.
+
+Controls accept only a current principal-private `microsoft.copilotstudio/agents` snapshot and its exact native resource, environment and CDS bot IDs. Inventory older than 24 hours, expired/removed/ambiguous targets and absent IDs disable status and mutations. An explicit status read retains `isBotQuarantined`, exact `lastUpdateTimeUtc`, observation time and correlation for 30 days with a 60-second cache. It stays visibly separate from lagging inventory state; unknown/unavailable never becomes `false`, and direct state never rewrites the inventory snapshot.
+
+Single and bulk operations are bounded to 25 targets. Preview freezes direct prestate/timestamp, exact targets, actor, capability revisions and requested state. A normal submit requires current independently approved quarantine and restoration canary evidence. Workers serialize each provider target, perform two current pre-reads, mark the one permitted POST sent durably, and require bounded GET convergence before success. Accepted, timed-out or interrupted sent work becomes `inconclusive`; reconciliation performs GET only and never replays or automatically inverts a partial bulk result. Startup moves unclaimed/unsent work to `waiting_authorization` without a provider call; explicit resume reacquires current delegated authorization. SecurityReader can review only current-principal quarantine audit events; Administrator does not inherit that role.
+
+Makers may still see and test a quarantined bot in Copilot Studio while users cannot use it through connected channels. Graph package blocking is an independent control with independent state and qualification. [docs/mutation-canaries.md](docs/mutation-canaries.md) defines the separate quarantine canary procedure. The current local installation reports `authConfigured: false`; no exact live target or canary approval was available, so live read/write evidence is `unavailable`, not passed from fixtures.
+
+## Purview Audit Search
+
+Purview Audit Search is an explicit SecurityReader workflow, not a scheduler or navigation-triggered collection. It uses Microsoft Graph v1.0 `auditLogQuery` with `AuditLogsQuery.Read.All`, code-owned Copilot interaction and Copilot Studio administration presets, required caller-selected subsets of each preset's allowlisted operations, a seven-day maximum requested window, and bounded polling/paging. The adapter stores typed allowlisted metadata and message IDs only. Prompt/response text, transcripts, raw `auditData` and provider response archives are prohibited.
+
+Microsoft's current create/list/records references and query resource remain inconsistent over `serviceFilter`/`serviceFilters`; single-query GET also lists an unrelated permission. Agent Control selects singular `serviceFilter`, direct create/get query objects and collection list envelopes, with no runtime fallback. Both delegated and application modes remain disabled until one separately approved complete lifecycle proves the exact contract. Routine Permission Center refresh creates zero queries.
+
+Submission returns a durable job promptly. Each physical Graph attempt reserves one of 64 durable request slots immediately before dispatch; each job has at most 12 explicit activations, each activation has a 60-second bound and at most six polls, and each logical Graph request has a 30-second retry budget with 2 MB per response. Interrupted work returns to `waiting_authorization` without provider calls. Explicit resume reconciles an ambiguous create marker or polls a saved provider ID; it does not replay create or completed work. Cancel and delete are local-only and do not claim remote cancellation/deletion. Delegated results stay private to their principal; application results are readable only through the current configured shared scope. Minimized results expire after 30 days and remain separate from local administrative audit and official usage. [docs/purview-audit-search.md](docs/purview-audit-search.md) defines the selected contract, authorization, caps, privacy, recovery and retention.
+
+## Legacy Audit Import
+
+[backend/scripts/import-legacy-audit.ts](backend/scripts/import-legacy-audit.ts) is an **operator-only** SQLite reader, excluded from the runtime image and ZIP. Never point it at a live SQLite/WAL file. Obtain a SQLite online-backup/safely closed standalone backup and its independently recorded SHA-256, then mount it read-only into an operator container. Phase 12 owns actual production backup/import execution; this phase tests fixtures only.
+
+```bash
+docker run --rm --network agent-control_default \
+  --mount "type=bind,source=$PWD/.local/agent-control/secrets,target=/run/secrets,readonly" \
+  --mount "type=bind,source=<absolute-protected-backup-directory>,target=/legacy,readonly" \
+  -e PGHOST=postgres -e PGUSER=agentcontrol_admin -e PGDATABASE=agentcontrol \
+  -e PGPASSWORD_FILE=/run/secrets/postgres-admin \
+  agent-control-operator:local backend/scripts/import-legacy-audit.ts \
+  /legacy/audit-backup.sqlite <expected-sha256>
+```
+
+The importer validates the known schema, a 64 MiB/100,000-row limit, integrity and allowlisted audit fields. It assigns deterministic source IDs and atomically verifies exact row count/content hashes plus a checksum-keyed receipt. Same-backup retries are idempotent; changed, malformed or unapproved fields stop the entire import for operator review. Never edit the source backup to make a check pass. Unknown tenant remains unknown and restricted. Old in-memory jobs/sessions were never in SQLite: require login and manually reconcile legacy writes without replay.
+
+## Official Usage Reports
+
+The only official per-agent and per-user usage authority is the Microsoft 365 admin-center **Copilot Agents usage** report. Microsoft currently documents 7- and 30-day report windows and says usage can appear within one hour of interaction; treat that as source latency, not a guarantee that an operator has imported the latest export. Microsoft Graph `copilotReportRoot` has three current `v1.0`/`beta` methods for licensed Microsoft 365 Copilot app user counts, trends and user activity, but none returns the equivalent per-agent Agents, Users & agents and Users datasets. Import therefore remains a manual operator workflow. Audit, Defender, telemetry, transcripts and package events are never substituted or relabelled as official usage.
+
+1. In the Microsoft 365 admin center, open **Reports** (use **Show all** if Reports is hidden), then **Usage**. Under **Reports**, select **Microsoft Copilot > Agents**.
+2. Select the same documented 7- or 30-day period for the complete bundle. Select each **Agents**, **Users & agents**, and **Users** table/tab and use its **Export CSV** action. Keep the original CSV files until the import is accepted.
+3. In Agent Control, sign in with `AgentControl.Administrator`, open **Official usage**, enter the source reporting start/end dates in the role-gated import panel, and optionally enter the source as-of timestamp only when the Microsoft report shows it.
+4. Choose all three CSVs, review the server-produced kind, hashes, schemas, row counts, period, source basis, warnings, reconciliation and complete bundle hash, then accept the reviewed bundle. All three kinds publish in one revision-fenced transaction. Missing companion files remain resumable actor-owned staging or an incomplete retained set and never replace active data.
+
+The parser accepts only the current Microsoft-documented and fixture-observed headers listed in [the official usage import runbook](docs/official-usage-import.md), validates UTF-8/content/row/field/byte bounds, and rejects unknown required-column changes as schema drift. Filenames, MIME types and extensions are not reporting-period authority. The supported CSVs contain no report-period or source-as-of metadata columns, so supplied period/as-of values are always labelled `operator_asserted` and source freshness remains `unknown`. Companion source basis must match exactly; download timestamps are recorded independently and are not used to guess compatibility.
+
+Accepted rows are immutable. Exact three-file retries return the original finite content-free bundle receipt even after staging cleanup or an active-pointer change; they do not reselect, replay or create another version. Changed hashes/revisions fail. A correction requires explicit acknowledgement, creates a superseding immutable set, and becomes active only when all three compatible kinds are accepted atomically. An administrator can preview and confirm selection of another retained complete set or deletion. Deleting the active set clears selection without falling back to an older set. Original upload bytes are never archived.
+
+`AgentControl.Reader` can read/export aggregate official usage. `AgentControl.SecurityReader` can read/export user-level official usage. `AgentControl.Administrator` can stage, review, accept, select and delete operational report sets but does not inherit either content-read role. Report agent IDs remain report-only and unresolved unless an exact documented cross-source identifier contract exists; names and creator strings are never identity keys. Pseudonymous usernames remain case-distinct and explicitly scoped to their report set and Users/Users & agents versions. Licensed and unlicensed active-user categories are not additive even within one agent because license changes can place one person in both categories; their sum is never presented as a distinct-user total. Exact distinct totals use the case-sensitive Users plus Users & agents dataset identity union, while each source's response total remains independent. In Users & agents, last activity is the date the agent was last used by anyone, not that user's last interaction. User recency comes only from Users and is unknown when that row is absent. Source disagreements remain visible instead of being corrected or hidden.
+
+Staging rows expire after 30 minutes and startup plus periodic runtime cleanup removes abandoned preview rows; accepted content, artifacts, versions, sets and bundle receipts expire independently after 180 days; minimal report audit metadata expires after 90 days. Upload parsing and processing have an active 15-second wall-clock timeout, and disconnected work keeps its admission slot until parsing/database work has settled. Admission caps are 8 MiB and 50,000 rows per file, two concurrent uploads per process, nine retained staging rows/150,000 rows/96 MiB per actor, and 30 rows/500,000 rows/256 MiB per tenant. Run `pwsh ./deploy-local.ps1 -Action Retain -Project <project>` during ordinary maintenance. `OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to `35`, accepts 1 through 365, and marks a selected set stale when either report-period age or accepted-set age exceeds the threshold. `never imported`, `incomplete`, `active`, `stale`, `not selected` and `deleted` remain distinct and never trigger another source fallback.
+
+The legacy browser key `agent-control:usage-reports:v1` is detected by key enumeration only. Its value is never read, parsed or uploaded. Every affected authenticated browser receives a content-free notice regardless of app role; only Administrator receives cleanup controls. The key survives sign-out, unmount and failed import. It is removed only after server-acknowledged successful original-file re-import confirmation or explicit discard acknowledgement; unrelated local-storage keys remain untouched. Storage at an older origin such as `http://localhost:5173` cannot be detected from `http://localhost:3001` and must be handled explicitly at that origin.
+
+Operator workflow: [docs/official-usage-import.md](docs/official-usage-import.md). Microsoft source: [Microsoft 365 Copilot Agents usage report](https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide).
+
+## Permissions And Saved Data
+
+Every signed-in account can open **Permissions**, including an account awaiting internal role assignment. Registered adapters include package delegated/application reads, package block qualification, the fixture-tested but operation-disabled access adapter, directory lookup, delegated Power Platform inventory, delegated Copilot Studio quarantine behind separate full-cycle qualification, delegated/application Purview Audit Search behind live qualification, Defender hunting and local official report import. Later provider adapters appear when their owning phase registers them; contract definitions alone do not advertise working integrations.
+
+Permission rows consume the backend's exact resource audience, token mode, permissions, Microsoft/internal roles, licenses, cloud, configuration, source links, safe evidence, freshness and separate write qualification. **Request consent** starts one capability group's Entra flow, and **Retry probe** requests a current-account bounded read explicitly. Neither action assigns a role or license; a read probe never qualifies a write. Cancellation and interaction/Conditional Access outcomes return safe messages to the app without reflecting provider descriptions.
+
+The health control opens Permissions and summarizes available, degraded and blocked adapters. Expiry updates the UI locally without polling a provider. Provider actions fail closed on unavailable or expired evidence, while role-authorized saved package observations, saved Power Platform snapshots, saved reports and local audit remain accessible. **Refresh agents** creates and polls a durable package refresh; **Refresh inventory** creates a Power Platform refresh. Navigation performs no provider scan. Package details show saved observation time/expiry, source, v1.0-read/preview-control maturity, availability, deployment and assignments. Package block is explicitly distinct from Copilot Studio quarantine. Access and reassign actions remain visible but disabled with their exact lost-update/readback limitations and the reassign documentation link. The principal-scoped **Jobs** view exposes only role-authorized imports, refreshes, searches and controls, with explicit reauthentication, unsent cancellation/resume and read-only uncertain-write reconciliation. Inventory CSV uses server-side private filtering and details distinguish null/not-supplied, preview provenance, capability truncation and exact association outcomes. Administrator sees the import panel within **Official usage** without gaining aggregate, user-report or investigation data. Report storage, expiry and logout behavior are unchanged.
+
+Defender hunting has two separate finite authorizations. An exact successful query-version-3 qualification is valid for 24 hours and is required before every new provider send. The same Administrator plus SecurityReader approval creates an exact 30-day retained-scope authorization, which lets a current SecurityReader read only the bound saved history, counts, rows and CSV while the provider is unavailable or the 24-hour proof has expired. Revoking that exact retained scope hides the bound saved data immediately without deleting it. Delegated data remains principal-private; application-mode data may be shared only under the exact current enabled application scope and configuration revision. This local authorization cannot discover an external Defender RBAC/data-source revocation while offline, so it must not be represented as proof of current provider visibility. See [docs/defender-agent365-hunting.md](docs/defender-agent365-hunting.md) for the source/projection allowlists, dynamic-detail limitations, 15-minute job deadline and `rootSpanObserved` boundary.
+
+## Container Validation
+
+`-Action Test` builds the operator, creates a separately named `agentcontrol_test_*` PostgreSQL database, runs the following baseline and drops only guarded fixture databases. It never uses rollback-only isolation against demo data:
 
 ```text
-https://<static-web-app-host>/api/auth/callback
-```
-
-Before production deployment, the platform or application administrator must prepare:
-
-- An existing Microsoft Entra app registration configured as a web app.
-- A production redirect URI on that app registration: `https://<static-web-app-host>/api/auth/callback`.
-- Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` on that app registration, with tenant-wide admin consent granted.
-- An existing RBAC-enabled Azure Key Vault in the deployment resource group.
-- Existing Key Vault secrets for the Entra app client secret and Express session secret. The script defaults to `agent-control-client-secret` and `agent-control-session-secret`, but you can pass different secret names when running it.
-
-### Create the production Key Vault
-
-Create the vault in the same resource group that you will pass to `deploy-production.ps1`, then use these settings:
-
-- **Basics**: use the deployment subscription and resource group. Standard pricing is sufficient. Enable purge protection for a production vault if it matches your organization's recovery policy; after it is enabled, it cannot be disabled.
-- **Access configuration**: select **Azure role-based access control**. Leave **Azure Virtual Machines for deployment**, **Azure Resource Manager for template deployment**, and **Azure Disk Encryption for volume encryption** unchecked. Agent Control does not use those legacy resource-access options.
-- **Networking**: choose the deployment mode that matches your organization's policy.
-
-| Mode    | Script parameter                                      | Key Vault configuration                                             | Additional resources                                                                               |
-| ------- | ----------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Public  | `-KeyVaultNetworkAccess Public` or omit the parameter | Public access enabled from all networks                             | None                                                                                               |
-| Private | `-KeyVaultNetworkAccess Private`                      | Public access disabled by the script after private resources deploy | VNet, two subnets, private endpoint, private DNS zone, VNet link, and App Service VNet integration |
-
-Public mode is the backward-compatible default. Public reachability does not make secrets anonymous: Microsoft Entra authentication and Key Vault RBAC are still required. Private mode adds network isolation so the Key Vault data-plane endpoint is reachable by the application through the VNet and private endpoint. It has a small additional Azure cost for the private endpoint and Private DNS usage.
-
-Private mode uses `10.42.0.0/24` by default, with `10.42.0.0/26` delegated to App Service and `10.42.0.64/27` used for private endpoints. Override all three prefixes when those ranges conflict with connected or peered networks. The subnets must be contained by the VNet address space and must not overlap.
-
-Organizational Azure Policy may force Key Vault public access to remain disabled. Use private mode in that environment. Tenant-specific policy exemptions or bypass tags are not created, removed, or relied upon by this repository.
-
-After the vault is created:
-
-1. Give the administrator who will add the secret values a data-plane role such as **Key Vault Secrets Officer** on the vault. Creating the vault or having resource deployment permissions does not necessarily grant permission to create secrets when Azure RBAC is selected.
-2. Under **Objects** > **Secrets**, create `agent-control-client-secret`. Use the Entra app registration client secret **Value**, not its Secret ID.
-3. Create `agent-control-session-secret` with a separate cryptographically random value. A generated value of at least 32 random bytes is appropriate; do not reuse the Entra client secret. Generate a Base64-encoded value on macOS, Linux, WSL, or Git Bash with OpenSSL installed:
-
-   ```bash
-   openssl rand -base64 32
-   ```
-
-   On native Windows, use PowerShell 7 (`pwsh`):
-
-   ```powershell
-   [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-   ```
-
-   Store the command output as the Key Vault secret value.
-
-4. Keep both secrets enabled. The deployment script references the latest enabled version because the Bicep references do not pin a secret version.
-
-You do not need to grant the future App Service access manually. During deployment, Bicep enables its system-assigned managed identity and assigns that identity the least-privilege **Key Vault Secrets User** role on this vault.
-
-### Recommended deployment: PowerShell script
-
-Use `deploy-production.ps1` for normal deployments. It works from Windows, macOS, or Linux with PowerShell 7, Azure CLI, and Node.js 24 or newer installed. It opens the Azure browser sign-in flow if you are not already signed in, validates the app, runs Bicep, deploys the backend App Service package, deploys the Static Web Apps frontend, and smoke-tests `/api/health`.
-
-1. Prepare the Azure and Entra prerequisites.
-
-   Confirm that the Entra app registration already exists. For a new production deployment, create the target Azure resource group first, then create an RBAC-enabled Key Vault in that resource group with secrets for the Entra app client secret and Express session secret. The deployment script defaults to `agent-control-client-secret` and `agent-control-session-secret`. It does not create the vault or write secrets; it expects the vault to exist in the same resource group that you pass to the script.
-
-2. Install local deployment tools.
-
-   Install these tools on the machine where you will run the deployment:
-   - PowerShell 7 or newer: https://learn.microsoft.com/powershell/scripting/install/installing-powershell
-   - Azure CLI: https://learn.microsoft.com/cli/azure/install-azure-cli
-   - Node.js 24 or newer: https://nodejs.org/
-
-3. Download or clone this repository.
-
-   You do not need a GitHub account to deploy. Download the repository as a ZIP file, or clone it if you already use Git. Open a terminal in the repository root folder.
-
-4. Confirm your Azure permissions.
-
-   The account that runs the script needs permission to deploy into the target resource group and grant the backend App Service managed identity `Key Vault Secrets User` on the existing vault, such as Owner or User Access Administrator at the vault or resource-group scope. Private mode also requires permission to create virtual network, private endpoint, and private DNS resources and to disable public network access on the existing vault. The script does not need permissions to create Key Vaults, write Key Vault secrets, create app registrations, change app registration redirect URIs, add Graph permissions, or grant tenant-wide admin consent.
-
-5. Run the deployment script.
-
-   The script prompts for any missing values. To provide all values up front, run:
-
-   `NamePrefix` is used to generate Azure resource names, such as `<prefix>-prod-swa` and `<prefix>-prod-api`. The script defaults to `agent-control`, so you can omit `-NamePrefix` for a simple first deployment. If Azure reports a resource-name collision, or if your organization requires a naming convention, rerun the script with a short lowercase prefix such as `<org>-agent-control`.
-
-   `Location` defaults to the Azure region of the target resource group and controls the backend App Service, App Service plan, and Application Insights. `StaticWebAppLocation` is independent and defaults to `westeurope`, one of the regions supported by Azure Static Web Apps. The template does not create an Azure Function App; the Static Web Apps resource still requires its own supported location even though staging environments are disabled and the backend is a linked App Service.
-
-   Azure validates App Service worker quota during the Bicep deployment preflight. If the subscription does not have enough B1 quota in `Location`, the script stops with region-specific `az quota` commands and the minimum limit reported by Azure. It does not request quota automatically: quota changes require subscription-level permissions, may be governed centrally, and can require Azure approval. Quota allocation is free, but the App Service plan created after approval is billable.
-
-   On the first deployment, App Service can briefly start before ZipDeploy has populated `/home/site/wwwroot`. Azure CLI's Linux startup tracker may retain that empty-site failure even after OneDeploy succeeds and the packaged backend starts. Kudu can also recycle while handling a synchronous deployment request and return a transient 502 after accepting the ZIP. The script submits ZipDeploy asynchronously, retries only transient 502/503/504 submission failures, and polls Kudu's deployment record for up to 15 minutes. After Kudu reports success, it deploys the frontend and retries `https://<static-web-app-host>/api/health` for up to 10 minutes. The health check must return `{ "ok": true }` before deployment is reported as complete.
-
-   Frontend deployment does not change or override npm configuration. The script reads Microsoft's stable native `StaticSitesClient` release metadata from `https://aka.ms/swalocaldeploy`, downloads the platform binary from the published Azure Front Door URL, verifies its SHA-256 checksum, and caches it in the operating system's temporary directory by build ID. The Static Web Apps deployment token is passed through a temporary process environment variable and is removed or restored immediately afterward; it is never included in the command line or deployment exception text.
-
-   The linked backend enables App Service Authentication for the Azure Static Web Apps provider. A direct request to `https://<backend-app>.azurewebsites.net/api/health` returning `401` is expected; use the Static Web Apps URL to test the application. This prevents callers from bypassing the frontend route to access the backend directly.
-
-   ```powershell
-   pwsh ./deploy-production.ps1 `
-      -SubscriptionId "<subscription-id>" `
-      -TenantId "<tenant-id>" `
-      -ResourceGroupName "<resource-group-name>" `
-      -EnvironmentName "prod" `
-      -AppRegistrationClientId "<existing-entra-app-client-id>" `
-      -KeyVaultName "<existing-key-vault-name>" `
-      -ClientSecretName "agent-control-client-secret" `
-      -SessionSecretName "agent-control-session-secret"
-   ```
-
-   For private Key Vault access, add:
-
-   ```powershell
-   -KeyVaultNetworkAccess Private
-   ```
-
-   To override the dedicated network ranges, also pass `-VirtualNetworkAddressPrefix`, `-AppServiceIntegrationSubnetPrefix`, and `-PrivateEndpointSubnetPrefix`. The script creates the private network path first, disables the vault public endpoint, and then requires both App Service Key Vault references to report `Resolved` before application deployment continues.
-
-   On Windows PowerShell 7, use the same command from the repository root. If your shell starts in Windows PowerShell 5.1, run `pwsh` first or launch **PowerShell 7** from the Start menu.
-
-6. Confirm the production redirect URI.
-
-   After the first run, the script prints the Static Web Apps URL and expected Entra redirect URI. Add this redirect URI to the existing Entra app registration if it is not already present:
-
-   ```text
-   https://<static-web-app-host>/api/auth/callback
-   ```
-
-7. Rerun and test.
-
-   Rerun the script so the deployed backend `REDIRECT_URI` and the Entra app registration match before testing sign-in. Open the Static Web Apps URL and sign in with an admin account that can manage Copilot packages.
-
-### Direct Bicep deployment: infrastructure only
-
-Use Bicep directly only when you want to create or update Azure hosting resources without deploying application code. This is useful for platform teams that validate infrastructure separately from app release automation.
-
-```bash
-az login
-az account set --subscription <subscription-id>
-
-az group create \
-   --name <resource-group-name> \
-   --location <azure-region>
-
-az deployment group create \
-   --resource-group <resource-group-name> \
-   --template-file infra/main.bicep \
-   --parameters \
-      environmentName=<dev|test|prod> \
-      location=<azure-region> \
-      staticWebAppLocation=<static-web-apps-region> \
-      namePrefix=<globally-unique-prefix> \
-      tenantId=<tenant-id> \
-      appRegistrationClientId=<existing-entra-app-client-id> \
-      keyVaultName=<existing-key-vault-name> \
-      keyVaultNetworkAccess=<Public|Private> \
-      clientSecretName=<client-secret-name> \
-      sessionSecretName=<session-secret-name>
-```
-
-When using direct Bicep deployment with `keyVaultNetworkAccess=Private`, Bicep creates the private network path but does not modify the existing Key Vault resource. After the deployment succeeds, disable its public endpoint with `az keyvault update --public-network-access Disabled`, refresh the App Service Key Vault references, and confirm both report `Resolved`. The PowerShell deployment script performs these steps automatically.
-
-You can also copy or edit [infra/main.bicepparam](infra/main.bicepparam) and pass it instead of inline parameters:
-
-```bash
-az deployment group create \
-   --resource-group <resource-group-name> \
-   --template-file infra/main.bicep \
-   --parameters infra/main.bicepparam
-```
-
-The Bicep deployment outputs `staticWebAppName`, `staticWebAppUrl`, `backendAppName`, `backendAppResourceId`, `backendAppUrl`, `redirectUri`, and `keyVaultNetworkAccess`. It does not deploy `frontend/dist` or `backend/dist`.
-
-If you deploy code manually after running Bicep, build first:
-
-```bash
-npm ci
 npm run test --workspace backend
 npm run test --workspace frontend
 npm run typecheck --workspace backend
@@ -287,98 +219,71 @@ npm run lint --workspace frontend
 npm run build
 ```
 
-Package and deploy the backend:
+These commands are invoked inside Docker by [backend/scripts/test-all.ts](backend/scripts/test-all.ts). For a focused check, build `docker build --target operator -t agent-control-operator:local .`, use the same secret/network mounts as the importer, point `PGDATABASE` at a separately created `agentcontrol_test_*` control database, and override the entrypoint with `--entrypoint npm` followed by `run test --workspace backend -- <test-path>`. Remove that exact fixture database afterward, never `agentcontrol`. The `test` target also supports non-database frontend/type checks with `docker run --rm <test-image> npm run ...`.
 
 ```bash
-rm -rf backend-package backend.zip
-mkdir -p backend-package/backend backend-package/frontend
-cp package-lock.json package.json backend-package/
-cp backend/package.json backend-package/backend/package.json
-cp frontend/package.json backend-package/frontend/package.json
-cp -R backend/dist backend-package/backend/dist
-(cd backend-package && npm ci --omit=dev --workspace backend)
-rm -rf backend-package/frontend
-(cd backend-package && zip -qr ../backend.zip .)
-
-az webapp deploy \
-   --resource-group <resource-group-name> \
-   --name <backendAppName-output> \
-   --src-path backend.zip \
-   --type zip
+pwsh -NoProfile -File scripts/local-deployment.tests.ps1
+pwsh -NoProfile -File scripts/restart-runtime.tests.ps1 -Project agent-control
+pwsh -NoProfile -File scripts/persistence.tests.ps1 -Project agent-control
+docker run --rm --network agent-control_default agent-control-operator:local \
+  backend/scripts/package-smoke.ts http://app:3001
+docker build --target browser-test -t agent-control-browser .
+docker run --rm --network agent-control_default \
+  --mount "type=bind,source=$PWD/artifacts,target=/evidence" agent-control-browser
+git diff --check
 ```
 
-For production frontend deployment, use `deploy-production.ps1` rather than invoking the npm-distributed Static Web Apps CLI manually. The script performs the frontend build and uploads `frontend/dist` with the checksum-verified native client described above.
+The restart harness uses guarded synthetic databases on the same project volume, the actual runtime image and a test-only bind-mounted provider fixture; it removes fixture containers/databases. It never installs an auth bypass. The minimal disposable Playwright stage checks the unconfigured built app at desktop/mobile sizes and writes screenshots under ignored `artifacts/` (create that directory first). Its bridge origin is `http://app:3001`, corresponding to canonical host `http://localhost:3001`. No host Node/browser automation is required; VS Code may report missing host Vite types until attached to a container, and container type checks are authoritative.
 
-The backend keeps the current SQLite audit log for this first deployment. It is configured to write under `/home/data/agent-control`, which is persistent App Service storage. Keep the App Service scaled to one instance unless you move audit logging and session state to shared Azure services.
+### Permission Center Qualification
 
-## Usage Report Import
+Reuse the retained local project, without resetting its volume or rotating secrets:
 
-Agent Control works without report files. If no usage reports are imported, the app lists Copilot packages and supports block/unblock exactly as before.
+```powershell
+pwsh -NoProfile -File ./deploy-local.ps1 -Project agent-control-phase01
+pwsh -NoProfile -File ./scripts/permission-browser.tests.ps1 -Project agent-control-phase01
+```
 
-To enrich the package list and user access view with last activity, active users, responses sent, creator type, and user drilldown data:
+The second command builds the `permission-browser-test` target and runs [backend/scripts/browser-fixture.browser.ts](backend/scripts/browser-fixture.browser.ts) through its dedicated Vitest configuration. A disposable container contains the **built** React app, real Express API/routes/policy/capability repository, isolated PostgreSQL session/evidence data, Chromium and axe. PostgreSQL is reached as `postgres` over `agent-control-phase01_default`. App and browser share **http://localhost:3001 inside that container**, with no published fixture port and no access to the demo app's browser origin/storage. The retained demo remains at **http://localhost:3001 on the host**.
 
-1. Obtain these three Microsoft 365 Copilot usage report CSV exports for the same period, typically 30 days:
-   - **Agents**: agent-level metrics used for Agent view enrichment and inactive-agent filtering.
-   - **Users & agents**: per-user, per-agent rows used by agent details and User view access history.
-   - **Users**: user-level summary rows used by User view summary metrics.
-2. In Agent Control, use **Import CSVs** and select one, two, or all three exported CSV files.
+The script creates one random `agentcontrol_test_*` control database; the test helper creates and migrates a second random fixture database, using the existing restricted app password without changing it. Auth and provider HTTP behavior are deterministic test-only mocks, with outbound browser/provider requests blocked. There are no live provider grants, writes or credentials. The fixture requires `NODE_ENV=test` and `AGENT_CONTROL_FIXTURE_MODE=browser`; ordinary runtime configuration rejects that marker in every environment. The fixture entry point, mocks, browsers and dev dependencies are excluded from production artifacts.
 
-The app has two primary views. **Agent view** lists current Copilot packages from the Graph package API, enriched with imported report data when available. **User view** starts with users, then shows every agent access row found for the selected user in the **Users & agents** CSV. The User view combines the **Users** CSV with bridge-only usernames from the **Users & agents** CSV so a user is not hidden just because they are missing from one export.
+[frontend/browser/permissions.spec.ts](frontend/browser/permissions.spec.ts) exercises every status, exact requirement text, role separation, current-principal evidence, explicit refresh, consent cancellation, stale saved data, direct denied API writes, loading, errors, keyboard focus and mobile overflow. Axe runs WCAG A/AA checks including rendered contrast at **1440x1000** and **360x780**. Synthetic-only viewport/row screenshots and the JSON report are written under `artifacts/phase03/`. No traces containing auth transactions are retained.
 
-The **Agents** CSV is the canonical source for agent-level metrics. The **Users & agents** CSV is used for drilldown, User view access history, and as a fallback if the Agents CSV has not been imported. The **Users** CSV is used for user summary context.
-
-The app matches imported report rows to listed packages by `Agent ID`. Report-only rows that do not match a package are shown as unmatched diagnostics and are not blockable. Package rows without imported report data remain visible and manageable.
-
-The inactive filter uses **Last activity date (UTC)** from the imported report. Active user and response counts belong to the selected report period, so an agent can have `0` responses in a 30-day export while still having a known older last activity date. User view includes `0`-response **Users & agents** rows as access history by default and separately shows response-producing agent counts.
-
-## Useful Commands
+Exact focused component/DOM-axe command, after the operator image is built:
 
 ```bash
-npm run build
-npm run test
-npm run lint
-npm run dev --workspace backend
-npm run dev --workspace frontend
+docker run --rm --entrypoint npm agent-control-phase01-operator:local \
+  run test --workspace frontend -- src/components/PermissionCenter.test.tsx \
+  src/capabilityState.test.ts src/useCapabilities.test.tsx src/authorization.test.ts
 ```
 
-## API Behavior
+[frontend/vitest.config.ts](frontend/vitest.config.ts) runs React Testing Library in jsdom, with API-client HTTP fixtures. DOM axe disables only contrast, which Chromium checks. Native details/dialog keyboard behavior is qualified in Chromium, not simulated by jsdom. These tests are also part of the aggregate frontend suite. Run the normal aggregate with `pwsh ./deploy-local.ps1 -Action Test -Project agent-control-phase01`.
 
-- `GET /api/agents` lists packages filtered to `supportedHosts` containing `Copilot`.
-- `GET /api/agents/:id` gets package details.
-- `PATCH /api/agents/:id/access` replaces one package's Available to or Installed for collection.
-- `POST /api/agents/access` starts a bulk Add or Replace access job for selected packages.
-- `GET /api/directory/principals` searches users, security groups, and Microsoft 365 groups.
-- `POST /api/directory/principals/resolve` resolves package assignment IDs for display.
-- `GET /api/agents/bulk-jobs/:id` returns progress and results for a bulk job.
-- `POST /api/agents/block` starts a selected-ID bulk block job.
-- `POST /api/agents/unblock` starts a selected-ID bulk unblock job.
-- `POST /api/agents/:id/block` blocks one package.
-- `POST /api/agents/:id/unblock` unblocks one package.
-- `POST /api/agents/block-all` blocks all currently listed unblocked agents.
-- `POST /api/agents/unblock-all` unblocks all currently listed blocked agents.
-- `GET /api/audit/events` lists persisted block, unblock, availability, and installation audit events.
-- `GET /api/auth/login`, `GET /api/auth/callback`, and `POST /api/auth/logout` handle sign-in and sign-out.
+Normal success or assertion failure closes the fixture server/session store, drops its fixture database, removes the disposable container (`--rm`), and drops the control database in PowerShell `finally`. Only the two normal Compose services remain. On hard host/container interruption, use the printed `isolated_browser_fixture` database name and the exact control name from that run to inspect and remove those guarded targets only; never bulk-delete databases, volumes, or project secrets. Reruns use new database/container names.
 
-Usage report import is handled in the browser from local CSV files. It does not add backend report endpoints and does not call Microsoft Graph for report data.
+## Package Feed And Export
 
-Bulk actions are best effort. The backend returns succeeded, skipped, and failed entries so partial failures are visible. Access **Add** reads each package, merges and deduplicates the selected principals, and skips packages that already contain them. It also skips an all-user scope because the selected principals already have access, and fails safely when Graph does not return enough information to distinguish an empty scope from a broad one. To match the documented beta API example, each PATCH sends both writable collections: the selected collection is changed and the other collection is preserved from the package detail response. If Graph omits the unselected collection, the app refuses the write rather than risk clearing it.
+Dependency, test, operator and browser build stages select the approved **`https://packagefeedproxy.microsoft.io/npm/`** registry automatically. Runtime receives no registry credentials. Stock Node maintenance containers must pass that setting explicitly:
 
-After Graph returns `204 No Content` for an access PATCH, Agent Control reads the package again, verifies the requested effective `all`/`some`/`none` scope and principal collection, and confirms that the unselected access setting was preserved. Graph can accept a collection update without changing an existing All users scope. In that case, Agent Control reports `access_update_not_applied`, keeps the editor open, and records a failed audit event instead of claiming success. The documented API does not provide a writable `availableTo` or `deployedTo` property to force that scope transition.
+```bash
+docker run --rm -e NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/ \
+  --mount "type=bind,source=$PWD,target=/app" -w /app node:24-bookworm-slim \
+  npm install --package-lock-only --ignore-scripts
+```
 
-The access editor supports individual users, security groups, Microsoft 365 groups, and clearing a collection with **No users**. Microsoft Graph reports `all`, `some`, or `none` through `availableTo` and `deployedTo`, but the update API documents only the user/group collections as writable. **All users** remains disabled because Microsoft does not document a supported write payload; the app does not substitute a tenant-wide group for that state.
+When feed authentication is required, use company onboarding and the optional BuildKit `--secret "id=npmrc,src=$HOME/.npmrc"` supported by install/prune stages. Never put credentials in build arguments or disable TLS/Defender. This is npm registry configuration for this project, not a Docker-wide network policy or a redirect for image/OS downloads.
 
-## Audit Log
+```bash
+docker build --platform linux/amd64 --target export --output type=local,dest=artifacts .
+docker run --rm --network agent-control_default \
+  --mount "type=bind,source=$PWD/artifacts,target=/evidence,readonly" \
+  agent-control-operator:local backend/scripts/package-smoke.ts \
+  http://app:3001 /evidence/agent-control-linux-x64.zip
+```
 
-The backend records block, unblock, availability, and installation attempts before sending the corresponding Graph mutation. Each audit event includes the agent ID, optional display name when available, action, signed-in actor, tenant ID, timestamps, final status, and failure message when Graph rejects the change. Access events also record the target, mutation mode, scope, principals, and principal counts before and after the change.
+[Dockerfile](Dockerfile) uses Node 24, compiles both workspaces, and exports `artifacts/agent-control-linux-x64.zip` from the same release tree. Linux/x64 checks reject an ARM-target export. The ZIP starts with `npm start` (one `node backend/dist/server.js` process), includes production dependencies and built assets, and excludes tests, operator scripts, SQLite data and local credentials. API/auth routing precedes static fallback; immutable hashed assets and no-store HTML have separate caching.
 
-Signed-in users can review these records in the **Audit log** tab. The tab loads the newest events from `GET /api/audit/events`, supports refresh, and filters by action, result, agent, user, or operation ID.
+## Production Boundary
 
-The audit log is a local SQLite database. This keeps development and a first Azure deployment simple, but it assumes a single writable backend instance. For Azure production usage with this storage mode, deploy the backend as a single-instance App Service and point `AGENT_CONTROL_DATA_DIR` at persistent App Service storage under `/home`. If you later need backend scale-out, multiple container replicas, or stronger compliance retention, move the audit service to Azure Table Storage or append blobs instead of sharing one SQLite file across instances.
-
-The default `backend/data/` location survives normal `git pull` operations because it is ignored by Git. It will not survive deployment processes that delete the entire repository directory, so use an outside-repo or Azure persistent path for anything important.
-
-## Disclaimer
-
-This project is provided as-is, without warranty of any kind. Use it at your own discretion and validate it in your own environment before relying on it for administrative workflows.
-
-For more information, visit https://candede.com.
+Production has one code path: [deploy-azure.ps1](deploy-azure.ps1), the [approved-target contract](infra/production-target.example.json), and [Bicep](infra/main.bicep). It deploys the same tested Linux/x64 ZIP to one Linux B1 App Service and one PostgreSQL 17 Flexible Server (`Standard_B1ms`, 32 GiB, seven-day backups), using five versioned runtime references from an existing prepared vault. The administrator database secret remains bootstrap-only. Resource deployment starts in maintenance and is stopped before bootstrap; opening follows contained smoke and human authentication evidence. Monitoring exports only redacted application console events plus aggregate metrics, never raw HTTP/IP/URL or PostgreSQL query/session logs; backup health requires an exact receipt-bound restore-point probe rather than the backup-storage cost metric. The script requires an exact target, dated itemized estimate, budget/change/maintenance approval and explicit Burstable POC risk acceptance; examples and mock receipts are not approval or cloud evidence. See [Azure deployment](docs/azure-production-deployment.md) and [disaster recovery](infra/disaster-recovery.md). The removed `deploy-production.ps1`/Static Web Apps path has no compatibility wrapper. No local-only Phase 12 work accessed Azure.

@@ -2,19 +2,18 @@ import type { CopilotPackage } from "./api/client";
 
 type AgentBuiltWithFields = Pick<
   CopilotPackage,
-  "platform" | "shortDescription"
+  "authoringTool" | "platform" | "shortDescription"
 >;
 
 export function getBuiltWithLabel(agent: AgentBuiltWithFields) {
-  const platform =
-    typeof agent.platform === "string" ? agent.platform : undefined;
-  const builtWith = getBuiltUsingValue(agent.shortDescription) ?? platform;
+  const authoritative = typeof agent.authoringTool === "string"
+    ? agent.authoringTool
+    : typeof agent.platform === "string" ? agent.platform : undefined;
 
-  if (!builtWith) {
-    return undefined;
-  }
+  if (authoritative) return formatBuiltWithValue(authoritative);
 
-  return formatBuiltWithValue(builtWith);
+  const packageHint = getBuiltUsingValue(agent.shortDescription);
+  return packageHint ? `Package hint: ${formatBuiltWithValue(packageHint)}` : undefined;
 }
 
 export function formatBuiltWithLabel(agent: AgentBuiltWithFields) {

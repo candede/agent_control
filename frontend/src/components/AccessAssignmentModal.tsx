@@ -15,6 +15,9 @@ import {
   type AccessScopeSelection,
 } from "../accessScope";
 import { PrincipalPicker } from "./PrincipalPicker";
+import { WorkbenchActionGate } from "../workbenchActionContext";
+import { useCapabilityContext } from "../capabilityContext";
+import { providerActionAllowed, capabilityExplanation } from "../capabilityState";
 
 type AccessAssignmentModalProps = {
   context: "single" | "bulk";
@@ -37,6 +40,9 @@ export function AccessAssignmentModal({
   onCancel,
   onSubmit,
 }: AccessAssignmentModalProps) {
+  const capabilities = useCapabilityContext();
+  const directory = capabilities.views.find(view => view.definition.id === "graph.directory.read");
+  const directoryAllowed = providerActionAllowed(directory, false, capabilities.now);
   const initialScope = getInitialAccessScope(initialStatus, initialPrincipals);
   const [target, setTarget] = useState<PackageAccessTarget>(initialTarget);
   const [mode, setMode] = useState<PackageAccessMutationMode>("replace");
@@ -81,7 +87,7 @@ export function AccessAssignmentModal({
   }, [busy, onCancel, submitting]);
 
   useEffect(() => {
-    if (initialScope !== "specific" || initialPrincipals.length === 0) {
+    if (!directoryAllowed || initialScope !== "specific" || initialPrincipals.length === 0) {
       return;
     }
 
@@ -108,7 +114,7 @@ export function AccessAssignmentModal({
     return () => {
       cancelled = true;
     };
-  }, [initialPrincipals, initialScope]);
+  }, [initialPrincipals, initialScope, directoryAllowed]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
@@ -357,7 +363,7 @@ export function AccessAssignmentModal({
                   </div>
                   <span>{selected.length} selected</span>
                 </div>
-                {resolving ? (
+                {!directoryAllowed ? <p role="status">{directory ? capabilityExplanation(directory, capabilities.now) : "Directory capability is unavailable."}</p> : resolving ? (
                   <p className="access-resolving" role="status">
                     Resolving current assignments...
                   </p>
@@ -407,6 +413,7 @@ export function AccessAssignmentModal({
           >
             Cancel
           </button>
+          <WorkbenchActionGate actionId="packages.access">
           <button
             type="button"
             className={scope === "none" ? "danger" : undefined}
@@ -426,6 +433,7 @@ export function AccessAssignmentModal({
                 ? "Confirm and apply"
                 : "Apply"}
           </button>
+                  </WorkbenchActionGate>
         </footer>
       </section>
     </div>

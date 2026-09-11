@@ -11,6 +11,7 @@ import {
   bulkUpdatePackageAccess,
   GraphPackagesClient,
   updatePackageAccess,
+  verifyPackageMutationConverged,
   verifyPackageAccessApplied,
   type FetchLike,
 } from "./graphPackages.js";
@@ -64,6 +65,19 @@ describe("GraphPackagesClient", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
+  it("rejects a hostile pagination link before sending the token", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: [],
+      "@odata.nextLink": "https://unapproved.invalid/v1.0/copilot/admin/catalog/packages",
+    }));
+
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({
+      status: 502,
+      code: "invalid_provider_link",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("retries transient failures while reading package details", async () => {
     const fetcher = vi
       .fn<FetchLike>()
@@ -87,6 +101,70 @@ describe("GraphPackagesClient", () => {
     ).resolves.toMatchObject({ id: "P_1" });
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(retryDelay).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["block", "/beta/copilot/admin/catalog/packages/P_1/block"],
+    ["unblock", "/beta/copilot/admin/catalog/packages/P_1/unblock"],
+  ] as const)("dispatches the documented beta %s operation once", async (action, pathname) => {
+    const fetcher = vi.fn<FetchLike>(async (input, request) => {
+      expect(new URL(input).pathname).toBe(pathname);
+      expect(request?.method).toBe("POST");
+      expect(request?.body).toBeUndefined();
+      expect(new Headers(request?.headers).get("client-request-id")).toBe("correlation-1");
+      return new Response(null, { status: 204 });
+    });
+    const client = new GraphPackagesClient(fetcher);
+    await client[action === "block" ? "blockPackage" : "unblockPackage"]("token", "P_1", { correlationId: "correlation-1" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("uses the documented beta reassignment contract but does not infer owner verification", async () => {
+    const fetcher = vi.fn<FetchLike>(async (input, request) => {
+      expect(new URL(input).pathname).toBe("/beta/copilot/admin/catalog/packages/P_1/reassign");
+      expect(request?.method).toBe("POST");
+      expect(JSON.parse(String(request?.body))).toEqual({ userId: "11111111-1111-4111-8111-111111111111" });
+      return new Response(null, { status: 204 });
+    });
+    await new GraphPackagesClient(fetcher).reassignPackage("token", "P_1", "11111111-1111-4111-8111-111111111111", { correlationId: "correlation-2" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("never retries a mutation dispatch after a provider failure", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ error: { code: "ServiceUnavailable", message: "uncertain" } }, { status: 503 }));
+    await expect(new GraphPackagesClient(fetcher, { maxAttempts: 3, delay: async () => undefined }).blockPackage("token", "P_1", { correlationId: "correlation-3" }))
+      .rejects.toMatchObject({ status: 503, code: "ServiceUnavailable" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("repeats bounded detail reads until a block mutation converges", async () => {
+    let reads = 0;
+    const client = new GraphPackagesClient(async () => {
+      reads += 1;
+      return Response.json({ id: "P_1", displayName: "First", isBlocked: reads >= 3 });
+    });
+    await expect(verifyPackageMutationConverged(client, "token", "P_1", "block", { kind: "block", isBlocked: true }, { maxAttempts: 4, delayMs: 0 })).resolves.toMatchObject({ readbackCount: 3 });
+    expect(reads).toBe(3);
+  });
+
+  it("keeps accepted-but-not-applied state inconclusive after the readback bound", async () => {
+    const client = new GraphPackagesClient(async () => Response.json({ id: "P_1", displayName: "First", isBlocked: false }));
+    await expect(verifyPackageMutationConverged(client, "token", "P_1", "block", { kind: "block", isBlocked: true }, { maxAttempts: 3, delayMs: 0 })).rejects.toMatchObject({
+      code: "verification_inconclusive",
+      details: { lastState: { kind: "block", isBlocked: false }, readbackCount: 3 },
+    });
+  });
+
+  it("propagates an overall readback abort without starting another retry", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn<FetchLike>(async (_input, request) => new Promise((_resolve, reject) => {
+      request?.signal?.addEventListener("abort", () => reject(request.signal!.reason), { once: true });
+    }));
+    const verification = verifyPackageMutationConverged(new GraphPackagesClient(fetcher), "token", "P_1", "block", { kind: "block", isBlocked: true }, { signal: controller.signal });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    controller.abort(new AppError(409, "cancelled", "cancelled"));
+    await expect(verification).rejects.toMatchObject({ code: "cancelled" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("replaces the selected collection and preserves the other collection", async () => {

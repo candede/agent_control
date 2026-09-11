@@ -6,8 +6,8 @@ import type {
   PackageAccessUpdate,
 } from "../api/client";
 import type { ReactNode } from "react";
-
-const showManageAccessActions = false;
+import { WorkbenchActionGate } from "../workbenchActionContext";
+import { PreviewBadge } from "./PermissionCenter";
 
 type BulkProgressBase = {
   total: number;
@@ -56,7 +56,7 @@ export function BulkActions({
   onUnblockAll,
 }: BulkActionsProps) {
   const failedResults =
-    result?.results.filter((item) => item.status === "failed") ?? [];
+    result?.results.filter((item) => item.status === "failed" || item.status === "inconclusive") ?? [];
   const visibleFailures = failedResults.slice(0, 12);
   const hiddenFailureCount = Math.max(
     0,
@@ -68,13 +68,11 @@ export function BulkActions({
     <section className="bulk-panel" aria-label="Bulk actions">
       <div>
         <h2>Tenant-wide controls</h2>
-        <p>
-          Select agents in the table, then run a server-side bulk change with
-          throttling-aware retries.
-        </p>
+        <PreviewBadge />
         <span className="selected-count">{selectedCount} selected</span>
       </div>
       <div className="bulk-buttons">
+        <WorkbenchActionGate actionId="packages.block">
         <button
           className="danger"
           type="button"
@@ -83,6 +81,8 @@ export function BulkActions({
         >
           {busyAction === "block" ? "Blocking selected" : "Block selected"}
         </button>
+        </WorkbenchActionGate>
+        <WorkbenchActionGate actionId="packages.unblock">
         <button
           type="button"
           disabled={disabled || selectedCount === 0}
@@ -92,7 +92,8 @@ export function BulkActions({
             ? "Unblocking selected"
             : "Unblock selected"}
         </button>
-        {showManageAccessActions ? (
+        </WorkbenchActionGate>
+        <WorkbenchActionGate actionId="packages.access">
           <button
             type="button"
             className="secondary"
@@ -104,7 +105,7 @@ export function BulkActions({
               ? "Updating access"
               : "Manage access"}
           </button>
-        ) : null}
+        </WorkbenchActionGate>
       </div>
       {progress ? <BulkProgressMeter progress={progress} /> : null}
       {activityProgress}
@@ -114,6 +115,8 @@ export function BulkActions({
           <span>{result.succeeded} succeeded</span>
           <span>{result.skipped} skipped</span>
           <span>{result.failed} failed</span>
+          <span>{result.results.filter(item => item.status === "inconclusive").length} inconclusive</span>
+          <span>{result.results.filter(item => item.status === "cancelled").length} cancelled</span>
           {sideEffectErrors.length > 0 ? (
             <span>{sideEffectErrors.length} audit/progress errors</span>
           ) : null}
@@ -125,6 +128,7 @@ export function BulkActions({
                   <li key={item.id}>
                     <span>{item.displayName}</span>
                     <small>{item.message}</small>
+                    {item.reconciliationStatus && item.reconciliationStatus !== "not_required" ? <small>Reconciliation: {item.reconciliationStatus.replaceAll("_", " ")}{item.retryEligible ? ". Eligible only for a new explicit preview and confirmation." : ""}</small> : null}
                   </li>
                 ))}
               </ul>

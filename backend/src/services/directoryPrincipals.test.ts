@@ -3,8 +3,14 @@ import {
   buildGroupSearchUrl,
   buildUserSearchUrl,
   DirectoryPrincipalsClient,
+  validateDirectoryUrl,
 } from "./directoryPrincipals.js";
 import type { FetchLike } from "./graphPackages.js";
+
+const userId = "11111111-1111-4111-8111-111111111111";
+const securityGroupId = "22222222-2222-4222-8222-222222222222";
+const microsoft365GroupId = "33333333-3333-4333-8333-333333333333";
+const distributionGroupId = "44444444-4444-4444-8444-444444444444";
 
 describe("DirectoryPrincipalsClient", () => {
   it("escapes directory search terms and bounds selected fields", () => {
@@ -34,7 +40,7 @@ describe("DirectoryPrincipalsClient", () => {
         return Response.json({
           value: [
             {
-              id: "user-1",
+              id: userId,
               displayName: "Adele Vance",
               mail: "adele@example.com",
             },
@@ -45,19 +51,19 @@ describe("DirectoryPrincipalsClient", () => {
       return Response.json({
         value: [
           {
-            id: "group-security",
+            id: securityGroupId,
             displayName: "Security Team",
             groupTypes: [],
             securityEnabled: true,
           },
           {
-            id: "group-m365",
+            id: microsoft365GroupId,
             displayName: "Marketing",
             groupTypes: ["Unified"],
             securityEnabled: false,
           },
           {
-            id: "group-distribution",
+            id: distributionGroupId,
             displayName: "Newsletter",
             groupTypes: [],
             securityEnabled: false,
@@ -77,7 +83,7 @@ describe("DirectoryPrincipalsClient", () => {
       "user",
     ]);
     expect(
-      result.some((principal) => principal.resourceId === "group-distribution"),
+      result.some((principal) => principal.resourceId === distributionGroupId),
     ).toBe(false);
   });
 
@@ -90,6 +96,12 @@ describe("DirectoryPrincipalsClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("rejects directory requests outside the documented Graph origin and paths", () => {
+    expect(() => validateDirectoryUrl("https://unapproved.invalid/v1.0/users")).toThrowError(expect.objectContaining({ code: "invalid_provider_link" }));
+    expect(() => validateDirectoryUrl("https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages")).toThrowError(expect.objectContaining({ code: "invalid_provider_link" }));
+    expect(() => validateDirectoryUrl("https://user:password@graph.microsoft.com/v1.0/groups")).toThrowError(expect.objectContaining({ code: "invalid_provider_link" }));
+  });
+
   it("uses raw IDs for missing principals but surfaces permission errors", async () => {
     const missingFetcher = vi.fn<FetchLike>(async () =>
       Response.json(
@@ -99,11 +111,11 @@ describe("DirectoryPrincipalsClient", () => {
     );
     const missing = await new DirectoryPrincipalsClient(missingFetcher).resolve(
       "token",
-      [{ resourceType: "user", resourceId: "deleted-user" }],
+      [{ resourceType: "user", resourceId: userId }],
     );
 
     expect(missing[0]).toMatchObject({
-      displayName: "deleted-user",
+      displayName: userId,
       principalKind: "unknown",
     });
 
@@ -116,7 +128,7 @@ describe("DirectoryPrincipalsClient", () => {
 
     await expect(
       new DirectoryPrincipalsClient(forbiddenFetcher).resolve("token", [
-        { resourceType: "group", resourceId: "group-1" },
+        { resourceType: "group", resourceId: securityGroupId },
       ]),
     ).rejects.toMatchObject({
       status: 403,
@@ -127,7 +139,7 @@ describe("DirectoryPrincipalsClient", () => {
   it("preserves existing unsupported group labels during resolution", async () => {
     const fetcher = vi.fn<FetchLike>(async () =>
       Response.json({
-        id: "group-distribution",
+        id: distributionGroupId,
         displayName: "Newsletter",
         groupTypes: [],
         securityEnabled: false,
@@ -136,7 +148,7 @@ describe("DirectoryPrincipalsClient", () => {
 
     const [resolved] = await new DirectoryPrincipalsClient(fetcher).resolve(
       "token",
-      [{ resourceType: "group", resourceId: "group-distribution" }],
+      [{ resourceType: "group", resourceId: distributionGroupId }],
     );
 
     expect(resolved).toMatchObject({
@@ -158,7 +170,7 @@ describe("DirectoryPrincipalsClient", () => {
     });
     const principals = Array.from({ length: 24 }, (_, index) => ({
       resourceType: "user",
-      resourceId: `user-${index}`,
+      resourceId: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
     }));
 
     const result = await new DirectoryPrincipalsClient(fetcher).resolve(
@@ -168,5 +180,22 @@ describe("DirectoryPrincipalsClient", () => {
 
     expect(result).toHaveLength(24);
     expect(peakRequests).toBeLessThanOrEqual(8);
+  });
+
+  it("rejects duplicate requests and exact identity redirection", async () => {
+    const redirected = vi.fn<FetchLike>(async () => Response.json({
+      id: "99999999-9999-4999-8999-999999999999",
+      displayName: "Different user",
+    }));
+    const client = new DirectoryPrincipalsClient(redirected);
+
+    await expect(client.resolve("token", [
+      { resourceType: "user", resourceId: userId },
+      { resourceType: "user", resourceId: userId.toUpperCase() },
+    ])).rejects.toMatchObject({ code: "duplicate_principal" });
+    expect(redirected).not.toHaveBeenCalled();
+
+    await expect(client.resolve("token", [{ resourceType: "user", resourceId: userId }]))
+      .rejects.toMatchObject({ code: "principal_identity_mismatch" });
   });
 });

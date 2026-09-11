@@ -16,17 +16,26 @@
   },
   "dependencies": {
     "@azure/msal-node": "^5.3.1",
+    "@types/multer": "^2.2.0",
+    "connect-pg-simple": "^10.0.0",
     "cors": "^2.8.5",
+    "csv-parse": "^7.0.2",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "express-session": "^1.18.2",
-    "helmet": "^8.1.0"
+    "helmet": "^8.1.0",
+    "multer": "^2.3.0",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
+    "@kusto/language-service-next": "12.4.1",
+    "@types/connect-pg-simple": "^7.0.3",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/express-session": "^1.18.2",
     "@types/node": "^24.13.2",
+    "@types/pg": "^8.15.6",
+    "fflate": "^0.8.2",
     "tsx": "^4.21.0",
     "typescript": "~6.0.2",
     "vitest": "^4.0.16"

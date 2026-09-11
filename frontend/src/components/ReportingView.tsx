@@ -1,4 +1,3 @@
-import { useMemo } from "react";
 import {
   Bar,
   BarChart,
@@ -12,21 +11,20 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { CopilotPackage } from "../api/client";
-import {
-  buildReportingSummary,
-  type ReportingTopAgent,
-  type ReportingTopUser,
-  type ReportingUsageReports,
-  type ReportingValue,
-} from "../reportingModels";
+import type {
+  OfficialUsageAggregateView,
+  OfficialUsageTopAgent,
+  OfficialUsageTopUser,
+  OfficialUsageUserView,
+  OfficialUsageValue,
+} from "../../../backend/src/types/officialUsage";
 
 type ReportingViewProps = {
   activityWindowDays: number;
-  agents: CopilotPackage[];
+  data?: OfficialUsageAggregateView;
   inactiveDays: number;
   onActivityWindowDaysChange: (activityWindowDays: number) => void;
-  reports: ReportingUsageReports;
+  userData?: OfficialUsageUserView;
 };
 
 const chartColors = [
@@ -43,25 +41,26 @@ const chartColors = [
 
 export function ReportingView({
   activityWindowDays,
-  agents,
+  data,
   inactiveDays,
   onActivityWindowDaysChange,
-  reports,
+  userData,
 }: ReportingViewProps) {
-  const summary = useMemo(
-    () =>
-      buildReportingSummary({
-        activityWindowDays,
-        agents,
-        inactiveDays,
-        reports,
-      }),
-    [activityWindowDays, agents, inactiveDays, reports],
-  );
+  if (!data) return <div className="screen-state">Loading official usage...</div>;
+  const summary = data.summary;
   const hasCatalog = summary.catalog.totalAgents > 0;
 
   return (
     <section className="reporting-view" aria-label="Agent insights dashboard">
+      <section className="official-usage-lineage" aria-label="Official usage lineage">
+        <div><span>Authority</span><strong>{data.authority}</strong></div>
+        <div><span>State</span><strong>{formatAvailability(data.availability)}</strong></div>
+        <div><span>Source period</span><strong>{data.activeSet ? `${data.activeSet.reportingPeriod.startDate} to ${data.activeSet.reportingPeriod.endDate}` : "Unavailable"}</strong></div>
+        <div><span>Coverage</span><strong>{data.missingKinds.length ? `Missing ${data.missingKinds.map(formatKind).join(", ")}` : "All three exports"}</strong></div>
+        <div><span>Age / staleness</span><strong>{data.periodAgeDays === null ? "Unknown" : `Period ${data.periodAgeDays} day(s); import ${data.acceptedAgeDays} day(s); stale after either exceeds ${data.staleAfterDays}`}</strong></div>
+        <div><span>Source freshness</span><strong>{data.lineages.length ? data.lineages.map(lineage => `${formatKind(lineage.kind)}: ${lineage.sourceFreshness}`).join("; ") : "Unknown"}</strong></div>
+        <div><span>Versions</span><strong>{data.lineages.map(lineage => `${formatKind(lineage.kind)} ${lineage.fileHash.slice(0, 10)} / ${lineage.schemaVersion} / ${lineage.reportingPeriod.provenance}${lineage.sourceAsOf ? ` / ${lineage.sourceAsOf}` : " / source as-of absent"}${lineage.warnings.length ? ` / ${lineage.warnings.length} warning(s)` : ""}${lineage.supersedesVersionId ? " / superseding" : ""}`).join("; ") || "None"}</strong></div>
+      </section>
       <section
         className="summary-grid report-summary-grid"
         aria-label="Report summary"
@@ -75,12 +74,12 @@ export function ReportingView({
           muted={!summary.usage.hasAgentUsage}
         />
         <Metric
-          label="Responses"
+          label="Responses (Agents report)"
           value={summary.usage.totalResponses}
           muted={!summary.usage.hasAgentUsage}
         />
         <Metric
-          label="Active users"
+          label="Distinct users (dataset union)"
           value={summary.usage.totalActiveUsers}
           muted={!summary.usage.hasAgentUsage}
         />
@@ -124,13 +123,15 @@ export function ReportingView({
         {summary.usage.hasAgentUsage ? (
           <>
             <div className="report-kpi-strip">
+              <SmallStat label="Response total basis" value={summary.usage.totalResponsesBasis === "agents_report" ? "Agents report only" : "Unknown"} />
+              <SmallStat label="Active-user basis" value={summary.usage.totalActiveUsersBasis === "users_and_users_agents_distinct_identity" ? "Distinct Users + Users & agents identities" : "Unknown"} />
               <SmallStat
-                label="Licensed active users"
-                value={summary.usage.licensedActiveUsers}
+                label="Response reconciliation"
+                value={formatComparison(summary.usage.responseReconciliation)}
               />
               <SmallStat
-                label="Unlicensed active users"
-                value={summary.usage.unlicensedActiveUsers}
+                label="Active-user reconciliation"
+                value={formatComparison(summary.usage.activeUserReconciliation)}
               />
               <SmallStat
                 label="Agents without imported usage"
@@ -163,13 +164,13 @@ export function ReportingView({
                 agents={summary.usage.topAgentsByResponses}
               />
               <TopAgentsTable
-                title="Top agents by active users"
+                title="Top agents by distinct active users"
                 agents={summary.usage.topAgentsByActiveUsers}
               />
             </div>
           </>
         ) : (
-          <EmptyReportState message="Import the Agents or Users & agents CSV report to add response totals, active users, inactivity, creator types, and top-agent usage." />
+          <EmptyReportState message="Import and activate Agents, Users & agents, and Users for one compatible period to add official usage." />
         )}
       </section>
 
@@ -274,11 +275,11 @@ export function ReportingView({
             </div>
           </>
         ) : (
-          <EmptyReportState message="Import the Agents or Users & agents CSV report to analyze active agents within a selected activity window." />
+          <EmptyReportState message="Import and activate Agents, Users & agents, and Users for one compatible period to analyze activity." />
         )}
       </section>
 
-      <section
+      {userData ? <section
         className="report-section"
         aria-labelledby="user-reporting-title"
       >
@@ -288,40 +289,40 @@ export function ReportingView({
             <h2 id="user-reporting-title">User engagement</h2>
           </div>
           <span>
-            {summary.usage.hasUserUsage ? "Imported" : "No user import"}
+            {userData.users.count ? "Imported" : "No user import"}
           </span>
         </div>
 
-        {summary.usage.hasUserUsage ? (
+        {userData.users.count ? (
           <>
             <div className="report-kpi-strip">
               <SmallStat
                 label="Imported users"
-                value={summary.users.importedUsers}
+                value={userData.counts.userRows}
               />
               <SmallStat
                 label="Users with access rows"
-                value={summary.users.usersWithAccessRows}
+                value={userData.counts.users}
               />
               <SmallStat
                 label="Responses received"
-                value={summary.users.totalResponsesReceived}
+                value={userData.counts.totalResponsesReceived}
               />
               <SmallStat
                 label="Report-only rows"
-                value={summary.users.reportOnlyRows}
+                value={userData.counts.reportOnlyRows}
               />
               <SmallStat
                 label="Report mismatches"
-                value={summary.users.mismatchCount}
+                value={userData.counts.mismatchCount}
               />
             </div>
-            <TopUsersTable users={summary.users.topUsersByResponses} />
+            <TopUsersTable users={userData.topUsersByResponses} />
           </>
         ) : (
-          <EmptyReportState message="Import the Users and Users & agents CSV reports to add user totals, top users, report-only rows, and mismatch counts." />
+          <EmptyReportState message="Import and activate Agents, Users & agents, and Users for one compatible period to add user totals and comparisons." />
         )}
-      </section>
+      </section> : null}
 
       {!hasCatalog ? (
         <div className="empty-state compact-empty-state">
@@ -339,13 +340,13 @@ function Metric({
   muted,
 }: {
   label: string;
-  value: number;
+  value: number | null;
   muted?: boolean;
 }) {
   return (
     <div className={muted ? "metric report-muted-metric" : "metric"}>
       <span>{label}</span>
-      <strong>{value.toLocaleString()}</strong>
+      <strong>{value === null ? "Unknown" : value.toLocaleString()}</strong>
     </div>
   );
 }
@@ -355,13 +356,13 @@ function SmallStat({
   value,
 }: {
   label: string;
-  value: number | string;
+  value: number | string | null;
 }) {
   return (
     <div className="report-small-stat">
       <span>{label}</span>
       <strong>
-        {typeof value === "number" ? value.toLocaleString() : value}
+        {value === null ? "Unknown" : typeof value === "number" ? value.toLocaleString() : value}
       </strong>
     </div>
   );
@@ -387,7 +388,7 @@ function ChartPanel({
   );
 }
 
-function DonutChart({ data }: { data: ReportingValue[] }) {
+function DonutChart({ data }: { data: OfficialUsageValue[] }) {
   if (!data.length) {
     return (
       <EmptyReportState message="No values returned for this breakdown." />
@@ -421,7 +422,7 @@ function DonutChart({ data }: { data: ReportingValue[] }) {
   );
 }
 
-function VerticalBarChart({ data }: { data: ReportingValue[] }) {
+function VerticalBarChart({ data }: { data: OfficialUsageValue[] }) {
   if (!data.length) {
     return (
       <EmptyReportState message="No values returned for this breakdown." />
@@ -460,7 +461,7 @@ function TopAgentsTable({
   agents,
 }: {
   title: string;
-  agents: ReportingTopAgent[];
+  agents: OfficialUsageTopAgent[];
 }) {
   return (
     <section className="report-table-card">
@@ -473,7 +474,7 @@ function TopAgentsTable({
                 <th>Agent</th>
                 <th>Status</th>
                 <th>Responses</th>
-                <th>Active users</th>
+                <th>Distinct active users</th>
                 <th>Last activity</th>
               </tr>
             </thead>
@@ -486,7 +487,7 @@ function TopAgentsTable({
                   </td>
                   <td>{agent.status}</td>
                   <td>{agent.responses.toLocaleString()}</td>
-                  <td>{agent.activeUsers.toLocaleString()}</td>
+                  <td>{agent.activeUsers === null ? "Unknown" : agent.activeUsers.toLocaleString()}</td>
                   <td>
                     {formatReportDate(agent.lastActivityDateUtc) ?? "Unknown"}
                   </td>
@@ -502,7 +503,7 @@ function TopAgentsTable({
   );
 }
 
-function TopUsersTable({ users }: { users: ReportingTopUser[] }) {
+function TopUsersTable({ users }: { users: OfficialUsageTopUser[] }) {
   return (
     <section className="report-table-card">
       <h3>Top users by responses</h3>
@@ -514,7 +515,7 @@ function TopUsersTable({ users }: { users: ReportingTopUser[] }) {
                 <th>User</th>
                 <th>Responses</th>
                 <th>Agents used</th>
-                <th>Last activity</th>
+                <th>User last activity (Users report)</th>
               </tr>
             </thead>
             <tbody>
@@ -525,9 +526,9 @@ function TopUsersTable({ users }: { users: ReportingTopUser[] }) {
                     <small>{user.username}</small>
                   </td>
                   <td>{user.responses.toLocaleString()}</td>
-                  <td>{user.agentsUsed.toLocaleString()}</td>
+                  <td>{user.agentsUsed.toLocaleString()}<small>Users report</small></td>
                   <td>
-                    {formatReportDate(user.latestActivityDateUtc) ?? "Unknown"}
+                    {formatReportDate(user.userLastActivityDateUtc) ?? "Unknown"}
                   </td>
                 </tr>
               ))}
@@ -579,8 +580,21 @@ function formatDateRange(range?: { earliest: string; latest: string }) {
     : `${earliest} to ${latest}`;
 }
 
-function formatCountRatio(value: number, total: number) {
-  return `${value.toLocaleString()} / ${total.toLocaleString()}`;
+function formatCountRatio(value: number | null, total: number | null) {
+  return value === null || total === null ? "Unknown" : `${value.toLocaleString()} / ${total.toLocaleString()}`;
+}
+
+function formatAvailability(value: OfficialUsageAggregateView["availability"]) {
+  return value.split("_").map(part => part[0].toUpperCase() + part.slice(1)).join(" ");
+}
+
+function formatKind(value: OfficialUsageAggregateView["missingKinds"][number]) {
+  return value === "agents" ? "Agents" : value === "userAgents" ? "Users & agents" : "Users";
+}
+
+function formatComparison(value: OfficialUsageAggregateView["summary"]["usage"]["responseReconciliation"]) {
+  const sources = Object.entries(value.sourceValues).map(([source, count]) => `${source}: ${count === null ? "unavailable" : count.toLocaleString()}`).join("; ");
+  return `${value.status.replace("_", " ")}${value.difference === null ? "" : ` (range ${value.difference.toLocaleString()})`}; ${sources}`;
 }
 
 function clampNumber(

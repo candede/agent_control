@@ -2,128 +2,59 @@
 
 ## Quick Brief
 
-Agent Control is a local admin app for reviewing Microsoft 365 Copilot agents in a tenant, blocking or unblocking them, and managing their Available to and Installed for assignments with Microsoft Graph. It includes a Vite React frontend and an Express backend.
-
-This app requires an Agents 365 license in the tenant. Without the required tenant licensing and Microsoft Graph permission, the app cannot list or manage Copilot agent packages.
+This React client is built into the combined Agent Control Express artifact. The supported local workflow is the repository-root Docker deployment; there is no separate production frontend origin or host Node/Vite requirement.
 
 ## What This App Does
 
-Agent Control helps Microsoft 365 administrators manage Copilot agent availability from a local browser experience. After sign-in, the app lists Copilot-supported packages from Microsoft Graph and shows useful package details such as name, publisher, description, supported hosts, version, and blocked status.
+Agent Control presents saved, explicitly refreshed Microsoft Graph package observations and saved Power Platform inventory. Package list/detail reads use least-privileged delegated or separately approved application read access. Provider actions are capability-gated and never run on navigation.
 
 Admins can use the app to:
 
 - Sign in with a work or school account through Microsoft Entra ID.
-- View Copilot agents available in the tenant.
+- View authorized saved Copilot package observations.
 - Search and filter agents by name, description, publisher, host, ID, or blocked state.
 - Block or unblock a single Copilot agent.
 - Select multiple agents and run bulk block or unblock actions.
-- Edit Available to or Installed for from an agent's details.
-- Add or replace users, security groups, and Microsoft 365 groups across multiple selected agents.
-- Clear an access collection with No users.
+- Inspect Available to and Installed for assignments when authorized.
+- See package access controls disabled with the missing conditional-write protection explained.
+- See owner reassignment disabled with its missing owner-readback/conditional-write contract and Microsoft documentation link.
 - Review bulk action results, including succeeded, skipped, and failed packages.
 
 The browser does not call Microsoft Graph directly. It calls the local Express backend, and the backend calls Microsoft Graph on behalf of the signed-in user.
 
 ## Requirements
 
-- Node.js 24 or newer.
-- An Agents 365 license in the Microsoft 365 tenant.
-- A Microsoft Entra ID app registration.
-- Microsoft Graph delegated permissions `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All` with admin consent.
-- A work or school account that has permission to manage Copilot packages in the tenant.
-- Correct local environment values in `.env` before starting the backend.
+Use the host and identity prerequisites in the [root runbook](../README.md): PowerShell 7, Docker with Compose v2, a browser, and an approved single-tenant Entra application when sign-in is required. Provider permissions are requested per capability rather than granted as one baseline bundle. Microsoft Agent 365 licensing applies to package APIs.
 
-## Microsoft Entra ID App Registration
+## Run Locally
 
-Register an application in Microsoft Entra ID before running the app.
+From the repository root:
 
-Use these settings:
-
-- Platform type: Web.
-- Redirect URI: `http://localhost:3001/api/auth/callback`.
-- Client secret: create a client secret and keep it private.
-- API permissions: Microsoft Graph delegated `CopilotPackages.ReadWrite.All`, `User.ReadBasic.All`, and `Group.Read.All`.
-- Admin consent: grant tenant-wide admin consent for the delegated permission.
-
-The backend also requests standard sign-in scopes such as `openid`, `profile`, `offline_access`, and `User.Read` so it can authenticate the user and keep the session active. The directory scopes support the mixed user and group picker.
-
-## Environment Setup
-
-Create a `.env` file before starting the backend. You can copy the sample file from the repo root:
-
-```bash
-cp .env.example .env
+```powershell
+pwsh -NoProfile -File ./deploy-local.ps1
 ```
 
-Enter the correct values for your tenant and app registration:
-
-```env
-TENANT_ID=your-tenant-id
-CLIENT_ID=your-entra-app-client-id
-CLIENT_SECRET=your-entra-app-client-secret
-SESSION_SECRET=use-a-long-random-value
-REDIRECT_URI=http://localhost:3001/api/auth/callback
-FRONTEND_ORIGIN=http://localhost:5173
-PORT=3001
-```
-
-The backend reads `.env` from either the repo root or the `backend` folder. Make sure the values are correct before starting the backend, especially `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URI`, and `FRONTEND_ORIGIN`.
-
-## Install Dependencies
-
-From the repo root, install all workspace dependencies:
-
-```bash
-npm install
-```
-
-## Start the Backend
-
-Open a terminal and start the backend:
-
-```bash
-cd backend
-npm run dev
-```
-
-By default, the backend runs on `http://localhost:3001`.
-
-## Start the Frontend
-
-Open a second terminal and start the frontend:
-
-```bash
-cd frontend
-npm run dev
-```
-
-By default, the frontend runs on `http://localhost:5173`.
-
-For local testing, use `npm run dev` in both folders and keep both terminals running. The frontend depends on the backend for sign-in, session state, and all Copilot package actions.
+Open `http://localhost:3001`. Build, test, lint, browser automation, Node and npm all run in Docker. See the [root runbook](../README.md) for retained project names, restricted identity secret input, lifecycle actions and isolated database tests.
 
 ## How To Use The App
 
-1. Start the backend from the `backend` folder with `npm run dev`.
-2. Start the frontend from the `frontend` folder with `npm run dev`.
-3. Open `http://localhost:5173` in a browser.
-4. Sign in with a work or school account from the tenant that has the Agents 365 license.
-5. Review the Copilot agent list after the app loads package data from Microsoft Graph.
-6. Use search, publisher filtering, and blocked status filtering to find agents.
-7. Use the action button on a row to block or unblock one agent.
-8. Open an agent's details and use Edit beside Available to or Installed for to replace that collection.
-9. Select multiple rows and choose Manage access to Add or Replace assignments on one setting.
-10. Review the result summary after bulk actions. Failed packages remain selected for retry.
-11. Sign out when finished.
+1. Open `http://localhost:3001` and sign in when identity is configured.
+2. Request only the package read capability needed for the selected delegated/application mode.
+3. Explicitly refresh package observations; navigation itself never calls Microsoft Graph.
+4. Search/filter saved rows and inspect package source, freshness, deployment, block state and assignments according to the current app role.
+5. Use a block/unblock action only when its separate preview qualification is current, review the risk preview, then monitor the durable job and provider verification.
+6. Reconcile an inconclusive item by read only; a new write always requires a new preview and confirmation.
+7. Sign out when finished.
 
 ## Notes
 
-- The app is intended for local admin use during development or tenant administration workflows.
-- Microsoft Graph package block and unblock operations depend on Graph API availability and tenant licensing.
-- Package access updates use a Microsoft Graph beta endpoint. To match its documented request example, the app sends both writable collections while changing the selected collection and preserving the other from package detail.
-- Access updates are verified with a fresh package read after Graph returns `204`. If the requested effective scope or principals did not change, or if the unselected access setting changed, the editor remains open and reports that Graph did not apply the request safely.
-- Microsoft Graph reports access as `all`, `some`, or `none`, but its update API does not document a supported All users write payload. All users remains disabled; No users, specific users, security groups, and Microsoft 365 groups are supported.
-- If sign-in fails, confirm the redirect URI in Entra ID matches `REDIRECT_URI` in `.env`.
-- If package or directory operations fail, confirm all three delegated Graph permissions have admin consent and the signed-in account is authorized by Microsoft Graph.
+- Microsoft Graph package list/detail use v1.0; block/unblock, access update and reassignment remain beta preview operations.
+- HTTP `204` is acceptance, never mutation success without provider read-back.
+- Access update fixtures prove exact payload preservation/readback, but product writes remain disabled because the endpoint has no documented `If-Match` or equivalent lost-update bound.
+- Reassignment uses the documented beta `{ "userId": "<Entra user object ID>" }` adapter fixture but remains disabled because detail has no owner read-back field and the operation has no conditional-write header.
+- Directory assignment IDs must be native Entra UUIDs and resolve exactly to current users, security groups or Microsoft 365 groups; deleted, duplicate, unresolved or redirected identities are rejected.
+- Package selections keep the 5,000-target authority. When inline selection would exceed the 4,096-byte route budget, the URL carries only a count marker and the complete non-authoritative UI selection is kept in principal-scoped browser session storage; an unavailable or mismatched session record restores no partial selection and is reported visibly.
+- [Package mutation canaries](../docs/mutation-canaries.md) documents the fixture-proven restoration command. Phase 13 owns any real approved tenant execution.
 
 ## Disclaimer
 

@@ -1,0 +1,50 @@
+.permission-center { display: grid; gap: 20px; min-width: 0; color: var(--text-h); }
+.permission-heading, .permission-row > header, .permission-dialog header { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
+.permission-center h2 { font-size: 28px; line-height: 1.2; }
+.permission-center h3 { margin: 0; font-size: 18px; line-height: 1.4; }
+.permission-notice { min-height: 48px; overflow-wrap: anywhere; }
+.internal-roles { border-block: 1px solid var(--border); padding-block: 18px; display: grid; gap: 12px; }
+.internal-roles ul { padding: 0; margin: 0; list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 24px; }
+.internal-roles li { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.permission-list { display: grid; }
+.permission-row { display: grid; gap: 14px; padding: 22px 0; border-bottom: 1px solid var(--border); min-width: 0; }
+.permission-row header > div { flex: 1 1 260px; }
+.permission-row .eyebrow { color: #53605a; }
+.permission-metadata { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px 24px; margin: 0; }
+.permission-metadata dt { color: #53605a; font-size: 13px; font-weight: 700; }
+.permission-metadata dd { margin: 4px 0 0; }
+.permission-center p, .permission-center dd, .permission-center code, .permission-center li, .permission-center a, .permission-dialog { overflow-wrap: anywhere; }
+.permission-actions { display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
+.permission-actions a, .internal-roles a, .permission-dialog a { color: #20584d; display: inline-flex; align-items: center; gap: 5px; }
+.capability-status, .preview-badge { display: inline-flex; padding: 4px 8px; font-size: 13px; font-weight: 700; border: 1px solid #786650; border-radius: 4px; background: #fff8e6; color: #594313; }
+.status-available { background: #e4f3eb; color: #20573f; border-color: #7e9c89; }
+.status-provider_error, .status-missing_internal_role, .status-missing_permission { color: #832d20; background: #ffede7; border-color: #c19588; }
+.preview-badge { position: relative; cursor: help; }
+.preview-badge [role="tooltip"] { display: none; position: absolute; right: 0; top: 100%; width: 230px; max-width: 65vw; padding: 12px; background: #fffdf7; color: #10211f; border: 1px solid #53605a; z-index: 10; font-weight: 400; }
+.preview-badge:hover [role="tooltip"], .preview-badge:focus [role="tooltip"] { display: block; }
+.permission-evidence summary { cursor: pointer; padding: 8px 0; font-weight: 700; }
+.permission-evidence p { padding-block: 6px; }
+.permission-dialog { box-sizing: border-box; width: min(560px, calc(100vw - 32px)); max-height: calc(100svh - 32px); padding: 24px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text-h); }
+.permission-dialog::backdrop { background: rgb(16 33 31 / 45%); }
+.permission-dialog p, .permission-dialog ul { margin-block: 16px; }
+.permission-dialog h2 { font-size: 22px; }
+.permission-dialog .icon-button { width: 44px; height: 44px; padding: 0; justify-content: center; }
+.capability-gate { display: inline-flex; flex-direction: column; gap: 6px; min-width: 0; max-width: 100%; vertical-align: top; }
+.gate-explanation { display: grid; gap: 4px; max-width: 300px; color: #644236; font-size: 12px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+button.permission-link { padding: 2px 0; min-height: 28px; border: 0; background: transparent; color: #20584d; text-align: left; justify-content: start; font-size: 12px; text-decoration: underline; }
+.capability-health { min-height: 42px; font-size: 13px; }
+.view-switcher { box-sizing: border-box; max-width: 100%; flex-wrap: wrap; }
+.view-switcher > .capability-gate, .view-switcher > button { flex: 1 0 110px; }
+.view-switcher > .capability-gate > button { height: 100%; }
+.permission-center button, .permission-dialog button { min-height: 44px; white-space: normal; }
+:focus-visible { outline: 3px solid #156e9a; outline-offset: 3px; }
+@media (max-width: 760px) {
+  .permission-metadata { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .internal-roles ul { grid-template-columns: minmax(0, 1fr); }
+  .top-bar { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 460px) {
+  .permission-metadata { grid-template-columns: minmax(0, 1fr); }
+  .permission-actions { align-items: stretch; flex-direction: column; }
+  .permission-row header > div { flex-basis: 100%; }
+}

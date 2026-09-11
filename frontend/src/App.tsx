@@ -9,25 +9,31 @@ import {
 import {
   Bot,
   ExternalLink,
-  FileCheck2,
-  FileWarning,
   Globe2,
-  TriangleAlert,
-  UserRound,
-  UsersRound,
-  type LucideIcon,
+  Play,
+  Square,
 } from "lucide-react";
 import {
   ApiError,
   blockAgent,
   blockAgents,
+  downloadPackageInventoryCsv,
   getAgentDetails,
-  getAgentDetailsBatch,
   getAgents,
-  getAuditEvents,
+  getPackageRefreshJob,
   getBulkActionJob,
   getCurrentUser,
+  getWorkbenchMetadata,
+  getOfficialUsageAggregate,
+  getOfficialUsageUsers,
+  cancelBulkActionJob,
+  previewPackageMutation,
+  reconcileBulkActionJob,
+  resumeBulkActionJob,
   signOut,
+  startExactPackageRefresh,
+  startPackageRefresh,
+  subscribeSessionRevalidationRequired,
   unblockAgent,
   unblockAgents,
   updateAgentAccess,
@@ -37,18 +43,26 @@ import {
   type AuditAction,
   type CopilotPackage,
   type CopilotPackageDetail,
+  type PackageMutationPreview,
   type PackageAccessUpdate,
+  type PackagePage,
+  type PackageListQuery,
+  type PackageRefreshJob,
+  type OfficialUsageAggregateView,
+  type OfficialUsageUserView,
   type SessionUser,
 } from "./api/client";
-import {
-  downloadCsv,
-  getExportFilename,
-  toAgentExportRow,
-  toCsv,
-} from "./agentExport";
-import { getBuiltWithFilterValue, getBuiltWithLabel } from "./agentDisplay";
+import { downloadBlob } from "./agentExport";
 import "./App.css";
+import { isJobPolling, jobStatusMessage } from "./jobStatus";
 import { parseBulkRefSearch } from "./bulkRefSearch";
+import { projectVerifiedAccessScope } from "./packageMutationState";
+import { clearPackageSelection, restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
+import { allowedViews, hasRole } from "./authorization";
+import { useCapabilities } from "./useCapabilities";
+import { CapabilityGate } from "./components/CapabilityGate";
+import { CapabilityContext } from "./capabilityContext";
+import { CapabilityHealth, PermissionCenter } from "./components/PermissionCenter";
 import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { AgentTable } from "./components/AgentTable";
@@ -56,162 +70,29 @@ import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
 import { UserAccessView } from "./components/UserAccessView";
+import { InventoryExplorer } from "./components/InventoryExplorer";
+import { CopilotStudioQuarantineTargetPicker } from "./components/CopilotStudioQuarantineTargetPicker";
+import { OfficialUsageImportPanel } from "./components/OfficialUsageImportPanel";
+import { DefenderHuntingView } from "./components/DefenderHuntingView";
+import { JobsView } from "./components/JobsView";
+import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
-  parseUsageReport,
-  parseUsageReportFileTimestamp,
-  type AgentUsageSummary,
-  type AgentUsageReport,
-  type ParsedUsageReport,
-  type UserAgentUsageReport,
-  type UserAgentUsageRow,
-  type UserUsageReport,
-  type UsageReportKind,
-} from "./reportImports";
+  agentRouteSearch,
+  officialUsageRouteSearch,
+  parseAgentRoute,
+  parseOfficialUsageRoute,
+  parsePowerPlatformRoute,
+  parseWorkbenchView,
+  workbenchUrl,
+  type WorkbenchViewId,
+} from "./workbenchRouting";
+import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionContext";
 
-type UsageReportsState = {
-  agents?: AgentUsageReport;
-  userAgents?: UserAgentUsageReport;
-  users?: UserUsageReport;
-};
-
-type PendingUsageImport = {
-  reports: ParsedUsageReport[];
-  failures: UsageImportFailure[];
-  warnings: string[];
-  totalFiles: number;
-};
-
-type UsageImportFailure = {
-  fileName: string;
-  message: string;
-};
-
-type UsageImportStatus = {
-  kind: "success" | "error";
-  message: string;
-};
-
-type ActiveView = "agents" | "users" | "reports" | "audit";
-
-type BulkRefSearchState = {
-  ref: string;
-  agentIds: Set<string>;
-  error?: string;
-};
-
-const usageReportsStorageKey = "agent-control:usage-reports:v1";
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
-const agentDisplayPageSize = 1_000;
-const maxTransientChangedRows = 50;
-
-const emptyUsageReports = (): UsageReportsState => ({});
-
-function loadStoredUsageReports(): UsageReportsState {
-  if (typeof window === "undefined") {
-    return emptyUsageReports();
-  }
-
-  try {
-    const storedReports = window.localStorage.getItem(usageReportsStorageKey);
-
-    if (!storedReports) {
-      return emptyUsageReports();
-    }
-
-    const parsedReports: unknown = JSON.parse(storedReports);
-    return isStoredUsageReports(parsedReports)
-      ? parsedReports
-      : emptyUsageReports();
-  } catch {
-    return emptyUsageReports();
-  }
-}
-
-function loadInitialUsageReportsState(): {
-  reports: UsageReportsState;
-  status?: UsageImportStatus;
-} {
-  const reports = loadStoredUsageReports();
-
-  if (!hasUsageReports(reports)) {
-    return { reports };
-  }
-
-  return {
-    reports,
-    status: {
-      kind: "success",
-      message: `Restored saved usage reports: ${formatImportRowSummary(
-        summarizeUsageReportsState(reports),
-      )}.`,
-    },
-  };
-}
-
-function saveStoredUsageReports(reports: UsageReportsState) {
-  if (typeof window === "undefined") {
-    return true;
-  }
-
-  try {
-    if (hasUsageReports(reports)) {
-      window.localStorage.setItem(
-        usageReportsStorageKey,
-        JSON.stringify(reports),
-      );
-    } else {
-      window.localStorage.removeItem(usageReportsStorageKey);
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function clearStoredUsageReports() {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  try {
-    window.localStorage.removeItem(usageReportsStorageKey);
-  } catch {
-    // Clearing reports should never fail the visible user action.
-  }
-}
-
-function hasUsageReports(reports: UsageReportsState) {
-  return Boolean(reports.agents || reports.userAgents || reports.users);
-}
-
-function isStoredUsageReports(value: unknown): value is UsageReportsState {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  return (
-    isStoredReport(value.agents, "agents") &&
-    isStoredReport(value.userAgents, "userAgents") &&
-    isStoredReport(value.users, "users")
-  );
-}
-
-function isStoredReport(value: unknown, kind: UsageReportKind) {
-  if (value === undefined) {
-    return true;
-  }
-
-  return (
-    isRecord(value) &&
-    value.kind === kind &&
-    typeof value.fileName === "string" &&
-    typeof value.importedAt === "string" &&
-    Array.isArray(value.warnings) &&
-    Array.isArray(value.rows)
-  );
-}
+const packageRefreshPollIntervalMs = 750;
+const foregroundJobPollBudgetMs = 5 * 60_000;
+const agentDisplayPageSize = 50;
 
 function withPackageSummaryFallback(
   detail: CopilotPackageDetail,
@@ -224,28 +105,77 @@ function withPackageSummaryFallback(
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+function LinkedAgentJobStatus({
+  controlJob,
+  error,
+  refreshJob,
+}: {
+  controlJob?: BulkActionJob;
+  error?: string;
+  refreshJob?: PackageRefreshJob;
+}) {
+  return (
+    <>
+      {error ? <div className="error-banner" role="alert">{error}</div> : null}
+      {refreshJob ? (
+        <section className="controls" aria-label="Selected package refresh job">
+          <strong>Package refresh · {refreshJob.status.replaceAll("_", " ")}</strong>
+          <span>{refreshJob.observedCount}{refreshJob.totalRecords === null ? "" : ` of ${refreshJob.totalRecords}`} packages observed</span>
+          <code>{refreshJob.id}</code>
+          {refreshJob.message ? <span>{refreshJob.message}</span> : null}
+        </section>
+      ) : null}
+      {controlJob ? (
+        <section className="controls" aria-label="Selected package control job">
+          <strong>Package {controlJob.action} · {controlJob.status.replaceAll("_", " ")}</strong>
+          <span>{controlJob.completed} of {controlJob.total} exact targets complete</span>
+          <code>{controlJob.id}</code>
+        </section>
+      ) : null}
+    </>
+  );
 }
 
 function App() {
+  const initialAgentRoute = useRef(parseAgentRoute(window.location.search)).current;
+  const initialOfficialUsageRoute = useRef(parseOfficialUsageRoute(window.location.search)).current;
   const [user, setUser] = useState<SessionUser>();
+  const [sessionEpoch, setSessionEpoch] = useState(0);
+  const [loadedWorkbenchMetadata, setLoadedWorkbenchMetadata] = useState<{
+    principalKey: string;
+    value: Awaited<ReturnType<typeof getWorkbenchMetadata>>;
+  }>();
+  const [legacyUsagePresent, setLegacyUsagePresent] = useState(hasLegacyUsageStorage);
+  const capabilityState = useCapabilities(user);
+  const [trackedJob, setTrackedJob] = useState<BulkActionJob>();
+  const [linkedPackageRefreshJob, setLinkedPackageRefreshJob] = useState<PackageRefreshJob>();
+  const [linkedJobError, setLinkedJobError] = useState<string>();
+  const [authSetup, setAuthSetup] = useState<{ authConfigured: boolean; callback: string; setup?: string }>();
   const [agents, setAgents] = useState<CopilotPackage[]>([]);
+  const [agentPage, setAgentPage] = useState<PackagePage>();
+  const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
   const [loadingAgents, setLoadingAgents] = useState(false);
   const [error, setError] = useState<string>();
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialAgentRoute.search);
   const [statusFilter, setStatusFilter] = useState<
     "all" | "allowed" | "blocked"
-  >("all");
-  const [publisherFilter, setPublisherFilter] = useState("all");
-  const [availableToFilter, setAvailableToFilter] = useState("all");
-  const [hostFilter, setHostFilter] = useState("all");
-  const [platformFilter, setPlatformFilter] = useState("all");
-  const [createdWithinDays, setCreatedWithinDays] = useState("");
+  >(initialAgentRoute.status);
+  const [publisherFilter, setPublisherFilter] = useState(initialAgentRoute.publisher);
+  const [availableToFilter, setAvailableToFilter] = useState(initialAgentRoute.availability);
+  const [hostFilter, setHostFilter] = useState(initialAgentRoute.host);
+  const [platformFilter, setPlatformFilter] = useState(initialAgentRoute.platform);
+  const [createdWithinDays, setCreatedWithinDays] = useState(initialAgentRoute.createdWithinDays);
+  const [agentSortBy, setAgentSortBy] = useState<NonNullable<PackageListQuery["sortBy"]>>(initialAgentRoute.sortBy);
+  const [agentSortDirection, setAgentSortDirection] = useState<NonNullable<PackageListQuery["sortDirection"]>>(initialAgentRoute.sortDirection);
+  const [agentPageIndex, setAgentPageIndex] = useState(initialAgentRoute.page);
   const [selectedAgentIds, setSelectedAgentIds] = useState<Set<string>>(
-    () => new Set(),
+    () => new Set(initialAgentRoute.selectedIds),
   );
+  const [pendingStoredAgentSelectionCount, setPendingStoredAgentSelectionCount] = useState(
+    initialAgentRoute.selectionStorage === "session" ? initialAgentRoute.selectionCount : undefined,
+  );
+  const [selectionRouteNotice, setSelectionRouteNotice] = useState<{ tone: "success" | "error"; text: string }>();
   const [busyAgentId, setBusyAgentId] = useState<string>();
   const [busyBulkAction, setBusyBulkAction] = useState<AuditAction>();
   const [bulkProgress, setBulkProgress] = useState<BulkProgress>();
@@ -253,6 +183,11 @@ function App() {
   const [bulkConfirmation, setBulkConfirmation] = useState<BulkConfirmation>();
   const [bulkAccessAgentIds, setBulkAccessAgentIds] = useState<string[]>();
   const [agentDetail, setAgentDetail] = useState<CopilotPackageDetail>();
+  const [agentDetailTab, setAgentDetailTab] = useState(initialAgentRoute.detailTab ?? "identities");
+  const [requestedAgentDetailId, setRequestedAgentDetailId] = useState(initialAgentRoute.detailId);
+  const [requestedPackageRefreshJobId, setRequestedPackageRefreshJobId] = useState(initialAgentRoute.refreshJobId);
+  const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
+  const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
   const [loadingAgentDetailId, setLoadingAgentDetailId] = useState<string>();
@@ -263,54 +198,312 @@ function App() {
   const [exportProgressTotal, setExportProgressTotal] = useState(0);
   const [exportProgressMode, setExportProgressMode] =
     useState<ExportMode>("full");
-  const [initialUsageReportsState] = useState(loadInitialUsageReportsState);
-  const [usageReports, setUsageReports] = useState<UsageReportsState>(
-    () => initialUsageReportsState.reports,
-  );
-  const [pendingUsageImport, setPendingUsageImport] =
-    useState<PendingUsageImport>();
-  const [usageImportStatus, setUsageImportStatus] = useState<
-    UsageImportStatus | undefined
-  >(() => initialUsageReportsState.status);
-  const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
-  const [inactiveDays, setInactiveDays] = useState(30);
-  const [reportActivityWindowDays, setReportActivityWindowDays] = useState(30);
-  const [activeView, setActiveView] = useState<ActiveView>("agents");
+  const [officialUsageAggregate, setOfficialUsageAggregate] =
+    useState<OfficialUsageAggregateView>();
+  const [officialUsageUsers, setOfficialUsageUsers] =
+    useState<OfficialUsageUserView>();
+  const [officialUsageUserOffset, setOfficialUsageUserOffset] = useState(0);
+  const [officialUsageUserQuery, setOfficialUsageUserQuery] = useState<{
+    search?: string;
+    creatorType?: string;
+    activity?: "all" | "recent" | "inactive" | "no-activity";
+    responsesOnly?: boolean;
+  }>({});
+  const inactiveDays = 30;
+  const [reportActivityWindowDays, setReportActivityWindowDays] = useState(initialOfficialUsageRoute.activityWindowDays);
+  const [requestedOfficialUsageStagingId, setRequestedOfficialUsageStagingId] = useState(initialOfficialUsageRoute.stagingId);
+  const [activeView, setActiveView] = useState<WorkbenchViewId>(() => parseWorkbenchView(window.location.pathname));
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
-  const [agentDisplayWindow, setAgentDisplayWindow] = useState({
-    key: "",
-    limit: agentDisplayPageSize,
-  });
+  const [packageSnapshotExpiresAt, setPackageSnapshotExpiresAt] = useState<Date>();
+  const [refreshingAgents, setRefreshingAgents] = useState(false);
   const [recentlyChangedAgentIds, setRecentlyChangedAgentIds] = useState<
     Set<string>
   >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
+  const agentListRequestId = useRef(0);
+  const agentListAbortController = useRef<AbortController | undefined>(undefined);
   const bulkJobPollRequestId = useRef(0);
-  const bulkRefSearchRequestId = useRef(0);
+  const packageRefreshRequestId = useRef(0);
+  const linkedPackageRefreshRequestId = useRef(0);
+  const officialUsageRequestId = useRef(0);
+  const officialUsageAbortController = useRef<AbortController | undefined>(undefined);
+  const sessionRevalidationInFlight = useRef(false);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
   const stateChangeVersions = useRef(new Map<string, number>());
   const stateChangeTimerIds = useRef(new Set<number>());
+  const savedViewSearches = useRef(new Map<WorkbenchViewId, string>([
+    [parseWorkbenchView(window.location.pathname), window.location.search],
+  ]));
+  const principalKey = user
+    ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
+    : `signed-out:${sessionEpoch}`;
+  const workbenchMetadata = loadedWorkbenchMetadata?.principalKey === principalKey
+    ? loadedWorkbenchMetadata.value
+    : undefined;
   const resumeBulkJob = useEffectEvent((jobId: string) => {
     void followBulkJob(jobId);
   });
-  const [bulkRefSearch, setBulkRefSearch] = useState<BulkRefSearchState>();
+  const loadLinkedControlJob = useEffectEvent((jobId: string) =>
+    followBulkJob(jobId, undefined, false));
+  const loadSavedAgents = useEffectEvent(() => {
+    void loadAgents();
+  });
+  const loadSavedOfficialUsage = useEffectEvent(() => {
+    void loadOfficialUsage();
+  });
+  const revalidateCurrentSession = useEffectEvent(() => {
+    if (sessionRevalidationInFlight.current || (!user && loadingSession)) return;
+    sessionRevalidationInFlight.current = true;
+    clearPrivateState();
+    setUser(undefined);
+    void loadSession().finally(() => {
+      sessionRevalidationInFlight.current = false;
+    });
+  });
+
+  useEffect(() => {
+    return subscribeSessionRevalidationRequired(() => revalidateCurrentSession());
+  }, []);
 
   useEffect(() => {
     void loadSession();
   }, []);
 
   useEffect(() => {
-    if (user) {
-      void loadAgents();
+    agentDetailRequestId.current += 1;
+    agentListRequestId.current += 1;
+    agentListAbortController.current?.abort();
+    bulkJobPollRequestId.current += 1;
+    packageRefreshRequestId.current += 1;
+    linkedPackageRefreshRequestId.current += 1;
+    officialUsageRequestId.current += 1;
+    officialUsageAbortController.current?.abort();
+    resumedBulkJobIds.current.clear();
+    agentDetailsCache.current.clear();
+    void Promise.resolve().then(() => {
+      setAgents([]);
+      setAgentPage(undefined);
+      setAgentDetail(undefined);
+      setTrackedJob(undefined);
+      setLinkedPackageRefreshJob(undefined);
+      setLinkedJobError(undefined);
+      setBulkProgress(undefined);
+      setBulkResult(undefined);
+      setOfficialUsageAggregate(undefined);
+      setOfficialUsageUsers(undefined);
+      setLoadingAgentDetailId(undefined);
+    });
+  }, [principalKey]);
+
+  useEffect(() => {
+    if (!user) return;
+    const controller = new AbortController();
+    getWorkbenchMetadata({ signal: controller.signal })
+      .then(value => setLoadedWorkbenchMetadata({ principalKey, value }))
+      .catch((requestError) => {
+        if (!(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+          setError(errorMessage(requestError));
+        }
+      });
+    return () => controller.abort();
+  }, [principalKey, user]);
+
+  useEffect(() => {
+    function restoreRoute() {
+      const view = parseWorkbenchView(window.location.pathname);
+      savedViewSearches.current.set(view, window.location.search);
+      setActiveView(view);
+      if (view === "agents") {
+        const route = parseAgentRoute(window.location.search);
+        setQuery(route.search);
+        setStatusFilter(route.status);
+        setPublisherFilter(route.publisher);
+        setAvailableToFilter(route.availability);
+        setHostFilter(route.host);
+        setPlatformFilter(route.platform);
+        setCreatedWithinDays(route.createdWithinDays);
+        setAgentSortBy(route.sortBy);
+        setAgentSortDirection(route.sortDirection);
+        setAgentPageIndex(route.page);
+        setSelectedAgentIds(new Set(route.selectionStorage === "session" ? [] : route.selectedIds));
+        setPendingStoredAgentSelectionCount(route.selectionStorage === "session" ? route.selectionCount : undefined);
+        if (route.selectionStorage !== "session") setSelectionRouteNotice(undefined);
+        setAgentDetailTab(route.detailTab ?? "identities");
+        setRequestedAgentDetailId(route.detailId);
+        setRequestedPackageRefreshJobId(route.refreshJobId);
+        setRequestedPackageRefreshMode(route.refreshMode);
+        setRequestedPackageControlJobId(route.controlJobId);
+        setAgentDetail(current => current?.id === route.detailId ? current : undefined);
+      } else if (view === "official-usage") {
+        const route = parseOfficialUsageRoute(window.location.search);
+        setRequestedOfficialUsageStagingId(route.stagingId);
+        setReportActivityWindowDays(route.activityWindowDays);
+      }
     }
-  }, [user]);
+    window.addEventListener("popstate", restoreRoute);
+    return () => window.removeEventListener("popstate", restoreRoute);
+  }, []);
+
+  useEffect(() => {
+    if (!user || pendingStoredAgentSelectionCount === undefined) return;
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (!active) return;
+      const restored = restorePackageSelection(user, pendingStoredAgentSelectionCount);
+      if (restored.status === "restored") {
+        setSelectedAgentIds(new Set(restored.ids));
+        setSelectionRouteNotice({
+          tone: "success",
+          text: `${restored.ids.length.toLocaleString()} selected packages were restored from this signed-in browser session.`,
+        });
+      } else {
+        setSelectedAgentIds(new Set());
+        setSelectionRouteNotice({
+          tone: "error",
+          text: `The prior ${pendingStoredAgentSelectionCount.toLocaleString()}-package selection could not be restored. No partial selection was applied.`,
+        });
+      }
+      setPendingStoredAgentSelectionCount(undefined);
+    });
+    return () => {
+      active = false;
+    };
+  }, [pendingStoredAgentSelectionCount, user]);
+
+  useEffect(() => {
+    if (activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
+    const search = agentRouteSearch({
+      search: query,
+      status: statusFilter,
+      publisher: publisherFilter,
+      availability: availableToFilter,
+      host: hostFilter,
+      platform: platformFilter,
+      createdWithinDays,
+      sortBy: agentSortBy,
+      sortDirection: agentSortDirection,
+      page: agentPageIndex,
+      detailId: agentDetail?.id ?? requestedAgentDetailId,
+      detailTab: agentDetailTab,
+      selectedIds: [...selectedAgentIds],
+      refreshJobId: requestedPackageRefreshJobId,
+      refreshMode: requestedPackageRefreshMode,
+      controlJobId: requestedPackageControlJobId,
+    });
+    const selectionStored = search.get("selectionState") === "session";
+    const selectionSaved = selectionStored && user
+      ? storePackageSelection(user, [...selectedAgentIds])
+      : false;
+    const next = workbenchUrl("agents", search);
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.replaceState({ view: "agents" }, "", next);
+    }
+    if (selectionStored) {
+      void Promise.resolve().then(() => setSelectionRouteNotice({
+        tone: selectionSaved ? "success" : "error",
+        text: selectionSaved
+          ? `${selectedAgentIds.size.toLocaleString()} selected packages are preserved only for this signed-in browser session and omitted from the URL.`
+          : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
+      }));
+    }
+  }, [activeView, agentDetail?.id, agentDetailTab, agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, selectedAgentIds, statusFilter, user]);
+
+  useEffect(() => {
+    if (activeView !== "official-usage") return;
+    const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      stagingId: requestedOfficialUsageStagingId,
+      activityWindowDays: reportActivityWindowDays,
+    }));
+    savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.replaceState({ view: "official-usage" }, "", next);
+    }
+  }, [activeView, reportActivityWindowDays, requestedOfficialUsageStagingId]);
+
+  useEffect(() => {
+    if (!user || activeView !== "agents" || !requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
+    const summary = agents.find(agent => agent.id === requestedAgentDetailId);
+    if (summary) {
+      void handleViewAgentDetails(summary);
+      return;
+    }
+    const requestId = ++agentDetailRequestId.current;
+    void Promise.resolve().then(() => {
+      if (requestId !== agentDetailRequestId.current) return;
+      setLoadingAgentDetailId(requestedAgentDetailId);
+      setAgentDetailError(undefined);
+      return getAgentDetails(requestedAgentDetailId);
+    }).then(detail => {
+      if (detail && requestId === agentDetailRequestId.current) setAgentDetail(detail);
+    }).catch(requestError => {
+      if (requestId === agentDetailRequestId.current) {
+        setRequestedAgentDetailId(undefined);
+        setAgentDetailError(errorMessage(requestError));
+      }
+    }).finally(() => {
+      if (requestId === agentDetailRequestId.current) setLoadingAgentDetailId(undefined);
+    });
+  }, [activeView, agentDetail?.id, agents, loadingAgentDetailId, requestedAgentDetailId, user]);
+
+  useEffect(() => {
+    if (!user || activeView !== "agents" || !requestedPackageRefreshJobId) {
+      void Promise.resolve().then(() => setLinkedPackageRefreshJob(undefined));
+      return;
+    }
+    const owner = ++linkedPackageRefreshRequestId.current;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    const load = async () => {
+      try {
+        const job = await getPackageRefreshJob(requestedPackageRefreshJobId, requestedPackageRefreshMode, { signal: controller.signal });
+        if (controller.signal.aborted || owner !== linkedPackageRefreshRequestId.current) return;
+        setLinkedPackageRefreshJob(job);
+        if (job.status === "running" && Date.now() < deadline) {
+          timer = window.setTimeout(() => void load(), packageRefreshPollIntervalMs);
+        }
+      } catch (requestError) {
+        if (!controller.signal.aborted && owner === linkedPackageRefreshRequestId.current) {
+          setLinkedJobError(`The exact package refresh job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
+        }
+      }
+    };
+    void Promise.resolve().then(() => {
+      if (controller.signal.aborted) return;
+      setLinkedPackageRefreshJob(undefined);
+      setLinkedJobError(undefined);
+      return load();
+    });
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (owner === linkedPackageRefreshRequestId.current) linkedPackageRefreshRequestId.current += 1;
+    };
+  }, [activeView, principalKey, requestedPackageRefreshJobId, requestedPackageRefreshMode, user]);
+
+  useEffect(() => {
+    if (!user || activeView !== "agents" || !requestedPackageControlJobId) return;
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (!active) return;
+      setTrackedJob(undefined);
+      setBulkResult(undefined);
+      setLinkedJobError(undefined);
+      return loadLinkedControlJob(requestedPackageControlJobId);
+    });
+    return () => {
+      active = false;
+      bulkJobPollRequestId.current += 1;
+    };
+  }, [activeView, principalKey, requestedPackageControlJobId, user]);
 
   useEffect(() => {
     if (!user) {
       return;
     }
+    if (requestedPackageControlJobId || requestedPackageRefreshJobId) return;
 
     const jobId = loadStoredActiveBulkJobId();
 
@@ -320,7 +513,37 @@ function App() {
 
     resumedBulkJobIds.current.add(jobId);
     resumeBulkJob(jobId);
-  }, [user]);
+  }, [principalKey, requestedPackageControlJobId, requestedPackageRefreshJobId, user]);
+
+  useEffect(() => {
+    if (!user || !(hasRole(user, "AgentControl.Reader") || hasRole(user, "AgentControl.Operator"))) {
+      agentListAbortController.current?.abort();
+      void Promise.resolve().then(() => {
+        setAgents([]);
+        setAgentPage(undefined);
+        setAgentDetail(undefined);
+        setRequestedAgentDetailId(undefined);
+      });
+      return;
+    }
+    if (!hasRole(user, "AgentControl.Reader")) {
+      agentListAbortController.current?.abort();
+      void Promise.resolve().then(() => {
+        setAgents([]);
+        setAgentPage(undefined);
+        setError(undefined);
+      });
+      return;
+    }
+    loadSavedAgents();
+    return () => agentListAbortController.current?.abort();
+  }, [agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
+
+  useEffect(() => {
+    if (user) {
+      loadSavedOfficialUsage();
+    }
+  }, [inactiveDays, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
 
   useEffect(
     () => () => {
@@ -331,276 +554,70 @@ function App() {
     [],
   );
 
-  const userAgentRowsByAgentId = useMemo(() => {
-    const rowsByAgentId = new Map<string, UserAgentUsageRow[]>();
+  const usageByAgentId = useMemo(() => new Map(), []);
 
-    for (const row of usageReports.userAgents?.rows ?? []) {
-      if (!row.agentId) {
-        continue;
-      }
+  const allowedAgentCount = agentPage?.summary.allowed ?? 0;
+  const blockedAgentCount = agentPage?.summary.blocked ?? 0;
+  const publisherOptions = agentPage?.facets.publishers ?? [];
+  const hostOptions = agentPage?.facets.hosts ?? [];
+  const availableToOptions = agentPage?.facets.availability ?? [];
+  const platformOptions = agentPage?.facets.platforms ?? [];
 
-      const rows = rowsByAgentId.get(row.agentId) ?? [];
-      rows.push(row);
-      rowsByAgentId.set(row.agentId, rows);
-    }
+  const effectivePlatformFilter = platformFilter;
 
-    return rowsByAgentId;
-  }, [usageReports.userAgents]);
-
-  const usageByAgentId = useMemo(
-    () => buildUsageByAgentId(usageReports, userAgentRowsByAgentId),
-    [usageReports, userAgentRowsByAgentId],
-  );
-
-  const inactiveAgentCount = useMemo(
-    () =>
-      agents.filter((agent) =>
-        isInactiveUsage(usageByAgentId.get(agent.id), inactiveDays),
-      ).length,
-    [agents, inactiveDays, usageByAgentId],
-  );
-
-  const allowedAgentCount = useMemo(
-    () => agents.filter((agent) => !agent.isBlocked).length,
-    [agents],
-  );
-
-  const blockedAgentCount = useMemo(
-    () => agents.filter((agent) => agent.isBlocked).length,
-    [agents],
-  );
-
-  const publisherOptions = useMemo(() => {
-    const publishers = new Map<string, string>();
-
-    for (const agent of agents) {
-      const label = agent.publisher || "Unknown";
-      const value = agent.publisher || unknownPublisherValue;
-      publishers.set(value, label);
-    }
-
-    return [...publishers]
-      .map(([value, label]) => ({ value, label }))
-      .sort((first, second) => first.label.localeCompare(second.label));
-  }, [agents]);
-
-  const hostOptions = useMemo(() => {
-    const hosts = new Map<string, string>();
-
-    for (const agent of agents) {
-      if (hasUnknownHostValue(agent)) {
-        hosts.set(unknownHostValue, "Unknown");
-      }
-
-      for (const host of getKnownHostValues(agent)) {
-        hosts.set(host, formatHostLabel(host));
-      }
-    }
-
-    return [...hosts]
-      .map(([value, label]) => ({ value, label }))
-      .sort((first, second) => first.label.localeCompare(second.label));
-  }, [agents]);
-
-  const availableToOptions = useMemo(() => {
-    const availability = new Map<string, string>();
-
-    for (const agent of agents) {
-      const value = agent.availableTo || unknownAvailableToValue;
-      const label = formatDetailLabel(agent.availableTo) ?? "Unknown";
-      availability.set(value, label);
-    }
-
-    if ([...availability.keys()].some(isAvailableToSomeOrAllValue)) {
-      availability.set(someOrAllAvailableToValue, "allowed For Some or All");
-    }
-
-    return [...availability]
-      .map(([value, label]) => ({
-        value:
-          value === someOrAllAvailableToValue
-            ? value
-            : encodeAvailableToFilterValue(value),
-        label,
-      }))
-      .sort((first, second) => first.label.localeCompare(second.label));
-  }, [agents]);
-
-  const platformOptions = useMemo(() => {
-    const platforms = new Map<string, string>();
-
-    for (const agent of agents) {
-      const value = getBuiltWithFilterValue(agent);
-      const label = getBuiltWithLabel(agent);
-
-      if (value && label) {
-        platforms.set(value, label);
-      }
-    }
-
-    return [...platforms]
-      .map(([value, label]) => ({ value, label }))
-      .sort((first, second) => first.label.localeCompare(second.label));
-  }, [agents]);
-
-  const effectivePlatformFilter =
-    platformFilter === "all" ||
-    platformOptions.some((platform) => platform.value === platformFilter)
-      ? platformFilter
-      : "all";
-
+  const canReadSensitiveUsage = hasRole(user, "AgentControl.SecurityReader");
   const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
+  const requestedBulkRefQuery = parseBulkRefSearch(query);
+  const bulkRefAuthorizationMissing = Boolean(
+    (requestedBulkRefQuery || normalizedBulkRefQuery) && !canReadSensitiveUsage,
+  );
+  const loadingBulkRefSearch = false;
+  const visibleViews = workbenchMetadata
+    ? workbenchMetadata.views
+        .filter(view => view.roles.length === 0 || view.roles.some(role => user?.roles.includes(role)))
+        .map(view => view.id)
+    : allowedViews(user);
+  const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
+  const canOperate = hasRole(user, "AgentControl.Operator");
+  const canImportReports = hasRole(user, "AgentControl.Administrator");
 
   useEffect(() => {
-    const requestId = ++bulkRefSearchRequestId.current;
+    if (!user || visibleActiveView === activeView) return;
+    window.history.replaceState({ view: visibleActiveView }, "", workbenchUrl(visibleActiveView));
+  }, [activeView, user, visibleActiveView]);
 
-    if (!normalizedBulkRefQuery) {
-      return;
+  function navigateToView(view: WorkbenchViewId) {
+    savedViewSearches.current.set(activeView, window.location.search);
+    setAgentDetail(undefined);
+    setRequestedAgentDetailId(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setBulkAccessAgentIds(undefined);
+    setBulkConfirmation(undefined);
+    setExportChoiceOpen(false);
+    setActiveView(view);
+    const savedSearch = savedViewSearches.current.get(view) ?? "";
+    const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
+    const next = workbenchUrl(view, search);
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.pushState({ view }, "", next);
     }
+  }
 
-    getAuditEvents({
-      limit: 5_000,
-      scope: "bulk",
-      operationIdPrefix: normalizedBulkRefQuery,
-    })
-      .then((response) => {
-        if (requestId !== bulkRefSearchRequestId.current) {
-          return;
-        }
-
-        setBulkRefSearch({
-          ref: normalizedBulkRefQuery,
-          agentIds: new Set(response.value.map((event) => event.agentId)),
-        });
-      })
-      .catch((requestError: unknown) => {
-        if (requestId !== bulkRefSearchRequestId.current) {
-          return;
-        }
-
-        setBulkRefSearch({
-          ref: normalizedBulkRefQuery,
-          agentIds: new Set(),
-          error: errorMessage(requestError),
-        });
-      });
-  }, [normalizedBulkRefQuery]);
-
-  const loadingBulkRefSearch = Boolean(
-    normalizedBulkRefQuery && bulkRefSearch?.ref !== normalizedBulkRefQuery,
-  );
-
-  const agentDisplayWindowKey = [
-    availableToFilter,
-    createdWithinDays,
-    deferredQuery,
-    effectivePlatformFilter,
-    hostFilter,
-    inactiveDays,
-    publisherFilter,
-    statusFilter,
-    usageFilter,
-  ].join("\u001f");
-  const visibleAgentLimit =
-    agentDisplayWindow.key === agentDisplayWindowKey
-      ? agentDisplayWindow.limit
-      : agentDisplayPageSize;
-  const agentFilterCriteria = useMemo<AgentFilterCriteria>(
-    () => ({
-      availableToFilter,
-      bulkRefSearch,
-      creationWindowDays: parseOptionalPositiveInteger(createdWithinDays),
-      effectivePlatformFilter,
-      hostFilter,
-      inactiveDays,
-      normalizedBulkRefQuery,
-      normalizedQuery: deferredQuery.trim().toLowerCase(),
-      publisherFilter,
-      statusFilter,
-      usageByAgentId,
-      usageFilter,
-    }),
-    [
-      availableToFilter,
-      bulkRefSearch,
-      createdWithinDays,
-      deferredQuery,
-      effectivePlatformFilter,
-      hostFilter,
-      inactiveDays,
-      normalizedBulkRefQuery,
-      publisherFilter,
-      statusFilter,
-      usageByAgentId,
-      usageFilter,
-    ],
-  );
-
-  const filteredAgents = useMemo(() => {
-    return agents.filter((agent) =>
-      agentMatchesFilters(agent, agentFilterCriteria, true),
-    );
-  }, [agents, agentFilterCriteria]);
-
-  const selectedAgents = useMemo(
-    () => agents.filter((agent) => selectedAgentIds.has(agent.id)),
-    [agents, selectedAgentIds],
-  );
-
-  const displayedFilteredAgents = useMemo(
-    () => filteredAgents.slice(0, visibleAgentLimit),
-    [filteredAgents, visibleAgentLimit],
-  );
-  const recentlyChangedFilteredOutAgents = useMemo(() => {
-    if (statusFilter === "all" || recentlyChangedAgentIds.size === 0) {
-      return [];
+  function handleReportActivityWindowChange(activityWindowDays: number) {
+    const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      stagingId: requestedOfficialUsageStagingId,
+      activityWindowDays,
+    }));
+    savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.pushState({ view: "official-usage" }, "", next);
     }
+    setReportActivityWindowDays(activityWindowDays);
+  }
 
-    const filteredAgentIds = new Set(filteredAgents.map((agent) => agent.id));
-
-    const transientAgents: CopilotPackage[] = [];
-
-    for (const agent of agents) {
-      if (
-        recentlyChangedAgentIds.has(agent.id) &&
-        !filteredAgentIds.has(agent.id) &&
-        agentMatchesFilters(agent, agentFilterCriteria, false)
-      ) {
-        transientAgents.push(agent);
-
-        if (transientAgents.length >= maxTransientChangedRows) {
-          break;
-        }
-      }
-    }
-
-    return transientAgents;
-  }, [
-    agents,
-    agentFilterCriteria,
-    filteredAgents,
-    recentlyChangedAgentIds,
-    statusFilter,
-  ]);
-  const displayedAgents = useMemo(
-    () =>
-      mergeAgentRowsInCatalogOrder(
-        agents,
-        displayedFilteredAgents,
-        recentlyChangedFilteredOutAgents,
-      ),
-    [agents, displayedFilteredAgents, recentlyChangedFilteredOutAgents],
-  );
-
-  const filteredAllowedAgentCount = filteredAgents.filter(
-    (agent) => !agent.isBlocked,
-  ).length;
-  const filteredBlockedAgentCount = filteredAgents.filter(
-    (agent) => agent.isBlocked,
-  ).length;
-  const filteredInactiveAgentCount = filteredAgents.filter((agent) =>
-    isInactiveUsage(usageByAgentId.get(agent.id), inactiveDays),
-  ).length;
+  const displayedAgents = agents;
+  const filteredAllowedAgentCount = agentPage?.filteredSummary.allowed ?? 0;
+  const filteredBlockedAgentCount = agentPage?.filteredSummary.blocked ?? 0;
 
   const hasActiveAgentFilters =
     deferredQuery.trim().length > 0 ||
@@ -609,24 +626,74 @@ function App() {
     availableToFilter !== "all" ||
     hostFilter !== "all" ||
     effectivePlatformFilter !== "all" ||
-    parseOptionalPositiveInteger(createdWithinDays) !== undefined ||
-    usageFilter !== "all";
+    parseOptionalPositiveInteger(createdWithinDays) !== undefined;
 
-  const matchingSelectedCount = filteredAgents.filter((agent) =>
+  const matchingSelectedCount = agents.filter((agent) =>
     selectedAgentIds.has(agent.id),
   ).length;
   const allMatchingSelected =
-    filteredAgents.length > 0 &&
-    matchingSelectedCount === filteredAgents.length;
-  const exportableAgentCount = filteredAgents.length;
-  const hasMoreDisplayedAgents =
-    displayedFilteredAgents.length < filteredAgents.length;
+    agents.length > 0 &&
+    matchingSelectedCount === agents.length;
+  const exportableAgentCount = agentPage?.count ?? 0;
+
+  function clearPrivateState() {
+    clearPackageSelection(user);
+    setSessionEpoch(current => current + 1);
+    agentDetailRequestId.current += 1;
+    agentListRequestId.current += 1;
+    agentListAbortController.current?.abort();
+    bulkJobPollRequestId.current += 1;
+    packageRefreshRequestId.current += 1;
+    linkedPackageRefreshRequestId.current += 1;
+    officialUsageRequestId.current += 1;
+    officialUsageAbortController.current?.abort();
+    resumedBulkJobIds.current.clear();
+    agentDetailsCache.current.clear();
+    stateChangeVersions.current.clear();
+    for (const timerId of stateChangeTimerIds.current) window.clearTimeout(timerId);
+    stateChangeTimerIds.current.clear();
+    clearStoredActiveBulkJobId();
+    setLoadedWorkbenchMetadata(undefined);
+    setAgents([]);
+    setAgentPage(undefined);
+    setAgentSnapshotId(undefined);
+    setSelectedAgentIds(new Set());
+    setPendingStoredAgentSelectionCount(undefined);
+    setSelectionRouteNotice(undefined);
+    setBulkConfirmation(undefined);
+    setBulkAccessAgentIds(undefined);
+    setAgentDetail(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setLoadingAgentDetailId(undefined);
+    setAgentDetailError(undefined);
+    setBusyAgentId(undefined);
+    setBusyBulkAction(undefined);
+    setExportChoiceOpen(false);
+    setLastAgentListRefreshAt(undefined);
+    setPackageSnapshotExpiresAt(undefined);
+    setLoadingAgents(false);
+    setRefreshingAgents(false);
+    setRecentlyChangedAgentIds(new Set());
+    setExportingCsv(false);
+    setExportProgress(0);
+    setExportProgressTotal(0);
+    setBulkProgress(undefined);
+    setBulkResult(undefined);
+    setTrackedJob(undefined);
+    setLinkedPackageRefreshJob(undefined);
+    setLinkedJobError(undefined);
+    setOfficialUsageAggregate(undefined);
+    setOfficialUsageUsers(undefined);
+    setOfficialUsageUserOffset(0);
+  }
 
   async function loadSession() {
     setLoadingSession(true);
     setError(undefined);
 
     try {
+      const setup = await fetch("/api/auth/status", { credentials: "include" });
+      if (setup.ok) setAuthSetup(await setup.json());
       const session = await getCurrentUser();
       setUser(session.user);
     } catch (requestError) {
@@ -638,27 +705,153 @@ function App() {
     }
   }
 
-  async function loadAgents() {
+  async function loadAgents(forceCurrentSnapshot = false) {
+    const requestId = ++agentListRequestId.current;
+    agentListAbortController.current?.abort();
+    if (bulkRefAuthorizationMissing) {
+      agentListAbortController.current = undefined;
+      setLoadingAgents(false);
+      setError(undefined);
+      setAgents([]);
+      setAgentPage(undefined);
+      setAgentSnapshotId(undefined);
+      setLastAgentListRefreshAt(undefined);
+      setPackageSnapshotExpiresAt(undefined);
+      agentDetailsCache.current.clear();
+      setExportChoiceOpen(false);
+      return;
+    }
+    const controller = new AbortController();
+    agentListAbortController.current = controller;
     setLoadingAgents(true);
     setError(undefined);
 
     try {
-      const response = await getAgents();
+      const response = await getAgents({
+        ...(!forceCurrentSnapshot && agentSnapshotId ? { snapshotId: agentSnapshotId } : {}),
+        ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+        ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+        ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
+        ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
+        ...(hostFilter === "all" ? {} : { host: hostFilter }),
+        ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+        ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+        sortBy: agentSortBy,
+        sortDirection: agentSortDirection,
+        limit: agentDisplayPageSize,
+        offset: agentPageIndex * agentDisplayPageSize,
+      }, { signal: controller.signal });
+      if (requestId !== agentListRequestId.current) return;
+      const lastPage = Math.max(Math.ceil(response.count / agentDisplayPageSize) - 1, 0);
+      if (agentPageIndex > lastPage) {
+        setAgentPageIndex(lastPage);
+        return;
+      }
       setAgents(response.value);
-      setLastAgentListRefreshAt(new Date());
+      setAgentPage(response);
+      setAgentSnapshotId(response.snapshot?.id);
+      setLastAgentListRefreshAt(response.snapshot ? new Date(response.snapshot.observedAt) : undefined);
+      setPackageSnapshotExpiresAt(response.snapshot ? new Date(response.snapshot.expiresAt) : undefined);
       agentDetailsCache.current.clear();
-      setSelectedAgentIds((current) => {
-        const availableIds = new Set(response.value.map((agent) => agent.id));
-        const next = new Set(
-          [...current].filter((agentId) => availableIds.has(agentId)),
-        );
+    } catch (requestError) {
+      if (requestId === agentListRequestId.current && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+        setError(errorMessage(requestError));
+      }
+    } finally {
+      if (requestId === agentListRequestId.current) setLoadingAgents(false);
+    }
+  }
 
-        return next.size === current.size ? current : next;
-      });
+  async function loadOfficialUsage() {
+    const requestId = ++officialUsageRequestId.current;
+    officialUsageAbortController.current?.abort();
+    const controller = new AbortController();
+    officialUsageAbortController.current = controller;
+    if (!user) {
+      setOfficialUsageAggregate(undefined);
+      setOfficialUsageUsers(undefined);
+      return;
+    }
+
+    const [aggregateResult, usersResult] = await Promise.allSettled([
+      hasRole(user, "AgentControl.Reader")
+        ? getOfficialUsageAggregate({
+            activityWindowDays: reportActivityWindowDays,
+            inactiveDays,
+        }, { signal: controller.signal })
+        : Promise.resolve(undefined),
+      hasRole(user, "AgentControl.SecurityReader")
+        ? getOfficialUsageUsers(
+          { ...officialUsageUserQuery, inactiveDays, limit: 100, offset: officialUsageUserOffset },
+          { signal: controller.signal },
+        )
+        : Promise.resolve(undefined),
+    ]);
+
+    if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
+    if (aggregateResult.status === "fulfilled") {
+      setOfficialUsageAggregate(aggregateResult.value);
+    } else if (!(aggregateResult.reason instanceof ApiError && aggregateResult.reason.kind === "aborted")) {
+      setError(errorMessage(aggregateResult.reason));
+    }
+
+    if (usersResult.status === "fulfilled") {
+      setOfficialUsageUsers(usersResult.value);
+    } else if (!(usersResult.reason instanceof ApiError && usersResult.reason.kind === "aborted")) {
+      setError(errorMessage(usersResult.reason));
+    }
+    if (officialUsageAbortController.current === controller) officialUsageAbortController.current = undefined;
+  }
+
+  async function handleRefreshAgents() {
+    const requestId = ++packageRefreshRequestId.current;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    setRefreshingAgents(true);
+    setError(undefined);
+
+    try {
+      let job = await startPackageRefresh("delegated");
+      while (job.status === "running" && Date.now() < deadline) {
+        await wait(packageRefreshPollIntervalMs);
+        if (packageRefreshRequestId.current !== requestId) return;
+        job = await getPackageRefreshJob(job.id, job.tokenMode);
+        if (packageRefreshRequestId.current !== requestId) return;
+      }
+
+      if (job.status === "running") throw new Error("Package refresh status polling reached its five-minute bound. The durable job remains available in Jobs.");
+      if (job.status !== "succeeded") {
+        throw new Error(job.message ?? (job.status === "waiting_authorization"
+          ? "Package refresh requires current delegated read authorization. Open Permissions to request consent or retry the probe."
+          : "Package refresh failed without replacing the last complete saved observation."));
+      }
+      await loadAgents(true);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
-      setLoadingAgents(false);
+      if (packageRefreshRequestId.current === requestId) setRefreshingAgents(false);
+    }
+  }
+
+  async function handleRefreshExactPackage(id: string) {
+    const requestId = ++packageRefreshRequestId.current;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    setRefreshingAgents(true);
+    setError(undefined);
+    setAgentDetailError(undefined);
+    try {
+      let job = await startExactPackageRefresh(id, "delegated");
+      while (job.status === "running" && Date.now() < deadline) {
+        await wait(packageRefreshPollIntervalMs);
+        if (packageRefreshRequestId.current !== requestId) return;
+        job = await getPackageRefreshJob(job.id, job.tokenMode);
+      }
+      if (job.status === "running") throw new Error("Exact package refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
+      if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current delegated package-read authorization.");
+      setRequestedAgentDetailId(id);
+    } catch (requestError) {
+      setAgentDetailError(errorMessage(requestError));
+    } finally {
+      if (packageRefreshRequestId.current === requestId) setRefreshingAgents(false);
     }
   }
 
@@ -672,128 +865,12 @@ function App() {
       return;
     }
 
+    clearPrivateState();
     setUser(undefined);
-    setAgents([]);
-    setSelectedAgentIds(new Set());
-    setBulkConfirmation(undefined);
-    setBulkAccessAgentIds(undefined);
-    setAgentDetail(undefined);
-    setSingleAccessAgentDetail(undefined);
-    setLoadingAgentDetailId(undefined);
-    setAgentDetailError(undefined);
-    setExportChoiceOpen(false);
-    setLastAgentListRefreshAt(undefined);
-    setRecentlyChangedAgentIds(new Set());
-    setExportingCsv(false);
-    setExportProgress(0);
-    setExportProgressTotal(0);
-    agentDetailsCache.current.clear();
-    setBulkResult(undefined);
-    clearStoredActiveBulkJobId();
-    bulkJobPollRequestId.current += 1;
-    clearStoredUsageReports();
-    setUsageReports(emptyUsageReports());
-    setPendingUsageImport(undefined);
-    setUsageImportStatus(undefined);
   }
 
   function handleSearchQueryChange(nextQuery: string) {
-    const nextRef = parseBulkRefSearch(nextQuery);
-
     setQuery(nextQuery);
-
-    if (bulkRefSearch && bulkRefSearch.ref !== nextRef) {
-      setBulkRefSearch(undefined);
-    }
-  }
-
-  async function handleSelectUsageReports(files: FileList | null) {
-    if (!files?.length) {
-      return;
-    }
-
-    const parsedReports: ParsedUsageReport[] = [];
-    const failures: UsageImportFailure[] = [];
-    const warnings: string[] = [];
-
-    for (const file of [...files]) {
-      try {
-        const report = parseUsageReport(file.name, await file.text());
-        parsedReports.push(report);
-
-        for (const warning of report.warnings) {
-          warnings.push(`${file.name}: ${warning}`);
-        }
-      } catch (importError) {
-        failures.push({
-          fileName: file.name,
-          message:
-            importError instanceof Error
-              ? importError.message
-              : "Import failed.",
-        });
-      }
-    }
-
-    const reports = coalesceUsageReportsByKind(parsedReports, warnings);
-
-    setUsageImportStatus(undefined);
-    setPendingUsageImport({
-      reports,
-      failures,
-      warnings,
-      totalFiles: files.length,
-    });
-  }
-
-  function handleConfirmUsageImport() {
-    if (!pendingUsageImport) {
-      return;
-    }
-
-    if (pendingUsageImport.reports.length === 0) {
-      setUsageImportStatus({
-        kind: "error",
-        message: "No recognized usage report CSV files were selected.",
-      });
-      setPendingUsageImport(undefined);
-      return;
-    }
-
-    const nextUsageReports = mergeUsageReports(
-      usageReports,
-      pendingUsageImport.reports,
-    );
-    const persisted = saveStoredUsageReports(nextUsageReports);
-
-    setUsageReports(nextUsageReports);
-
-    const counts = summarizeParsedUsageReports(pendingUsageImport.reports);
-    const issueCount =
-      pendingUsageImport.failures.length +
-      pendingUsageImport.warnings.length +
-      (persisted ? 0 : 1);
-
-    setUsageImportStatus({
-      kind: persisted ? "success" : "error",
-      message: `Import successful: ${formatImportRowSummary(counts)}${
-        issueCount
-          ? `, with ${issueCount} issue${issueCount === 1 ? "" : "s"}`
-          : ""
-      }.${
-        persisted
-          ? ""
-          : " Reports will stay available for this session, but could not be saved for reload."
-      }`,
-    });
-    setPendingUsageImport(undefined);
-  }
-
-  function handleClearUsageReports() {
-    clearStoredUsageReports();
-    setUsageReports(emptyUsageReports());
-    setPendingUsageImport(undefined);
-    setUsageImportStatus(undefined);
   }
 
   async function handleViewAgentDetails(agent: CopilotPackage) {
@@ -802,6 +879,7 @@ function App() {
 
     setAgentDetailError(undefined);
     setAgentDetail(undefined);
+    setRequestedAgentDetailId(agent.id);
     setLoadingAgentDetailId(agent.id);
 
     try {
@@ -863,13 +941,9 @@ function App() {
     setBulkResult(undefined);
 
     try {
-      if (targetBlockedState) {
-        await blockAgent(agent.id);
-      } else {
-        await unblockAgent(agent.id);
-      }
-
-      updateCachedAgentBlockedState(agent.id, targetBlockedState);
+      const action = targetBlockedState ? "block" : "unblock";
+      const preview = await previewPackageMutation({ action, ids: [agent.id], mutationScope: "single" });
+      setBulkConfirmation({ action, ids: [agent.id], mutationScope: "single", preview });
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -882,76 +956,61 @@ function App() {
       throw new Error("Agent details are no longer open.");
     }
 
-    await updateSingleAgentAccess(agentDetail.id, update);
+    await requestAccessConfirmation([agentDetail.id], update, "single");
   }
 
-  async function updateSingleAgentAccess(
-    agentId: string,
+  async function requestAccessConfirmation(
+    ids: string[],
     update: PackageAccessUpdate,
+    mutationScope: "single" | "bulk",
   ) {
-    if (update.mode !== "replace") {
+    if (mutationScope === "single" && update.mode !== "replace") {
       throw new Error("Single-agent access updates must replace assignments.");
     }
 
     setError(undefined);
-    const response = await updateAgentAccess(agentId, update);
-    agentDetailsCache.current.set(response.agent.id, response.agent);
-    setAgentDetail((current) =>
-      current?.id === response.agent.id ? response.agent : current,
-    );
-    setSingleAccessAgentDetail((current) =>
-      current?.id === response.agent.id ? response.agent : current,
-    );
-    setAgents((current) =>
-      current.map((agent) =>
-        agent.id === response.agent.id
-          ? {
-              ...agent,
-              availableTo: response.agent.availableTo,
-              deployedTo: response.agent.deployedTo,
-              lastModifiedDateTime: response.agent.lastModifiedDateTime,
-            }
-          : agent,
-      ),
-    );
-    markAgentStatesChanged([response.agent.id]);
+    const action = update.target === "availability" ? "update-availability" : "update-installation";
+    const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update });
+    setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
   }
 
   function requestExportCsv() {
-    if (exportableAgentCount === 0 || exportingCsv) {
+    if (exportableAgentCount === 0 || exportingCsv || bulkRefAuthorizationMissing) {
       return;
     }
 
     setExportChoiceOpen(true);
   }
 
-  async function handleExportCsv(mode: ExportMode) {
-    const agentsToExport = filteredAgents;
-
-    if (agentsToExport.length === 0 || exportingCsv) {
+  async function handleExportCsv() {
+    if (exportableAgentCount === 0 || exportingCsv || !agentSnapshotId || bulkRefAuthorizationMissing) {
       return;
     }
 
     setExportChoiceOpen(false);
     setError(undefined);
     setExportingCsv(true);
-    setExportProgressMode(mode);
+    setExportProgressMode("fast");
     setExportProgress(0);
-    setExportProgressTotal(agentsToExport.length);
+    setExportProgressTotal(exportableAgentCount);
 
     try {
-      const rows =
-        mode === "fast"
-          ? agentsToExport.map((agent) =>
-              toAgentExportRow(agent, "", usageByAgentId.get(agent.id)),
-            )
-          : await buildFullExportRows(agentsToExport);
-
-      if (mode === "fast") {
-        setExportProgress(agentsToExport.length);
-      }
-
-      downloadCsv(getExportFilename(hasActiveAgentFilters, mode), toCsv(rows));
+      const blob = await downloadPackageInventoryCsv({
+        snapshotId: agentSnapshotId,
+        filters: {
+          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
+          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
+          ...(hostFilter === "all" ? {} : { host: hostFilter }),
+          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+          sortBy: agentSortBy,
+          sortDirection: agentSortDirection,
+        },
+      });
+      setExportProgress(exportableAgentCount);
+      downloadBlob("package-inventory.csv", blob);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -961,83 +1020,43 @@ function App() {
     }
   }
 
-  async function buildFullExportRows(agentsToExport: CopilotPackage[]) {
-    const detailsById = new Map<string, CopilotPackageDetail>();
-    const detailErrorsById = new Map<string, string>();
-    const missingIds: string[] = [];
-
-    for (const agent of agentsToExport) {
-      const cachedDetail = agentDetailsCache.current.get(agent.id);
-
-      if (cachedDetail) {
-        detailsById.set(agent.id, cachedDetail);
-      } else {
-        missingIds.push(agent.id);
-      }
-    }
-
-    setExportProgress(detailsById.size);
-
-    for (const batchIds of chunks(missingIds, detailBatchSize)) {
-      const response = await getAgentDetailsBatch(batchIds);
-
-      for (const result of response.results) {
-        if (result.status === "succeeded") {
-          agentDetailsCache.current.set(result.id, result.package);
-          detailsById.set(result.id, result.package);
-        } else {
-          detailErrorsById.set(result.id, result.message);
-        }
-      }
-
-      setExportProgress((current) => current + response.results.length);
-    }
-
-    return agentsToExport.map((agent) =>
-      toAgentExportRow(
-        detailsById.get(agent.id) ?? agent,
-        detailErrorsById.get(agent.id) ?? "",
-        usageByAgentId.get(agent.id),
-      ),
-    );
-  }
-
-  function requestBulkAction(targetBlockedState: boolean) {
+  async function requestBulkAction(targetBlockedState: boolean) {
     const label = targetBlockedState ? "block" : "unblock";
-    const scope = selectedAgents;
+    const scope = [...selectedAgentIds];
 
     if (scope.length === 0) {
       setError("Select one or more agents before running a bulk action.");
       return;
     }
 
-    const candidates = scope.filter(
-      (agent) => agent.isBlocked !== targetBlockedState,
-    );
-    const skipped = scope.filter(
-      (agent) => agent.isBlocked === targetBlockedState,
-    );
-
     setError(undefined);
-    setBulkConfirmation({
-      action: label,
-      targetBlockedState,
-      scope,
-      actionableCount: candidates.length,
-      skippedCount: skipped.length,
-    });
+    try {
+      const preview = await previewPackageMutation({ action: label, ids: scope, mutationScope: "bulk" });
+      setBulkConfirmation({ action: label, ids: scope, mutationScope: "bulk", preview });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
   }
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
-    const { action: label, scope, targetBlockedState } = confirmation;
+    const { action: label, ids, mutationScope, preview, accessUpdate } = confirmation;
 
     setBulkConfirmation(undefined);
 
     setBusyBulkAction(label);
-    setBulkProgress({
-      action: label,
-      targetBlockedState,
-      total: scope.length,
+    setBulkProgress(accessUpdate ? {
+      action: label as "update-availability" | "update-installation",
+      accessUpdate,
+      total: ids.length,
+      completed: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      currentAgentName: "starting server-side bulk job",
+    } : {
+      action: label as "block" | "unblock",
+      targetBlockedState: label === "block",
+      total: ids.length,
       completed: 0,
       succeeded: 0,
       failed: 0,
@@ -1048,9 +1067,23 @@ function App() {
     setBulkResult(undefined);
 
     try {
-      const job = targetBlockedState
-        ? await blockAgents(scope.map((agent) => agent.id))
-        : await unblockAgents(scope.map((agent) => agent.id));
+      let job: BulkActionJob;
+      if (accessUpdate) {
+        if (mutationScope === "single") {
+          if (accessUpdate.mode !== "replace") throw new Error("Single-agent access updates must replace assignments.");
+          job = await updateAgentAccess(ids[0], accessUpdate, preview.confirmationHash);
+        } else {
+          job = await updateAgentsAccess(ids, accessUpdate, preview.confirmationHash);
+        }
+      } else if (mutationScope === "single") {
+        job = label === "block"
+          ? await blockAgent(ids[0], preview.confirmationHash)
+          : await unblockAgent(ids[0], preview.confirmationHash);
+      } else {
+        job = label === "block"
+          ? await blockAgents(ids, preview.confirmationHash)
+          : await unblockAgents(ids, preview.confirmationHash);
+      }
 
       saveStoredActiveBulkJobId(job.id);
       await followBulkJob(job.id, job);
@@ -1063,13 +1096,13 @@ function App() {
   }
 
   function requestBulkAccessUpdate() {
-    if (selectedAgents.length === 0) {
+    if (selectedAgentIds.size === 0) {
       setError("Select one or more agents before managing access.");
       return;
     }
 
     setError(undefined);
-    setBulkAccessAgentIds(selectedAgents.map((agent) => agent.id));
+    setBulkAccessAgentIds([...selectedAgentIds]);
   }
 
   async function runBulkAccessUpdate(update: PackageAccessUpdate) {
@@ -1079,56 +1112,39 @@ function App() {
       throw new Error("The selected agents are no longer available.");
     }
 
-    const action: AuditAction =
-      update.target === "availability"
-        ? "update-availability"
-        : "update-installation";
-    setBusyBulkAction(action);
-    setBulkProgress({
-      action,
-      accessUpdate: update,
-      total: ids.length,
-      completed: 0,
-      succeeded: 0,
-      failed: 0,
-      skipped: 0,
-      currentAgentName: "starting server-side bulk job",
-    });
     setError(undefined);
     setBulkResult(undefined);
 
     try {
-      const job = await updateAgentsAccess(ids, update);
+      await requestAccessConfirmation(ids, update, "bulk");
       setBulkAccessAgentIds(undefined);
-      saveStoredActiveBulkJobId(job.id);
-      await followBulkJob(job.id, job);
     } catch (requestError) {
       setError(errorMessage(requestError));
-      setBusyBulkAction(undefined);
-      setBulkProgress(undefined);
-      clearStoredActiveBulkJobId();
       throw requestError;
     }
   }
 
-  async function followBulkJob(jobId: string, initialJob?: BulkActionJob) {
+  async function followBulkJob(jobId: string, initialJob?: BulkActionJob, persist = true) {
     const requestId = bulkJobPollRequestId.current + 1;
     bulkJobPollRequestId.current = requestId;
+    let keepStored = true;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
 
     try {
       let job = initialJob ?? (await getBulkActionJob(jobId));
+      if (bulkJobPollRequestId.current !== requestId) return;
+      setTrackedJob(job);
 
       setBusyBulkAction(job.action);
       setBulkProgress(toBulkProgress(job));
-      saveStoredActiveBulkJobId(job.id);
+      if (persist) saveStoredActiveBulkJobId(job.id);
 
-      while (job.status === "queued" || job.status === "running") {
+      while (isJobPolling(job.status) && Date.now() < deadline) {
         await wait(bulkJobPollIntervalMs);
 
         if (bulkJobPollRequestId.current !== requestId) {
           return;
         }
-
         job = await getBulkActionJob(jobId);
 
         if (bulkJobPollRequestId.current !== requestId) {
@@ -1136,20 +1152,31 @@ function App() {
         }
 
         setBulkProgress(toBulkProgress(job));
+        setTrackedJob(job);
       }
 
-      if (job.status === "completed" && job.result) {
-        applyBulkActionResult(job.result);
-      } else {
-        setError(job.error ?? "Bulk action failed before it completed.");
+      if (isJobPolling(job.status)) {
+        keepStored = persist;
+        setError("Package job polling reached its five-minute bound. The durable job remains available for explicit refresh in Jobs.");
+        return;
       }
+
+      keepStored = job.canResume || job.status === "waiting_authorization";
+      if (job.result) {
+        if (persist) applyBulkActionResult(job.result);
+        else setBulkResult(job.result);
+      }
+      setError(jobStatusMessage(job.status));
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (bulkJobPollRequestId.current === requestId) {
+        if (persist) setError(errorMessage(requestError));
+        else setLinkedJobError(`The exact package control job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
+      }
     } finally {
       if (bulkJobPollRequestId.current === requestId) {
         setBusyBulkAction(undefined);
         setBulkProgress(undefined);
-        clearStoredActiveBulkJobId();
+        if (persist && !keepStored) clearStoredActiveBulkJobId();
       }
     }
   }
@@ -1173,6 +1200,10 @@ function App() {
         agentDetailsCache.current.delete(id);
       }
 
+      setAgents((currentAgents) => currentAgents.map(agent => changedIds.includes(agent.id)
+        ? projectVerifiedAccessScope(agent, result.accessUpdate!)
+        : agent));
+
       if (agentDetail && changedIds.includes(agentDetail.id)) {
         setAgentDetail(undefined);
       }
@@ -1185,10 +1216,10 @@ function App() {
       }
 
       markAgentStatesChanged(changedIds);
-      void loadAgents();
     }
 
     setBulkResult(result);
+    setSelectionRouteNotice(undefined);
     setSelectedAgentIds(
       new Set(
         result.results
@@ -1196,6 +1227,33 @@ function App() {
           .map((result) => result.id),
       ),
     );
+  }
+
+  async function handleResumeJob() {
+    if (!trackedJob || !window.confirm("Resume only unsent items with your current authorization? Inconclusive writes will not be replayed.")) return;
+    try { const job = await resumeBulkActionJob(trackedJob.id); await followBulkJob(job.id, job); }
+    catch (requestError) { setError(errorMessage(requestError)); }
+  }
+
+  async function handleCancelJob() {
+    if (!trackedJob) return;
+    try { setTrackedJob(await cancelBulkActionJob(trackedJob.id)); }
+    catch (requestError) { setError(errorMessage(requestError)); }
+  }
+
+  async function handleReconcileJob() {
+    if (!trackedJob) return;
+    setError(undefined);
+    try {
+      const reconciled = await reconcileBulkActionJob(trackedJob.id);
+      setTrackedJob(reconciled);
+      if (reconciled.result) setBulkResult(reconciled.result);
+      if (reconciled.reconciliation.failed) {
+        setError(`${reconciled.reconciliation.failed} provider read${reconciled.reconciliation.failed === 1 ? "" : "s"} could not be reconciled.`);
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
   }
 
   function handleClearAgentFilters() {
@@ -1206,14 +1264,7 @@ function App() {
     setHostFilter("all");
     setPlatformFilter("all");
     setCreatedWithinDays("");
-    setUsageFilter("all");
-  }
-
-  function updateCachedAgentBlockedState(
-    agentId: string,
-    targetBlockedState: boolean,
-  ) {
-    updateCachedAgentBlockedStates([agentId], targetBlockedState);
+    setAgentPageIndex(0);
   }
 
   function updateCachedAgentBlockedStates(
@@ -1318,6 +1369,7 @@ function App() {
   }
 
   function toggleAgentSelection(agentId: string) {
+    setSelectionRouteNotice(undefined);
     setSelectedAgentIds((current) => {
       const next = new Set(current);
 
@@ -1332,6 +1384,7 @@ function App() {
   }
 
   function toggleMatchingSelection(matchingAgents: CopilotPackage[]) {
+    setSelectionRouteNotice(undefined);
     setSelectedAgentIds((current) => {
       const next = new Set(current);
       const matchingIds = matchingAgents.map((agent) => agent.id);
@@ -1364,8 +1417,9 @@ function App() {
             manage Copilot packages, tenant availability, and agent status.
           </p>
           {error ? <div className="error-banner">{error}</div> : null}
+          {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
           <div className="signin-actions">
-            <a className="primary-link signin-button" href="/api/auth/login">
+            <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
               Sign in with Entra ID
             </a>
             <span>Delegated admin access required</span>
@@ -1377,6 +1431,8 @@ function App() {
   }
 
   return (
+    <CapabilityContext value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
+    <WorkbenchActionProvider value={workbenchMetadata?.actions}>
     <main className="app-shell">
       <header className="top-bar">
         <div className="title-block">
@@ -1384,48 +1440,77 @@ function App() {
           <div className="title-row">
             <h1>Agent Control</h1>
             <nav className="view-switcher" aria-label="Primary views">
+              {visibleViews.includes("agents") ? (
+              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Operator"]}>
               <button
                 type="button"
                 className={
-                  activeView === "agents" ? "view-button active" : "view-button"
+                  visibleActiveView === "agents" ? "view-button active" : "view-button"
                 }
-                onClick={() => setActiveView("agents")}
+                aria-current={visibleActiveView === "agents" ? "page" : undefined}
+                onClick={() => navigateToView("agents")}
               >
-                Agent view
+                Agents
               </button>
+              </CapabilityGate>
+              ) : null}
+              {visibleViews.includes("power-platform") ? (
+              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Operator"]}>
+              <button type="button" className={visibleActiveView === "power-platform" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "power-platform" ? "page" : undefined} onClick={() => navigateToView("power-platform")}>Power Platform</button>
+              </CapabilityGate>
+              ) : null}
+              {visibleViews.includes("users") ? (
+              <CapabilityGate roles={["AgentControl.SecurityReader"]}>
               <button
                 type="button"
                 className={
-                  activeView === "users" ? "view-button active" : "view-button"
+                  visibleActiveView === "users" ? "view-button active" : "view-button"
                 }
-                onClick={() => setActiveView("users")}
+                aria-current={visibleActiveView === "users" ? "page" : undefined}
+                onClick={() => navigateToView("users")}
               >
-                User view
+                Users
               </button>
+              </CapabilityGate>
+              ) : null}
+              {visibleViews.includes("official-usage") ? (
+              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Administrator"]}>
               <button
                 type="button"
                 className={
-                  activeView === "reports"
+                  visibleActiveView === "official-usage"
                     ? "view-button active"
                     : "view-button"
                 }
-                onClick={() => setActiveView("reports")}
+                aria-current={visibleActiveView === "official-usage" ? "page" : undefined}
+                onClick={() => navigateToView("official-usage")}
               >
-                Insights
+                Official usage
               </button>
+              </CapabilityGate>
+              ) : null}
+              {visibleViews.includes("audit") ? (
+              <CapabilityGate roles={["AgentControl.SecurityReader"]}>
               <button
                 type="button"
                 className={
-                  activeView === "audit" ? "view-button active" : "view-button"
+                  visibleActiveView === "audit" ? "view-button active" : "view-button"
                 }
-                onClick={() => setActiveView("audit")}
+                aria-current={visibleActiveView === "audit" ? "page" : undefined}
+                onClick={() => navigateToView("audit")}
               >
-                Audit log
+                Audit
               </button>
+              </CapabilityGate>
+              ) : null}
+              {visibleViews.includes("security") ? <CapabilityGate roles={["AgentControl.SecurityReader"]}><button type="button" className={visibleActiveView === "security" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "security" ? "page" : undefined} onClick={() => navigateToView("security")}>Security</button></CapabilityGate> : null}
+              <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
+              <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button>
             </nav>
           </div>
         </div>
         <div className="user-menu">
+          <CapabilityHealth />
           <span>{user.displayName || user.username}</span>
           <button type="button" onClick={() => void handleSignOut()}>
             Sign out
@@ -1434,22 +1519,37 @@ function App() {
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
+      {legacyUsagePresent && visibleActiveView !== "official-usage" ? (
+        <div className="report-status error" role="status">
+          <strong>Legacy browser report data is present in this browser.</strong>
+          <p>It was not read or migrated. Re-import the original Microsoft exports, or ask an Agent Control Administrator to explicitly discard the legacy copy.</p>
+          {canImportReports ? <button type="button" className="secondary" onClick={() => navigateToView("official-usage")}>Open Official usage</button> : null}
+        </div>
+      ) : null}
 
-      <ReportImportPanel
-        reports={usageReports}
-        status={usageImportStatus}
-        onImport={(files) => void handleSelectUsageReports(files)}
-        onClear={handleClearUsageReports}
-      />
-
-      {activeView === "agents" ? (
+      {visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
+        !hasRole(user, "AgentControl.Reader") ? (
+          <>
+            <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
+            <ExactPackageLookup
+              loading={Boolean(loadingAgentDetailId)}
+              error={agentDetailError}
+              onLookup={(id) => {
+                setAgentDetailError(undefined);
+                setRequestedAgentDetailId(id);
+              }}
+              onRefresh={(id) => void handleRefreshExactPackage(id)}
+            />
+          </>
+        ) : (
         <>
+          <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
           <section className="summary-grid" aria-label="Agent summary">
             <Metric
               label="Total"
-              value={agents.length}
+              value={agentPage?.summary.total ?? 0}
               filteredValue={
-                hasActiveAgentFilters ? filteredAgents.length : undefined
+                hasActiveAgentFilters ? agentPage?.filteredSummary.total : undefined
               }
             />
             <Metric
@@ -1464,13 +1564,6 @@ function App() {
               value={blockedAgentCount}
               filteredValue={
                 hasActiveAgentFilters ? filteredBlockedAgentCount : undefined
-              }
-            />
-            <Metric
-              label={`Inactive >${inactiveDays}d`}
-              value={inactiveAgentCount}
-              filteredValue={
-                hasActiveAgentFilters ? filteredInactiveAgentCount : undefined
               }
             />
           </section>
@@ -1492,10 +1585,25 @@ function App() {
             progress={bulkProgress}
             result={bulkResult}
             selectedCount={selectedAgentIds.size}
-            onBlockAll={() => requestBulkAction(true)}
+            onBlockAll={() => void requestBulkAction(true)}
             onManageAccess={requestBulkAccessUpdate}
-            onUnblockAll={() => requestBulkAction(false)}
+            onUnblockAll={() => void requestBulkAction(false)}
           />
+
+          {selectionRouteNotice ? (
+            <div className={selectionRouteNotice.tone === "error" ? "error-banner" : "report-status"} role="status">
+              {selectionRouteNotice.text}
+            </div>
+          ) : null}
+          {canOperate && trackedJob && (isJobPolling(trackedJob.status) || trackedJob.canResume || trackedJob.status === "partial" || trackedJob.status === "waiting_authorization") ? (
+            <section className="controls" aria-label="Job controls">
+              <span role="status">{jobStatusMessage(trackedJob.status) ?? "Job running"}</span>
+              {trackedJob.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
+              {trackedJob.canResume ? <WorkbenchActionGate actionId="packages.resume"><button type="button" onClick={() => void handleResumeJob()}><Play size={16} aria-hidden="true" /> Resume unsent items</button></WorkbenchActionGate> : null}
+              {trackedJob.results.some(result => result.status === "inconclusive" && result.reconciliationStatus === "required") ? <WorkbenchActionGate actionId="packages.reconcile"><button type="button" className="secondary" onClick={() => void handleReconcileJob()}>Reconcile inconclusive</button></WorkbenchActionGate> : null}
+              {isJobPolling(trackedJob.status) || trackedJob.canResume ? <WorkbenchActionGate actionId="packages.cancel"><button type="button" onClick={() => void handleCancelJob()}><Square size={16} aria-hidden="true" /> Cancel unsent items</button></WorkbenchActionGate> : null}
+            </section>
+          ) : null}
 
           <section className="controls catalog-controls" aria-label="Filters">
             <div
@@ -1512,7 +1620,7 @@ function App() {
                   type="search"
                   value={query}
                   onChange={(event) =>
-                    handleSearchQueryChange(event.target.value)
+                    { handleSearchQueryChange(event.target.value); setAgentPageIndex(0); }
                   }
                   placeholder="Name, publisher, ID, ref"
                 />
@@ -1525,9 +1633,7 @@ function App() {
                   }
                   value={statusFilter}
                   onChange={(event) =>
-                    setStatusFilter(
-                      event.target.value as "all" | "allowed" | "blocked",
-                    )
+                    { setStatusFilter(event.target.value as "all" | "allowed" | "blocked"); setAgentPageIndex(0); }
                   }
                 >
                   <option value="all">All</option>
@@ -1544,7 +1650,7 @@ function App() {
                       : "active-filter-select"
                   }
                   value={availableToFilter}
-                  onChange={(event) => setAvailableToFilter(event.target.value)}
+                  onChange={(event) => { setAvailableToFilter(event.target.value); setAgentPageIndex(0); }}
                 >
                   <option value="all">All availability</option>
                   {availableToOptions.map((availability) => (
@@ -1570,7 +1676,7 @@ function App() {
                       : "active-filter-select"
                   }
                   value={publisherFilter}
-                  onChange={(event) => setPublisherFilter(event.target.value)}
+                  onChange={(event) => { setPublisherFilter(event.target.value); setAgentPageIndex(0); }}
                 >
                   <option value="all">All publishers</option>
                   {publisherOptions.map((publisher) => (
@@ -1587,7 +1693,7 @@ function App() {
                     hostFilter === "all" ? undefined : "active-filter-select"
                   }
                   value={hostFilter}
-                  onChange={(event) => setHostFilter(event.target.value)}
+                  onChange={(event) => { setHostFilter(event.target.value); setAgentPageIndex(0); }}
                 >
                   <option value="all">All hosts</option>
                   {hostOptions.map((host) => (
@@ -1606,7 +1712,7 @@ function App() {
                       : "active-filter-select"
                   }
                   value={effectivePlatformFilter}
-                  onChange={(event) => setPlatformFilter(event.target.value)}
+                  onChange={(event) => { setPlatformFilter(event.target.value); setAgentPageIndex(0); }}
                 >
                   <option value="all">All platforms</option>
                   {platformOptions.map((platform) => (
@@ -1630,58 +1736,27 @@ function App() {
                     max="3650"
                     value={createdWithinDays}
                     onChange={(event) =>
-                      setCreatedWithinDays(event.target.value)
+                      { setCreatedWithinDays(event.target.value); setAgentPageIndex(0); }
                     }
                     placeholder="Any"
                   />
                   <span>days</span>
                 </div>
               </label>
-            </div>
-
-            <div
-              className="filter-section filter-section-usage"
-              aria-label="Usage window"
-            >
-              <span className="filter-section-title">Usage window</span>
               <label>
-                <span>Usage state</span>
-                <select
-                  className={
-                    usageFilter === "all" ? undefined : "active-filter-select"
-                  }
-                  value={usageFilter}
-                  onChange={(event) =>
-                    setUsageFilter(event.target.value as UsageFilter)
-                  }
-                >
-                  <option value="all">All usage states</option>
-                  <option value="with-usage">Has imported usage</option>
-                  <option value="without-usage">No imported usage</option>
-                  <option value="recent">
-                    Active in last {inactiveDays} days
-                  </option>
-                  <option value="inactive">
-                    Inactive over {inactiveDays} days
-                  </option>
+                <span>Sort by</span>
+                <select value={agentSortBy} onChange={(event) => { setAgentSortBy(event.target.value as NonNullable<PackageListQuery["sortBy"]>); setAgentPageIndex(0); }}>
+                  <option value="displayName">Name</option>
+                  <option value="publisher">Publisher</option>
+                  <option value="lastModifiedAt">Last modified</option>
                 </select>
               </label>
-              <label className="threshold-filter">
-                <span>Inactive threshold</span>
-                <div className="number-with-unit">
-                  <input
-                    type="number"
-                    min="1"
-                    max="365"
-                    value={inactiveDays}
-                    onChange={(event) =>
-                      setInactiveDays(
-                        clampNumber(event.target.value, 1, 365, 30),
-                      )
-                    }
-                  />
-                  <span>days</span>
-                </div>
+              <label>
+                <span>Direction</span>
+                <select value={agentSortDirection} onChange={(event) => { setAgentSortDirection(event.target.value as "asc" | "desc"); setAgentPageIndex(0); }}>
+                  <option value="asc">Ascending</option>
+                  <option value="desc">Descending</option>
+                </select>
               </label>
             </div>
 
@@ -1690,19 +1765,19 @@ function App() {
               aria-label="Table actions"
             >
               <div className="filter-action-buttons">
-                <button
+                <WorkbenchActionGate actionId="packages.refresh"><button
                   type="button"
                   className="icon-button control-icon-button"
                   aria-label={
-                    loadingAgents ? "Refreshing agents" : "Refresh agents"
+                    refreshingAgents ? "Refreshing agents" : "Refresh agents"
                   }
-                  title={loadingAgents ? "Refreshing agents" : "Refresh agents"}
-                  disabled={loadingAgents}
-                  onClick={() => void loadAgents()}
+                  title={refreshingAgents ? "Refreshing agents" : "Refresh agents"}
+                  disabled={loadingAgents || refreshingAgents}
+                  onClick={() => void handleRefreshAgents()}
                 >
                   <RefreshIcon />
-                </button>
-                <button
+                </button></WorkbenchActionGate>
+                <WorkbenchActionGate actionId="packages.export"><button
                   type="button"
                   className="secondary icon-button control-icon-button"
                   aria-label={
@@ -1716,19 +1791,19 @@ function App() {
                       : "Export filtered CSV"
                   }
                   disabled={
-                    loadingAgents || exportingCsv || exportableAgentCount === 0
+                    loadingAgents || exportingCsv || exportableAgentCount === 0 || bulkRefAuthorizationMissing
                   }
                   onClick={requestExportCsv}
                 >
                   <ExportIcon />
-                </button>
+                </button></WorkbenchActionGate>
               </div>
               <span className="last-refresh" aria-live="polite">
                 {lastAgentListRefreshAt
-                  ? `Last full refresh ${formatRefreshTime(
+                  ? `Saved Graph observation ${formatRefreshTime(
                       lastAgentListRefreshAt,
-                    )}`
-                  : ""}
+                    )}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : " / v1.0 read, preview controls"}`
+                  : "No saved package observation. Refresh explicitly when authorized."}
               </span>
             </div>
             <button
@@ -1741,15 +1816,16 @@ function App() {
             </button>
           </section>
 
+          {bulkRefAuthorizationMissing ? (
+            <div className="error-banner" role="status">
+              Bulk-reference filters require the independent AgentControl.SecurityReader role. Regular package text search remains available.
+            </div>
+          ) : null}
           {loadingBulkRefSearch ? (
             <div className="screen-state">
               Resolving bulk ref {normalizedBulkRefQuery}...
             </div>
           ) : null}
-          {normalizedBulkRefQuery && bulkRefSearch?.error ? (
-            <div className="error-banner">{bulkRefSearch.error}</div>
-          ) : null}
-
           {loadingAgents ? (
             <div className="screen-state">Loading Copilot agents...</div>
           ) : (
@@ -1759,57 +1835,62 @@ function App() {
                 busyAgentId={busyAgentId}
                 selectedIds={selectedAgentIds}
                 recentlyChangedIds={recentlyChangedAgentIds}
+                operationsAllowed={canOperate}
                 selectionDisabled={Boolean(busyBulkAction)}
                 usageByAgentId={usageByAgentId}
                 allMatchingSelected={allMatchingSelected}
                 selectedCount={selectedAgentIds.size}
                 onToggleAgentSelection={toggleAgentSelection}
                 onToggleMatchingSelection={() =>
-                  toggleMatchingSelection(filteredAgents)
+                  toggleMatchingSelection(agents)
                 }
                 onViewDetails={(agent) => void handleViewAgentDetails(agent)}
                 onManageAccess={(agent) => void handleManageAgentAccess(agent)}
                 onBlock={(agent) => void handleAgentAction(agent, true)}
                 onUnblock={(agent) => void handleAgentAction(agent, false)}
               />
-              <AgentDisplayWindowControls
-                displayedCount={displayedFilteredAgents.length}
-                totalCount={filteredAgents.length}
-                hasMore={hasMoreDisplayedAgents}
-                onLoadMore={() =>
-                  setAgentDisplayWindow((currentWindow) => {
-                    const currentLimit =
-                      currentWindow.key === agentDisplayWindowKey
-                        ? currentWindow.limit
-                        : agentDisplayPageSize;
-
-                    return {
-                      key: agentDisplayWindowKey,
-                      limit: currentLimit + agentDisplayPageSize,
-                    };
-                  })
-                }
+              <AgentPageControls
+                pageIndex={agentPageIndex}
+                pageSize={agentDisplayPageSize}
+                totalCount={agentPage?.count ?? 0}
+                loading={loadingAgents}
+                onPageChange={setAgentPageIndex}
               />
             </div>
           )}
         </>
-      ) : activeView === "users" ? (
+        )
+      ) : visibleActiveView === "power-platform" ? (
+        hasRole(user, "AgentControl.Reader")
+          ? <InventoryExplorer key={principalKey} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Operator"))} />
+          : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
+      ) : visibleActiveView === "users" ? (
         <UserAccessView
-          agents={agents}
-          inactiveDays={inactiveDays}
-          reports={usageReports}
+          data={officialUsageUsers}
+          onPageChange={setOfficialUsageUserOffset}
+          onQueryChange={(query) => {
+            setOfficialUsageUserOffset(0);
+            setOfficialUsageUserQuery(query);
+          }}
         />
-      ) : activeView === "reports" ? (
-        <ReportingView
-          activityWindowDays={reportActivityWindowDays}
-          agents={agents}
-          inactiveDays={inactiveDays}
-          onActivityWindowDaysChange={setReportActivityWindowDays}
-          reports={usageReports}
-        />
-      ) : (
-        <AuditLogView agents={agents} />
-      )}
+      ) : visibleActiveView === "official-usage" ? (
+        <section className="official-usage-workbench" aria-label="Official usage">
+          {canImportReports ? <OfficialUsageImportPanel key={principalKey} initialStagingId={requestedOfficialUsageStagingId} onChanged={() => void loadOfficialUsage()} onLegacyCleared={() => setLegacyUsagePresent(false)} /> : null}
+          {hasRole(user, "AgentControl.Reader") ? <ReportingView
+            activityWindowDays={reportActivityWindowDays}
+            data={officialUsageAggregate}
+            inactiveDays={inactiveDays}
+            onActivityWindowDaysChange={handleReportActivityWindowChange}
+            userData={canReadSensitiveUsage ? officialUsageUsers : undefined}
+          /> : null}
+        </section>
+      ) : visibleActiveView === "audit" ? (
+        <AuditLogView key={principalKey} agents={agents} />
+      ) : visibleActiveView === "security" ? (
+        <DefenderHuntingView key={principalKey} />
+      ) : visibleActiveView === "jobs" ? (
+        <JobsView key={principalKey} user={user} />
+      ) : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
       {loadingAgentDetailId ? (
         <div className="detail-loading" role="status" aria-live="polite">
@@ -1824,10 +1905,16 @@ function App() {
       {agentDetail ? (
         <AgentDetailModal
           agent={agentDetail}
-          usage={usageByAgentId.get(agentDetail.id)}
-          userRows={userAgentRowsByAgentId.get(agentDetail.id) ?? []}
-          onClose={() => setAgentDetail(undefined)}
+          activeTab={agentDetailTab}
+          onTabChange={setAgentDetailTab}
+          roles={user?.roles ?? []}
+          onClose={() => { setAgentDetail(undefined); setRequestedAgentDetailId(undefined); }}
           onUpdateAccess={handleUpdateAgentAccess}
+          onSetBlocked={async (blocked) => {
+            await handleAgentAction(agentDetail, blocked);
+            setAgentDetail(undefined);
+            setRequestedAgentDetailId(undefined);
+          }}
         />
       ) : null}
 
@@ -1840,7 +1927,7 @@ function App() {
           initialPrincipals={singleAccessAgentDetail.allowedUsersAndGroups}
           onCancel={() => setSingleAccessAgentDetail(undefined)}
           onSubmit={async (update) => {
-            await updateSingleAgentAccess(singleAccessAgentDetail.id, update);
+            await requestAccessConfirmation([singleAccessAgentDetail.id], update, "single");
             setSingleAccessAgentDetail(undefined);
           }}
         />
@@ -1868,161 +1955,26 @@ function App() {
           agentCount={exportableAgentCount}
           isFiltered={hasActiveAgentFilters}
           onCancel={() => setExportChoiceOpen(false)}
-          onExport={(mode) => void handleExportCsv(mode)}
-        />
-      ) : null}
-
-      {pendingUsageImport ? (
-        <UsageImportReviewModal
-          pendingImport={pendingUsageImport}
-          onCancel={() => setPendingUsageImport(undefined)}
-          onConfirm={handleConfirmUsageImport}
+          onExport={() => void handleExportCsv()}
         />
       ) : null}
 
       <AppFooter />
     </main>
+    </WorkbenchActionProvider>
+    </CapabilityContext>
   );
 }
-
-const unknownPublisherValue = "__unknown__";
-const unknownHostValue = "__unknown_host__";
-const unknownAvailableToValue = "__unknown__";
-const someOrAllAvailableToValue = "__some_or_all__";
-const availableToFilterValuePrefix = "available:";
-const detailBatchSize = 100;
-const someOrAllAvailableToNormalizedValues = new Set([
-  "all",
-  "some",
-  "allowedforall",
-  "allowedforsome",
-]);
 
 type ExportMode = "fast" | "full";
 
-type UsageFilter =
-  | "all"
-  | "with-usage"
-  | "without-usage"
-  | "recent"
-  | "inactive";
-
-type BulkConfirmation = {
-  action: "block" | "unblock";
-  targetBlockedState: boolean;
-  scope: CopilotPackage[];
-  actionableCount: number;
-  skippedCount: number;
+export type BulkConfirmation = {
+  action: AuditAction;
+  ids: string[];
+  mutationScope: "single" | "bulk";
+  preview: PackageMutationPreview;
+  accessUpdate?: PackageAccessUpdate;
 };
-
-type AgentFilterCriteria = {
-  availableToFilter: string;
-  bulkRefSearch?: BulkRefSearchState;
-  creationWindowDays?: number;
-  effectivePlatformFilter: string;
-  hostFilter: string;
-  inactiveDays: number;
-  normalizedBulkRefQuery?: string;
-  normalizedQuery: string;
-  publisherFilter: string;
-  statusFilter: "all" | "allowed" | "blocked";
-  usageByAgentId: Map<string, AgentUsageSummary>;
-  usageFilter: UsageFilter;
-};
-
-function agentMatchesFilters(
-  agent: CopilotPackage,
-  criteria: AgentFilterCriteria,
-  includeStatus: boolean,
-) {
-  const usage = criteria.usageByAgentId.get(agent.id);
-  const matchesStatus =
-    !includeStatus ||
-    criteria.statusFilter === "all" ||
-    (criteria.statusFilter === "blocked" && agent.isBlocked) ||
-    (criteria.statusFilter === "allowed" && !agent.isBlocked);
-  const matchesPublisher =
-    criteria.publisherFilter === "all" ||
-    agent.publisher === criteria.publisherFilter ||
-    (!agent.publisher && criteria.publisherFilter === unknownPublisherValue);
-  const matchesAvailability = matchesAvailableToFilter(
-    agent.availableTo,
-    criteria.availableToFilter,
-  );
-  const matchesHost =
-    criteria.hostFilter === "all" ||
-    (criteria.hostFilter === unknownHostValue
-      ? hasUnknownHostValue(agent)
-      : getKnownHostValues(agent).includes(criteria.hostFilter));
-  const matchesPlatform =
-    criteria.effectivePlatformFilter === "all" ||
-    getBuiltWithFilterValue(agent) === criteria.effectivePlatformFilter;
-  const matchesCreationAge = criteria.creationWindowDays
-    ? isCreatedWithinDays(agent.createdDateTime, criteria.creationWindowDays)
-    : true;
-  const matchesUsage = matchesUsageFilter(
-    usage,
-    criteria.usageFilter,
-    criteria.inactiveDays,
-  );
-  const matchesBulkRef = criteria.normalizedBulkRefQuery
-    ? criteria.bulkRefSearch?.ref === criteria.normalizedBulkRefQuery &&
-      criteria.bulkRefSearch.agentIds.has(agent.id)
-    : true;
-
-  return (
-    matchesStatus &&
-    matchesPublisher &&
-    matchesAvailability &&
-    matchesHost &&
-    matchesPlatform &&
-    matchesCreationAge &&
-    matchesUsage &&
-    matchesBulkRef &&
-    (criteria.normalizedBulkRefQuery ||
-      !criteria.normalizedQuery ||
-      getAgentSearchableText(agent, usage).includes(criteria.normalizedQuery))
-  );
-}
-
-function getAgentSearchableText(
-  agent: CopilotPackage,
-  usage: AgentUsageSummary | undefined,
-) {
-  return [
-    agent.displayName,
-    agent.shortDescription,
-    agent.publisher,
-    formatDetailLabel(agent.availableTo),
-    agent.platform,
-    getBuiltWithLabel(agent),
-    usage?.agentName,
-    usage?.creatorType,
-    usage?.agentId,
-    agent.createdDateTime,
-    agent.id,
-    getKnownHostValues(agent).join(" "),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-}
-
-function mergeAgentRowsInCatalogOrder(
-  catalogAgents: CopilotPackage[],
-  primaryAgents: CopilotPackage[],
-  additionalAgents: CopilotPackage[],
-) {
-  if (additionalAgents.length === 0) {
-    return primaryAgents;
-  }
-
-  const displayedAgentIds = new Set(
-    [...primaryAgents, ...additionalAgents].map((agent) => agent.id),
-  );
-
-  return catalogAgents.filter((agent) => displayedAgentIds.has(agent.id));
-}
 
 function toBulkProgress(job: BulkActionJob): BulkProgress {
   const progress = {
@@ -2071,73 +2023,38 @@ function clearStoredActiveBulkJobId() {
   }
 }
 
-function formatHostLabel(host: string) {
-  return host
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .trim();
-}
-
-function getKnownHostValues(agent: Pick<CopilotPackage, "supportedHosts">) {
-  return [...new Set((agent.supportedHosts ?? []).map(normalizeHostValue))]
-    .filter(Boolean)
-    .sort((first, second) => first.localeCompare(second));
-}
-
-function hasUnknownHostValue(agent: Pick<CopilotPackage, "supportedHosts">) {
-  return (
-    !agent.supportedHosts?.length ||
-    agent.supportedHosts.some((host) => !normalizeHostValue(host))
-  );
-}
-
-function normalizeHostValue(host: string | null | undefined) {
-  return typeof host === "string" ? host.trim() : "";
-}
-
-function matchesAvailableToFilter(value: string | undefined, filter: string) {
-  if (filter === "all") {
-    return true;
-  }
-
-  if (filter === someOrAllAvailableToValue) {
-    return isAvailableToSomeOrAllValue(value);
-  }
-
-  const expectedValue = decodeAvailableToFilterValue(filter);
-  return (
-    value === expectedValue ||
-    (!value && expectedValue === unknownAvailableToValue)
-  );
-}
-
-function encodeAvailableToFilterValue(value: string) {
-  return `${availableToFilterValuePrefix}${value}`;
-}
-
-function decodeAvailableToFilterValue(value: string) {
-  return value.startsWith(availableToFilterValuePrefix)
-    ? value.slice(availableToFilterValuePrefix.length)
-    : value;
-}
-
-function isAvailableToSomeOrAllValue(value: string | undefined) {
-  if (!value) {
-    return false;
-  }
-
-  return someOrAllAvailableToNormalizedValues.has(normalizeFilterValue(value));
-}
-
-function normalizeFilterValue(value: string) {
-  return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
-}
-
 function formatRefreshTime(date: Date) {
   return date.toLocaleTimeString([], {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
+  loading: boolean;
+  error?: string;
+  onLookup: (id: string) => void;
+  onRefresh: (id: string) => void;
+}) {
+  const [nativeId, setNativeId] = useState("");
+  return <section className="screen-state exact-package-lookup" aria-labelledby="exact-package-heading">
+    <h2 id="exact-package-heading">Exact package targeting</h2>
+    <p>Operator does not inherit Reader inventory enumeration. Enter one known Microsoft Graph package native ID to inspect and control only that target.</p>
+    <form onSubmit={event => {
+      event.preventDefault();
+      const id = nativeId.trim();
+      if (id && id.length <= 512 && !/[\r\n\0]/.test(id)) onLookup(id);
+    }}>
+      <label><span>Graph package native ID</span><input value={nativeId} maxLength={512} onChange={event => setNativeId(event.target.value)} /></label>
+      <button type="submit" disabled={loading || !nativeId.trim()}>Inspect exact package</button>
+      <WorkbenchActionGate actionId="packages.refresh.exact"><button type="button" className="secondary" disabled={loading || !nativeId.trim()} onClick={() => {
+        const id = nativeId.trim();
+        if (id && id.length <= 512 && !/[\r\n\0]/.test(id)) onRefresh(id);
+      }}>Refresh exact package</button></WorkbenchActionGate>
+    </form>
+    {loading ? <p role="status">Loading exact package…</p> : null}
+    {error ? <p role="alert">{error}</p> : null}
+  </section>;
 }
 
 function Metric({
@@ -2201,47 +2118,32 @@ function ExportProgressMeter({
   );
 }
 
-function AgentDisplayWindowControls({
-  displayedCount,
+function AgentPageControls({
+  pageIndex,
+  pageSize,
   totalCount,
-  hasMore,
-  onLoadMore,
+  loading,
+  onPageChange,
 }: {
-  displayedCount: number;
+  pageIndex: number;
+  pageSize: number;
   totalCount: number;
-  hasMore: boolean;
-  onLoadMore: () => void;
+  loading: boolean;
+  onPageChange: (page: number) => void;
 }) {
-  if (totalCount === 0) {
-    return null;
-  }
-
-  const remainingCount = Math.max(0, totalCount - displayedCount);
-  const nextCount = Math.min(agentDisplayPageSize, remainingCount);
-
+  const pageCount = Math.max(Math.ceil(totalCount / pageSize), 1);
+  const start = totalCount ? pageIndex * pageSize + 1 : 0;
+  const end = Math.min((pageIndex + 1) * pageSize, totalCount);
   return (
     <div className="agent-display-window" aria-live="polite">
-      <span>
-        Showing {displayedCount.toLocaleString()} of{" "}
-        {totalCount.toLocaleString()} matching agents
-      </span>
-      {hasMore ? (
-        <button type="button" className="secondary" onClick={onLoadMore}>
-          Load {nextCount.toLocaleString()} more
-        </button>
-      ) : null}
+      <span>{start.toLocaleString()}-{end.toLocaleString()} of {totalCount.toLocaleString()} matching agents</span>
+      <div>
+        <button type="button" className="secondary" disabled={loading || pageIndex === 0} onClick={() => onPageChange(Math.max(0, pageIndex - 1))}>Previous</button>
+        <span>Page {pageIndex + 1} of {pageCount}</span>
+        <button type="button" className="secondary" disabled={loading || pageIndex + 1 >= pageCount} onClick={() => onPageChange(pageIndex + 1)}>Next</button>
+      </div>
     </div>
   );
-}
-
-function chunks<T>(items: T[], size: number) {
-  const result: T[][] = [];
-
-  for (let index = 0; index < items.length; index += size) {
-    result.push(items.slice(index, index + size));
-  }
-
-  return result;
 }
 
 function RefreshIcon() {
@@ -2328,255 +2230,6 @@ function AppFooter() {
   );
 }
 
-function ReportImportPanel({
-  reports,
-  status,
-  onImport,
-  onClear,
-}: {
-  reports: UsageReportsState;
-  status?: UsageImportStatus;
-  onImport: (files: FileList | null) => void;
-  onClear: () => void;
-}) {
-  const hasImportedReports = Boolean(
-    reports.agents || reports.userAgents || reports.users,
-  );
-  const reportTiming = summarizeUsageReportTiming(reports);
-  const now = new Date();
-  const reportSourceAge = getReportSourceAgeDetails(reportTiming, now);
-
-  return (
-    <section className="report-panel" aria-label="Usage report import">
-      <div className="report-panel-header">
-        <div>
-          <strong>Usage reports</strong>
-          <span>
-            {hasImportedReports
-              ? `Saved: ${formatImportRowSummary(
-                  summarizeUsageReportsState(reports),
-                )}`
-              : "Import the Agents, Users & agents, and Users CSV exports to enrich this view."}
-          </span>
-        </div>
-        <div className="report-actions">
-          <label className="file-button">
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              multiple
-              onChange={(event) => {
-                onImport(event.currentTarget.files);
-                event.currentTarget.value = "";
-              }}
-            />
-            Import CSVs
-          </label>
-          <button
-            type="button"
-            className="secondary"
-            disabled={!hasImportedReports && !status}
-            onClick={onClear}
-          >
-            Clear reports
-          </button>
-        </div>
-      </div>
-
-      {status || hasImportedReports ? (
-        <div
-          className={`report-status ${status?.kind ?? "success"}`}
-          aria-live="polite"
-        >
-          <div className="report-status-row">
-            <div className="report-status-copy">
-              {status ? (
-                <span className="report-status-message">{status.message}</span>
-              ) : null}
-              {hasImportedReports && reportSourceAge.sourceStamp ? (
-                <span className="report-source-stamp">
-                  Latest source stamp: {reportSourceAge.sourceStamp}
-                </span>
-              ) : null}
-            </div>
-            {hasImportedReports ? (
-              <div
-                className={`report-age${reportSourceAge.isStale ? " stale" : ""}`}
-                aria-label="Usage report age"
-              >
-                <span>Report age</span>
-                <strong>{reportSourceAge.value}</strong>
-              </div>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function UsageImportReviewModal({
-  pendingImport,
-  onCancel,
-  onConfirm,
-}: {
-  pendingImport: PendingUsageImport;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const counts = summarizeParsedUsageReports(pendingImport.reports);
-  const importDisabled = pendingImport.reports.length === 0;
-  const summaryItems: Array<{
-    label: string;
-    value: number;
-    icon: LucideIcon;
-    tone: UsageReportKind;
-  }> = [
-    { label: "Agents", value: counts.agents, icon: Bot, tone: "agents" },
-    {
-      label: "Users & agents",
-      value: counts.userAgents,
-      icon: UsersRound,
-      tone: "userAgents",
-    },
-    { label: "Users", value: counts.users, icon: UserRound, tone: "users" },
-  ];
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
-      <section
-        className="confirm-modal usage-import-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="usage-import-title"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="usage-import-header">
-          <span className="usage-import-header-icon" aria-hidden="true">
-            <FileCheck2 size={22} strokeWidth={2.2} />
-          </span>
-          <div>
-            <p className="eyebrow">CSV import</p>
-            <h2 id="usage-import-title">Review usage reports</h2>
-          </div>
-        </div>
-
-        <p className="usage-import-copy">
-          Parsed {pendingImport.totalFiles.toLocaleString()} selected file
-          {pendingImport.totalFiles === 1 ? "" : "s"}. Confirm to apply these
-          usage metrics to the agent table.
-        </p>
-
-        <div
-          className="confirm-summary usage-import-summary"
-          aria-label="Parsed report rows"
-        >
-          {summaryItems.map((item) => {
-            const Icon = item.icon;
-
-            return (
-              <span
-                key={item.tone}
-                className={`usage-import-stat ${item.tone}`}
-              >
-                <span className="usage-import-stat-label">
-                  <Icon size={18} strokeWidth={2.15} aria-hidden="true" />
-                  {item.label}
-                </span>
-                <strong>{item.value.toLocaleString()}</strong>
-              </span>
-            );
-          })}
-        </div>
-
-        {pendingImport.reports.length ? (
-          <section className="detail-section usage-import-section">
-            <h3>Recognized reports</h3>
-            <ul className="detail-list usage-report-list">
-              {pendingImport.reports.map((report) => {
-                const Icon = getUsageReportIcon(report.kind);
-
-                return (
-                  <li
-                    key={`${report.kind}-${report.fileName}`}
-                    className={`usage-report-card ${report.kind}`}
-                  >
-                    <span className="usage-report-icon" aria-hidden="true">
-                      <Icon size={18} strokeWidth={2.15} />
-                    </span>
-                    <span className="usage-report-copy">
-                      <strong>{formatReportKind(report.kind)}</strong>
-                      <small>
-                        {report.rows.length.toLocaleString()} rows
-                        {report.periodDays
-                          ? `, ${report.periodDays}-day export`
-                          : ""}
-                      </small>
-                    </span>
-                    <span className="usage-report-pill">Ready</span>
-                  </li>
-                );
-              })}
-            </ul>
-          </section>
-        ) : null}
-
-        {pendingImport.failures.length ? (
-          <section className="detail-section usage-import-section attention">
-            <h3>Files that need attention</h3>
-            <ul className="detail-list usage-attention-list">
-              {pendingImport.failures.map((failure) => (
-                <li
-                  key={failure.fileName}
-                  className="usage-report-card attention"
-                >
-                  <span className="usage-report-icon" aria-hidden="true">
-                    <FileWarning size={18} strokeWidth={2.15} />
-                  </span>
-                  <span className="usage-report-copy">
-                    <strong>{failure.fileName}</strong>
-                    <small>{failure.message}</small>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        ) : null}
-
-        {pendingImport.warnings.length ? (
-          <section className="detail-section usage-import-section warning">
-            <h3>Warnings</h3>
-            <ul className="detail-list usage-attention-list">
-              {pendingImport.warnings.slice(0, 6).map((warning) => (
-                <li key={warning} className="usage-report-card warning">
-                  <span className="usage-report-icon" aria-hidden="true">
-                    <TriangleAlert size={18} strokeWidth={2.15} />
-                  </span>
-                  <span className="usage-report-copy">
-                    <small>{warning}</small>
-                  </span>
-                </li>
-              ))}
-            </ul>
-            {pendingImport.warnings.length > 6 ? (
-              <p>{pendingImport.warnings.length - 6} more warnings hidden.</p>
-            ) : null}
-          </section>
-        ) : null}
-
-        <div className="confirm-actions">
-          <button type="button" className="secondary" onClick={onCancel}>
-            Cancel
-          </button>
-          <button type="button" disabled={importDisabled} onClick={onConfirm}>
-            Import reports
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
 function formatDetailLabel(value?: string) {
   if (!value) {
     return undefined;
@@ -2586,187 +2239,6 @@ function formatDetailLabel(value?: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
-}
-
-function mergeUsageReports(
-  current: UsageReportsState,
-  reports: ParsedUsageReport[],
-): UsageReportsState {
-  const next: UsageReportsState = {
-    ...current,
-  };
-
-  for (const report of reports) {
-    if (report.kind === "agents") {
-      next.agents = report;
-    } else if (report.kind === "userAgents") {
-      next.userAgents = report;
-    } else {
-      next.users = report;
-    }
-  }
-
-  return next;
-}
-
-function coalesceUsageReportsByKind(
-  reports: ParsedUsageReport[],
-  warnings: string[],
-) {
-  const reportsByKind = new Map<UsageReportKind, ParsedUsageReport>();
-
-  for (const report of reports) {
-    if (reportsByKind.has(report.kind)) {
-      warnings.push(
-        `Multiple ${formatReportKind(report.kind)} reports were selected; using ${report.fileName}.`,
-      );
-    }
-
-    reportsByKind.set(report.kind, report);
-  }
-
-  return [...reportsByKind.values()];
-}
-
-function buildUsageByAgentId(
-  reports: UsageReportsState,
-  userAgentRowsByAgentId: Map<string, UserAgentUsageRow[]>,
-) {
-  const usageByAgentId = new Map<string, AgentUsageSummary>();
-  const agentReport = reports.agents;
-
-  if (agentReport) {
-    for (const row of agentReport.rows) {
-      if (!row.agentId) {
-        continue;
-      }
-
-      usageByAgentId.set(row.agentId, {
-        ...row,
-        fileName: agentReport.fileName,
-        importedAt: agentReport.importedAt,
-        periodDays: agentReport.periodDays,
-        sourceReport: "agents",
-        userRows: userAgentRowsByAgentId.get(row.agentId) ?? [],
-      });
-    }
-
-    return usageByAgentId;
-  }
-
-  for (const [agentId, rows] of userAgentRowsByAgentId) {
-    const usernames = new Set(rows.map((row) => row.username).filter(Boolean));
-    const latestActivity = latestDate(
-      rows.map((row) => row.lastActivityDateUtc),
-    );
-    const responsesSentToUsers = rows.reduce(
-      (total, row) => total + row.responsesSentToUsers,
-      0,
-    );
-    const firstRow = rows[0];
-
-    usageByAgentId.set(agentId, {
-      agentId,
-      agentName: firstRow?.agentName ?? "",
-      creatorType: firstRow?.creatorType ?? "",
-      activeUsersLicensed: 0,
-      activeUsersUnlicensed: 0,
-      activeUsersTotal: usernames.size,
-      responsesSentToUsers,
-      lastActivityDateUtc: latestActivity,
-      fileName: reports.userAgents?.fileName ?? "",
-      importedAt: reports.userAgents?.importedAt ?? "",
-      periodDays: reports.userAgents?.periodDays,
-      sourceReport: "userAgents",
-      userRows: rows,
-    });
-  }
-
-  return usageByAgentId;
-}
-
-function latestDate(values: Array<string | undefined>) {
-  return values
-    .filter((value): value is string => Boolean(value))
-    .sort((first, second) => Date.parse(second) - Date.parse(first))[0];
-}
-
-function matchesUsageFilter(
-  usage: AgentUsageSummary | undefined,
-  filter: UsageFilter,
-  inactiveDays: number,
-) {
-  if (filter === "all") {
-    return true;
-  }
-
-  if (filter === "with-usage") {
-    return Boolean(usage);
-  }
-
-  if (filter === "without-usage") {
-    return !usage;
-  }
-
-  if (!usage?.lastActivityDateUtc) {
-    return false;
-  }
-
-  const inactive = isInactiveUsage(usage, inactiveDays);
-  return filter === "inactive" ? inactive : !inactive;
-}
-
-function isInactiveUsage(
-  usage: AgentUsageSummary | undefined,
-  inactiveDays: number,
-) {
-  if (!usage?.lastActivityDateUtc) {
-    return false;
-  }
-
-  const today = startOfUtcDay(new Date());
-  const activityDate = startOfUtcDay(new Date(usage.lastActivityDateUtc));
-  const elapsedDays = Math.floor(
-    (today.getTime() - activityDate.getTime()) / 86_400_000,
-  );
-
-  return elapsedDays > inactiveDays;
-}
-
-function isCreatedWithinDays(value: string | undefined, days: number) {
-  if (!value) {
-    return false;
-  }
-
-  const createdAt = new Date(value).getTime();
-
-  if (Number.isNaN(createdAt)) {
-    return false;
-  }
-
-  const elapsedMs = Date.now() - createdAt;
-  return elapsedMs >= 0 && elapsedMs <= days * 86_400_000;
-}
-
-function startOfUtcDay(date: Date) {
-  return new Date(
-    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-  );
-}
-
-function clampNumber(
-  value: string,
-  minimum: number,
-  maximum: number,
-  fallback: number,
-) {
-  const parsed = Number(value);
-
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-
-  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
 }
 
 function parseOptionalPositiveInteger(value: string) {
@@ -2779,169 +2251,7 @@ function parseOptionalPositiveInteger(value: string) {
   return Math.floor(parsed);
 }
 
-function formatReportKind(kind: UsageReportKind) {
-  if (kind === "agents") {
-    return "Agents";
-  }
-
-  if (kind === "userAgents") {
-    return "Users & agents";
-  }
-
-  return "Users";
-}
-
-function getUsageReportIcon(kind: UsageReportKind): LucideIcon {
-  if (kind === "agents") {
-    return Bot;
-  }
-
-  if (kind === "userAgents") {
-    return UsersRound;
-  }
-
-  return UserRound;
-}
-
-function summarizeParsedUsageReports(reports: ParsedUsageReport[]) {
-  return reports.reduce(
-    (counts, report) => {
-      counts[report.kind] += report.rows.length;
-      return counts;
-    },
-    { agents: 0, userAgents: 0, users: 0 } satisfies Record<
-      UsageReportKind,
-      number
-    >,
-  );
-}
-
-function summarizeUsageReportsState(reports: UsageReportsState) {
-  return {
-    agents: reports.agents?.rows.length ?? 0,
-    userAgents: reports.userAgents?.rows.length ?? 0,
-    users: reports.users?.rows.length ?? 0,
-  } satisfies Record<UsageReportKind, number>;
-}
-
-function summarizeUsageReportTiming(reports: UsageReportsState) {
-  const reportList = [reports.agents, reports.userAgents, reports.users].filter(
-    (report): report is ParsedUsageReport => Boolean(report),
-  );
-  const sourceGeneratedAtValues = reportList
-    .map(
-      (report) =>
-        report.sourceGeneratedAt ??
-        parseUsageReportFileTimestamp(report.fileName),
-    )
-    .filter(isValidDateString);
-
-  return {
-    newestSourceGeneratedAt: latestTimestamp(sourceGeneratedAtValues),
-    oldestSourceGeneratedAt: earliestTimestamp(sourceGeneratedAtValues),
-    sourceGeneratedAtCount: sourceGeneratedAtValues.length,
-    reportCount: reportList.length,
-  };
-}
-
-function latestTimestamp(values: string[]) {
-  return values.sort(
-    (first, second) => Date.parse(second) - Date.parse(first),
-  )[0];
-}
-
-function earliestTimestamp(values: string[]) {
-  return values.sort(
-    (first, second) => Date.parse(first) - Date.parse(second),
-  )[0];
-}
-
-function isValidDateString(value: string | undefined): value is string {
-  return Boolean(value && Number.isFinite(Date.parse(value)));
-}
-
-function getReportSourceAgeDetails(
-  timing: ReturnType<typeof summarizeUsageReportTiming>,
-  now: Date,
-) {
-  if (!timing.newestSourceGeneratedAt) {
-    return {
-      value: "Unavailable",
-      sourceStamp: "No filename timestamp detected.",
-      isStale: false,
-    };
-  }
-
-  const newestAge = formatAgeInHours(timing.newestSourceGeneratedAt, now);
-  const oldestAge = timing.oldestSourceGeneratedAt
-    ? formatAgeInHours(timing.oldestSourceGeneratedAt, now)
-    : newestAge;
-  const ageLabel =
-    timing.oldestSourceGeneratedAt &&
-    timing.oldestSourceGeneratedAt !== timing.newestSourceGeneratedAt &&
-    oldestAge !== newestAge
-      ? `${newestAge} to ${oldestAge}`
-      : newestAge;
-  const missingStampCount = timing.reportCount - timing.sourceGeneratedAtCount;
-  const oldestSourceAgeMs = timing.oldestSourceGeneratedAt
-    ? now.getTime() - Date.parse(timing.oldestSourceGeneratedAt)
-    : 0;
-
-  return {
-    value: `${ageLabel} old`,
-    sourceStamp: `${formatUtcDateTime(timing.newestSourceGeneratedAt)}${
-      missingStampCount > 0
-        ? `; ${missingStampCount} report${missingStampCount === 1 ? "" : "s"} without a filename timestamp`
-        : ""
-    }`,
-    isStale: oldestSourceAgeMs > 86_400_000,
-  };
-}
-
-function formatAgeInHours(value: string, now: Date) {
-  const elapsedMs = Math.max(0, now.getTime() - Date.parse(value));
-  const elapsedHours = Math.floor(elapsedMs / 3_600_000);
-
-  if (elapsedHours < 1) {
-    return "less than 1 hour";
-  }
-
-  return `${elapsedHours.toLocaleString()} hour${elapsedHours === 1 ? "" : "s"}`;
-}
-
-function formatUtcDateTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZone: "UTC",
-    timeZoneName: "short",
-  }).format(new Date(value));
-}
-
-function formatImportRowSummary(counts: Record<UsageReportKind, number>) {
-  const parts = [
-    counts.agents ? `${counts.agents.toLocaleString()} agent rows` : undefined,
-    counts.userAgents
-      ? `${counts.userAgents.toLocaleString()} user-agent rows`
-      : undefined,
-    counts.users ? `${counts.users.toLocaleString()} user rows` : undefined,
-  ].filter((part): part is string => Boolean(part));
-
-  if (parts.length === 0) {
-    return "0 rows";
-  }
-
-  if (parts.length === 1) {
-    return parts[0];
-  }
-
-  return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
-}
-
-function BulkConfirmModal({
+export function BulkConfirmModal({
   confirmation,
   onCancel,
   onConfirm,
@@ -2950,12 +2260,8 @@ function BulkConfirmModal({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const actionLabel = confirmation.targetBlockedState ? "Block" : "Unblock";
-  const sampleAgents = confirmation.scope.slice(0, 4);
-  const hiddenCount = Math.max(
-    0,
-    confirmation.scope.length - sampleAgents.length,
-  );
+  const { summary } = confirmation.preview;
+  const actionLabel = formatDetailLabel(summary.operation) ?? summary.operation;
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -2979,49 +2285,62 @@ function BulkConfirmModal({
         onClick={(event) => event.stopPropagation()}
       >
         <div>
-          <p className="eyebrow">Confirm bulk change</p>
-          <h2 id="bulk-confirm-title">{actionLabel} selected agents?</h2>
+          <p className="eyebrow">Confirm preview package mutation</p>
+          <h2 id="bulk-confirm-title">{actionLabel} {summary.targetCount === 1 ? "package" : "packages"}?</h2>
         </div>
         <p>
-          This will {confirmation.action} {confirmation.actionableCount}{" "}
-          selected Copilot agents. {confirmation.skippedCount} selected agents
-          already match the target state and will be skipped.
+          Review the saved prestate and requested state. The server will reread
+          each exact native package target immediately before one dispatch and
+          fail it if the mutation-relevant state changed.
         </p>
         <div className="confirm-summary" aria-label="Bulk action summary">
           <span>
-            <strong>{confirmation.scope.length}</strong> selected
+            <strong>{summary.targetCount}</strong> targets
           </span>
           <span>
-            <strong>{confirmation.actionableCount}</strong> to change
+            <strong>{summary.risk ? "Preview write risk" : "Review"}</strong>
+            <span>{summary.affectedPrincipalCount} affected principals</span>
           </span>
           <span>
-            <strong>{confirmation.skippedCount}</strong> skipped
+            <strong>{summary.scope}</strong> scope
           </span>
         </div>
-        <ul className="confirm-agent-list" aria-label="Selected agents preview">
-          {sampleAgents.map((agent) => (
-            <li key={agent.id}>
-              <span>{agent.displayName}</span>
-              <small>{agent.publisher || "Unknown publisher"}</small>
+        <dl className="permission-metadata confirm-metadata">
+          <div><dt>Provider</dt><dd>{summary.provider}</dd></div>
+          <div><dt>Endpoint</dt><dd><code>{summary.endpoint}</code> / {summary.apiMaturity}</dd></div>
+          <div><dt>Permission</dt><dd>{summary.permission}</dd></div>
+          <div><dt>Actor</dt><dd>{summary.actor.displayName} ({summary.actor.username})</dd></div>
+          <div><dt>Rollback</dt><dd>{summary.rollback}</dd></div>
+          <div><dt>Target selection hash</dt><dd><code>{summary.targetSelectionHash}</code></dd></div>
+        </dl>
+        <ul className="confirm-agent-list" aria-label="Exact package mutation preview">
+          {summary.targets.map((target) => (
+            <li key={target.id}>
+              <span>{target.displayName}</span>
+              <small><code>{target.id}</code></small>
+              <small>Current: <code>{JSON.stringify(target.currentState)}</code></small>
+              <small>Requested: <code>{JSON.stringify(target.requestedState)}</code></small>
             </li>
           ))}
         </ul>
-        {hiddenCount > 0 ? (
+        {summary.additionalTargetCount > 0 ? (
           <p className="confirm-muted">
-            {hiddenCount} more selected agents are included.
+            {summary.additionalTargetCount} more exact package targets are included in the hashed selection.
           </p>
         ) : null}
         <div className="confirm-actions">
           <button type="button" className="secondary" onClick={onCancel}>
             Cancel
           </button>
+          <WorkbenchActionGate actionId={confirmation.accessUpdate ? "packages.access" : summary.operation === "block" ? "packages.block" : "packages.unblock"}>
           <button
             type="button"
-            className={confirmation.targetBlockedState ? "danger" : undefined}
+            className={summary.operation === "block" || confirmation.accessUpdate?.scope === "none" ? "danger" : undefined}
             onClick={onConfirm}
           >
-            {actionLabel} selected
+            Confirm {actionLabel.toLowerCase()}
           </button>
+          </WorkbenchActionGate>
         </div>
       </section>
     </div>
@@ -3037,7 +2356,7 @@ function ExportChoiceModal({
   agentCount: number;
   isFiltered: boolean;
   onCancel: () => void;
-  onExport: (mode: ExportMode) => void;
+  onExport: () => void;
 }) {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -3062,34 +2381,25 @@ function ExportChoiceModal({
       >
         <div>
           <p className="eyebrow">Export agents</p>
-          <h2 id="export-choice-title">Choose CSV export type</h2>
+          <h2 id="export-choice-title">Export authorized CSV</h2>
         </div>
         <p>
           Export {agentCount.toLocaleString()}{" "}
-          {isFiltered ? "filtered" : "loaded"} agents. Full export includes
-          detail-only fields and may take longer.
+          {isFiltered ? "filtered" : "loaded"} agents from the current saved
+          package snapshot. The server rechecks your current role and scope.
         </p>
         <div className="export-choice-grid">
+          <WorkbenchActionGate actionId="packages.export">
           <button
             type="button"
             className="secondary export-choice-card"
-            onClick={() => onExport("fast")}
+            onClick={onExport}
           >
-            <strong>Fast export</strong>
-            <span>Use the current table data and imported usage reports.</span>
-            <small>No per-agent detail lookups.</small>
+            <strong>Download package inventory</strong>
+            <span>Exports only the exact filtered package IDs from the selected saved snapshot.</span>
+            <small>Formula-safe CSV with source, observation, and expiry fields.</small>
           </button>
-          <button
-            type="button"
-            className="export-choice-card"
-            onClick={() => onExport("full")}
-          >
-            <strong>Full details</strong>
-            <span>
-              Include categories, sensitivity, access, and element details.
-            </span>
-            <small>Uses cached details and batched API calls.</small>
-          </button>
+          </WorkbenchActionGate>
         </div>
         <div className="confirm-actions">
           <button type="button" className="secondary" onClick={onCancel}>
@@ -3104,11 +2414,11 @@ function ExportChoiceModal({
 function errorMessage(error: unknown) {
   if (error instanceof ApiError) {
     if (error.status === 403) {
-      return `${error.message} Confirm admin consent for delegated CopilotPackages.ReadWrite.All and the signed-in user's admin role.`;
+      return `${error.message} Open Permissions for the current account's exact requirements. Consent does not assign roles or licenses.`;
     }
 
     if (error.status === 503) {
-      return `${error.message} Copy .env.example to .env and fill in the Entra app registration values.`;
+      return `${error.message} Check Permissions and the local deployment setup.`;
     }
 
     return error.message;

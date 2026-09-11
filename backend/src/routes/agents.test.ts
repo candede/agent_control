@@ -4,19 +4,23 @@ import {
   parseDirectorySearchLimit,
   parseActionGroupId,
   parsePackageAccessUpdate,
+  parseMutationScope,
+  inventoryPackageDetail,
 } from "./agents.js";
 
+const groupId = "11111111-1111-4111-8111-111111111111";
+const userId = "22222222-2222-4222-8222-222222222222";
+
 describe("parsePackageAccessUpdate", () => {
-  it("parses and deduplicates a specific principal update", () => {
+  it("parses a specific principal update", () => {
     expect(
       parsePackageAccessUpdate({
         target: "availability",
         mode: "add",
         scope: "specific",
         principals: [
-          { resourceType: "group", resourceId: "group-1" },
-          { resourceType: "group", resourceId: "GROUP-1" },
-          { resourceType: "user", resourceId: "user-1" },
+          { resourceType: "group", resourceId: groupId },
+          { resourceType: "user", resourceId: userId },
         ],
       }),
     ).toEqual({
@@ -24,10 +28,20 @@ describe("parsePackageAccessUpdate", () => {
       mode: "add",
       scope: "specific",
       principals: [
-        { resourceType: "group", resourceId: "GROUP-1" },
-        { resourceType: "user", resourceId: "user-1" },
+        { resourceType: "group", resourceId: groupId },
+        { resourceType: "user", resourceId: userId },
       ],
     });
+  });
+
+  it("rejects duplicate principals instead of silently deduplicating", () => {
+    expect(() => parsePackageAccessUpdate({
+      target: "availability", mode: "replace", scope: "specific",
+      principals: [
+        { resourceType: "group", resourceId: groupId },
+        { resourceType: "group", resourceId: groupId.toUpperCase() },
+      ],
+    })).toThrow("Duplicate package access principals");
   });
 
   it("accepts replacing a target with no users", () => {
@@ -70,16 +84,29 @@ describe("parsePackageAccessUpdate", () => {
 });
 
 describe("parseBulkActionIds", () => {
-  it("trims and deduplicates string IDs", () => {
-    expect(parseBulkActionIds({ ids: [" P_1 ", "P_1", "P_2"] })).toEqual([
-      "P_1",
-      "P_2",
-    ]);
+  it("trims unique string IDs", () => {
+    expect(parseBulkActionIds({ ids: [" P_1 ", "P_2"] })).toEqual(["P_1", "P_2"]);
+  });
+
+  it("rejects duplicate IDs after normalization", () => {
+    expect(() => parseBulkActionIds({ ids: [" P_1 ", "P_1"] })).toThrow(
+      "Duplicate package IDs",
+    );
   });
 
   it("rejects non-string IDs", () => {
     expect(() => parseBulkActionIds({ ids: ["P_1", { id: "P_2" }] })).toThrow(
       "Each id must be a non-empty string",
+    );
+  });
+});
+
+describe("parseMutationScope", () => {
+  it("keeps mutation cardinality separate from package access scope", () => {
+    expect(parseMutationScope("single")).toBe("single");
+    expect(parseMutationScope("bulk")).toBe("bulk");
+    expect(() => parseMutationScope("specific")).toThrowError(
+      expect.objectContaining({ code: "invalid_mutation_scope" }),
     );
   });
 });
@@ -114,5 +141,15 @@ describe("parseActionGroupId", () => {
     expect(() => parseActionGroupId("a".repeat(65))).toThrow(
       "Action group ID is invalid",
     );
+  });
+});
+
+describe("inventoryPackageDetail", () => {
+  it("removes exact assignment principals from Reader inventory", () => {
+    expect(inventoryPackageDetail({
+      id: "package-1", displayName: "Fixture", isBlocked: false,
+      allowedUsersAndGroups: [{ resourceType: "user", resourceId: "sensitive-user" }],
+      acquireUsersAndGroups: [{ resourceType: "group", resourceId: "sensitive-group" }],
+    })).toEqual({ id: "package-1", displayName: "Fixture", isBlocked: false });
   });
 });

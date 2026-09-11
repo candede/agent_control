@@ -6,13 +6,14 @@ import {
   LockOpen,
   Mail,
   MailCheck,
+  UserRoundCog,
   ShieldCheck,
 } from "lucide-react";
 import type { CopilotPackage } from "../api/client";
 import { formatBuiltWithLabel } from "../agentDisplay";
+import { WorkbenchActionGate } from "../workbenchActionContext";
 
 const agentTableColumnStorageKey = "agent-control:agent-table-columns:v1";
-const showManageAccessActions = false;
 
 type AgentTableColumnId =
   | "publisher"
@@ -51,6 +52,7 @@ type AgentTableProps = {
   busyAgentId?: string;
   selectedIds: Set<string>;
   recentlyChangedIds: Set<string>;
+  operationsAllowed: boolean;
   selectionDisabled: boolean;
   usageByAgentId: Map<string, AgentTableUsage>;
   allMatchingSelected: boolean;
@@ -80,6 +82,7 @@ export function AgentTable({
   busyAgentId,
   selectedIds,
   recentlyChangedIds,
+  operationsAllowed,
   selectionDisabled,
   usageByAgentId,
   allMatchingSelected,
@@ -181,7 +184,7 @@ export function AgentTable({
                 type="checkbox"
                 aria-label="Select all matching agents"
                 checked={allMatchingSelected}
-                disabled={selectionDisabled || agents.length === 0}
+                disabled={!operationsAllowed || selectionDisabled || agents.length === 0}
                 onChange={onToggleMatchingSelection}
               />
             </th>
@@ -283,7 +286,7 @@ export function AgentTable({
                     type="checkbox"
                     aria-label={`Select ${agent.displayName}`}
                     checked={selected}
-                    disabled={selectionDisabled}
+                    disabled={!operationsAllowed || selectionDisabled}
                     onChange={() => onToggleAgentSelection(agent.id)}
                   />
                 </td>
@@ -322,10 +325,8 @@ export function AgentTable({
                       className={`status-carousel ${
                         agent.isBlocked ? "show-blocked" : "show-allowed"
                       }`}
-                      aria-label={`Status: ${
-                        agent.isBlocked ? "Blocked" : "Allowed"
-                      }`}
                     >
+                      <span className="sr-only">Status: {agent.isBlocked ? "Blocked" : "Allowed"}</span>
                       <span
                         className="status-carousel-track"
                         aria-hidden="true"
@@ -338,6 +339,7 @@ export function AgentTable({
                 ) : null}
                 <td>
                   <div className="row-actions">
+                    <WorkbenchActionGate actionId="packages.inspect" compact>
                     <button
                       className="icon-button"
                       type="button"
@@ -348,7 +350,8 @@ export function AgentTable({
                     >
                       <Info aria-hidden="true" />
                     </button>
-                    {showManageAccessActions ? (
+                    </WorkbenchActionGate>
+                    <WorkbenchActionGate actionId="packages.access" compact>
                       <button
                         className="icon-button"
                         type="button"
@@ -359,7 +362,8 @@ export function AgentTable({
                       >
                         <ShieldCheck aria-hidden="true" />
                       </button>
-                    ) : null}
+                    </WorkbenchActionGate>
+                    <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"} compact>
                     {agent.isBlocked ? (
                       <button
                         className="icon-button"
@@ -383,6 +387,21 @@ export function AgentTable({
                         <Lock aria-hidden="true" />
                       </button>
                     )}
+                    </WorkbenchActionGate>
+                    <span className="capability-gate">
+                      <button
+                        className="icon-button"
+                        type="button"
+                        aria-label={`Reassign owner for ${agent.displayName}`}
+                        aria-describedby={`reassign-unavailable-${agent.id}`}
+                        title="Reassign owner is unavailable because Graph exposes no owner readback field or conditional-write protection."
+                        disabled
+                      >
+                        <UserRoundCog aria-hidden="true" />
+                      </button>
+                      <span className="sr-only" id={`reassign-unavailable-${agent.id}`}>Reassign owner is unavailable because Graph exposes no owner readback field or conditional-write protection.</span>
+                      <a className="reassign-doc-link" href="https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-reassign" target="_blank" rel="noreferrer" aria-label={`Reassignment documentation for ${agent.displayName}`}>Docs</a>
+                    </span>
                   </div>
                 </td>
               </tr>

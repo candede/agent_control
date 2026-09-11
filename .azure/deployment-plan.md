@@ -1,6 +1,8 @@
-# Agent Control Azure Deployment Plan
+# Historical Agent Control Azure Deployment Plan
 
-Status: Validated
+Status: Superseded historical evidence; not an active runbook or caller
+
+This file preserves the former split Static Web Apps design as historical evidence only. The executable production contract is now `deploy-azure.ps1` plus `infra/main.bicep`; do not execute the removed script or recreate this topology.
 
 ## Goal
 

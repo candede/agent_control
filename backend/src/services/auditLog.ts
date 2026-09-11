@@ -1,491 +1,143 @@
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
-import { config } from "../config.js";
-import type {
-  AccessAuditAction,
-  AuditEvent,
-  BlockAuditAction,
-  CompleteAuditEvent,
-  ListAuditEventsQuery,
-  StartAuditEvent,
-} from "../types/audit.js";
+import type pg from "pg";
+import { pool } from "../db/pool.js";
+import type { AuditEvent, CompleteAuditEvent, ListAuditEventsQuery, StartAuditEvent } from "../types/audit.js";
 
-const defaultListLimit = 100;
-const maxListLimit = 5_000;
+export type DataScope = { tenantId: string; principalId: string };
+type Database = Pick<pg.Pool, "query">;
 
-type AuditEventsFilter = {
-  where: string;
-  values: Array<string | number>;
-};
-
-type AuditEventRow = {
-  id: string;
-  operation_id: string;
-  scope: string;
-  action: string;
-  target_blocked_state: 0 | 1 | null;
-  agent_id: string;
-  agent_display_name: string | null;
-  actor_username: string;
-  actor_display_name: string;
-  actor_home_account_id: string;
-  tenant_id: string | null;
-  started_at: string;
-  completed_at: string | null;
-  status: string;
-  message: string | null;
-  error_code: string | null;
-  request_path: string;
-  metadata_json: string | null;
-};
+export function auditMetadata(value: Record<string, unknown> | undefined) {
+  if (!value) return undefined;
+  const result: Record<string, string | number | boolean> = {};
+  for (const key of ["target", "mode", "scope", "template", "rowCount", "requestCount", "previousCount", "resultingCount", "resultingBytes", "source", "snapshotId", "jobId", "reportSetId", "reportingStart", "reportingEnd", "leaseVersion", "correlationId", "confirmationHash", "targetSelectionHash", "prestateHash", "poststateHash", "readbackCount", "reconciliationStatus", "verification"]) {
+    const entry = value[key];
+    if (typeof entry === "string" && entry.length <= 128 || typeof entry === "number" && Number.isFinite(entry) || typeof entry === "boolean") {
+      result[key] = entry as string | number | boolean;
+    }
+  }
+  return result;
+}
 
 export class AuditLog {
-  private database: DatabaseSync;
-
-  constructor(databasePath = config.auditLog.databasePath) {
-    mkdirSync(dirname(databasePath), { recursive: true });
-    this.database = new DatabaseSync(databasePath);
-    this.initialize();
+  constructor(private scope: DataScope, private database: Database = pool) {
+    if (!scope.tenantId || !scope.principalId) throw new Error("Audit requires tenant and principal scope.");
   }
 
-  startEvent(event: StartAuditEvent) {
-    const auditEvent: AuditEvent = {
-      ...event,
-      id: event.id ?? randomUUID(),
-      startedAt: event.startedAt ?? new Date().toISOString(),
-      status: "started",
-    };
-
-    this.database
-      .prepare(
-        `INSERT INTO audit_events (
-          id,
-          operation_id,
-          scope,
-          action,
-          target_blocked_state,
-          agent_id,
-          agent_display_name,
-          actor_username,
-          actor_display_name,
-          actor_home_account_id,
-          tenant_id,
-          started_at,
-          status,
-          request_path,
-          metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        auditEvent.id,
-        auditEvent.operationId,
-        auditEvent.scope,
-        auditEvent.action,
-        auditEvent.targetBlockedState === undefined
-          ? null
-          : auditEvent.targetBlockedState
-            ? 1
-            : 0,
-        auditEvent.agentId,
-        auditEvent.agentDisplayName ?? null,
-        auditEvent.actor.username,
-        auditEvent.actor.displayName,
-        auditEvent.actor.homeAccountId,
-        auditEvent.actor.tenantId ?? null,
-        auditEvent.startedAt,
-        auditEvent.status,
-        auditEvent.requestPath,
-        stringifyMetadata(auditEvent.metadata),
-      );
-
-    return auditEvent;
-  }
-
-  completeEvent(id: string, update: CompleteAuditEvent) {
-    const result = this.database
-      .prepare(
-        `UPDATE audit_events
-        SET completed_at = ?,
-            status = ?,
-            message = ?,
-            error_code = ?,
-            metadata_json = COALESCE(?, metadata_json)
-        WHERE id = ?`,
-      )
-      .run(
-        update.completedAt ?? new Date().toISOString(),
-        update.status,
-        update.message ?? null,
-        update.errorCode ?? null,
-        stringifyMetadata(update.metadata),
-        id,
-      );
-
-    if (result.changes === 0) {
-      throw new Error(`Audit event ${id} was not found.`);
+  async startEvent(event: StartAuditEvent) {
+    if (event.actor.tenantId !== this.scope.tenantId || event.actor.homeAccountId !== this.scope.principalId) {
+      throw new Error("Audit actor scope mismatch.");
     }
-
-    const auditEvent = this.getEvent(id);
-
-    if (!auditEvent) {
-      throw new Error(`Audit event ${id} could not be loaded after update.`);
-    }
-
-    return auditEvent;
+    const record: AuditEvent = { ...event, id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "started", metadata: auditMetadata(event.metadata) };
+    await this.append(record);
+    return record;
   }
 
-  getEvent(id: string) {
-    const row = this.database
-      .prepare("SELECT * FROM audit_events WHERE id = ?")
-      .get(id) as AuditEventRow | undefined;
-
-    return row ? toAuditEvent(row) : undefined;
-  }
-
-  listEvents(query: ListAuditEventsQuery = {}) {
-    const filter = auditEventsFilter(query);
-    const values = [
-      ...filter.values,
-      normalizeLimit(query.limit),
-      normalizeOffset(query.offset),
-    ];
-    const rows = this.database
-      .prepare(
-        `SELECT * FROM audit_events ${filter.where}
-        ORDER BY started_at DESC, id DESC
-        LIMIT ? OFFSET ?`,
-      )
-      .all(...values) as AuditEventRow[];
-
-    return rows.flatMap((row) => {
-      const event = toAuditEvent(row);
-      return event ? [event] : [];
+  async requestEvents(events: StartAuditEvent[]) {
+    const records: AuditEvent[] = events.map(event => {
+      if (event.actor.tenantId !== this.scope.tenantId || event.actor.homeAccountId !== this.scope.principalId) {
+        throw new Error("Audit actor scope mismatch.");
+      }
+      return { ...event, id: event.id ?? randomUUID(), startedAt: event.startedAt ?? new Date().toISOString(), status: "requested", metadata: auditMetadata(event.metadata) } as AuditEvent;
     });
+    if (!records.length) return records;
+    await this.database.query(`INSERT INTO audit_events
+      (id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,target_blocked_state,
+       agent_id,agent_display_name,started_at,status,message,error_code,request_path,metadata)
+      SELECT gen_random_uuid(),entry.event_id,entry.operation_id,$2,$3,entry.actor_username,entry.actor_name,entry.scope,entry.action,entry.target_blocked_state,
+        entry.agent_id,entry.agent_display_name,entry.started_at,'requested',entry.message,entry.error_code,entry.request_path,entry.metadata
+      FROM jsonb_to_recordset($1::jsonb) AS entry(event_id text,operation_id text,actor_username text,actor_name text,scope text,action text,
+        target_blocked_state boolean,agent_id text,agent_display_name text,started_at timestamptz,message text,error_code text,request_path text,metadata jsonb)`, [JSON.stringify(records.map(record => ({
+        event_id: record.id, operation_id: record.operationId, actor_username: record.actor.username, actor_name: record.actor.displayName,
+        scope: record.scope, action: record.action, target_blocked_state: record.targetBlockedState ?? null, agent_id: record.agentId,
+        agent_display_name: record.agentDisplayName ?? null, started_at: record.startedAt, message: record.message ?? null,
+        error_code: record.errorCode ?? null, request_path: record.requestPath, metadata: record.metadata ?? null,
+      }))), this.scope.tenantId, this.scope.principalId]);
+    return records;
   }
 
-  countEvents(query: ListAuditEventsQuery = {}) {
-    const filter = auditEventsFilter(query);
-    const row = this.database
-      .prepare(`SELECT COUNT(*) AS count FROM audit_events ${filter.where}`)
-      .get(...filter.values) as { count: number };
-
-    return row.count;
+  async completeEvent(id: string, update: CompleteAuditEvent) {
+    const current = await this.getEvent(id);
+    if (!current) throw new Error("Audit event was not found in this scope.");
+    const record: AuditEvent = {
+      ...current, ...update,
+      completedAt: update.completedAt ?? new Date().toISOString(),
+      message: update.message?.slice(0, 4096), errorCode: update.errorCode?.slice(0, 256),
+      metadata: update.metadata ? auditMetadata(update.metadata) : current.metadata,
+    };
+    await this.append(record);
+    return record;
   }
 
-  close() {
-    this.database.close();
+  private async append(event: AuditEvent) {
+    await this.database.query(`INSERT INTO audit_events
+      (id,event_id,operation_id,tenant_id,principal_id,actor_username,actor_name,scope,action,target_blocked_state,
+       agent_id,agent_display_name,started_at,completed_at,status,message,error_code,request_path,metadata)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+    [randomUUID(), event.id, event.operationId, this.scope.tenantId, this.scope.principalId,
+      event.actor.username, event.actor.displayName, event.scope, event.action, event.targetBlockedState ?? null,
+      event.agentId, event.agentDisplayName ?? null, event.startedAt, event.completedAt ?? null, event.status,
+      event.message ?? null, event.errorCode ?? null, event.requestPath, event.metadata ?? null]);
   }
 
-  private initialize() {
-    this.database.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = 5000;
-
-      CREATE TABLE IF NOT EXISTS audit_events (
-        id TEXT PRIMARY KEY,
-        operation_id TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        action TEXT NOT NULL,
-        target_blocked_state INTEGER,
-        agent_id TEXT NOT NULL,
-        agent_display_name TEXT,
-        actor_username TEXT NOT NULL,
-        actor_display_name TEXT NOT NULL,
-        actor_home_account_id TEXT NOT NULL,
-        tenant_id TEXT,
-        started_at TEXT NOT NULL,
-        completed_at TEXT,
-        status TEXT NOT NULL,
-        message TEXT,
-        error_code TEXT,
-        request_path TEXT NOT NULL,
-        metadata_json TEXT
-      );
-    `);
-
-    this.ensureNullableTargetBlockedState();
-
-    this.database.exec(`
-      CREATE INDEX IF NOT EXISTS idx_audit_events_started_at
-        ON audit_events(started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_agent_id
-        ON audit_events(agent_id, started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_actor_username
-        ON audit_events(actor_username, started_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_events_operation_id
-        ON audit_events(operation_id);
-    `);
+  async getEvent(id: string) {
+    const result = await this.database.query("SELECT * FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND event_id=$3", [this.scope.tenantId, this.scope.principalId, id]);
+    return result.rows[0] ? toEvent(result.rows[0]) : undefined;
   }
 
-  private ensureNullableTargetBlockedState() {
-    const columns = this.database
-      .prepare("PRAGMA table_info(audit_events)")
-      .all() as Array<{ name: string; notnull: 0 | 1 }>;
-    const targetColumn = columns.find(
-      (column) => column.name === "target_blocked_state",
-    );
+  async getExportEvents(ids: string[]) {
+    const result = await this.database.query(`SELECT * FROM audit_projection
+      WHERE tenant_id=$1 AND principal_id=$2 AND event_id=ANY($3::text[])
+        AND observed_at>clock_timestamp()-interval '90 days'
+      ORDER BY array_position($3::text[],event_id)`, [this.scope.tenantId, this.scope.principalId, ids]);
+    return result.rows.map(toEvent);
+  }
 
-    if (!targetColumn?.notnull) {
-      return;
+  private filter(query: ListAuditEventsQuery) {
+    const clauses = ["tenant_id=$1", "principal_id=$2"];
+    const values: unknown[] = [this.scope.tenantId, this.scope.principalId];
+    for (const [key, column] of Object.entries({ agentId: "agent_id", actorUsername: "actor_username", scope: "scope", action: "action", status: "status" })) {
+      const value = query[key as keyof ListAuditEventsQuery];
+      if (value !== undefined) { values.push(value); clauses.push(`${column}=$${values.length}`); }
     }
+    if (query.operationIdPrefix) {
+      values.push(escapeLike(query.operationIdPrefix) + "%");
+      clauses.push(`operation_id LIKE $${values.length} ESCAPE '\\'`);
+    }
+    if (query.search) {
+      values.push(`%${escapeLike(query.search)}%`);
+      clauses.push(`concat_ws(' ',agent_id,agent_display_name,actor_username,actor_name,operation_id,message,error_code) ILIKE $${values.length} ESCAPE '\\'`);
+    }
+    return { sql: clauses.join(" AND "), values };
+  }
 
-    this.database.exec(`
-      BEGIN IMMEDIATE;
-      ALTER TABLE audit_events RENAME TO audit_events_legacy;
+  async listEvents(query: ListAuditEventsQuery = {}) {
+    const filter = this.filter(query);
+    const limit = Math.min(Math.max(Math.trunc(query.limit ?? 100), 1), 5000);
+    const offset = Math.min(Math.max(Math.trunc(query.offset ?? 0), 0), 100_000);
+    const result = await this.database.query(`SELECT * FROM audit_projection WHERE ${filter.sql}
+      ORDER BY started_at DESC,event_id DESC LIMIT $${filter.values.length + 1} OFFSET $${filter.values.length + 2}`, [...filter.values, limit, offset]);
+    return result.rows.map(toEvent);
+  }
 
-      CREATE TABLE audit_events (
-        id TEXT PRIMARY KEY,
-        operation_id TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        action TEXT NOT NULL,
-        target_blocked_state INTEGER,
-        agent_id TEXT NOT NULL,
-        agent_display_name TEXT,
-        actor_username TEXT NOT NULL,
-        actor_display_name TEXT NOT NULL,
-        actor_home_account_id TEXT NOT NULL,
-        tenant_id TEXT,
-        started_at TEXT NOT NULL,
-        completed_at TEXT,
-        status TEXT NOT NULL,
-        message TEXT,
-        error_code TEXT,
-        request_path TEXT NOT NULL,
-        metadata_json TEXT
-      );
-
-      INSERT INTO audit_events SELECT * FROM audit_events_legacy;
-      DROP TABLE audit_events_legacy;
-      COMMIT;
-    `);
+  async countEvents(query: ListAuditEventsQuery = {}) {
+    const filter = this.filter(query);
+    const result = await this.database.query(`SELECT count(*)::int AS count FROM audit_projection WHERE ${filter.sql}`, filter.values);
+    return result.rows[0].count as number;
   }
 }
 
-let defaultAuditLog: AuditLog | undefined;
+function escapeLike(value: string) { return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_"); }
 
-export function getAuditLog() {
-  if (!config.auditLog.enabled) {
-    return undefined;
-  }
-
-  defaultAuditLog ??= new AuditLog();
-  return defaultAuditLog;
-}
-
-function normalizeLimit(limit: number | undefined) {
-  if (!limit || Number.isNaN(limit)) {
-    return defaultListLimit;
-  }
-
-  return Math.min(Math.max(Math.trunc(limit), 1), maxListLimit);
-}
-
-function normalizeOffset(offset: number | undefined) {
-  if (!offset || Number.isNaN(offset)) {
-    return 0;
-  }
-
-  return Math.max(Math.trunc(offset), 0);
-}
-
-function auditEventsFilter(query: ListAuditEventsQuery): AuditEventsFilter {
-  const clauses = [
-    `(
-      scope IN ('single', 'bulk')
-      AND status IN ('started', 'succeeded', 'failed', 'skipped')
-      AND (
-      (action IN ('block', 'unblock') AND target_blocked_state IN (0, 1))
-      OR
-      (action IN ('update-availability', 'update-installation') AND target_blocked_state IS NULL)
-      )
-    )`,
-  ];
-  const values: Array<string | number> = [];
-
-  if (query.agentId) {
-    clauses.push("agent_id = ?");
-    values.push(query.agentId);
-  }
-
-  if (query.actorUsername) {
-    clauses.push("actor_username = ?");
-    values.push(query.actorUsername);
-  }
-
-  if (query.scope) {
-    clauses.push("scope = ?");
-    values.push(query.scope);
-  }
-
-  if (query.operationIdPrefix) {
-    clauses.push("operation_id LIKE ? ESCAPE '\\'");
-    values.push(`${escapeLikePrefix(query.operationIdPrefix)}%`);
-  }
-
-  if (query.action) {
-    clauses.push("action = ?");
-    values.push(query.action);
-  }
-
-  if (query.status) {
-    clauses.push("status = ?");
-    values.push(query.status);
-  }
-
-  if (query.search) {
-    clauses.push(`(
-      agent_id LIKE ? ESCAPE '\\'
-      OR agent_display_name LIKE ? ESCAPE '\\'
-      OR actor_username LIKE ? ESCAPE '\\'
-      OR actor_display_name LIKE ? ESCAPE '\\'
-      OR operation_id LIKE ? ESCAPE '\\'
-      OR message LIKE ? ESCAPE '\\'
-      OR error_code LIKE ? ESCAPE '\\'
-    )`);
-    const searchPattern = `%${escapeLikePrefix(query.search)}%`;
-    values.push(
-      searchPattern,
-      searchPattern,
-      searchPattern,
-      searchPattern,
-      searchPattern,
-      searchPattern,
-      searchPattern,
-    );
-  }
-
+function toEvent(row: Record<string, unknown>): AuditEvent {
   return {
-    where: clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "",
-    values,
-  };
+    id: row.event_id, operationId: row.operation_id, scope: row.scope, action: row.action,
+    ...(row.target_blocked_state === null ? {} : { targetBlockedState: row.target_blocked_state }),
+    agentId: row.agent_id, agentDisplayName: row.agent_display_name ?? undefined,
+    actor: { tenantId: row.tenant_id, homeAccountId: row.principal_id, username: row.actor_username, displayName: row.actor_name },
+    startedAt: (row.started_at as Date).toISOString(), completedAt: (row.completed_at as Date | null)?.toISOString(),
+    status: row.status, message: row.message ?? undefined, errorCode: row.error_code ?? undefined,
+    requestPath: row.request_path, metadata: row.metadata ?? undefined,
+  } as AuditEvent;
 }
 
-function stringifyMetadata(metadata: Record<string, unknown> | undefined) {
-  if (!metadata) {
-    return null;
-  }
-
-  const seen = new WeakSet<object>();
-
-  try {
-    return JSON.stringify(metadata, (_key, value) => {
-      if (typeof value === "bigint") {
-        return value.toString();
-      }
-
-      if (value instanceof Error) {
-        return {
-          name: value.name,
-          message: value.message,
-          stack: value.stack,
-        };
-      }
-
-      if (typeof value === "object" && value !== null) {
-        if (seen.has(value)) {
-          return "[Circular]";
-        }
-
-        seen.add(value);
-      }
-
-      return value;
-    });
-  } catch (error) {
-    return JSON.stringify({
-      serializationError:
-        error instanceof Error ? error.message : "Unable to serialize metadata",
-    });
-  }
-}
-
-function parseMetadata(metadataJson: string | null) {
-  if (!metadataJson) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(metadataJson) as Record<string, unknown>;
-  } catch {
-    return { raw: metadataJson };
-  }
-}
-
-function escapeLikePrefix(value: string) {
-  return value
-    .replaceAll("\\", "\\\\")
-    .replaceAll("%", "\\%")
-    .replaceAll("_", "\\_");
-}
-
-function toAuditEvent(row: AuditEventRow): AuditEvent | undefined {
-  if (!isAuditScope(row.scope) || !isAuditStatus(row.status)) {
-    return undefined;
-  }
-
-  const event = {
-    id: row.id,
-    operationId: row.operation_id,
-    scope: row.scope,
-    agentId: row.agent_id,
-    agentDisplayName: row.agent_display_name ?? undefined,
-    actor: {
-      username: row.actor_username,
-      displayName: row.actor_display_name,
-      homeAccountId: row.actor_home_account_id,
-      tenantId: row.tenant_id ?? undefined,
-    },
-    startedAt: row.started_at,
-    completedAt: row.completed_at ?? undefined,
-    status: row.status,
-    message: row.message ?? undefined,
-    errorCode: row.error_code ?? undefined,
-    requestPath: row.request_path,
-    metadata: parseMetadata(row.metadata_json),
-  };
-
-  if (isBlockAuditAction(row.action)) {
-    if (row.target_blocked_state === null) {
-      return undefined;
-    }
-
-    return {
-      ...event,
-      action: row.action,
-      targetBlockedState: row.target_blocked_state === 1,
-    };
-  }
-
-  if (isAccessAuditAction(row.action)) {
-    if (row.target_blocked_state !== null) {
-      return undefined;
-    }
-
-    return { ...event, action: row.action };
-  }
-
-  return undefined;
-}
-
-function isBlockAuditAction(action: string): action is BlockAuditAction {
-  return action === "block" || action === "unblock";
-}
-
-function isAccessAuditAction(action: string): action is AccessAuditAction {
-  return action === "update-availability" || action === "update-installation";
-}
-
-function isAuditScope(scope: string): scope is AuditEvent["scope"] {
-  return scope === "single" || scope === "bulk";
-}
-
-function isAuditStatus(status: string): status is AuditEvent["status"] {
-  return (
-    status === "started" ||
-    status === "succeeded" ||
-    status === "failed" ||
-    status === "skipped"
-  );
-}
+export function getAuditLog(scope: DataScope) { return new AuditLog(scope); }

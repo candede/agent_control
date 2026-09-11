@@ -1,6 +1,7 @@
 import { AppError } from "../errors.js";
 import type { PackageAccessEntity } from "../types/copilotPackage.js";
 import { graphError, type FetchLike } from "./graphPackages.js";
+import { boundedProviderJson } from "./providerJson.js";
 
 const graphV1 = "https://graph.microsoft.com/v1.0";
 const defaultSearchLimit = 25;
@@ -8,6 +9,7 @@ const maxSearchLimit = 50;
 const maxSearchQueryLength = 120;
 const maxResolveCount = 500;
 const resolveConcurrency = 8;
+const directoryObjectIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
 type GraphUser = {
   id: string;
@@ -74,6 +76,11 @@ export class DirectoryPrincipalsClient {
       ),
     ]);
 
+    if (!Array.isArray(users.value) || !Array.isArray(groups.value) || users.value.length > maxSearchLimit || groups.value.length > maxSearchLimit) {
+      throw new AppError(502, "provider_schema", "Directory collection is invalid or oversized.");
+    }
+    [...users.value, ...groups.value].forEach(validatePrincipal);
+
     return [
       ...users.value.map(mapUser),
       ...groups.value.filter(isAssignableGroup).map(mapGroup),
@@ -120,6 +127,7 @@ export class DirectoryPrincipalsClient {
         `${graphV1}/users/${encodeURIComponent(id)}?$select=id,displayName,mail,userPrincipalName`,
         accessToken,
       );
+      requireResolvedIdentity(user.id, id);
       return mapUser(user);
     } catch (error) {
       if (error instanceof AppError && error.status === 404) {
@@ -135,6 +143,7 @@ export class DirectoryPrincipalsClient {
         `${graphV1}/groups/${encodeURIComponent(id)}?$select=id,displayName,description,mail,groupTypes,securityEnabled`,
         accessToken,
       );
+      requireResolvedIdentity(group.id, id);
       return mapGroup(group);
     } catch (error) {
       if (error instanceof AppError && error.status === 404) {
@@ -149,7 +158,10 @@ export class DirectoryPrincipalsClient {
     accessToken: string,
     extraHeaders: Record<string, string> = {},
   ) {
+    validateDirectoryUrl(url);
     const response = await this.fetcher(url, {
+      signal: AbortSignal.timeout(10_000),
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
@@ -161,7 +173,14 @@ export class DirectoryPrincipalsClient {
       throw await graphError(response);
     }
 
-    return (await response.json()) as T;
+    return boundedProviderJson<T>(response);
+  }
+}
+
+export function validateDirectoryUrl(url: string) {
+  const target = new URL(url);
+  if (target.origin !== "https://graph.microsoft.com" || target.username || target.password || !/^\/v1\.0\/(users|groups)(?:\/|$)/.test(target.pathname)) {
+    throw new AppError(502, "invalid_provider_link", "Directory request left the documented Microsoft Graph endpoint.");
   }
 }
 
@@ -195,6 +214,7 @@ export function buildGroupSearchUrl(query: string, limit: number) {
 }
 
 function mapUser(user: GraphUser): DirectoryPrincipal {
+  validatePrincipal(user);
   return {
     resourceType: "user",
     resourceId: user.id,
@@ -210,6 +230,7 @@ function isAssignableGroup(group: GraphGroup) {
 }
 
 function mapGroup(group: GraphGroup): DirectoryPrincipal {
+  validatePrincipal(group);
   const isMicrosoft365Group = group.groupTypes?.includes("Unified") ?? false;
 
   return {
@@ -233,6 +254,16 @@ function fallbackPrincipal(entity: PackageAccessEntity): DirectoryPrincipal {
   };
 }
 
+function validatePrincipal(value: GraphUser | GraphGroup) {
+  if (!value || typeof value.id !== "string" || !directoryObjectIdPattern.test(value.id)) throw new AppError(502, "provider_schema", "Directory principal identity is not a native Microsoft Entra object ID.");
+  for (const key of ["displayName", "mail", "userPrincipalName", "description"] as const) {
+    const field = (value as Record<string, unknown>)[key];
+    if (field !== undefined && field !== null && (typeof field !== "string" || field.length > 4096)) throw new AppError(502, "provider_schema", "Directory principal field is invalid.");
+  }
+  const group = value as GraphGroup;
+  if (group.groupTypes !== undefined && (!Array.isArray(group.groupTypes) || group.groupTypes.length > 20 || group.groupTypes.some(type => typeof type !== "string"))) throw new AppError(502, "provider_schema", "Directory group type is invalid.");
+}
+
 function escapeSearchTerm(value: string) {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
@@ -242,19 +273,27 @@ function deduplicateEntities(entities: PackageAccessEntity[]) {
 
   for (const entity of entities) {
     const resourceId = entity.resourceId.trim();
-    const resourceType = entity.resourceType.trim();
+    const resourceType = entity.resourceType.trim().toLowerCase();
 
-    if (!resourceId || !resourceType) {
-      continue;
+    if ((resourceType !== "user" && resourceType !== "group") || !directoryObjectIdPattern.test(resourceId)) {
+      throw new AppError(400, "invalid_principal", "Directory resolution requires a user or group with a native Microsoft Entra object ID.");
     }
 
-    unique.set(`${resourceType.toLowerCase()}:${resourceId.toLowerCase()}`, {
+    const key = `${resourceType}:${resourceId.toLowerCase()}`;
+    if (unique.has(key)) throw new AppError(400, "duplicate_principal", "Duplicate directory principals are not allowed.");
+    unique.set(key, {
       resourceId,
       resourceType,
     });
   }
 
   return [...unique.values()];
+}
+
+function requireResolvedIdentity(resolvedId: string, requestedId: string) {
+  if (resolvedId.toLowerCase() !== requestedId.toLowerCase()) {
+    throw new AppError(502, "principal_identity_mismatch", "Microsoft Graph returned a different directory identity than the exact requested object ID.");
+  }
 }
 
 async function mapWithConcurrency<T, U>(
