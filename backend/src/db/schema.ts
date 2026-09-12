@@ -1612,6 +1612,12 @@ CREATE TABLE operational_state (
 );
 INSERT INTO operational_state(singleton,mode,provider_work_enabled) VALUES(true,'normal',true);
 ` },
+  { version: 27, sql: `
+ALTER TABLE power_platform_refresh_jobs DROP CONSTRAINT power_platform_refresh_jobs_status_check;
+ALTER TABLE power_platform_refresh_jobs ADD CONSTRAINT power_platform_refresh_jobs_status_check CHECK (status IN ('waiting_authorization','running','succeeded','failed','cancelled'));
+ALTER TABLE package_refresh_jobs DROP CONSTRAINT package_refresh_jobs_status_check;
+ALTER TABLE package_refresh_jobs ADD CONSTRAINT package_refresh_jobs_status_check CHECK (status IN ('waiting_authorization','running','succeeded','failed','cancelled'));
+` },
 ] as const;
 
 export function migrationChecksum(sql: string) {

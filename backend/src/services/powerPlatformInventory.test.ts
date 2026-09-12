@@ -7,7 +7,7 @@ import { PowerPlatformInventoryService } from "./powerPlatformInventory.js";
 
 const user: AuthenticatedUser = {
   tenantId: "tenant-a", homeAccountId: "principal-a", displayName: "Reader", username: "reader@example.invalid",
-  roles: ["AgentControl.Reader"], providerRoleIds: [inventoryProviderRoleIds.globalReader],
+  roles: ["AgentControl.Viewer"], providerRoleIds: [inventoryProviderRoleIds.globalReader],
 };
 
 function deferred<T>() {
@@ -20,7 +20,8 @@ function fixture(overrides: Record<string, unknown> = {}) {
   const job = { id: "11111111-1111-1111-1111-111111111111", status: "waiting_authorization", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, environmentScope: null, createdAt: "2026-09-08T00:00:00.000Z", attemptedAt: null, updatedAt: "2026-09-08T00:00:00.000Z", finishedAt: null };
   const repository = {
     submit: vi.fn(async () => job), getJob: vi.fn(async () => job), markRunning: vi.fn(async () => true), recordProgress: vi.fn(async () => undefined),
-    publish: vi.fn(async () => undefined), markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => undefined), recoverInterrupted: vi.fn(async () => 0),
+    publish: vi.fn(async () => undefined), markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => undefined),
+    cancel: vi.fn(async () => ({ ...job, status: "cancelled" })), recoverInterrupted: vi.fn(async () => 0),
     ...overrides,
   };
   const dependencies = {
@@ -59,19 +60,26 @@ describe("Power Platform inventory refresh service", () => {
     held.resolve(undefined as never);
   });
 
-  it("enforces Reader authority inside the service and fences publication after role loss", async () => {
-    const withoutReader = { ...user, roles: ["AgentControl.Operator" as const] };
+  it("lets Admin inherit Viewer authority and fences publication after all roles are lost", async () => {
+    const admin = { ...user, roles: ["AgentControl.Admin" as const] };
     const direct = fixture();
-    await expect(direct.service.submit(withoutReader, { idempotencyKey: "denied", requestedTypes: ["microsoft.copilotstudio/agents"] })).rejects.toMatchObject({ code: "missing_internal_role" });
-    expect(direct.repository.submit).not.toHaveBeenCalled();
+    await expect(direct.service.submit(admin, { idempotencyKey: "admin-read", requestedTypes: ["microsoft.copilotstudio/agents"] })).resolves.toBeDefined();
+    expect(direct.repository.submit).toHaveBeenCalledOnce();
 
     const fenced = fixture();
     fenced.dependencies.revalidateUser
       .mockResolvedValueOnce(user)
-      .mockResolvedValueOnce(withoutReader);
+      .mockResolvedValueOnce({ ...user, roles: [] });
     await fenced.service.start(user, fenced.job.id);
     await vi.waitFor(() => expect(fenced.repository.markWaitingAuthorization).toHaveBeenCalledTimes(1));
     expect(fenced.repository.publish).not.toHaveBeenCalled();
+  });
+
+  it("lets only the owning Viewer cancel its inventory refresh", async () => {
+    const direct = fixture();
+    await expect(direct.service.cancel(user, direct.job.id)).resolves.toMatchObject({ status: "cancelled" });
+    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id);
+    await expect(direct.service.cancel({ ...user, roles: [] }, direct.job.id)).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 
   it("bounds global refresh execution and recovers capacity after principal cancellation", async () => {

@@ -1,11 +1,16 @@
 import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { statusLabels } from "../src/capabilityState";
+import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
+import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
+import type { CapabilityView, QuarantineTargetPage } from "../src/api/client";
+
+const primaryCapabilityCount = capabilityDefinitions.filter(definition => definition.probe.adapterRegistered && definition.mode !== "application").length;
 
 async function login(page: Page, scenario: string) {
   await page.goto(`/api/auth/login?returnTo=${encodeURIComponent(`/permissions?fixture=${scenario}`)}`);
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
-  await expect(page.getByRole("article")).toHaveCount(12);
+  await expect(page.getByRole("article")).toHaveCount(primaryCapabilityCount);
 }
 function savedPackagePage(observedAt: string, expiresAt: string) {
   return {
@@ -20,14 +25,198 @@ function savedPackagePage(observedAt: string, expiresAt: string) {
 test.beforeEach(async ({ context }) => {
   await context.route(url => !["localhost", "127.0.0.1"].includes(url.hostname), route => route.abort());
 });
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "wait" });
+});
+
+test("consented Admin permissions do not ask for consent until a token check reports it missing", async ({ page }) => {
+  let missingConsent = false;
+  const posts: string[] = [];
+  function views(): CapabilityView[] {
+    return capabilityDefinitions.filter(definition => definition.probe.adapterRegistered && definition.mode !== "application").map(definition => {
+      const missing = missingConsent && definition.id === "graph.package.block.manage";
+      const providerRead = ["graph.package.read.delegated", "graph.directory.read", "powerPlatform.inventory.read"].includes(definition.id);
+      return { definition, decision: {
+        capabilityId: definition.id, status: missing ? "missing_permission" : "available", authorized: !missing, fresh: true,
+        verification: missing ? undefined : definition.mode === "local" ? "local" : providerRead ? "provider" : "token",
+        ...(definition.mode === "local" ? {} : {
+          checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 300_000).toISOString(),
+        }),
+        ...(missing ? { evidence: { category: "missing_permission", phase: "token_acquisition" } } : {}),
+        previewQualification: "not_required", remediation: [],
+      } };
+    });
+  }
+  await page.route("**/api/**", route => {
+    const path = new URL(route.request().url()).pathname;
+    if (route.request().method() === "POST") posts.push(path);
+    if (path === "/api/me") return route.fulfill({ json: {
+      user: { displayName: "Synthetic administrator", username: "fixture@example.invalid", homeAccountId: "consent-fixture", roles: ["AgentControl.Admin"] },
+      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+    } });
+    if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
+    if (path === "/api/capabilities" || path === "/api/capabilities/check") return route.fulfill({ json: { value: views() } });
+    if (path === "/api/agents") return route.fulfill({ json: savedPackagePage(new Date().toISOString(), new Date(Date.now() + 300_000).toISOString()) });
+    return route.fulfill({ json: { value: [] } });
+  });
+  await page.goto("/permissions");
+  const check = page.getByRole("button", { name: "Check status", exact: true });
+  await expect(check).toBeEnabled();
+  await expect(page.getByRole("button", { name: "3 provider-verified / 1 local / 6 ready to try / 0 degraded / 0 blocked" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
+  const packageRow = page.getByRole("article", { name: "Package block management" });
+  await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
+  await expect(packageRow.getByRole("link", { name: "Open Agents" })).toBeVisible();
+  missingConsent = true;
+  await check.click();
+  await expect(packageRow.getByRole("button", { name: "Request consent", exact: true })).toBeVisible();
+  await expect(packageRow.getByText("Missing app permission", { exact: true })).toBeVisible();
+  missingConsent = false;
+  await check.click();
+  await expect(packageRow.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
+  await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
+  expect(posts.length).toBeGreaterThanOrEqual(3);
+  expect(posts.every(path => path === "/api/capabilities/check")).toBe(true);
+});
+
+test("primary navigation uses the full header width at every screen size", async ({ page }, info) => {
+  await page.route("**/api/**", route => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") return route.fulfill({ json: {
+      user: { displayName: "Synthetic navigation validation account", username: "fixture@example.invalid", homeAccountId: "navigation-fixture", roles: ["AgentControl.Admin"] },
+      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+    } });
+    if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
+    if (path === "/api/agents") return route.fulfill({ json: savedPackagePage(new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()) });
+    return route.fulfill({ json: { value: [] } });
+  });
+  await page.goto("/permissions");
+  const navigation = page.getByRole("navigation", { name: "Primary views" });
+  await expect(navigation.getByRole("button")).toHaveCount(8);
+  const originalViewport = page.viewportSize()!;
+  for (const width of [originalViewport.width, 768, 1024, 1920]) {
+    await page.setViewportSize({ ...originalViewport, width });
+    const header = await page.locator(".top-bar").boundingBox();
+    const bounds = await navigation.boundingBox();
+    expect(bounds!.x).toBeCloseTo(header!.x, 1);
+    expect(bounds!.width).toBeCloseTo(header!.width, 1);
+    for (const button of await navigation.getByRole("button").all()) {
+      const buttonBounds = await button.boundingBox();
+      expect(buttonBounds!.x).toBeGreaterThanOrEqual(bounds!.x);
+      expect(buttonBounds!.x + buttonBounds!.width).toBeLessThanOrEqual(bounds!.x + bounds!.width);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  }
+  await page.setViewportSize(originalViewport);
+  expect((await new AxeBuilder({ page }).include(".top-bar").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("full-width-navigation.png") });
+});
+
+test("first Agents visit loads the catalog and access editing loads current details without a write", async ({ page }, info) => {
+  const refreshes: string[] = [];
+  const writes: string[] = [];
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "POST" && path.startsWith("/api/agents/") && path.endsWith("/refresh-jobs")) refreshes.push(path);
+    if (["POST", "PATCH"].includes(request.method()) && /\/api\/agents\/[^/]+\/(access|block|unblock)$/.test(path)) writes.push(path);
+  });
+  await login(page, `first-agent-visit-${info.project.name}`);
+  expect(refreshes).toEqual([]);
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(page.getByText("Synthetic package", { exact: true })).toBeVisible();
+  expect(refreshes.filter(path => path === "/api/agents/refresh-jobs")).toHaveLength(1);
+  await expect(page.getByRole("button", { name: "Block Synthetic package", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Manage access for Synthetic package", exact: true }).click();
+  const editor = page.getByRole("dialog");
+  await expect(editor).toBeVisible();
+  expect(refreshes.filter(path => path === "/api/agents/synthetic-package/refresh-jobs")).toHaveLength(1);
+  await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Permissions", exact: true }).click();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(page.getByText("Synthetic package", { exact: true })).toBeVisible();
+  expect(refreshes.filter(path => path === "/api/agents/refresh-jobs")).toHaveLength(1);
+  expect(writes).toEqual([]);
+});
+
+test("timeout recovery retries failed checks while keeping changes ready to try", async ({ page }, info) => {
+  const now = Date.now();
+  let recovered = false;
+  const requests: string[] = [];
+  const unexpected: string[] = [];
+  const views = (): CapabilityView[] => capabilityDefinitions.map(definition => {
+    const onDemand = definition.probe.kind === "on_demand";
+    const disabled = definition.mode === "application";
+    const timedOut = definition.id === "graph.package.read.delegated" && !recovered;
+    const status = disabled ? "not_configured" : timedOut ? "provider_error" : "available";
+    return {
+      definition, enabled: !disabled,
+      ...(disabled ? { configuration: { enabled: false, sharedDataScope: false } } : {}),
+      decision: {
+        capabilityId: definition.id, status, authorized: status === "available", fresh: true,
+        verification: status !== "available" ? undefined : onDemand ? "on_demand" : definition.mode === "local" ? "local"
+          : definition.probe.kind === "live_qualification" || definition.id.startsWith("powerPlatform.quarantine.") ? "token" : "provider",
+        ...(!onDemand ? { checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 300_000).toISOString() } : {}),
+        previewQualification: "not_required",
+        ...(timedOut ? { evidence: { category: "provider_timeout", phase: "provider_read", timeoutMs: 30_000 } } : {}),
+        remediation: [],
+      },
+    };
+  });
+  await page.route("**/api/**", async route => {
+    const url = new URL(route.request().url());
+    requests.push(url.pathname + url.search);
+    if (url.pathname === "/api/me") return route.fulfill({ json: {
+      user: { displayName: "Synthetic validation account", username: "fixture@example.invalid", homeAccountId: "fixture", roles: ["AgentControl.Admin"] },
+      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+    } });
+    if (url.pathname === "/api/auth/status") return route.fulfill({ json: { authConfigured: true, callback: `${url.origin}/api/auth/callback` } });
+    if (url.pathname === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
+    if (route.request().method() === "GET" && url.pathname === "/api/agents") {
+      return route.fulfill({ json: savedPackagePage(new Date(now).toISOString(), new Date(now + 300_000).toISOString()) });
+    }
+    if (route.request().method() === "GET" && ["/api/official-usage/aggregate", "/api/official-usage/users"].includes(url.pathname)) {
+      return route.fulfill({ json: {} });
+    }
+    if (url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check") {
+      if (url.searchParams.get("retry") === "failed") recovered = true;
+      return route.fulfill({ json: { value: views() } });
+    }
+    unexpected.push(url.pathname);
+    return route.fulfill({ status: 404, json: { code: "unexpected_fixture_request" } });
+  });
+  await page.goto("/permissions");
+  const catalog = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+  await expect(catalog.getByText("Check timed out", { exact: true })).toBeVisible();
+  await expect(catalog.getByText(/bounded provider check timed out after 30 seconds/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "Open Audit", exact: true })).toHaveAttribute("href", "/audit");
+  await expect(page.getByRole("link", { name: "Open Security", exact: true })).toHaveAttribute("href", "/security");
+  await expect(page.getByRole("link", { name: "Open Agents", exact: true }).first()).toHaveAttribute("href", "/agents");
+  await page.getByRole("button", { name: "Check status", exact: true }).click();
+  await expect(catalog.locator(".capability-status")).toHaveText("Available");
+  expect(requests.filter(path => path === "/api/capabilities/check?retry=failed")).toHaveLength(1);
+  const block = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package block management", exact: true }) });
+  await expect(block.locator(".capability-status")).toHaveText("Ready to try");
+  expect(unexpected).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("permission-timeout-recovery.png") });
+});
+
 for (const [status, label] of Object.entries(statusLabels)) {
   test(`${status}: readable, responsive, accessible`, async ({ page }, info) => {
     const errors: string[] = [];
     page.on("pageerror", error => errors.push(error.message));
-    await login(page, status);
-    const row = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+    const roleDenied = status === "missing_internal_role";
+    await login(page, roleDenied ? "role-Viewer" : status);
+    const row = page.getByRole("article").filter({ has: page.getByRole("heading", {
+      name: roleDenied ? "Package block management" : "Package catalog read",
+      exact: true,
+    }) });
     await expect(row.locator(".capability-status")).toHaveText(label);
-    await expect(row.getByText("delegated: CopilotPackages.Read.All", { exact: true })).toBeVisible();
+    await expect(row.getByText(
+      roleDenied ? "delegated: CopilotPackages.ReadWrite.All" : "delegated: CopilotPackages.Read.All",
+      { exact: true },
+    )).toBeVisible();
     await expect(row.getByText("https://graph.microsoft.com", { exact: true })).toBeVisible();
     const inventory = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Power Platform inventory", exact: true }) });
     await expect(inventory.getByText("delegated: ResourceQuery.Resources.Read", { exact: true })).toBeVisible();
@@ -38,15 +227,27 @@ for (const [status, label] of Object.entries(statusLabels)) {
     await row.screenshot({ path: `/evidence/permission-row-${status}-${info.project.name}.png` });
   });
 }
-test("explicit refresh, safe consent cancellation, panels and focus return", async ({ page }) => {
-  let probes = 0;
-  page.on("request", request => { if (new URL(request.url()).pathname.endsWith("/probe")) probes += 1; });
-  await login(page, "unknown");
-  expect(probes).toBe(0);
+test("automatic checks, safe consent cancellation, panels and focus return", async ({ page }) => {
+  let checks = 0;
+  let legacyProbes = 0;
+  const unexpectedProviderWorkloads: string[] = [];
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "POST" && path === "/api/capabilities/check") checks += 1;
+    if (path.endsWith("/probe")) legacyProbes += 1;
+    if (request.method() === "POST" && [
+      "/api/purview/audit/jobs",
+      "/api/hunting/jobs",
+      "/api/agents/refresh-jobs",
+      "/api/reports/imports",
+    ].includes(path)) unexpectedProviderWorkloads.push(path);
+  });
+  await login(page, "stale");
   const row = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
-  await row.getByRole("button", { name: "Retry probe" }).click();
   await expect(row.locator(".capability-status")).toHaveText("Available");
-  expect(probes).toBe(1);
+  expect(checks).toBe(1);
+  expect(legacyProbes).toBe(0);
+  expect(unexpectedProviderWorkloads).toEqual([]);
   const summary = row.locator("summary"); await summary.focus(); await page.keyboard.press("Enter");
   await expect(row.locator("details")).toHaveAttribute("open", "");
   const setup = row.getByRole("button", { name: "Setup instructions" }); await setup.click();
@@ -57,25 +258,41 @@ test("explicit refresh, safe consent cancellation, panels and focus return", asy
     expect(await dialog.evaluate(element => element.contains(document.activeElement))).toBe(true);
   }
   await page.keyboard.press("Escape"); await expect(dialog).not.toBeVisible(); await expect(setup).toBeFocused();
-  await row.getByRole("button", { name: "Request consent" }).click();
+  await expect(row.getByRole("button", { name: "Request consent" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  await login(page, "missing_delegated_grant");
+  const missingRow = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+  await missingRow.getByRole("button", { name: "Request consent" }).click();
   await expect(page.getByRole("status")).toContainText("Consent was cancelled or denied");
   await expect(page.getByText("never-render-provider-text")).toHaveCount(0);
-  expect(probes).toBe(1);
+  expect(legacyProbes).toBe(0);
+  expect(unexpectedProviderWorkloads).toEqual([]);
 });
-test("stale saved catalog remains readable and direct writes remain denied", async ({ page }) => {
+test("Viewer retains saved catalog access during stale read evidence", async ({ page }) => {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 60_000).toISOString();
   await page.route(url => url.pathname === "/api/agents", route => route.fulfill({ json: savedPackagePage(now, expiresAt) }));
-  await login(page, "available");
+  await page.route(url => url.pathname === "/api/capabilities/check", async route => {
+    const response = await route.fetch();
+    const body = await response.json() as { value: Array<{ definition: { id: string }; decision: Record<string, unknown> }> };
+    await route.fulfill({ json: { ...body, value: body.value.map(view => view.definition.id === "graph.package.read.delegated" ? {
+      ...view,
+      decision: {
+        ...view.decision,
+        status: "unknown",
+        authorized: false,
+        fresh: false,
+        checkedAt: new Date(Date.now() - 120_000).toISOString(),
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        verification: "provider",
+      },
+    } : view) } });
+  });
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByText("Synthetic package", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Block Synthetic package", exact: true })).toBeDisabled();
-  await page.route(url => url.pathname.endsWith("/graph.package.read.delegated/probe"), async route => {
-    const response = await route.fetch(); const value = await response.json();
-    await route.fulfill({ json: { ...value, status: "unknown", authorized: false, fresh: false, expiresAt: new Date(0).toISOString() } });
-  });
+  await expect(page.getByRole("button", { name: "Block Synthetic package", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Permissions", exact: true }).click();
-  await page.getByRole("article").first().getByRole("button", { name: "Retry probe" }).click();
   await expect(page.getByText("Unknown / stale evidence")).toBeVisible();
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByText("Synthetic package", { exact: true })).toBeVisible();
@@ -86,7 +303,7 @@ test("stale saved catalog remains readable and direct writes remain denied", asy
     const response = await fetch("/api/agents/synthetic-package/block", { method: "POST", headers: { "X-CSRF-Token": me.csrfToken } });
     return { status: response.status, body: await response.json() };
   });
-  expect(result).toMatchObject({ status: 403, body: { code: "capability_unavailable" } });
+  expect(result).toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
 });
 test("job deep links keep exact source identity and browser history without provider sends", async ({ page }) => {
   const observedAt = new Date().toISOString();
@@ -125,7 +342,7 @@ test("job deep links keep exact source identity and browser history without prov
     } });
   });
 
-  await login(page, "role-Reader");
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Jobs", exact: true }).click();
   await page.getByRole("article").filter({ hasText: "Older refresh" }).getByRole("link", { name: "Open source view" }).click();
   await expect(page).toHaveURL(new RegExp(`refreshJob=${olderId}`));
@@ -142,19 +359,19 @@ test("job deep links keep exact source identity and browser history without prov
   await expect(page.getByRole("region", { name: "Selected package refresh job" })).toHaveCount(0);
   expect(providerSends).toEqual([]);
 });
-test("qualified package preview is responsive and cancellation dispatches no write", async ({ page }) => {
+test("package preview is responsive and cancellation dispatches no write", async ({ page }) => {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 60_000).toISOString();
   let previews = 0;
   let writes = 0;
-  await page.route(url => url.pathname === "/api/capabilities", async route => {
+  await page.route(url => ["/api/capabilities", "/api/capabilities/check"].includes(url.pathname), async route => {
     const response = await route.fetch();
     const body = await response.json();
     await route.fulfill({ response, json: {
       ...body,
       value: body.value.map((view: { definition: { id: string }; decision: object }) => view.definition.id === "graph.package.block.manage" ? {
         ...view,
-        decision: { ...view.decision, status: "available", authorized: true, fresh: true, expiresAt, previewQualification: "qualified", remediation: [] },
+        decision: { capabilityId: view.definition.id, status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] },
       } : view),
     } });
   });
@@ -212,8 +429,8 @@ test("saved inventory navigation does not scan and explicit refresh is the only 
       identifiers: resourcePage.value[0].identifiers,
       package: { status: "unmatched", reason: "current provider schemas document no cross-source package identifier relation" },
       reports: { status: "unmatched", reason: "official report identifiers are report-only and cannot be joined" },
-      audit: { status: "unauthorized", reason: "SecurityReader is required before audit association lookup" },
-      security: { status: "unauthorized", reason: "SecurityReader is required before Defender association lookup" },
+      audit: { status: "available", count: 0, value: [] },
+      security: { status: "available", count: 0, value: [] },
       controls: { quarantineTarget: null, packageTarget: null },
     } });
     if (path === "/api/inventory/resources") return route.fulfill({ json: resourcePage });
@@ -223,7 +440,7 @@ test("saved inventory navigation does not scan and explicit refresh is the only 
     if (path.endsWith("/resume")) return route.fulfill({ status: 202, json: { ...waitingJob, status: "running" } });
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
-  await login(page, "role-Reader");
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Power Platform", exact: true }).click();
   await expect(page.getByRole("region", { name: "Power Platform inventory explorer" })).toBeVisible();
   await expect(page.getByText("Support intake", { exact: true })).toBeVisible();
@@ -247,7 +464,7 @@ test("saved inventory navigation does not scan and explicit refresh is the only 
   await dialog.getByRole("tab", { name: "Package" }).click();
   await expect(dialog.getByText(/current provider schemas document no cross-source/)).toBeVisible();
   await dialog.getByRole("tab", { name: "Audit" }).click();
-  await expect(dialog.getByText(/Unauthorized: SecurityReader is required/)).toBeVisible();
+  await expect(dialog.getByText(/Authorized and queried; no exact associated records/)).toBeVisible();
   await dialog.getByRole("tab", { name: "Power Platform" }).click();
   await expect(dialog.getByText("Search user", { exact: true })).toBeVisible();
   await expect(dialog.getByText(/GET · action/)).toBeVisible();
@@ -274,25 +491,27 @@ test("saved inventory navigation does not scan and explicit refresh is the only 
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: `/evidence/inventory-${test.info().project.name}.png`, fullPage: true });
 });
-test("quarantine uses real policy, exact saved targets, fail-closed qualification and verified fixture write", async ({ page }, testInfo) => {
+test("quarantine uses real policy, exact saved targets, confirmation and verified fixture write", async ({ page }, testInfo) => {
   const quarantineRequests: string[] = [];
   page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/quarantine/")) quarantineRequests.push(`${request.method()} ${url.pathname}`); });
-  await login(page, "role-Operator");
+  await login(page, "role-Admin");
+  const targets = await (await page.request.get("/api/quarantine/targets")).json() as QuarantineTargetPage;
+  const firstName = targets.value.find(target => target.botId === "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")!.displayName!;
+  const secondName = targets.value.find(target => target.botId === "cccccccc-cccc-cccc-cccc-cccccccccccc")!.displayName!;
   await page.getByRole("button", { name: "Power Platform", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Copilot Studio quarantine target picker" })).toBeVisible();
-  const qualifiedRow = page.getByRole("row", { name: /Select Qualified browser agent/ });
-  const unqualifiedRow = page.getByRole("row", { name: /Select Unqualified browser agent/ });
-  await expect(qualifiedRow.getByText("Qualified browser agent", { exact: true })).toBeVisible();
-  await expect(unqualifiedRow.getByText("Unqualified browser agent", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Power Platform inventory explorer" })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: `Select ${firstName} for quarantine control` })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: `Select ${secondName} for quarantine control` })).toBeVisible();
   expect(quarantineRequests.filter(value => value.includes("/status"))).toEqual([]);
 
-  await page.getByRole("checkbox", { name: "Select Unqualified browser agent for quarantine control" }).check();
+  await page.getByRole("checkbox", { name: `Select ${secondName} for quarantine control` }).check();
   await page.getByRole("button", { name: "Quarantine selected" }).click();
   const confirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
   await expect(confirmation.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / cccccccc-cccc-cccc-cccc-cccccccccccc", { exact: true })).toBeVisible();
-  await expect(confirmation.getByText(/two-direction canary qualification/)).toBeVisible();
-  await expect(confirmation.getByRole("checkbox")).toBeDisabled();
+  await expect(confirmation.getByRole("checkbox")).toBeEnabled();
   await expect(confirmation.getByRole("button", { name: "Confirm quarantine" })).toBeDisabled();
+  await confirmation.getByRole("checkbox").check();
+  await expect(confirmation.getByRole("button", { name: "Confirm quarantine" })).toBeEnabled();
   expect(await confirmation.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".quarantine-confirmation").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   expect(await confirmation.evaluate(element => element.contains(document.activeElement))).toBe(true);
@@ -301,32 +520,22 @@ test("quarantine uses real policy, exact saved targets, fail-closed qualificatio
     await page.keyboard.press("Tab");
     expect(await confirmation.evaluate(element => element.contains(document.activeElement))).toBe(true);
   }
-  await login(page, "role-Reader");
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Power Platform", exact: true }).click();
   await expect(page.getByRole("region", { name: "Power Platform inventory explorer" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Copilot Studio quarantine target picker" })).toHaveCount(0);
   expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(0);
-  await login(page, "role-Operator");
+  await login(page, "role-Admin");
   await page.getByRole("button", { name: "Power Platform", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Copilot Studio quarantine target picker" })).toBeVisible();
-
-  const blockedDirectWrite = await page.evaluate(async () => {
-    const me = await (await fetch("/api/me")).json();
-    const targets = await (await fetch("/api/quarantine/targets")).json();
-    const intent = { action: "quarantine", snapshotId: targets.snapshot.id, resourceNativeIds: ["browser-unqualified-agent"] };
-    const preview = await (await fetch("/api/quarantine/preview", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": me.csrfToken }, body: JSON.stringify(intent) })).json();
-    const response = await fetch("/api/quarantine/jobs", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": me.csrfToken, "Idempotency-Key": "browser-unqualified-direct" }, body: JSON.stringify({ ...intent, confirmationHash: preview.confirmationHash }) });
-    return { status: response.status, body: await response.json() };
-  });
-  expect(blockedDirectWrite).toMatchObject({ status: 409, body: { code: "quarantine_write_unqualified" } });
+  await expect(page.getByRole("region", { name: "Power Platform inventory explorer" })).toBeVisible();
 
   if (testInfo.project.name === "desktop") {
-    await page.getByRole("checkbox", { name: "Select Qualified browser agent for quarantine control" }).check();
+    await page.getByRole("checkbox", { name: `Select ${firstName} for quarantine control` }).check();
     await page.getByRole("button", { name: "Quarantine selected" }).click();
-    const qualifiedConfirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
-    await expect(qualifiedConfirmation.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", { exact: true })).toBeVisible();
-    await qualifiedConfirmation.getByRole("checkbox").check();
-    await qualifiedConfirmation.getByRole("button", { name: "Confirm quarantine" }).click();
+    const targetConfirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
+    await expect(targetConfirmation.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", { exact: true })).toBeVisible();
+    await targetConfirmation.getByRole("checkbox").check();
+    await targetConfirmation.getByRole("button", { name: "Confirm quarantine" }).click();
     await expect(page.getByText("Quarantine job: Succeeded", { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText(/1 of 1 complete · 1 verified/)).toBeVisible();
   } else {
@@ -341,14 +550,16 @@ test("quarantine uses real policy, exact saved targets, fail-closed qualificatio
     }
     return route.continue();
   });
-  await page.getByRole("button", { name: "Inspect direct status for Qualified browser agent" }).click();
+  await page.getByRole("button", { name: `View details for ${firstName}` }).click();
+  const directStatusDialog = page.getByRole("dialog", { name: firstName });
+  await directStatusDialog.getByRole("tab", { name: "Controls" }).click();
   await expect(page.getByText("Not checked", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Check direct status" }).click();
   await expect(page.getByRole("alert")).toContainText("Direct status unavailable: Synthetic direct status outage.");
   await page.getByRole("button", { name: "Check direct status" }).click();
   await expect(page.getByText("Quarantined", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Direct and inventory states disagree.", { exact: true })).toBeVisible();
-  expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(testInfo.project.name === "desktop" ? 2 : 1);
+  expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(testInfo.project.name === "desktop" ? 1 : 0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: `/evidence/quarantine-controls-${test.info().project.name}.png`, fullPage: true });
@@ -372,7 +583,7 @@ test("saved inventory remains readable during provider outage without a refresh"
   await expect(page.getByRole("button", { name: "Export filtered inventory CSV" })).toBeEnabled();
   expect(writes).toBe(0);
 });
-test("four independent roles, private evidence, and saved audit during outage", async ({ page, browser }) => {
+test("two-role hierarchy, private evidence, and saved audit during outage", async ({ page, browser }) => {
   let broadAgentReads = 0;
   await page.route(url => url.pathname === "/api/agents/synthetic-package", route => route.fulfill({ json: {
     id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, sourceSystem: "graph_packages",
@@ -382,35 +593,28 @@ test("four independent roles, private evidence, and saved audit during outage", 
   page.on("request", request => {
     if (new URL(request.url()).pathname === "/api/agents") broadAgentReads += 1;
   });
-  await login(page, "role-Administrator");
-  for (const view of ["Agents", "Power Platform", "Users", "Audit", "Security"]) await expect(page.getByRole("button", { name: view, exact: true })).toHaveCount(0);
+  await login(page, "role-Admin");
+  for (const view of ["Agents", "Power Platform", "Users", "Official usage", "Audit", "Security", "Jobs"]) {
+    await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
+  }
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
-  const result = await page.evaluate(async () => (await fetch("/api/agents")).status); expect(result).toBe(403);
-  await login(page, "role-Operator");
-  await expect(page.getByRole("button", { name: "Agents", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Power Platform", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Audit", exact: true })).toHaveCount(0);
-  const beforeOperatorView = broadAgentReads;
+  await login(page, "role-Viewer");
+  for (const view of ["Agents", "Power Platform", "Users", "Official usage", "Audit", "Security", "Jobs"]) {
+    await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
+  }
+  await page.getByRole("button", { name: "Official usage", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toHaveCount(0);
+  const beforeViewerView = broadAgentReads;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Exact package targeting" })).toBeVisible();
-  await page.getByLabel("Graph package native ID").fill("synthetic-package");
-  await page.getByRole("button", { name: "Inspect exact package" }).click();
-  await expect(page.getByRole("dialog", { name: "Synthetic package" })).toBeVisible();
-  expect(broadAgentReads).toBe(beforeOperatorView);
-  await page.getByRole("button", { name: "Close", exact: true }).click();
-  await login(page, "role-Reader");
-  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Power Platform", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
-  await login(page, "role-SecurityReader");
-  await expect(page.getByRole("button", { name: "Audit", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Security", exact: true })).toBeVisible();
+  expect(broadAgentReads).toBe(beforeViewerView);
+  await expect(page.getByRole("button", { name: /^Block / })).toHaveCount(0);
   await login(page, "provider_error");
   await page.getByRole("button", { name: "Audit", exact: true }).click();
   await expect(page.getByRole("region", { name: "Audit log", exact: true })).toBeVisible();
   expect(await page.evaluate(async () => (await fetch("/api/audit/events")).status)).toBe(200);
   const other = await browser.newContext(); const otherPage = await other.newPage();
+  await otherPage.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { code: "provider_error" } }));
   await otherPage.goto("http://localhost:3001/api/auth/login?returnTo=" + encodeURIComponent("/permissions?fixture=unprobed-principal"));
   await expect(otherPage.getByRole("article").first().locator(".capability-status")).toHaveText("Unknown");
   await other.close();
@@ -485,12 +689,12 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
   };
   const job = {
     id: jobId,
-    authorizationPrincipalId: "fixture-role-SecurityReader",
-    resultScope: { kind: "principal", scopeId: "fixture-role-SecurityReader", configurationRevision: null },
+    authorizationPrincipalId: "fixture-role-Viewer",
+    resultScope: { kind: "principal", scopeId: "fixture-role-Viewer", configurationRevision: null },
     tokenMode: "delegated",
     status: "partial",
     filters,
-    displayName: "agent-control:fixture-role-SecurityReader:browser",
+    displayName: "agent-control:fixture-role-Viewer:browser",
     providerQueryId: "provider-query-browser",
     providerStatus: "succeeded",
     localRequestId: "provider-correlation-browser",
@@ -562,7 +766,7 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
 
-  await login(page, "role-SecurityReader");
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Audit", exact: true }).click();
   await expect(page.getByRole("region", { name: "Audit log", exact: true })).toBeVisible();
   await page.getByRole("tab", { name: "Purview Audit Search" }).click();
@@ -608,8 +812,8 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   };
   const job = {
     id: jobId,
-    authorizationPrincipalId: "fixture-role-SecurityReader",
-    resultScope: { kind: "principal", scopeId: "fixture-role-SecurityReader", configurationRevision: null },
+    authorizationPrincipalId: "fixture-role-Viewer",
+    resultScope: { kind: "principal", scopeId: "fixture-role-Viewer", configurationRevision: null },
     tokenMode: "delegated",
     status: "partial",
     filters,
@@ -648,24 +852,24 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
       { capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", targetScopeHash: "a".repeat(64),
         approvedScope: { templateId: "agents_inventory", agentIds: ["agent-browser"], blueprintIds: [], actorObjectIds: [], operations: [] },
         queryVersion: 3, contractRevision: "b".repeat(64), permissionRevision: "c".repeat(64), configurationRevision: 1,
-        approvedBy: "fixture-role-SecurityReader", qualifiedAt: endDateTime, expiresAt },
+        approvedBy: "fixture-role-Admin", qualifiedAt: endDateTime, expiresAt },
       { capabilityId: "defender.hunting.delegated", templateId: "agent_activity", targetScopeHash: "d".repeat(64),
         approvedScope: { templateId: "agent_activity", agentIds: ["agent-browser"], blueprintIds: [], actorObjectIds: [], operations: ["InferenceCall", "InvokeAgent"] },
         queryVersion: 3, contractRevision: "b".repeat(64), permissionRevision: "c".repeat(64), configurationRevision: 1,
-        approvedBy: "fixture-role-SecurityReader", qualifiedAt: endDateTime, expiresAt },
+        approvedBy: "fixture-role-Admin", qualifiedAt: endDateTime, expiresAt },
     ],
     retainedScopes: [
-      { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", resultScope: { kind: "principal", scopeId: "fixture-role-SecurityReader", configurationRevision: null },
+      { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", resultScope: { kind: "principal", scopeId: "fixture-role-Viewer", configurationRevision: null },
         tokenMode: "delegated", capabilityId: "defender.hunting.delegated", templateId: "agents_inventory", targetScopeHash: "a".repeat(64),
         approvedScope: { templateId: "agents_inventory", agentIds: ["agent-browser"], blueprintIds: [], actorObjectIds: [], operations: [] },
         queryVersion: 3, contractRevision: "b".repeat(64), permissionRevision: "c".repeat(64), configurationRevision: 1,
-        approvedBy: "fixture-role-SecurityReader", sourceQualificationJobId: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+        approvedBy: "fixture-role-Admin", sourceQualificationJobId: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
         approvedAt: endDateTime, qualifiedAt: endDateTime, expiresAt, revokedAt: null },
-      { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", resultScope: { kind: "principal", scopeId: "fixture-role-SecurityReader", configurationRevision: null },
+      { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", resultScope: { kind: "principal", scopeId: "fixture-role-Viewer", configurationRevision: null },
         tokenMode: "delegated", capabilityId: "defender.hunting.delegated", templateId: "agent_activity", targetScopeHash: "d".repeat(64),
         approvedScope: { templateId: "agent_activity", agentIds: ["agent-browser"], blueprintIds: [], actorObjectIds: [], operations: ["InferenceCall", "InvokeAgent"] },
         queryVersion: 3, contractRevision: "b".repeat(64), permissionRevision: "c".repeat(64), configurationRevision: 1,
-        approvedBy: "fixture-role-SecurityReader", sourceQualificationJobId: "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb",
+        approvedBy: "fixture-role-Admin", sourceQualificationJobId: "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb",
         approvedAt: endDateTime, qualifiedAt: endDateTime, expiresAt, revokedAt: null },
     ],
     limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumRows: 200, maximumBytes: 2_000_000, providerRequests: 12, activations: 4 },
@@ -771,7 +975,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
 
-  await login(page, "role-SecurityReader");
+  await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Security", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Defender and Agent 365 hunting" })).toBeVisible();
   await expect(page.getByText(/Messages, instructions, memory and tool arguments or results are not retained/)).toBeVisible();
@@ -806,21 +1010,20 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: `/evidence/defender-hunting-${test.info().project.name}.png`, fullPage: true });
 });
-test("loading and probe transport failure preserve layout and fail closed", async ({ page }) => {
+test("loading and automatic-check transport failure preserve layout and fail closed", async ({ page }) => {
   let release!: () => void;
   const held = new Promise<void>(done => { release = done; });
   await page.route(url => url.pathname === "/api/capabilities", async route => {
     const response = await route.fetch(); await held; await route.fulfill({ response });
   });
-  await page.goto(`/api/auth/login?returnTo=${encodeURIComponent("/permissions?fixture=available")}`, { waitUntil: "domcontentloaded" });
+  await page.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { error: { code: "provider_error", message: "Synthetic outage" } } }));
+  await page.goto(`/api/auth/login?returnTo=${encodeURIComponent("/permissions?fixture=unknown")}`, { waitUntil: "domcontentloaded" });
   await expect(page.getByText("Loading capability decisions...", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Permissions", exact: true })).toBeEnabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   release();
-  await expect(page.getByRole("article")).toHaveCount(12);
-  await page.route(url => url.pathname.endsWith("/probe"), route => route.fulfill({ status: 503, json: { error: { code: "provider_error", message: "Synthetic outage" } } }));
-  await page.getByRole("article").first().getByRole("button", { name: "Retry probe" }).click();
-  await expect(page.getByRole("status")).toContainText("Probe refresh failed");
+  await expect(page.getByRole("article")).toHaveCount(primaryCapabilityCount);
+  await expect(page.getByRole("status")).toContainText("Automatic permission check failed");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("button", { name: "Refresh agents", exact: true })).toBeDisabled();
 });
@@ -921,17 +1124,13 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(page.getByText(/Dataset .*Users version .*Users & agents version/)).toBeVisible();
 
   await page.evaluate(() => localStorage.setItem("agent-control:usage-reports:v1", "still-untrusted"));
-  await login(page, "role-Reader");
+  await login(page, "role-Viewer");
   await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Microsoft 365 usage reports", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Agent insights dashboard" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
-
-  await login(page, "role-SecurityReader");
-  await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/Dataset .*Users version .*Users & agents version/)).toBeVisible();

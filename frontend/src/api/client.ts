@@ -24,7 +24,6 @@ export type QuarantineStatusView = {
 export type QuarantinePreview = {
   confirmationHash: string;
   summary: QuarantineConfirmationSummary;
-  qualification: { qualified: boolean; requiredForSubmit: true };
   statuses: QuarantineStatusView[];
 };
 
@@ -495,8 +494,15 @@ export async function getCurrentUser() {
   return result;
 }
 
-export function getCapabilities() {
-  return request<{ value: CapabilityView[] }>("/api/capabilities");
+export function getCapabilities(options: { signal?: AbortSignal } = {}) {
+  return request<{ value: CapabilityView[] }>("/api/capabilities", { signal: options.signal });
+}
+
+export function checkCapabilities(options: { signal?: AbortSignal; retryFailed?: boolean } = {}) {
+  return request<{ value: CapabilityView[] }>(`/api/capabilities/check${options.retryFailed ? "?retry=failed" : ""}`, {
+    method: "POST",
+    signal: options.signal,
+  });
 }
 
 export function getWorkbenchMetadata(options: { signal?: AbortSignal } = {}) {
@@ -509,10 +515,6 @@ export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
 
 export function beginCapabilityConsent(capabilityId: CapabilityId, returnTo = "/") {
   return request<{ authorizationUrl: string }>("/api/auth/consent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId, returnTo }) });
-}
-
-export function refreshCapability(capabilityId: CapabilityId) {
-  return request<CapabilityView["decision"]>(`/api/capabilities/${encodeURIComponent(capabilityId)}/probe`, { method: "POST" });
 }
 
 export function configureApplicationCapability(capabilityId: CapabilityId, enabled: boolean, sharedDataScope: boolean) {

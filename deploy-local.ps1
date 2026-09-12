@@ -2,6 +2,7 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Position=0)]
+    [Alias('Action')]
     [ValidateSet('start','stop','edit-config')]
     [string]$Command = 'start',
     [string]$Project = 'agent-control'

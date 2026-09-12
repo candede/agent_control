@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inventoryProviderRoleIds, inventoryRoleScope, normalizeInventoryProviderRoleIds, quarantineProviderRoleAuthorized, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
+import { inventoryProviderRoleIds, inventoryRoleScope, normalizeInventoryProviderRoleIds, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
 
 describe("Power Platform provider role scope", () => {
   it("maps only documented role-template IDs with full scope taking precedence", () => {
@@ -21,12 +21,5 @@ describe("Power Platform provider role scope", () => {
       "microsoft.powerplatform/environments",
       "microsoft.powerplatform/environmentgroups",
     ]);
-  });
-
-  it("authorizes quarantine only for its three documented provider roles", () => {
-    expect(quarantineProviderRoleAuthorized({ providerRoleIds: [inventoryProviderRoleIds.globalAdministrator] })).toBe(true);
-    expect(quarantineProviderRoleAuthorized({ providerRoleIds: [inventoryProviderRoleIds.aiAdministrator] })).toBe(true);
-    expect(quarantineProviderRoleAuthorized({ providerRoleIds: [inventoryProviderRoleIds.powerPlatformAdministrator] })).toBe(true);
-    expect(quarantineProviderRoleAuthorized({ providerRoleIds: [inventoryProviderRoleIds.globalReader, inventoryProviderRoleIds.aiReader] })).toBe(false);
   });
 });

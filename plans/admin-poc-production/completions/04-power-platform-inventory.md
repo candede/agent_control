@@ -93,7 +93,7 @@ Inherited [P01-LIVE-IDENTITY and P01-BUNDLE-SIZE](01-domain-persistence-foundati
 
 ## Next Session
 
-Phase05 may consume source-provenanced package fields, current private snapshots, scoped exact-ID helpers and capability/role gates. Native Graph package IDs remain mutation targets; associations never redirect controls. MSAL/OAuth remains ephemeral, reports remain browser-local until06, and every package preview write requires its separate exact-target canary/qualification. Do not modify applied migrations1-6. Reuse retained Docker deployment and isolated fixture harnesses.
+Phase05 may consume source-provenanced package fields, current private snapshots, scoped exact-ID helpers and capability/role gates. Native Graph package IDs remain mutation targets; associations never redirect controls. MSAL/OAuth remains ephemeral and reports remain browser-local until06. Under the current binding README, implemented package writes run on demand for an authorized, confirming Admin; exact-target canary qualification is optional and never gates ordinary writes. This updates the continuation instruction, not the phase's historical live-evidence results. Do not modify applied migrations1-6. Reuse retained Docker deployment and isolated fixture harnesses.
 
 ```text
 Implement only plans/admin-poc-production/05-package-management.md.
@@ -101,8 +101,9 @@ Read the binding README and Phase01-04 records; verify current auth/session,
 capability, identity/job/snapshot and UI contracts against the worktree.
 Preserve data, secrets, independent roles, source scope and migrations1-6.
 Use Docker and agent-control-phase01 at http://localhost:3001 with isolated
-fixtures. Keep unqualified writes disabled; never replay completed/uncertain
-writes. Do not commit, push, deploy Azure, change provider grants, create
+fixtures. Keep canaries optional and non-gating; never replay completed/uncertain
+writes. Preserve current Admin/provider authority, confirmation, audit and readback.
+Do not commit, push, deploy Azure, change provider grants, create
 campaign bookkeeping, run future ideas or continue beyond Phase05.
 ```
 

@@ -2,7 +2,7 @@
 
 Microsoft Purview Audit Search is compliance and security evidence. It is **not** official Microsoft 365 Copilot Agents usage. Agent Control keeps Purview records, local administrative audit, official usage reports, package inventory and Power Platform inventory as separate source authorities.
 
-The adapter and product workflow are fixture-qualified. No approved tenant lifecycle was run in Phase 07, so neither delegated nor application Audit Search is live-qualified. A routine Permission Center refresh never creates a saved Microsoft query. Availability requires a separately approved bounded create, poll and records lifecycle for the exact mode, permission, contract and configuration revision.
+The adapter and product workflow are fixture-qualified. No approved tenant lifecycle was run in Phase 07, so no live provider access is claimed. An automatic Permission Center check acquires the scoped token only, reports token verification, and never creates or runs a Microsoft query. Opening the view also creates no query. For delegated Viewer/Admin use, current capability authorization plus the user's explicit bounded search submission gates the selected create, poll and records lifecycle; that request establishes evidence for its principal without a separate approve/start qualification ritual. Application/shared mode remains separately Admin-approved and qualified.
 
 ## Selected Graph Contract
 
@@ -42,9 +42,9 @@ The Copilot references have a casing gap: older schema XML names the message ide
 
 ## Authorization And Eligibility
 
-- Every route requires `AgentControl.SecurityReader`. Qualification approval additionally requires the independent `AgentControl.Administrator` role.
+- Viewer and Admin with current or safely read-through-refreshed capability readiness may directly submit their own bounded delegated search and access, export, cancel, or locally delete only results authorized for their principal. The actual successful search establishes delegated principal provider evidence; there is no preceding qualification approval/start ritual. Explicit delegated qualification APIs may remain optional but are not prerequisites. Application-mode qualification and shared-scope controls require `AgentControl.Admin`; Admin inherits the delegated Viewer workflow.
 - Delegated mode is private to the authorizing principal and requires that user to hold the Purview **Audit Logs** or **View-Only Audit Logs** role.
-- Application mode is separately disabled by default. It requires Administrator enablement, approved shared data scope and application permission qualification; it does not convert delegated results into tenant-shared data.
+- Application mode is separately disabled by default. It requires explicit Admin enablement, approved shared data scope and application permission qualification; it does not convert delegated results into tenant-shared data and is never an automatic fallback. Delegated-only deployments keep it disabled.
 - Both modes use `AuditLogsQuery.Read.All`. Personal Microsoft accounts and non-global clouds are unsupported by this implementation.
 - Microsoft Purview licensing, unified audit logging, workload support, retention, service limits and tenant rollout independently control whether a query can run and what it can observe.
 
@@ -52,9 +52,9 @@ Microsoft's [Audit comparison](https://learn.microsoft.com/en-us/purview/audit-s
 
 The get-started guide maps the Purview Audit Reader and Audit Manager role groups to **View-Only Audit Logs** and **Audit Logs**; Graph application permissions are a separate requirement. [Audit retention policies](https://learn.microsoft.com/en-us/purview/audit-log-retention-policies) describe typical 180-day retention, with eligible Premium workloads/users and configured policies potentially retaining records longer. These source policies are not the application's seven-day query limit or 30-day local cache lifetime.
 
-A successful approved lifecycle proves only the selected API contract and effective access for that exact identity, mode and configuration at that time. In particular, a successful empty query does not prove licensing for every workload, event emission, historical retention or comprehensive source coverage. Verify those prerequisites separately and keep absent or unobserved records explicit.
+A successful explicit search lifecycle proves only the selected API contract and effective access for that exact identity, mode and configuration at that time. A token-only automatic check does not prove provider-operation or license access. In particular, a successful empty query does not prove licensing for every workload, event emission, historical retention or comprehensive source coverage. Verify those prerequisites separately and keep absent or unobserved records explicit.
 
-Missing grant, Purview role, application-scope approval, tenant support, license or conclusive lifecycle evidence leaves the capability visible but disabled with a bounded error category and correlation ID. Do not grant broader permissions to clear that state. Recheck the cited references and rerun one approved qualification after the exact prerequisite is repaired.
+Missing grant, Purview role, application-scope approval, tenant support, license or a failed explicit lifecycle leaves the capability visible with a bounded error category and correlation ID. Interactive consent, MFA and Conditional Access are reported as interaction needed, not missing permission. Unknown, unprobed and checking are not failures. Do not grant broader permissions to clear an unavailable state; repair the exact prerequisite and retry the ordinary bounded search when appropriate.
 
 ## Curated Searches And Bounds
 
@@ -63,7 +63,7 @@ The UI exposes two code-owned presets:
 - **Copilot interactions:** service `Copilot`, record type `copilotInteraction`, operation `CopilotInteraction`.
 - **Copilot Studio administration:** service `PowerPlatform`, record type `powerPlatformAdministratorActivity`, and explicit bot, bot-component, AI-plugin-operation and environment-variable create/update/delete or publish/share/auth/name/icon operations.
 
-Users may narrow a preset with exact UTC start/end times, user principal names, IP addresses, object IDs and administrative-unit UUIDs. Each filter array accepts at most 20 unique validated values. Ordinary searches cover at most the most recent seven days; qualification covers at most one hour.
+Users may narrow a preset with exact UTC start/end times, user principal names, IP addresses, object IDs and administrative-unit UUIDs. Each filter array accepts at most 20 unique validated values. Delegated searches cover at most the most recent seven days. A separately configured application/shared qualification remains bounded to at most one hour.
 
 | Boundary | Limit |
 | --- | --- |
@@ -101,6 +101,6 @@ Shutdown and startup perform no Graph work. Interrupted `running` or `reconcilin
 
 Cancel stops local polling/download and records that Microsoft Graph may continue the remote query. Delete removes only a non-running local job and its cached rows. The selected Microsoft contract exposes no remote cancel or delete operation, so the product never claims either action changes the provider query or source events.
 
-Jobs and dependent records expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive, preserving whether an attempted remote create may continue. Qualification approval expires after one day; detached expired qualification history is removed after the additional finite cleanup window. View/export audit expires under the ordinary 90-day local audit policy. Microsoft source-event retention and any remote query lifetime are separate provider policies and are never inferred from local expiry.
+Jobs and dependent records expire after 30 days through operator retention. The 48-hour deadline first makes unfinished work inconclusive, preserving whether an attempted remote create may continue. Separately configured application/shared qualification approval expires after one day; detached expired qualification history is removed after the additional finite cleanup window. Delegated searches have no preceding qualification approval record. View/export audit expires under the ordinary 90-day local audit policy. Microsoft source-event retention and any remote query lifetime are separate provider policies and are never inferred from local expiry.
 
 Run [operator retention](operations.md#retention) at least daily for an active installation, using the existing internal helper and its exact project/database confirmation, preview and bounded-batch safeguards. Retention is not a `deploy-local.ps1` argument and makes no provider calls.

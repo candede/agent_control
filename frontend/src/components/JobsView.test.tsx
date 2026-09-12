@@ -19,11 +19,11 @@ const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 
 const user = {
-  displayName: "Four Role",
-  username: "four-role@example.invalid",
+  displayName: "Admin",
+  username: "admin@example.invalid",
   homeAccountId: "principal",
   tenantId: "tenant",
-  roles: ["AgentControl.Reader", "AgentControl.Operator", "AgentControl.SecurityReader", "AgentControl.Administrator"],
+  roles: ["AgentControl.Admin"],
 } as const;
 
 const capabilityContext = {
@@ -32,7 +32,6 @@ const capabilityContext = {
   loading: false,
   now: Date.now(),
   reload: vi.fn(),
-  refresh: vi.fn(),
   openPermissions: vi.fn(),
 } as never;
 
@@ -63,7 +62,7 @@ describe("JobsView", () => {
       : input === "/api/agents/bulk-jobs/bulk-job/resume" ? Response.json({ id: "bulk-job" })
       : Promise.reject(new Error(`Unexpected request ${input}`)));
     const input = userEvent.setup();
-    render(<JobsView user={{ ...user, roles: ["AgentControl.Operator"] }} />);
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Admin"] }} />);
     await input.click(await screen.findByRole("button", { name: /Resume unsent/ }));
     expect(fetchMock).toHaveBeenCalledWith("/api/agents/bulk-jobs/bulk-job/resume", expect.objectContaining({ method: "POST" }));
     expect(screen.queryByText(/result bodies/i)).not.toBeInTheDocument();
@@ -77,10 +76,30 @@ describe("JobsView", () => {
         canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/audit?job=audit-job" }],
       unavailableSources: [{ source: "defender", code: "source_unavailable" }],
     }));
-    render(<JobsView user={{ ...user, roles: ["AgentControl.SecurityReader"] }} />);
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
     expect(await screen.findByText(/1 authorized source is temporarily unavailable/)).toBeInTheDocument();
     await new Promise(resolve => window.setTimeout(resolve, 2_100));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets Viewer manage read-job lifecycle but hides mutation jobs and controls", async () => {
+    fetchMock.mockResolvedValue(Response.json({
+      ...emptyProjection,
+      value: [
+        { id: "audit-job", source: "purview", label: "Purview Audit Search", target: "fixed preset",
+          status: "waiting_authorization", total: null, completed: 0, partial: false, canResume: true, canCancel: false,
+          canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/audit?job=audit-job" },
+        { id: "mutation-job", source: "package-controls", label: "Package block", target: "1 exact target",
+          status: "waiting_authorization", total: 1, completed: 0, partial: false, canResume: true, canCancel: true,
+          canReconcile: true, updatedAt: "2026-09-10T07:00:00.000Z", href: "/agents?controlJob=mutation-job" },
+      ],
+    }));
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+
+    expect(await screen.findByText("Purview Audit Search")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Resume unsent/ })).toBeInTheDocument();
+    expect(screen.queryByText("Package block")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /GET-only reconcile/ })).not.toBeInTheDocument();
   });
 
   it("drops a settled response owned by the previous principal", async () => {
@@ -89,8 +108,8 @@ describe("JobsView", () => {
       .mockResolvedValueOnce(Response.json({ ...emptyProjection, value: [{ id: "new", source: "package-refresh", label: "New principal job",
         target: "Current principal Graph package catalog", status: "succeeded", total: 1, completed: 1, partial: false,
         canResume: false, canCancel: false, canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/agents?refreshJob=new" }] }));
-    const rendered = render(<JobsView user={{ ...user, roles: ["AgentControl.Reader"] }} />);
-    rendered.rerender(<JobsView user={{ ...user, homeAccountId: "other", roles: ["AgentControl.Reader"] }} />);
+    const rendered = render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+    rendered.rerender(<JobsView user={{ ...user, homeAccountId: "other", roles: ["AgentControl.Viewer"] }} />);
     expect(await screen.findByText("New principal job")).toBeInTheDocument();
     releaseOld(Response.json({ ...emptyProjection, value: [{ id: "old", source: "package-refresh", label: "Old principal job",
       target: "Current principal Graph package catalog", status: "succeeded", total: 1, completed: 1, partial: false,
@@ -108,7 +127,7 @@ describe("JobsView", () => {
         canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/agents?controlJob=bulk-job",
       }] })
       : operation);
-    render(<JobsView user={{ ...user, roles: ["AgentControl.Operator"] }} />);
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Admin"] }} />);
     const button = await screen.findByRole("button", { name: /Resume unsent/ });
     button.click();
     button.click();
@@ -135,9 +154,9 @@ describe("JobsView", () => {
       }
       return new Promise<Response>(resolve => { release = resolve; });
     });
-    const rendered = render(<JobsView user={{ ...user, roles: ["AgentControl.Operator"] }} />);
+    const rendered = render(<JobsView user={{ ...user, roles: ["AgentControl.Admin"] }} />);
     await userEvent.click(await screen.findByRole("button", { name: /Resume unsent/ }));
-    rendered.rerender(<JobsView user={{ ...user, homeAccountId: "other", roles: ["AgentControl.Reader"] }} />);
+    rendered.rerender(<JobsView user={{ ...user, homeAccountId: "other", roles: ["AgentControl.Viewer"] }} />);
     release(Response.json({ id: "bulk-job" }));
     expect(await screen.findByText(/No retained jobs are visible/)).toBeInTheDocument();
     expect(screen.queryByText(/operation failed/i)).not.toBeInTheDocument();

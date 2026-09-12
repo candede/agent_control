@@ -10,6 +10,18 @@ const resource = {
 };
 
 describe("PowerPlatformResourceQueryClient", () => {
+  it("checks access with one bounded page and no continuation", async () => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 0,
+      count: 0,
+      resultTruncated: 0,
+      data: [],
+    }));
+    await new PowerPlatformResourceQueryClient(fetcher).checkAccess("opaque-token");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetcher.mock.calls[0][1].body as string).Options.Top).toBe(1);
+  });
+
   it("discards nested details that are not documented for the returned resource type", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
       ...resource, type: "microsoft.powerapps/codeapps", properties: {

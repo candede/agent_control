@@ -600,7 +600,7 @@ function validateReadScope(scope: PurviewAuditReadScope) {
     const allowed = new Set(resourceTypesForInventoryScope(identity.roleScope));
     if (!identity.principalId || !scope.resultScopes.some(resultScope => resultScope.kind === "principal" && resultScope.scopeId === identity.principalId)
       || !identity.resourceTypes.length || identity.resourceTypes.some(resourceType => !allowed.has(resourceType))) {
-      throw new AppError(403, "scope_mismatch", "Audit Search inventory association requires an exact current Reader identity scope.");
+      throw new AppError(403, "scope_mismatch", "Audit Search inventory association requires an exact current Viewer identity scope.");
     }
   }
 }

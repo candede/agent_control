@@ -3,6 +3,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import type { AuditAction } from "../types/audit.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { hasAppRole } from "../types/capability.js";
 import { canonicalAccessEntities, packageMutationStatesEqual, type PackageMutationState } from "../services/packageMutationState.js";
 import { pool, transaction } from "./pool.js";
 
@@ -107,7 +108,7 @@ export class PackageMutationQualificationRepository {
         restoration: project(claimed.rows.find(row => row.id === ids[1])!),
       } };
     });
-    if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The canary cycle Operator must be different from both approving Administrators.");
+    if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The Admin executing the canary cycle must differ from both approving Admins.");
     if (result.kind === "invalidated") throw new AppError(409, "qualification_invalidated", "The approved canary intent was invalidated by a contract, authentication mode, or configuration revision change.");
     if (result.kind === "mismatch") throw new AppError(409, "canary_cycle_mismatch", "The restoration approval must be the exact inverse action, target, and semantic state of the original approval.");
     if (result.kind === "missing") throw new AppError(409, "canary_cycle_not_approved", "Both canary directions require current, unused workflow-v3 approvals.");
@@ -239,11 +240,11 @@ function invalidCanaryAction(): never {
 }
 
 function requireQualificationAdministrator(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.Administrator")) throw new AppError(403, "missing_internal_role", "AgentControl.Administrator is required to record or inspect mutation qualifications.");
+  if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to record or inspect mutation qualifications.");
 }
 
 function requireQualificationOperator(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.Operator")) throw new AppError(403, "missing_internal_role", "AgentControl.Operator is required to execute canary restoration.");
+  if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to execute canary restoration.");
 }
 
 function requireTenant(user: AuthenticatedUser) {

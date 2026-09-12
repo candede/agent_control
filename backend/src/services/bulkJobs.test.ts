@@ -228,21 +228,44 @@ describe("Durable bulk execution", () => {
     }
   });
 
-  it("keeps access writes disabled even with current authorization", async () => {
-    const candidate = input();
-    candidate.action = "update-availability";
-    candidate.accessUpdate = { target: "availability", mode: "replace", scope: "specific", principals: [{ resourceType: "user", resourceId: "user-1" }] };
-    candidate.targets = [{ id: "package-1", displayName: "Fixture", prestate: { kind: "access", availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] } }];
-    candidate.confirmationHash = createJobConfirmation(candidate).confirmationHash;
-    const job = await jobs.submit(scope, candidate);
-    let authorizations = 0;
-    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
-      expect(request?.method).not.toBe("PATCH");
-      return Response.json({ id: "package-1", displayName: "Fixture", isBlocked: false, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] });
+  it("executes an explicitly confirmed access update once, preserving existing and unselected principals", async () => {
+    const retained = { resourceType: "user", resourceId: "existing-user" };
+    const added = { resourceType: "user", resourceId: "new-user" };
+    const installed = { resourceType: "group", resourceId: "installed-group" };
+    const candidate = confirmedInput({
+      ...input(), action: "update-availability",
+      accessUpdate: { target: "availability", mode: "add", scope: "specific", principals: [retained, added] },
+      targets: [{ id: "package-1", displayName: "Fixture", prestate: { kind: "access", availableTo: "some", deployedTo: "some", allowedUsersAndGroups: [retained], acquireUsersAndGroups: [installed] } }],
     });
-    await runBulkJob(job.id, scope, false, jobs, new GraphPackagesClient(fetcher), async () => `dispatch-token-${++authorizations}`);
-    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "failed", failed: 1 });
-    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "PATCH")).toHaveLength(0);
+    let allowed = [retained];
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "PATCH") {
+        expect(JSON.parse(String(request.body))).toEqual({ allowedUsersAndGroups: [retained, added], acquireUsersAndGroups: [installed] });
+        allowed = [retained, added];
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({ id: "package-1", displayName: "Fixture", isBlocked: false, availableTo: "some", deployedTo: "some", allowedUsersAndGroups: allowed, acquireUsersAndGroups: [installed] });
+    });
+    const job = await jobs.submit(scope, candidate);
+    await runBulkJob(job.id, scope, false, jobs, new GraphPackagesClient(fetcher), async () => "testing-token");
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "succeeded", succeeded: 1 });
+    await runBulkJob(job.id, scope, true, jobs, new GraphPackagesClient(fetcher), async () => "testing-token");
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("surfaces provider rejection of an installation update without a local qualification gate", async () => {
+    const candidate = confirmedInput({
+      ...input(), action: "update-installation",
+      accessUpdate: { target: "installation", mode: "replace", scope: "specific", principals: [{ resourceType: "user", resourceId: "new-user" }] },
+      targets: [{ id: "package-1", displayName: "Fixture", prestate: { kind: "access", availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] } }],
+    });
+    const job = await jobs.submit(scope, candidate);
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => request?.method === "PATCH"
+      ? Response.json({ error: { code: "Authorization_RequestDenied", message: "Provider rejected the update." } }, { status: 403 })
+      : Response.json({ id: "package-1", displayName: "Fixture", isBlocked: false, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [] }));
+    await runBulkJob(job.id, scope, false, jobs, new GraphPackagesClient(fetcher), async () => "testing-token");
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1 });
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "PATCH")).toHaveLength(1);
   });
 
   it("rejects wrong-principal execution and application-mode substitution", async () => {

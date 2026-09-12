@@ -100,13 +100,6 @@
   min-width: 0;
 }
 
-.title-row {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  flex-wrap: wrap;
-}
-
 .user-menu,
 .bulk-buttons {
   display: flex;
@@ -406,8 +399,9 @@
 }
 
 .view-switcher {
-  display: inline-flex;
-  width: fit-content;
+  display: flex;
+  grid-column: 1 / -1;
+  width: 100%;
   gap: 4px;
   padding: 4px;
   border: 1px solid var(--border);
@@ -4491,10 +4485,6 @@ button.audit-result-button:focus-visible {
 
   .quarantine-status-grid > div:last-child {
     border-bottom: 0;
-  }
-
-  .view-switcher {
-    width: 100%;
   }
 
   button.view-button {

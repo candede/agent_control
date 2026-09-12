@@ -25,7 +25,9 @@ export const authRouter = Router();
 
 policyRoute(authRouter, "get", "/auth/login", { access: "public", dataClass: "identity" }, async (request, response, next) => {
   try {
-    const flow = createAuthFlow("login", { returnTo: firstQueryValue(request.query.returnTo) });
+    const setup = firstQueryValue(request.query.setup);
+    if (setup !== undefined && setup !== "defer") throw new AppError(400, "invalid_auth_setup", "Provider setup may only be explicitly deferred.");
+    const flow = createAuthFlow("login", { returnTo: firstQueryValue(request.query.returnTo), providerConsent: setup !== "defer" });
     request.session.authFlowHandle = storeAuthFlow(request.sessionID, request.session.authFlowHandle, flow);
     await saveSession(request);
     const loginUrl = await createAuthorizationUrl(flow);
@@ -35,7 +37,7 @@ policyRoute(authRouter, "get", "/auth/login", { access: "public", dataClass: "id
   }
 });
 
-policyRoute(authRouter, "post", "/auth/consent", { access: "authenticated", dataClass: "identity", roles: ["AgentControl.Reader", "AgentControl.Operator", "AgentControl.SecurityReader", "AgentControl.Administrator"], csrf: true }, async (request, response, next) => {
+policyRoute(authRouter, "post", "/auth/consent", { access: "authenticated", dataClass: "identity", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response, next) => {
   try {
     const capabilityId = request.body?.capabilityId;
     const definition = typeof capabilityId === "string" ? getCapabilityDefinition(capabilityId) : undefined;
@@ -100,6 +102,7 @@ policyRoute(authRouter, "get", "/auth/callback", { access: "public", dataClass: 
         const failure = cleanup.find(value => value.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
       }
+      await capabilities.invalidatePrincipal(user);
       await activateAccountSession(user.tenantId!, user.homeAccountId, async () => {
         await regenerateSession(request);
         request.session.accountId = user.homeAccountId;

@@ -57,14 +57,14 @@ describe("InventoryExplorer", () => {
       snapshotId: savedSnapshot.id, observedAt: savedSnapshot.observedAt, expiresAt: savedSnapshot.expiresAt, identifiers: resource.identifiers,
       package: { status: "unmatched", reason: "No documented package-to-Power-Platform identifier equivalence exists." },
       reports: { status: "unmatched", reason: "Official report agent IDs are report-only." },
-      audit: { status: "available", count: 0, value: [] }, security: { status: "unauthorized", reason: "SecurityReader is required." },
+      audit: { status: "available", count: 0, value: [] }, security: { status: "unauthorized", reason: "Viewer is required." },
       controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
     });
     vi.mocked(getInventoryQuarantineSelection).mockResolvedValue({ value: [resource], snapshot: savedSnapshot });
     vi.mocked(refreshInventory).mockResolvedValue({ id: "job-a", status: "running", roleScope: "ai", environmentScope: null, requestedTypes: ["microsoft.copilotstudio/agents"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, createdAt: new Date().toISOString(), attemptedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), finishedAt: null });
     vi.mocked(getQuarantineJobs).mockResolvedValue({ value: [] });
     vi.mocked(getQuarantineStatus).mockResolvedValue(quarantineStatus());
-    vi.mocked(previewQuarantine).mockResolvedValue(quarantinePreview(true));
+    vi.mocked(previewQuarantine).mockResolvedValue(quarantinePreview());
     vi.mocked(submitQuarantine).mockResolvedValue(quarantineJob());
   });
 
@@ -195,15 +195,27 @@ describe("InventoryExplorer", () => {
     expect(screen.getByText(/Direct and inventory states disagree/)).toBeInTheDocument();
   });
 
-  it("shows an exact frozen preview but disables unqualified writes", async () => {
-    vi.mocked(previewQuarantine).mockResolvedValue(quarantinePreview(false));
+  it("allows Viewer direct-status reads without rendering quarantine mutations", async () => {
+    render(<InventoryExplorer packages={[]} canManageQuarantine={false} />);
+    fireEvent.click(await screen.findByRole("button", { name: "View details for agent-a" }));
+    const dialog = screen.getByRole("dialog", { name: "agent-a" });
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Controls" }));
+    fireEvent.click(await within(dialog).findByRole("button", { name: "Check direct status" }));
+
+    await waitFor(() => expect(getQuarantineStatus).toHaveBeenCalledOnce());
+    expect(within(dialog).getByText("Quarantined", { exact: true })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Restore from quarantine" })).not.toBeInTheDocument();
+  });
+
+  it("shows an exact frozen preview and requires target confirmation", async () => {
+    vi.mocked(previewQuarantine).mockResolvedValue(quarantinePreview());
     render(<InventoryExplorer packages={[]} />);
     fireEvent.click(await screen.findByRole("checkbox", { name: "Select agent-a for quarantine control" }));
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     const dialog = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
     expect(within(dialog).getByText(`${environmentId} / ${botId}`)).toBeInTheDocument();
-    expect(within(dialog).getByText(/two-direction canary qualification/)).toBeInTheDocument();
-    expect(within(dialog).getByRole("checkbox")).toBeDisabled();
+    expect(within(dialog).getByRole("checkbox")).toBeEnabled();
     expect(within(dialog).getByRole("button", { name: "Confirm quarantine" })).toBeDisabled();
     expect(submitQuarantine).not.toHaveBeenCalled();
   });
@@ -218,7 +230,7 @@ describe("InventoryExplorer", () => {
     expect(screen.getByRole("button", { name: "Check direct status" })).toBeDisabled();
   });
 
-  it("submits the qualified frozen native target with a caller-owned idempotency key", async () => {
+  it("submits the confirmed frozen native target with a caller-owned idempotency key", async () => {
     render(<InventoryExplorer packages={[]} />);
     fireEvent.click(await screen.findByRole("checkbox", { name: "Select agent-a for quarantine control" }));
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
@@ -265,11 +277,11 @@ function quarantineStatus() {
   return { target: { resourceNativeId: "agent-a", displayName: "agent-a", environmentId, botId }, direct: { isBotQuarantined: true, providerUpdatedAt: "2026-09-09T10:00:00.123Z", observedAt: "2026-09-09T10:00:01.000Z", correlationId: "correlation-a", source: "provider" as const }, inventory: { isQuarantined: false, quarantinedAt: null, observedAt: savedSnapshot.observedAt, snapshotId: savedSnapshot.id }, disagreesWithInventory: true };
 }
 
-function quarantinePreview(qualified: boolean) {
-  return { confirmationHash: "c".repeat(64), qualification: { qualified, requiredForSubmit: true as const }, statuses: [quarantineStatus()], summary: { risk: true as const, operation: "quarantine" as const, provider: "Power Platform Copilot Studio" as const, endpoint: "api-version=1 botQuarantine" as const, permission: "Delegated CopilotStudio.AdminActions.Invoke" as const, targetCount: 1, targetSelectionHash: "d".repeat(64), actor: { id: "operator-a", displayName: "Operator", username: "operator@example.invalid" }, packageControlIndependent: true as const, makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false as const, targets: [{ resourceNativeId: "agent-a", displayName: "agent-a", environmentId, botId, currentState: false, currentProviderUpdatedAt: "2026-09-09T10:00:00.123Z", requestedState: true, inventoryState: false, inventoryObservedAt: savedSnapshot.observedAt }], additionalTargetCount: 0 } };
+function quarantinePreview() {
+  return { confirmationHash: "c".repeat(64), statuses: [quarantineStatus()], summary: { risk: true as const, operation: "quarantine" as const, provider: "Power Platform Copilot Studio" as const, endpoint: "api-version=1 botQuarantine" as const, permission: "Delegated CopilotStudio.AdminActions.Invoke" as const, targetCount: 1, targetSelectionHash: "d".repeat(64), actor: { id: "admin-a", displayName: "Admin", username: "admin@example.invalid" }, packageControlIndependent: true as const, makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false as const, targets: [{ resourceNativeId: "agent-a", displayName: "agent-a", environmentId, botId, currentState: false, currentProviderUpdatedAt: "2026-09-09T10:00:00.123Z", requestedState: true, inventoryState: false, inventoryObservedAt: savedSnapshot.observedAt }], additionalTargetCount: 0 } };
 }
 
 function quarantineJob() {
-  const preview = quarantinePreview(true);
+  const preview = quarantinePreview();
   return { id: "job-a", action: "quarantine" as const, status: "queued" as const, confirmationHash: preview.confirmationHash, confirmation: preview.summary, isCanary: false, total: 1, completed: 0, succeeded: 0, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0, canResume: false, canReconcile: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), results: [] };
 }

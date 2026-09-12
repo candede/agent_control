@@ -351,7 +351,7 @@ export function AgentTable({
                       <Info aria-hidden="true" />
                     </button>
                     </WorkbenchActionGate>
-                    <WorkbenchActionGate actionId="packages.access" compact>
+                    {operationsAllowed ? <WorkbenchActionGate actionId="packages.access" compact>
                       <button
                         className="icon-button"
                         type="button"
@@ -362,8 +362,8 @@ export function AgentTable({
                       >
                         <ShieldCheck aria-hidden="true" />
                       </button>
-                    </WorkbenchActionGate>
-                    <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"} compact>
+                    </WorkbenchActionGate> : null}
+                    {operationsAllowed ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"} compact>
                     {agent.isBlocked ? (
                       <button
                         className="icon-button"
@@ -387,21 +387,21 @@ export function AgentTable({
                         <Lock aria-hidden="true" />
                       </button>
                     )}
-                    </WorkbenchActionGate>
-                    <span className="capability-gate">
+                    </WorkbenchActionGate> : null}
+                    {operationsAllowed ? <span className="capability-gate">
                       <button
                         className="icon-button"
                         type="button"
                         aria-label={`Reassign owner for ${agent.displayName}`}
                         aria-describedby={`reassign-unavailable-${agent.id}`}
-                        title="Reassign owner is unavailable because Graph exposes no owner readback field or conditional-write protection."
+                        title="Owner reassignment is not implemented in this app. Microsoft Graph does not expose a documented owner readback field."
                         disabled
                       >
                         <UserRoundCog aria-hidden="true" />
                       </button>
-                      <span className="sr-only" id={`reassign-unavailable-${agent.id}`}>Reassign owner is unavailable because Graph exposes no owner readback field or conditional-write protection.</span>
+                      <span className="sr-only" id={`reassign-unavailable-${agent.id}`}>Owner reassignment is not implemented in this app. Microsoft Graph does not expose a documented owner readback field.</span>
                       <a className="reassign-doc-link" href="https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-reassign" target="_blank" rel="noreferrer" aria-label={`Reassignment documentation for ${agent.displayName}`}>Docs</a>
-                    </span>
+                    </span> : null}
                   </div>
                 </td>
               </tr>

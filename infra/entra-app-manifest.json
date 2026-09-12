@@ -4,45 +4,23 @@
       "allowedMemberTypes": [
         "User"
       ],
-      "description": "Read aggregate inventory and reporting data without user-level or exact-target details.",
-      "displayName": "Agent Control Reader",
-      "id": "4fe41fd5-e548-4d53-b687-c7a33ae80ce3",
+      "description": "Allowed member types: Users/Groups. Observe inventory, reports and investigations with permitted provider access. No provider changes, imports or app configuration.",
+      "displayName": "Agent Control Viewer",
+      "id": "8a02b7f3-bdbf-4193-8b29-4da05684fb5a",
       "isEnabled": true,
       "origin": "Application",
-      "value": "AgentControl.Reader"
+      "value": "AgentControl.Viewer"
     },
     {
       "allowedMemberTypes": [
         "User"
       ],
-      "description": "Execute approved package operations against exact user and group targets.",
-      "displayName": "Agent Control Operator",
-      "id": "42af5a7b-ea7c-451e-a9f6-cb4fc75a7e63",
+      "description": "Allowed member types: Users/Groups. All Viewer access plus supported provider changes, imports and app configuration. Microsoft provider permissions still apply.",
+      "displayName": "Agent Control Admin",
+      "id": "9feab889-b807-4a97-a504-944ab53a380b",
       "isEnabled": true,
       "origin": "Application",
-      "value": "AgentControl.Operator"
-    },
-    {
-      "allowedMemberTypes": [
-        "User"
-      ],
-      "description": "Read user-identifying reports, audit records, and security investigation data.",
-      "displayName": "Agent Control Security Reader",
-      "id": "7b7b910c-50e1-427d-b2a0-18091055c68b",
-      "isEnabled": true,
-      "origin": "Application",
-      "value": "AgentControl.SecurityReader"
-    },
-    {
-      "allowedMemberTypes": [
-        "User"
-      ],
-      "description": "Configure capability registrations, imports, and administrative metadata.",
-      "displayName": "Agent Control Administrator",
-      "id": "5f3c0ea2-2d98-44a3-bca1-4ae515556b34",
-      "isEnabled": true,
-      "origin": "Application",
-      "value": "AgentControl.Administrator"
+      "value": "AgentControl.Admin"
     }
   ]
 }

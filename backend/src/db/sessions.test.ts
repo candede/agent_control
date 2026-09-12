@@ -1,7 +1,7 @@
 import session from "express-session";
 import { beforeAll, afterAll, describe, it, expect } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation, createSessionStore, revokeAccountSessionMutations } from "./sessions.js";
+import { assertCurrentStoredSession, beginAccountSessionValidation, commitAccountSessionValidation, createSessionStore, revokeAccountSessionMutations } from "./sessions.js";
 import { inventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -9,16 +9,27 @@ beforeAll(async () => { fixture = await testDatabase(); });
 afterAll(async () => { await fixture?.close(); });
 
 describe("PostgreSQL sessions", () => {
+  it("honors Admin inheritance in stored-session publication checks and rejects legacy roles", async () => {
+    const expires = new Date(Date.now() + 60_000);
+    await fixture.operator.query("INSERT INTO sessions(sid,sess,expire) VALUES($1,$2,$3),($4,$5,$3)", [
+      "admin-session", { tenantId: "tenant", accountId: "admin", user: { roles: ["AgentControl.Admin"] } }, expires,
+      "legacy-session", { tenantId: "tenant", accountId: "legacy", user: { roles: ["AgentControl.Administrator"] } },
+    ]);
+    await expect(assertCurrentStoredSession(fixture.runtime, "admin-session", "tenant", "admin", "AgentControl.Viewer")).resolves.toBeUndefined();
+    await expect(assertCurrentStoredSession(fixture.runtime, "admin-session", "tenant", "admin", "AgentControl.Admin")).resolves.toBeUndefined();
+    await expect(assertCurrentStoredSession(fixture.runtime, "legacy-session", "tenant", "legacy", "AgentControl.Viewer")).rejects.toMatchObject({ code: "unauthorized" });
+  });
+
   it("persists across store recreation, excludes tokens and isolates tenant reads", async () => {
     const store = createSessionStore(fixture.runtime,"tenant");
-    const data = { cookie: new session.Cookie({maxAge:60000}), accountId:"principal", authFlowHandle:"a".repeat(43), csrfToken:"fixture-csrf", rolesValidatedAt:1234, user:{tenantId:"tenant",homeAccountId:"principal",username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Reader","untrusted-role"],providerRoleIds:[inventoryProviderRoleIds.aiReader,"00000000-0000-0000-0000-000000000000","must-not-persist-role-name"]}, authFlow:{state:"must-not-persist-state",nonce:"must-not-persist-nonce",codeVerifier:"must-not-persist-verifier"}, accessToken:"must-not-persist-token", refreshToken:"must-not-persist-refresh", tokenCache:"must-not-persist-cache", code:"must-not-persist-code", clientSecret:"must-not-persist-secret" };
+    const data = { cookie: new session.Cookie({maxAge:60000}), accountId:"principal", authFlowHandle:"a".repeat(43), csrfToken:"fixture-csrf", rolesValidatedAt:1234, user:{tenantId:"tenant",homeAccountId:"principal",username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Viewer","untrusted-role"],providerRoleIds:[inventoryProviderRoleIds.aiReader,"00000000-0000-0000-0000-000000000000","must-not-persist-role-name"]}, authFlow:{state:"must-not-persist-state",nonce:"must-not-persist-nonce",codeVerifier:"must-not-persist-verifier"}, accessToken:"must-not-persist-token", refreshToken:"must-not-persist-refresh", tokenCache:"must-not-persist-cache", code:"must-not-persist-code", clientSecret:"must-not-persist-secret" };
     await new Promise<void>((resolve,reject) => store.set("fixture-session",data,error => error ? reject(error) : resolve()));
     store.close();
     const recreated = createSessionStore(fixture.runtime,"tenant");
     const other = createSessionStore(fixture.runtime,"other");
     try {
       const found = await new Promise((resolve,reject) => recreated.get("fixture-session",(error,value) => error ? reject(error) : resolve(value)));
-      expect(found).toMatchObject({accountId:"principal",tenantId:"tenant",authFlowHandle:"a".repeat(43),csrfToken:"fixture-csrf",rolesValidatedAt:1234,user:{roles:["AgentControl.Reader"],providerRoleIds:[inventoryProviderRoleIds.aiReader]}});
+      expect(found).toMatchObject({accountId:"principal",tenantId:"tenant",authFlowHandle:"a".repeat(43),csrfToken:"fixture-csrf",rolesValidatedAt:1234,user:{roles:["AgentControl.Viewer"],providerRoleIds:[inventoryProviderRoleIds.aiReader]}});
       const serialized = (await fixture.runtime.query<{ value: string }>("SELECT sess::text AS value FROM sessions WHERE sid='fixture-session'")).rows[0].value;
       for (const secret of ["must-not-persist-state","must-not-persist-nonce","must-not-persist-verifier","must-not-persist-token","must-not-persist-refresh","must-not-persist-cache","must-not-persist-code","must-not-persist-secret","must-not-persist-role-name","00000000-0000-0000-0000-000000000000"]) expect(serialized).not.toContain(secret);
       expect(await new Promise(resolve => other.get("fixture-session",(_error,value) => resolve(value)))).toBeNull();

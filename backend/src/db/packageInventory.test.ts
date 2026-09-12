@@ -39,6 +39,15 @@ async function running(idempotencyKey: string, requestedIds?: string[]) {
 }
 
 describe.sequential("Package inventory repository", () => {
+  it("cancels only the requesting principal's unfinished read job", async () => {
+    const job = await repository.submit(scope, {
+      authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cancel",
+    });
+    expect(await repository.cancel({ ...scope, principalId: "other-reader" }, job.id, scope.principalId)).toBeUndefined();
+    expect(await repository.cancel(scope, job.id, "other-reader")).toMatchObject({ status: "waiting_authorization" });
+    expect(await repository.cancel(scope, job.id, scope.principalId)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
+  });
+
   it("publishes complete allowlisted snapshots and scopes filters before counts and paging", async () => {
     const id = await running("package-broad");
     await repository.publish(scope, id, { packages: [packageValue("b", true), packageValue("a")], totalRecords: 2, pages: 2 });

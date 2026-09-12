@@ -40,7 +40,7 @@ const snapshot = { id: snapshotId, observedAt: new Date().toISOString(), expires
 const candidate = {
   nativeId: "native-agent",
   type: "microsoft.copilotstudio/agents" as const,
-  displayName: "Canary agent",
+  displayName: "Saved agent",
   environmentId,
   botId,
   identifiers: [{ kind: "environment_id" as const, value: environmentId }, { kind: "cds_bot_id" as const, value: botId }],
@@ -72,7 +72,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
 
   it("loads only saved control targets and performs no provider status read", async () => {
     render(<CopilotStudioQuarantineTargetPicker />);
-    expect(await screen.findByText("Canary agent")).toBeInTheDocument();
+    expect(await screen.findByText("Saved agent")).toBeInTheDocument();
     expect(screen.getByText(environmentId)).toBeInTheDocument();
     expect(screen.getByText(botId)).toBeInTheDocument();
     expect(screen.getByText("Not linked; independent")).toBeInTheDocument();
@@ -81,9 +81,9 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
     expect(previewQuarantine).not.toHaveBeenCalled();
   });
 
-  it("submits the exact selected native target only after qualified confirmation", async () => {
+  it("submits the exact selected native target only after confirmation", async () => {
     render(<CopilotStudioQuarantineTargetPicker />);
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" }));
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     const dialog = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
     expect(within(dialog).getByText(`${environmentId} / ${botId}`)).toBeInTheDocument();
@@ -105,7 +105,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
 
   it("explains maker behavior and cancellation closes confirmation without a send", async () => {
     render(<CopilotStudioQuarantineTargetPicker />);
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" }));
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     const dialog = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
     expect(within(dialog).getByText(/Makers may still see and test this bot/)).toBeInTheDocument();
@@ -116,7 +116,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
 
   it("does not restore a frozen confirmation after the selection changes away and back", async () => {
     render(<CopilotStudioQuarantineTargetPicker />);
-    const target = await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" });
+    const target = await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" });
     fireEvent.click(target);
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     expect(await screen.findByRole("dialog", { name: "Quarantine 1 agent" })).toBeInTheDocument();
@@ -131,7 +131,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
     let resolvePreview!: (value: ReturnType<typeof preview>) => void;
     vi.mocked(previewQuarantine).mockReturnValueOnce(new Promise(resolve => { resolvePreview = resolve; }));
     render(<CopilotStudioQuarantineTargetPicker />);
-    const target = await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" });
+    const target = await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" });
     fireEvent.click(target);
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     await waitFor(() => expect(previewQuarantine).toHaveBeenCalledTimes(1));
@@ -144,7 +144,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
   it("retries a failed submit with the same frozen receipt", async () => {
     vi.mocked(submitQuarantine).mockRejectedValueOnce(new Error("Connection interrupted.")).mockResolvedValueOnce(job());
     render(<CopilotStudioQuarantineTargetPicker />);
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" }));
     fireEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
     const dialog = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
     fireEvent.click(within(dialog).getByRole("checkbox"));
@@ -158,8 +158,8 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
   it("keeps server-ineligible targets disabled without preview or status egress", async () => {
     vi.mocked(getQuarantineTargets).mockResolvedValue({ ...targetPage, value: [{ ...candidate, botId: null, quarantineEligibility: { eligible: false, code: "native_identity_unavailable", reason: "No exact CDS bot identity." } }] });
     render(<CopilotStudioQuarantineTargetPicker />);
-    expect(await screen.findByRole("checkbox", { name: "Select Canary agent for quarantine control" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Inspect direct status for Canary agent" })).toBeDisabled();
+    expect(await screen.findByRole("checkbox", { name: "Select Saved agent for quarantine control" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Inspect direct status for Saved agent" })).toBeDisabled();
     expect(screen.getByText("No exact CDS bot identity.")).toBeInTheDocument();
     expect(previewQuarantine).not.toHaveBeenCalled();
     expect(getQuarantineStatus).not.toHaveBeenCalled();
@@ -193,7 +193,7 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
   });
 
   it("shows partial inconclusive work and reconciles only on explicit command", async () => {
-    const partial = { ...job(), status: "partial" as const, completed: 1, inconclusive: 1, canReconcile: true, results: [{ resourceNativeId: "native-agent", displayName: "Canary agent", environmentId, botId, status: "inconclusive" as const, requestedState: true, observedState: null, observedProviderUpdatedAt: null, observedAt: null, correlationId: null, reconciliationStatus: "required" as const, retryEligible: false, message: "Provider outcome requires GET reconciliation." }] };
+    const partial = { ...job(), status: "partial" as const, completed: 1, inconclusive: 1, canReconcile: true, results: [{ resourceNativeId: "native-agent", displayName: "Saved agent", environmentId, botId, status: "inconclusive" as const, requestedState: true, observedState: null, observedProviderUpdatedAt: null, observedAt: null, correlationId: null, reconciliationStatus: "required" as const, retryEligible: false, message: "Provider outcome requires GET reconciliation." }] };
     vi.mocked(getQuarantineJobs).mockResolvedValue({ value: [partial] });
     render(<CopilotStudioQuarantineTargetPicker />);
     expect(await screen.findByText(/1 inconclusive/)).toBeInTheDocument();
@@ -263,11 +263,11 @@ describe("CopilotStudioQuarantineTargetPicker", () => {
 });
 
 function statusView() {
-  return { target: { resourceNativeId: "native-agent", displayName: "Canary agent", environmentId, botId }, direct: { isBotQuarantined: false, providerUpdatedAt: "2026-09-09T10:00:00.123Z", observedAt: "2026-09-09T10:00:01.000Z", correlationId: "33333333-3333-4333-8333-333333333333", source: "provider" as const }, inventory: { isQuarantined: false, quarantinedAt: null, observedAt: snapshot.observedAt, snapshotId }, disagreesWithInventory: false };
+  return { target: { resourceNativeId: "native-agent", displayName: "Saved agent", environmentId, botId }, direct: { isBotQuarantined: false, providerUpdatedAt: "2026-09-09T10:00:00.123Z", observedAt: "2026-09-09T10:00:01.000Z", correlationId: "33333333-3333-4333-8333-333333333333", source: "provider" as const }, inventory: { isQuarantined: false, quarantinedAt: null, observedAt: snapshot.observedAt, snapshotId }, disagreesWithInventory: false };
 }
 
 function preview() {
-  return { confirmationHash: "c".repeat(64), qualification: { qualified: true, requiredForSubmit: true as const }, statuses: [statusView()], summary: { risk: true as const, operation: "quarantine" as const, provider: "Power Platform Copilot Studio" as const, endpoint: "api-version=1 botQuarantine" as const, permission: "Delegated CopilotStudio.AdminActions.Invoke" as const, targetCount: 1, targetSelectionHash: "d".repeat(64), actor: { id: "operator-a", displayName: "Operator", username: "operator@example.invalid" }, packageControlIndependent: true as const, makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false as const, targets: [{ resourceNativeId: "native-agent", displayName: "Canary agent", environmentId, botId, currentState: false, currentProviderUpdatedAt: "2026-09-09T10:00:00.123Z", requestedState: true, inventoryState: false, inventoryObservedAt: snapshot.observedAt }], additionalTargetCount: 0 } };
+  return { confirmationHash: "c".repeat(64), statuses: [statusView()], summary: { risk: true as const, operation: "quarantine" as const, provider: "Power Platform Copilot Studio" as const, endpoint: "api-version=1 botQuarantine" as const, permission: "Delegated CopilotStudio.AdminActions.Invoke" as const, targetCount: 1, targetSelectionHash: "d".repeat(64), actor: { id: "admin-a", displayName: "Admin", username: "admin@example.invalid" }, packageControlIndependent: true as const, makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false as const, targets: [{ resourceNativeId: "native-agent", displayName: "Saved agent", environmentId, botId, currentState: false, currentProviderUpdatedAt: "2026-09-09T10:00:00.123Z", requestedState: true, inventoryState: false, inventoryObservedAt: snapshot.observedAt }], additionalTargetCount: 0 } };
 }
 
 function job(): QuarantineJob {

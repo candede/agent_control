@@ -117,7 +117,14 @@ export class PowerPlatformResourceQueryClient {
     return { resources, totalRecords: totalRecords ?? 0, pages, unknownFieldCount };
   }
 
-  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId?: string): Promise<ResourceQueryPage> {
+  async checkAccess(accessToken: string, signal?: AbortSignal) {
+    const requestedTypes = ["microsoft.powerplatform/environments"] as const;
+    const page = await this.requestPage(accessToken, requestedTypes, undefined, signal ?? AbortSignal.timeout(10_000), undefined, 1);
+    const parsed = parsePage(page, requestedTypes);
+    if (parsed.resources.length > 1) throw new AppError(502, "provider_schema", "Power Platform access check returned an oversized page.");
+  }
+
+  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId?: string, pageSize = defaultPageSize): Promise<ResourceQueryPage> {
     const body = {
       TableName: "PowerPlatformResources",
       Clauses: [{
@@ -127,7 +134,7 @@ export class PowerPlatformResourceQueryClient {
         Values: types.map(type => `'${type.replaceAll("'", "''")}'`),
       }, ...(environmentId ? [{ $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] }] : [])],
       Options: {
-        Top: defaultPageSize,
+        Top: pageSize,
         Skip: 0,
         ...(skipToken ? { SkipToken: skipToken } : {}),
       },

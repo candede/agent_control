@@ -17,7 +17,7 @@
     "postgresFlexibleServer": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-agent-control-resource-group/providers/Microsoft.DBforPostgreSQL/flexibleServers/approved-agent-control-postgres"
   },
   "expectedDatabaseName": "agentcontrol",
-  "expectedSchemaVersion": 26,
+  "expectedSchemaVersion": 27,
   "runnerIpv4Address": "192.0.2.10",
   "legacyAuditBackupPath": null,
   "legacyAuditBackupSha256": null,

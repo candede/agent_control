@@ -2,7 +2,7 @@
 
 ## Mission
 
-Add bounded, on-demand Microsoft Purview Audit searches through the Microsoft Graph v1.0 asynchronous Audit Search API, with a live proof-of-contract gate for Microsoft's documented permission and property inconsistencies.
+Add bounded, on-demand Microsoft Purview Audit searches through the Microsoft Graph v1.0 asynchronous Audit Search API, recording actual request evidence for Microsoft's documented permission and property inconsistencies without a separate delegated-qualification gate.
 
 ## Prerequisites
 
@@ -24,13 +24,13 @@ Add bounded, on-demand Microsoft Purview Audit searches through the Microsoft Gr
 - Intended delegated/application permission for cross-workload searches: `AuditLogsQuery.Read.All`.
 - Delegated users additionally need the Purview **Audit Logs** or **View-Only Audit Logs** role.
 - Search availability and record retention depend on Purview Audit licensing, unified audit logging, workload support, and tenant rollout.
-- Microsoft documentation has conflicted on the single-query GET permission and `serviceFilter` versus `serviceFilters`. Qualification must prove the exact create/poll/list-records lifecycle with approved least-privileged credentials. Creating a saved query is bounded remote state and consumes service quota, even though it does not mutate audited business resources. A routine capability refresh must not create a new query. Do not invent remote delete/cancel/expiry operations that the current contract does not expose.
+- Microsoft documentation has conflicted on the single-query GET permission and `serviceFilter` versus `serviceFilters`. An explicit bounded delegated search establishes exact create/poll/list-records evidence using current least-privileged credentials; no separate qualification approval/start ritual is required. Application/shared mode retains its separate Admin approval and qualification. Creating a saved query is bounded remote state and consumes service quota, even though it does not mutate audited business resources. A routine capability refresh must not create a new query. Do not invent remote delete/cancel/expiry operations that the current contract does not expose.
 
 ## Required implementation
 
 1. Build a Graph Audit Search adapter for the documented v1.0 lifecycle: create an `auditLogQuery`, poll boundedly to a terminal state and retrieve bounded record pages. Track provider ID/status/error and separately configured local expiry; claim remote expiry only when documented/supplied. Validate every response.
-2. At phase start, capture current official contract links and fixture shapes. The [create reference](https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0) specifies `POST /security/auditLog/queries` and singular `serviceFilter`; reverify GET and records independently. Run one explicit, approved bounded lifecycle qualification, storing its provider query ID before polling. Keep exactly one selected request contract; fixture variants document rejected/previous shapes, not runtime fallback requests or extra privilege grants.
-   Missing grant, unavailable tenant, or inconclusive live contract produces a registered disabled capability with safe evidence and a recheck/support trigger. Fixture-complete adapter/jobs/UI work may finish the phase but is not live qualification.
+2. At phase start, capture current official contract links and fixture shapes. The [create reference](https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0) specifies `POST /security/auditLog/queries` and singular `serviceFilter`; reverify GET and records independently. If authorized, record one explicit bounded lifecycle's evidence, storing its provider query ID before polling; never require this prior exercise for ordinary delegated searches. Keep exactly one selected request contract; fixture variants document rejected/previous shapes, not runtime fallback requests or extra privilege grants.
+   Report actual grant, tenant or request-contract failures with safe evidence and a recheck/support trigger. Absent optional live proof is an evidence gap, not a delegated activation gate. Fixture-complete adapter/jobs/UI work may finish the phase but is not live qualification.
 3. Expose safe structured filters for UTC start/end, supported services/workloads, operations, users, IPs, object IDs, and administrative units where the API supports them. Do not accept arbitrary provider filter JSON or unbounded date ranges.
 4. Provide curated Copilot and agent searches using `CopilotInteraction` and relevant Power Platform/Copilot Studio administrative operations. Parse versioned typed records; discard raw responses and unknown fields with safe schema diagnostics.
 5. Allowlist the metadata needed for investigation: native event ID, event time, operation, workload/service, result, actor/object IDs, client IP, agent/app IDs and correlation/source fields where documented. Additional bounded metadata needs an explicit display/filter use; no unrestricted `auditData` or content payload storage.
@@ -58,7 +58,7 @@ Run the global validation baseline. If authorized, create one narrow live query 
 
 ## Production continuation
 
-An inconclusive or failing live proof does not stop the campaign. Leave Graph Audit Search visible but disabled with exact evidence, keep local administrative audit independent and link the fix-forward issue. Do not broaden to an unrelated permission such as `ThreatIntelligence.Read.All` without current authoritative proof.
+An inconclusive or failing live proof does not stop the campaign. Report actual request/authorization failures with exact evidence, keep local administrative audit independent and link the fix-forward issue. Do not make optional qualification a prerequisite for ordinary delegated searches or broaden to an unrelated permission such as `ThreatIntelligence.Read.All` without current authoritative proof.
 
 ## Scope guard
 
@@ -70,7 +70,7 @@ Create `plans/admin-poc-production/completions/07-graph-audit-search.md` with ex
 
 ## Done conditions
 
-- When live-qualified, bounded Graph audit searches are durable, restart-safe, permission-gated, and source-provenanced; otherwise the complete surface is visibly disabled with truthful evidence and remediation.
+- Bounded delegated Graph audit searches are on demand, durable, restart-safe, permission-gated and source-provenanced; actual request failures have truthful evidence and remediation without a prior-qualification gate.
 - Copilot/agent audit metadata is normalized without claiming message content or official usage.
-- Microsoft contract ambiguity is resolved by evidence or truthfully gates the feature.
+- Microsoft contract ambiguity is disclosed and actual outcomes are recorded; absent optional proof is not an activation prerequisite.
 - Phase 08 hunting and Phase 10's two-source audit UI can reuse scoped jobs/read contracts without any feed infrastructure.

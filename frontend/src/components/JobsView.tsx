@@ -19,6 +19,7 @@ import {
   type WorkbenchJobSummary,
   type WorkbenchJobsResponse,
 } from "../api/client";
+import { hasRole } from "../authorization";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 
 const progressingStatuses = new Set(["queued", "running", "reconciling_create"]);
@@ -36,6 +37,8 @@ export function JobsView({ user }: { user: SessionUser }) {
   const actionSequence = useRef(0);
   const actionAdmission = useRef<{ owner: number; token: number } | undefined>(undefined);
   const principalKey = `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}`;
+  const canManageMutationJobs = hasRole(user, "AgentControl.Admin");
+  const visibleJobs = state?.value.filter(job => canManageMutationJobs || isReadJob(job));
 
   const stop = useCallback(() => {
     request.current?.abort();
@@ -164,8 +167,8 @@ export function JobsView({ user }: { user: SessionUser }) {
       {state?.unavailableSources.length ? (
         <div className="notice" role="status">{state.unavailableSources.length} authorized source{state.unavailableSources.length === 1 ? " is" : "s are"} temporarily unavailable. Other source statuses remain usable.</div>
       ) : null}
-      {state && state.value.length === 0 ? <div className="screen-state">No retained jobs are visible to this principal and role set.</div> : null}
-      {state?.value.map(job => {
+      {state && visibleJobs?.length === 0 ? <div className="screen-state">No retained jobs are visible to this principal and role set.</div> : null}
+      {visibleJobs?.map(job => {
         return (
           <article className="job-card" key={`${job.source}:${job.id}`}>
             <div className="job-card-heading">
@@ -201,6 +204,13 @@ export function JobsView({ user }: { user: SessionUser }) {
       {state ? <p className="jobs-note">Last authorized projection {new Date(state.polledAt).toLocaleString()} · request {state.requestId}</p> : null}
     </section>
   );
+}
+
+function isReadJob(job: WorkbenchJobSummary) {
+  return job.source === "package-refresh"
+    || job.source === "power-platform"
+    || job.source === "purview"
+    || job.source === "defender";
 }
 
 function jobActionId(job: WorkbenchJobSummary, operation: "resume" | "cancel" | "reconcile") {

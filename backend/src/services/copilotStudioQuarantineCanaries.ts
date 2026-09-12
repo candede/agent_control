@@ -7,6 +7,7 @@ import { beginAccountSessionValidation, commitAccountSessionValidation } from ".
 import { AppError } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority, QuarantineJob } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { hasAppRole } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 import { runTrackedCopilotStudioQuarantineJob } from "./copilotStudioQuarantineJobs.js";
@@ -114,7 +115,7 @@ export class CopilotStudioQuarantineCanaryService {
 
   private async authorize(scope: QuarantineScope) {
     const user = await this.dependencies.revalidateUser(scope.principalId);
-    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !user.roles.includes("AgentControl.Operator")) throw AppError.unauthorized("The quarantine canary Operator changed or lost authority.");
+    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Admin")) throw AppError.unauthorized("The quarantine canary Admin changed or lost authority.");
     await this.dependencies.requireAvailable("powerPlatform.quarantine.manage", user);
     const authority = await this.dependencies.authorityContext(user);
     const accessToken = await this.dependencies.delegatedToken(scope.principalId, "powerPlatform.quarantine.manage");
@@ -159,7 +160,7 @@ function sameAuthority(left: QuarantineAuthority, right: QuarantineAuthority) {
 }
 
 function executionScope(user: AuthenticatedUser): QuarantineScope {
-  if (!user.tenantId || !user.roles.includes("AgentControl.Operator")) throw new AppError(403, "missing_internal_role", "Operator is required for a full quarantine canary cycle.");
+  if (!user.tenantId || !hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required for a full quarantine canary cycle.");
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
 }
 

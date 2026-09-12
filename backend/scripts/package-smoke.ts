@@ -30,7 +30,7 @@ for (const path of ["/api/unknown","/missing.js","/assets/missing.js"]) {
 assert.equal((await fetch(`${base}/api/auth/callback`)).status,400);
 assert.equal((await fetch(`${base}/api/diagnostics`)).status,401);
 const identity = await fetch(`${base}/api/me`, { headers: {
-  "X-MS-CLIENT-PRINCIPAL": Buffer.from(JSON.stringify({ userId: "fixture", userRoles: ["AgentControl.Administrator"] })).toString("base64"),
+  "X-MS-CLIENT-PRINCIPAL": Buffer.from(JSON.stringify({ userId: "fixture", userRoles: ["AgentControl.Admin"] })).toString("base64"),
   "X-MS-CLIENT-PRINCIPAL-ID": "fixture",
 } });
 assert.equal(identity.status, 401, "Client-supplied identity headers must not authenticate");

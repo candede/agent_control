@@ -5,7 +5,7 @@ import { config } from "../config.js";
 import { revalidateAuthenticatedUser } from "../auth/msal.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { capabilities } from "../services/capabilities.js";
-import type { AppRole, CapabilityId } from "../types/capability.js";
+import { hasAppRole, type AppRole, type CapabilityId } from "../types/capability.js";
 
 export const roleRevalidationIntervalMs = 5 * 60 * 1000;
 
@@ -48,7 +48,7 @@ function saveSession(request: Request) {
 
 export function requireRoles(...roles: AppRole[]): RequestHandler {
   return (request, _response, next) => {
-    if (!request.session.user || !roles.some(role => request.session.user!.roles.includes(role))) {
+    if (!request.session.user || !roles.some(role => hasAppRole(request.session.user!.roles, role))) {
       next(new AppError(403, "missing_internal_role", "The required Agent Control app role is not assigned."));
       return;
     }

@@ -77,10 +77,13 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   app.use("/api", apiAdmission);
   app.use("/api", (request, response, next) => {
     response.setHeader("Cache-Control", "private, no-store");
-    if (!["GET","HEAD","OPTIONS"].includes(request.method) && request.get("Origin") !== config.frontendOrigin) return next(new AppError(403,"invalid_origin","A same-origin request is required."));
+    if (!["GET","HEAD","OPTIONS"].includes(request.method) && request.get("Origin") !== config.frontendOrigin) return next(new AppError(403,"invalid_origin","A same-origin request is required. Open the configured public URL and ensure the tunnel/reverse proxy preserves the browser Origin header. For an existing Dev Tunnel port, use devtunnel port update with --origin-header unchanged; host flags alone may not update the port. This is a connection configuration issue, not a missing permission.", {
+      expectedOrigin: config.frontendOrigin,
+      receivedOrigin: request.get("Origin") ?? null,
+    }));
     next();
   });
-  policyRoute(app, "get", "/api/diagnostics", { access: "authenticated", dataClass: "operational_metadata", roles: ["AgentControl.Administrator"] }, async (_request, response) => {
+  policyRoute(app, "get", "/api/diagnostics", { access: "authenticated", dataClass: "operational_metadata", roles: ["AgentControl.Admin"] }, async (_request, response) => {
     const state = await readOperationalState(database);
     response.json({
       authConfigured,

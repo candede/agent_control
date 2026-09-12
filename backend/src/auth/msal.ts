@@ -10,7 +10,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { authConfigured, config, loginScopes } from "../config.js";
 import { AppError } from "../errors.js";
 import { authFlowLifetimeMs } from "./flows.js";
-import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
+import { capabilityDefinitions, getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import type { CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser, AuthFlow } from "../types/session.js";
@@ -84,16 +84,23 @@ export function capabilityScopes(capabilityId: CapabilityId) {
   return definition.permissions.map(permission => `${resource}/${permission}`);
 }
 
-export function createAuthFlow(kind: "login" | "consent", options: { capabilityId?: CapabilityId; accountId?: string; returnTo?: string } = {}): AuthFlow {
+export function createAuthFlow(kind: "login" | "consent", options: { capabilityId?: CapabilityId; accountId?: string; returnTo?: string; providerConsent?: boolean } = {}): AuthFlow {
+  const providerSetup = kind === "login" && options.providerConsent !== false;
   const scopes = kind === "login"
-    ? [...loginScopes]
+    ? [...loginScopes, ...(providerSetup ? ["offline_access", ...capabilityScopes("graph.directory.read")] : [])]
     : ["openid", "profile", "offline_access", ...capabilityScopes(options.capabilityId!)];
+  const extraScopesToConsent = providerSetup
+    ? [...new Set(capabilityDefinitions.filter(definition => definition.mode === "delegated"
+      && definition.probe.adapterRegistered)
+      .flatMap(definition => capabilityScopes(definition.id)))].filter(scope => !scopes.includes(scope))
+    : undefined;
   return {
     kind,
     state: randomValue(),
     nonce: randomValue(),
     codeVerifier: randomValue(),
     scopes,
+    ...(extraScopesToConsent ? { extraScopesToConsent } : {}),
     createdAt: Date.now(),
     returnTo: safeReturnPath(options.returnTo),
     capabilityId: options.capabilityId,
@@ -104,12 +111,13 @@ export function createAuthFlow(kind: "login" | "consent", options: { capabilityI
 export async function createAuthorizationUrl(flow: AuthFlow) {
   const url = await getMsalClient().getAuthCodeUrl({
     scopes: flow.scopes,
+    ...(flow.extraScopesToConsent ? { extraScopesToConsent: flow.extraScopesToConsent } : {}),
     redirectUri: config.redirectUri,
     state: flow.state,
     nonce: flow.nonce,
     codeChallenge: createHash("sha256").update(flow.codeVerifier).digest("base64url"),
     codeChallengeMethod: "S256",
-    prompt: flow.kind === "login" ? "select_account" : "consent",
+    ...(flow.kind === "login" ? { prompt: "select_account" } : {}),
   });
   return validateAuthorizationUrl(url);
 }
@@ -247,7 +255,10 @@ function validateAuthenticationPrincipal(result: AuthenticationResult | null, ex
 function validateTokenResult(result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
   if (!result?.accessToken) throw interactionRequired();
   if (result.tenantId !== config.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
-  if (!(result.expiresOn instanceof Date) || !Number.isFinite(result.expiresOn.getTime()) || result.expiresOn.getTime() <= Date.now()) {
+  if (!(result.expiresOn instanceof Date) || !Number.isFinite(result.expiresOn.getTime())) {
+    throw new AppError(502, "identity_provider_error", "Microsoft Entra ID returned invalid token expiry metadata.");
+  }
+  if (result.expiresOn.getTime() <= Date.now()) {
     throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in or grant consent again.");
   }
 
@@ -319,8 +330,11 @@ function validateOptionalProviderClaims(claims: Record<string, unknown> | undefi
     throw AppError.unauthorized("Microsoft Entra ID returned a token for a different resource.");
   }
   const now = Math.floor(Date.now() / 1000);
-  if (typeof claims.exp === "number" && claims.exp <= now || typeof claims.nbf === "number" && claims.nbf > now) {
+  if (typeof claims.exp === "number" && claims.exp <= now) {
     throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in or grant consent again.");
+  }
+  if (typeof claims.nbf === "number" && claims.nbf > now) {
+    throw new AppError(502, "authorization_not_yet_valid", "The Microsoft token is not yet valid. Check the application host clock before retrying.");
   }
   if (mode === "application" && claims.idtyp === "user") {
     throw new AppError(401, "invalid_token_mode", "Microsoft Entra ID returned a delegated token for an application request.");
@@ -353,10 +367,29 @@ async function sendMsalRequest<T>(url: string, method: "GET" | "POST", options: 
 
 function normalizeTokenError(error: unknown) {
   if (error instanceof AppError) return error;
-  const code = String((error as { errorCode?: unknown })?.errorCode ?? "").toLowerCase();
-  if (["interaction_required", "consent_required", "login_required", "no_tokens_found"].includes(code)) return interactionRequired();
-  if (code === "invalid_grant") return new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in or grant consent again.");
-  return new AppError(502, "identity_provider_error", "Microsoft Entra ID could not complete token acquisition.");
+  const fields = error !== null && typeof error === "object" ? error : {};
+  const code = "errorCode" in fields && typeof fields.errorCode === "string" ? fields.errorCode.toLowerCase() : "";
+  const subError = "subError" in fields && typeof fields.subError === "string" ? fields.subError.toLowerCase() : "";
+  const errorNo = "errorNo" in fields && typeof fields.errorNo === "string" ? fields.errorNo
+    : "errorMessage" in fields && typeof fields.errorMessage === "string" ? fields.errorMessage.match(/\bAADSTS(\d{5,9})\b/)?.[1] : undefined;
+  const correlationId = "correlationId" in fields && typeof fields.correlationId === "string"
+    && /^[a-zA-Z0-9-]{1,128}$/.test(fields.correlationId) ? fields.correlationId : undefined;
+  const details = {
+    ...(correlationId ? { correlationId } : {}),
+    ...(errorNo && /^\d{5,9}$/.test(errorNo) ? { providerErrorCode: `AADSTS${errorNo}` } : {}),
+  };
+  if (code === "consent_required" || subError === "consent_required" || ["65001", "65004", "90094"].includes(errorNo ?? "")) {
+    return new AppError(403, "missing_permission", "Microsoft Entra ID requires consent for this delegated capability.", details);
+  }
+  if (["700082", "700084", "70043", "50173"].includes(errorNo ?? "")) {
+    return new AppError(401, "authorization_expired", "Microsoft authorization expired or was revoked. Sign in again.", details);
+  }
+  if (["interaction_required", "login_required", "no_tokens_found", "invalid_grant"].includes(code)
+    || ["interaction_required", "login_required", "basic_action", "additional_action"].includes(subError)
+    || ["50076", "50079", "50158", "53000", "53001", "53003"].includes(errorNo ?? "")) {
+    return new AppError(401, "interaction_required", "Microsoft Entra ID requires interactive authorization. Continue sign-in or contact your administrator about Conditional Access.", details);
+  }
+  return new AppError(502, "identity_provider_error", "Microsoft Entra ID could not complete token acquisition.", details);
 }
 
 function interactionRequired() {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   blockAgent,
+  checkCapabilities,
   getBulkActionJob,
   getDefenderHuntingJob,
   getAgents,
@@ -39,6 +40,17 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it("requests failed-check recovery only for an explicit retry", async () => {
+    const fetchMock = mockJsonResponse({ value: [] });
+    await checkCapabilities();
+    await checkCapabilities({ retryFailed: true });
+    expect(fetchMock.mock.calls.map(call => call[0])).toEqual([
+      "/api/capabilities/check",
+      "/api/capabilities/check?retry=failed",
+    ]);
+    expect(fetchMock.mock.calls.every(call => call[1]?.method === "POST")).toBe(true);
+  });
+
   it("encodes directory searches and limits", async () => {
     const fetchMock = mockJsonResponse({ value: [] });
 
@@ -93,7 +105,7 @@ describe("access API client", () => {
     const unsubscribe = subscribeSessionRevalidationRequired(listener);
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ status: 403, code: "forbidden", detail: "Current provider permission is insufficient." }, { status: 403 }))
-      .mockResolvedValueOnce(Response.json({ status: 403, code: "missing_internal_role", detail: "SecurityReader is required." }, { status: 403 }))
+      .mockResolvedValueOnce(Response.json({ status: 403, code: "missing_internal_role", detail: "Viewer is required." }, { status: 403 }))
       .mockResolvedValueOnce(Response.json({ status: 401, code: "unauthorized", detail: "The current session has expired.", requestId: "request-401" }, { status: 401 }));
     vi.stubGlobal("fetch", fetchMock);
 

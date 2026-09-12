@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { request as httpRequest, type ClientRequest, type Server } from "node:http";
 import session from "express-session";
 import { parse as parseCsv } from "csv-parse/sync";
-import { beforeAll, afterAll, beforeEach, describe, it, expect, vi } from "vitest";
+import { beforeAll, afterAll, beforeEach, afterEach, describe, it, expect, assert, vi } from "vitest";
 import { retain } from "../scripts/database.js";
 import { testDatabase, fixturePassword } from "../scripts/testDatabase.js";
 import { createApp } from "./app.js";
-import { acquireDelegatedToken } from "./auth/msal.js";
+import { acquireDelegatedToken, revalidateAuthenticatedUser } from "./auth/msal.js";
 import { authConfigured, config } from "./config.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./db/copilotStudioQuarantine.js";
 import { DefenderHuntingRepository } from "./db/defenderHunting.js";
@@ -23,6 +23,8 @@ import { AuditLog } from "./services/auditLog.js";
 import { CopilotStudioQuarantineClient } from "./services/copilotStudioQuarantine.js";
 import { GraphPackagesClient } from "./services/graphPackages.js";
 import { capabilities } from "./services/capabilities.js";
+import { defenderHunting } from "./services/defenderHunting.js";
+import { purviewAudit } from "./services/purviewAudit.js";
 import { launchBulkJob, runBulkJob } from "./services/bulkJobs.js";
 import type { AppRole } from "./types/capability.js";
 import type { PowerPlatformResource } from "./types/powerPlatformInventory.js";
@@ -35,8 +37,8 @@ vi.hoisted(() => {
 });
 const huntingCapabilityFixture = vi.hoisted(() => ({ applicationRevision: 1 }));
 const authFixture = vi.hoisted(() => ({
-  user: {tenantId:"11111111-1111-1111-1111-111111111111",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"]},
-  revalidatedUser: {tenantId:"11111111-1111-1111-1111-111111111111",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"]},
+  user: {tenantId:"11111111-1111-1111-1111-111111111111",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]},
+  revalidatedUser: {tenantId:"11111111-1111-1111-1111-111111111111",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]},
   pendingRevalidation: undefined as Promise<unknown> | undefined,
   revalidationStarted: 0,
   redemptions: 0,
@@ -51,7 +53,7 @@ vi.mock("./auth/msal.js", () => ({
   matchesAuthState: (left:string,right:string) => left === right, evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
 }));
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
-  requireAvailable: vi.fn(async () => undefined), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: huntingCapabilityFixture.applicationRevision })), invalidatePrincipal: vi.fn(async () => undefined), list: vi.fn(async () => []), refresh: vi.fn(), configureApplication: vi.fn(),
+  requireAvailable: vi.fn(async () => undefined), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: huntingCapabilityFixture.applicationRevision })), invalidatePrincipal: vi.fn(async () => undefined), list: vi.fn(async () => []), check: vi.fn(async () => []), refresh: vi.fn(), configureApplication: vi.fn(),
   packageQualificationIdentity: vi.fn(async (action: string) => ({ capabilityId: action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage", contractRevision: "a".repeat(64), configurationRevision: 1, authMode: "delegated" })),
   auditQualificationContext: vi.fn(async (capabilityId: string) => ({ capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
   recordAuditQualificationEvidence: vi.fn(async () => ({ authorized: true })),
@@ -64,6 +66,7 @@ vi.mock("./services/powerPlatformResourceQuery.js", () => ({ PowerPlatformResour
   async query() { inventoryProviderFixture.queries += 1; return {resources:[],totalRecords:0,pages:1,unknownFieldCount:0}; }
 } }));
 vi.mock("./services/bulkJobs.js", async original => ({ ...await original<typeof import("./services/bulkJobs.js")>(), launchBulkJob: vi.fn() }));
+vi.mock("./services/copilotStudioQuarantineJobs.js", async original => ({ ...await original<typeof import("./services/copilotStudioQuarantineJobs.js")>(), launchCopilotStudioQuarantineJob: vi.fn() }));
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let application: ReturnType<typeof createApp>;
@@ -87,6 +90,7 @@ beforeAll(async () => {
   vi.spyOn(CopilotStudioQuarantineClient.prototype,"getStatus").mockImplementation(async (_token, target, options) => ({ ...target, isBotQuarantined: false,
     lastUpdateTimeUtc: "2026-09-09T10:00:00.123Z", observedAt: new Date().toISOString(), correlationId: options.correlationId }));
   await publishPackageSnapshot("fixture-principal");
+  await publishPackageSnapshot("reader");
   await publishPackageSnapshot("operator", ["package-1"]);
 });
 afterAll(async () => {
@@ -162,6 +166,35 @@ async function mutationPreview(action: "block" | "unblock", ids: string[], mutat
 
 describe.sequential("packaged API/session contracts", () => {
   beforeEach(() => clearAdmissionForTest());
+  afterEach(async () => {
+    await Promise.all([defenderHunting.drain(), purviewAudit.drain()]);
+  });
+  it("requires the preserved public origin for tunnel permission checks and logout", async () => {
+    const previousOrigin = config.frontendOrigin;
+    config.frontendOrigin = "https://fixture-3002.euw.devtunnels.ms";
+    try {
+      for (const path of ["/api/capabilities/check", "/api/auth/logout"]) {
+        for (const origin of [undefined, "null", "http://localhost", "https://localhost", "https://unapproved.invalid"]) {
+          const denied = await fetch(`${base}${path}`, { method: "POST", headers: {
+            ...(origin === undefined ? {} : { Origin: origin }),
+            "X-Forwarded-Host": "fixture-3002.euw.devtunnels.ms",
+            "X-Forwarded-Proto": "https",
+          } });
+          expect(denied.status).toBe(403);
+          expect(await denied.json()).toMatchObject({
+            code: "invalid_origin",
+            detail: expect.stringContaining("--origin-header unchanged"),
+            details: { expectedOrigin: config.frontendOrigin, receivedOrigin: origin ?? null },
+          });
+        }
+        const preserved = await fetch(`${base}${path}`, { method: "POST", headers: { Origin: config.frontendOrigin } });
+        expect(preserved.status).toBe(401);
+        expect(await preserved.json()).toMatchObject({ code: "unauthorized" });
+      }
+    } finally {
+      config.frontendOrigin = previousOrigin;
+    }
+  });
   it("keeps liveness, readiness, API/auth and static routes separate", async () => {
     const health=await request("/api/health");
     expect(await health.json()).toEqual({ok:true});
@@ -213,7 +246,7 @@ describe.sequential("packaged API/session contracts", () => {
   });
   it("removes stale roles when consent returns an authoritative empty assignment", async () => {
     const originalCookie=cookie;
-    cookie=await roleCookie("fixture-principal",["AgentControl.Reader"]);
+    cookie=await roleCookie("fixture-principal",["AgentControl.Viewer"]);
     try {
       expect((await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":"wrong"},body:JSON.stringify({capabilityId:"graph.package.read.delegated"})})).status).toBe(403);
       const consent=await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({capabilityId:"graph.package.read.delegated"})});
@@ -224,14 +257,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect(me.status).toBe(200);
       expect(await me.json()).toMatchObject({user:{roles:[]},roleAssignmentRequired:true});
     } finally {
-      authFixture.user.roles=["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"];
+      authFixture.user.roles=["AgentControl.Admin"];
       cookie=originalCookie;
     }
   });
   it("returns safe cancellation and conditional-access outcomes only after consuming the flow", async () => {
     const originalCookie = cookie;
     try {
-      cookie = await roleCookie("fixture-principal", ["AgentControl.Reader"]);
+      cookie = await roleCookie("fixture-principal", ["AgentControl.Viewer"]);
       for (const [providerError, outcome] of [["access_denied", "cancelled"], ["interaction_required", "interaction_required"], ["unrecognized-error", "failed"]]) {
         await request("/api/auth/consent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/?view=permissions" }) });
         const redemptions = authFixture.redemptions;
@@ -240,12 +273,12 @@ describe.sequential("packaged API/session contracts", () => {
         expect(result.headers.get("location")).toBe(`/?view=permissions&authorization=${outcome}`);
         expect(authFixture.redemptions).toBe(redemptions);
         expect((await request("/api/auth/callback?state=fixture-state&error=access_denied")).status).toBe(400);
-        expect(await (await request("/api/me")).json()).toMatchObject({ user: { roles: ["AgentControl.Reader"] } });
+        expect(await (await request("/api/me")).json()).toMatchObject({ user: { roles: ["AgentControl.Viewer"] } });
       }
     } finally { cookie = originalCookie; }
   });
   it("rejects direct provider writes despite manipulated or disabled frontend controls", async () => {
-    const operatorCookie = await roleCookie("gate-operator", ["AgentControl.Operator"]);
+    const operatorCookie = await roleCookie("gate-operator", ["AgentControl.Admin"]);
     const before = await fixture.operator.query("SELECT count(*)::int AS count FROM jobs");
     const denial = new AppError(403, "capability_unavailable", "Preview writes remain unqualified.");
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(denial);
@@ -254,7 +287,7 @@ describe.sequential("packaged API/session contracts", () => {
         expect((await request(endpoint, { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json" }, body: JSON.stringify({ ids: ["package-1"] }) })).status).toBe(403);
       }
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows).toEqual(before.rows);
-      const adminCookie = await roleCookie("gate-admin", ["AgentControl.Administrator"]);
+      const adminCookie = await roleCookie("gate-admin", ["AgentControl.Admin"]);
       expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: adminCookie } })).status).toBe(403);
     } finally { vi.mocked(capabilities.requireAvailable).mockResolvedValue(undefined); }
   });
@@ -263,9 +296,9 @@ describe.sequential("packaged API/session contracts", () => {
     const previousCookie = cookie;
     csrfToken = "provider-audit-fixture-csrf";
     const principalId = "provider-audit-reader";
-    const securityCookie = await roleCookie(principalId, ["AgentControl.SecurityReader"]);
-    const otherCookie = await roleCookie("other-security-reader", ["AgentControl.SecurityReader"]);
-    const readerCookie = await roleCookie("ordinary-reader", ["AgentControl.Reader"]);
+    const securityCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    const otherCookie = await roleCookie("other-security-reader", ["AgentControl.Viewer"]);
+    const readerCookie = await roleCookie("ordinary-reader", ["AgentControl.Viewer"]);
     const repository = new PurviewAuditRepository(fixture.runtime);
     const scope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
@@ -291,7 +324,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(history.status).toBe(200);
       expect(history.headers.get("cache-control")).toContain("no-store");
       await expect(history.json()).resolves.toMatchObject({ count: 1, limit: 10, offset: 0 });
-      expect((await request(`/api/audit-search/jobs/${job.id}/records`, { headers: { Cookie: readerCookie } })).status).toBe(403);
+      expect((await request(`/api/audit-search/jobs/${job.id}/records`, { headers: { Cookie: readerCookie } })).status).toBe(404);
       expect((await request(`/api/audit-search/jobs/${job.id}/records`, { headers: { Cookie: otherCookie } })).status).toBe(404);
       const saved = await request(`/api/audit-search/jobs/${job.id}/records`, { headers: { Cookie: securityCookie } });
       expect(saved.status).toBe(200);
@@ -345,9 +378,9 @@ describe.sequential("packaged API/session contracts", () => {
     const previousCookie = cookie;
     csrfToken = "defender-hunting-fixture-csrf";
     const principalId = "defender-hunting-reader";
-    const securityCookie = await roleCookie(principalId, ["AgentControl.SecurityReader", "AgentControl.Administrator"]);
-    const otherCookie = await roleCookie("other-hunting-reader", ["AgentControl.SecurityReader"]);
-    const readerCookie = await roleCookie("ordinary-hunting-reader", ["AgentControl.Reader"]);
+    const securityCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    const otherCookie = await roleCookie("other-hunting-reader", ["AgentControl.Viewer"]);
+    const readerCookie = await roleCookie("ordinary-hunting-reader", ["AgentControl.Viewer"]);
     const repository = new DefenderHuntingRepository(fixture.runtime);
     const scope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
@@ -398,17 +431,12 @@ describe.sequential("packaged API/session contracts", () => {
       expect(catalogBody.templates.every((template: Record<string, unknown>) => !("workspaceId" in template))).toBe(true);
       await fixture.operator.query("UPDATE defender_hunting_qualification_evidence SET expires_at=clock_timestamp()-interval '1 second' WHERE qualified_job_id=$1", [qualificationJob.id]);
       const tokenCalls = vi.mocked(acquireDelegatedToken).mock.calls.length;
-      const deniedSend = await request("/api/hunting/jobs", { method: "POST", headers: { Cookie: securityCookie, "Content-Type": "application/json" },
-        body: JSON.stringify({ tokenMode: "delegated", filters }) });
-      expect(deniedSend.status).toBe(403);
-      expect(await deniedSend.json()).toMatchObject({ code: "hunting_scope_unqualified" });
-      expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
       const history = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: securityCookie } });
       expect(history.status).toBe(200);
       expect(history.headers.get("cache-control")).toContain("no-store");
       await expect(history.json()).resolves.toMatchObject({ count: 3, limit: 10, offset: 0 });
       expect((await repository.getJob(scope, job.id))?.providerRequestCount).toBe(beforeNavigation?.providerRequestCount);
-      expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: readerCookie } })).status).toBe(403);
+      expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: readerCookie } })).status).toBe(404);
       expect((await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(404);
       const saved = await request(`/api/hunting/jobs/${job.id}/rows`, { headers: { Cookie: securityCookie } });
       expect(saved.status).toBe(200);
@@ -488,6 +516,7 @@ describe.sequential("packaged API/session contracts", () => {
       const changedHistory = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: otherCookie } });
       await expect(changedHistory.json()).resolves.toMatchObject({ count: 0, value: [] });
       expect((await request(`/api/hunting/jobs/${applicationJob.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(404);
+      expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
 
       const auditRows = (await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action LIKE '%hunting%' ORDER BY action,observed_at", [config.tenantId, principalId])).rows;
       expect(auditRows).toEqual(expect.arrayContaining([
@@ -504,14 +533,70 @@ describe.sequential("packaged API/session contracts", () => {
       cookie = previousCookie;
     }
   });
-  it("returns a durable Audit Search activation while worker revalidation is pending", async () => {
+  it("accepts unqualified delegated hunting without bypassing worker authorization or application scope", async () => {
     const previousUser = authFixture.revalidatedUser;
+    const previousCsrf = csrfToken;
+    csrfToken = "delegated-hunting-fixture-csrf";
+    const principalId = "unqualified-delegated-hunting-viewer";
+    const filters = {
+      templateId: "agents_inventory",
+      startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(),
+      endDateTime: new Date().toISOString(),
+      agentIds: ["@http-delegated-agent"], blueprintIds: [], actorObjectIds: [], operations: [],
+    };
+    const tokenCalls = vi.mocked(acquireDelegatedToken).mock.calls.length;
+    const revalidationCalls = vi.mocked(revalidateAuthenticatedUser).mock.calls.length;
     let release!: () => void;
     authFixture.pendingRevalidation = new Promise<void>(resolve => { release = resolve; });
-    authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: "prompt-audit-reader", roles: ["AgentControl.SecurityReader"] };
-    const securityCookie = await roleCookie("prompt-audit-reader", ["AgentControl.SecurityReader"]);
-    const started = authFixture.revalidationStarted;
+    authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: principalId, roles: ["AgentControl.Viewer"] };
     try {
+      const viewerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+      const application = await request("/api/hunting/jobs", {
+        method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ tokenMode: "application", filters }),
+      });
+      expect(application.status).toBe(403);
+      await expect(application.json()).resolves.toMatchObject({ code: "hunting_scope_unqualified" });
+
+      const response = await request("/api/hunting/jobs", {
+        method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ tokenMode: "delegated", filters }),
+      });
+      expect(response.status).toBe(202);
+      const job = await response.json();
+      assert(job !== null && typeof job === "object" && "id" in job && typeof job.id === "string");
+      expect(job).toMatchObject({
+        authorizationPrincipalId: principalId, tokenMode: "delegated",
+        resultScope: { kind: "principal", scopeId: principalId },
+        status: "running", activationCount: 1, providerRequestCount: 0,
+        qualification: null, retainedScopeId: null,
+      });
+      await vi.waitFor(() => expect(vi.mocked(revalidateAuthenticatedUser).mock.calls.slice(revalidationCalls)
+        .filter(([accountId]) => accountId === principalId)).toHaveLength(1));
+      expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
+      const cancelled = await request(`/api/hunting/jobs/${job.id}/cancel`, { method: "POST", headers: { Cookie: viewerCookie } });
+      expect(cancelled.status).toBe(200);
+      await expect(cancelled.json()).resolves.toMatchObject({ status: "cancelled", providerRequestCount: 0 });
+    } finally {
+      release();
+      authFixture.pendingRevalidation = undefined;
+      await defenderHunting.drain();
+      authFixture.revalidatedUser = previousUser;
+      csrfToken = previousCsrf;
+    }
+    expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
+  });
+  it("returns a durable Audit Search activation while worker revalidation is pending", async () => {
+    const previousUser = authFixture.revalidatedUser;
+    const previousCsrf = csrfToken;
+    csrfToken = "pending-audit-fixture-csrf";
+    let release!: () => void;
+    authFixture.pendingRevalidation = new Promise<void>(resolve => { release = resolve; });
+    authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: "prompt-audit-reader", roles: ["AgentControl.Viewer"] };
+    const revalidationCalls = vi.mocked(revalidateAuthenticatedUser).mock.calls.length;
+    const tokenCalls = vi.mocked(acquireDelegatedToken).mock.calls.length;
+    try {
+      const securityCookie = await roleCookie("prompt-audit-reader", ["AgentControl.Viewer"]);
       const response = await request("/api/audit-search/jobs", {
         method: "POST",
         headers: { Cookie: securityCookie, "Content-Type": "application/json" },
@@ -522,13 +607,18 @@ describe.sequential("packaged API/session contracts", () => {
       });
       expect(response.status).toBe(202);
       const job = await response.json();
+      assert(job !== null && typeof job === "object" && "id" in job && typeof job.id === "string");
       expect(job).toMatchObject({ status: "reconciling_create", activationCount: 1, providerRequestCount: 0 });
-      await vi.waitFor(() => expect(authFixture.revalidationStarted).toBe(started + 1));
+      await vi.waitFor(() => expect(vi.mocked(revalidateAuthenticatedUser).mock.calls.slice(revalidationCalls)
+        .filter(([accountId]) => accountId === "prompt-audit-reader")).toHaveLength(1));
+      expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
       expect((await request(`/api/audit-search/jobs/${job.id}/cancel`, { method: "POST", headers: { Cookie: securityCookie } })).status).toBe(200);
     } finally {
       release();
       authFixture.pendingRevalidation = undefined;
+      await purviewAudit.drain();
       authFixture.revalidatedUser = previousUser;
+      csrfToken = previousCsrf;
     }
   });
   it("consumes a mismatched callback state without redeeming it", async () => {
@@ -584,11 +674,35 @@ describe.sequential("packaged API/session contracts", () => {
     }
     expect(launchBulkJob).toHaveBeenCalled();
   });
+  it("admits confirmed access intent while preserving role, CSRF and exact confirmation guards", async () => {
+    const prior = await fixture.operator.query("SELECT snapshot_id,package_data FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId]);
+    try {
+      await fixture.operator.query("UPDATE package_inventory_resources SET package_data=package_data || $2::jsonb WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId, { availableTo: "some", deployedTo: "none" }]);
+      const intent = { action: "update-availability", ids: ["package-1"], mutationScope: "single", target: "availability", mode: "replace", scope: "none", principals: [] };
+      const preview = await request("/api/agents/mutation-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(intent) });
+      expect(preview.status).toBe(200);
+      const confirmed = await preview.json();
+      expect(confirmed.summary).toMatchObject({ risk: true, operation: "update-availability" });
+      const body = JSON.stringify({ ...intent, confirmationHash: confirmed.confirmationHash });
+      const headers = { "Content-Type": "application/json" };
+      expect((await request("/api/agents/package-1/access", { method: "PATCH", headers: { ...headers, "x-csrf-token": "wrong" }, body })).status).toBe(403);
+      expect((await request("/api/agents/package-1/access", { method: "PATCH", headers: { ...headers, Cookie: await roleCookie("testing-viewer", ["AgentControl.Viewer"]) }, body })).status).toBe(403);
+      expect((await request("/api/agents/package-1/access", { method: "PATCH", headers, body: JSON.stringify({ ...intent, confirmationHash: "f".repeat(64) }) })).status).toBe(409);
+      const accepted = await request("/api/agents/package-1/access", { method: "PATCH", headers, body });
+      expect(accepted.status).toBe(202);
+      const job = await accepted.json();
+      expect(job).toMatchObject({ status: "queued", action: "update-availability" });
+      await request(`/api/agents/bulk-jobs/${job.id}/cancel`, { method: "POST" });
+    } finally {
+      for (const row of prior.rows) await fixture.operator.query("UPDATE package_inventory_resources SET package_data=$2 WHERE snapshot_id=$1 AND native_id='package-1'", [row.snapshot_id, row.package_data]);
+    }
+  });
+
   it("executes both approved canary directions as separate durable jobs", async () => {
     const originalCookie = cookie;
     const approvalBody = { targetId: "package-canary", action: "block", prestate: { kind: "block", isBlocked: false }, poststate: { kind: "block", isBlocked: true } };
     try {
-      cookie = await roleCookie("approver", ["AgentControl.Administrator"]);
+      cookie = await roleCookie("approver", ["AgentControl.Admin"]);
       expect((await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, metadata: {} }) })).status).toBe(400);
       const originalResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(approvalBody) });
       const restorationResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) });
@@ -599,8 +713,8 @@ describe.sequential("packaged API/session contracts", () => {
       expect(approval).toMatchObject({ status: "approved", targetId: "package-canary", approvedBy: { principalId: "approver" }, actor: null });
       expect(restorationApproval).toMatchObject({ status: "approved", action: "unblock", approvedBy: { principalId: "approver" } });
 
-      cookie = await roleCookie("operator", ["AgentControl.Operator"]);
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "operator", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Operator"] };
+      cookie = await roleCookie("operator", ["AgentControl.Admin"]);
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "operator", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
         .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: false })
         .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: false })
@@ -621,7 +735,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(GraphPackagesClient.prototype.blockPackage).toHaveBeenCalledTimes(1);
       expect(GraphPackagesClient.prototype.unblockPackage).toHaveBeenCalledTimes(1);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"] };
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
       cookie = originalCookie;
     }
   });
@@ -631,11 +745,11 @@ describe.sequential("packaged API/session contracts", () => {
     const blocksBefore = vi.mocked(GraphPackagesClient.prototype.blockPackage).mock.calls.length;
     const unblocksBefore = vi.mocked(GraphPackagesClient.prototype.unblockPackage).mock.calls.length;
     try {
-      cookie = await roleCookie("conflict-approver", ["AgentControl.Administrator"]);
+      cookie = await roleCookie("conflict-approver", ["AgentControl.Admin"]);
       const original = await (await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(approvalBody) })).json();
       const restoration = await (await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) })).json();
-      cookie = await roleCookie("conflict-operator", ["AgentControl.Operator"]);
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Operator"] };
+      cookie = await roleCookie("conflict-operator", ["AgentControl.Admin"]);
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Admin"] };
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
         .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: false })
         .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: false })
@@ -653,11 +767,11 @@ describe.sequential("packaged API/session contracts", () => {
         { status: "succeeded" }, { status: "failed" },
       ]);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"] };
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
       cookie = originalCookie;
     }
   });
-  it("retains Operator authority through reconciliation publication", async () => {
+  it("retains Admin authority through reconciliation publication", async () => {
     const repository = new JobRepository(fixture.runtime);
     const owner = { tenantId: config.tenantId!, principalId: "fixture-principal" };
     const intent: JobIntentInput = { action: "block", targets: [{ id: "reconcile-role-loss", displayName: "Reconcile", prestate: { kind: "block", isBlocked: false } }], actor: authFixture.user, requestPath: "/api/agents/block", scope: "single" };
@@ -668,12 +782,12 @@ describe.sequential("packaged API/session contracts", () => {
       unblockPackage: async () => undefined,
     } as unknown as GraphPackagesClient;
     await runBulkJob(job.id, owner, false, repository, provider, async () => "ephemeral-token");
-    authFixture.revalidatedUser = { ...authFixture.user, roles: ["AgentControl.Reader"] };
+    authFixture.revalidatedUser = { ...authFixture.user, roles: ["AgentControl.Viewer"] };
     try {
       expect((await request(`/api/agents/bulk-jobs/${job.id}/reconcile`, { method: "POST" })).status).toBe(403);
       expect(await repository.get(job.id, owner)).toMatchObject({ results: [{ reconciliationStatus: "required" }] });
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"] };
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
     }
   });
   it("requires same-origin mutations and isolates saved jobs by principal", async () => {
@@ -681,7 +795,7 @@ describe.sequential("packaged API/session contracts", () => {
     const response=await request("/api/agents/package-1/block",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(preview)});
     const job=await response.json();
     expect((await request("/api/agents/package-1/block",{method:"POST",headers:{Origin:"https://unapproved.invalid","Content-Type":"application/json"},body:JSON.stringify(preview)})).status).toBe(403);
-    const otherCookie=await roleCookie("other",["AgentControl.Operator"]);
+    const otherCookie=await roleCookie("other",["AgentControl.Admin"]);
     const mine=await request("/api/agents/bulk-jobs?limit=20");
     expect(mine.status).toBe(200);
     expect(await mine.json()).toMatchObject({value:expect.arrayContaining([expect.objectContaining({id:job.id})])});
@@ -704,11 +818,11 @@ describe.sequential("packaged API/session contracts", () => {
     }
     expect(JSON.stringify(body)).not.toContain("sensitive-user");
   });
-  it("requires CSRF and keeps app roles non-hierarchical", async () => {
+  it("requires CSRF, gives Admin all Viewer reads, and denies unassigned users", async () => {
     expect((await request("/api/agents/package-1/block",{method:"POST",headers:{"x-csrf-token":"wrong"}})).status).toBe(403);
-    const administratorCookie=await roleCookie("administrator",["AgentControl.Administrator"]);
-    expect((await request("/api/agents",{headers:{Cookie:administratorCookie}})).status).toBe(403);
-    expect((await request("/api/audit/events",{headers:{Cookie:administratorCookie}})).status).toBe(403);
+    const administratorCookie=await roleCookie("administrator",["AgentControl.Admin"]);
+    expect((await request("/api/agents",{headers:{Cookie:administratorCookie}})).status).toBe(200);
+    expect((await request("/api/audit/events",{headers:{Cookie:administratorCookie}})).status).toBe(200);
     const diagnostics=await request("/api/diagnostics",{headers:{Cookie:administratorCookie}});
     expect(diagnostics.status).toBe(200);
     expect(await diagnostics.json()).toEqual({
@@ -719,22 +833,39 @@ describe.sequential("packaged API/session contracts", () => {
     const me=await request("/api/me",{headers:{Cookie:noRoleCookie}});
     expect(me.status).toBe(200);
     expect((await me.json()).roleAssignmentRequired).toBe(true);
-    expect((await request("/api/capabilities",{headers:{Cookie:noRoleCookie}})).status).toBe(200);
+    expect((await request("/api/capabilities",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
+    expect((await request("/api/capabilities/check",{method:"POST",headers:{Cookie:noRoleCookie}})).status).toBe(403);
     expect((await request("/api/diagnostics",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
+    const viewerCookie = await roleCookie("viewer-no-write", ["AgentControl.Viewer"]);
+    expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie, "x-csrf-token": "wrong" } })).status).toBe(403);
+    expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId: "graph.package.read.delegated" }) })).status).toBe(400);
+    expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(200);
+    expect((await request("/api/capabilities/check?retry=failed", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(200);
+    expect(capabilities.check).toHaveBeenLastCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }), { retryFailed: true });
+    expect((await request("/api/capabilities/check?retry=failed", { method: "POST", headers: { Cookie: viewerCookie, "x-csrf-token": "wrong" } })).status).toBe(403);
+    expect((await request("/api/capabilities/check?retry=all", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(400);
+    expect(vi.mocked(capabilities.check)).toHaveBeenCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }));
+    expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+    expect((await request("/api/official-usage/staging/not-owned", { method: "DELETE", headers: { Cookie: viewerCookie } })).status).toBe(403);
+    const legacyCookie = await roleCookie("legacy-role-only", ["AgentControl.Reader" as AppRole]);
+    expect((await request("/api/agents", { headers: { Cookie: legacyCookie } })).status).toBe(403);
   });
-  it("keeps broad inventory Reader-only and Operator reads exact-target", async () => {
-    const readerCookie=await roleCookie("reader",["AgentControl.Reader"]);
-    const operatorCookie=await roleCookie("operator",["AgentControl.Operator"]);
+  it("allows Viewer and inherited Admin package reads including exact targets", async () => {
+    const readerCookie=await roleCookie("reader",["AgentControl.Viewer"]);
+    const operatorCookie=await roleCookie("operator",["AgentControl.Admin"]);
     expect((await request("/api/agents",{headers:{Cookie:readerCookie}})).status).toBe(200);
-    expect((await request("/api/agents",{headers:{Cookie:operatorCookie}})).status).toBe(403);
-    expect((await request("/api/agents/details",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"]})})).status).toBe(403);
+    expect((await request("/api/agents",{headers:{Cookie:operatorCookie}})).status).toBe(200);
+    expect((await request("/api/agents/details",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"]})})).status).toBe(200);
+    const viewerExact = await request("/api/agents/package-1",{headers:{Cookie:readerCookie}});
+    expect(viewerExact.status).toBe(200);
+    expect(await viewerExact.json()).toMatchObject({id:"package-1",allowedUsersAndGroups:[{resourceId:"sensitive-user"}]});
     const exact=await request("/api/agents/package-1",{headers:{Cookie:operatorCookie}});
     expect(exact.status).toBe(200);
     expect(await exact.json()).toMatchObject({id:"package-1",allowedUsersAndGroups:[{resourceId:"sensitive-user"}]});
   });
   it("exports only exact authorized package rows with snapshot provenance, formula safety and row-free audit", async () => {
     const principalId="package-export-reader";
-    const readerCookie=await roleCookie(principalId,["AgentControl.Reader"]);
+    const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     const snapshotId=await publishPackageSnapshot(principalId);
     await fixture.operator.query(`UPDATE package_inventory_resources
       SET publisher='=formula',package_data=jsonb_set(package_data,'{publisher}',to_jsonb('=formula'::text))
@@ -747,14 +878,14 @@ describe.sequential("packaged API/session contracts", () => {
     const rows=parseCsv(await response.text(),{bom:true,columns:true});
     expect(rows).toEqual([expect.objectContaining({id:"package-1",publisher:"'=formula",sourceSystem:"graph_packages",snapshotId})]);
     expect(JSON.stringify(rows)).not.toContain("sensitive-user");
-    const securityCookie=await roleCookie(principalId,["AgentControl.SecurityReader"]);
+    const securityCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     const audit=await request("/api/audit/events?action=export-package-inventory",{headers:{Cookie:securityCookie}});
     expect(audit.status).toBe(200);
     const auditBody=await audit.json() as {value:Array<{action:string;metadata?:Record<string,unknown>}>};
     expect(auditBody.value).toEqual([expect.objectContaining({action:"export-package-inventory",metadata:expect.objectContaining({source:"graph_packages",snapshotId,resultingCount:1})})]);
     expect(JSON.stringify(auditBody)).not.toContain("=formula");
-    const operatorCookie=await roleCookie(principalId,["AgentControl.Operator"]);
-    expect((await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})})).status).toBe(403);
+    const operatorCookie=await roleCookie(principalId,["AgentControl.Admin"]);
+    expect((await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:operatorCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})})).status).toBe(200);
     await publishPackageSnapshot(principalId);
     const stale = await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})});
     expect(stale.status).toBe(409);
@@ -763,8 +894,7 @@ describe.sequential("packaged API/session contracts", () => {
   it.each(["role", "session", "expiry", "deletion", "application-scope", "filter-source"] as const)(
     "denies export when %s changes during final audit without releasing rows", async change => {
       const principalId = `export-race-${change}`;
-      const readerCookie = await roleCookie(principalId, change === "filter-source"
-        ? ["AgentControl.Reader", "AgentControl.SecurityReader"] : ["AgentControl.Reader"]);
+      const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
       const ownerId = change === "application-scope" ? config.clientId! : principalId;
       const snapshotId = await publishPackageSnapshot(ownerId);
       if (change === "filter-source") {
@@ -810,24 +940,23 @@ describe.sequential("packaged API/session contracts", () => {
       }
     });
 
-  it("requires the independent audit role before inventory reference filters, counts and exports", async () => {
+  it("allows Viewer audit-reference filters while preserving principal scope", async () => {
     const principalId = "inventory-audit-filter";
-    const readerCookie = await roleCookie(principalId, ["AgentControl.Reader"]);
+    const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
     const snapshotId = await publishPackageSnapshot(principalId);
     const audit = new AuditLog({ tenantId: config.tenantId!, principalId }, fixture.runtime);
     await audit.startEvent({ operationId: "abcd1234-own-action", scope: "bulk", action: "block", targetBlockedState: true,
       agentId: "package-1", actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
       requestPath: "/fixture" });
-    expect((await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } })).status).toBe(403);
+    expect((await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } })).status).toBe(200);
     const exportRequest = { method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
       body: JSON.stringify({ snapshotId, filters: { operationIdPrefix: "abcd1234" } }) };
-    expect((await request("/api/agents/export.csv", exportRequest)).status).toBe(403);
-    const authorizedCookie = await roleCookie(principalId, ["AgentControl.Reader", "AgentControl.SecurityReader"]);
-    const result = await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: authorizedCookie } });
+    expect((await request("/api/agents/export.csv", exportRequest)).status).toBe(200);
+    const result = await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } });
     expect(await result.json()).toMatchObject({ count: 1, value: [{ id: "package-1" }] });
     const otherId = "inventory-audit-filter-other";
     await publishPackageSnapshot(otherId);
-    const otherCookie = await roleCookie(otherId, ["AgentControl.Reader", "AgentControl.SecurityReader"]);
+    const otherCookie = await roleCookie(otherId, ["AgentControl.Viewer"]);
     expect(await (await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: otherCookie } })).json())
       .toMatchObject({ count: 0, value: [] });
   });
@@ -841,7 +970,7 @@ describe.sequential("packaged API/session contracts", () => {
     const exportRequest = (selectedCookie: string) => request("/api/audit/events/export.csv", {
       method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify({ ids: [event.id] }),
     });
-    const securityCookie = await roleCookie(principalId, ["AgentControl.SecurityReader"]);
+    const securityCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
     const exported = await exportRequest(securityCookie);
     expect(exported.status).toBe(200);
     const rows = parseCsv(await exported.text(), { bom: true, columns: true });
@@ -849,10 +978,10 @@ describe.sequential("packaged API/session contracts", () => {
     const auditRecords = await audit.listEvents({ action: "export-administrative-audit" });
     expect(auditRecords).toEqual([expect.objectContaining({ metadata: expect.objectContaining({ resultingCount: 1 }), status: "succeeded" })]);
     expect(JSON.stringify(auditRecords)).not.toContain("private selected audit message");
-    const otherCookie = await roleCookie("administrative-export-other", ["AgentControl.SecurityReader"]);
+    const otherCookie = await roleCookie("administrative-export-other", ["AgentControl.Viewer"]);
     expect((await exportRequest(otherCookie)).status).toBe(404);
-    const readerCookie = await roleCookie(principalId, ["AgentControl.Reader"]);
-    expect((await exportRequest(readerCookie)).status).toBe(403);
+    const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    expect((await exportRequest(readerCookie)).status).toBe(200);
     const complete = AuditLog.prototype.completeEvent;
     const completion = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
       const result = await complete.call(this, id, update);
@@ -890,14 +1019,8 @@ describe.sequential("packaged API/session contracts", () => {
       messages: [], contentAvailable: false, unknownFieldCount: 0,
     }], pageCount: 1, providerRowCount: 1, storedRowCount: 1, byteCount: 512, unknownFieldCount: 0, complete: true, nextLink: null, partialReason: null });
     const path = `/api/inventory/resources/native-agent/related?snapshotId=${snapshotId}&type=microsoft.copilotstudio%2Fagents&environmentId=11111111-1111-4111-8111-111111111111`;
-    const readerOnly = await roleCookie(principalId, ["AgentControl.Reader"]);
-    const unauthorized = await request(path, { headers: { Cookie: readerOnly } });
-    expect(await unauthorized.json()).toMatchObject({
-      audit: { status: "unauthorized" }, security: { status: "unauthorized" },
-      package: { status: "unmatched" }, reports: { status: "unmatched" },
-    });
-    const permittedCookie = await roleCookie(principalId, ["AgentControl.Reader", "AgentControl.SecurityReader"]);
-    const permitted = await request(path, { headers: { Cookie: permittedCookie } });
+    const readerOnly = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    const permitted = await request(path, { headers: { Cookie: readerOnly } });
     expect(permitted.status).toBe(200);
     expect(await permitted.json()).toMatchObject({
       snapshotId, nativeId: "native-agent",
@@ -905,11 +1028,11 @@ describe.sequential("packaged API/session contracts", () => {
       security: { status: "unmatched" },
       controls: { quarantineTarget: { environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222" }, packageTarget: null },
     });
-    const otherReader = await roleCookie("source-detail-other", ["AgentControl.Reader", "AgentControl.SecurityReader"]);
+    const otherReader = await roleCookie("source-detail-other", ["AgentControl.Viewer"]);
     expect((await request(path, { headers: { Cookie: otherReader } })).status).toBe(404);
   });
   it("reads authorized saved audit data during provider outage", async () => {
-    const securityReaderCookie=await roleCookie("security-reader",["AgentControl.SecurityReader"]);
+    const securityReaderCookie=await roleCookie("security-reader",["AgentControl.Viewer"]);
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(new AppError(502,"provider_error","provider unavailable"));
     try {
       const response=await request("/api/audit/events",{headers:{Cookie:securityReaderCookie}});
@@ -919,7 +1042,7 @@ describe.sequential("packaged API/session contracts", () => {
   });
   it("enforces inventory role, CSRF and private job/snapshot/export scope without live GET reads", async () => {
     const principalId="inventory-reader";
-    const readerCookie=await roleCookie(principalId,["AgentControl.Reader"]);
+    const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     const repository=new PowerPlatformInventoryRepository(fixture.runtime);
     const inventoryScope={tenantId:config.tenantId!,principalId};
     const job=await repository.submit(inventoryScope,{idempotencyKey:"route-inventory",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
@@ -947,31 +1070,31 @@ describe.sequential("packaged API/session contracts", () => {
 
       expect((await request("/api/inventory/refresh-jobs",{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong","Content-Type":"application/json"},body:"{}"})).status).toBe(403);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}/resume`,{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong"}})).status).toBe(403);
-      for (const role of ["AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"] as AppRole[]) {
-        const roleOnlyCookie=await roleCookie(`inventory-${role}`, [role]);
-        for (const path of ["/api/inventory/resources","/api/inventory/refresh-jobs","/api/inventory/snapshots","/api/inventory/export.csv"]) expect((await request(path,{headers:{Cookie:roleOnlyCookie}})).status).toBe(403);
-      }
+      const adminReader = await roleCookie(principalId, ["AgentControl.Admin"]);
+      expect((await request(`/api/inventory/resources?snapshotId=${snapshotId}`, { headers: { Cookie: adminReader } })).status).toBe(200);
+      const unassigned = await roleCookie("inventory-unassigned", []);
+      for (const path of ["/api/inventory/resources","/api/inventory/refresh-jobs","/api/inventory/snapshots","/api/inventory/export.csv"]) expect((await request(path,{headers:{Cookie:unassigned}})).status).toBe(403);
 
-      const otherReader=await roleCookie("inventory-other",["AgentControl.Reader"]);
+      const otherReader=await roleCookie("inventory-other",["AgentControl.Viewer"]);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}`,{headers:{Cookie:otherReader}})).status).toBe(404);
       expect((await request(`/api/inventory/resources?snapshotId=${snapshotId}&limit=1&offset=0`,{headers:{Cookie:otherReader}})).status).toBe(404);
       expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`,{headers:{Cookie:otherReader}})).status).toBe(404);
       expect(await (await request("/api/inventory/resources",{headers:{Cookie:otherReader}})).json()).toMatchObject({count:0,value:[],snapshot:null});
     } finally { vi.mocked(capabilities.requireAvailable).mockResolvedValue(undefined); }
   });
-  it("enforces exact quarantine targeting, Operator writes and SecurityReader-only audit review", async () => {
+  it("allows Viewer quarantine reads while keeping controls and canaries Admin-only", async () => {
     const originalCookie = cookie;
     const principalId = "quarantine-operator";
-    const operatorCookie = await roleCookie(principalId, ["AgentControl.Operator"]);
+    const operatorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const snapshotId = await publishQuarantineInventory(principalId);
-    const readerCookie = await roleCookie("quarantine-reader", ["AgentControl.Reader"]);
-    const otherOperatorCookie = await roleCookie("quarantine-other", ["AgentControl.Operator"]);
-    const administratorCookie = await roleCookie(principalId, ["AgentControl.Administrator"]);
-    const securityReaderCookie = await roleCookie(principalId, ["AgentControl.SecurityReader"]);
-    authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Quarantine operator", username: "quarantine-operator@example.invalid", roles: ["AgentControl.Operator"] };
+    const readerCookie = await roleCookie("quarantine-reader", ["AgentControl.Viewer"]);
+    const otherOperatorCookie = await roleCookie("quarantine-other", ["AgentControl.Admin"]);
+    const administratorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
+    const securityReaderCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Quarantine operator", username: "quarantine-operator@example.invalid", roles: ["AgentControl.Admin"] };
     const providerReads = vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length;
     try {
-      expect((await request("/api/quarantine/targets", { headers: { Cookie: readerCookie } })).status).toBe(403);
+      expect((await request("/api/quarantine/targets", { headers: { Cookie: readerCookie } })).status).toBe(200);
       const targetList = await request("/api/quarantine/targets?limit=25&offset=0", { headers: { Cookie: operatorCookie } });
       expect(targetList.status).toBe(200);
       const targetPage = await targetList.json();
@@ -979,9 +1102,9 @@ describe.sequential("packaged API/session contracts", () => {
       expect(targetPage.value[0]).not.toHaveProperty("provenance");
       expect(await (await request("/api/quarantine/targets", { headers: { Cookie: otherOperatorCookie } })).json()).toEqual({ value: [], count: 0, snapshot: null });
       expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads);
-      expect((await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: readerCookie } })).status).toBe(403);
+      expect((await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/status?snapshotId=not-a-uuid&nativeId=native-agent", { headers: { Cookie: operatorCookie } })).status).toBe(400);
-      expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads);
+      expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads + 1);
 
       const status = await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: operatorCookie } });
       expect(status.status).toBe(200);
@@ -997,15 +1120,16 @@ describe.sequential("packaged API/session contracts", () => {
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"] }) });
       expect(previewResponse.status).toBe(200);
       const preview = await previewResponse.json();
-      expect(preview).toMatchObject({ qualification: { qualified: false, requiredForSubmit: true }, summary: { packageControlIndependent: true, targetCount: 1 } });
+      expect(preview).toMatchObject({ summary: { packageControlIndependent: true, targetCount: 1 } });
+      expect(preview).not.toHaveProperty("qualification");
       expect((await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], confirmationHash: preview.confirmationHash }) })).status).toBe(400);
       expect((await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json", "Idempotency-Key": "strict-scalar" },
         body: JSON.stringify({ action: "quarantine", snapshotId: [snapshotId], resourceNativeIds: ["native-agent"], confirmationHash: preview.confirmationHash }) })).status).toBe(400);
-      const submit = await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json", "Idempotency-Key": "app-route-unqualified" },
+      const submit = await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json", "Idempotency-Key": "app-route-normal" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], confirmationHash: preview.confirmationHash }) });
-      expect(submit.status).toBe(409);
-      expect(await submit.json()).toMatchObject({ code: "quarantine_write_unqualified" });
+      expect(submit.status).toBe(202);
+      expect(await submit.json()).toMatchObject({ status: "queued", action: "quarantine" });
 
       const quarantineRepository = new CopilotStudioQuarantineRepository(fixture.runtime);
       const inventoryTarget = (await new PowerPlatformInventoryRepository(fixture.runtime).resolveQuarantineTargets({ tenantId: config.tenantId!, principalId }, snapshotId, ["native-agent"]))[0];
@@ -1015,12 +1139,7 @@ describe.sequential("packaged API/session contracts", () => {
         displayName: "Quarantine operator", username: "quarantine-operator@example.invalid" }, authority: { contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 },
         requestPath: "/api/quarantine/jobs" };
       const durableConfirmation = createQuarantineConfirmation(durableInput);
-      await fixture.operator.query(`INSERT INTO copilot_quarantine_qualifications
-        (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,contract_revision,permission_revision,configuration_revision,auth_mode)
-        VALUES(gen_random_uuid(),$1,$2,$3,gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),repeat('c',64),repeat('d',64),1,'delegated')`,
-      [config.tenantId!, inventoryTarget.environmentId, inventoryTarget.botId]);
       const durableJob = await quarantineRepository.submit({ tenantId: config.tenantId!, principalId }, { ...durableInput, idempotencyKey: "app-route-durable", confirmationHash: durableConfirmation.confirmationHash });
-      await fixture.operator.query("DELETE FROM copilot_quarantine_qualifications WHERE tenant_id=$1", [config.tenantId!]);
       const retryReads = vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length;
       const durableRetry = await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json", "Idempotency-Key": "app-route-durable" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], confirmationHash: durableConfirmation.confirmationHash }) });
@@ -1032,18 +1151,18 @@ describe.sequential("packaged API/session contracts", () => {
       expect(changedRetry.status).toBe(409);
       expect(await changedRetry.json()).toMatchObject({ code: "idempotency_mismatch" });
 
-      expect((await request("/api/quarantine/audit", { headers: { Cookie: operatorCookie } })).status).toBe(403);
-      expect((await request("/api/quarantine/audit", { headers: { Cookie: administratorCookie } })).status).toBe(403);
+      expect((await request("/api/quarantine/audit", { headers: { Cookie: operatorCookie } })).status).toBe(200);
+      expect((await request("/api/quarantine/audit", { headers: { Cookie: administratorCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/audit", { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"] };
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
       cookie = originalCookie;
     }
   });
   it("returns a durable waiting inventory job when token acquisition fails after submission", async () => {
     const principalId="inventory-token-loss";
-    const readerCookie=await roleCookie(principalId,["AgentControl.Reader"]);
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:principalId,displayName:"Inventory token loss",username:"inventory-token-loss@example.invalid",roles:["AgentControl.Reader"]};
+    const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
+    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:principalId,displayName:"Inventory token loss",username:"inventory-token-loss@example.invalid",roles:["AgentControl.Viewer"]};
     inventoryProviderFixture.queries=0;
     vi.mocked(acquireDelegatedToken).mockRejectedValueOnce(new AppError(401,"interaction_required","Interactive authorization is required."));
     try {
@@ -1055,13 +1174,13 @@ describe.sequential("packaged API/session contracts", () => {
       const persisted=await new PowerPlatformInventoryRepository(fixture.runtime).getJob({tenantId:config.tenantId!,principalId},job.id);
       expect(persisted).toMatchObject({status:"waiting_authorization",snapshotId:null});
     } finally {
-      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"]};
+      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
     }
   });
   it("imports official usage through bounded multipart staging and enforces aggregate and user roles", async () => {
-    const administratorCookie = await roleCookie("usage-administrator", ["AgentControl.Administrator"]);
-    const readerCookie = await roleCookie("fixture-principal", ["AgentControl.Reader"]);
-    const securityReaderCookie = await roleCookie("usage-security-reader", ["AgentControl.SecurityReader"]);
+    const administratorCookie = await roleCookie("usage-administrator", ["AgentControl.Admin"]);
+    const readerCookie = await roleCookie("fixture-principal", ["AgentControl.Viewer"]);
+    const securityReaderCookie = await roleCookie("usage-security-reader", ["AgentControl.Viewer"]);
     const bundleId = randomUUID();
     const reports = [
       ["agents", "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nusage-agent,=Formula agent,Declarative,1,1,4,2026-07-06"],
@@ -1099,9 +1218,9 @@ describe.sequential("packaged API/session contracts", () => {
     const deniedForm = new FormData();
     deniedForm.append("file", new Blob([reports[0][1]]), "private.csv");
     expect((await request("/api/official-usage/staging", { method: "POST", headers: { Cookie: administratorCookie, "x-csrf-token": "wrong" }, body: deniedForm })).status).toBe(403);
-    expect((await request("/api/official-usage/aggregate", { headers: { Cookie: administratorCookie } })).status).toBe(403);
-    expect((await request("/api/official-usage/users", { headers: { Cookie: readerCookie } })).status).toBe(403);
-    const otherAdministratorCookie = await roleCookie("usage-other-administrator", ["AgentControl.Administrator"]);
+    expect((await request("/api/official-usage/aggregate", { headers: { Cookie: administratorCookie } })).status).toBe(200);
+    expect((await request("/api/official-usage/users", { headers: { Cookie: readerCookie } })).status).toBe(200);
+    const otherAdministratorCookie = await roleCookie("usage-other-administrator", ["AgentControl.Admin"]);
     expect((await request(`/api/official-usage/bundles/${bundleId}/preview`, {
       method: "POST", headers: { Cookie: otherAdministratorCookie },
     })).status).toBe(404);
@@ -1149,7 +1268,7 @@ describe.sequential("packaged API/session contracts", () => {
       accountId: "cross-tenant-admin",
       csrfToken,
       rolesValidatedAt: Date.now(),
-      user: { tenantId: crossTenantId, homeAccountId: "cross-tenant-admin", username: "cross-tenant@example.invalid", displayName: "cross-tenant", roles: ["AgentControl.Administrator"] },
+      user: { tenantId: crossTenantId, homeAccountId: "cross-tenant-admin", username: "cross-tenant@example.invalid", displayName: "cross-tenant", roles: ["AgentControl.Admin"] },
     }]);
     expect((await request(`/api/official-usage/bundles/${bundleId}/accept`, {
       method: "POST", headers: { Cookie: signedSessionCookie(crossTenantSid), "Content-Type": "application/json" },
@@ -1262,7 +1381,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_audit WHERE action='legacy_cleanup_acknowledged' AND actor_principal_id='usage-administrator'")).rows[0].count).toBe(1);
   });
   it("caps simultaneous official usage uploads and releases disconnected reservations", async () => {
-    const administratorCookie = await roleCookie("usage-admission-administrator", ["AgentControl.Administrator"]);
+    const administratorCookie = await roleCookie("usage-admission-administrator", ["AgentControl.Admin"]);
     const heldRequests: ClientRequest[] = [];
     const openHeldUpload = async () => {
       const boundary = `held-${randomUUID()}`;
@@ -1322,7 +1441,7 @@ describe.sequential("packaged API/session contracts", () => {
     })).status).toBe(204);
   });
   it("releases upload admission after a Multer limit failure without retaining staging", async () => {
-    const administratorCookie = await roleCookie("usage-multer-administrator", ["AgentControl.Administrator"]);
+    const administratorCookie = await roleCookie("usage-multer-administrator", ["AgentControl.Admin"]);
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const missingFile = new FormData();
       missingFile.append("bundleId", randomUUID());
@@ -1358,7 +1477,7 @@ describe.sequential("packaged API/session contracts", () => {
     })).status).toBe(204);
   });
   it("does not release upload capacity while disconnected repository work is still pending", async () => {
-    const administratorCookie = await roleCookie("usage-held-work-administrator", ["AgentControl.Administrator"]);
+    const administratorCookie = await roleCookie("usage-held-work-administrator", ["AgentControl.Admin"]);
     const lockClient = await fixture.operator.connect();
     const controller = new AbortController();
     let secondUpload: ClientRequest | undefined;
@@ -1427,7 +1546,7 @@ describe.sequential("packaged API/session contracts", () => {
     }
   });
   it("times out a never-ending multipart body when the wall-clock timer advances", async () => {
-    const administratorCookie = await roleCookie("usage-deadline-administrator", ["AgentControl.Administrator"]);
+    const administratorCookie = await roleCookie("usage-deadline-administrator", ["AgentControl.Admin"]);
     const boundary = `deadline-${randomUUID()}`;
     const bundleId = randomUUID();
     const csv = "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\ndeadline-agent,Deadline,Declarative,1,0,1,2026-07-06";
@@ -1460,7 +1579,7 @@ describe.sequential("packaged API/session contracts", () => {
         pending.on("error", reject);
         pending.write(prefix);
       });
-      for (let attempt = 0; attempt < 200 && vi.getTimerCount() === 0; attempt += 1) {
+      for (let attempt = 0; attempt < 1_000 && vi.getTimerCount() === 0; attempt += 1) {
         await new Promise(resolve => setImmediate(resolve));
       }
       expect(vi.getTimerCount()).toBeGreaterThan(0);
@@ -1484,20 +1603,36 @@ describe.sequential("packaged API/session contracts", () => {
         {...authFixture.revalidatedUser,homeAccountId:"refresh-principal",tenantId:"99999999-9999-9999-9999-999999999999"},
       ]) {
         authFixture.revalidatedUser=revalidatedUser;
-        cookie=await roleCookie("refresh-principal",["AgentControl.Reader"],0);
+        cookie=await roleCookie("refresh-principal",["AgentControl.Viewer"],0);
         expect((await request("/api/me")).status).toBe(401);
       }
     } finally {
-      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"]};
+      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
       cookie=originalCookie;
     }
   });
+  it("applies authoritative demotion and complete role revocation before protected work", async () => {
+    const originalCookie = cookie;
+    try {
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "demoted-principal", displayName: "Demoted", username: "demoted@example.invalid", roles: ["AgentControl.Viewer"] };
+      const adminSession = await roleCookie("demoted-principal", ["AgentControl.Admin"], 0);
+      expect((await request("/api/agents", { headers: { Cookie: adminSession } })).status).toBe(200);
+      expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: adminSession, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+
+      authFixture.revalidatedUser = { ...authFixture.revalidatedUser, roles: [] };
+      const viewerSession = await roleCookie("demoted-principal", ["AgentControl.Viewer"], 0);
+      expect((await request("/api/agents", { headers: { Cookie: viewerSession } })).status).toBe(403);
+    } finally {
+      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      cookie = originalCookie;
+    }
+  });
   it("does not restore a held role refresh after account logout", async () => {
-    const staleCookie=await roleCookie("race-principal",["AgentControl.Reader"],0);
-    const logoutCookie=await roleCookie("race-principal",["AgentControl.Reader"]);
+    const staleCookie=await roleCookie("race-principal",["AgentControl.Viewer"],0);
+    const logoutCookie=await roleCookie("race-principal",["AgentControl.Viewer"]);
     let release!: () => void;
     authFixture.pendingRevalidation=new Promise<void>(resolve => { release=resolve; });
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"race-principal",displayName:"Race",username:"race@example.invalid",roles:["AgentControl.Reader"]};
+    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"race-principal",displayName:"Race",username:"race@example.invalid",roles:["AgentControl.Viewer"]};
     const started=authFixture.revalidationStarted;
     const staleRequest=request("/api/me",{headers:{Cookie:staleCookie}});
     await vi.waitFor(() => expect(authFixture.revalidationStarted).toBe(started+1));
@@ -1506,7 +1641,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await staleRequest).status).toBe(401);
     expect((await fixture.runtime.query("SELECT 1 FROM sessions WHERE principal_id='race-principal'")).rowCount).toBe(0);
     authFixture.pendingRevalidation=undefined;
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader","AgentControl.Operator","AgentControl.SecurityReader","AgentControl.Administrator"]};
+    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
   });
   it("deletes legacy sessions without a role-bearing user shape", async () => {
     const sid=randomUUID();

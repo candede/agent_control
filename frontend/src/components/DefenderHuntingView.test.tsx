@@ -63,18 +63,18 @@ function inventoryPage(sourceJob: DefenderHuntingJob, agentName: string): Defend
     byteCount: sourceJob.byteCount, expiresAt: sourceJob.expiresAt } };
 }
 
-function context(available = true, roles = ["AgentControl.SecurityReader", "AgentControl.Administrator"] as const) {
+function context(available = true, roles = ["AgentControl.Admin"] as const) {
   return { user: { homeAccountId: "security-a", tenantId: "tenant-a", displayName: "Security", username: "security@example.invalid", roles: [...roles] }, loading: false,
     now: Date.parse("2026-09-09T11:02:00.000Z"), reload: vi.fn(async () => undefined), openPermissions: vi.fn(),
     views: ["delegated", "application"].map(mode => ({ definition: { id: `defender.hunting.${mode}`, displayName: "Defender hunting", purpose: "Hunt", provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: "https://graph.microsoft.com",
-      mode, permissions: ["ThreatHunting.Read.All"], providerRoles: [], licenses: [], configuration: [], sources: [], dataClass: "hunting", internalRoles: ["AgentControl.SecurityReader"],
+      mode, permissions: ["ThreatHunting.Read.All"], providerRoles: [], licenses: [], configuration: [], sources: [], dataClass: "hunting", internalRoles: ["AgentControl.Viewer"],
       probe: { kind: "live_qualification", adapterRegistered: true, description: "bounded" } },
       decision: { capabilityId: `defender.hunting.${mode}`, status: available ? "available" : "unknown", authorized: available, fresh: available,
         checkedAt: available ? "2026-09-09T11:00:00.000Z" : undefined, expiresAt: available ? "2026-09-09T11:05:00.000Z" : undefined,
         previewQualification: "not_required", remediation: available ? [] : ["Run one approved qualification."] } })) } as never;
 }
 
-function renderView(available = true, roles?: readonly ("AgentControl.SecurityReader" | "AgentControl.Administrator")[]) {
+function renderView(available = true, roles?: readonly ("AgentControl.Viewer" | "AgentControl.Admin")[]) {
   if (!available) vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({ ...catalog, qualifications: [] });
   return render(<CapabilityContext value={context(available, roles as never)}><DefenderHuntingView /></CapabilityContext>);
 }
@@ -138,13 +138,15 @@ describe("DefenderHuntingView", () => {
     expect(submitted).not.toHaveProperty("workspaceId");
   });
 
-  it("requires explicit administrator acknowledgement and a separate run for qualification", async () => {
+  it("keeps explicit application qualification approval and run separate", async () => {
     const approved = job({ status: "waiting_authorization", complete: false, noData: false, snapshotId: null, canResume: true, qualification: {
-      capabilityId: "defender.hunting.delegated", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });
+      capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });
     vi.mocked(approveDefenderHuntingQualification).mockResolvedValue(approved);
     vi.mocked(startDefenderHuntingQualification).mockResolvedValue({ ...approved, status: "running" });
-    renderView(false);
-    await screen.findByText("Live hunting is not qualified");
+    renderView(false, ["AgentControl.Admin"]);
+    await screen.findByText("Delegated authorization is not ready");
+    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
+    await screen.findByText("Shared application hunting is not qualified");
     const approve = screen.getByRole("button", { name: /Approve qualification/ });
     expect(approve).toBeDisabled();
     fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
@@ -195,12 +197,15 @@ describe("DefenderHuntingView", () => {
     expect(screen.getByText("Exact entra_agent_id")).toBeVisible();
   });
 
-  it("keeps qualification unavailable to SecurityReader without Administrator", async () => {
-    renderView(false, ["AgentControl.SecurityReader"]);
-    await screen.findByText("Live hunting is not qualified");
+  it("removes delegated qualification ritual while retaining own-scope revoke and Admin-only application setup", async () => {
+    renderView(false, ["AgentControl.Viewer"]);
+    await screen.findByText("Delegated authorization is not ready");
+    expect(screen.queryByRole("button", { name: /Approve qualification/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Revoke saved-data access/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
     expect(screen.queryByRole("button", { name: /Approve qualification/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Revoke saved-data access/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
   });
 
   it("revokes the exact retained scope and refreshes saved visibility", async () => {
@@ -219,11 +224,12 @@ describe("DefenderHuntingView", () => {
     }
   });
 
-  it("does not let broad capability availability or sibling evidence authorize another template", async () => {
+  it("does not let sibling evidence authorize another application template", async () => {
     vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({ ...catalog, qualifications: [{ ...catalog.qualifications[0], templateId: "agent_activity",
       approvedScope: { templateId: "agent_activity", agentIds: [], blueprintIds: [], actorObjectIds: [], operations: ["InferenceCall", "InvokeAgent"] } }] });
     renderView();
-    expect(await screen.findByText("Live hunting is not qualified")).toBeVisible();
+    fireEvent.change(await screen.findByLabelText("Authorization"), { target: { value: "application" } });
+    expect(await screen.findByText("Shared application hunting is not qualified")).toBeVisible();
     expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
@@ -232,7 +238,9 @@ describe("DefenderHuntingView", () => {
     let resolveApproval!: (value: DefenderHuntingJob) => void;
     vi.mocked(approveDefenderHuntingQualification).mockReturnValue(new Promise(resolve => { resolveApproval = resolve; }));
     const approvalView = renderView(false);
-    await screen.findByText("Live hunting is not qualified");
+    await screen.findByText("Delegated authorization is not ready");
+    fireEvent.change(screen.getByLabelText("Authorization"), { target: { value: "application" } });
+    await screen.findByText("Shared application hunting is not qualified");
     fireEvent.change(screen.getByLabelText("Agent IDs"), { target: { value: "agent-before-approval" } });
     fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
     fireEvent.click(screen.getByRole("button", { name: /Approve qualification/ }));
@@ -247,7 +255,7 @@ describe("DefenderHuntingView", () => {
     vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
     vi.mocked(submitDefenderHunt).mockReturnValue(new Promise(resolve => { resolveSearch = resolve; }));
     renderView();
-    await screen.findByText("Current qualification evidence permits an explicit hunt.");
+    await screen.findByText("Delegated authorization permits an explicit bounded hunt.");
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     fireEvent.change(screen.getByLabelText("Agent IDs"), { target: { value: "agent-after-search" } });

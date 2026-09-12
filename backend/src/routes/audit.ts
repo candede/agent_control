@@ -42,7 +42,7 @@ const auditStatuses = new Set<AuditStatus>([
 ]);
 const auditScopes = new Set<AuditScope>(["single", "bulk"]);
 
-policyRoute(auditRouter, "get", "/audit/events", { access: "authenticated", dataClass: "local_audit", roles: ["AgentControl.SecurityReader"] }, async (request, response, next) => {
+policyRoute(auditRouter, "get", "/audit/events", { access: "authenticated", dataClass: "local_audit", roles: ["AgentControl.Viewer"] }, async (request, response, next) => {
   try {
     const auditLog = getAuditLog(requestScope(request));
     const query = parseAuditEventsQuery(request.query);
@@ -78,7 +78,7 @@ export function parseAuditEventsQuery(query: Record<string, unknown>) {
 }
 
 policyRoute(auditRouter, "post", "/audit/events/export.csv", {
-  access: "authenticated", dataClass: "local_audit_export", roles: ["AgentControl.SecurityReader"], csrf: true,
+  access: "authenticated", dataClass: "local_audit_export", roles: ["AgentControl.Viewer"], csrf: true,
 }, async (request, response) => {
   const ids: unknown = request.body?.ids;
   if (!Array.isArray(ids) || !ids.length || ids.length > 100
@@ -88,7 +88,7 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", {
   }
   const deadlineAt = Date.now() + 15_000;
   const audit = getAuditLog(requestScope(request));
-  const validateSession = createExportPublicationValidator(request, "AgentControl.SecurityReader");
+  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
   const receipt = await audit.startEvent({ operationId: `export-administrative-audit:${randomUUID()}`, action: "export-administrative-audit",
     scope: "bulk", agentId: "local-administrative-audit", actor: request.session.user!, requestPath: request.path,
     metadata: { source: "local_administrative_audit" } });

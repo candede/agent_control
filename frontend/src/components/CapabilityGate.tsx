@@ -1,6 +1,7 @@
 import { cloneElement, useId, type ButtonHTMLAttributes, type ReactElement } from "react";
 import { ShieldCheck } from "lucide-react";
 import type { AppRole, CapabilityId } from "../api/client";
+import { hasRole } from "../authorization";
 import { capabilityExplanation, providerActionAllowed } from "../capabilityState";
 import { useCapabilityContext } from "../capabilityContext";
 
@@ -11,7 +12,7 @@ export function CapabilityGate({ capability, roles, write = false, compact = fal
   const context = useCapabilityContext();
   const descriptionId = useId();
   const view = context.views.find(item => item.definition.id === capability);
-  const roleAllowed = !roles || roles.some(role => context.user?.roles.includes(role));
+  const roleAllowed = !roles || roles.some(role => hasRole(context.user, role));
   const allowed = roleAllowed && (!capability || providerActionAllowed(view, write, context.now));
   const explanation = !roleAllowed ? `Requires ${roles!.join(" or ")}.` : view ? capabilityExplanation(view, context.now)
     : context.loading ? "Checking capability status." : "Capability status is unavailable. Open Permissions to retry.";

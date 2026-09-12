@@ -6,6 +6,7 @@ getDefenderHuntingCatalog, getDefenderHuntingJob, getDefenderHuntingJobs, getDef
   submitDefenderHunt, revokeDefenderHuntingRetainedScope, type DefenderHuntingCatalog, type DefenderHuntingFilters, type DefenderHuntingJob, type DefenderHuntingRow,
   type DefenderHuntingRowPage, type DefenderHuntingTokenMode, type DefenderInventoryDetailState } from "../api/client";
 import { hasRole } from "../authorization";
+import { providerActionAllowed } from "../capabilityState";
 import { useCapabilityContext } from "../capabilityContext";
 import { parseSecurityRoute, securityRouteSearch, workbenchUrl } from "../workbenchRouting";
 
@@ -58,7 +59,8 @@ function DefenderHuntingSession() {
 
   const capabilityId = tokenMode === "delegated" ? "defender.hunting.delegated" : "defender.hunting.application";
   const capabilityView = capability.views.find(view => view.definition.id === capabilityId);
-  const canQualify = hasRole(capability.user, "AgentControl.SecurityReader") && hasRole(capability.user, "AgentControl.Administrator");
+  const applicationMode = tokenMode === "application";
+  const canQualify = applicationMode && hasRole(capability.user, "AgentControl.Admin");
   const filters = makeFilters({ templateId, startDateTime, endDateTime, agentIds, blueprintIds, actorObjectIds, operations });
   const qualification = filters && catalog?.qualifications.find(evidence => evidence.capabilityId === capabilityId
     && evidence.templateId === filters.templateId && equalQualificationScope(evidence.approvedScope, filters)
@@ -66,7 +68,14 @@ function DefenderHuntingSession() {
   const retainedScope = filters && catalog?.retainedScopes.find(scope => scope.capabilityId === capabilityId
     && scope.templateId === filters.templateId && equalQualificationScope(scope.approvedScope, filters)
     && scope.queryVersion === 3 && scope.revokedAt === null && Date.parse(scope.expiresAt) > capability.now);
-  const available = Boolean(qualification && retainedScope);
+  const canRevokeRetainedScope = retainedScope
+    ? retainedScope.tokenMode === "delegated"
+      ? hasRole(capability.user, "AgentControl.Viewer")
+      : hasRole(capability.user, "AgentControl.Admin")
+    : false;
+  const available = applicationMode
+    ? Boolean(qualification && retainedScope)
+    : providerActionAllowed(capabilityView, false, capability.now);
   const rangeError = rangeMessage(filters, catalog);
   const operationError = templateId !== "agents_inventory" && operations.length === 0 ? "Select at least one operation." : undefined;
   const qualificationTargetError = filters && !filters.agentIds.length && !filters.blueprintIds.length && !filters.actorObjectIds.length
@@ -346,7 +355,7 @@ function DefenderHuntingSession() {
 
       {retainedScope ? <section className="hunting-qualification" aria-label="Retained hunting scope"><div><strong>Exact saved-data scope approved</strong>
         <p>Saved history remains readable until {formatDateTime(retainedScope.expiresAt)} while this local approval, current role and configuration remain valid.</p></div>
-        {canQualify ? <div className="hunting-qualification-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void handleRevokeRetainedScope()}><Trash2 aria-hidden="true" /> Revoke saved-data access</button></div> : null}
+        {canRevokeRetainedScope ? <div className="hunting-qualification-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void handleRevokeRetainedScope()}><Trash2 aria-hidden="true" /> Revoke saved-data access</button></div> : null}
       </section> : null}
 
       <form className="hunting-form" onSubmit={handleSearch}>
@@ -368,19 +377,23 @@ function DefenderHuntingSession() {
           {templateId !== "agents_inventory" ? <TextFilter label="Actor object IDs" value={actorObjectIds} onChange={value => { setActorObjectIds(value); invalidateApproval(); }} /> : null}
         </div></details>
 
-        {rangeError || operationError || !available && qualificationTargetError
+        {rangeError || operationError || applicationMode && !available && qualificationTargetError
           ? <div className="error-banner" role="alert">{rangeError ?? operationError ?? qualificationTargetError}</div> : null}
 
-        {!available ? <section className="hunting-qualification" aria-label="Hunting qualification required"><div><strong>Live hunting is not qualified</strong>
+        {!available && applicationMode ? <section className="hunting-qualification" aria-label="Hunting qualification required"><div><strong>Shared application hunting is not qualified</strong>
           {(capabilityView?.decision.remediation ?? ["Open Permissions to review the exact Defender hunting contract."]).map(item => <p key={item}>{item}</p>)}</div>
           <div className="hunting-qualification-actions"><button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
             {canQualify ? <label><input type="checkbox" checked={approvalAcknowledged} onChange={event => setApprovalAcknowledged(event.target.checked)} /><span>Approve one bounded fixed-template provider query</span></label> : null}
             {canQualify ? <button type="button" disabled={!approvalAcknowledged || !filters || Boolean(rangeError || operationError || qualificationTargetError || busy)} onClick={() => void handleApprove()}><ShieldCheck aria-hidden="true" /> Approve qualification</button> : null}
-            {approvedJob?.qualification && approvedJob.status === "waiting_authorization" ? <button type="button" disabled={Boolean(busy)} onClick={() => void handleStartQualification()}><Play aria-hidden="true" /> Run approved qualification</button> : null}
-          </div></section> : null}
+            {canQualify && approvedJob?.qualification && approvedJob.status === "waiting_authorization" ? <button type="button" disabled={Boolean(busy)} onClick={() => void handleStartQualification()}><Play aria-hidden="true" /> Run approved qualification</button> : null}
+          </div></section> : !available ? <section className="hunting-qualification" aria-label="Hunting authorization pending"><div><strong>Delegated authorization is not ready</strong>
+            <p>Automatic safe permission checks run while this signed-in session is active. They never submit a hunting query.</p></div>
+            <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
+          </section> : null}
 
         <div className="hunting-search-actions"><WorkbenchActionGate actionId="defender.search"><button type="submit" disabled={!available || !filters || Boolean(rangeError || operationError || busy)}><Search aria-hidden="true" /> Run hunt</button></WorkbenchActionGate>
-          <span>{available ? "Current qualification evidence permits an explicit hunt." : "Provider requests remain disabled until one approved qualification succeeds."}</span></div>
+          <span>{available ? applicationMode ? "Current shared qualification permits an explicit hunt." : "Delegated authorization permits an explicit bounded hunt."
+            : applicationMode ? "Provider requests remain disabled until shared application qualification succeeds." : "Provider requests remain disabled until automatic permission checks establish delegated authorization."}</span></div>
       </form>
 
       <section className="hunting-history" aria-labelledby="hunting-history-title"><header><div><h3 id="hunting-history-title">Hunting history</h3><p>Delegated results remain principal-private. Application results use only the current approved shared scope.</p></div><span>{historyCount.toLocaleString()} jobs</span></header>

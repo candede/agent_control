@@ -4,6 +4,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
+import type { AppRole } from "../types/capability.js";
 
 const PgSessionStore = connectPgSimple(session);
 
@@ -57,11 +58,12 @@ export async function assertCurrentStoredSession(
   sessionId: string,
   tenantId: string,
   principalId: string,
-  requiredRole: string,
+  requiredRole: AppRole,
 ) {
   const result = await database.query(`SELECT 1 FROM sessions
     WHERE sid=$1 AND tenant_id=$2 AND principal_id=$3 AND expire>clock_timestamp()
-      AND jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),$4)`,
+      AND (jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),$4)
+        OR ($4='AgentControl.Viewer' AND jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),'AgentControl.Admin')))`,
   [sessionId, tenantId, principalId, requiredRole]);
   if (result.rowCount !== 1) throw AppError.unauthorized("The export session or required role is no longer current.");
 }

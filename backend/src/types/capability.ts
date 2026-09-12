@@ -1,11 +1,13 @@
 export const appRoles = [
-  "AgentControl.Reader",
-  "AgentControl.Operator",
-  "AgentControl.SecurityReader",
-  "AgentControl.Administrator",
+  "AgentControl.Viewer",
+  "AgentControl.Admin",
 ] as const;
 
 export type AppRole = (typeof appRoles)[number];
+
+export function hasAppRole(roles: readonly AppRole[], role: AppRole): boolean {
+  return roles.includes(role) || (role === "AgentControl.Viewer" && roles.includes("AgentControl.Admin"));
+}
 
 export const capabilityIds = [
   "graph.package.read.delegated",
@@ -15,6 +17,7 @@ export const capabilityIds = [
   "graph.package.reassign.manage",
   "graph.directory.read",
   "powerPlatform.inventory.read",
+  "powerPlatform.quarantine.read",
   "powerPlatform.quarantine.manage",
   "purview.audit.search.delegated",
   "purview.audit.search.application",
@@ -64,7 +67,7 @@ export type CapabilityDefinition = {
   internalRoles: AppRole[];
   consentGroup?: string;
   probe: {
-    kind: "provider_read" | "live_qualification" | "local_policy" | "qualification_only" | "not_registered";
+    kind: "provider_read" | "live_qualification" | "local_policy" | "on_demand" | "not_registered";
     adapterRegistered: boolean;
     description: string;
   };
@@ -75,15 +78,28 @@ export type CapabilityDecision = {
   status: CapabilityStatus;
   authorized: boolean;
   fresh: boolean;
+  verification?: "local" | "token" | "provider" | "qualification" | "on_demand";
   checkedAt?: string;
   expiresAt?: string;
   lastSuccessAt?: string;
   previewQualification: "not_required" | "unqualified" | "qualified";
-  evidence?: { category?: string; correlationId?: string };
+  evidence?: {
+    category?: string;
+    correlationId?: string;
+    httpStatus?: number;
+    providerErrorCode?: string;
+    phase?: "token_acquisition" | "provider_read";
+    timeoutMs?: number;
+  };
   remediation: string[];
 };
 
 export type CapabilityView = {
   definition: CapabilityDefinition;
   decision: CapabilityDecision;
+  enabled?: boolean;
+  configuration?: {
+    enabled: boolean;
+    sharedDataScope: boolean;
+  };
 };

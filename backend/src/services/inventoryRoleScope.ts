@@ -17,11 +17,6 @@ const fullRoleIds = new Set<string>([
   inventoryProviderRoleIds.globalReader,
 ]);
 const aiRoleIds = new Set<string>([inventoryProviderRoleIds.aiAdministrator, inventoryProviderRoleIds.aiReader]);
-const quarantineRoleIds = new Set<string>([
-  inventoryProviderRoleIds.globalAdministrator,
-  inventoryProviderRoleIds.aiAdministrator,
-  inventoryProviderRoleIds.powerPlatformAdministrator,
-]);
 const relevantRoleIds = new Set<string>([...fullRoleIds, ...aiRoleIds]);
 const aiResourceTypes = new Set<PowerPlatformResourceType>([
   "microsoft.powerapps/codeapps",
@@ -47,10 +42,6 @@ export function inventoryRoleScope(user: Pick<AuthenticatedUser, "providerRoleId
 
 export function resourceTypesForInventoryScope(scope: InventoryRoleScope) {
   return scope === "ai" ? powerPlatformResourceTypes.filter(type => aiResourceTypes.has(type)) : [...powerPlatformResourceTypes];
-}
-
-export function quarantineProviderRoleAuthorized(user: Pick<AuthenticatedUser, "providerRoleIds">) {
-  return normalizeInventoryProviderRoleIds(user.providerRoleIds).some(roleId => quarantineRoleIds.has(roleId));
 }
 
 function ordinal(left: string, right: string) {

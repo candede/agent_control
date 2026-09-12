@@ -13,8 +13,8 @@ import { transaction } from "./pool.js";
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let qualifications: PackageMutationQualificationRepository;
 let jobs: JobRepository;
-const administrator: AuthenticatedUser = { homeAccountId: "admin-1", tenantId: "tenant-1", displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Administrator"] };
-const operator: AuthenticatedUser = { homeAccountId: "operator-1", tenantId: "tenant-1", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Operator"] };
+const administrator: AuthenticatedUser = { homeAccountId: "admin-1", tenantId: "tenant-1", displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
+const operator: AuthenticatedUser = { homeAccountId: "operator-1", tenantId: "tenant-1", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
 const prestate = { kind: "block" as const, isBlocked: false };
 const poststate = { kind: "block" as const, isBlocked: true };
 
@@ -30,7 +30,7 @@ afterAll(async () => { await fixture?.close(); });
 
 describe("Package mutation qualifications", () => {
   it("requires separate approvals and durable verification of both exact directions", async () => {
-    await expect(qualifications.createApproved({ ...administrator, roles: ["AgentControl.Operator"] }, qualificationInput())).rejects.toMatchObject({ code: "missing_internal_role" });
+    await expect(qualifications.createApproved({ ...administrator, roles: [] }, qualificationInput())).rejects.toMatchObject({ code: "missing_internal_role" });
     const approvals = await createApprovals("package-1");
     expect(approvals.original).toMatchObject({ status: "approved", action: "block", workflowVersion: 3, actorPrincipalId: null, approvedByPrincipalId: "admin-1" });
     await expect(qualifications.claimCycle({ ...operator, homeAccountId: "admin-1" }, approvals.original.id, approvals.restoration.id, identity(), identity())).rejects.toMatchObject({ code: "separate_approval_required" });

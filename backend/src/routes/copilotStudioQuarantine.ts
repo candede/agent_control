@@ -16,7 +16,7 @@ import { policyRoute } from "./policy.js";
 export const copilotStudioQuarantineRouter = Router();
 const inventoryRepository = new PowerPlatformInventoryRepository();
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/targets", { access: "authenticated", dataClass: "copilot_studio_quarantine_target", roles: ["AgentControl.Operator"] }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/targets", { access: "authenticated", dataClass: "copilot_studio_quarantine_target", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await inventoryRepository.listQuarantineTargets(requestScope(request), {
     search: optionalSearch(first(request.query.search)),
     limit: positiveInteger(first(request.query.limit), 50, 100),
@@ -24,15 +24,15 @@ policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/targets", { acces
   }));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/status", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage" }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/status", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.quarantine.read" }, async (request, response) => {
   response.json(await copilotStudioQuarantineControl.status(request.session.user!, requiredUuid(first(request.query.snapshotId), "snapshotId"), requiredNativeId(first(request.query.nativeId)), first(request.query.force) === "true"));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/preview", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/preview", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
   response.json(await copilotStudioQuarantineControl.preview(request.session.user!, parseIntent(request.body, false)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_control", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_control", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
   const intent = parseIntent(request.body, true);
   response.status(202).json(await copilotStudioQuarantineControl.submit(request.session.user!, {
     ...intent,
@@ -41,28 +41,28 @@ policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs", { access:
   }));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Operator"] }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/jobs", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await copilotStudioQuarantineJobs.list(requestScope(request), positiveInteger(first(request.query.limit), 20, 50)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/audit", { access: "authenticated", dataClass: "copilot_studio_quarantine_audit", roles: ["AgentControl.SecurityReader"] }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/audit", { access: "authenticated", dataClass: "copilot_studio_quarantine_audit", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await copilotStudioQuarantineJobs.listAudit(requestScope(request), positiveInteger(first(request.query.limit), 100, 500)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/jobs/:id", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Operator"] }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/jobs/:id", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   await copilotStudioQuarantineJobs.recoverInterrupted();
   const job = await copilotStudioQuarantineJobs.get(requestScope(request), requiredUuid(request.params.id, "job ID"));
   if (!job) throw new AppError(404, "not_found", "Quarantine job was not found.");
   response.json(job);
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/cancel", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Operator"], csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/cancel", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const job = await cancelCopilotStudioQuarantineJob(requestScope(request), requiredUuid(request.params.id, "job ID"));
   if (!job) throw new AppError(404, "not_found", "Quarantine job was not found.");
   response.json(job);
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/resume", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/resume", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
   if (request.body?.confirmed !== true || Object.keys(request.body).length !== 1) throw new AppError(400, "confirmation_required", "Resume accepts only explicit confirmed true for unsent work.");
   const scope = requestScope(request);
   const id = requiredUuid(request.params.id, "job ID");
@@ -74,20 +74,20 @@ policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/resume"
   response.status(202).json(job);
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/reconcile", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/jobs/:id/reconcile", { access: "authenticated", dataClass: "copilot_studio_quarantine_job", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
   if (request.body && Object.keys(request.body).length) throw new AppError(400, "invalid_request", "Quarantine reconciliation does not accept mutation input.");
   response.json(await reconcileCopilotStudioQuarantineJob(requiredUuid(request.params.id, "job ID"), requestScope(request)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/canary-approvals", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Administrator"], csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/canary-approvals", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   response.status(201).json(await copilotStudioQuarantineCanaries.createApproval(request.session.user!, parseCanaryApproval(request.body)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/canary-approvals", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Administrator"] }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/canary-approvals", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Admin"] }, async (request, response) => {
   response.json(await copilotStudioQuarantineCanaryRepository.list(request.session.user!, positiveInteger(first(request.query.limit), 50, 100)));
 });
 
-policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/canary-approvals/:id/execute", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Operator"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
+policyRoute(copilotStudioQuarantineRouter, "post", "/quarantine/canary-approvals/:id/execute", { access: "authenticated", dataClass: "copilot_studio_quarantine_qualification", roles: ["AgentControl.Admin"], capabilityId: "powerPlatform.quarantine.manage", csrf: true }, async (request, response) => {
   const execution = parseCanaryExecution(request.body);
   response.json(await copilotStudioQuarantineCanaries.execute(request.session.user!, requiredUuid(request.params.id, "approval ID"), execution.restorationApprovalId));
 });

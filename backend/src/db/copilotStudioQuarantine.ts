@@ -148,16 +148,6 @@ export class CopilotStudioQuarantineRepository {
         requireMatchingSubmission(existing.rows[0], items.rows, identity);
         return existing.rows[0].id;
       }
-      if (!input.canaryApprovalId) {
-        const unqualified = await client.query(`SELECT 1 FROM jsonb_array_elements($5::jsonb) target WHERE NOT EXISTS (
-          SELECT 1 FROM copilot_quarantine_qualifications qualification WHERE qualification.tenant_id=$1
-            AND qualification.target_environment_id=target->>0 AND qualification.target_bot_id=target->>1
-            AND qualification.contract_revision=$2 AND qualification.permission_revision=$3 AND qualification.configuration_revision=$4
-            AND qualification.auth_mode='delegated' AND qualification.expires_at>clock_timestamp()) LIMIT 1`,
-        [scope.tenantId, input.authority.contractRevision, input.authority.permissionRevision, input.authority.configurationRevision,
-          JSON.stringify(confirmation.targets.map(target => [target.environmentId, target.botId]))]);
-        if (unqualified.rowCount) throw new AppError(409, "quarantine_write_unqualified", "Every exact quarantine target requires a current restored full-cycle qualification.");
-      }
       const targetValues = confirmation.targets.flatMap(target => [target.environmentId, target.botId]);
       const unresolved = await client.query(`SELECT 1 FROM copilot_quarantine_job_items item JOIN copilot_quarantine_jobs job ON job.id=item.job_id
         WHERE job.tenant_id=$1 AND job.expires_at>clock_timestamp() AND item.status='inconclusive' AND item.reconciliation_status='required'
@@ -475,12 +465,7 @@ export class CopilotStudioQuarantineRepository {
       [job.canary_approval_id, job.tenant_id, job.principal_id, job.id, item.environment_id, item.bot_id, job.action, item.prestate,
         item.requested_state, job.contract_revision, job.permission_revision, job.configuration_revision]);
       if (!approval.rowCount) throw new AppError(401, "qualification_invalidated", "The exact claimed quarantine canary approval is no longer current for dispatch.");
-      return;
     }
-    const qualification = await client.query(`SELECT 1 FROM copilot_quarantine_qualifications WHERE tenant_id=$1 AND target_environment_id=$2
-      AND target_bot_id=$3 AND contract_revision=$4 AND permission_revision=$5 AND configuration_revision=$6 AND auth_mode='delegated'
-      AND expires_at>clock_timestamp() LIMIT 1`, [job.tenant_id, item.environment_id, item.bot_id, job.contract_revision, job.permission_revision, job.configuration_revision]);
-    if (!qualification.rowCount) throw new AppError(409, "quarantine_write_unqualified", "This exact quarantine target is no longer qualified for provider dispatch.");
   }
 
   private async requireNoUnresolvedTarget(client: pg.PoolClient, tenantId: string, item: QuarantineItemRow) {

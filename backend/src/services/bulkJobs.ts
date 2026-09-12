@@ -7,10 +7,9 @@ import type { DataScope } from "./auditLog.js";
 import { GraphPackagesClient, updatePackageAccess, verifyPackageMutationConverged } from "./graphPackages.js";
 import { maintenanceActive } from "./maintenance.js";
 import { requireProviderAdmissions } from "./operationalState.js";
-import type { CapabilityId } from "../types/capability.js";
+import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
-import { requirePackageMutationOperationSafe } from "./packageMutationSafety.js";
 import { operationalLog } from "./telemetry.js";
 
 export const bulkJobs = new JobRepository();
@@ -117,7 +116,6 @@ export async function runBulkJob(
           if (job.access_update) {
             const accessAction = job.action;
             if (accessAction !== "update-availability" && accessAction !== "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package access action does not match its payload.");
-            requirePackageMutationOperationSafe(accessAction);
             const result = await updatePackageAccess(provider, accessToken, item.target_id, job.access_update, before, dispatch, readOptions);
             if (!result.changed) {
               await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1 }, scope, job.capability, authorize, signal);
@@ -225,7 +223,7 @@ async function authorizeDelegatedJob(scope: DataScope, capabilityId: CapabilityI
 async function authorizeReconciliation(scope: DataScope, capabilityId: CapabilityId) {
   const user = await revalidateAuthenticatedUser(scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The reconciliation actor no longer matches the signed-in account.");
-  if (!user.roles.includes("AgentControl.Operator")) throw new AppError(403, "missing_internal_role", "AgentControl.Operator is required to reconcile package mutations.");
+  if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to reconcile package mutations.");
   await capabilities.requireAvailable(capabilityId, user);
   return acquireDelegatedToken(scope.principalId, capabilityId);
 }

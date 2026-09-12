@@ -3,6 +3,7 @@ import { PowerPlatformInventoryRepository, type InventoryDataScope, type Invento
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { hasAppRole } from "../types/capability.js";
 import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import { capabilities } from "./capabilities.js";
 import { inventoryRoleScope, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
@@ -80,6 +81,16 @@ export class PowerPlatformInventoryService {
     return job;
   }
 
+  async cancel(user: AuthenticatedUser, id: string) {
+    requireReader(user);
+    const scope = dataScope(user);
+    const job = await this.repository.getJob(scope, id);
+    if (!job) throw new AppError(404, "not_found", "Inventory refresh job was not found.");
+    const cancelled = await this.repository.cancel(scope, id);
+    this.active.get(id)?.controller.abort(new AppError(409, "read_job_cancelled", "Inventory refresh was cancelled."));
+    return cancelled!;
+  }
+
   async recover() {
     return this.repository.recoverInterrupted();
   }
@@ -121,6 +132,10 @@ export class PowerPlatformInventoryService {
         await this.repository.publish(scope, id, result);
       });
     } catch (error) {
+      if (error instanceof AppError && error.code === "read_job_cancelled") {
+        await this.repository.cancel(scope, id);
+        return;
+      }
       if (isAuthorizationFailure(error)) {
         await this.repository.markWaitingAuthorization(scope, id);
         return;
@@ -139,7 +154,7 @@ function dataScope(user: AuthenticatedUser): InventoryDataScope {
 }
 
 function requireReader(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.Reader")) throw new AppError(403, "missing_internal_role", "Power Platform inventory refresh requires the Reader role.");
+  if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Power Platform inventory refresh requires the Viewer role.");
 }
 
 function requireSamePrincipal(scope: InventoryDataScope, user: AuthenticatedUser) {

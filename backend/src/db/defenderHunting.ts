@@ -166,13 +166,14 @@ export class DefenderHuntingRepository {
     return result.rows.map(projectRetainedScope);
   }
 
-  async revokeRetainedScope(scope: DefenderHuntingReadScope, id: string, revokedBy: string) {
-    if (!revokedBy || revokedBy.length > 256) throw new AppError(403, "scope_mismatch", "Hunting scope revocation requires an exact current administrator.");
+  async revokeRetainedScope(scope: DefenderHuntingReadScope, id: string, tokenMode: DefenderHuntingTokenMode, revokedBy: string) {
+    if (!revokedBy || revokedBy.length > 256) throw new AppError(403, "scope_mismatch", "Hunting scope revocation requires an exact current actor.");
     const read = retainedScopeWhere(scope, "retained");
     const result = await this.database.query<RetainedScopeRow>(`UPDATE defender_hunting_retained_scopes retained
-      SET revoked_at=clock_timestamp(),revoked_by=$${read.values.length + 2}
-      WHERE retained.id=$${read.values.length + 1} AND ${read.sql} AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
-      RETURNING retained.*`, [...read.values, id, revokedBy]);
+      SET revoked_at=clock_timestamp(),revoked_by=$${read.values.length + 3}
+      WHERE retained.id=$${read.values.length + 1} AND retained.token_mode=$${read.values.length + 2}
+        AND ${read.sql} AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp()
+      RETURNING retained.*`, [...read.values, id, tokenMode, revokedBy]);
     if (!result.rows[0]) throw new AppError(404, "not_found", "Current retained hunting scope was not found.");
     return projectRetainedScope(result.rows[0]);
   }
@@ -440,7 +441,7 @@ export class DefenderHuntingRepository {
     const identityScope = scope.inventoryIdentityScope;
     if (!identityScope) return rows.map(() => ({ status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const }));
     const allowed = new Set(resourceTypesForInventoryScope(identityScope.roleScope));
-    if (!identityScope.resourceTypes.length || identityScope.resourceTypes.some(value => !allowed.has(value))) throw new AppError(403, "scope_mismatch", "Hunting inventory association requires an exact current Reader identity scope.");
+    if (!identityScope.resourceTypes.length || identityScope.resourceTypes.some(value => !allowed.has(value))) throw new AppError(403, "scope_mismatch", "Hunting inventory association requires an exact current Viewer identity scope.");
     const candidates = await this.database.query<IdentityRow>(`SELECT DISTINCT resource.native_id COLLATE "C" AS native_id,resource.resource_type COLLATE "C" AS resource_type,
         resource.environment_id COLLATE "C" AS environment_id,resource.identifiers
       FROM power_platform_inventory_resources resource JOIN power_platform_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
@@ -479,7 +480,13 @@ export class DefenderHuntingRepository {
 
 function validateSubmissionBinding(scope: DefenderHuntingScope, filters: DefenderHuntingFilters,
   qualification?: DefenderHuntingQualificationBinding, retainedScope?: DefenderHuntingRetainedScopeBinding) {
-  if (Boolean(qualification) === Boolean(retainedScope)) {
+  if (!qualification && !retainedScope) {
+    if (scope.tokenMode !== "delegated") {
+      throw new AppError(400, "invalid_qualification", "Application hunting requires an exact retained-scope qualification.");
+    }
+    return;
+  }
+  if (qualification && retainedScope) {
     throw new AppError(400, "invalid_qualification", "Hunting requires exactly one qualification approval or retained-scope binding.");
   }
   if (retainedScope) {
@@ -579,7 +586,12 @@ function retainedAuthorityPredicate(scope: DefenderHuntingReadScope, alias: stri
 }
 
 function retainedVisibilityPredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
-  return (scope.qualifications ?? []).map(({ resultScope, authority }) => {
+  const principalOffset = values.length + 1;
+  values.push(scope.authorizationPrincipalId);
+  const ordinaryDelegated = `(${alias}.token_mode='delegated' AND ${alias}.result_scope_kind='principal'
+    AND ${alias}.result_scope_id=$${principalOffset} AND ${alias}.authorization_principal_id=$${principalOffset}
+    AND NOT ${alias}.is_qualification AND ${alias}.retained_scope_id IS NULL)`;
+  const qualified = (scope.qualifications ?? []).map(({ resultScope, authority }) => {
     const offset = values.length + 1;
     values.push(resultScope.kind, resultScope.scopeId, resultScope.configurationRevision, authority.capabilityId,
       authority.contractRevision, authority.permissionRevision, authority.configurationRevision, scope.authorizationPrincipalId);
@@ -598,7 +610,8 @@ function retainedVisibilityPredicate(scope: DefenderHuntingReadScope, alias: str
         AND retained.capability_id=$${offset + 3} AND retained.contract_revision=$${offset + 4}
         AND retained.permission_revision=$${offset + 5} AND retained.configuration_revision=$${offset + 6}
         AND retained.revoked_at IS NULL AND retained.expires_at>clock_timestamp())))`;
-  }).join(" OR ");
+  });
+  return [ordinaryDelegated, ...qualified].join(" OR ");
 }
 
 async function requireRetainedScope(client: Pick<pg.Pool | pg.PoolClient, "query">, scope: DefenderHuntingScope,

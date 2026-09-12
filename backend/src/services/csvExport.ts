@@ -2,7 +2,7 @@ import type { Request, Response } from "express";
 import { assertCurrentStoredSession, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
-import type { AppRole } from "../types/capability.js";
+import { hasAppRole, type AppRole } from "../types/capability.js";
 
 export type CsvExportBudget = {
   maximumRows: number;
@@ -15,13 +15,13 @@ export function createExportPublicationValidator(request: Request, requiredRole:
   const tenantId = user?.tenantId;
   const principalId = request.session.accountId;
   const sessionId = request.sessionID;
-  if (!user || !tenantId || !principalId || user.homeAccountId !== principalId || !user.roles.includes(requiredRole)) {
+  if (!user || !tenantId || !principalId || user.homeAccountId !== principalId || !hasAppRole(user.roles, requiredRole)) {
     throw AppError.unauthorized("The export requires a current authorized session.");
   }
   const validation = beginAccountSessionValidation(tenantId, principalId);
   return () => commitAccountSessionValidation(validation, async () => {
     if (request.session.accountId !== principalId || request.session.user?.tenantId !== tenantId
-      || request.session.user.homeAccountId !== principalId || !request.session.user.roles.includes(requiredRole)) {
+      || request.session.user.homeAccountId !== principalId || !hasAppRole(request.session.user.roles, requiredRole)) {
       throw AppError.unauthorized("The export session or required role is no longer current.");
     }
     await assertCurrentStoredSession(pool, sessionId, tenantId, principalId, requiredRole);

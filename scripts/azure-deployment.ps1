@@ -1,5 +1,7 @@
 #requires -Version 7.0
 
+$script:ReleaseSchemaVersion = 27
+
 $script:RequiredSecretNames = @(
     'agent-control-tenant-id',
     'agent-control-client-id',
@@ -94,10 +96,10 @@ function Test-ApprovedQualificationTargets {
         [string]::IsNullOrWhiteSpace([string]$Qualification.restorationOwner)) {
         throw 'Qualification expiry/restoration ownership is invalid.'
     }
-    $roles = @('AgentControl.Reader', 'AgentControl.Operator', 'AgentControl.SecurityReader', 'AgentControl.Administrator')
+    $roles = @('AgentControl.Viewer', 'AgentControl.Admin')
     foreach ($persona in @($Qualification.personas)) {
         Assert-GuidValue $persona.principalObjectId 'Qualification principalObjectId'
-        if (-not @($persona.appRoles).Count -or @($persona.appRoles | Where-Object { $_ -notin $roles }).Count) {
+        if (-not @($persona.appRoles).Count -or @($persona.appRoles | Where-Object { $_ -cnotin $roles }).Count) {
             throw 'Qualification persona contains an unknown or empty role set.'
         }
     }
@@ -186,7 +188,7 @@ function Test-ApprovedAzureTarget {
     if ($Target.installationMode -ne 'fresh' -and $Target.firstInstallApproved -eq $true) {
         throw 'Existing-target deployment cannot also approve fresh initialization.'
     }
-    if ($Target.expectedSchemaVersion -ne 26) { throw 'The approved baseline must name immutable schema version 26.' }
+    if ($Target.expectedSchemaVersion -notin @(26, $script:ReleaseSchemaVersion)) { throw 'The approved baseline must name schema version 26 (role cutover) or 27 (current release).' }
     if ($Target.installationMode -eq 'legacy_import') {
         if (-not $Target.legacyAuditBackupPath -or $Target.legacyAuditBackupSha256 -notmatch '^[a-f0-9]{64}$') {
             throw 'Legacy import requires one bounded SQLite-safe backup path and exact checksum.'
@@ -626,18 +628,23 @@ function Invoke-RealAzureOperation {
             $app = Get-AzJson @('ad', 'app', 'show', '--id', $target.entraApplicationId)
             $manifest = Get-Content -LiteralPath (Join-Path $Context.Root 'infra/entra-app-manifest.json') -Raw | ConvertFrom-Json
             $expectedRoles = @($manifest.appRoles.value | Sort-Object)
-            $actualRoles = @($app.appRoles | Where-Object isEnabled | ForEach-Object value | Sort-Object)
-            if (@(Compare-Object $expectedRoles $actualRoles).Count -or $target.callbackUri -notin @($app.web.redirectUris)) {
+            $enabledRoles = @($app.appRoles | Where-Object isEnabled)
+            $actualRoles = @($enabledRoles | ForEach-Object value | Sort-Object)
+            if (@(Compare-Object $expectedRoles $actualRoles -CaseSensitive).Count -or
+                @($enabledRoles | Where-Object { ($_.allowedMemberTypes -join ',') -cne 'User' }).Count -or
+                $target.callbackUri -notin @($app.web.redirectUris)) {
                 Write-Host "Registration preview requires exactly these role values: $($expectedRoles -join ', ')"
                 Write-Host "Registration preview requires callback: $($target.callbackUri)"
-                throw 'Registration differs from the approved four-role/callback preview. Apply the displayed administrator-owned change, then rerun; the wizard never writes directory configuration.'
+                throw 'Registration differs from the approved two-role Users/Groups/callback preview. Apply the displayed administrator-owned change, then rerun; the wizard never writes directory configuration.'
             }
             $servicePrincipals = Get-AzJson @('ad', 'sp', 'list', '--filter', "appId eq '$($target.entraApplicationId)'")
             if (@($servicePrincipals).Count -ne 1) { throw 'The exact application service principal is missing or ambiguous.' }
-            $administratorRole = @($manifest.appRoles | Where-Object value -eq 'AgentControl.Administrator')
+            if ($servicePrincipals[0].appRoleAssignmentRequired -ne $true) { throw 'Set Assignment required to Yes on the enterprise application before deployment.' }
+            $administratorRole = @($enabledRoles | Where-Object value -CEQ 'AgentControl.Admin')
+            Assert-GuidValue $administratorRole[0].id 'Admin app role ID'
             $assignments = Get-AzJson @('rest', '--method', 'get', '--url',
                 "https://graph.microsoft.com/v1.0/servicePrincipals/$($servicePrincipals[0].id)/appRoleAssignedTo?`$filter=appRoleId%20eq%20$($administratorRole[0].id)&`$select=id,principalType")
-            if (@($assignments.value).Count -lt 1) { throw 'At least one approved AgentControl.Administrator assignment is required.' }
+            if (@($assignments.value).Count -lt 1) { throw 'At least one approved AgentControl.Admin assignment is required.' }
             return @{ roleCount = $actualRoles.Count; callbackVerified = $true; directoryWrites = 0; administratorAssignmentCount = @($assignments.value).Count }
         }
         'qualification_preflight' {
@@ -1011,7 +1018,7 @@ function Invoke-RealAzureOperation {
             }
             if ($Context.Completed.Contains('resource_deploy')) {
                 $mode = if ($Context.Completed.Contains('database_migrate')) { 'upgrade' } else { 'fresh' }
-                $version = if ($mode -eq 'upgrade') { [string]$target.expectedSchemaVersion } else { '0' }
+                $version = if ($mode -eq 'upgrade') { [string]$script:ReleaseSchemaVersion } else { '0' }
                 Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $mode, $version) `
                     -ServerName $Context.ServingServerName | Out-Null
             }

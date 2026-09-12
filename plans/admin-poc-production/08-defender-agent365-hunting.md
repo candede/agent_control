@@ -62,6 +62,6 @@ Create `plans/admin-poc-production/completions/08-defender-agent365-hunting.md` 
 
 ## Done conditions
 
-- Curated manual hunting is fixture-complete, scoped and source-provenanced, live-qualified or truthfully disabled with evidence.
+- Curated manual hunting is fixture-complete, scoped and source-provenanced. Ordinary delegated investigations establish evidence through the explicit request without prior qualification; actual provider limitations are reported truthfully. Application/shared mode retains its separate Admin approval and qualification.
 - Only needed allowed fields are retained; exact IDs and incomplete coverage remain honest.
 - Phase 09 can reuse established auth/jobs and Phase 10 can consume typed hunting results without collector infrastructure.

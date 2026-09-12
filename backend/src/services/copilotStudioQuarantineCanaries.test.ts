@@ -19,8 +19,8 @@ beforeAll(async () => { fixture = await testDatabase(); canaries = new CopilotSt
 afterAll(async () => { await fixture?.close(); });
 
 function users(tenantId: string) {
-  const administrator: AuthenticatedUser = { tenantId, homeAccountId: randomUUID(), displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Administrator"] };
-  const operator: AuthenticatedUser = { tenantId, homeAccountId: randomUUID(), displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Operator"] };
+  const administrator: AuthenticatedUser = { tenantId, homeAccountId: randomUUID(), displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
+  const operator: AuthenticatedUser = { tenantId, homeAccountId: randomUUID(), displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
   return { administrator, operator };
 }
 

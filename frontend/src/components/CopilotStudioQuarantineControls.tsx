@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Ban, CheckCircle2, CircleOff, RefreshCw, RotateCw, ShieldAlert, X } from "lucide-react";
+import { Ban, CheckCircle2, CircleOff, RefreshCw, RotateCw, X } from "lucide-react";
 import {
   cancelQuarantineJob,
   getQuarantineJob,
@@ -16,6 +16,7 @@ import {
 } from "../api/client";
 import { quarantineTargetReason, type QuarantineSelectableTarget, type QuarantineSelectionSnapshot } from "../quarantineTarget";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { CapabilityGate } from "./CapabilityGate";
 
 type Props = {
   snapshot: QuarantineSelectionSnapshot | null;
@@ -139,7 +140,7 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
   }
 
   async function beginPreview(action: QuarantineAction) {
-    if (!snapshot || !eligible) return;
+    if (!snapshot || !eligible || !canManage) return;
     const requestedSelectionKey = selectionKey;
     const requestedSelectionRevision = selectionRevision.current;
     const snapshotId = snapshot.id;
@@ -160,7 +161,7 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
   }
 
   async function submit() {
-    if (!frozenPreview || frozenPreview.selectionKey !== selectionKey || !confirmed || !frozenPreview.preview.qualification.qualified) return;
+    if (!frozenPreview || frozenPreview.selectionKey !== selectionKey || !confirmed || !eligible || !canManage) return;
     const requestedSelectionKey = frozenPreview.selectionKey;
     setBusyKey(requestedSelectionKey);
     setBoundError(undefined);
@@ -188,20 +189,20 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
     const disabledReason = quarantineTargetReason(resource, snapshot, eligibilityNow);
     return <section className="inventory-detail-section quarantine-control" aria-labelledby="quarantine-control-title">
       <div className="quarantine-control-heading"><div><h3 id="quarantine-control-title">Copilot Studio quarantine</h3><p>Direct provider state and saved inventory state remain independent.</p></div>
-        <WorkbenchActionGate actionId="quarantine.change" compact>
+        <CapabilityGate capability="powerPlatform.quarantine.read" roles={["AgentControl.Viewer"]} compact>
           <button type="button" className="secondary" disabled={Boolean(disabledReason) || busy} onClick={() => void loadStatus(Boolean(status))}><RefreshCw aria-hidden="true" /> {status ? "Recheck direct status" : "Check direct status"}</button>
-        </WorkbenchActionGate>
+        </CapabilityGate>
       </div>
       {disabledReason ? <p className="quarantine-disabled"><CircleOff aria-hidden="true" /> {disabledReason}</p> : null}
       <StatusComparison status={status} resource={resource} snapshot={snapshot} />
       <p className="quarantine-maker-note">Makers may still see and test a quarantined bot in Copilot Studio while users cannot use it through connected channels. Package blocking is a separate control.</p>
-      <div className="quarantine-actions">
+      {canManage ? <div className="quarantine-actions">
         <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="danger" disabled={!eligible || busy} onClick={() => void beginPreview("quarantine")}><Ban aria-hidden="true" /> Quarantine</button></WorkbenchActionGate>
         <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="secondary" disabled={!eligible || busy} onClick={() => void beginPreview("unquarantine")}><CheckCircle2 aria-hidden="true" /> Restore from quarantine</button></WorkbenchActionGate>
-      </div>
+      </div> : null}
       {error ? <p className="error-banner" role="alert">{error}</p> : null}
       {job ? <QuarantineJobStatus job={job} busy={busy} onRefresh={() => updateJob(getQuarantineJob)} onCancel={() => updateJob(cancelQuarantineJob)} onResume={() => updateJob(resumeQuarantineJob)} onReconcile={() => updateJob(reconcileQuarantineJob)} /> : null}
-      {preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
+      {preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} canSubmit={eligible && canManage} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
     </section>;
   }
 
@@ -209,12 +210,12 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
     <div><strong>{targets.length} of 25 exact Copilot Studio agents selected</strong><span>Selection uses native IDs from one saved inventory snapshot.</span></div>
     <div className="quarantine-actions">
       <button type="button" className="secondary" disabled={!targets.length} onClick={onClear}><X aria-hidden="true" /> Clear</button>
-      <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="danger" disabled={!eligible || busy} onClick={() => void beginPreview("quarantine")}><Ban aria-hidden="true" /> Quarantine selected</button></WorkbenchActionGate>
-      <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="secondary" disabled={!eligible || busy} onClick={() => void beginPreview("unquarantine")}><CheckCircle2 aria-hidden="true" /> Restore selected</button></WorkbenchActionGate>
+      <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="danger" disabled={!eligible || busy || !canManage} onClick={() => void beginPreview("quarantine")}><Ban aria-hidden="true" /> Quarantine selected</button></WorkbenchActionGate>
+      <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="secondary" disabled={!eligible || busy || !canManage} onClick={() => void beginPreview("unquarantine")}><CheckCircle2 aria-hidden="true" /> Restore selected</button></WorkbenchActionGate>
     </div>
     {error ? <p className="error-banner" role="alert">{error}</p> : null}
     {job ? <QuarantineJobStatus job={job} busy={busy} onRefresh={() => updateJob(getQuarantineJob)} onCancel={() => updateJob(cancelQuarantineJob)} onResume={() => updateJob(resumeQuarantineJob)} onReconcile={() => updateJob(reconcileQuarantineJob)} /> : null}
-    {preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
+    {preview && frozenPreview ? <QuarantineConfirmation preview={preview} action={frozenPreview.action} confirmed={confirmed} busy={busy} canSubmit={eligible && canManage} onConfirmed={setConfirmed} onClose={() => { setFrozenPreview(undefined); setConfirmed(false); }} onSubmit={submit} /> : null}
   </section>;
 }
 
@@ -226,7 +227,7 @@ function StatusComparison({ status, resource, snapshot }: { status?: QuarantineS
   </div>;
 }
 
-function QuarantineConfirmation({ preview, action, confirmed, busy, onConfirmed, onClose, onSubmit }: { preview: QuarantinePreview; action: QuarantineAction; confirmed: boolean; busy: boolean; onConfirmed: (value: boolean) => void; onClose: () => void; onSubmit: () => Promise<void> }) {
+function QuarantineConfirmation({ preview, action, confirmed, busy, canSubmit, onConfirmed, onClose, onSubmit }: { preview: QuarantinePreview; action: QuarantineAction; confirmed: boolean; busy: boolean; canSubmit: boolean; onConfirmed: (value: boolean) => void; onClose: () => void; onSubmit: () => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current;
@@ -251,10 +252,9 @@ function QuarantineConfirmation({ preview, action, confirmed, busy, onConfirmed,
       <p>{preview.summary.makerBehavior}</p>
       <dl><div><dt>Provider</dt><dd>{preview.summary.provider}</dd></div><div><dt>Endpoint</dt><dd>{preview.summary.endpoint}</dd></div><div><dt>Permission</dt><dd>{preview.summary.permission}</dd></div><div><dt>Atomicity</dt><dd>Not provider-atomic; each target is verified independently</dd></div></dl>
       <div className="quarantine-confirmation-targets">{preview.summary.targets.map(target => <div key={target.resourceNativeId}><strong>{target.displayName}</strong><span>{target.environmentId} / {target.botId}</span><span>{target.currentState ? "Quarantined" : "Not quarantined"} to {target.requestedState ? "quarantined" : "not quarantined"}</span></div>)}</div>
-      {!preview.qualification.qualified ? <p className="quarantine-disabled"><ShieldAlert aria-hidden="true" /> Writes remain disabled until a current, independent two-direction canary qualification is published.</p> : null}
-      <label className="quarantine-confirm-check"><input type="checkbox" checked={confirmed} disabled={!preview.qualification.qualified || busy} onChange={event => onConfirmed(event.target.checked)} /><span>I confirm this exact frozen target list and understand partial results are not automatically inverted.</span></label>
+      <label className="quarantine-confirm-check"><input type="checkbox" checked={confirmed} disabled={!canSubmit || busy} onChange={event => onConfirmed(event.target.checked)} /><span>I confirm this exact frozen target list and understand partial results are not automatically inverted.</span></label>
     </div>
-    <footer><button type="button" className="secondary" onClick={closeDialog}>Cancel</button><button type="button" className={action === "quarantine" ? "danger" : "primary-link"} disabled={!confirmed || busy || !preview.qualification.qualified} onClick={() => void onSubmit()}>Confirm {action === "quarantine" ? "quarantine" : "restoration"}</button></footer>
+    <footer><button type="button" className="secondary" onClick={closeDialog}>Cancel</button><WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className={action === "quarantine" ? "danger" : "primary-link"} disabled={!confirmed || busy || !canSubmit} onClick={() => void onSubmit()}>Confirm {action === "quarantine" ? "quarantine" : "restoration"}</button></WorkbenchActionGate></footer>
   </dialog>;
 }
 

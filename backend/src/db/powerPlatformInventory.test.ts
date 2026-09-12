@@ -43,6 +43,12 @@ async function submitAndRun(idempotencyKey: string, roleScope: "full" | "ai" | "
 }
 
 describe.sequential("Power Platform inventory repository", () => {
+  it("cancels only the owning principal's unfinished read job", async () => {
+    const job = await repository.submit(scope, { idempotencyKey: "inventory-cancel", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
+    expect(await repository.cancel({ ...scope, principalId: "principal-b" }, job.id)).toBeUndefined();
+    expect(await repository.cancel(scope, job.id)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
+  });
+
   it("publishes complete snapshots atomically and filters private scope before counts and paging", async () => {
     const id = await submitAndRun("broad-a");
     await repository.publish(scope, id, { resources: [resource("agent-b"), resource("agent-a")], totalRecords: 2, pages: 2, unknownFieldCount: 1 });

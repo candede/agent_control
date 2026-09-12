@@ -58,7 +58,7 @@ const quarantineProvider={
 const quarantineAuthorization=async()=>({accessToken:"explicit-fixture-authorization",authority:receipt.quarantineAuthority});
 let purviewInterruptedCreate;
 let purviewInterruptedPoll;
-const purviewUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.SecurityReader"],providerRoles:[],providerRoleScope:"unknown"};
+const purviewUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"],providerRoles:[],providerRoleScope:"unknown"};
 const purviewService=new PurviewAuditService(purviewRepository,{
   delegatedToken:async()=>"explicit-fixture-authorization",
   applicationToken:async()=>{throw new Error("application token not expected");},
@@ -75,7 +75,7 @@ const purviewService=new PurviewAuditService(purviewRepository,{
   wait:async()=>undefined,
   random:()=>0,
 });
-const defenderUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.SecurityReader","AgentControl.Administrator"],providerRoles:[],providerRoleScope:"unknown"};
+const defenderUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"],providerRoles:[],providerRoleScope:"unknown"};
 const defenderService=new DefenderHuntingService(defenderRepository,{
   delegatedToken:async()=>"explicit-fixture-authorization",
   applicationToken:async()=>{throw new Error("application token not expected");},
@@ -222,7 +222,7 @@ try {
   assert.equal(quarantineProviderCalls.set,writesBeforeReconciliation);
   assert.equal((await quarantineRepository.get(scope,receipt.quarantineSent)).status,"succeeded");
   assert.equal((await quarantineRepository.get(scope,receipt.quarantineSent)).canReconcile,false);
-  const inventoryUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader"],providerRoleIds:["f2ef992c-3afb-46b9-b7cf-a126ee74c451"]};
+  const inventoryUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"],providerRoleIds:["f2ef992c-3afb-46b9-b7cf-a126ee74c451"]};
   const inventoryService=new PowerPlatformInventoryService(inventoryRepository,{
     delegatedToken:async()=>"explicit-fixture-authorization",revalidateUser:async()=>inventoryUser,requireAvailable:async()=>undefined,
     query:async(_token,_types,options)=>{inventoryScans+=1;assert.equal(options.expectedTenantId,scope.tenantId);return {resources:[],totalRecords:0,pages:1,unknownFieldCount:0};},
@@ -232,7 +232,7 @@ try {
   assert.equal((await inventoryRepository.getJob(scope,receipt.inventoryInterrupted)).status,"succeeded");
   assert.equal((await inventoryRepository.getJob(scope,receipt.inventoryCompleted)).status,"succeeded");
   assert.equal(inventoryScans,1);
-  const packageUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Reader"]};
+  const packageUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Viewer"]};
   const packageService=new PackageInventoryService(packageRepository,{
     delegatedToken:async()=>"explicit-fixture-authorization",applicationToken:async()=>{throw new Error("application token not expected");},revalidateUser:async()=>packageUser,
     requireAvailable:async()=>undefined,requireApplicationDataScope:async()=>{throw new Error("application scope not expected");},applicationPrincipalId:()=>undefined,

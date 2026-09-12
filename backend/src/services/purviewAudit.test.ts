@@ -5,7 +5,7 @@ import type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, P
 import { createProviderQueryBody } from "./graphAuditSearch.js";
 import { PurviewAuditService } from "./purviewAudit.js";
 
-const user: AuthenticatedUser = { homeAccountId: "reader-a", tenantId: "tenant-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.SecurityReader", "AgentControl.Administrator"], providerRoles: [], providerRoleScope: "unknown" };
+const user: AuthenticatedUser = { homeAccountId: "reader-a", tenantId: "tenant-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"], providerRoles: [], providerRoleScope: "unknown" };
 const filters: PurviewAuditFilters = { presetId: "copilot_interactions", operations: ["CopilotInteraction"], startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(), endDateTime: new Date().toISOString(), userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [] };
 
 function job(overrides: Partial<PurviewAuditJob> = {}): PurviewAuditJob {
@@ -60,6 +60,12 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.getQuery).toHaveBeenCalledOnce();
     expect(fixture.dependencies.listRecords).toHaveBeenCalledOnce();
     expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.homeAccountId, "purview.audit.search.delegated");
+    expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
+      "purview.audit.search.delegated",
+      user,
+      "available",
+      expect.objectContaining({ providerRequestId: null }),
+    );
   });
 
   it("returns the activated durable job while account revalidation is still pending", async () => {
@@ -293,12 +299,12 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
   });
 
-  it("requires current Administrator and SecurityReader roles at qualification dispatch and publication", async () => {
+  it("requires current Viewer authority at qualification dispatch and publication", async () => {
     const qualification: PurviewAuditQualification = { id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.delegated", tokenMode: "delegated",
       authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "principal", scopeId: user.homeAccountId, configurationRevision: null }, filters,
       status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId,
       approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: job().id };
-    const dispatch = setup({ revalidateUser: vi.fn(async () => ({ ...user, roles: ["AgentControl.SecurityReader"] })) });
+    const dispatch = setup({ revalidateUser: vi.fn(async () => ({ ...user, roles: [] })) });
     dispatch.setCurrent(job({ qualificationId: qualification.id }));
     dispatch.repository.getQualification.mockResolvedValue(qualification);
     await dispatch.service.start(user, job().id, "delegated");
@@ -307,7 +313,7 @@ describe("Purview audit worker", () => {
 
     const publication = setup({ revalidateUser: vi.fn()
       .mockResolvedValueOnce(user)
-      .mockResolvedValueOnce({ ...user, roles: ["AgentControl.SecurityReader"] }) });
+      .mockResolvedValueOnce({ ...user, roles: [] }) });
     publication.setCurrent(job({ qualificationId: qualification.id }));
     publication.repository.getQualification.mockResolvedValue(qualification);
     await publication.service.start(user, job().id, "delegated");
@@ -384,9 +390,28 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
   });
 
-  it("requires both internal roles for explicit qualification approval", async () => {
+  it("allows Viewer delegated qualification and reserves application qualification for Admin", async () => {
     const fixture = setup();
-    await expect(fixture.service.approveQualification({ ...user, roles: ["AgentControl.SecurityReader"] }, { tokenMode: "delegated", filters })).rejects.toMatchObject({ code: "missing_internal_role" });
-    expect(fixture.repository.approveQualification).not.toHaveBeenCalled();
+    await expect(fixture.service.approveQualification({ ...user, roles: [] }, { tokenMode: "delegated", filters })).rejects.toMatchObject({ code: "missing_internal_role" });
+    await expect(fixture.service.approveQualification(user, { tokenMode: "delegated", filters })).resolves.toBeUndefined();
+    expect(fixture.repository.approveQualification).toHaveBeenCalledOnce();
+
+    const application = setup({
+      applicationIdentity: () => "application-client",
+      qualificationContext: vi.fn(async () => ({ capabilityId: "purview.audit.search.application" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
+    });
+    await expect(application.service.approveQualification(user, { tokenMode: "application", filters }))
+      .rejects.toMatchObject({ code: "missing_internal_role" });
+    const admin = { ...user, roles: ["AgentControl.Admin"] as const };
+    await expect(application.service.approveQualification(admin, { tokenMode: "application", filters })).resolves.toBeUndefined();
+
+    const qualification: PurviewAuditQualification = {
+      id: "33333333-3333-4333-8333-333333333333", capabilityId: "purview.audit.search.application", tokenMode: "application",
+      authorizationPrincipalId: user.homeAccountId, resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 }, filters,
+      status: "approved", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
+      approvedBy: user.homeAccountId, approvedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), jobId: null,
+    };
+    application.repository.getQualification.mockResolvedValue(qualification);
+    await expect(application.service.startQualification(user, qualification.id)).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 });

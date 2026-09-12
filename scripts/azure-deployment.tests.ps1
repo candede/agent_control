@@ -224,11 +224,14 @@ function New-Fixture {
             '--version', 'fixtureversion1') -Json @{ value = $value; attributes = @{ enabled = $true; expires = [DateTimeOffset]::UtcNow.AddDays(30).ToString('o') } }
     }
     $manifest = Get-Content -LiteralPath (Join-Path $root 'infra/entra-app-manifest.json') -Raw | ConvertFrom-Json
+    $administratorRole = @($manifest.appRoles | Where-Object value -eq 'AgentControl.Admin')[0]
+    $administratorRole.id = '77777777-7777-4777-8777-777777777777'
     Add-Az $fixture registration_verify @('ad', 'app', 'show', '--id', $Target.entraApplicationId) -Json @{
         appRoles = @($manifest.appRoles); web = @{ redirectUris = @($Target.callbackUri) }
     }
-    Add-Az $fixture registration_verify @('ad', 'sp', 'list', '--filter', "appId eq '$($Target.entraApplicationId)'") -Json @(@{ id = '55555555-5555-4555-8555-555555555555' })
-    $administratorRole = @($manifest.appRoles | Where-Object value -eq 'AgentControl.Administrator')[0]
+    Add-Az $fixture registration_verify @('ad', 'sp', 'list', '--filter', "appId eq '$($Target.entraApplicationId)'") -Json @(@{
+        id = '55555555-5555-4555-8555-555555555555'; appRoleAssignmentRequired = $true
+    })
     Add-Az $fixture registration_verify @('rest', '--method', 'get', '--url',
         "https://graph.microsoft.com/v1.0/servicePrincipals/55555555-5555-4555-8555-555555555555/appRoleAssignedTo?`$filter=appRoleId%20eq%20$($administratorRole.id)&`$select=id,principalType") -Json @{
         value = @(@{ id = '66666666-6666-4666-8666-666666666666'; principalType = 'User' })
@@ -251,7 +254,7 @@ function New-Fixture {
     if ($FreshResourcesExist) {
         Add-DatabaseCommand $fixture resume_verify $Target @('backend/scripts/azure-database.ts', 'preflight',
             $(if ($ResumeDatabaseInitialized) { 'upgrade' } else { 'fresh' }),
-            $(if ($ResumeDatabaseInitialized) { '26' } else { '0' }))
+            $(if ($ResumeDatabaseInitialized) { '27' } else { '0' }))
         Add-Az $fixture resume_verify @('webapp', 'config', 'appsettings', 'list', '--ids', $Target.expectedResourceIds.appService) -Json @(
             @{ name = 'MAINTENANCE_MODE'; value = 'true' }
         )
@@ -294,7 +297,7 @@ function New-Fixture {
         status = 'Completed'
     }
     Add-DatabaseCommand $fixture database_preflight $Target @('backend/scripts/azure-database.ts', 'preflight',
-        $Target.installationMode, $(if ($Target.installationMode -eq 'fresh') { '0' } else { '26' }))
+        $Target.installationMode, $(if ($Target.installationMode -eq 'fresh') { '0' } else { [string]$Target.expectedSchemaVersion }))
     Add-DatabaseCommand $fixture database_migrate $Target @('backend/scripts/database.ts')
     if ($Target.installationMode -eq 'legacy_import') {
         Add-DatabaseCommand $fixture legacy_import $Target @('backend/scripts/import-legacy-audit.ts', $Target.legacyAuditBackupPath,
@@ -469,8 +472,16 @@ try {
 
     $target = New-Target
     Assert-True ((Test-ApprovedAzureTarget $target Mock).expectedSchemaVersion -eq 26) 'Valid target was rejected.'
+    $currentSchemaTarget = Copy-Object $target
+    $currentSchemaTarget.expectedSchemaVersion = 27
+    Assert-True ((Test-ApprovedAzureTarget $currentSchemaTarget Mock).expectedSchemaVersion -eq 27) 'Current two-role schema baseline was rejected.'
+    $currentSchemaContext = New-Context $currentSchemaTarget (New-Fixture $currentSchemaTarget) 'current-schema'
+    Set-SyntheticBootstrapSecrets $currentSchemaContext
+    Invoke-DeploymentOperation $currentSchemaContext database_preflight | Out-Null
+    Remove-AzureSensitiveDirectories $currentSchemaContext
     foreach ($case in @(
         @{ mutate = { param($t) $t.isApproval = $false }; error = 'isApproval' },
+        @{ mutate = { param($t) $t.expectedSchemaVersion = 25 }; error = 'approved baseline' },
         @{ mutate = { param($t) $t.estimate.monthlyTotal = 9 }; error = 'total' },
         @{ mutate = { param($t) $t.resources.postgresFlexibleServer.sku = 'Standard_D2s_v3' }; error = 'renewed estimate' },
         @{ mutate = { param($t) $t.resources.approvedAppOutboundIpv4Addresses = @() }; error = 'outbound' }
@@ -483,6 +494,35 @@ try {
     $changedVersion.preparedVaultContract.versions[5].version = 'fixtureversion2'
     Assert-Fails { Test-ApprovedAzureTarget $changedVersion Mock } 'Phase 11 coordinated-rotation prerequisite'
     Assert-True (-not (Get-Content -LiteralPath (Join-Path $root 'deploy-azure.ps1') -Raw).Contains('CredentialRotation')) 'Wizard still exposes credential rotation.'
+
+    $registration = New-Context $target (New-Fixture $target) 'registration'
+    $registrationEvidence = Invoke-DeploymentOperation $registration registration_verify
+    Assert-True ($registrationEvidence.roleCount -eq 2 -and $registrationEvidence.administratorAssignmentCount -eq 1) 'Two-role registration with a portal-created Admin ID was rejected.'
+    foreach ($case in @(
+        @{ name = 'legacy-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'AgentControl.Reader' }; error = 'two-role' },
+        @{ name = 'application-members'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].allowedMemberTypes = @('User','Application') }; error = 'Users/Groups' },
+        @{ name = 'unrestricted-signin'; mutate = { param($f) $f.commands.registration_verify[1].json[0].appRoleAssignmentRequired = $false }; error = 'Assignment required' },
+        @{ name = 'no-admin'; mutate = { param($f) $f.commands.registration_verify[2].json.value = @() }; error = 'AgentControl.Admin assignment' }
+    )) {
+        $fixture = New-Fixture $target
+        & $case.mutate $fixture
+        Assert-Fails { Invoke-DeploymentOperation (New-Context $target $fixture "registration-$($case.name)") registration_verify } $case.error
+    }
+    $qualification = Get-Content -LiteralPath (Join-Path $root 'infra/qualification-targets.example.json') -Raw | ConvertFrom-Json
+    $qualification.isApproval = $true
+    $qualification.tenantId = $target.tenantId
+    $qualification.entraApplicationId = $target.entraApplicationId
+    $qualification.canonicalOrigin = $target.canonicalOrigin
+    $qualification.expiresAt = [DateTimeOffset]::UtcNow.AddDays(1).ToString('o')
+    $qualification.personas[0].principalObjectId = '88888888-8888-4888-8888-888888888888'
+    foreach ($role in @('AgentControl.Viewer','AgentControl.Admin')) {
+        $qualification.personas[0].appRoles = @($role)
+        Assert-True ((Test-ApprovedQualificationTargets $qualification $target).approved) 'A current role persona was rejected.'
+    }
+    foreach ($role in @('AgentControl.Operator','agentcontrol.admin')) {
+        $qualification.personas[0].appRoles = @($role)
+        Assert-Fails { Test-ApprovedQualificationTargets $qualification $target } 'unknown or empty role'
+    }
 
     $skuFixture = New-Fixture $target
     $skuContext = New-Context $target $skuFixture 'sku'

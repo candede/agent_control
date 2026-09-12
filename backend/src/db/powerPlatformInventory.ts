@@ -200,6 +200,15 @@ export class PowerPlatformInventoryRepository {
     return this.getJob(scope, id);
   }
 
+  async cancel(scope: InventoryDataScope, id: string) {
+    validateScope(scope);
+    await this.database.query(`UPDATE power_platform_refresh_jobs SET status='cancelled',error_code='cancelled',message='Cancelled by the requesting principal.',
+      finished_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
+    [id, scope.tenantId, scope.principalId]);
+    return this.getJob(scope, id);
+  }
+
   async publish(scope: InventoryDataScope, id: string, result: ResourceQueryResult) {
     validateScope(scope);
     const snapshotId = await transaction(this.database, async client => {
@@ -444,7 +453,7 @@ function projectQuarantineCandidate(snapshot: SnapshotRow, matches: ResourceRow[
   };
   if (stale) return { nativeId: resource.native_id, type: "microsoft.copilotstudio/agents", displayName: resource.display_name ?? resource.native_id,
     environmentId: matches.length === 1 ? resource.environment_id || null : null, botId: matches.length === 1 ? singleIdentifier(identifiers, "cds_bot_id") : null, identifiers, details,
-    quarantineEligibility: { eligible: false, code: "stale_snapshot", reason: "The saved inventory target is older than 24 hours. A Reader must refresh inventory explicitly before quarantine work." } };
+    quarantineEligibility: { eligible: false, code: "stale_snapshot", reason: "The saved inventory target is older than 24 hours. A Viewer must refresh inventory explicitly before quarantine work." } };
   return { nativeId: resource.native_id, type: "microsoft.copilotstudio/agents", displayName: resource.display_name ?? resource.native_id,
     environmentId: target?.environmentId ?? null, botId: target?.botId ?? null, identifiers, details,
     quarantineEligibility: target ? { eligible: true, code: "eligible" } : { eligible: false, code: eligibilityCode(resolution.errorCode!), reason: resolution.reason } };

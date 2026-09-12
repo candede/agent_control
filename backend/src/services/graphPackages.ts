@@ -20,6 +20,7 @@ import type {
 
 const graphV1 = "https://graph.microsoft.com/v1.0";
 const graphBeta = "https://graph.microsoft.com/beta";
+export const packageReadTimeoutMs = 30_000;
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
 const bulkWriteConcurrency = 4;
@@ -138,6 +139,16 @@ export class GraphPackagesClient {
     return packages;
   }
 
+  async checkCatalogAccess(accessToken: string, signal?: AbortSignal) {
+    const page = await this.requestReadWithRetry<GraphCollectionResponse<CopilotPackage>>(
+      buildCopilotAgentsListUrl(),
+      accessToken,
+      { signal },
+    );
+    if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Package access check returned an invalid collection.");
+    page.value.forEach(allowlistedPackage);
+  }
+
   async getPackageDetails(accessToken: string, id: string, options: PackageReadOptions = {}) {
     return allowlistedPackage(await this.requestReadWithRetry<CopilotPackageDetail>(
       `${graphV1}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
@@ -207,7 +218,7 @@ export class GraphPackagesClient {
     }
     options.signal?.throwIfAborted();
     const correlationId = options.correlationId ?? randomUUID();
-    const timeoutSignal = AbortSignal.timeout(10_000);
+    const timeoutSignal = AbortSignal.timeout(!init.method || init.method === "GET" ? packageReadTimeoutMs : 10_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
     const response = await this.fetcher(url, {
       ...init,
@@ -220,17 +231,21 @@ export class GraphPackagesClient {
         "return-client-request-id": "true",
         ...init.headers,
       },
+    }).catch(error => {
+      signal.throwIfAborted();
+      if (error instanceof TypeError) throw new AppError(502, "provider_network_error", "Microsoft Graph could not be reached.");
+      throw error;
     });
 
     if (!response.ok) {
-      throw await graphError(response);
+      throw await graphError(response, signal);
     }
 
     if (response.status === 204) {
       return undefined as T;
     }
 
-    return boundedProviderJson<T>(response);
+    return boundedProviderJson<T>(response, signal);
   }
 
   private async requestReadWithRetry<T>(
@@ -870,16 +885,16 @@ export async function bulkGetPackageDetails(
   };
 }
 
-export async function graphError(response: Response) {
-  const body = await boundedProviderText(response, 65_536).catch(() => "");
-  let details: unknown;
-  let message = `Microsoft Graph request failed with status ${response.status}.`;
+export async function graphError(response: Response, signal?: AbortSignal) {
+  const body = await boundedProviderText(response, 65_536, signal).catch(() => "");
+  const message = `Microsoft Graph request failed with status ${response.status}.`;
   let code = "graph_error";
+  let providerErrorCode: string | undefined;
+  let throttled = response.status === 429;
 
   if (body) {
     try {
-      details = JSON.parse(body) as unknown;
-      const graphDetails = details as {
+      const graphDetails = JSON.parse(body) as {
         error?: { code?: string; message?: string };
         Message?: string;
         message?: string;
@@ -892,17 +907,23 @@ export async function graphError(response: Response) {
         message;
       const providerCode =
         graphDetails.error?.code ?? graphDetails.StatusCode?.toString() ?? code;
-      if (typeof providerMessage === "string") message = providerMessage.slice(0, 1024);
-      if (typeof providerCode === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(providerCode)) code = providerCode;
-      details = { error: { code, message } };
+      if (response.status === 424 && typeof providerMessage === "string") throttled = providerMessage.toLowerCase().includes("too many requests");
+      if (typeof providerCode === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(providerCode) && providerCode !== "graph_error") {
+        code = providerCode;
+        providerErrorCode = providerCode;
+      }
     } catch {
-      message = body.slice(0, 1024);
-      details = message;
+      // Malformed provider bodies must never become public diagnostics.
     }
   }
 
+  const correlationId = [response.headers.get("request-id"), response.headers.get("client-request-id")]
+    .find(value => value !== null && /^[A-Za-z0-9-]{1,128}$/.test(value));
   return new AppError(response.status, code, message, {
-    graph: details,
+    httpStatus: response.status,
+    ...(providerErrorCode ? { providerErrorCode } : {}),
+    ...(correlationId ? { correlationId } : {}),
+    ...(throttled ? { throttled: true } : {}),
     retryAfterMs: retryAfterMs(response.headers.get("Retry-After")),
   });
 }
@@ -912,8 +933,8 @@ function isRetryableGraphError(error: AppError) {
     error.status === 429 ||
     error.status === 503 ||
     error.status === 504 ||
-    (error.status === 424 &&
-      error.message.toLowerCase().includes("too many requests"))
+    (error.status === 424 && typeof error.details === "object" && error.details !== null &&
+      "throttled" in error.details && error.details.throttled === true)
   );
 }
 

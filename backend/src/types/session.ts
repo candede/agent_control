@@ -15,6 +15,7 @@ export type AuthFlow = {
   nonce: string;
   codeVerifier: string;
   scopes: string[];
+  extraScopesToConsent?: string[];
   createdAt: number;
   returnTo: string;
   capabilityId?: CapabilityId;

@@ -193,7 +193,8 @@ Read the roadmap README, Phase 07 completion record and named prerequisite owner
 Verify delivered artifacts in the current worktree; preserve unrelated changes.
 Implement, validate and document every Phase 08 requirement. Use Docker tooling
 and the retained agent-control-phase01 local deployment without reset or secret
-rotation. New schema work starts at migration 18. Keep Purview live capabilities
-disabled without their separately approved qualification. Do not commit, push,
+rotation. New schema work starts at migration 18. Follow current delegated
+on-demand authorization; optional qualification never gates ordinary delegated
+searches. Preserve separate application/shared-scope approval. Do not commit, push,
 deploy to Azure or change provider grants. Stop before Phase 09.
 ```

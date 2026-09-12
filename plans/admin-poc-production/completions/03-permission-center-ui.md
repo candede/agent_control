@@ -105,7 +105,7 @@ No new implementation, accessibility, data-loss or cleanup issue remains. Inheri
 
 - Implement only [04-power-platform-inventory.md](../04-power-platform-inventory.md) in a fresh session. No Phase 04 implementation was started here.
 - Reuse backend capability definitions/types, current-principal evidence scopes, independent roles, route policies, PostgreSQL ownership and the shared UI gate. The Power Platform adapter is still unregistered; registration must follow implementation/probe evidence, not a UI constant or synthetic success.
-- Reuse the retained `agent-control-phase01` project and the Docker-only browser/component harness. Add any required schema through a new additive migration, never by modifying migrations 1-4. Keep browser-local reports unchanged until Phase 06 and all unqualified/completed/uncertain writes unreplayed.
+- Reuse the retained `agent-control-phase01` project and the Docker-only browser/component harness. Add any required schema through a new additive migration, never by modifying migrations 1-4. Keep browser-local reports unchanged until Phase 06 and completed/uncertain writes unreplayed. Current ordinary Admin-confirmed operations require actual provider authorization, not prior canary qualification.
 - Read the binding README and Phase 01/02/03 records, then verify the current producer/consumer paths against the actual worktree. Preserve the post-handoff auth/session protections and safe callback outcomes.
 
 ```text

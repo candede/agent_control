@@ -17,7 +17,7 @@ export const powerPlatformResourceTypes = [
 export type PowerPlatformResourceType = typeof powerPlatformResourceTypes[number];
 export type InventoryRoleScope = "full" | "ai" | "unknown";
 export type InventoryCoverageStatus = "covered" | "not_authorized_scope" | "unknown";
-export type InventoryJobStatus = "waiting_authorization" | "running" | "succeeded" | "failed";
+export type InventoryJobStatus = "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
 export type InventoryFieldMaturity = "ga" | "preview";
 export type InventoryIdentifierKind =
   | "power_platform_resource_id"

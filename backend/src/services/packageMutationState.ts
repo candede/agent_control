@@ -47,7 +47,13 @@ export function expectedPackageMutationState(before: PackageMutationState, actio
     throw new AppError(409, "reassign_verification_unavailable", "Reassignment cannot be projected without a documented owner readback field.");
   }
   if (!accessUpdate || before.kind !== "access") throw new AppError(409, "mutation_state_mismatch", "The frozen package state does not match the requested access operation.");
-  const principals = canonicalAccessEntities(accessUpdate.principals);
+  const requested = canonicalAccessEntities(accessUpdate.principals);
+  const previousScope = accessUpdate.target === "availability" ? before.availableTo : before.deployedTo;
+  const previousPrincipals = accessUpdate.target === "availability" ? before.allowedUsersAndGroups : before.acquireUsersAndGroups;
+  if (accessUpdate.mode === "add" && previousScope === "all") return before;
+  const principals = accessUpdate.mode === "add"
+    ? canonicalAccessEntities([...new Map([...previousPrincipals, ...requested].map(principal => [`${principal.resourceType}:${principal.resourceId}`, principal])).values()])
+    : requested;
   if (accessUpdate.target === "availability") {
     return { ...before, availableTo: accessUpdate.scope === "none" ? "none" : "some", allowedUsersAndGroups: principals };
   }

@@ -26,8 +26,9 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3001"
-      FRONTEND_ORIGIN: http://localhost:${APP_PORT:-3001}
-      REDIRECT_URI: http://localhost:${APP_PORT:-3001}/api/auth/callback
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:${APP_PORT:-3001}}
+      REDIRECT_URI: ${REDIRECT_URI:-http://localhost:${APP_PORT:-3001}/api/auth/callback}
+      TRUST_PROXY: ${TRUST_PROXY:-0}
       TENANT_ID: ${TENANT_ID:-}
       CLIENT_ID: ${CLIENT_ID:-}
       CLIENT_SECRET_FILE: /run/secrets/client-secret

@@ -10,6 +10,7 @@ import {
   bulkSetBlockedState,
   bulkUpdatePackageAccess,
   GraphPackagesClient,
+  graphError,
   updatePackageAccess,
   verifyPackageMutationConverged,
   verifyPackageAccessApplied,
@@ -25,6 +26,126 @@ describe("GraphPackagesClient", () => {
     expect(url.searchParams.get("$filter")).toBe(
       "supportedHosts/any(h:h eq 'Copilot')",
     );
+  });
+
+  it.each([0, 1, 3])("accepts a valid first catalog page with %i rows and never follows pagination", async count => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: Array.from({ length: count }, (_, index) => ({ id: `P_${index}`, displayName: "Package", isBlocked: false })),
+      "@odata.nextLink": "https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?page=2",
+    }));
+    await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect([...new URL(String(fetcher.mock.calls[0][0])).searchParams.keys()]).toEqual(["$filter"]);
+    expect(new URL(String(fetcher.mock.calls[0][0])).searchParams.get("$filter")).toBe("supportedHosts/any(h:h eq 'Copilot')");
+    expect(fetcher.mock.calls[0][1]?.method ?? "GET").toBe("GET");
+    expect(fetcher.mock.calls[0][1]?.body).toBeUndefined();
+  });
+
+  it.each([null, {}, { value: null }, { value: {} }, { value: [{ id: 12 }] }])("still rejects invalid catalog first-page schemas: %j", async body => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json(body));
+    await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("retains the response byte limit for catalog checks without requesting an undocumented row limit", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response("x".repeat(2_000_001)));
+    await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_result_limit" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["probe", "inventory", "detail"])("allows a slow package %s read within a finite 30-second deadline", async operation => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    try {
+      const fetcher = vi.fn<FetchLike>(async (_url, init) => new Promise((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        setTimeout(() => resolve(Response.json(operation === "detail"
+          ? { id: "P_1", displayName: "Package", isBlocked: false } : { value: [] })), 12_000);
+      }));
+      const client = new GraphPackagesClient(fetcher);
+      const result = operation === "probe" ? client.checkCatalogAccess("token")
+        : operation === "inventory" ? client.listCopilotAgents("token") : client.getPackageDetails("token", "P_1");
+      const assertion = expect(result).resolves.toEqual(operation === "probe" ? undefined
+        : operation === "inventory" ? [] : expect.objectContaining({ id: "P_1", isBlocked: false }));
+      await vi.advanceTimersByTimeAsync(12_000);
+      await assertion;
+      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally {
+      timeout.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps mutation requests bounded to ten seconds without read retries", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 204 }));
+    try {
+      await new GraphPackagesClient(fetcher).blockPackage("token", "P_1");
+      expect(timeout).toHaveBeenCalledOnce();
+      expect(timeout).toHaveBeenCalledWith(10_000);
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
+
+  it("cancels a stalled successful catalog response body at the caller deadline", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream({ cancel })));
+    const result = new GraphPackagesClient(fetcher).checkCatalogAccess("token", controller.signal);
+    const assertion = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    controller.abort(new DOMException("deadline", "TimeoutError"));
+    await assertion;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("retains only bounded Graph status, code, and response request ID diagnostics", async () => {
+    const error = await graphError(Response.json({
+      error: { code: "Authorization_RequestDenied", message: "person@example.invalid private-token", innerError: { secret: "private-body" } },
+    }, { status: 403, headers: { "request-id": "graph-request-123", "client-request-id": "client-request-123" } }));
+    expect(error).toMatchObject({ status: 403, code: "Authorization_RequestDenied", details: {
+      httpStatus: 403, providerErrorCode: "Authorization_RequestDenied", correlationId: "graph-request-123",
+    } });
+    expect(error.message).toBe("Microsoft Graph request failed with status 403.");
+    expect(JSON.stringify(error)).not.toMatch(/person@|private-token|private-body/);
+  });
+
+  it.each(["<html>person@example.invalid private-token</html>", "{", JSON.stringify({ error: { code: "x".repeat(129), message: "private-token" } })])(
+    "does not surface malformed or unbounded provider diagnostics", async body => {
+      const error = await graphError(new Response(body, { status: 502, headers: { "request-id": "person@example.invalid", "client-request-id": "x".repeat(129) } }));
+      expect(error.details).toEqual({ httpStatus: 502, retryAfterMs: undefined });
+      expect(error.code).toBe("graph_error");
+      expect(JSON.stringify(error)).not.toMatch(/person@|private-token/);
+    },
+  );
+
+  it("uses a safe echoed client request ID when no valid provider request ID exists", async () => {
+    const error = await graphError(new Response("invalid body", { status: 500, headers: { "request-id": "bad/id", "client-request-id": "client-123" } }));
+    expect(error.details).toMatchObject({ httpStatus: 500, correlationId: "client-123" });
+  });
+
+  it("categorizes network failures without exposing their messages or retrying a mutation", async () => {
+    const fetcher = vi.fn(async () => { throw new TypeError("private-url private-token"); });
+    const client = new GraphPackagesClient(fetcher);
+    await expect(client.checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_network_error" });
+    await expect(client.blockPackage("token", "P_1")).rejects.toMatchObject({ code: "provider_network_error" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the existing 424 throttling retry without publishing the provider message", async () => {
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(Response.json({ error: { code: "FailedDependency", message: "too many requests private-token" } }, { status: 424 }))
+      .mockResolvedValueOnce(Response.json({ value: [] }));
+    const wait = vi.fn(async () => undefined);
+    await expect(new GraphPackagesClient(fetcher, { delay: wait }).checkCatalogAccess("token")).resolves.toBeUndefined();
+    expect(wait).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("follows Microsoft Graph pagination while listing agents", async () => {
@@ -745,7 +866,7 @@ describe("GraphPackagesClient", () => {
     expect(result.succeeded).toBe(1);
   });
 
-  it("preserves plain-text Graph error messages", async () => {
+  it("replaces plain-text Graph error bodies with safe status diagnostics", async () => {
     const client = new GraphPackagesClient(
       async () =>
         new Response("Service temporarily unavailable", { status: 503 }),
@@ -755,9 +876,9 @@ describe("GraphPackagesClient", () => {
     await expect(client.listCopilotAgents("token")).rejects.toMatchObject({
       status: 503,
       code: "graph_error",
-      message: "Service temporarily unavailable",
+      message: "Microsoft Graph request failed with status 503.",
       details: {
-        graph: "Service temporarily unavailable",
+        httpStatus: 503,
       },
     });
   });

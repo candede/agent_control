@@ -13,14 +13,20 @@ import {
 
 let initialized: Awaited<ReturnType<typeof testDatabase>>;
 let empty: Awaited<ReturnType<typeof testDatabase>>;
+let previousRelease: Awaited<ReturnType<typeof testDatabase>>;
 
 beforeAll(async () => {
   initialized = await testDatabase();
   empty = await testDatabase(false);
+  previousRelease = await testDatabase(false);
+  await bootstrap(previousRelease.operator, fixturePassword);
+  await migrate(previousRelease.operator, migrations.slice(0, -1));
+  await grantRuntime(previousRelease.operator);
 });
 afterAll(async () => {
   await initialized.close();
   await empty.close();
+  await previousRelease.close();
 });
 
 describe("Azure database identity and sequencing guards", () => {
@@ -54,6 +60,14 @@ describe("Azure database identity and sequencing guards", () => {
       (await empty.operator.query("SELECT checksum FROM schema_migrations WHERE version=$1", [migrations.length])).rows[0].checksum,
       migrations.length,
     ]);
+  });
+
+  it("accepts the approved previous-release baseline and the current schema on repeat deployment", async () => {
+    await expect(preflightAzureDatabase(previousRelease.operator, "upgrade", migrations.length - 1, previousRelease.name))
+      .resolves.toMatchObject({ currentVersion: migrations.length - 1 });
+    await migrate(previousRelease.operator);
+    await expect(preflightAzureDatabase(previousRelease.operator, "upgrade", migrations.length, previousRelease.name))
+      .resolves.toMatchObject({ currentVersion: migrations.length });
   });
 
   it("keeps maintenance closed through drain and reopens with provider work disabled", async () => {

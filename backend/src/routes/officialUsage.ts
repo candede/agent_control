@@ -139,7 +139,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   const packageRepository = new PackageInventoryRepository(database);
 
   policyRoute(router, "post", "/official-usage/staging", {
-    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Admin"], csrf: true,
   }, reserveUpload, csvUpload, async (request: UploadRequest, response) => {
     const uploadState = request[uploadRequestState];
     const file = request.file;
@@ -186,26 +186,26 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "get", "/official-usage/admin", {
-    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Administrator"],
+    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Admin"],
   }, async (request, response) => {
     response.json(await repository.getAdminState(requestScope(request)));
   });
 
   policyRoute(router, "delete", "/official-usage/staging/:id", {
-    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     await repository.discardStaging(requestScope(request), uuid(request.params.id));
     response.status(204).end();
   });
 
   policyRoute(router, "post", "/official-usage/bundles/:id/preview", {
-    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     response.json(await repository.previewBundle(requestScope(request), uuid(request.params.id)));
   });
 
   policyRoute(router, "post", "/official-usage/bundles/:id/accept", {
-    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     response.json(await repository.acceptBundle(requestScope(request), uuid(request.params.id), {
       bundleHash: hash(request.body?.bundleHash, "bundle hash"),
@@ -214,13 +214,13 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "post", "/official-usage/sets/:id/preview", {
-    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     response.json(await repository.previewSetOperation(requestScope(request), operation(request.body?.operation), uuid(request.params.id)));
   });
 
   policyRoute(router, "post", "/official-usage/confirmations/:id", {
-    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     response.json(await repository.confirmSetOperation(requestScope(request), uuid(request.params.id), {
       operation: operation(request.body?.operation),
@@ -231,7 +231,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "post", "/official-usage/legacy-cleanup-acknowledgements", {
-    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Administrator"], csrf: true,
+    access: "authenticated", dataClass: "official_usage_metadata", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
     if (!request.body || !["reimported", "discarded"].includes(request.body.disposition) || Object.keys(request.body).some(key => key !== "disposition")) {
       throw new AppError(400, "invalid_legacy_acknowledgement", "Acknowledge either successful re-import or explicit discard without sending legacy report content.");
@@ -241,7 +241,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "get", "/official-usage/aggregate", {
-    access: "authenticated", dataClass: "official_usage_aggregate", roles: ["AgentControl.Reader"],
+    access: "authenticated", dataClass: "official_usage_aggregate", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
     const [published, packages] = await Promise.all([
@@ -252,10 +252,10 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "get", "/official-usage/aggregate.csv", {
-    access: "authenticated", dataClass: "official_usage_aggregate_export", roles: ["AgentControl.Reader"],
+    access: "authenticated", dataClass: "official_usage_aggregate_export", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     await sendOfficialCsv(request, response, {
-      role: "AgentControl.Reader",
+      role: "AgentControl.Viewer",
       action: "export-official-usage-aggregate",
       filename: "official-agent-usage.csv",
       load: async () => {
@@ -282,17 +282,17 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   });
 
   policyRoute(router, "get", "/official-usage/users", {
-    access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.SecurityReader"],
+    access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
     response.json(buildOfficialUsageUserView(await repository.getPublished(scope.tenantId), userViewOptions(request.query)));
   });
 
   policyRoute(router, "get", "/official-usage/users.csv", {
-    access: "authenticated", dataClass: "official_usage_user_export", roles: ["AgentControl.SecurityReader"],
+    access: "authenticated", dataClass: "official_usage_user_export", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     await sendOfficialCsv(request, response, {
-      role: "AgentControl.SecurityReader",
+      role: "AgentControl.Viewer",
       action: "export-official-usage-users",
       filename: "official-user-usage.csv",
       load: async () => {

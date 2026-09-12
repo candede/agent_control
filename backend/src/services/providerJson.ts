@@ -12,7 +12,10 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
     void reader.cancel(signal?.reason).catch(() => undefined);
   };
   try {
-    if (signal?.aborted) throw signal.reason;
+    if (signal?.aborted) {
+      onAbort();
+      await aborted;
+    }
     signal?.addEventListener("abort", onAbort, { once: true });
     for (;;) {
       const chunk = await (signal ? Promise.race([reader.read(), aborted]) : reader.read());
@@ -31,8 +34,8 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export async function boundedProviderJson<T>(response: Response): Promise<T> {
-  const text = await boundedProviderText(response);
+export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  const text = await boundedProviderText(response, undefined, signal);
   try { return JSON.parse(text) as T; }
   catch { throw new AppError(502, "provider_schema", "Provider response was not valid JSON."); }
 }

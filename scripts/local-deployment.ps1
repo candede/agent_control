@@ -4,7 +4,7 @@ function Invoke-DockerCommand {
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID')) {
+            foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
@@ -36,6 +36,7 @@ function New-LocalContext {
     $url = if ($port) { "http://localhost:$port" } else { '' }
     return @{
         Root=$rootPath; State=$state; Project=$Project; Port=$port; Url=$url
+        PublicUrl=$(if ($settings.publicUrl) { $settings.publicUrl } else { $url })
         Volume="${Project}_data"; Network="${Project}_default"; Image="${Project}-app:local"; Operator="${Project}-operator:local"
         Compose=@('compose','--project-directory',$rootPath,'--env-file',(Join-Path $state 'compose.env'),'-f',(Join-Path $rootPath 'compose.yaml'),'-p',$Project)
     }
@@ -50,7 +51,42 @@ function Read-LocalSettings {
     if ($settings.Contains('port') -and ($settings.port -isnot [long] -and $settings.port -isnot [int] -or $settings.port -lt 1024 -or $settings.port -gt 65535)) {
         throw 'Saved project port must be an integer from 1024 to 65535. Repair settings.json before continuing.'
     }
+    if ($settings.Contains('publicUrl') -and ($settings.publicUrl -isnot [string] -or ($settings.publicUrl -ne '' -and -not (Test-LocalPublicUrl $settings.publicUrl)))) {
+        throw 'Saved publicUrl must be empty or a canonical HTTPS origin without a trailing slash, path, query or fragment. Repair settings.json before continuing.'
+    }
     return $settings
+}
+
+function Test-LocalPublicUrl {
+    param([string]$Value)
+    $uri = $null
+    return ($Value -cmatch '^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[1-9][0-9]{0,4})?$' -and
+        [Uri]::TryCreate($Value,[UriKind]::Absolute,[ref]$uri) -and
+        $uri.AbsoluteUri -ceq "$Value/" -and
+        # Node's URL parser interprets numeric final labels as IPv4, unlike .NET.
+        ($uri.HostNameType -eq [UriHostNameType]::IPv4 -or $uri.DnsSafeHost -cnotmatch '(?:^|\.)(?:[0-9]+|0x[0-9a-f]+)$'))
+}
+
+function Read-LocalPublicUrl {
+    param([string]$Current,[int]$Port)
+    $display = if ($Current) { $Current } else { "http://localhost:$Port (automatic)" }
+    Write-Host 'For a controlled HTTPS tunnel/reverse proxy, enter its public origin. This enables trust of one proxy hop; it must forward X-Forwarded-Proto: https.'
+    Show-LocalTunnelGuidance $Port
+    while ($true) {
+        $value = [string](Read-Host "Public URL [$display; Enter to keep; 'local' to reset]")
+        if ([string]::IsNullOrWhiteSpace($value)) { return $Current }
+        $value = $value.Trim()
+        if ($value -ieq 'local') { return '' }
+        if (Test-LocalPublicUrl $value) { return $value }
+        Write-Warning 'Enter a canonical HTTPS origin, e.g. https://your-tunnel.devtunnels.ms, without a trailing slash, path, query or fragment; or local.'
+    }
+}
+
+function Show-LocalTunnelGuidance {
+    param([int]$Port)
+    Write-Host "Configure the existing tunnel port: devtunnel port update YOUR_TUNNEL_ID -p $Port --host-header unchanged --origin-header unchanged"
+    Write-Host "Then host the tunnel: devtunnel host YOUR_TUNNEL_ID --host-header unchanged --origin-header unchanged"
+    Write-Host 'Host flags alone may leave an existing port rewriting Origin to localhost, breaking permission checks and sign-out. Persist the port settings; do not force a fixed Origin or disable same-origin checks.'
 }
 
 function Protect-LocalPath {
@@ -71,8 +107,9 @@ function Show-LocalRegistrationGuidance {
 Registered app permissions and setup
 ===================================
 Use an approved single-tenant Entra Web application.
-Basic sign-in requests openid and profile; broad data permissions are not needed
-just to sign in. Add only the feature permissions you intend to use below.
+Normal sign-in requests all implemented delegated permissions up front, including package changes.
+Sign in without provider setup defers consent and requests only openid and profile.
+Approve the intended permissions below; consent does not assign roles or licenses.
 
 Entra admin center > App registrations > your app > API permissions >
 Add a permission. Select the API and Delegated permissions for user-driven features.
@@ -92,7 +129,11 @@ Power Platform - Delegated permissions:
   Resource/application ID: 8578e004-a5c6-46e7-913e-12f58912df43
 
 Obtain the required tenant administrator consent for the selected permissions.
-The app requests delegated consent incrementally through its Permissions view.
+After sign-in, the app checks delegated access automatically without requiring
+probe-button clicks. Interactive consent, MFA or Conditional Access may still
+require the user's participation; the app cannot grant those permissions itself.
+Automatic checks never change packages, quarantine agents or run investigations.
+Token acquisition alone does not prove provider access, roles or licensing.
 Optional Microsoft Graph Application permissions, ONLY for separately enabled
 app-only features: CopilotPackages.Read.All, AuditLogsQuery.Read.All,
 ThreatHunting.Read.All. A client secret does not require Application permissions;
@@ -100,13 +141,16 @@ do not add both permission types by default.
 
 App roles (separate from API permissions):
   Add the appRoles entries from infra/entra-app-manifest.json, preserving the
-  registration's other settings. In Enterprise applications > your app >
-  Users and groups, assign the roles each user or group needs:
-    AgentControl.Reader         Inventory and aggregate reporting.
-    AgentControl.Operator       Approved control operations.
-    AgentControl.SecurityReader User-level reporting, audit and investigations.
-    AgentControl.Administrator  Capability configuration and imports.
-  Administrator does not include the other roles.
+  registration's other settings. When creating roles in the portal, select
+  Users/Groups for Allowed member types. origin: Application describes where
+  a role is defined, not who receives it.
+  In Enterprise applications > your app > Properties, set Assignment required
+  to Yes. Under Users and groups, assign one role to each approved user/group:
+    AgentControl.Viewer  Observe inventory, reports and investigations.
+    AgentControl.Admin   All viewing plus supported changes, imports and configuration.
+  Admin includes Viewer access; only one role assignment is needed.
+  Replace legacy role assignments explicitly; they do not grant these new roles.
+  Sign out and back in after assignment. Provider permissions still apply.
 
 Provider-side requirements still apply to the signed-in user:
   Inventory: one of Global Administrator, Power Platform Administrator, Dynamics 365
@@ -117,7 +161,7 @@ Provider-side requirements still apply to the signed-in user:
   Defender: Defender XDR RBAC and data-source access.
 Applicable licensing is also required (including Microsoft Agent 365 for package
 APIs). CSV report import and local application audit need no external API permission.
-Consent alone does not enable unqualified or unsupported operations.
+Consent alone does not enable unsupported operations or qualify provider writes.
 
 This wizard displays guidance only; it does not verify or grant permissions.
 See docs/deployment-setup.md and docs/provider-contract-inventory-2026-09-08.md
@@ -202,6 +246,7 @@ function Initialize-LocalState {
     $previousTenantId = $tenantId
     $previousClientId = $clientId
     $port = if ($settings.Contains('port')) { [int]$settings.port } else { 0 }
+    $publicUrl = [string]$settings.publicUrl
     $settingsFile = Join-Path $state 'settings.json'
     foreach ($identifier in @($tenantId,$clientId)) { if ($identifier -and $identifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings; use a separate project for another tenant.' } }
     $clientFile = Join-Path $secretDirectory 'client-secret'
@@ -215,7 +260,9 @@ function Initialize-LocalState {
         if ($Edit -or -not $clientId) { $clientId = Read-LocalIdentifier 'Entra client ID (application GUID)' $clientId -AllowEmpty:$Edit }
         if ($Edit -or $missingClientSecret) { $clientSecret = Read-LocalClientSecret $clientSecret -AllowEmpty:$Edit }
         if ($Edit -or -not $port) { $port = Read-LocalPort $port }
-        Write-Host "Register http://localhost:$port/api/auth/callback as the application's Web reply URL."
+        if ($Edit) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
+        $origin = if ($publicUrl) { $publicUrl } else { "http://localhost:$port" }
+        Write-Host "Register $origin/api/auth/callback as the application's Web reply URL. Begin sign-in at $origin."
     }
     if (-not $port) { throw 'Project port is missing. Run start or edit-config to complete the project wizard.' }
     if ($Edit -and $ExistingVolume -and $previousTenantId -and $previousTenantId -ine $tenantId) {
@@ -223,7 +270,8 @@ function Initialize-LocalState {
     }
     $tenantChanged = $previousTenantId -cne $tenantId
     $clientChanged = $previousClientId -cne $clientId
-    $settingsChanged = $tenantChanged -or $clientChanged -or $settings.port -ne $port
+    $publicUrlChanged = [string]$settings.publicUrl -cne $publicUrl
+    $settingsChanged = $tenantChanged -or $clientChanged -or $settings.port -ne $port -or $publicUrlChanged
     $secretChanged = $previousSecret -cne $clientSecret
     if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
     if ($Edit -and ($settingsChanged -or $secretChanged) -and $ExistingVolume) {
@@ -257,11 +305,15 @@ function Initialize-LocalState {
         $settings.port = $port
         if ($tenantChanged) { $settings.tenantId = $tenantId }
         if ($clientChanged) { $settings.clientId = $clientId }
+        if ($publicUrlChanged) { $settings.publicUrl = $publicUrl }
         Write-LocalText $settingsFile ($settings | ConvertTo-Json -Depth 20)
     }
     $Context.Port = $port
     $Context.Url = "http://localhost:$port"
-    $lines = @("LOCAL_STATE_DIR='$state'","APP_PORT=$port","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$($Context.Image)","TENANT_ID=$tenantId","CLIENT_ID=$clientId")
+    $Context.PublicUrl = if ($publicUrl) { $publicUrl } else { $Context.Url }
+    $trustProxy = if ($publicUrl) { '1' } else { '0' }
+    $lines = @("LOCAL_STATE_DIR='$state'","APP_PORT=$port","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$($Context.Image)","TENANT_ID=$tenantId","CLIENT_ID=$clientId",
+        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy")
     Write-LocalText (Join-Path $state 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
     Protect-LocalPath $settingsFile
     Protect-LocalPath (Join-Path $state 'compose.env')
@@ -401,4 +453,8 @@ function Invoke-LocalDeployment {
         throw
     }
     Write-Host "Healthy local app: $($Context.Url)"
+    if ($Context.PublicUrl -cne $Context.Url) {
+        Write-Host "Open $($Context.PublicUrl) to sign in. Local health is verified; tunnel reachability is not checked."
+        Show-LocalTunnelGuidance $Context.Port
+    }
 }

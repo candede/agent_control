@@ -21,6 +21,7 @@ import {
   getAgentDetails,
   getAgents,
   getPackageRefreshJob,
+  getPackageRefreshJobs,
   getBulkActionJob,
   getCurrentUser,
   getWorkbenchMetadata,
@@ -45,6 +46,7 @@ import {
   type CopilotPackageDetail,
   type PackageMutationPreview,
   type PackageAccessUpdate,
+  type PackageAccessTarget,
   type PackagePage,
   type PackageListQuery,
   type PackageRefreshJob,
@@ -60,6 +62,7 @@ import { projectVerifiedAccessScope } from "./packageMutationState";
 import { clearPackageSelection, restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
+import { providerActionAllowed } from "./capabilityState";
 import { CapabilityGate } from "./components/CapabilityGate";
 import { CapabilityContext } from "./capabilityContext";
 import { CapabilityHealth, PermissionCenter } from "./components/PermissionCenter";
@@ -153,6 +156,7 @@ function App() {
   const [authSetup, setAuthSetup] = useState<{ authConfigured: boolean; callback: string; setup?: string }>();
   const [agents, setAgents] = useState<CopilotPackage[]>([]);
   const [agentPage, setAgentPage] = useState<PackagePage>();
+  const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number }>();
   const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
   const [loadingAgents, setLoadingAgents] = useState(false);
@@ -190,6 +194,7 @@ function App() {
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
+  const [singleAccessTarget, setSingleAccessTarget] = useState<PackageAccessTarget>("availability");
   const [loadingAgentDetailId, setLoadingAgentDetailId] = useState<string>();
   const [agentDetailError, setAgentDetailError] = useState<string>();
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
@@ -225,6 +230,9 @@ function App() {
   const agentListAbortController = useRef<AbortController | undefined>(undefined);
   const bulkJobPollRequestId = useRef(0);
   const packageRefreshRequestId = useRef(0);
+  const initialAgentRefreshAttempts = useRef(new Set<string>());
+  const initialAgentRefreshChecks = useRef(new Set<string>());
+  const initialAgentRefreshMounted = useRef(true);
   const linkedPackageRefreshRequestId = useRef(0);
   const officialUsageRequestId = useRef(0);
   const officialUsageAbortController = useRef<AbortController | undefined>(undefined);
@@ -312,7 +320,13 @@ function App() {
 
   useEffect(() => {
     function restoreRoute() {
+      agentDetailRequestId.current += 1;
+      setLoadingAgentDetailId(undefined);
+      setSingleAccessAgentDetail(undefined);
+      setBulkAccessAgentIds(undefined);
+      setBulkConfirmation(undefined);
       const view = parseWorkbenchView(window.location.pathname);
+      if (view !== "agents") setAgentDetail(undefined);
       savedViewSearches.current.set(view, window.location.search);
       setActiveView(view);
       if (view === "agents") {
@@ -347,7 +361,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!user || pendingStoredAgentSelectionCount === undefined) return;
+    if (!user || !hasRole(user, "AgentControl.Viewer") || pendingStoredAgentSelectionCount === undefined) return;
     let active = true;
     void Promise.resolve().then(() => {
       if (!active) return;
@@ -423,7 +437,7 @@ function App() {
   }, [activeView, reportActivityWindowDays, requestedOfficialUsageStagingId]);
 
   useEffect(() => {
-    if (!user || activeView !== "agents" || !requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
+    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
     const summary = agents.find(agent => agent.id === requestedAgentDetailId);
     if (summary) {
       void handleViewAgentDetails(summary);
@@ -448,7 +462,7 @@ function App() {
   }, [activeView, agentDetail?.id, agents, loadingAgentDetailId, requestedAgentDetailId, user]);
 
   useEffect(() => {
-    if (!user || activeView !== "agents" || !requestedPackageRefreshJobId) {
+    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedPackageRefreshJobId) {
       void Promise.resolve().then(() => setLinkedPackageRefreshJob(undefined));
       return;
     }
@@ -484,7 +498,7 @@ function App() {
   }, [activeView, principalKey, requestedPackageRefreshJobId, requestedPackageRefreshMode, user]);
 
   useEffect(() => {
-    if (!user || activeView !== "agents" || !requestedPackageControlJobId) return;
+    if (!user || !hasRole(user, "AgentControl.Admin") || activeView !== "agents" || !requestedPackageControlJobId) return;
     let active = true;
     void Promise.resolve().then(() => {
       if (!active) return;
@@ -500,7 +514,7 @@ function App() {
   }, [activeView, principalKey, requestedPackageControlJobId, user]);
 
   useEffect(() => {
-    if (!user) {
+    if (!user || !hasRole(user, "AgentControl.Admin")) {
       return;
     }
     if (requestedPackageControlJobId || requestedPackageRefreshJobId) return;
@@ -516,22 +530,34 @@ function App() {
   }, [principalKey, requestedPackageControlJobId, requestedPackageRefreshJobId, user]);
 
   useEffect(() => {
-    if (!user || !(hasRole(user, "AgentControl.Reader") || hasRole(user, "AgentControl.Operator"))) {
+    if (!user) {
       agentListAbortController.current?.abort();
       void Promise.resolve().then(() => {
         setAgents([]);
         setAgentPage(undefined);
         setAgentDetail(undefined);
-        setRequestedAgentDetailId(undefined);
       });
       return;
     }
-    if (!hasRole(user, "AgentControl.Reader")) {
+    if (!hasRole(user, "AgentControl.Viewer")) {
       agentListAbortController.current?.abort();
       void Promise.resolve().then(() => {
+        clearPackageSelection(user);
         setAgents([]);
         setAgentPage(undefined);
-        setError(undefined);
+        setAgentSnapshotId(undefined);
+        setSelectedAgentIds(new Set());
+        setPendingStoredAgentSelectionCount(undefined);
+        setSelectionRouteNotice(undefined);
+        setBulkConfirmation(undefined);
+        setBulkAccessAgentIds(undefined);
+        setAgentDetail(undefined);
+        setRequestedAgentDetailId(undefined);
+        setRequestedPackageRefreshJobId(undefined);
+        setRequestedPackageControlJobId(undefined);
+        setTrackedJob(undefined);
+        setLinkedPackageRefreshJob(undefined);
+        setLinkedJobError(undefined);
       });
       return;
     }
@@ -546,10 +572,17 @@ function App() {
   }, [inactiveDays, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
 
   useEffect(
-    () => () => {
-      for (const timerId of stateChangeTimerIds.current) {
-        window.clearTimeout(timerId);
-      }
+    () => {
+      initialAgentRefreshMounted.current = true;
+      const timerIds = stateChangeTimerIds.current;
+      return () => {
+        initialAgentRefreshMounted.current = false;
+        agentDetailRequestId.current += 1;
+        packageRefreshRequestId.current += 1;
+        for (const timerId of timerIds) {
+          window.clearTimeout(timerId);
+        }
+      };
     },
     [],
   );
@@ -565,21 +598,56 @@ function App() {
 
   const effectivePlatformFilter = platformFilter;
 
-  const canReadSensitiveUsage = hasRole(user, "AgentControl.SecurityReader");
+  const canReadSensitiveUsage = hasRole(user, "AgentControl.Viewer");
   const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
-  const requestedBulkRefQuery = parseBulkRefSearch(query);
-  const bulkRefAuthorizationMissing = Boolean(
-    (requestedBulkRefQuery || normalizedBulkRefQuery) && !canReadSensitiveUsage,
-  );
   const loadingBulkRefSearch = false;
-  const visibleViews = workbenchMetadata
-    ? workbenchMetadata.views
-        .filter(view => view.roles.length === 0 || view.roles.some(role => user?.roles.includes(role)))
-        .map(view => view.id)
-    : allowedViews(user);
+  const authorizedViews = allowedViews(user);
+  const visibleViews: WorkbenchViewId[] = workbenchMetadata
+    ? workbenchMetadata.views.flatMap(view => {
+        const id = authorizedViews.find(candidate => candidate === view.id);
+        return id && (view.roles.length === 0 || view.roles.some(role => hasRole(user, role))) ? [id] : [];
+      })
+    : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
-  const canOperate = hasRole(user, "AgentControl.Operator");
-  const canImportReports = hasRole(user, "AgentControl.Administrator");
+  const canOperate = hasRole(user, "AgentControl.Admin");
+  const canImportReports = hasRole(user, "AgentControl.Admin");
+  const initialAgentRefreshAllowed = useEffectEvent((owner: string) => {
+    const refreshAction = workbenchMetadata?.actions.find(action => action.id === "packages.refresh");
+    const readCapability = capabilityState.views.find(view => view.definition.id === "graph.package.read.delegated");
+    return initialAgentRefreshMounted.current && principalKey === owner && user && hasRole(user, "AgentControl.Viewer")
+      && !loadingSession && !sessionRevalidationInFlight.current && visibleActiveView === "agents"
+      && !loadingAgents && savedAgentPageOwner?.principalKey === owner && savedAgentPageOwner.requestId === agentListRequestId.current
+      && agentPage?.snapshot === null && !agentSnapshotId && !refreshingAgents
+      && !linkedPackageRefreshJob && !requestedPackageRefreshJobId && !requestedPackageControlJobId
+      && refreshAction?.roles.some(role => hasRole(user, role))
+      && providerActionAllowed(readCapability, false, capabilityState.now);
+  });
+  const loadInitialAgents = useEffectEvent(async () => {
+    const owner = principalKey;
+    if (!initialAgentRefreshAllowed(owner) || !user) return;
+    const account = `${user.tenantId ?? ""}\0${user.homeAccountId}`;
+    if (initialAgentRefreshAttempts.current.has(account) || initialAgentRefreshChecks.current.has(account)) return;
+    initialAgentRefreshChecks.current.add(account);
+    const refreshRequest = packageRefreshRequestId.current;
+    try {
+      const jobs = await getPackageRefreshJobs("delegated");
+      if (!initialAgentRefreshAllowed(owner) || refreshRequest !== packageRefreshRequestId.current) return;
+      initialAgentRefreshAttempts.current.add(account);
+      if (jobs.value.length || jobs.lastAttemptAt || jobs.lastSuccessAt) return;
+      await handleRefreshAgents();
+    } catch (requestError) {
+      initialAgentRefreshAttempts.current.add(account);
+      if (initialAgentRefreshAllowed(owner)) setError(errorMessage(requestError));
+    } finally {
+      initialAgentRefreshChecks.current.delete(account);
+    }
+  });
+
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => { if (active) return loadInitialAgents(); });
+    return () => { active = false; };
+  }, [agentPage, agentSnapshotId, capabilityState.now, capabilityState.views, linkedPackageRefreshJob, loadingAgents, loadingSession, principalKey, refreshingAgents, requestedPackageControlJobId, requestedPackageRefreshJobId, savedAgentPageOwner, user, visibleActiveView, workbenchMetadata]);
 
   useEffect(() => {
     if (!user || visibleActiveView === activeView) return;
@@ -587,6 +655,8 @@ function App() {
   }, [activeView, user, visibleActiveView]);
 
   function navigateToView(view: WorkbenchViewId) {
+    agentDetailRequestId.current += 1;
+    setLoadingAgentDetailId(undefined);
     savedViewSearches.current.set(activeView, window.location.search);
     setAgentDetail(undefined);
     setRequestedAgentDetailId(undefined);
@@ -656,6 +726,7 @@ function App() {
     setLoadedWorkbenchMetadata(undefined);
     setAgents([]);
     setAgentPage(undefined);
+    setSavedAgentPageOwner(undefined);
     setAgentSnapshotId(undefined);
     setSelectedAgentIds(new Set());
     setPendingStoredAgentSelectionCount(undefined);
@@ -708,19 +779,6 @@ function App() {
   async function loadAgents(forceCurrentSnapshot = false) {
     const requestId = ++agentListRequestId.current;
     agentListAbortController.current?.abort();
-    if (bulkRefAuthorizationMissing) {
-      agentListAbortController.current = undefined;
-      setLoadingAgents(false);
-      setError(undefined);
-      setAgents([]);
-      setAgentPage(undefined);
-      setAgentSnapshotId(undefined);
-      setLastAgentListRefreshAt(undefined);
-      setPackageSnapshotExpiresAt(undefined);
-      agentDetailsCache.current.clear();
-      setExportChoiceOpen(false);
-      return;
-    }
     const controller = new AbortController();
     agentListAbortController.current = controller;
     setLoadingAgents(true);
@@ -728,7 +786,7 @@ function App() {
 
     try {
       const response = await getAgents({
-        ...(!forceCurrentSnapshot && agentSnapshotId ? { snapshotId: agentSnapshotId } : {}),
+        ...(!forceCurrentSnapshot && agentSnapshotId && savedAgentPageOwner?.principalKey === principalKey ? { snapshotId: agentSnapshotId } : {}),
         ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
         ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
         ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
@@ -741,7 +799,7 @@ function App() {
         limit: agentDisplayPageSize,
         offset: agentPageIndex * agentDisplayPageSize,
       }, { signal: controller.signal });
-      if (requestId !== agentListRequestId.current) return;
+      if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
       const lastPage = Math.max(Math.ceil(response.count / agentDisplayPageSize) - 1, 0);
       if (agentPageIndex > lastPage) {
         setAgentPageIndex(lastPage);
@@ -749,6 +807,7 @@ function App() {
       }
       setAgents(response.value);
       setAgentPage(response);
+      setSavedAgentPageOwner({ principalKey, requestId });
       setAgentSnapshotId(response.snapshot?.id);
       setLastAgentListRefreshAt(response.snapshot ? new Date(response.snapshot.observedAt) : undefined);
       setPackageSnapshotExpiresAt(response.snapshot ? new Date(response.snapshot.expiresAt) : undefined);
@@ -774,13 +833,13 @@ function App() {
     }
 
     const [aggregateResult, usersResult] = await Promise.allSettled([
-      hasRole(user, "AgentControl.Reader")
+      hasRole(user, "AgentControl.Viewer")
         ? getOfficialUsageAggregate({
             activityWindowDays: reportActivityWindowDays,
             inactiveDays,
         }, { signal: controller.signal })
         : Promise.resolve(undefined),
-      hasRole(user, "AgentControl.SecurityReader")
+      hasRole(user, "AgentControl.Viewer")
         ? getOfficialUsageUsers(
           { ...officialUsageUserQuery, inactiveDays, limit: 100, offset: officialUsageUserOffset },
           { signal: controller.signal },
@@ -804,6 +863,8 @@ function App() {
   }
 
   async function handleRefreshAgents() {
+    if (!user || sessionRevalidationInFlight.current) return;
+    initialAgentRefreshAttempts.current.add(`${user.tenantId ?? ""}\0${user.homeAccountId}`);
     const requestId = ++packageRefreshRequestId.current;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
     setRefreshingAgents(true);
@@ -811,6 +872,7 @@ function App() {
 
     try {
       let job = await startPackageRefresh("delegated");
+      if (packageRefreshRequestId.current !== requestId) return;
       while (job.status === "running" && Date.now() < deadline) {
         await wait(packageRefreshPollIntervalMs);
         if (packageRefreshRequestId.current !== requestId) return;
@@ -826,7 +888,7 @@ function App() {
       }
       await loadAgents(true);
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (packageRefreshRequestId.current === requestId) setError(errorMessage(requestError));
     } finally {
       if (packageRefreshRequestId.current === requestId) setRefreshingAgents(false);
     }
@@ -903,7 +965,28 @@ function App() {
     }
   }
 
-  async function handleManageAgentAccess(agent: CopilotPackage) {
+  async function refreshAccessDetails(id: string, requestId: number, deadline = Date.now() + foregroundJobPollBudgetMs) {
+    const access = capabilityState.views.find(view => view.definition.id === "graph.package.access.manage");
+    if (!hasRole(user, "AgentControl.Admin") || !providerActionAllowed(access, true, Date.now())) {
+      throw new Error("Current Admin access and package access-management authorization are required.");
+    }
+    let job = await startExactPackageRefresh(id, "delegated");
+    if (agentDetailRequestId.current !== requestId) return;
+    while (job.status === "running" && Date.now() < deadline) {
+      await wait(packageRefreshPollIntervalMs);
+      if (agentDetailRequestId.current !== requestId) return;
+      job = await getPackageRefreshJob(job.id, job.tokenMode);
+      if (agentDetailRequestId.current !== requestId) return;
+    }
+    if (job.status === "running") throw new Error("Reading current package access reached its five-minute bound. The read-only job remains available in Jobs.");
+    if (job.status !== "succeeded") throw new Error(job.message ?? "Microsoft Graph could not load current package access. Check delegated permissions and retry.");
+    const detail = await getAgentDetails(id);
+    if (agentDetailRequestId.current !== requestId) return;
+    agentDetailsCache.current.set(id, detail);
+    return detail;
+  }
+
+  async function handleManageAgentAccess(agent: CopilotPackage, target: PackageAccessTarget = "availability") {
     const requestId = agentDetailRequestId.current + 1;
     agentDetailRequestId.current = requestId;
 
@@ -912,14 +995,13 @@ function App() {
     setLoadingAgentDetailId(agent.id);
 
     try {
-      const detail = withPackageSummaryFallback(
-        await getAgentDetails(agent.id),
-        agent,
-      );
+      const detail = await refreshAccessDetails(agent.id, requestId);
+      if (!detail) return;
 
       if (agentDetailRequestId.current === requestId) {
-        agentDetailsCache.current.set(agent.id, detail);
+        setSingleAccessTarget(target);
         setSingleAccessAgentDetail(detail);
+        if (agentDetail?.id === agent.id) setAgentDetail(detail);
       }
     } catch (requestError) {
       if (agentDetailRequestId.current === requestId) {
@@ -970,12 +1052,14 @@ function App() {
 
     setError(undefined);
     const action = update.target === "availability" ? "update-availability" : "update-installation";
+    const requestId = agentDetailRequestId.current;
     const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update });
+    if (agentDetailRequestId.current !== requestId) return;
     setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
   }
 
   function requestExportCsv() {
-    if (exportableAgentCount === 0 || exportingCsv || bulkRefAuthorizationMissing) {
+    if (exportableAgentCount === 0 || exportingCsv) {
       return;
     }
 
@@ -983,7 +1067,7 @@ function App() {
   }
 
   async function handleExportCsv() {
-    if (exportableAgentCount === 0 || exportingCsv || !agentSnapshotId || bulkRefAuthorizationMissing) {
+    if (exportableAgentCount === 0 || exportingCsv || !agentSnapshotId) {
       return;
     }
 
@@ -1114,11 +1198,19 @@ function App() {
 
     setError(undefined);
     setBulkResult(undefined);
+    const requestId = ++agentDetailRequestId.current;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
 
     try {
+      for (const id of ids) {
+        if (Date.now() >= deadline) throw new Error("Reading current access for the selected packages reached its five-minute bound. Select fewer packages and retry.");
+        if (!await refreshAccessDetails(id, requestId, deadline)) return;
+      }
       await requestAccessConfirmation(ids, update, "bulk");
+      if (agentDetailRequestId.current !== requestId) return;
       setBulkAccessAgentIds(undefined);
     } catch (requestError) {
+      if (agentDetailRequestId.current !== requestId) return;
       setError(errorMessage(requestError));
       throw requestError;
     }
@@ -1407,22 +1499,36 @@ function App() {
   }
 
   if (!user) {
+    const authorizationOutcome = new URLSearchParams(window.location.search).get("authorization");
+    const authorizationNotice = authorizationOutcome === "cancelled"
+      ? "Microsoft permission setup was cancelled or denied. You can retry, or sign in without provider setup and complete it later in Permissions."
+      : authorizationOutcome === "interaction_required"
+        ? "Microsoft requires additional sign-in, consent, or Conditional Access steps. Complete those steps or contact your tenant administrator."
+        : authorizationOutcome === "failed"
+          ? "Microsoft did not complete sign-in or permission setup. Retry or contact your tenant administrator." : undefined;
     return (
       <main className="signed-out">
         <section className="signin-panel" aria-labelledby="signin-title">
           <p className="eyebrow">Microsoft 365 Copilot administration</p>
           <h1 id="signin-title">Agent Control</h1>
           <p className="signin-lede">
-            Sign in with a work or school account that has delegated access to
-            manage Copilot packages, tenant availability, and agent status.
+            Sign in with an assigned Viewer or Admin work account. Microsoft will
+            request any outstanding delegated permissions for all implemented
+            features, including inventory, directory lookup, investigations,
+            package changes, and Copilot Studio quarantine during sign-in.
           </p>
+          <p>Already approved permissions normally need no further consent. Consent does not run investigations or change provider data; Microsoft roles and licenses still apply.</p>
+          {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
           {error ? <div className="error-banner">{error}</div> : null}
           {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
           <div className="signin-actions">
             <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
               Sign in with Entra ID
             </a>
-            <span>Delegated admin access required</span>
+            <a aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login?setup=defer&returnTo=%2Fpermissions"}>
+              Sign in without provider setup
+            </a>
+            <span>Use deferred setup when an administrator must approve permissions or you only need locally saved data.</span>
           </div>
         </section>
         <AppFooter />
@@ -1437,11 +1543,18 @@ function App() {
       <header className="top-bar">
         <div className="title-block">
           <p className="eyebrow">Tenant package controls</p>
-          <div className="title-row">
-            <h1>Agent Control</h1>
-            <nav className="view-switcher" aria-label="Primary views">
+          <h1>Agent Control</h1>
+        </div>
+        <div className="user-menu">
+          <CapabilityHealth />
+          <span>{user.displayName || user.username}</span>
+          <button type="button" onClick={() => void handleSignOut()}>
+            Sign out
+          </button>
+        </div>
+        <nav className="view-switcher" aria-label="Primary views">
               {visibleViews.includes("agents") ? (
-              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Operator"]}>
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
                 type="button"
                 className={
@@ -1455,12 +1568,12 @@ function App() {
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("power-platform") ? (
-              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Operator"]}>
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button type="button" className={visibleActiveView === "power-platform" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "power-platform" ? "page" : undefined} onClick={() => navigateToView("power-platform")}>Power Platform</button>
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("users") ? (
-              <CapabilityGate roles={["AgentControl.SecurityReader"]}>
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
                 type="button"
                 className={
@@ -1474,7 +1587,7 @@ function App() {
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("official-usage") ? (
-              <CapabilityGate roles={["AgentControl.Reader", "AgentControl.Administrator"]}>
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
                 type="button"
                 className={
@@ -1490,7 +1603,7 @@ function App() {
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("audit") ? (
-              <CapabilityGate roles={["AgentControl.SecurityReader"]}>
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
                 type="button"
                 className={
@@ -1503,32 +1616,23 @@ function App() {
               </button>
               </CapabilityGate>
               ) : null}
-              {visibleViews.includes("security") ? <CapabilityGate roles={["AgentControl.SecurityReader"]}><button type="button" className={visibleActiveView === "security" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "security" ? "page" : undefined} onClick={() => navigateToView("security")}>Security</button></CapabilityGate> : null}
+              {visibleViews.includes("security") ? <CapabilityGate roles={["AgentControl.Viewer"]}><button type="button" className={visibleActiveView === "security" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "security" ? "page" : undefined} onClick={() => navigateToView("security")}>Security</button></CapabilityGate> : null}
               <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
-              <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button>
-            </nav>
-          </div>
-        </div>
-        <div className="user-menu">
-          <CapabilityHealth />
-          <span>{user.displayName || user.username}</span>
-          <button type="button" onClick={() => void handleSignOut()}>
-            Sign out
-          </button>
-        </div>
+              {visibleViews.includes("jobs") ? <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button> : null}
+        </nav>
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
       {legacyUsagePresent && visibleActiveView !== "official-usage" ? (
         <div className="report-status error" role="status">
           <strong>Legacy browser report data is present in this browser.</strong>
-          <p>It was not read or migrated. Re-import the original Microsoft exports, or ask an Agent Control Administrator to explicitly discard the legacy copy.</p>
+          <p>It was not read or migrated. Re-import the original Microsoft exports, or ask an AgentControl.Admin to explicitly discard the legacy copy.</p>
           {canImportReports ? <button type="button" className="secondary" onClick={() => navigateToView("official-usage")}>Open Official usage</button> : null}
         </div>
       ) : null}
 
       {visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
-        !hasRole(user, "AgentControl.Reader") ? (
+        !hasRole(user, "AgentControl.Viewer") ? (
           <>
             <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
             <ExactPackageLookup
@@ -1568,7 +1672,7 @@ function App() {
             />
           </section>
 
-          <BulkActions
+          {canOperate ? <BulkActions
             disabled={
               loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
             }
@@ -1588,7 +1692,7 @@ function App() {
             onBlockAll={() => void requestBulkAction(true)}
             onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => void requestBulkAction(false)}
-          />
+          /> : null}
 
           {selectionRouteNotice ? (
             <div className={selectionRouteNotice.tone === "error" ? "error-banner" : "report-status"} role="status">
@@ -1791,7 +1895,7 @@ function App() {
                       : "Export filtered CSV"
                   }
                   disabled={
-                    loadingAgents || exportingCsv || exportableAgentCount === 0 || bulkRefAuthorizationMissing
+                    loadingAgents || exportingCsv || exportableAgentCount === 0
                   }
                   onClick={requestExportCsv}
                 >
@@ -1803,7 +1907,8 @@ function App() {
                   ? `Saved Graph observation ${formatRefreshTime(
                       lastAgentListRefreshAt,
                     )}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : " / v1.0 read, preview controls"}`
-                  : "No saved package observation. Refresh explicitly when authorized."}
+                  : refreshingAgents ? "Loading your agents from Microsoft Graph; no provider settings are changed."
+                    : "No saved package observation. An initial read-only load starts here when authorized; Refresh agents retries it."}
               </span>
             </div>
             <button
@@ -1816,11 +1921,6 @@ function App() {
             </button>
           </section>
 
-          {bulkRefAuthorizationMissing ? (
-            <div className="error-banner" role="status">
-              Bulk-reference filters require the independent AgentControl.SecurityReader role. Regular package text search remains available.
-            </div>
-          ) : null}
           {loadingBulkRefSearch ? (
             <div className="screen-state">
               Resolving bulk ref {normalizedBulkRefQuery}...
@@ -1861,8 +1961,8 @@ function App() {
         </>
         )
       ) : visibleActiveView === "power-platform" ? (
-        hasRole(user, "AgentControl.Reader")
-          ? <InventoryExplorer key={principalKey} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Operator"))} />
+        hasRole(user, "AgentControl.Viewer")
+          ? <InventoryExplorer key={principalKey} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
           : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
       ) : visibleActiveView === "users" ? (
         <UserAccessView
@@ -1876,7 +1976,7 @@ function App() {
       ) : visibleActiveView === "official-usage" ? (
         <section className="official-usage-workbench" aria-label="Official usage">
           {canImportReports ? <OfficialUsageImportPanel key={principalKey} initialStagingId={requestedOfficialUsageStagingId} onChanged={() => void loadOfficialUsage()} onLegacyCleared={() => setLegacyUsagePresent(false)} /> : null}
-          {hasRole(user, "AgentControl.Reader") ? <ReportingView
+          {hasRole(user, "AgentControl.Viewer") ? <ReportingView
             activityWindowDays={reportActivityWindowDays}
             data={officialUsageAggregate}
             inactiveDays={inactiveDays}
@@ -1898,8 +1998,8 @@ function App() {
         </div>
       ) : null}
 
-      {agentDetailError ? (
-        <div className="error-banner">{agentDetailError}</div>
+      {agentDetailError && !agentDetail ? (
+        <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
       {agentDetail ? (
@@ -1908,7 +2008,11 @@ function App() {
           activeTab={agentDetailTab}
           onTabChange={setAgentDetailTab}
           roles={user?.roles ?? []}
-          onClose={() => { setAgentDetail(undefined); setRequestedAgentDetailId(undefined); }}
+          onClose={() => { agentDetailRequestId.current += 1; setLoadingAgentDetailId(undefined); setAgentDetail(undefined); setRequestedAgentDetailId(undefined); }}
+          onEditAccess={target => void handleManageAgentAccess(agentDetail, target)}
+          preparingAccess={Boolean(loadingAgentDetailId)}
+          accessError={agentDetailError}
+          externalAccessEditorOpen={singleAccessAgentDetail?.id === agentDetail.id}
           onUpdateAccess={handleUpdateAgentAccess}
           onSetBlocked={async (blocked) => {
             await handleAgentAction(agentDetail, blocked);
@@ -1922,9 +2026,9 @@ function App() {
         <AccessAssignmentModal
           context="single"
           agentCount={1}
-          initialTarget="availability"
-          initialStatus={singleAccessAgentDetail.availableTo}
-          initialPrincipals={singleAccessAgentDetail.allowedUsersAndGroups}
+          initialTarget={singleAccessTarget}
+          initialStatus={singleAccessTarget === "availability" ? singleAccessAgentDetail.availableTo : singleAccessAgentDetail.deployedTo}
+          initialPrincipals={singleAccessTarget === "availability" ? singleAccessAgentDetail.allowedUsersAndGroups : singleAccessAgentDetail.acquireUsersAndGroups}
           onCancel={() => setSingleAccessAgentDetail(undefined)}
           onSubmit={async (update) => {
             await requestAccessConfirmation([singleAccessAgentDetail.id], update, "single");
@@ -2039,7 +2143,7 @@ function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
   const [nativeId, setNativeId] = useState("");
   return <section className="screen-state exact-package-lookup" aria-labelledby="exact-package-heading">
     <h2 id="exact-package-heading">Exact package targeting</h2>
-    <p>Operator does not inherit Reader inventory enumeration. Enter one known Microsoft Graph package native ID to inspect and control only that target.</p>
+    <p>Enter one known Microsoft Graph package native ID to inspect that exact target.</p>
     <form onSubmit={event => {
       event.preventDefault();
       const id = nativeId.trim();
@@ -2293,6 +2397,7 @@ export function BulkConfirmModal({
           each exact native package target immediately before one dispatch and
           fail it if the mutation-relevant state changed.
         </p>
+        {(summary.operation === "update-availability" || summary.operation === "update-installation") && <p role="note">Access updates can overwrite concurrent administrator changes.</p>}
         <div className="confirm-summary" aria-label="Bulk action summary">
           <span>
             <strong>{summary.targetCount}</strong> targets
@@ -2413,6 +2518,7 @@ function ExportChoiceModal({
 
 function errorMessage(error: unknown) {
   if (error instanceof ApiError) {
+    if (error.code === "invalid_origin") return error.message;
     if (error.status === 403) {
       return `${error.message} Open Permissions for the current account's exact requirements. Consent does not assign roles or licenses.`;
     }

@@ -77,10 +77,10 @@ describe("runtime configuration", () => {
   });
 
   it("ignores bootstrap role and administrator environment variables", async () => {
-    const loaded = await loadConfig({ NODE_ENV: "test", SESSION_SECRET: "x".repeat(32), BOOTSTRAP_ADMIN: "true", BOOTSTRAP_ROLES: "AgentControl.Administrator", AGENT_CONTROL_ADMIN: "fixture@example.invalid" });
+    const loaded = await loadConfig({ NODE_ENV: "test", SESSION_SECRET: "x".repeat(32), BOOTSTRAP_ADMIN: "true", BOOTSTRAP_ROLES: "AgentControl.Admin", AGENT_CONTROL_ADMIN: "fixture@example.invalid" });
     loaded.validateRuntimeConfig();
     expect(loaded.config).not.toHaveProperty("roles");
-    expect(JSON.stringify(loaded.config)).not.toContain("AgentControl.Administrator");
+    expect(JSON.stringify(loaded.config)).not.toContain("AgentControl.Admin");
     expect(JSON.stringify(loaded.config)).not.toContain("fixture@example.invalid");
   });
 

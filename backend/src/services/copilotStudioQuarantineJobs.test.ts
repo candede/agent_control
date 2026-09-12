@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import { CopilotStudioQuarantineCanaryRepository } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
-import type { FrozenQuarantineTarget, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
+import type { FrozenQuarantineTarget, QuarantineAction, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import {
   cancelCopilotStudioQuarantineJob,
   reconcileCopilotStudioQuarantineJob,
@@ -29,17 +30,9 @@ function target(snapshotId: string, state = false): FrozenQuarantineTarget {
     inventoryQuarantinedAt: null, environmentId, botId, directStatus: { environmentId, botId, isBotQuarantined: state,
       lastUpdateTimeUtc: updatedAt, observedAt: new Date().toISOString(), correlationId: "44444444-4444-4444-8444-444444444444" } };
 }
-async function ensureQualified(tenantId: string, targetBotId = botId) {
-  await fixture.runtime.query(`INSERT INTO copilot_quarantine_qualifications
-    (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,
-     contract_revision,permission_revision,configuration_revision,auth_mode)
-    VALUES(gen_random_uuid(),$1,$2,$3,gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),$4,$5,1,'delegated') ON CONFLICT DO NOTHING`,
-  [tenantId, environmentId, targetBotId, authority.contractRevision, authority.permissionRevision]);
-}
-async function submitted(value: QuarantineScope) {
-  await ensureQualified(value.tenantId);
+async function submitted(value: QuarantineScope, action: QuarantineAction = "quarantine") {
   const snapshotId = await seedInventory(value);
-  const input = { action: "quarantine" as const, targets: [target(snapshotId)], actor: actor(value), authority, requestPath: "/api/quarantine/jobs" };
+  const input = { action, targets: [target(snapshotId, action === "unquarantine")], actor: actor(value), authority, requestPath: "/api/quarantine/jobs" };
   const confirmation = createQuarantineConfirmation(input);
   return repository.submit(value, { ...input, idempotencyKey: randomUUID(), confirmationHash: confirmation.confirmationHash });
 }
@@ -89,7 +82,6 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
       resourceNativeId, botId: `${index + 3}2222222-2222-4222-8222-222222222222`,
     }));
     const snapshotId = await seedInventory(value, descriptors);
-    for (const descriptor of descriptors) await ensureQualified(value.tenantId, descriptor.botId);
     const targets = descriptors.map(descriptor => {
       const original = target(snapshotId);
       return { ...original, ...descriptor, directStatus: { ...original.directStatus, botId: descriptor.botId } };
@@ -151,23 +143,32 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     log.mockRestore();
   });
 
-  it("persists sent before one POST and requires GET readback for success", async () => {
+  it.each(["quarantine", "unquarantine"] as const)("dispatches normal %s without qualification, persisting sent before one POST and verifying GET readback", async action => {
     const value = scope();
-    const job = await submitted(value);
-    let quarantined = false;
+    const job = await submitted(value, action);
+    expect(job.isCanary).toBe(false);
+    expect(await repository.isQualified(value, authority, [{ environmentId, botId }])).toBe(false);
+    let quarantined = action === "unquarantine";
+    const requestedState = !quarantined;
+    const authorized = vi.fn(authorize);
     const provider = {
       getStatus: vi.fn(async () => status(quarantined)),
       setQuarantine: vi.fn(async () => {
         const sent = await fixture.runtime.query("SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND sent_at IS NOT NULL", [job.id]);
         expect(sent.rowCount).toBe(1);
-        quarantined = true;
-        return status(true);
+        quarantined = requestedState;
+        return status(requestedState);
       }),
     };
-    await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
+    await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorized);
     expect(provider.setQuarantine).toHaveBeenCalledTimes(1);
+    expect(provider.setQuarantine).toHaveBeenCalledWith("ephemeral-token", { environmentId, botId }, requestedState, expect.objectContaining({ correlationId: expect.any(String) }));
     expect(provider.getStatus).toHaveBeenCalledTimes(3);
     expect(await repository.get(value, job.id)).toMatchObject({ status: "succeeded", succeeded: 1 });
+    expect(authorized).toHaveBeenCalledWith(value);
+    expect(await repository.isQualified(value, authority, [{ environmentId, botId }])).toBe(false);
+    const audit = (await repository.listAudit(value)).value.filter(event => event.jobId === job.id);
+    expect(audit.map(event => event.phase).sort()).toEqual(["requested", "sent", "started", "succeeded"]);
   });
 
   it("does not abort another principal's active worker when cancellation is unauthorized", async () => {
@@ -217,19 +218,45 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     expect(await repository.get(value, job.id)).toMatchObject({ status: "failed", failed: 1, results: [{ errorCode: "quarantine_prestate_conflict" }] });
   });
 
-  it("denies egress when exact-target qualification is revoked before dispatch", async () => {
+  it.each(["current", "expired"] as const)("rechecks the actual %s approval for an explicit canary job at final dispatch", async approvalState => {
     const value = scope();
-    const job = await submitted(value);
-    await fixture.operator.query("DELETE FROM copilot_quarantine_qualifications WHERE tenant_id=$1 AND target_environment_id=$2 AND target_bot_id=$3", [value.tenantId, environmentId, botId]);
-    await fixture.operator.query(`INSERT INTO copilot_quarantine_qualifications
-      (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,contract_revision,permission_revision,configuration_revision,auth_mode)
-      VALUES(gen_random_uuid(),$1,$2,'99999999-9999-9999-9999-999999999999',gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),$3,$4,1,'delegated')`,
-    [value.tenantId, environmentId, authority.contractRevision, authority.permissionRevision]);
-    const provider = { getStatus: vi.fn(async () => status(false)), setQuarantine: vi.fn(async () => status(true)) };
+    const snapshotId = await seedInventory(value);
+    const frozen = target(snapshotId);
+    const canaries = new CopilotStudioQuarantineCanaryRepository(fixture.runtime);
+    const operator = { ...actor(value), roles: ["AgentControl.Admin" as const] };
+    const administrator = { ...operator, homeAccountId: randomUUID() };
+    const original = await canaries.createApproved(administrator, {
+      target: frozen, action: "quarantine", prestate: false, prestateProviderUpdatedAt: updatedAt, poststate: true, authority,
+    });
+    const restoration = await canaries.createApproved(administrator, {
+      target: frozen, action: "unquarantine", prestate: true, prestateProviderUpdatedAt: null, poststate: false, authority,
+    });
+    await canaries.claimCycle(operator, original.id, restoration.id, authority);
+    const input = { action: "quarantine" as const, targets: [frozen], actor: actor(value), authority,
+      requestPath: "/api/quarantine/canary-approvals/execute", canaryApprovalId: original.id };
+    const job = await repository.submit(value, { ...input, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(input).confirmationHash });
+    expect(job.isCanary).toBe(true);
+    let reads = 0;
+    let quarantined = false;
+    const provider = {
+      getStatus: vi.fn(async () => {
+        if (++reads === 2 && approvalState === "expired") await fixture.operator.query("UPDATE copilot_quarantine_canary_approvals SET status='expired' WHERE id=$1", [original.id]);
+        return status(quarantined);
+      }),
+      setQuarantine: vi.fn(async () => { quarantined = true; return status(true); }),
+    };
     await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
-    expect(provider.getStatus).not.toHaveBeenCalled();
-    expect(provider.setQuarantine).not.toHaveBeenCalled();
-    expect(await repository.get(value, job.id)).toMatchObject({ status: "failed", results: [{ errorCode: "quarantine_write_unqualified" }] });
+    if (approvalState === "current") {
+      expect(provider.getStatus).toHaveBeenCalledTimes(3);
+      expect(provider.setQuarantine).toHaveBeenCalledTimes(1);
+      expect(await repository.get(value, job.id)).toMatchObject({ status: "succeeded", succeeded: 1 });
+    } else {
+      expect(provider.getStatus).toHaveBeenCalledTimes(2);
+      expect(provider.setQuarantine).not.toHaveBeenCalled();
+      expect(await repository.get(value, job.id)).toMatchObject({ status: "waiting_authorization", completed: 0, canResume: true });
+      expect((await fixture.operator.query("SELECT sent_at FROM copilot_quarantine_job_items WHERE job_id=$1", [job.id])).rows).toEqual([{ sent_at: null }]);
+    }
+    expect(await repository.isQualified(value, authority, [frozen])).toBe(false);
   });
 
   it("denies egress when the frozen target is absent from current private inventory", async () => {

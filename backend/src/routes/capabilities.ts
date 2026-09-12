@@ -4,21 +4,34 @@ import { capabilities } from "../services/capabilities.js";
 import { getCapabilityDefinition } from "../services/capabilityRegistry.js";
 import { operationalLog } from "../services/telemetry.js";
 import { policyRoute } from "./policy.js";
+import { appRoles } from "../types/capability.js";
 
 export const capabilitiesRouter = Router();
-const recognizedRoles = ["AgentControl.Reader", "AgentControl.Operator", "AgentControl.SecurityReader", "AgentControl.Administrator"] as const;
 
-policyRoute(capabilitiesRouter, "get", "/capabilities", { access: "authenticated", dataClass: "configuration" }, async (request, response) => {
+policyRoute(capabilitiesRouter, "get", "/capabilities", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json({ value: await capabilities.list(request.session.user!) });
 });
 
-policyRoute(capabilitiesRouter, "post", "/capabilities/:id/probe", { access: "authenticated", dataClass: "configuration", roles: [...recognizedRoles], csrf: true }, async (request, response) => {
+policyRoute(capabilitiesRouter, "post", "/capabilities/check", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
+  if (request.body !== undefined && (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length)) {
+    throw new AppError(400, "invalid_request", "Automatic capability checks do not accept request parameters.");
+  }
+  const retry = request.query.retry;
+  if (Object.keys(request.query).some(key => key !== "retry") || retry !== undefined && retry !== "failed") {
+    throw new AppError(400, "invalid_request", "The only supported capability check option is retry=failed.");
+  }
+  response.json({ value: retry === "failed"
+    ? await capabilities.check(request.session.user!, { retryFailed: true })
+    : await capabilities.check(request.session.user!) });
+});
+
+policyRoute(capabilitiesRouter, "post", "/capabilities/:id/probe", { access: "authenticated", dataClass: "configuration", roles: [...appRoles], csrf: true }, async (request, response) => {
   const definition = getCapabilityDefinition(String(request.params.id));
   if (!definition) throw new AppError(404, "capability_not_found", "Capability was not found.");
   response.json(await capabilities.refresh(definition.id, request.session.user!));
 });
 
-policyRoute(capabilitiesRouter, "put", "/capabilities/:id/configuration", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Administrator"], csrf: true }, async (request, response) => {
+policyRoute(capabilitiesRouter, "put", "/capabilities/:id/configuration", { access: "authenticated", dataClass: "configuration", roles: ["AgentControl.Admin"], csrf: true }, async (request, response) => {
   const definition = getCapabilityDefinition(String(request.params.id));
   if (!definition) throw new AppError(404, "capability_not_found", "Capability was not found.");
   if (typeof request.body?.enabled !== "boolean" || typeof request.body?.sharedDataScope !== "boolean") throw new AppError(400, "invalid_configuration", "enabled and sharedDataScope must be booleans.");

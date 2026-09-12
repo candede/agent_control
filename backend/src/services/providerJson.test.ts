@@ -5,6 +5,24 @@ import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { allowlistedPackage } from "./packageObservation.js";
 
 describe("bounded provider observations", () => {
+  it("aborts and cancels a stalled JSON response body", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    const pending = boundedProviderJson(new Response(new ReadableStream({ cancel })), controller.signal);
+    const assertion = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+    controller.abort(new DOMException("deadline", "TimeoutError"));
+    await assertion;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a response body even when its deadline elapsed before consumption", async () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException("deadline", "TimeoutError"));
+    const cancel = vi.fn();
+    await expect(boundedProviderJson(new Response(new ReadableStream({ cancel })), controller.signal)).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("rejects oversized and malformed payloads", async () => {
     await expect(boundedProviderJson(new Response("x".repeat(2_000_001)))).rejects.toMatchObject({ code: "provider_result_limit" });
     await expect(boundedProviderJson(new Response("{"))).rejects.toMatchObject({ code: "provider_schema" });

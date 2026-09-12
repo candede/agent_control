@@ -59,7 +59,7 @@ type JobRow = {
   query_hash: string;
   scope_kind: "broad" | "exact";
   requested_ids: string[];
-  status: "waiting_authorization" | "running" | "succeeded" | "failed";
+  status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
   page_count: number;
   observed_count: number;
   total_records: number | null;
@@ -182,6 +182,16 @@ export class PackageInventoryRepository {
   async markFailed(scope: PackageDataScope, id: string, code: string, message: string) {
     await this.database.query(`UPDATE package_refresh_jobs SET status='failed',error_code=$4,message=$5,finished_at=clock_timestamp(),updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting_authorization')`, [id, scope.tenantId, scope.principalId, safeCode(code), message.slice(0, 1024)]);
+    return this.getJob(scope, id);
+  }
+
+  async cancel(scope: PackageDataScope, id: string, authorizationPrincipalId: string) {
+    validateScope(scope);
+    await this.database.query(`UPDATE package_refresh_jobs SET status='cancelled',error_code='cancelled',message='Cancelled by the requesting principal.',
+      finished_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND authorization_principal_id=$4
+        AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
+    [id, scope.tenantId, scope.principalId, authorizationPrincipalId]);
     return this.getJob(scope, id);
   }
 

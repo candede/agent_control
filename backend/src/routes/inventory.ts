@@ -10,12 +10,13 @@ import { powerPlatformInventory } from "../services/powerPlatformInventory.js";
 import { purviewAudit } from "../services/purviewAudit.js";
 import { powerPlatformResourceTypes, type PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
 import type { InventorySourceAwareDetail, RelatedSource } from "../types/workbench.js";
+import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 
 export const inventoryRouter = Router();
 const inventoryRepository = new PowerPlatformInventoryRepository();
 
-policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Reader"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
+policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
   const job = await powerPlatformInventory.submit(request.session.user!, {
     idempotencyKey: request.get("Idempotency-Key") ?? randomUUID(),
     environmentScope: optionalText(request.body?.environmentId, 512),
@@ -25,28 +26,31 @@ policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authe
   response.status(202).json(current);
 });
 
-policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Reader"] }, async (request, response) => {
+policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await inventoryRepository.listJobs(requestScope(request), positiveInteger(first(request.query.limit), 20, 50)));
 });
 
-policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Reader"] }, async (request, response) => {
+policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await powerPlatformInventory.get(request.session.user!, jobId(request.params.id)));
 });
 
-policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/resume", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Reader"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
+policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/resume", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
   response.status(202).json(await startOrWaiting(request.session.user!, jobId(request.params.id)));
 });
+policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/cancel", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
+  response.json(await powerPlatformInventory.cancel(request.session.user!, jobId(request.params.id)));
+});
 
-policyRoute(inventoryRouter, "get", "/inventory/snapshots", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Reader"] }, async (request, response) => {
+policyRoute(inventoryRouter, "get", "/inventory/snapshots", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await inventoryRepository.listSnapshots(requestScope(request), positiveInteger(first(request.query.limit), 50, 50)));
 });
 
-policyRoute(inventoryRouter, "get", "/inventory/resources", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Reader"] }, async (request, response) => {
+policyRoute(inventoryRouter, "get", "/inventory/resources", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await inventoryRepository.list(requestScope(request), listQuery(request.query)));
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
-  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Reader"],
+  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
 }, async (request, response) => {
   const snapshotId = optionalUuid(first(request.query.snapshotId));
   if (!snapshotId) throw new AppError(400, "snapshot_required", "Source-aware detail requires the exact saved snapshot.");
@@ -57,14 +61,14 @@ policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
   const identifierValues = (kind: string) => exact.resource.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value);
   const botIds = identifierValues("cds_bot_id");
   const entraAgentIds = identifierValues("entra_agent_id");
-  const hasSecurityRole = request.session.user!.roles.includes("AgentControl.SecurityReader");
+  const hasSecurityRole = hasAppRole(request.session.user!.roles, "AgentControl.Viewer");
   const audit: InventorySourceAwareDetail["audit"] = !hasSecurityRole
-    ? { status: "unauthorized", reason: "SecurityReader is required; no audit lookup or count was performed." }
+    ? { status: "unauthorized", reason: "Viewer is required; no audit lookup or count was performed." }
     : !exact.resource.environmentId || botIds.length !== 1
       ? { status: "unmatched", reason: "No single exact CDS bot ID plus environment association is available." }
       : await sourceResult(() => purviewAudit.relatedInventoryRecords(request.session.user!, { environmentId: exact.resource.environmentId!, botId: botIds[0] }));
   const security: InventorySourceAwareDetail["security"] = !hasSecurityRole
-    ? { status: "unauthorized", reason: "SecurityReader is required; no Defender lookup or count was performed." }
+    ? { status: "unauthorized", reason: "Viewer is required; no Defender lookup or count was performed." }
     : entraAgentIds.length !== 1
       ? { status: "unmatched", reason: "No single exact Entra agent ID association is available." }
       : await sourceResult(() => defenderHunting.relatedInventoryRows(request.session.user!, entraAgentIds[0]));
@@ -84,7 +88,7 @@ policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/quarantine-selection", {
-  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Reader"],
+  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
 }, async (request, response) => {
   const snapshotId = optionalUuid(first(request.query.snapshotId));
   if (!snapshotId) throw new AppError(400, "snapshot_required", "Selection resolution requires the exact saved snapshot.");
@@ -93,12 +97,12 @@ policyRoute(inventoryRouter, "get", "/inventory/quarantine-selection", {
   response.json(await inventoryRepository.getQuarantineSelection(requestScope(request), snapshotId, selected));
 });
 
-policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Reader"] }, async (request, response) => {
+policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const deadlineAt = Date.now() + 15_000;
   const scope = requestScope(request);
   const snapshotId = optionalUuid(first(request.query.snapshotId));
   if (!snapshotId) throw new AppError(400, "snapshot_required", "Power Platform export requires the exact saved snapshot selection.");
-  const validateSession = createExportPublicationValidator(request, "AgentControl.Reader");
+  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
   const validatePublication = async () => {
     await validateSession();
     await inventoryRepository.assertSnapshotCurrent(scope, snapshotId);

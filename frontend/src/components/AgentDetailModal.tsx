@@ -6,6 +6,7 @@ import type {
   PackageAccessTarget,
   PackageAccessUpdate,
 } from "../api/client";
+import { hasAppRole } from "../../../backend/src/types/capability";
 import { getBuiltWithLabel } from "../agentDisplay";
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
 import { WorkbenchActionGate } from "../workbenchActionContext";
@@ -20,6 +21,10 @@ type AgentDetailModalProps = {
   roles?: AppRole[];
   onClose: () => void;
   onUpdateAccess: (update: PackageAccessUpdate) => Promise<void>;
+  onEditAccess?: (target: PackageAccessTarget) => void;
+  preparingAccess?: boolean;
+  accessError?: string;
+  externalAccessEditorOpen?: boolean;
   onSetBlocked?: (blocked: boolean) => Promise<void>;
 };
 
@@ -42,6 +47,10 @@ export function AgentDetailModal({
   roles = [],
   onClose,
   onUpdateAccess,
+  onEditAccess,
+  preparingAccess = false,
+  accessError,
+  externalAccessEditorOpen = false,
   onSetBlocked,
 }: AgentDetailModalProps) {
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
@@ -52,6 +61,10 @@ export function AgentDetailModal({
   const selectTab = (tab: DetailTab) => {
     setInternalTab(tab);
     onTabChange?.(tab);
+  };
+  const editAccess = (target: PackageAccessTarget) => {
+    if (onEditAccess) onEditAccess(target);
+    else setEditingAccessTarget(target);
   };
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
@@ -78,7 +91,7 @@ export function AgentDetailModal({
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !editingAccessTarget) {
+      if (event.key === "Escape" && !editingAccessTarget && !externalAccessEditorOpen) {
         onClose();
       }
     }
@@ -86,7 +99,7 @@ export function AgentDetailModal({
     window.addEventListener("keydown", handleKeyDown);
 
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [editingAccessTarget, onClose]);
+  }, [editingAccessTarget, externalAccessEditorOpen, onClose]);
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
@@ -262,12 +275,14 @@ export function AgentDetailModal({
               <AccessList
                 label="Available to"
                 values={agent.allowedUsersAndGroups}
-                onEdit={() => setEditingAccessTarget("availability")}
+                onEdit={() => editAccess("availability")}
+                busy={preparingAccess}
               />
               <AccessList
                 label="Installed for"
                 values={agent.acquireUsersAndGroups}
-                onEdit={() => setEditingAccessTarget("installation")}
+                onEdit={() => editAccess("installation")}
+                busy={preparingAccess}
               />
             </div>
             <p className="detail-overflow-note">
@@ -333,11 +348,13 @@ export function AgentDetailModal({
           </section>
         ) : selectedTab === "power-platform" ? <UnavailablePanel id="power-platform" title="Power Platform data">No documented package-to-Power-Platform identifier equivalence exists. Names, app IDs, manifest IDs, asset IDs, owners, and timestamps were not used as joins. Power Platform records remain usable in their authorized inventory view.</UnavailablePanel>
           : selectedTab === "reports" ? <UnavailablePanel id="reports" title="Official reports">Official report agent IDs are report-only under the retained three-file contract. No documented exact relation to a Graph package ID exists, so no report lookup, metric substitution, or count was performed.</UnavailablePanel>
-          : selectedTab === "audit-security" ? <UnavailablePanel id="audit-security" title="Audit and security">{roles.includes("AgentControl.SecurityReader") ? "SecurityReader is authorized for source views, but Purview and Defender define exact Power Platform identifier associations only. No documented exact relation to this Graph package exists, so names were not queried." : "SecurityReader is not assigned. Audit and Defender records and counts were not requested. Their source views remain independently authorized."}</UnavailablePanel>
+          : selectedTab === "audit-security" ? <UnavailablePanel id="audit-security" title="Audit and security">{hasAppRole(roles, "AgentControl.Viewer") ? "Viewer access includes the source views, but Purview and Defender define exact Power Platform identifier associations only. No documented exact relation to this Graph package exists, so names were not queried." : "Viewer is not assigned. Audit and Defender records and counts were not requested."}</UnavailablePanel>
           : <section id="agent-controls-panel" className="detail-section metadata" role="tabpanel" aria-labelledby="agent-tab-controls" tabIndex={0}><div className="detail-section-header"><h3>Native package controls</h3><span>{agent.id}</span></div><p>Block state and package access target only this exact Graph package ID. Copilot Studio quarantine remains a separate environment/CDS bot control.</p>
-            {onSetBlocked ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"}><button type="button" className="secondary" onClick={() => void onSetBlocked(!agent.isBlocked)}>{agent.isBlocked ? "Unblock exact package" : "Block exact package"}</button></WorkbenchActionGate> : null}
-            <WorkbenchActionGate actionId="packages.access"><button type="button" className="secondary" onClick={() => setEditingAccessTarget("availability")}>Manage package availability</button></WorkbenchActionGate>
+            {hasAppRole(roles, "AgentControl.Admin") && onSetBlocked ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"}><button type="button" className="secondary" onClick={() => void onSetBlocked(!agent.isBlocked)}>{agent.isBlocked ? "Unblock exact package" : "Block exact package"}</button></WorkbenchActionGate> : null}
+            {hasAppRole(roles, "AgentControl.Admin") ? <WorkbenchActionGate actionId="packages.access"><button type="button" className="secondary" disabled={preparingAccess} onClick={() => editAccess("availability")}>Manage package availability</button></WorkbenchActionGate> : <p>Admin is required for package mutations.</p>}
           </section>}
+        {preparingAccess ? <p role="status">Loading current access from Microsoft Graph...</p> : null}
+        {accessError ? <p className="error-banner" role="alert">{accessError}</p> : null}
         {editingAccessTarget ? (
           <AccessAssignmentModal
             context="single"
@@ -583,18 +600,20 @@ function AccessList({
   label,
   values,
   onEdit,
+  busy = false,
 }: {
   label: string;
   values?: CopilotPackageDetail["allowedUsersAndGroups"];
   onEdit: () => void;
+  busy?: boolean;
 }) {
   return (
     <div className="access-list">
       <div className="access-list-header">
         <span>{label}</span>
         <WorkbenchActionGate actionId="packages.access">
-        <button type="button" className="secondary" onClick={onEdit}>
-          Edit
+        <button type="button" className="secondary" aria-label={`Edit ${label === "Available to" ? "availability" : "installation"}`} disabled={busy} onClick={onEdit}>
+          {busy ? "Loading..." : "Edit"}
         </button>
         </WorkbenchActionGate>
       </div>

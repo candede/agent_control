@@ -39,7 +39,7 @@ describe("AuditLogView routing", () => {
   it("exports exact displayed event IDs through the authorized server rather than serializing cached rows", async () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
       id: "event-1", operationId: "operation-1", action: "block", targetBlockedState: true, scope: "single",
-      agentId: "package-1", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.SecurityReader"] },
+      agentId: "package-1", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Viewer"] },
       startedAt: "2026-09-10T10:00:00.000Z", status: "failed", requestPath: "/fixture",
     }] });
     vi.mocked(downloadAdministrativeAuditCsv).mockRejectedValue(new Error("Download not authorized"));

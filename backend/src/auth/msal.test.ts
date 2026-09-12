@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ConfidentialClientApplication } from "@azure/msal-node";
 import { config, loginScopes } from "../config.js";
 import { acquireApplicationToken, acquireDelegatedToken, capabilityScopes, createAuthFlow, createAuthorizationUrl, evictAccount, msalNetworkClient, msalNetworkTimeoutMs, redeemAuthorizationCode, replaceMsalClientForTest, revalidateAuthenticatedUser, toAuthenticatedUser, type MsalClient } from "./msal.js";
 import { inventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
+import { capabilityDefinitions } from "../services/capabilityRegistry.js";
 
 const tenantId = "11111111-1111-1111-1111-111111111111";
 const otherTenantId = "99999999-9999-9999-9999-999999999999";
@@ -20,7 +22,7 @@ function futureExpiry() {
 function fakeClient(overrides: Partial<MsalClient> = {}) {
   const removeAccount = vi.fn(async () => undefined);
   const client: MsalClient = {
-    getAuthCodeUrl: vi.fn(async () => "https://login.microsoftonline.com/fixture"),
+    getAuthCodeUrl: vi.fn(async () => `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize`),
     acquireTokenByCode: vi.fn(),
     acquireTokenSilent: vi.fn(async request => {
       const scopes = request.scopes as string[];
@@ -42,12 +44,84 @@ afterEach(() => {
 });
 
 describe("authentication scopes", () => {
-  it("keeps the initial sign-in identity-only", () => {
+  it("requests all implemented delegated consent up front, including Admin package-write scopes", () => {
     expect(loginScopes).toEqual(["openid", "profile"]);
-    expect(createAuthFlow("login").scopes).toEqual(["openid", "profile"]);
+    const flow = createAuthFlow("login");
+    expect(flow.scopes).toEqual(["openid", "profile", "offline_access",
+      "https://graph.microsoft.com/User.ReadBasic.All", "https://graph.microsoft.com/Group.Read.All"]);
+    expect(flow.extraScopesToConsent).toEqual([
+      "https://graph.microsoft.com/CopilotPackages.Read.All",
+      "https://graph.microsoft.com/CopilotPackages.ReadWrite.All",
+      "https://api.powerplatform.com/ResourceQuery.Resources.Read",
+      "https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke",
+      "https://graph.microsoft.com/AuditLogsQuery.Read.All",
+      "https://graph.microsoft.com/ThreatHunting.Read.All",
+    ]);
+    const requestedScopes = [...flow.scopes, ...flow.extraScopesToConsent!];
+    expect(requestedScopes.join(" ")).not.toMatch(/\.default/);
+    expect(new Set(requestedScopes).size).toBe(requestedScopes.length);
+    for (const definition of capabilityDefinitions.filter(value => value.mode === "delegated" && value.probe.adapterRegistered)) {
+      expect(requestedScopes).toEqual(expect.arrayContaining(capabilityScopes(definition.id)));
+    }
     expect(capabilityScopes("graph.package.read.delegated")).toEqual(["https://graph.microsoft.com/CopilotPackages.Read.All"]);
     expect(capabilityScopes("powerPlatform.inventory.read")).toEqual(["https://api.powerplatform.com/ResourceQuery.Resources.Read"]);
     expect(capabilityScopes("powerPlatform.quarantine.manage")).toEqual(["https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke"]);
+  });
+
+  it("allows provider setup to be explicitly deferred without changing identity revalidation scopes", async () => {
+    const { client } = fakeClient();
+    replaceMsalClientForTest(client);
+    const flow = createAuthFlow("login", { providerConsent: false });
+    expect(flow.scopes).toEqual(loginScopes);
+    expect(flow.extraScopesToConsent).toBeUndefined();
+    await createAuthorizationUrl(flow);
+    expect(client.getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ scopes: loginScopes, prompt: "select_account" }));
+    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("extraScopesToConsent");
+  });
+
+  it("lets Entra decide whether recovery needs consent instead of forcing repeated consent", async () => {
+    const { client } = fakeClient();
+    replaceMsalClientForTest(client);
+    const flow = createAuthFlow("consent", { capabilityId: "graph.directory.read", accountId: account.homeAccountId });
+    await createAuthorizationUrl(flow);
+    expect(client.getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ scopes: flow.scopes }));
+    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("prompt");
+    expect(flow.extraScopesToConsent).toBeUndefined();
+  });
+
+  it("encodes cross-resource consent with the installed MSAL SDK without making token or provider requests", async () => {
+    const authority = `https://login.microsoftonline.com/${tenantId}`;
+    const networkClient = {
+      sendGetRequestAsync: vi.fn(async () => { throw new Error("Unexpected network request"); }),
+      sendPostRequestAsync: vi.fn(async () => { throw new Error("Unexpected network request"); }),
+    };
+    const nativeClient = new ConfidentialClientApplication({
+      auth: {
+        clientId: config.clientId!, clientSecret: "fixture", authority,
+        cloudDiscoveryMetadata: JSON.stringify({
+          tenant_discovery_endpoint: `${authority}/v2.0/.well-known/openid-configuration`,
+          metadata: [{ preferred_network: "login.microsoftonline.com", preferred_cache: "login.microsoftonline.com", aliases: ["login.microsoftonline.com"] }],
+        }),
+        authorityMetadata: JSON.stringify({
+          authorization_endpoint: `${authority}/oauth2/v2.0/authorize`,
+          token_endpoint: `${authority}/oauth2/v2.0/token`,
+          end_session_endpoint: `${authority}/oauth2/v2.0/logout`,
+          issuer: `${authority}/v2.0`,
+          jwks_uri: `${authority}/discovery/v2.0/keys`,
+        }),
+      },
+      system: { networkClient },
+    });
+    const flow = createAuthFlow("login");
+    const url = new URL(await nativeClient.getAuthCodeUrl({
+      scopes: flow.scopes, extraScopesToConsent: flow.extraScopesToConsent,
+      redirectUri: "http://localhost:3002/api/auth/callback",
+    }));
+    const requestedScopes = url.searchParams.get("scope")!.split(" ");
+    expect(requestedScopes).toEqual(expect.arrayContaining([...flow.scopes, ...flow.extraScopesToConsent!]));
+    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:3002/api/auth/callback");
+    expect(networkClient.sendGetRequestAsync).not.toHaveBeenCalled();
+    expect(networkClient.sendPostRequestAsync).not.toHaveBeenCalled();
   });
 
   it("isolates delegated requests by account, resource, and capability scopes", async () => {
@@ -64,10 +138,12 @@ describe("authentication scopes", () => {
     const user = toAuthenticatedUser({
       account,
       idTokenClaims: {
+        roles: ["AgentControl.Viewer", "AgentControl.Admin", "AgentControl.Reader", "AgentControl.Operator", "AgentControl.SecurityReader", "AgentControl.Administrator"],
         wids: [inventoryProviderRoleIds.aiReader, inventoryProviderRoleIds.aiReader, "00000000-0000-0000-0000-000000000000", "secret-role-name", 42],
       },
     } as never);
     expect(user.providerRoleIds).toEqual([inventoryProviderRoleIds.aiReader]);
+    expect(user.roles).toEqual(["AgentControl.Admin", "AgentControl.Viewer"]);
     const excessive = toAuthenticatedUser({ account, idTokenClaims: { wids: Array.from({ length: 65 }, () => inventoryProviderRoleIds.globalReader) } } as never);
     expect(excessive.providerRoleIds).toEqual([]);
   });
@@ -82,11 +158,40 @@ describe("authentication scopes", () => {
   });
 
   it("maps interaction, invalid-grant, conditional-access, and provider failures", async () => {
-    for (const [errorCode, expectedCode] of [["consent_required", "interaction_required"], ["interaction_required", "interaction_required"], ["invalid_grant", "authorization_expired"], ["request_timeout", "identity_provider_error"]]) {
+    for (const [errorCode, expectedCode] of [["consent_required", "missing_permission"], ["interaction_required", "interaction_required"], ["invalid_grant", "interaction_required"], ["request_timeout", "identity_provider_error"]]) {
       const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { errorCode }; }) });
       replaceMsalClientForTest(client);
       await expect(acquireDelegatedToken("account-a", "graph.package.read.delegated")).rejects.toMatchObject({ code: expectedCode });
     }
+  });
+
+  it.each([
+    { error: { errorCode: "invalid_grant", subError: "consent_required" }, expected: "missing_permission" },
+    { error: { errorCode: "invalid_grant", errorNo: "65001" }, expected: "missing_permission" },
+    { error: { errorCode: "invalid_grant", errorMessage: "AADSTS65001: private-account@example.invalid needs consent" }, expected: "missing_permission" },
+    { error: { errorCode: "invalid_grant", subError: "additional_action" }, expected: "interaction_required" },
+    { error: { errorCode: "invalid_grant", errorNo: "50076" }, expected: "interaction_required" },
+    { error: { errorCode: "invalid_grant", errorNo: "53003" }, expected: "interaction_required" },
+    { error: { errorCode: "invalid_grant", errorNo: "700082" }, expected: "authorization_expired" },
+    { error: { errorCode: "invalid_grant", errorNo: "50173" }, expected: "authorization_expired" },
+  ])("distinguishes consent, interaction and expiration for $error", async ({ error, expected }) => {
+    const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { ...error, correlationId: "safe-request-id", claims: "private-claims" }; }) });
+    replaceMsalClientForTest(client);
+    const result = acquireDelegatedToken("account-a", "graph.directory.read");
+    await expect(result).rejects.toMatchObject({ code: expected, details: { correlationId: "safe-request-id" } });
+    await result.catch(failure => {
+      expect(JSON.stringify(failure)).not.toMatch(/private-account|private-claims|errorMessage/);
+    });
+  });
+
+  it("retains only a safe Entra error number and correlation ID", async () => {
+    const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw {
+      errorCode: "invalid_grant", errorNo: "65001", correlationId: "unsafe\nheader", errorMessage: "private details",
+    }; }) });
+    replaceMsalClientForTest(client);
+    await expect(acquireDelegatedToken("account-a", "graph.directory.read")).rejects.toMatchObject({
+      code: "missing_permission", details: { providerErrorCode: "AADSTS65001" },
+    });
   });
 
   it("rejects missing delegated grants and missing application roles", async () => {
@@ -132,6 +237,22 @@ describe("authentication scopes", () => {
     await expect(acquireDelegatedToken("account-a", "graph.package.read.delegated")).rejects.toMatchObject({ code: "authorization_expired" });
   });
 
+  it("does not mislabel invalid expiry metadata or a future token start time as expired consent", async () => {
+    for (const expiresOn of [undefined, new Date("invalid")]) {
+      const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => ({
+        accessToken: "opaque", scopes: capabilityScopes("graph.directory.read"), account, tenantId, expiresOn,
+      } as never)) });
+      replaceMsalClientForTest(client);
+      await expect(acquireDelegatedToken("account-a", "graph.directory.read")).rejects.toMatchObject({ code: "identity_provider_error" });
+    }
+    const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => ({
+      accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, nbf: Math.floor(Date.now() / 1000) + 60 }),
+      scopes: capabilityScopes("graph.directory.read"), account, tenantId, expiresOn: futureExpiry(),
+    } as never)) });
+    replaceMsalClientForTest(client);
+    await expect(acquireDelegatedToken("account-a", "graph.directory.read")).rejects.toMatchObject({ code: "authorization_not_yet_valid" });
+  });
+
   it("rejects inconsistent callback and refreshed-principal metadata", async () => {
     const flow = createAuthFlow("consent", { capabilityId: "graph.package.read.delegated", accountId: "account-a" });
     const callbackResult = { account, tenantId, idTokenClaims: { nonce: flow.nonce, tid: otherTenantId } };
@@ -139,7 +260,7 @@ describe("authentication scopes", () => {
     replaceMsalClientForTest(callback.client);
     await expect(redeemAuthorizationCode("code", flow)).rejects.toMatchObject({ code: "unauthorized" });
 
-    const switched = fakeClient({ acquireTokenSilent: vi.fn(async () => ({ account: { ...account, homeAccountId: "account-b" }, tenantId, idTokenClaims: { tid: tenantId, roles: ["AgentControl.Reader"] } } as never)) });
+    const switched = fakeClient({ acquireTokenSilent: vi.fn(async () => ({ account: { ...account, homeAccountId: "account-b" }, tenantId, idTokenClaims: { tid: tenantId, roles: ["AgentControl.Viewer"] } } as never)) });
     replaceMsalClientForTest(switched.client);
     await expect(revalidateAuthenticatedUser("account-a")).rejects.toMatchObject({ code: "unauthorized" });
   });
@@ -152,8 +273,12 @@ describe("authentication scopes", () => {
     replaceMsalClientForTest(client);
     await createAuthorizationUrl(flow);
     expect(getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ codeChallengeMethod: "S256", codeChallenge: expect.not.stringContaining(flow.codeVerifier) }));
+    expect(getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ extraScopesToConsent: flow.extraScopesToConsent }));
     await redeemAuthorizationCode("authorization-code", flow);
     expect(acquireTokenByCode).toHaveBeenCalledWith(expect.objectContaining({ code: "authorization-code", codeVerifier: flow.codeVerifier }));
+    expect(acquireTokenByCode).toHaveBeenCalledWith(expect.objectContaining({ scopes: flow.scopes }));
+    expect(vi.mocked(client.acquireTokenByCode).mock.calls[0][0]).not.toHaveProperty("extraScopesToConsent");
+    expect(flow.scopes.every(scope => !scope.startsWith("https://api.powerplatform.com/"))).toBe(true);
 
     const badNonce = fakeClient({ acquireTokenByCode: vi.fn(async () => ({ account, tenantId, idTokenClaims: { tid: tenantId, nonce: "wrong" } } as never)) });
     replaceMsalClientForTest(badNonce.client);

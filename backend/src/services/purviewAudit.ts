@@ -3,12 +3,13 @@ import { config } from "../config.js";
 import { PurviewAuditRepository, type PurviewAuditExecution, type PurviewAuditReadScope, type PurviewAuditScope } from "../db/purviewAudit.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import type { CapabilityStatus } from "../types/capability.js";
+import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { PurviewAuditJob, PurviewAuditTokenMode, PurviewProviderQuery } from "../types/purviewAudit.js";
 import { capabilities } from "./capabilities.js";
 import { GraphAuditSearchClient, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
 import { inventoryRoleScope, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
+import { operationalLog } from "./telemetry.js";
 
 type CapabilityId = "purview.audit.search.delegated" | "purview.audit.search.application";
 type AuditDependencies = {
@@ -68,7 +69,7 @@ export class PurviewAuditService {
   ) {}
 
   async submit(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; idempotencyKey: string }) {
-    requireSecurityReader(user);
+    requireViewer(user);
     const filters = validatePurviewAuditFilters(input.filters);
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
@@ -79,7 +80,7 @@ export class PurviewAuditService {
   }
 
   async approveQualification(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown }) {
-    requireQualificationApprover(user);
+    requireQualificationRole(user, input.tokenMode);
     const filters = validatePurviewAuditFilters(input.filters, { qualification: true });
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
@@ -90,11 +91,14 @@ export class PurviewAuditService {
   }
 
   async startQualification(user: AuthenticatedUser, qualificationId: string) {
-    requireQualificationApprover(user);
+    requireViewer(user);
     if (!user.tenantId) throw AppError.unauthorized();
     const qualification = await this.repository.getQualification(user.tenantId, qualificationId);
-    if (!qualification || qualification.authorizationPrincipalId !== user.homeAccountId || !resultScopeMatches(qualification.resultScope,
-      await this.resultScopeForMode(user, qualification.tokenMode))) throw new AppError(404, "not_found", "Audit Search qualification was not found.");
+    if (!qualification || qualification.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Audit Search qualification was not found.");
+    requireQualificationRole(user, qualification.tokenMode);
+    if (!resultScopeMatches(qualification.resultScope, await this.resultScopeForMode(user, qualification.tokenMode))) {
+      throw new AppError(404, "not_found", "Audit Search qualification was not found.");
+    }
     const context = await this.dependencies.qualificationContext(qualification.capabilityId, user);
     if (qualification.contractRevision !== context.contractRevision || qualification.permissionRevision !== context.permissionRevision || qualification.configurationRevision !== context.configurationRevision) {
       throw new AppError(409, "qualification_superseded", "Audit Search permission, contract, or configuration changed after approval.");
@@ -110,7 +114,7 @@ export class PurviewAuditService {
   }
 
   start(user: AuthenticatedUser, id: string, tokenMode: PurviewAuditTokenMode): Promise<PurviewAuditJob> {
-    requireSecurityReader(user);
+    requireViewer(user);
     const actor = actorScope(user);
     const existing = this.active.get(id);
     if (existing && existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId) return existing.started;
@@ -149,29 +153,29 @@ export class PurviewAuditService {
   }
 
   async get(user: AuthenticatedUser, id: string) {
-    requireSecurityReader(user);
+    requireViewer(user);
     const job = await this.repository.getJob(await this.readScope(user), id);
     if (!job) throw new AppError(404, "not_found", "Audit Search job was not found.");
     return job;
   }
 
   async list(user: AuthenticatedUser, limit = 20, offset = 0) {
-    requireSecurityReader(user);
+    requireViewer(user);
     return this.repository.listJobs(await this.readScope(user), limit, offset);
   }
 
   async records(user: AuthenticatedUser, id: string, limit = 100, offset = 0) {
-    requireSecurityReader(user);
+    requireViewer(user);
     return this.repository.listRecords(await this.readScope(user), id, limit, offset);
   }
 
   async relatedInventoryRecords(user: AuthenticatedUser, target: { environmentId: string; botId: string }, limit = 20) {
-    requireSecurityReader(user);
+    requireViewer(user);
     return this.repository.relatedInventoryRecords(await this.readScope(user), target, limit);
   }
 
   async cancel(user: AuthenticatedUser, id: string) {
-    requireSecurityReader(user);
+    requireViewer(user);
     const readScope = await this.readScope(user);
     if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
     this.active.get(id)?.controller.abort(new AppError(409, "audit_cancelled", "Audit Search was cancelled locally."));
@@ -179,7 +183,7 @@ export class PurviewAuditService {
   }
 
   async delete(user: AuthenticatedUser, id: string) {
-    requireSecurityReader(user);
+    requireViewer(user);
     const readScope = await this.readScope(user);
     if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
     this.active.get(id)?.controller.abort(new AppError(409, "audit_cancelled", "Audit Search local cache was deleted."));
@@ -225,8 +229,8 @@ export class PurviewAuditService {
       await abortable(commitAccountSessionValidation(validation, async () => {
         signal.throwIfAborted();
         requireSamePrincipal(actor, freshUser);
-        if (qualification) requireQualificationApprover(freshUser);
-        else requireSecurityReader(freshUser);
+        if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
+        else requireViewer(freshUser);
       }), signal);
       const providerOptions = {
         signal,
@@ -285,14 +289,18 @@ export class PurviewAuditService {
       const job = await abortable(commitAccountSessionValidation(publicationValidation, async () => {
         publicationSignal.throwIfAborted();
         requireSamePrincipal(actor, publicationUser);
-        if (qualification) requireQualificationApprover(publicationUser);
-        else requireSecurityReader(publicationUser);
+        if (qualification) requireQualificationRole(publicationUser, scope.tokenMode);
+        else requireViewer(publicationUser);
         return this.repository.publish(scope, current.id, execution, result);
       }), publicationSignal);
-      if (qualification && job.status === "succeeded") {
+      const evidenceCapabilityId = qualification?.capabilityId ??
+        (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
+      if (evidenceCapabilityId && job.status === "succeeded") {
         try {
-          await abortable(this.dependencies.recordQualificationEvidence(qualification.capabilityId, publicationUser, "available", { providerRequestId: job.providerRequestId }), publicationSignal);
-        } catch {}
+          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available", { providerRequestId: job.providerRequestId }), publicationSignal);
+        } catch {
+          operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_success" });
+        }
       }
     } catch (error) {
       if (error instanceof AppError && error.code === "audit_execution_lost") return;
@@ -302,14 +310,18 @@ export class PurviewAuditService {
       }
       const inconclusive = error instanceof AppError && ["audit_create_inconclusive", "provider_schema", "provider_error", "invalid_provider_link", "audit_provider_request_limit", "audit_job_expired"].includes(error.code);
       const job = await this.repository.fail(scope, current.id, execution, error instanceof AppError ? error.code : "provider_error", safeFailureMessage(error), inconclusive);
-      if (qualification) {
+      const evidenceCapabilityId = qualification?.capabilityId ??
+        (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
+      if (evidenceCapabilityId) {
         try {
           const evidenceSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
           const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), evidenceSignal);
-          await abortable(this.dependencies.recordQualificationEvidence(qualification.capabilityId, evidenceUser, qualificationEvidenceStatus(error), {
+          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, evidenceUser, qualificationEvidenceStatus(error), {
             category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
           }), evidenceSignal);
-        } catch {}
+        } catch {
+          operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_failure" });
+        }
       }
     }
   }
@@ -323,8 +335,8 @@ export class PurviewAuditService {
     const freshUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
     signal.throwIfAborted();
     requireSamePrincipal(actor, freshUser);
-    if (qualification) requireQualificationApprover(freshUser);
-    else requireSecurityReader(freshUser);
+    if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
+    else requireViewer(freshUser);
     const capabilityId = capabilityForMode(scope.tokenMode);
     if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
     if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
@@ -381,7 +393,7 @@ export class PurviewAuditService {
     }
     const roleScope = inventoryRoleScope(user);
     return { tenantId: user.tenantId, resultScopes,
-      ...(user.roles.includes("AgentControl.Reader") && roleScope !== "unknown" ? { inventoryIdentityScope: {
+      ...(hasAppRole(user.roles, "AgentControl.Viewer") && roleScope !== "unknown" ? { inventoryIdentityScope: {
         principalId: user.homeAccountId, roleScope, resourceTypes: [...resourceTypesForInventoryScope(roleScope)],
       } } : {}) };
   }
@@ -424,13 +436,15 @@ function actorScope(user: AuthenticatedUser) {
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
 }
 
-function requireSecurityReader(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.SecurityReader")) throw new AppError(403, "missing_internal_role", "Audit Search requires the SecurityReader role.");
+function requireViewer(user: AuthenticatedUser) {
+  if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Audit Search requires the Viewer role.");
 }
 
-function requireQualificationApprover(user: AuthenticatedUser) {
-  requireSecurityReader(user);
-  if (!user.roles.includes("AgentControl.Administrator")) throw new AppError(403, "missing_internal_role", "Audit Search qualification approval requires Administrator and SecurityReader roles.");
+function requireQualificationRole(user: AuthenticatedUser, tokenMode: PurviewAuditTokenMode) {
+  requireViewer(user);
+  if (tokenMode === "application" && !hasAppRole(user.roles, "AgentControl.Admin")) {
+    throw new AppError(403, "missing_internal_role", "Application Audit Search qualification approval requires the Admin role.");
+  }
 }
 
 function requireSamePrincipal(scope: { tenantId: string; principalId: string }, user: AuthenticatedUser) {

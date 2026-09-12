@@ -68,6 +68,23 @@ async function qualifyScope(key: string, scope = principalScope, selectedFilters
 }
 
 describe.sequential("Defender hunting repository", () => {
+  it("accepts bounded ordinary delegated jobs without weakening application retained scope", async () => {
+    const delegated = await repository.submit(principalScope, { idempotencyKey: "ordinary-delegated", filters });
+    expect(delegated).toMatchObject({ tokenMode: "delegated", qualification: null, retainedScopeId: null });
+    const readScope = { tenantId: principalScope.tenantId, authorizationPrincipalId: principalScope.authorizationPrincipalId,
+      resultScopes: [principalScope.resultScope], qualifications: [] };
+    await expect(repository.getJob(readScope, delegated.id)).resolves.toMatchObject({ id: delegated.id });
+    await expect(repository.listJobs(readScope)).resolves.toMatchObject({ value: expect.arrayContaining([expect.objectContaining({ id: delegated.id })]) });
+    const applicationScope: DefenderHuntingScope = {
+      tenantId: principalScope.tenantId,
+      authorizationPrincipalId: principalScope.authorizationPrincipalId,
+      resultScope: { kind: "application", scopeId: "application-client", configurationRevision: 1 },
+      tokenMode: "application",
+    };
+    await expect(repository.submit(applicationScope, { idempotencyKey: "ordinary-application", filters }))
+      .rejects.toMatchObject({ code: "invalid_qualification" });
+  });
+
   it("filters source-detail matches by retained authorization before rows and counts", async () => {
     const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "detail-reader",
       resultScope: { kind: "principal", scopeId: "detail-reader", configurationRevision: null } };
@@ -81,7 +98,9 @@ describe.sequential("Defender hunting repository", () => {
     ]));
     expect(await repository.relatedInventoryRows({ ...readScope, qualifications: [] }, nativeId)).toEqual({ count: 0, value: [] });
     const retained = await repository.requireQualifiedScope(scope, filters, authority);
-    await repository.revokeRetainedScope(readScope, retained.id, scope.authorizationPrincipalId);
+    await expect(repository.revokeRetainedScope(readScope, retained.id, "application", scope.authorizationPrincipalId))
+      .rejects.toMatchObject({ code: "not_found" });
+    await repository.revokeRetainedScope(readScope, retained.id, "delegated", scope.authorizationPrincipalId);
     expect(await repository.relatedInventoryRows(readScope, nativeId)).toEqual({ count: 0, value: [] });
   });
 

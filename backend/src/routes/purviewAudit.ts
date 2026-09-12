@@ -17,7 +17,7 @@ purviewAuditRouter.use((_request, response, next) => {
   next();
 });
 
-policyRoute(purviewAuditRouter, "get", "/audit-search/catalog", { access: "authenticated", dataClass: "provider_audit_metadata", roles: ["AgentControl.SecurityReader"] }, (_request, response) => {
+policyRoute(purviewAuditRouter, "get", "/audit-search/catalog", { access: "authenticated", dataClass: "provider_audit_metadata", roles: ["AgentControl.Viewer"] }, (_request, response) => {
   response.json({
     presets: Object.entries(purviewAuditPresets).map(([id, value]) => ({ id, label: value.label, service: value.serviceFilter, recordTypes: value.recordTypeFilters, operations: value.operationFilters })),
     limits: { maximumWindowHours: 168, qualificationWindowHours: 1, maximumPages: 20, maximumRows: 5_000, maximumBytes: 8_000_000,
@@ -28,58 +28,58 @@ policyRoute(purviewAuditRouter, "get", "/audit-search/catalog", { access: "authe
   });
 });
 
-policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.SecurityReader", "AgentControl.Administrator"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   response.status(201).json(await purviewAudit.approveQualification(request.session.user!, { tokenMode: tokenMode(request.body?.tokenMode), filters: request.body?.filters }));
 });
 
-policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications/:id/start", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.SecurityReader", "AgentControl.Administrator"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "post", "/audit-search/qualifications/:id/start", { access: "authenticated", dataClass: "provider_audit_qualification", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   response.status(202).json(await startQualificationOrWaiting(request, uuid(request.params.id)));
 });
 
-policyRoute(purviewAuditRouter, "post", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.SecurityReader"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "post", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const mode = tokenMode(request.body?.tokenMode);
   const job = await purviewAudit.submit(request.session.user!, { tokenMode: mode, filters: request.body?.filters, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() });
   response.status(202).json(await startOrWaiting(request, job.id, mode));
 });
 
-policyRoute(purviewAuditRouter, "get", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.SecurityReader"] }, async (request, response) => {
+policyRoute(purviewAuditRouter, "get", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await purviewAudit.list(request.session.user!, positiveInteger(first(request.query.limit), 20, 50),
     positiveInteger(first(request.query.offset), 0, 100_000, true)));
 });
 
-policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.SecurityReader"] }, async (request, response) => {
+policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await purviewAudit.get(request.session.user!, uuid(request.params.id)));
 });
 
-policyRoute(purviewAuditRouter, "post", "/audit-search/jobs/:id/resume", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.SecurityReader"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "post", "/audit-search/jobs/:id/resume", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = uuid(request.params.id);
   const job = await purviewAudit.get(request.session.user!, id);
   response.status(202).json(await startOrWaiting(request, id, job.tokenMode));
 });
 
-policyRoute(purviewAuditRouter, "post", "/audit-search/jobs/:id/cancel", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.SecurityReader"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "post", "/audit-search/jobs/:id/cancel", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   response.json(await purviewAudit.cancel(request.session.user!, uuid(request.params.id)));
 });
 
-policyRoute(purviewAuditRouter, "delete", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_cache", roles: ["AgentControl.SecurityReader"], csrf: true }, async (request, response) => {
+policyRoute(purviewAuditRouter, "delete", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_cache", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const id = uuid(request.params.id);
   confirmLocalDelete(request.body, id);
   await purviewAudit.delete(request.session.user!, id);
   response.status(204).end();
 });
 
-policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id/records", { access: "authenticated", dataClass: "private_provider_audit", roles: ["AgentControl.SecurityReader"] }, async (request, response) => {
+policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id/records", { access: "authenticated", dataClass: "private_provider_audit", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const id = uuid(request.params.id);
   const result = await auditedRead(request, id, "view-audit-search", () => purviewAudit.records(request.session.user!, id,
     positiveInteger(first(request.query.limit), 100, 500), positiveInteger(first(request.query.offset), 0, 100_000, true)));
   response.json(result);
 });
 
-policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id/export.csv", { access: "authenticated", dataClass: "private_provider_audit_export", roles: ["AgentControl.SecurityReader"] }, async (request, response) => {
+policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id/export.csv", { access: "authenticated", dataClass: "private_provider_audit_export", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const deadlineAt = Date.now() + 15_000;
   const id = uuid(request.params.id);
   const scope = requestScope(request);
-  const validateSession = createExportPublicationValidator(request, "AgentControl.SecurityReader");
+  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
   const validatePublication = async () => {
     await validateSession();
     await purviewAudit.get(request.session.user!, id);

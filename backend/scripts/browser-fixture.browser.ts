@@ -9,6 +9,7 @@ import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision } from "../src/db/capabilities.js";
 import { capabilityDefinitions } from "../src/services/capabilityRegistry.js";
+import { capabilities } from "../src/services/capabilities.js";
 import { GraphPackagesClient } from "../src/services/graphPackages.js";
 import { DirectoryPrincipalsClient } from "../src/services/directoryPrincipals.js";
 import { appRoles, type CapabilityStatus } from "../src/types/capability.js";
@@ -17,6 +18,8 @@ import { OfficialUsageRepository } from "../src/db/officialUsage.js";
 import { PowerPlatformInventoryRepository } from "../src/db/powerPlatformInventory.js";
 import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../src/services/officialUsageViews.js";
 import { CopilotStudioQuarantineClient } from "../src/services/copilotStudioQuarantine.js";
+import { PowerPlatformResourceQueryClient } from "../src/services/powerPlatformResourceQuery.js";
+import type { AuthenticatedUser } from "../src/types/session.js";
 
 vi.hoisted(() => {
   process.env.NODE_ENV = "test";
@@ -34,17 +37,6 @@ vi.mock("../src/auth/msal.js", async original => {
     ...actual,
     createAuthorizationUrl: async (flow: ReturnType<typeof actual.createAuthFlow>) => {
       const scenario = new URL(flow.returnTo, "http://localhost:3001").searchParams.get("fixture") ?? "available";
-      if (flow.kind === "login") {
-        const repository = new CapabilityRepository(fixture.runtime);
-        for (const definition of capabilityDefinitions.filter(item => item.probe.kind === "provider_read")) {
-          const configuration = await repository.configuration(config.tenantId!, definition.id);
-          if (![...statuses, "stale", "role-Reader", "role-Operator", "role-SecurityReader", "role-Administrator"].includes(scenario)) continue;
-          await repository.recordEvidence({ tenantId: config.tenantId!, principalId: definition.mode === "application" ? config.clientId! : `fixture-${scenario}`,
-            authorizationPrincipalId: `fixture-${scenario}`, capabilityId: definition.id, resourceAudience: definition.audience, environmentId: definition.cloud,
-            tokenMode: definition.mode as "delegated" | "application", permissionRevision: capabilityPermissionRevision(definition), contractRevision: capabilityContractRevision(definition), configurationRevision: configuration.revision,
-          }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", {}, scenario === "stale" ? -1000 : 240000);
-        }
-      }
       identity.scenarios.set(flow.state, scenario);
       return flow.kind === "consent" ? `/api/auth/callback?state=${flow.state}&error=access_denied&error_description=never-render-provider-text`
         : `/api/auth/callback?state=${flow.state}&code=${flow.state}`;
@@ -56,7 +48,7 @@ vi.mock("../src/auth/msal.js", async original => {
         providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
     },
     acquireDelegatedToken: async (accountId: string) => {
-      if (accountId === "fixture-missing_permission") throw new AppError(403, "missing_permission", "Synthetic missing permission");
+      if (accountId === "fixture-missing_permission" || accountId === "fixture-missing_delegated_grant") throw new AppError(403, "missing_permission", "Synthetic missing permission");
       return accountId;
     },
     acquireApplicationToken: async () => "fixture-application",
@@ -85,22 +77,32 @@ beforeAll(async () => {
   const repository = new CapabilityRepository(fixture.runtime);
   const applicationDefinition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
   await repository.setApplicationConfiguration(config.tenantId!, applicationDefinition.id, true, true, "fixture-administrator");
-  for (const scenario of [...statuses, "stale", "role-Reader", "role-Operator", "role-SecurityReader", "role-Administrator"]) {
-    const principal = `fixture-${scenario}`;
+  const invalidatePrincipal = capabilities.invalidatePrincipal.bind(capabilities);
+  vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
+    await invalidatePrincipal(user);
+    const scenario = user.homeAccountId.replace(/^fixture-/, "");
+    if (![...statuses, "stale", "role-Viewer", "role-Admin"].includes(scenario)) return;
     for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "provider_read")) {
       const configuration = await repository.configuration(config.tenantId!, definition.id);
-      await repository.recordEvidence({ tenantId: config.tenantId!, principalId: definition.mode === "application" ? config.clientId! : principal,
-        authorizationPrincipalId: principal, capabilityId: definition.id, resourceAudience: definition.audience, environmentId: definition.cloud,
+      await repository.recordEvidence({ tenantId: config.tenantId!, principalId: definition.mode === "application" ? config.clientId! : user.homeAccountId,
+        authorizationPrincipalId: user.homeAccountId, capabilityId: definition.id, resourceAudience: definition.audience, environmentId: definition.cloud,
         tokenMode: definition.mode as "delegated" | "application", permissionRevision: capabilityPermissionRevision(definition), contractRevision: capabilityContractRevision(definition), configurationRevision: configuration.revision,
-      }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", { category: scenario === "provider_error" ? "provider_error" : undefined }, scenario === "stale" ? -1000 : 240000);
+      }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", {
+        category: scenario === "provider_error" ? "provider_error" : undefined,
+        verification: definition.id === "powerPlatform.quarantine.read" ? "token" : "provider",
+      }, scenario === "stale" ? -1000 : 240000);
     }
-  }
+  });
+  vi.spyOn(GraphPackagesClient.prototype, "checkCatalogAccess").mockImplementation(async token => {
+    if (token === "fixture-provider_error") throw new AppError(502, "provider_error", "Synthetic provider outage");
+  });
   vi.spyOn(GraphPackagesClient.prototype, "listCopilotAgents").mockImplementation(async token => {
     if (token === "fixture-provider_error") throw new AppError(502, "provider_error", "Synthetic provider outage");
     return [{ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {} }];
   });
-  vi.spyOn(GraphPackagesClient.prototype, "getPackageDetails").mockResolvedValue({ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {} });
+  vi.spyOn(GraphPackagesClient.prototype, "getPackageDetails").mockResolvedValue({ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [], sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {} });
   vi.spyOn(DirectoryPrincipalsClient.prototype, "search").mockResolvedValue([]);
+  vi.spyOn(PowerPlatformResourceQueryClient.prototype, "checkAccess").mockResolvedValue(undefined);
   await seedQuarantineTargets(repository);
   vi.spyOn(CopilotStudioQuarantineClient.prototype, "getStatus").mockImplementation(async (_token, target, options) => {
     quarantineProviderFixture.reads += 1;
@@ -158,7 +160,7 @@ it("qualifies the packaged Permission Center through Chromium and axe", async ()
 });
 
 async function seedQuarantineTargets(capabilityRepository: CapabilityRepository) {
-  const scope = { tenantId: config.tenantId!, principalId: "fixture-role-Operator" };
+  const scope = { tenantId: config.tenantId!, principalId: "fixture-role-Admin" };
   const inventory = new PowerPlatformInventoryRepository(fixture.runtime);
   const job = await inventory.submit(scope, { idempotencyKey: "browser-quarantine-targets", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
   expect(await inventory.markRunning(scope, job.id)).toBe(true);

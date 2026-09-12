@@ -37,7 +37,7 @@ function Invoke-TestDocker {
     param([string[]]$Arguments,[switch]$Capture)
     $line=$Arguments -join '|'; $script:Calls.Add($line)
     if ($script:CheckProjectEnvironment -and $Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
-        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID')) {
+        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             if ($null -ne [Environment]::GetEnvironmentVariable($name)) { throw "Shell environment overrode project setting $name." }
         }
     }
@@ -61,7 +61,11 @@ function Invoke-RestMethod {
     if ($Uri.EndsWith('/api/auth/status')) { return @{authConfigured=$script:AuthConfigured} }
     throw 'Unexpected readiness URL.'
 }
-function Get-LocalHealth { param([string]$Url) return @{authConfigured=$script:AuthConfigured;callback="$Url/api/auth/callback"} }
+function Get-LocalHealth {
+    param([string]$Url)
+    Assert-True ($Url -match '^http://localhost:\d+$') 'Deployment health must not depend on tunnel reachability.'
+    return @{authConfigured=$script:AuthConfigured;callback="$Url/api/auth/callback"}
+}
 function Assert-True { param([bool]$Condition,[string]$Message) if (-not $Condition) { throw $Message }; $script:Checks++ }
 function Assert-Fails { param([scriptblock]$Command,[string]$Pattern) try { & $Command; throw 'Expected failure did not occur' } catch { Assert-True ($_.Exception.Message -match $Pattern) "Unexpected failure: $($_.Exception.Message)" } }
 function New-FixtureContext {
@@ -94,15 +98,21 @@ try {
         Assert-True ($guidance.Contains($permission)) "Registration guidance omitted permission $permission."
     }
     $manifest=Get-Content -LiteralPath (Join-Path $repositoryRoot 'infra/entra-app-manifest.json') -Raw | ConvertFrom-Json
+    Assert-True (($manifest.appRoles.value -join ',') -ceq 'AgentControl.Viewer,AgentControl.Admin') 'Manifest must expose exactly Viewer and Admin.'
+    Assert-True (@($manifest.appRoles | Where-Object { ($_.allowedMemberTypes -join ',') -cne 'User' }).Count -eq 0) 'App roles must be assignable to users/groups only.'
     foreach ($role in $manifest.appRoles) { Assert-True ($guidance.Contains($role.value)) 'Registration guidance omitted an application role.' }
-    foreach ($requiredText in @('openid and profile','Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Optional Microsoft Graph Application permissions','Administrator does not include the other roles','does not verify or grant permissions')) {
+    foreach ($requiredText in @('openid and profile','Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Optional Microsoft Graph Application permissions','Admin includes Viewer access','only one role assignment','Assignment required','Users/Groups for Allowed member types','does not verify or grant permissions')) {
         Assert-True ($guidance.Contains($requiredText)) "Registration guidance omitted distinction: $requiredText."
+    }
+    foreach ($requiredText in @('checks delegated access automatically','Interactive consent, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Normal sign-in requests all implemented delegated permissions up front, including package changes','Sign in without provider setup defers consent')) {
+        Assert-True ($guidance.Contains($requiredText)) "Automatic access-check guidance omitted distinction: $requiredText."
     }
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     foreach ($removed in @('TenantId','ClientId','ClientSecretFile','Port','StateRoot','Action','DryRun','ConfirmCleanup','BackupFile','RestoreDatabase','CleanupBatchSize','ConfirmReset','OpenBrowser')) {
         Assert-True (-not $entry.Parameters.ContainsKey($removed)) "Entry point still accepts $removed."
     }
     Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 2) 'Entry point must expose only Command and Project.'
+    Assert-True ($entry.Parameters['Command'].Aliases -contains 'Action') 'Entry point must accept -Action as an alias for Command.'
     $defaultProject=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Project' }).DefaultValue.Value
     Assert-True ($defaultProject -ceq 'agent-control') 'Default project changed.'
     $defaultCommand=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Command' }).DefaultValue.Value
@@ -197,15 +207,15 @@ try {
     }
     $snapshot=Get-ConfigSnapshot $editContext
     $callsBefore=$script:Calls.Count
-    foreach ($answer in @('','','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
     Assert-True ($script:Calls.Count -eq $callsBefore+3) 'No-op edit stopped containers or made unnecessary Docker changes.'
-    foreach ($answer in @($tenant,$client,$clientSecret,'14391')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'14391','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
 
-    foreach ($answer in @('','','','14393')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','14393','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     $edited=Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json
@@ -215,7 +225,7 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $editContext.State 'control/maintenance')) 'Edited project was not left in maintenance.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @('','','replacement-fixture-secret','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','replacement-fixture-secret','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot @('secrets/client-secret')
     Assert-True ([IO.File]::ReadAllText($editSecret) -ceq 'replacement-fixture-secret') 'Secret-only edit did not save the new secret.'
@@ -223,7 +233,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $reauthenticate)) 'Port/secret-only edits unnecessarily scheduled session deletion.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @('',$otherClient,'','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('',$otherClient,'','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     Assert-True ((Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json).clientId -ceq $otherClient) 'Client-ID-only edit was not saved.'
@@ -232,13 +242,13 @@ try {
     Assert-True (-not ($script:Calls -join "`n").Contains('replacement-fixture-secret')) 'Edited secret leaked to Docker arguments.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @($otherTenant,'','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($otherTenant,'','','','')) { $script:Answers.Enqueue($answer) }
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'retained data'
     Assert-ConfigUnchanged $editContext $snapshot
     foreach ($answer in @('','',"first`nsecond")) { $script:Answers.Enqueue($answer) }
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Configuration requires'
     Assert-ConfigUnchanged $editContext $snapshot
-    foreach ($answer in @('','','unsaved-secret','14394')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','unsaved-secret','14394','')) { $script:Answers.Enqueue($answer) }
     $script:Failure='\|stop\|--timeout\|130\|app$'
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Simulated'
     $script:Failure=''
@@ -246,7 +256,7 @@ try {
 
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try {
-        foreach ($answer in @('','','',"$($listener.LocalEndpoint.Port)")) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @('','','',"$($listener.LocalEndpoint.Port)",'')) { $script:Answers.Enqueue($answer) }
         Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'occupied'
         Assert-ConfigUnchanged $editContext $snapshot
     } finally { $listener.Stop() }
@@ -260,13 +270,82 @@ try {
     $script:Answers.Enqueue('')
     Assert-True ((Read-LocalPort) -eq 3001) 'Wizard default port must be 3001.'
 
+    $tunnelUrl='https://fixture-3002.devtunnels.ms'
+    $snapshot=Get-ConfigSnapshot $editContext
+    $callsBefore=$script:Calls.Count
+    $invalidUrls=@('http://example.com','https://example.com/','https://example.com/path','https://example.com?query=1','https://example.com#fragment',
+        'https://user:password@example.com','https://EXAMPLE.com','https://example.com:443','https://example.com:65536',"https://example.com`nTRUST_PROXY=0",
+        'https://example.com/$VALUE','not-a-url','https://example.1','https://example.0xff','https://127.1','https://2130706433')
+    foreach ($url in $invalidUrls) { Assert-True (-not (Test-LocalPublicUrl $url)) "Invalid public origin accepted: $url" }
+    foreach ($url in @($tunnelUrl,'https://test--tunnel.devtunnels.ms','https://example.com:8443','https://127.0.0.1')) {
+        Assert-True (Test-LocalPublicUrl $url) "Valid public origin rejected: $url"
+    }
+    foreach ($answer in (@('','','','') + $invalidUrls + @(" $tunnelUrl "))) { $script:Answers.Enqueue($answer) }
+    $messages=Invoke-LocalDeployment $editContext 'EditConfig' 3>$null 6>&1
+    Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
+    Assert-True ($script:Calls.Count -eq $callsBefore+4 -and $script:Calls[$script:Calls.Count-1] -match '\|stop\|--timeout\|130\|app$') 'Public-URL edit did not stop/drain the app.'
+    Assert-True (-not (Test-Path -LiteralPath $reauthenticate)) 'Public-URL edit unnecessarily scheduled session deletion.'
+    Assert-True (($messages -join "`n").Contains("Register $tunnelUrl/api/auth/callback")) 'Wizard guidance did not use the public callback.'
+    Assert-True (($messages -join "`n").Contains('devtunnel port update YOUR_TUNNEL_ID -p 14393 --host-header unchanged --origin-header unchanged')) 'Wizard omitted persistent origin-preserving settings for the existing tunnel port.'
+    Assert-True (($messages -join "`n").Contains('devtunnel host YOUR_TUNNEL_ID --host-header unchanged --origin-header unchanged')) 'Wizard omitted the tunnel host command.'
+    $reloaded=New-LocalContext $testRoot 'editable-project'
+    Assert-True ($reloaded.PublicUrl -ceq $tunnelUrl -and $reloaded.Url -ceq 'http://localhost:14393' -and $reloaded.Port -eq 14393) 'Public origin changed the listener or local health URL.'
+    $compose=[IO.File]::ReadAllText((Join-Path $editContext.State 'compose.env'))
+    foreach ($expected in @("FRONTEND_ORIGIN=$tunnelUrl","REDIRECT_URI=$tunnelUrl/api/auth/callback",'TRUST_PROXY=1','APP_PORT=14393')) {
+        Assert-True ($compose.Contains($expected)) "Public-URL configuration omitted $expected."
+    }
+    Assert-True ((Read-LocalSettings $editContext.State).publicUrl -ceq $tunnelUrl) 'Public URL was not persisted.'
+    Assert-True ((New-LocalContext $testRoot 'fixture-project').PublicUrl -ceq 'http://localhost:14391') 'Public URL leaked into another project.'
+
+    $snapshot=Get-ConfigSnapshot $editContext
+    $callsBefore=$script:Calls.Count
+    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
+    Assert-ConfigUnchanged $editContext $snapshot
+    Assert-True ($script:Calls.Count -eq $callsBefore+3) 'No-op public URL edit stopped the app.'
+    foreach ($answer in @('','','','','https://replacement.devtunnels.ms')) { $script:Answers.Enqueue($answer) }
+    $script:Failure='\|stop\|--timeout\|130\|app$'
+    Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Simulated'
+    $script:Failure=''
+    Assert-ConfigUnchanged $editContext $snapshot
+    $promptCount=$script:Prompts.Count
+    $messages=Invoke-LocalDeployment $reloaded 'Deploy' 6>&1
+    Assert-True ($script:Prompts.Count -eq $promptCount) 'Saved public URL prompted again on start.'
+    Assert-ConfigUnchanged $editContext $snapshot
+    Assert-True (($messages -join "`n").Contains("Open $tunnelUrl to sign in")) 'Startup did not display the public sign-in URL.'
+    Assert-True (($messages -join "`n").Contains('devtunnel port update YOUR_TUNNEL_ID -p 14393 --host-header unchanged --origin-header unchanged')) 'Startup omitted persistent origin-preserving settings for the saved tunnel port.'
+    Assert-True (($messages -join "`n").Contains('devtunnel host YOUR_TUNNEL_ID --host-header unchanged --origin-header unchanged')) 'Startup omitted the tunnel host command.'
+
+    foreach ($answer in @('','','','14394','')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
+    Assert-True ($editContext.PublicUrl -ceq $tunnelUrl -and $editContext.Url -ceq 'http://localhost:14394') 'Port edit altered the explicit public origin.'
+    foreach ($answer in @('','','','','local')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
+    $reloaded=New-LocalContext $testRoot 'editable-project'
+    Assert-True ($reloaded.PublicUrl -ceq 'http://localhost:14394' -and (Read-LocalSettings $editContext.State).publicUrl -ceq '') 'Reset did not restore automatic localhost origin.'
+    $compose=[IO.File]::ReadAllText((Join-Path $editContext.State 'compose.env'))
+    foreach ($expected in @('FRONTEND_ORIGIN=http://localhost:14394','REDIRECT_URI=http://localhost:14394/api/auth/callback','TRUST_PROXY=0')) {
+        Assert-True ($compose.Contains($expected)) "Reset configuration omitted $expected."
+    }
+    $snapshot=Get-ConfigSnapshot $editContext
+    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
+    Assert-ConfigUnchanged $editContext $snapshot
+
+    $invalidPublic=New-FixtureContext 'invalid-public-url'
+    foreach ($value in @($null,42,@{},'http://remote.example','https://remote.example/path')) {
+        [IO.File]::WriteAllText((Join-Path $invalidPublic.State 'settings.json'),(@{port=14391;publicUrl=$value} | ConvertTo-Json))
+        Assert-Fails { New-LocalContext $testRoot 'invalid-public-url' } 'Saved publicUrl'
+    }
+
     $unstarted=New-LocalContext $testRoot 'unstarted-project'
-    foreach ($answer in @($tenant,$client,$clientSecret,'14394')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'14394',$tunnelUrl)) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $unstarted 'EditConfig' 6>$null
-    foreach ($answer in @($otherTenant,'','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($otherTenant,'','','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $unstarted 'EditConfig' 6>$null
     Assert-True ((Get-Content -LiteralPath (Join-Path $unstarted.State 'settings.json') -Raw | ConvertFrom-Json).tenantId -ceq $otherTenant) 'Tenant correction before first deployment was rejected.'
     Assert-True (-not $script:Volumes.Contains($unstarted.Volume)) 'Edit-config provisioned a database.'
+    Assert-True ((New-LocalContext $testRoot 'unstarted-project').PublicUrl -ceq $tunnelUrl) 'New project did not retain its public URL.'
 
     foreach ($variant in @('empty','null','absent','whitespace')) {
         $portOnly=New-FixtureContext "port-only-$variant"
@@ -289,7 +368,7 @@ try {
                 $unchanged[$relative]=@{hash=(Get-FileHash -LiteralPath $path).Hash;modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.Ticks}
             }
         }
-        foreach ($answer in @('','','','14395')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @('','','','14395','')) { $script:Answers.Enqueue($answer) }
         $messages=Invoke-LocalDeployment $portOnly 'EditConfig' 6>&1
         $updated=Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
         Assert-True ($updated.port -eq 14395 -and $updated.note -ceq $original.note) 'Port-only edit did not preserve unrelated settings.'
@@ -304,7 +383,7 @@ try {
         Assert-True (($messages -join "`n").Contains('Identity configuration is incomplete')) 'Partial configuration was incorrectly reported as complete.'
         $settingsBefore=[IO.File]::ReadAllText($settingsPath)
         $modified=(Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc.Ticks
-        foreach ($answer in @('','','','')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
         Invoke-LocalDeployment $portOnly 'EditConfig' 6>$null
         Assert-True ([IO.File]::ReadAllText($settingsPath) -ceq $settingsBefore -and (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc.Ticks -eq $modified) 'No-op edit rewrote incomplete settings.'
         $script:Answers.Enqueue('')
@@ -312,7 +391,7 @@ try {
     }
 
     $newPortOnly=New-LocalContext $testRoot 'new-port-only'
-    foreach ($answer in @('','','','14395')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','14395','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $newPortOnly 'EditConfig' 6>$null
     $newSettings=Get-Content -LiteralPath (Join-Path $newPortOnly.State 'settings.json') -Raw | ConvertFrom-Json -AsHashtable
     Assert-True ($newSettings.Count -eq 1 -and $newSettings.port -eq 14395) 'New port-only configuration saved unwanted identity fields.'
@@ -323,7 +402,7 @@ try {
 
     $shellValues=@{}
     try {
-        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID')) {
+        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             $shellValues[$name]=[Environment]::GetEnvironmentVariable($name)
         }
         $script:CheckProjectEnvironment=$true
@@ -447,17 +526,21 @@ try {
         $messages=. $entryPath stop @projectArguments 6>&1
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Stop unexpectedly displayed onboarding guidance.'
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/control/maintenance")) 'Explicit stop did not close admissions.'
-        foreach ($answer in @('','','','')) { $script:Answers.Enqueue($answer) }
-        $messages=. $entryPath edit-config @projectArguments 6>&1
+        foreach ($answer in @('','','','',$tunnelUrl)) { $script:Answers.Enqueue($answer) }
+        $messages=. $entryPath -Action edit-config @projectArguments 6>&1
         Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the complete registration guidance.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Edit-config displayed the saved client secret.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+8) 'Explicit edit-config did not prompt for all settings.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+9) 'Explicit edit-config did not prompt for all settings.'
+        $entrySettings=Read-LocalSettings (Join-Path $entryState $projectName)
+        Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) '-Action edit-config did not persist the public URL independently of the port.'
+        $messages=. $entryPath -Action start @projectArguments 6>&1
+        Assert-True ($script:Prompts.Count -eq $promptCount+9 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) '-Action start did not reuse the saved public URL.'
     }
     $context=$retainedContext
     Assert-True ($script:Answers.Count -eq 0) 'Entry-point wizard did not consume the expected answers.'
     Assert-Fails { . $entryPath -Port 3001 } 'parameter.*Port'
     Assert-Fails { . $entryPath -StateRoot $testRoot } 'parameter.*StateRoot'
-    Assert-Fails { . $entryPath -Action Start } 'parameter.*Action'
+    Assert-Fails { . $entryPath -Action Reset } 'ValidateSet|validation|not belong'
 
     $backups=Join-Path $context.State 'backups'
     $originalCulture=[Threading.Thread]::CurrentThread.CurrentCulture

@@ -3,11 +3,11 @@ import type { SessionUser } from "./api/client";
 import { clearPackageSelection, restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 
 const reader: SessionUser = {
-  displayName: "Reader",
+  displayName: "Viewer",
   username: "reader@example.invalid",
   homeAccountId: "reader-1",
   tenantId: "tenant-1",
-  roles: ["AgentControl.Reader"],
+  roles: ["AgentControl.Viewer"],
 };
 
 describe("package selection session state", () => {

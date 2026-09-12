@@ -8,7 +8,7 @@ const user: AuthenticatedUser = {
   homeAccountId: "principal-package",
   displayName: "Package Reader",
   username: "reader@example.invalid",
-  roles: ["AgentControl.Reader"],
+  roles: ["AgentControl.Viewer"],
 };
 
 function fixture(overrides: Record<string, unknown> = {}) {
@@ -36,6 +36,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     publish: vi.fn(async () => undefined),
     markWaitingAuthorization: vi.fn(async () => undefined),
     markFailed: vi.fn(async () => undefined),
+    cancel: vi.fn(async () => ({ ...job, status: "cancelled" as const })),
     recoverInterrupted: vi.fn(async () => 0),
     ...overrides,
   };
@@ -72,12 +73,19 @@ describe("Package refresh service", () => {
     expect(dependencies.requireApplicationDataScope).toHaveBeenCalled();
   });
 
-  it("allows Operator exact reads but denies broad inventory and application reads", async () => {
-    const operator = { ...user, roles: ["AgentControl.Operator" as const] };
+  it("lets Admin inherit every Viewer package read mode", async () => {
+    const admin = { ...user, roles: ["AgentControl.Admin" as const] };
     const direct = fixture();
-    await expect(direct.service.submit(operator, { tokenMode: "delegated", idempotencyKey: "broad" })).rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(direct.service.submit(operator, { tokenMode: "application", idempotencyKey: "application" })).rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(direct.service.submit(operator, { tokenMode: "delegated", idempotencyKey: "exact", requestedIds: ["package-1"] })).resolves.toBeDefined();
+    await expect(direct.service.submit(admin, { tokenMode: "delegated", idempotencyKey: "broad" })).resolves.toBeDefined();
+    await expect(direct.service.submit(admin, { tokenMode: "application", idempotencyKey: "application" })).resolves.toBeDefined();
+    await expect(direct.service.submit(admin, { tokenMode: "delegated", idempotencyKey: "exact", requestedIds: ["package-1"] })).resolves.toBeDefined();
+  });
+
+  it("lets only the owning Viewer cancel a read refresh", async () => {
+    const direct = fixture();
+    await expect(direct.service.cancel(user, direct.job.id, "delegated")).resolves.toMatchObject({ status: "cancelled" });
+    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id, user.homeAccountId);
+    await expect(direct.service.cancel({ ...user, roles: [] }, direct.job.id, "delegated")).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 
   it("leaves authorization failure waiting without starting the scan", async () => {

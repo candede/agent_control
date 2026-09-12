@@ -9,8 +9,8 @@ let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let canaries: CopilotStudioQuarantineCanaryRepository;
 let jobs: CopilotStudioQuarantineRepository;
 const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 };
-const administrator: AuthenticatedUser = { tenantId: "tenant-a", homeAccountId: "administrator-a", displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Administrator"] };
-const operator: AuthenticatedUser = { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Operator"] };
+const administrator: AuthenticatedUser = { tenantId: "tenant-a", homeAccountId: "administrator-a", displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
+const operator: AuthenticatedUser = { tenantId: "tenant-a", homeAccountId: "operator-a", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
 const target = { resourceNativeId: "native-agent", displayName: "Canary agent", snapshotId: "11111111-1111-4111-8111-111111111111",
   inventoryObservedAt: "2026-09-09T19:00:00Z", inventoryExpiresAt: "2026-09-10T19:00:00Z", environmentId: "22222222-2222-4222-8222-222222222222",
   botId: "33333333-3333-4333-8333-333333333333", inventoryQuarantineState: false, inventoryQuarantinedAt: null };
@@ -32,7 +32,7 @@ describe.sequential("Copilot Studio quarantine canary repository", () => {
   });
 
   it("rejects the approving principal and invalidates authority revision drift", async () => {
-    const sameActor = { ...administrator, roles: ["AgentControl.Operator"] as const };
+    const sameActor = { ...administrator, roles: ["AgentControl.Admin"] as const };
     const sameActorApprovals = await approvals();
     await expect(canaries.claimCycle(sameActor, sameActorApprovals.original.id, sameActorApprovals.restoration.id, authority)).rejects.toMatchObject({ code: "separate_approval_required" });
     const stale = await approvals({ ...authority, configurationRevision: 2 });

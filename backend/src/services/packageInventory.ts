@@ -3,7 +3,7 @@ import { config } from "../config.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageRefreshInput, type PackageScanResult } from "../db/packageInventory.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import type { CapabilityId } from "../types/capability.js";
+import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
@@ -45,7 +45,7 @@ export class PackageInventoryService {
   ) {}
 
   async submit(user: AuthenticatedUser, input: RefreshInput) {
-    requireRefreshRole(user, input.tokenMode, Boolean(input.requestedIds?.length));
+    requireRefreshRole(user);
     if (input.tokenMode === "application") await this.dependencies.requireApplicationDataScope("graph.package.read.application", user);
     const scope = dataScope(user, input.tokenMode, this.dependencies.applicationPrincipalId());
     return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
@@ -60,13 +60,13 @@ export class PackageInventoryService {
       const current = await this.repository.getJob(scope, id);
       if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
       if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
-      requireRefreshRole(user, tokenMode, current.scopeKind === "exact");
+      requireRefreshRole(user);
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const freshUser = await this.dependencies.revalidateUser(actor.principalId);
       let token = "";
       await commitAccountSessionValidation(validation, async () => {
         requireSamePrincipal(actor, freshUser);
-        requireRefreshRole(freshUser, tokenMode, current.scopeKind === "exact");
+        requireRefreshRole(freshUser);
         const capabilityId = capabilityForMode(tokenMode);
         if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
         await this.dependencies.requireAvailable(capabilityId, freshUser);
@@ -90,6 +90,16 @@ export class PackageInventoryService {
     const job = await this.repository.getJob(dataScope(user, tokenMode, this.dependencies.applicationPrincipalId()), id);
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
     return job;
+  }
+
+  async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
+    requireRefreshRole(user);
+    const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
+    const job = await this.repository.getJob(scope, id);
+    if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
+    const cancelled = await this.repository.cancel(scope, id, user.homeAccountId);
+    this.active.get(id)?.controller.abort(new AppError(409, "read_job_cancelled", "Package refresh was cancelled."));
+    return cancelled!;
   }
 
   recover() {
@@ -122,7 +132,7 @@ export class PackageInventoryService {
       await commitAccountSessionValidation(validation, async () => {
         signal.throwIfAborted();
         requireSamePrincipal(actor, freshUser);
-        requireRefreshRole(freshUser, current.tokenMode, current.scopeKind === "exact");
+        requireRefreshRole(freshUser);
         const capabilityId = capabilityForMode(current.tokenMode);
         if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
         await this.dependencies.requireAvailable(capabilityId, freshUser);
@@ -130,6 +140,10 @@ export class PackageInventoryService {
         await this.repository.publish(scope, id, result);
       });
     } catch (error) {
+      if (error instanceof AppError && error.code === "read_job_cancelled") {
+        await this.repository.cancel(scope, id, actor.principalId);
+        return;
+      }
       if (isAuthorizationFailure(error)) {
         await this.repository.markWaitingAuthorization(scope, id);
         return;
@@ -184,11 +198,8 @@ function actorScope(user: AuthenticatedUser): PackageDataScope {
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
 }
 
-function requireRefreshRole(user: AuthenticatedUser, mode: RefreshInput["tokenMode"], exact: boolean) {
-  const allowed = mode === "delegated" && exact
-    ? user.roles.includes("AgentControl.Reader") || user.roles.includes("AgentControl.Operator")
-    : user.roles.includes("AgentControl.Reader");
-  if (!allowed) throw new AppError(403, "missing_internal_role", exact ? "Exact package refresh requires Reader or Operator." : "Broad package refresh requires Reader.");
+function requireRefreshRole(user: AuthenticatedUser) {
+  if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Package refresh requires Viewer.");
 }
 
 function requireSamePrincipal(scope: PackageDataScope, user: AuthenticatedUser) {

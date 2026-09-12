@@ -8,16 +8,15 @@ import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionC
 const capabilityContext = {
   views: [],
   user: {
-    displayName: "Reader",
+    displayName: "Viewer",
     username: "reader@example.invalid",
     homeAccountId: "reader",
     tenantId: "tenant",
-    roles: ["AgentControl.Reader"],
+    roles: ["AgentControl.Viewer"],
   },
   loading: false,
   now: Date.now(),
   reload: vi.fn(),
-  refresh: vi.fn(),
   openPermissions: vi.fn(),
 } as never;
 

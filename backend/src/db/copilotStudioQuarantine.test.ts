@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
+import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./copilotStudioQuarantine.js";
 
@@ -44,12 +44,13 @@ function frozen(target: InventoryQuarantineTarget, state = false, updatedAt = "2
     lastUpdateTimeUtc: updatedAt, observedAt: new Date().toISOString(), correlationId: "33333333-3333-4333-8333-333333333333" } };
 }
 
-async function qualify(targetEnvironmentId = environmentId, targetBotId = botId) {
-  return (await fixture.operator.query<{ id: string }>(`INSERT INTO copilot_quarantine_qualifications
-    (id,tenant_id,target_environment_id,target_bot_id,original_approval_id,restoration_approval_id,original_job_id,restoration_job_id,
-     contract_revision,permission_revision,configuration_revision,auth_mode)
-    VALUES(gen_random_uuid(),'tenant-a',$1,$2,gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),$3,$4,1,'delegated') RETURNING id`,
-  [targetEnvironmentId, targetBotId, authority.contractRevision, authority.permissionRevision])).rows[0].id;
+async function unqualifiedInput(action: QuarantineAction = "quarantine") {
+  const inputScope = { ...scope, principalId: randomUUID() };
+  const snapshotId = await seedInventory(inputScope.principalId, new Date(), randomUUID());
+  const target = frozen((await inventory.resolveQuarantineTargets(inputScope, snapshotId, ["native-agent"]))[0], action === "unquarantine");
+  const base = { action, targets: [target], actor: { ...actor, homeAccountId: inputScope.principalId },
+    authority, requestPath: "/api/quarantine/jobs" };
+  return { scope: inputScope, input: { ...base, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(base).confirmationHash } };
 }
 
 describe.sequential("Copilot Studio quarantine repository", () => {
@@ -89,29 +90,24 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     expect(await repository.latestObservation(statusScope, target)).toEqual(status);
   });
 
-  it("requires full-cycle qualification, preserves canonical idempotency, and freezes provider timestamp evidence", async () => {
+  it("preserves canonical idempotency and frozen provider timestamp evidence without canary qualification", async () => {
     const snapshotId = await seedInventory();
     const target = frozen((await inventory.resolveQuarantineTargets(scope, snapshotId, ["native-agent"]))[0]);
     const base = { action: "quarantine" as const, targets: [target], actor, authority, requestPath: "/api/quarantine/jobs" };
     const confirmation = createQuarantineConfirmation(base);
-    await expect(repository.submit(scope, { ...base, idempotencyKey: "unqualified", confirmationHash: confirmation.confirmationHash }))
-      .rejects.toMatchObject({ code: "quarantine_write_unqualified" });
-    const qualificationId = await qualify();
-    await qualify();
-    expect(await repository.isQualified(scope, authority, [target])).toBe(true);
+    expect(await repository.isQualified(scope, authority, [target])).toBe(false);
     const [first, concurrentRetry] = await Promise.all([
       repository.submit(scope, { ...base, idempotencyKey: "same-key", confirmationHash: confirmation.confirmationHash }),
       repository.submit(scope, { ...base, idempotencyKey: "same-key", confirmationHash: confirmation.confirmationHash }),
     ]);
     expect(concurrentRetry.id).toBe(first.id);
-    await fixture.operator.query("UPDATE copilot_quarantine_qualifications SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [qualificationId]);
     const retry = await repository.submit(scope, { ...base, idempotencyKey: "same-key", confirmationHash: confirmation.confirmationHash });
     expect(retry.id).toBe(first.id);
     const changed = { ...base, targets: [frozen(target, false, "2026-09-09T19:00:01.000Z")] };
     const changedConfirmation = createQuarantineConfirmation(changed);
     await expect(repository.submit(scope, { ...changed, idempotencyKey: "same-key", confirmationHash: changedConfirmation.confirmationHash }))
       .rejects.toMatchObject({ code: "idempotency_mismatch" });
-    await fixture.operator.query("UPDATE copilot_quarantine_qualifications SET expires_at=clock_timestamp()+interval '1 day' WHERE id=$1", [qualificationId]);
+    expect(await repository.isQualified(scope, authority, [target])).toBe(false);
   });
 
   it("recovers a sent item as inconclusive and blocks new work until GET reconciliation", async () => {
@@ -146,7 +142,6 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     const snapshotId = await seedInventory("startup-operator", new Date(), startupBotId);
     const startupScope = { tenantId: "tenant-a", principalId: "startup-operator" };
     const target = frozen((await inventory.resolveQuarantineTargets(startupScope, snapshotId, ["native-agent"]))[0]);
-    await qualify(environmentId, startupBotId);
     const base = { action: "quarantine" as const, targets: [target], actor: { ...actor, homeAccountId: startupScope.principalId }, authority, requestPath: "/api/quarantine/jobs" };
     const confirmation = createQuarantineConfirmation(base);
     const job = await repository.submit(startupScope, { ...base, idempotencyKey: "startup-unclaimed", confirmationHash: confirmation.confirmationHash });
@@ -161,5 +156,40 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     await repository.recoverInterrupted(true);
     expect(await repository.get(startupScope, job.id)).toMatchObject({ status: "waiting_authorization", canResume: true });
     expect(await repository.get(startupScope, runningJob.id)).toMatchObject({ status: "inconclusive", canReconcile: true });
+  });
+
+  it.each(["quarantine", "unquarantine"] as const)("admits normal %s without manufacturing qualification or changing ownership and receipts", async action => {
+    const { scope, input } = await unqualifiedInput(action);
+    expect(await repository.isQualified(scope, authority, input.targets)).toBe(false);
+    const job = await repository.submit(scope, input);
+    expect(job).toMatchObject({ status: "queued", action, isCanary: false, confirmationHash: input.confirmationHash, total: 1 });
+    expect(await repository.isQualified(scope, authority, input.targets)).toBe(false);
+    expect(await repository.get({ ...scope, principalId: randomUUID() }, job.id)).toBeUndefined();
+    expect((await repository.listAudit(scope)).value).toMatchObject([{ phase: "requested" }]);
+    await expect(repository.submit(scope, { ...input, action: action === "quarantine" ? "unquarantine" : "quarantine" }))
+      .rejects.toMatchObject({ code: "idempotency_mismatch" });
+    expect((await repository.submit(scope, input)).id).toBe(job.id);
+  });
+
+  it("preserves actor, frozen target and confirmation validation without canary qualification", async () => {
+    const { scope, input } = await unqualifiedInput();
+    await expect(repository.submit({ ...scope, principalId: randomUUID() }, input)).rejects.toMatchObject({ code: "scope_mismatch" });
+    await expect(repository.submit(scope, { ...input, confirmationHash: "e".repeat(64) })).rejects.toMatchObject({ code: "confirmation_mismatch" });
+    const target = input.targets[0];
+    await expect(repository.submit(scope, { ...input, targets: [{ ...target, directStatus: { ...target.directStatus, botId: randomUUID() } }] }))
+      .rejects.toMatchObject({ code: "invalid_quarantine_target" });
+    await expect(repository.submit(scope, { ...input, targets: [target, target] })).rejects.toMatchObject({ code: "duplicate_target" });
+    expect((await repository.list(scope)).value).toEqual([]);
+  });
+
+  it("requires actual approval for an explicit canary job without restricting normal submission", async () => {
+    const { scope, input } = await unqualifiedInput();
+    const canaryInput = { ...input, canaryApprovalId: randomUUID() };
+    const canaryConfirmation = createQuarantineConfirmation(canaryInput);
+    canaryInput.confirmationHash = canaryConfirmation.confirmationHash;
+    await expect(repository.submit(scope, canaryInput)).rejects.toMatchObject({ code: "qualification_invalidated" });
+    expect((await repository.list(scope)).value).toEqual([]);
+    expect(await repository.isQualified(scope, authority, input.targets)).toBe(false);
+    await expect(repository.submit(scope, input)).resolves.toMatchObject({ isCanary: false, status: "queued" });
   });
 });

@@ -252,9 +252,8 @@ function PurviewAuditSession({
     false,
     capability.now,
   );
-  const canQualify =
-    hasRole(capability.user, "AgentControl.SecurityReader") &&
-    hasRole(capability.user, "AgentControl.Administrator");
+  const applicationMode = tokenMode === "application";
+  const canQualify = applicationMode && hasRole(capability.user, "AgentControl.Admin");
   const filters = makeFilters({
     administrativeUnitIds,
     endDateTime,
@@ -628,7 +627,7 @@ function PurviewAuditSession({
           </div>
         </details>
 
-        {!available ? (
+        {!available && applicationMode ? (
           <section
             className="purview-qualification"
             aria-label="Audit Search qualification required"
@@ -662,6 +661,14 @@ function PurviewAuditSession({
                     Approve one narrow remote query for contract qualification
                   </span>
                 </label>
+              ) : !available ? (
+                <section className="purview-qualification" aria-label="Audit Search authorization pending">
+                  <div>
+                    <strong>Delegated authorization is not ready</strong>
+                    <p>Automatic safe permission checks run while this signed-in session is active. No audit search is submitted by those checks.</p>
+                  </div>
+                  <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
+                </section>
               ) : null}
               {canQualify ? (
                 <button
@@ -678,7 +685,7 @@ function PurviewAuditSession({
                   <ShieldCheck aria-hidden="true" /> Approve qualification
                 </button>
               ) : null}
-              {qualification &&
+              {canQualify && qualification &&
               qualification.status === "approved" &&
               Date.parse(qualification.expiresAt) > capability.now ? (
                 <button
@@ -707,8 +714,8 @@ function PurviewAuditSession({
           </WorkbenchActionGate>
           <span>
             {available
-              ? "Qualified evidence is current."
-              : "Search remains disabled until the exact lifecycle succeeds."}
+              ? applicationMode ? "Shared application qualification is current." : "Delegated authorization is ready for an explicit bounded search."
+              : applicationMode ? "Search remains disabled until shared application setup and qualification succeed." : "Search remains disabled until automatic permission checks establish delegated authorization."}
           </span>
         </div>
       </form>

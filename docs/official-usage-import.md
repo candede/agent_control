@@ -35,11 +35,11 @@ Microsoft documents the following interpretation constraints:
 
 ## Validate and accept
 
-1. Sign in with `AgentControl.Administrator`; this role does not grant aggregate or user-content read access.
-2. Open **Official usage** and use its Administrator-only import panel to enter the report start/end dates. Select **This bundle is an explicit correction** before replacing an active set.
+1. Sign in with `AgentControl.Admin`. Admin includes all Viewer access, including aggregate and user-level accepted report views.
+2. Open **Official usage** and use its Admin-only import panel to enter the report start/end dates. Select **This bundle is an explicit correction** before replacing an active set.
 3. Choose one or more original CSVs and select **Validate and stage**. The server, not the browser, identifies each kind and parses the rows.
 4. Review the full bundle hash, coverage, per-file hash/schema/period/source basis, warnings and reconciliation. Source values that disagree remain separate and visible.
-5. Add missing companions to the same bundle. Reloading restores the current administrator's active staging. Incomplete submissions remain non-published and cannot change active usage.
+5. Add missing companions to the same bundle. Reloading restores the current Admin's active staging. Incomplete submissions remain non-published and cannot change active usage.
 6. Select **Accept reviewed bundle** only when all three kinds are present. The server rechecks the bundle hash and active-selection revision and commits all staged companions atomically.
 
 Exact retries use a finite content-free receipt containing tenant, actor, bundle, original hash/revision and original result. They return that result after staging cleanup without replaying or reselecting anything; changed intent fails. A correction creates a superseding set. Selecting or deleting a retained set requires a separate native confirmation dialog. Deleting the active set clears selection; Agent Control never chooses an older set automatically.
@@ -67,7 +67,7 @@ Run ordinary [operator retention](operations.md#retention) at least daily while 
 - A malformed, incompatible or schema-drift file is rejected without changing the active set. Correct the input and stage that kind again in the same bundle.
 - A missing companion leaves the bundle incomplete and acceptance disabled. Reload or use **Resume** on the retained incomplete set.
 - A stale bundle hash or active revision returns a conflict. Refresh import state and review the complete current bundle again.
-- A partial discard failure remains visible. Refresh and retry only the staged rows still owned by the current administrator.
+- A partial discard failure remains visible. Refresh and retry only the staged rows still owned by the current Admin.
 - Expired staging cannot be accepted. Re-export when freshness matters and stage the original files again.
 - Upload timeout/disconnect cancels publication at the transaction boundary. If cleanup cannot be verified, the API returns `upload_cleanup_failed` when possible and emits only the value-free `official_usage_upload_cleanup_failed` operational event; inspect owned staging before retrying.
 - If the legacy browser notice appears, its value was not read or migrated. Re-import the original files and acknowledge removal, or explicitly acknowledge discard. Only the exact legacy key is removed; unrelated browser storage remains.

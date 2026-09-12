@@ -40,7 +40,7 @@ export type DirectoryPrincipal = PackageAccessEntity & {
 export class DirectoryPrincipalsClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
-  async search(accessToken: string, query: string, limit = defaultSearchLimit) {
+  async search(accessToken: string, query: string, limit = defaultSearchLimit, signal?: AbortSignal) {
     const normalizedQuery = query.trim();
 
     if (normalizedQuery.length < 2) {
@@ -68,11 +68,13 @@ export class DirectoryPrincipalsClient {
         buildUserSearchUrl(normalizedQuery, normalizedLimit),
         accessToken,
         { ConsistencyLevel: "eventual" },
+        signal,
       ),
       this.request<GraphCollection<GraphGroup>>(
         buildGroupSearchUrl(normalizedQuery, normalizedLimit),
         accessToken,
         { ConsistencyLevel: "eventual" },
+        signal,
       ),
     ]);
 
@@ -157,10 +159,11 @@ export class DirectoryPrincipalsClient {
     url: string,
     accessToken: string,
     extraHeaders: Record<string, string> = {},
+    signal?: AbortSignal,
   ) {
     validateDirectoryUrl(url);
     const response = await this.fetcher(url, {
-      signal: AbortSignal.timeout(10_000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
       redirect: "error",
       headers: {
         Authorization: `Bearer ${accessToken}`,

@@ -3,6 +3,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import type { InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { hasAppRole } from "../types/capability.js";
 import { pool, transaction } from "./pool.js";
 
 export type QuarantineCanaryApprovalInput = {
@@ -81,7 +82,7 @@ export class CopilotStudioQuarantineCanaryRepository {
         restoration: projectApproval(claimed.rows.find(row => row.id === ids[1])!),
       } };
     });
-    if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The quarantine canary Operator must differ from the approving Administrator.");
+    if (result.kind === "same_actor") throw new AppError(409, "separate_approval_required", "The Admin executing the quarantine canary must differ from the approving Admin.");
     if (result.kind === "invalidated") throw new AppError(409, "qualification_invalidated", "The quarantine canary contract, permission, or configuration revision changed.");
     if (result.kind === "mismatch") throw new AppError(409, "canary_cycle_mismatch", "Restoration must be the exact inverse target, action, and semantic state, with its future provider timestamp left unset.");
     if (result.kind === "missing") throw new AppError(409, "canary_cycle_not_approved", "Both quarantine canary directions require current unused approvals.");
@@ -186,11 +187,11 @@ function projectApproval(row: CanaryRow) {
 }
 
 function requireAdministrator(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.Administrator")) throw new AppError(403, "missing_internal_role", "Administrator is required to approve or inspect quarantine canaries.");
+  if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required to approve or inspect quarantine canaries.");
 }
 
 function requireOperator(user: AuthenticatedUser) {
-  if (!user.roles.includes("AgentControl.Operator")) throw new AppError(403, "missing_internal_role", "Operator is required to execute quarantine canaries.");
+  if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required to execute quarantine canaries.");
 }
 
 function requireTenant(user: AuthenticatedUser) {

@@ -42,12 +42,12 @@ vi.mock("../api/client", async (importOriginal) => ({
   submitPurviewAuditSearch: vi.fn(),
 }));
 
-const securityReader: SessionUser = {
-  displayName: "Synthetic security reader",
+const viewer: SessionUser = {
+  displayName: "Synthetic viewer",
   username: "reader@example.invalid",
   homeAccountId: "reader-a",
   tenantId: "tenant-a",
-  roles: ["AgentControl.SecurityReader"],
+  roles: ["AgentControl.Viewer"],
 };
 
 function render(ui: ReactNode) {
@@ -57,8 +57,8 @@ function render(ui: ReactNode) {
 }
 
 const administrator: SessionUser = {
-  ...securityReader,
-  roles: ["AgentControl.SecurityReader", "AgentControl.Administrator"],
+  ...viewer,
+  roles: ["AgentControl.Admin"],
 };
 
 const catalog = {
@@ -159,6 +159,7 @@ function capabilityView(authorized: boolean): CapabilityView {
       status: authorized ? "available" : "unknown",
       authorized,
       fresh: authorized,
+      verification: "provider",
       checkedAt: authorized ? "2026-09-08T13:00:00.000Z" : undefined,
       expiresAt: authorized ? "2026-09-08T14:00:00.000Z" : undefined,
       previewQualification: authorized ? "qualified" : "unqualified",
@@ -178,11 +179,10 @@ function context(
     views: [capabilityView(authorized)],
     user,
     loading: false,
-    pending: undefined,
+    pending: false,
     error: undefined,
     now,
     reload: vi.fn(async () => undefined),
-    refresh: vi.fn(async () => undefined),
     openPermissions: vi.fn(),
   };
 }
@@ -222,18 +222,16 @@ describe("PurviewAuditView", () => {
     delete (URL as Partial<typeof URL>).createObjectURL;
   });
 
-  it("loads only saved state and keeps remote query commands disabled when unqualified", async () => {
+  it("keeps delegated search disabled without exposing a qualification ritual", async () => {
     render(
-      <CapabilityContext value={context(securityReader)}>
+      <CapabilityContext value={context(viewer)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText("Live lifecycle not qualified")).toBeVisible();
+    expect(await screen.findByText(/automatic permission checks establish delegated authorization/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
-    expect(
-      screen.queryByRole("button", { name: "Approve qualification" }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
     expect(getPurviewAuditCatalog).toHaveBeenCalledOnce();
     expect(getPurviewAuditJobs).toHaveBeenCalledExactlyOnceWith(20, 0);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
@@ -241,11 +239,11 @@ describe("PurviewAuditView", () => {
     expect(startPurviewAuditQualification).not.toHaveBeenCalled();
   });
 
-  it("requires a dual-role administrator to approve exact filters before qualification starts", async () => {
+  it("keeps explicit Admin application qualification approval and start", async () => {
     vi.mocked(approvePurviewAuditQualification).mockImplementation(
       async (tokenMode, approvedFilters) => ({
         id: "qualification-a",
-        capabilityId: "purview.audit.search.delegated",
+        capabilityId: "purview.audit.search.application",
         tokenMode,
         authorizationPrincipalId: "reader-a",
         resultScope: { kind: "principal", scopeId: "reader-a", configurationRevision: null },
@@ -274,6 +272,8 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
+    await screen.findByText(/automatic permission checks establish delegated authorization/);
+    await user.selectOptions(screen.getByLabelText("Authorization"), "application");
     await screen.findByText("Live lifecycle not qualified");
     const approve = screen.getByRole("button", {
       name: "Approve qualification",
@@ -288,7 +288,7 @@ describe("PurviewAuditView", () => {
 
     expect(approvePurviewAuditQualification).toHaveBeenCalledOnce();
     expect(approvePurviewAuditQualification).toHaveBeenCalledWith(
-      "delegated",
+      "application",
       expect.objectContaining({
         presetId: "copilot_interactions",
         operations: ["CopilotInteraction"],
@@ -309,6 +309,23 @@ describe("PurviewAuditView", () => {
       "qualification-a",
     );
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+  });
+
+  it("keeps application qualification approval Admin-only", async () => {
+    const user = userEvent.setup();
+    render(
+      <CapabilityContext value={context(viewer)}>
+        <PurviewAuditView />
+      </CapabilityContext>,
+    );
+
+    await screen.findByText(/automatic permission checks establish delegated authorization/);
+    await user.selectOptions(screen.getByLabelText("Authorization"), "application");
+    expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", {
+      name: "Approve one narrow remote query for contract qualification",
+    })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
   });
 
   it("shows bounded partial coverage, minimized identifiers, and exact associations", async () => {
@@ -364,7 +381,7 @@ describe("PurviewAuditView", () => {
     const user = userEvent.setup();
 
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -398,7 +415,7 @@ describe("PurviewAuditView", () => {
     vi.mocked(submitPurviewAuditSearch).mockResolvedValue(partialJob);
     const user = userEvent.setup();
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -423,7 +440,7 @@ describe("PurviewAuditView", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     const user = userEvent.setup();
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -437,7 +454,7 @@ describe("PurviewAuditView", () => {
   it("reloads saved history for a new account and ignores the previous account's late response", async () => {
     let resolveStaleHistory!: (value: Awaited<ReturnType<typeof getPurviewAuditJobs>>) => void;
     const currentUser: SessionUser = {
-      ...securityReader,
+      ...viewer,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
@@ -452,7 +469,7 @@ describe("PurviewAuditView", () => {
       .mockResolvedValueOnce({ value: [currentJob], count: 1, limit: 20, offset: 0 });
 
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -475,7 +492,7 @@ describe("PurviewAuditView", () => {
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [latest], count: 21, limit: 20, offset: 0 });
     vi.mocked(getPurviewAuditJob).mockResolvedValue(partialJob);
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView initialJobId={partialJob.id} />
       </CapabilityContext>,
     );
@@ -488,7 +505,7 @@ describe("PurviewAuditView", () => {
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [partialJob], count: 1, limit: 20, offset: 0 });
     vi.mocked(getPurviewAuditJob).mockRejectedValue(new Error("Not found"));
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView initialJobId="other-principal-job" />
       </CapabilityContext>,
     );
@@ -500,7 +517,7 @@ describe("PurviewAuditView", () => {
   it("ignores a late record page after the account changes", async () => {
     let resolveStaleRecords!: (value: Awaited<ReturnType<typeof getPurviewAuditRecords>>) => void;
     const currentUser: SessionUser = {
-      ...securityReader,
+      ...viewer,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
@@ -512,7 +529,7 @@ describe("PurviewAuditView", () => {
     );
     const user = userEvent.setup();
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -534,14 +551,14 @@ describe("PurviewAuditView", () => {
 
   it("reloads saved state when the current account's capability configuration changes", async () => {
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
     await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledOnce());
 
     view.rerender(
-      <CapabilityContext value={context(securityReader)}>
+      <CapabilityContext value={context(viewer)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -560,13 +577,13 @@ describe("PurviewAuditView", () => {
     const user = userEvent.setup();
     render(
       <CapabilityContext
-        value={context(securityReader, true, Date.parse("2026-09-08T14:00:00.001Z"))}
+        value={context(viewer, true, Date.parse("2026-09-08T14:00:00.001Z"))}
       >
         <PurviewAuditView />
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText("Live lifecycle not qualified")).toBeVisible();
+    expect(await screen.findByText(/automatic permission checks establish delegated authorization/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: /View results 11111111/ }));
     expect(getPurviewAuditRecords).toHaveBeenCalledExactlyOnceWith(partialJob.id, 100, 0);
@@ -597,6 +614,7 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView />
       </CapabilityContext>,
     );
+    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
     await user.click(await screen.findByRole("checkbox", {
       name: "Approve one narrow remote query for contract qualification",
     }));
@@ -631,6 +649,7 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView />
       </CapabilityContext>,
     );
+    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
     const approval = await screen.findByRole("checkbox", {
       name: "Approve one narrow remote query for contract qualification",
     });
@@ -654,7 +673,7 @@ describe("PurviewAuditView", () => {
       finishedAt: null,
     };
     const currentUser: SessionUser = {
-      ...securityReader,
+      ...viewer,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
@@ -664,7 +683,7 @@ describe("PurviewAuditView", () => {
       .mockReturnValueOnce(new Promise((resolve) => { resolveStalePoll = resolve; }))
       .mockResolvedValueOnce({ value: [], count: 0, limit: 20, offset: 0 });
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -700,7 +719,7 @@ describe("PurviewAuditView", () => {
     });
     const user = userEvent.setup();
     render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -716,7 +735,7 @@ describe("PurviewAuditView", () => {
 
   it("ignores a qualification approval that resolves after the account changes", async () => {
     let resolveStaleApproval!: (value: PurviewAuditQualification) => void;
-    const currentAdministrator: SessionUser = {
+    const currentAdmin: SessionUser = {
       ...administrator,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
@@ -730,6 +749,7 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView />
       </CapabilityContext>,
     );
+    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
     await user.click(await screen.findByRole("checkbox", {
       name: "Approve one narrow remote query for contract qualification",
     }));
@@ -737,7 +757,7 @@ describe("PurviewAuditView", () => {
     await waitFor(() => expect(approvePurviewAuditQualification).toHaveBeenCalledOnce());
 
     view.rerender(
-      <CapabilityContext value={context(currentAdministrator)}>
+      <CapabilityContext value={context(currentAdmin)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -750,7 +770,7 @@ describe("PurviewAuditView", () => {
 
   it("ignores a qualification job that starts after the account changes", async () => {
     let resolveStaleStart!: (value: PurviewAuditJob) => void;
-    const currentAdministrator: SessionUser = {
+    const currentAdmin: SessionUser = {
       ...administrator,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
@@ -767,6 +787,7 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView />
       </CapabilityContext>,
     );
+    await user.selectOptions(await screen.findByLabelText("Authorization"), "application");
     await user.click(await screen.findByRole("checkbox", {
       name: "Approve one narrow remote query for contract qualification",
     }));
@@ -775,7 +796,7 @@ describe("PurviewAuditView", () => {
     await waitFor(() => expect(startPurviewAuditQualification).toHaveBeenCalledOnce());
 
     view.rerender(
-      <CapabilityContext value={context(currentAdministrator)}>
+      <CapabilityContext value={context(currentAdmin)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -811,7 +832,7 @@ describe("PurviewAuditView", () => {
     let resolveJob!: (value: PurviewAuditJob) => void;
     let resolveDelete!: () => void;
     const currentUser: SessionUser = {
-      ...securityReader,
+      ...viewer,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
@@ -834,7 +855,7 @@ describe("PurviewAuditView", () => {
     }
     const user = userEvent.setup();
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -861,7 +882,7 @@ describe("PurviewAuditView", () => {
   it("does not create a delayed CSV download after the account changes", async () => {
     let resolveStaleExport!: (value: Blob) => void;
     const currentUser: SessionUser = {
-      ...securityReader,
+      ...viewer,
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
@@ -878,7 +899,7 @@ describe("PurviewAuditView", () => {
     );
     const user = userEvent.setup();
     const view = render(
-      <CapabilityContext value={context(securityReader, true)}>
+      <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
@@ -899,7 +920,7 @@ describe("PurviewAuditView", () => {
   it("has no DOM accessibility violations", async () => {
     const { container } = render(
       <main>
-        <CapabilityContext value={context(securityReader, true)}>
+        <CapabilityContext value={context(viewer, true)}>
           <PurviewAuditView />
         </CapabilityContext>
       </main>,

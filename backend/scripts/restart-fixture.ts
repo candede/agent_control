@@ -107,8 +107,8 @@ if (process.argv[2] === "seed") {
     await defenderHunting.authorizeProviderRequest(defenderScope,defenderCompleted.id,defenderCompletedExecution);
     await defenderHunting.recordProviderResponse(defenderScope,defenderCompleted.id,defenderCompletedExecution,"defender-provider-completed");
     await defenderHunting.publish(defenderScope,defenderCompleted.id,defenderCompletedExecution,{rows:[],providerRowCount:0,storedRowCount:0,byteCount:2,complete:true,partialReason:null});
-    const administrator={tenantId:scope.tenantId,homeAccountId:"restart-canary-approver",displayName:"Canary approver",username:"approver@example.invalid",roles:["AgentControl.Administrator"] as const};
-    const operator={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Operator"] as const};
+    const administrator={tenantId:scope.tenantId,homeAccountId:"restart-canary-approver",displayName:"Canary approver",username:"approver@example.invalid",roles:["AgentControl.Admin"] as const};
+    const operator={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"] as const};
     const qualificationIdentity={contractRevision:"a".repeat(64),configurationRevision:7,authMode:"delegated" as const};
     const canaryOriginal=await qualifications.createApproved(administrator,{targetId:"restart-canary",action:"block",...qualificationIdentity,prestate:{kind:"block",isBlocked:false},poststate:{kind:"block",isBlocked:true}});
     const canaryRestoration=await qualifications.createApproved(administrator,{targetId:"restart-canary",action:"unblock",...qualificationIdentity,prestate:{kind:"block",isBlocked:true},poststate:{kind:"block",isBlocked:false}});

@@ -16,7 +16,7 @@ const user: SessionUser = {
   username: "operator@example.invalid",
   homeAccountId: "operator-1",
   tenantId: "tenant-1",
-  roles: ["AgentControl.Reader", "AgentControl.Operator"],
+  roles: ["AgentControl.Admin"],
 };
 
 const agent: CopilotPackageDetail = {
@@ -44,7 +44,37 @@ const agent: CopilotPackageDetail = {
 };
 
 describe("package management UI", () => {
-  it("keeps saved reads usable while preview controls remain visibly disabled", () => {
+  it.each(["AgentControl.Admin", "AgentControl.Viewer"] as const)("keeps package changes scoped to %s", async role => {
+    const block = vi.fn();
+    const access = vi.fn();
+    renderWithCapabilities(
+      <AgentTable
+        agents={[agent]} selectedIds={new Set()} recentlyChangedIds={new Set()} operationsAllowed
+        selectionDisabled={false} usageByAgentId={new Map()} allMatchingSelected={false} selectedCount={0}
+        onToggleAgentSelection={vi.fn()} onToggleMatchingSelection={vi.fn()} onViewDetails={vi.fn()}
+        onManageAccess={access} onBlock={block} onUnblock={vi.fn()}
+      />,
+      [onDemandCapability("graph.package.access.manage"), onDemandCapability("graph.package.block.manage")],
+      { ...user, roles: [role] },
+    );
+    const blockButton = screen.getByRole("button", { name: "Block Research assistant" });
+    const accessButton = screen.getByRole("button", { name: "Manage access for Research assistant" });
+    if (role === "AgentControl.Admin") {
+      expect(blockButton).toBeEnabled();
+      expect(accessButton).toBeEnabled();
+    } else {
+      expect(blockButton).toBeDisabled();
+      expect(accessButton).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toBeDisabled();
+    expect(block).not.toHaveBeenCalled();
+    expect(access).not.toHaveBeenCalled();
+    await userEvent.click(blockButton);
+    await userEvent.click(accessButton);
+    expect(block).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 1 : 0);
+    expect(access).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 1 : 0);
+  });
+  it("keeps saved reads usable when provider permission is missing", () => {
     renderWithCapabilities(
       <AgentTable
         agents={[agent]}
@@ -62,22 +92,22 @@ describe("package management UI", () => {
         onBlock={vi.fn()}
         onUnblock={vi.fn()}
       />,
-      [capability("graph.package.read.delegated", "available"), capability("graph.package.access.manage", "preview_disabled"), capability("graph.package.block.manage", "preview_disabled")],
+      [capability("graph.package.read.delegated", "available"), capability("graph.package.access.manage", "missing_permission"), capability("graph.package.block.manage", "missing_permission")],
     );
 
     expect(screen.getByRole("button", { name: "View details for Research assistant" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toHaveAccessibleDescription(/no If-Match or equivalent lost-update protection/i);
+    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toHaveAccessibleDescription(/Requires delegated CopilotPackages.ReadWrite.All/i);
     expect(screen.getByRole("button", { name: "Block Research assistant" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toHaveAccessibleDescription(/no owner readback field or conditional-write protection/i);
+    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toHaveAccessibleDescription(/Owner reassignment is not implemented in this app/i);
     expect(screen.getByRole("link", { name: "Reassignment documentation for Research assistant" })).toHaveAttribute("href", "https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-reassign");
   });
 
   it("shows package source, maturity, deployment, freshness, and distinct block semantics", () => {
     renderWithCapabilities(
       <AgentDetailModal agent={agent} activeTab="package" onClose={vi.fn()} onUpdateAccess={vi.fn()} />,
-      [capability("graph.package.access.manage", "preview_disabled")],
+      [onDemandCapability("graph.package.access.manage")],
     );
 
     expect(screen.getByText("Package block")).toBeInTheDocument();
@@ -92,7 +122,7 @@ describe("package management UI", () => {
     const input = userEvent.setup();
     renderWithCapabilities(
       <AgentDetailModal agent={agent} onClose={vi.fn()} onUpdateAccess={vi.fn()} />,
-      [capability("graph.package.access.manage", "preview_disabled")],
+      [onDemandCapability("graph.package.access.manage")],
     );
 
     await input.click(screen.getByRole("tab", { name: "Identities" }));
@@ -101,18 +131,19 @@ describe("package management UI", () => {
     expect(screen.getByText("graph_packages · ga · displayName")).toBeInTheDocument();
   });
 
-  it("confirms the complete server-issued mutation summary", async () => {
+  it.each(["block", "update-availability"] as const)("confirms the complete server-issued %s summary", async operation => {
     const confirmation: BulkConfirmation = {
-      action: "block",
+      action: operation,
+      ...(operation === "update-availability" ? { accessUpdate: { target: "availability" as const, mode: "replace" as const, scope: "none" as const, principals: [] } } : {}),
       ids: [agent.id],
       mutationScope: "single",
       preview: {
         confirmationHash: "a".repeat(64),
         summary: {
           risk: true,
-          operation: "block",
+          operation,
           provider: "Microsoft Graph",
-          endpoint: "POST /beta/copilot/admin/catalog/packages/{id}/block",
+          endpoint: operation === "block" ? "POST /beta/copilot/admin/catalog/packages/{id}/block" : "PATCH /beta/copilot/admin/catalog/packages/{id}/access",
           apiMaturity: "preview",
           permission: "Delegated CopilotPackages.ReadWrite.All",
           actor: { id: user.homeAccountId, displayName: user.displayName, username: user.username },
@@ -127,7 +158,7 @@ describe("package management UI", () => {
       },
     };
     const confirm = vi.fn();
-    renderWithCapabilities(<BulkConfirmModal confirmation={confirmation} onCancel={vi.fn()} onConfirm={confirm} />, [capability("graph.package.block.manage", "available", "qualified")]);
+    renderWithCapabilities(<BulkConfirmModal confirmation={confirmation} onCancel={vi.fn()} onConfirm={confirm} />, [onDemandCapability(operation === "block" ? "graph.package.block.manage" : "graph.package.access.manage")]);
 
     expect(screen.getByText("Microsoft Graph")).toBeInTheDocument();
     expect(screen.getByText("Preview write risk")).toBeInTheDocument();
@@ -135,7 +166,14 @@ describe("package management UI", () => {
     expect(screen.getByText(/Current:/)).toHaveTextContent('"isBlocked":false');
     expect(screen.getByText(/Requested:/)).toHaveTextContent('"isBlocked":true');
     expect(screen.getByText(/separately confirmed inverse operation/)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Confirm block" }));
+    if (operation === "update-availability") {
+      expect(screen.getByRole("note")).toHaveTextContent("Access updates can overwrite concurrent administrator changes.");
+    } else {
+      expect(screen.queryByRole("note")).not.toBeInTheDocument();
+    }
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: operation === "block" ? "Confirm block" : "Confirm update availability" }));
     expect(confirm).toHaveBeenCalledOnce();
   });
 
@@ -145,7 +183,7 @@ describe("package management UI", () => {
   });
 });
 
-function capability(id: CapabilityId, status: CapabilityView["decision"]["status"], previewQualification: CapabilityView["decision"]["previewQualification"] = "unqualified"): CapabilityView {
+function capability(id: CapabilityId, status: CapabilityView["decision"]["status"]): CapabilityView {
   const definition = capabilityDefinitions.find(item => item.id === id)!;
   return {
     definition,
@@ -154,13 +192,21 @@ function capability(id: CapabilityId, status: CapabilityView["decision"]["status
       status,
       authorized: status === "available",
       fresh: true,
+      verification: "provider",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
-      previewQualification,
+      previewQualification: "not_required",
       remediation: [],
     },
   };
 }
 
-function renderWithCapabilities(children: React.ReactNode, views: CapabilityView[]) {
-  return render(<CapabilityContext value={{ views, user, loading: false, pending: undefined, error: undefined, now: Date.now(), reload: vi.fn(), refresh: vi.fn(), openPermissions: vi.fn() }}><WorkbenchActionProvider value={workbenchActions}>{children}</WorkbenchActionProvider></CapabilityContext>);
+function onDemandCapability(id: CapabilityId): CapabilityView {
+  return {
+    definition: capabilityDefinitions.find(item => item.id === id)!,
+    decision: { capabilityId: id, status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required", remediation: [] },
+  };
+}
+
+function renderWithCapabilities(children: React.ReactNode, views: CapabilityView[], currentUser = user) {
+  return render(<CapabilityContext value={{ views, user: currentUser, loading: false, pending: false, error: undefined, now: Date.now(), reload: vi.fn(), openPermissions: vi.fn() }}><WorkbenchActionProvider value={workbenchActions}>{children}</WorkbenchActionProvider></CapabilityContext>);
 }
