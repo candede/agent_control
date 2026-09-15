@@ -30,8 +30,8 @@ type StagingRow = {
   schema_version: string;
   bundle_id: string;
   correction_of_set_id: string | null;
-  reporting_start: string | Date;
-  reporting_end: string | Date;
+  reporting_start: string | Date | null;
+  reporting_end: string | Date | null;
   period_provenance: ParsedOfficialUsageReport["reportingPeriod"]["provenance"];
   source_as_of: Date | null;
   source_as_of_provenance: ParsedOfficialUsageReport["sourceAsOfProvenance"];
@@ -52,8 +52,9 @@ type SetRow = {
   id: string;
   bundle_id: string;
   actor_principal_id: string;
-  reporting_start: string | Date;
-  reporting_end: string | Date;
+  reporting_start: string | Date | null;
+  reporting_end: string | Date | null;
+  period_provenance: ParsedOfficialUsageReport["reportingPeriod"]["provenance"];
   supersedes_set_id: string | null;
   complete: boolean;
   accepted_at: Date | null;
@@ -85,8 +86,8 @@ type PublishedVersionRow = {
   file_hash: string;
   parser_version: string;
   schema_version: string;
-  reporting_start: string | Date;
-  reporting_end: string | Date;
+  reporting_start: string | Date | null;
+  reporting_end: string | Date | null;
   period_provenance: ParsedOfficialUsageReport["reportingPeriod"]["provenance"];
   source_as_of: Date | null;
   source_as_of_provenance: ParsedOfficialUsageReport["sourceAsOfProvenance"];
@@ -267,7 +268,8 @@ export class OfficialUsageRepository {
           WHERE staging.tenant_id=$1 AND staging.actor_principal_id=$2 AND staging.bundle_id=$3
             AND staging.status='active' AND staging.expires_at>clock_timestamp()
             AND artifact.file_hash=staging.file_hash
-            AND version.reporting_start=staging.reporting_start AND version.reporting_end=staging.reporting_end
+            AND version.reporting_start IS NOT DISTINCT FROM staging.reporting_start
+            AND version.reporting_end IS NOT DISTINCT FROM staging.reporting_end
             AND version.period_provenance=staging.period_provenance
             AND version.source_as_of IS NOT DISTINCT FROM staging.source_as_of
             AND version.source_as_of_provenance=staging.source_as_of_provenance`,
@@ -287,27 +289,42 @@ export class OfficialUsageRepository {
       if (!reportSet) {
         const setId = randomUUID();
         reportSet = (await client.query<SetRow>(`INSERT INTO official_usage_sets
-          (id,tenant_id,bundle_id,actor_principal_id,reporting_start,reporting_end,supersedes_set_id)
-          VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *,'{}'::text[] AS kinds`,
-        [setId, scope.tenantId, stage.bundle_id, scope.principalId, stage.reporting_start, stage.reporting_end, stage.correction_of_set_id])).rows[0];
+          (id,tenant_id,bundle_id,actor_principal_id,reporting_start,reporting_end,period_provenance,supersedes_set_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *,'{}'::text[] AS kinds`,
+        [setId, scope.tenantId, stage.bundle_id, scope.principalId, stage.reporting_start, stage.reporting_end,
+          stage.period_provenance, stage.correction_of_set_id])).rows[0];
       }
-        if (reportSet.actor_principal_id !== scope.principalId) {
-          throw new AppError(409, "bundle_owner_mismatch", "This unpublished report bundle belongs to another administrator.");
-        }
-        if (reportSet.deleted_at || dateValue(reportSet.reporting_start) !== dateValue(stage.reporting_start) ||
-          dateValue(reportSet.reporting_end) !== dateValue(stage.reporting_end) ||
+      if (reportSet.actor_principal_id !== scope.principalId) {
+        throw new AppError(409, "bundle_owner_mismatch", "This unpublished report bundle belongs to another administrator.");
+      }
+      if (reportSet.deleted_at || reportSet.period_provenance !== stage.period_provenance ||
           reportSet.supersedes_set_id !== stage.correction_of_set_id) {
         throw new AppError(409, "incompatible_bundle", "This preview is incompatible with the retained report bundle.");
       }
-        const companions = await client.query<Pick<StagingRow, "period_provenance" | "source_as_of" | "source_as_of_provenance">>(`SELECT version.period_provenance,version.source_as_of,version.source_as_of_provenance
-          FROM official_usage_set_versions membership JOIN official_usage_versions version ON version.id=membership.version_id
-          WHERE membership.set_id=$1 AND membership.tenant_id=$2`, [reportSet.id, scope.tenantId]);
-        if (companions.rows.some(companion => !compatibleSourceBasis(companion, stage))) {
-          throw new AppError(409, "incompatible_bundle", "The report source snapshot metadata is incompatible with this retained bundle.");
+      const companions = await client.query<Pick<StagingRow,
+        "reporting_start" | "reporting_end" | "period_provenance" | "source_as_of" | "source_as_of_provenance">>(
+        `SELECT version.reporting_start,version.reporting_end,version.period_provenance,
+          version.source_as_of,version.source_as_of_provenance
+        FROM official_usage_set_versions membership JOIN official_usage_versions version ON version.id=membership.version_id
+        WHERE membership.set_id=$1 AND membership.tenant_id=$2`, [reportSet.id, scope.tenantId]);
+      if (companions.rows.some(companion => !compatibleReportBasis(companion, stage))) {
+        throw new AppError(409, "incompatible_bundle", "The report period or source snapshot basis is incompatible with this retained bundle.");
+      }
+      if (stage.period_provenance === "activity_range") {
+        const coverage = unionCoverage(reportSet, stage);
+        if (dateValue(reportSet.reporting_start) !== coverage.startDate || dateValue(reportSet.reporting_end) !== coverage.endDate) {
+          reportSet = (await client.query<SetRow>(`UPDATE official_usage_sets
+            SET reporting_start=$3::date,reporting_end=$4::date WHERE id=$1 AND tenant_id=$2
+            RETURNING *,'{}'::text[] AS kinds`,
+          [reportSet.id, scope.tenantId, coverage.startDate, coverage.endDate])).rows[0];
         }
+      } else if (dateValue(reportSet.reporting_start) !== dateValue(stage.reporting_start) ||
+          dateValue(reportSet.reporting_end) !== dateValue(stage.reporting_end)) {
+        throw new AppError(409, "incompatible_bundle", "This preview is incompatible with the retained report bundle.");
+      }
       const existing = await client.query<{
         version_id: string; file_hash: string; parser_version: string; schema_version: string;
-        reporting_start: string | Date; reporting_end: string | Date; period_provenance: StagingRow["period_provenance"];
+        reporting_start: string | Date | null; reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"];
         source_as_of: Date | null; source_as_of_provenance: StagingRow["source_as_of_provenance"];
         downloaded_at: Date | null; row_count: number; warnings: string[];
       }>(`SELECT membership.version_id,artifact.file_hash,artifact.parser_version,artifact.schema_version,
@@ -500,7 +517,7 @@ export class OfficialUsageRepository {
       reportingPeriod: {
         startDate: dateValue(version.reporting_start),
         endDate: dateValue(version.reporting_end),
-        days: Math.floor((Date.parse(dateValue(version.reporting_end)) - Date.parse(dateValue(version.reporting_start))) / 86_400_000) + 1,
+        days: periodDays(version.reporting_start, version.reporting_end),
         provenance: version.period_provenance,
       },
       sourceAsOf: version.source_as_of?.toISOString(),
@@ -518,7 +535,7 @@ export class OfficialUsageRepository {
         reportingPeriod: {
           startDate: dateValue(version.reporting_start),
           endDate: dateValue(version.reporting_end),
-          days: Math.floor((Date.parse(dateValue(version.reporting_end)) - Date.parse(dateValue(version.reporting_start))) / 86_400_000) + 1,
+          days: periodDays(version.reporting_start, version.reporting_end),
           provenance: version.period_provenance,
         },
         sourceAsOf: version.source_as_of?.toISOString(),
@@ -696,7 +713,7 @@ async function companionMetrics(client: pg.PoolClient, scope: OfficialUsageScope
 
 async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, bundleId: string, expectedActiveRevision: number) {
   const reportSet = await client.query<{
-    id: string; actor_principal_id: string; reporting_start: string | Date; reporting_end: string | Date;
+    id: string; actor_principal_id: string; reporting_start: string | Date | null; reporting_end: string | Date | null;
     supersedes_set_id: string | null;
   }>(`SELECT id,actor_principal_id,reporting_start,reporting_end,supersedes_set_id FROM official_usage_sets
     WHERE tenant_id=$1 AND bundle_id=$2 AND deleted_at IS NULL AND expires_at>clock_timestamp()`, [scope.tenantId, bundleId]);
@@ -708,7 +725,7 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
     ORDER BY kind,id FOR UPDATE`, [scope.tenantId, scope.principalId, bundleId]);
   const accepted = await client.query<{
     kind: ParsedOfficialUsageReport["kind"]; version_id: string; file_hash: string;
-    reporting_start: string | Date; reporting_end: string | Date; period_provenance: StagingRow["period_provenance"];
+    reporting_start: string | Date | null; reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"];
     source_as_of: Date | null; source_as_of_provenance: StagingRow["source_as_of_provenance"];
   }>(`SELECT membership.kind,membership.version_id,artifact.file_hash,version.reporting_start,version.reporting_end,
       version.period_provenance,version.source_as_of,version.source_as_of_provenance
@@ -746,14 +763,16 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
   ];
   const basis = bases[0];
   if (basis && bases.some(candidate =>
-    dateValue(candidate.reportingStart) !== dateValue(basis.reportingStart) ||
-    dateValue(candidate.reportingEnd) !== dateValue(basis.reportingEnd) ||
     candidate.correctionOfSetId !== basis.correctionOfSetId ||
-    !compatibleSourceBasis({
+    !compatibleReportBasis({
+      reporting_start: candidate.reportingStart,
+      reporting_end: candidate.reportingEnd,
       period_provenance: candidate.periodProvenance,
       source_as_of: candidate.sourceAsOf,
       source_as_of_provenance: candidate.sourceAsOfProvenance,
     }, {
+      reporting_start: basis.reportingStart,
+      reporting_end: basis.reportingEnd,
       period_provenance: basis.periodProvenance,
       source_as_of: basis.sourceAsOf,
       source_as_of_provenance: basis.sourceAsOfProvenance,
@@ -863,7 +882,11 @@ function projectSet(row: SetRow) {
   return {
     id: row.id,
     bundleId: row.bundle_id,
-    reportingPeriod: { startDate: dateValue(row.reporting_start), endDate: dateValue(row.reporting_end) },
+    reportingPeriod: {
+      startDate: dateValue(row.reporting_start),
+      endDate: dateValue(row.reporting_end),
+      provenance: row.period_provenance,
+    },
     supersedesSetId: row.supersedes_set_id,
     complete: row.complete,
     kinds: row.kinds,
@@ -882,8 +905,18 @@ function validateTenant(tenantId: string) {
   if (!tenantId) throw new AppError(403, "scope_mismatch", "Official usage requires an exact tenant scope.");
 }
 
-function dateValue(value: string | Date) {
-  return typeof value === "string" ? value : value.toISOString().slice(0, 10);
+function dateValue(value: string | Date | null) {
+  if (value === null || typeof value === "string") return value;
+  // pg decodes DATE as local midnight, not a UTC instant. Preserve its civil date.
+  return `${String(value.getFullYear()).padStart(4, "0")}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+}
+
+function periodDays(start: string | Date | null, end: string | Date | null) {
+  const startDate = dateValue(start);
+  const endDate = dateValue(end);
+  return startDate && endDate
+    ? Math.floor((Date.parse(endDate) - Date.parse(startDate)) / 86_400_000) + 1
+    : null;
 }
 
 function compatibleSourceBasis(
@@ -895,10 +928,34 @@ function compatibleSourceBasis(
   return left.source_as_of.getTime() === right.source_as_of.getTime();
 }
 
+function compatibleReportBasis(
+  left: Pick<StagingRow, "reporting_start" | "reporting_end" | "period_provenance" | "source_as_of" | "source_as_of_provenance">,
+  right: Pick<StagingRow, "reporting_start" | "reporting_end" | "period_provenance" | "source_as_of" | "source_as_of_provenance">,
+) {
+  if (!compatibleSourceBasis(left, right)) return false;
+  return left.period_provenance === "activity_range" ||
+    dateValue(left.reporting_start) === dateValue(right.reporting_start) &&
+    dateValue(left.reporting_end) === dateValue(right.reporting_end);
+}
+
+function unionCoverage(
+  left: Pick<SetRow, "reporting_start" | "reporting_end">,
+  right: Pick<StagingRow, "reporting_start" | "reporting_end">,
+) {
+  const starts = [dateValue(left.reporting_start), dateValue(right.reporting_start)]
+    .filter((value): value is string => value !== null);
+  const ends = [dateValue(left.reporting_end), dateValue(right.reporting_end)]
+    .filter((value): value is string => value !== null);
+  return {
+    startDate: starts.length ? starts.sort()[0] : null,
+    endDate: ends.length ? ends.sort().at(-1)! : null,
+  };
+}
+
 function sameImmutableVersionIntent(
   version: {
-    file_hash: string; parser_version: string; schema_version: string; reporting_start: string | Date;
-    reporting_end: string | Date; period_provenance: StagingRow["period_provenance"]; source_as_of: Date | null;
+    file_hash: string; parser_version: string; schema_version: string; reporting_start: string | Date | null;
+    reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"]; source_as_of: Date | null;
     source_as_of_provenance: StagingRow["source_as_of_provenance"]; downloaded_at: Date | null;
     row_count: number; warnings: string[];
   },

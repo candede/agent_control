@@ -84,12 +84,11 @@ export function capabilityScopes(capabilityId: CapabilityId) {
   return definition.permissions.map(permission => `${resource}/${permission}`);
 }
 
-export function createAuthFlow(kind: "login" | "consent", options: { capabilityId?: CapabilityId; accountId?: string; returnTo?: string; providerConsent?: boolean } = {}): AuthFlow {
-  const providerSetup = kind === "login" && options.providerConsent !== false;
+export function createAuthFlow(kind: "login" | "consent", options: { capabilityId?: CapabilityId; accountId?: string; returnTo?: string } = {}): AuthFlow {
   const scopes = kind === "login"
-    ? [...loginScopes, ...(providerSetup ? ["offline_access", ...capabilityScopes("graph.directory.read")] : [])]
+    ? [...loginScopes, "offline_access", ...capabilityScopes("graph.directory.read")]
     : ["openid", "profile", "offline_access", ...capabilityScopes(options.capabilityId!)];
-  const extraScopesToConsent = providerSetup
+  const extraScopesToConsent = kind === "login"
     ? [...new Set(capabilityDefinitions.filter(definition => definition.mode === "delegated"
       && definition.probe.adapterRegistered)
       .flatMap(definition => capabilityScopes(definition.id)))].filter(scope => !scopes.includes(scope))

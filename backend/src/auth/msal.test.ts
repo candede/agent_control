@@ -52,10 +52,13 @@ describe("authentication scopes", () => {
     expect(flow.extraScopesToConsent).toEqual([
       "https://graph.microsoft.com/CopilotPackages.Read.All",
       "https://graph.microsoft.com/CopilotPackages.ReadWrite.All",
+      "https://graph.microsoft.com/User.Read.All",
+      "https://graph.microsoft.com/LicenseAssignment.Read.All",
       "https://api.powerplatform.com/ResourceQuery.Resources.Read",
       "https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke",
       "https://graph.microsoft.com/AuditLogsQuery.Read.All",
       "https://graph.microsoft.com/ThreatHunting.Read.All",
+      "https://graph.microsoft.com/Reports.Read.All",
     ]);
     const requestedScopes = [...flow.scopes, ...flow.extraScopesToConsent!];
     expect(requestedScopes.join(" ")).not.toMatch(/\.default/);
@@ -66,17 +69,7 @@ describe("authentication scopes", () => {
     expect(capabilityScopes("graph.package.read.delegated")).toEqual(["https://graph.microsoft.com/CopilotPackages.Read.All"]);
     expect(capabilityScopes("powerPlatform.inventory.read")).toEqual(["https://api.powerplatform.com/ResourceQuery.Resources.Read"]);
     expect(capabilityScopes("powerPlatform.quarantine.manage")).toEqual(["https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke"]);
-  });
-
-  it("allows provider setup to be explicitly deferred without changing identity revalidation scopes", async () => {
-    const { client } = fakeClient();
-    replaceMsalClientForTest(client);
-    const flow = createAuthFlow("login", { providerConsent: false });
-    expect(flow.scopes).toEqual(loginScopes);
-    expect(flow.extraScopesToConsent).toBeUndefined();
-    await createAuthorizationUrl(flow);
-    expect(client.getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ scopes: loginScopes, prompt: "select_account" }));
-    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("extraScopesToConsent");
+    expect(capabilityScopes("reports.copilotUsage.read")).toEqual(["https://graph.microsoft.com/Reports.Read.All"]);
   });
 
   it("lets Entra decide whether recovery needs consent instead of forcing repeated consent", async () => {

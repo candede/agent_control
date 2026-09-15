@@ -1,10 +1,12 @@
 export type OfficialUsageReportKind = "agents" | "userAgents" | "users";
 
+export type OfficialUsagePeriodProvenance = "source_metadata" | "operator_asserted" | "activity_range";
+
 export type OfficialUsageMetadata = {
-  reportingPeriod: {
+  reportingPeriod?: {
     startDate: string;
     endDate: string;
-    provenance: "source_metadata" | "operator_asserted";
+    provenance: Exclude<OfficialUsagePeriodProvenance, "activity_range">;
   };
   sourceAsOf?: {
     value: string;
@@ -18,10 +20,10 @@ export type OfficialUsageReportBase = {
   parserVersion: string;
   schemaVersion: string;
   reportingPeriod: {
-    startDate: string;
-    endDate: string;
-    days: number;
-    provenance: "source_metadata" | "operator_asserted";
+    startDate: string | null;
+    endDate: string | null;
+    days: number | null;
+    provenance: OfficialUsagePeriodProvenance;
   };
   sourceAsOf?: string;
   sourceAsOfProvenance: "source_metadata" | "operator_asserted" | "absent";
@@ -96,7 +98,11 @@ export type AcceptedOfficialUsageReports = {
 export type OfficialUsageSetSummary = {
   id: string;
   bundleId: string;
-  reportingPeriod: { startDate: string; endDate: string };
+  reportingPeriod: {
+    startDate: string | null;
+    endDate: string | null;
+    provenance: OfficialUsagePeriodProvenance;
+  };
   supersedesSetId: string | null;
   complete: boolean;
   kinds: OfficialUsageReportKind[];
@@ -147,6 +153,24 @@ export type OfficialUsageTopUser = {
   userLastActivityDateUtc?: string;
 };
 
+export type OfficialUsageDateFilter = {
+  startDate?: string;
+  endDate?: string;
+};
+
+export type OfficialUsageAgentSort =
+  | "agentName"
+  | "responses"
+  | "licensedUsers"
+  | "unlicensedUsers"
+  | "lastActivity";
+
+export type OfficialUsageUserSort =
+  | "displayName"
+  | "responses"
+  | "agentsUsed"
+  | "lastActivity";
+
 export type OfficialUsageSourceComparison = {
   sourceValues: Record<string, number | null>;
   status: "matching" | "mismatch" | "not_comparable";
@@ -181,6 +205,9 @@ export type OfficialUsageReportingSummary = {
     topAgentsByActiveUsers: OfficialUsageTopAgent[];
     lastActivityRange?: { earliest: string; latest: string };
     activeUsersAreNonAdditive: true;
+    reportedLicensedActiveUserOccurrences: number | null;
+    reportedUnlicensedActiveUserOccurrences: number | null;
+    activeUserOccurrenceNotice: string;
   };
   activityWindow: {
     anchorDateUtc?: string;
@@ -220,6 +247,20 @@ export type OfficialUsageAggregateView = {
   activeSet: OfficialUsageSetSummary | null;
   lineages: OfficialUsageLineage[];
   missingKinds: OfficialUsageReportKind[];
+  filters: {
+    search?: string;
+    creatorType?: string;
+    startDate?: string;
+    endDate?: string;
+    sortBy: OfficialUsageAgentSort;
+    sortDirection: "asc" | "desc";
+    creatorTypes: string[];
+  };
+  rankings: {
+    mostResponses: OfficialUsageTopAgent[];
+    leastResponses: OfficialUsageTopAgent[];
+    zeroResponseAgents: number;
+  };
   summary: OfficialUsageReportingSummary;
   agents: { value: OfficialUsageAgent[]; count: number; limit: number; offset: number };
 };
@@ -243,6 +284,9 @@ export type OfficialUsageUserSummary = {
   bridgeResponsesSentToUsers: number;
   missingUserReport: boolean;
   hasReportMismatch: boolean;
+  reviewCohort: "zero_responses" | "low_responses" | "outside_threshold" | "unknown";
+  reviewCandidate: boolean;
+  licenseAssignmentStatus: "unavailable";
   creatorTypes: string[];
   rows: OfficialUsageUserAgentRow[];
   searchableText: string;
@@ -261,15 +305,39 @@ export type OfficialUsageUserView = {
   acceptedAgeDays: number | null;
   activeSet: OfficialUsageSetSummary | null;
   lineages: OfficialUsageLineage[];
-  filters: { creatorTypes: string[] };
+  filters: {
+    creatorTypes: string[];
+    search?: string;
+    creatorType?: string;
+    activity: "all" | "recent" | "inactive" | "no-activity";
+    responsesOnly: boolean;
+    startDate?: string;
+    endDate?: string;
+    lowResponseThreshold: number;
+    cohort: "all" | "zero" | "low" | "review";
+    sortBy: OfficialUsageUserSort;
+    sortDirection: "asc" | "desc";
+  };
   counts: {
     users: number;
+    filteredUsers: number;
     userRows: number;
     accessRows: number;
     reportOnlyRows: number;
     totalResponsesReceived: number;
     mismatchCount: number;
   };
+  cohorts: {
+    zeroResponses: number;
+    lowResponses: number;
+    reviewCandidates: number;
+    unknownUserMetrics: number;
+    missingBridgeRows: number;
+    threshold: number;
+  };
+  recencyAnchorDateUtc?: string;
+  decisionNotice: string;
   topUsersByResponses: OfficialUsageTopUser[];
+  leastUsersByResponses: OfficialUsageTopUser[];
   users: { value: OfficialUsageUserSummary[]; count: number; limit: number; offset: number };
 };

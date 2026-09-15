@@ -108,7 +108,6 @@ Registered app permissions and setup
 ===================================
 Use an approved single-tenant Entra Web application.
 Normal sign-in requests all implemented delegated permissions up front, including package changes.
-Sign in without provider setup defers consent and requests only openid and profile.
 Approve the intended permissions below; consent does not assign roles or licenses.
 
 Entra admin center > App registrations > your app > API permissions >

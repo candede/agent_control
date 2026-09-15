@@ -5,7 +5,7 @@ import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./o
 const set = {
   id: "11111111-1111-4111-8111-111111111111",
   bundleId: "22222222-2222-4222-8222-222222222222",
-  reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06" },
+  reportingPeriod: { startDate: "2026-06-07", endDate: "2026-07-06", provenance: "source_metadata" as const },
   supersedesSetId: null,
   complete: true,
   kinds: ["agents", "userAgents", "users"] as const,
@@ -123,13 +123,119 @@ describe("official usage views", () => {
     expect(buildOfficialUsageAggregateView({ ...base, retainedCompleteSets: 0, retainedIncompleteSets: 0, hasImportHistory: true }, [], { staleAfterDays: 35 }).availability).toBe("deleted");
     expect(buildOfficialUsageAggregateView(published(), [], { staleAfterDays: 35, now: new Date("2026-09-01T00:00:00.000Z") }).availability).toBe("stale");
     const oldAcceptance = published();
-    oldAcceptance.activeSet = { ...oldAcceptance.activeSet!, reportingPeriod: { startDate: "2026-08-03", endDate: "2026-09-01" }, acceptedAt: "2026-06-01T00:00:00.000Z" };
+    oldAcceptance.activeSet = { ...oldAcceptance.activeSet!, reportingPeriod: { startDate: "2026-08-03", endDate: "2026-09-01", provenance: "source_metadata" }, acceptedAt: "2026-06-01T00:00:00.000Z" };
     expect(buildOfficialUsageAggregateView(oldAcceptance, [], { staleAfterDays: 35, now: new Date("2026-09-02T00:00:00.000Z") }).availability).toBe("stale");
+  });
+
+  it("keeps unknown source coverage dates nullable instead of inventing a reporting period", () => {
+    const source = published();
+    source.activeSet = {
+      ...source.activeSet!,
+      reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
+      acceptedAt: "2026-09-12T00:00:00.000Z",
+    };
+    for (const report of Object.values(source.reports)) {
+      if (report) report.lineage.reportingPeriod = { startDate: null, endDate: null, days: null, provenance: "activity_range" };
+    }
+
+    const result = buildOfficialUsageAggregateView(source, [], {
+      staleAfterDays: 35,
+      now: new Date("2026-09-12T12:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({ availability: "active", periodAgeDays: null, acceptedAgeDays: 0 });
+    expect(result.lineages.every(item => item.reportingPeriod.startDate === null && item.reportingPeriod.endDate === null)).toBe(true);
   });
 
   it("filters the complete dataset before paging", () => {
     const result = buildOfficialUsageUserView(published(), { staleAfterDays: 35, search: "pseudonym b", limit: 1 });
     expect(result.users).toMatchObject({ count: 1, value: [expect.objectContaining({ username: "casesensitiveuser" })] });
+  });
+
+  it("sorts all agent rows before paging and retains undated rows until a date filter is selected", () => {
+    const source = published();
+    source.reports.agents!.rows.push({
+      agentId: "undated",
+      agentName: "Undated",
+      creatorType: "Agent built by Microsoft",
+      activeUsersLicensed: 0,
+      activeUsersUnlicensed: 0,
+      responsesSentToUsers: 50,
+    });
+    const sorted = buildOfficialUsageAggregateView(source, [], {
+      staleAfterDays: 35,
+      agentSortBy: "responses",
+      sortDirection: "desc",
+      limit: 1,
+      offset: 1,
+    });
+    expect(sorted.agents.count).toBe(4);
+    expect(sorted.agents.value[0]).toMatchObject({ agentId: "usage-a", responsesSentToUsers: 9 });
+
+    const dated = buildOfficialUsageAggregateView(source, [], {
+      staleAfterDays: 35,
+      startDate: "2026-01-01",
+      limit: 100,
+    });
+    expect(dated.agents.value.map(agent => agent.agentId)).not.toContain("undated");
+  });
+
+  it("uses inclusive UTC civil date filters while the default retains unknown dates", () => {
+    const source = published();
+    source.reports.users!.rows.push({
+      username: "unknown-date",
+      displayName: "Unknown date",
+      numberOfAgentsUsed: 0,
+      agentResponsesReceived: 0,
+    });
+
+    const unfiltered = buildOfficialUsageUserView(source, { staleAfterDays: 35, limit: 100 });
+    expect(unfiltered.users.value.map(user => user.username)).toContain("unknown-date");
+    expect(unfiltered.cohorts).toMatchObject({ zeroResponses: 1, lowResponses: 1, reviewCandidates: 2, missingBridgeRows: 1, threshold: 5 });
+
+    const filtered = buildOfficialUsageUserView(source, {
+      staleAfterDays: 35,
+      startDate: "2026-07-05",
+      endDate: "2026-07-05",
+      limit: 100,
+    });
+    expect(filtered.users.value.map(user => user.username)).toEqual(["casesensitiveuser"]);
+    expect(filtered.filters).toMatchObject({ startDate: "2026-07-05", endDate: "2026-07-05" });
+  });
+
+  it("applies cohort boundaries and sorts the full result before paging", () => {
+    const source = published();
+    source.reports.users!.rows.push(
+      { username: "zero", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+      { username: "boundary", displayName: "Boundary", numberOfAgentsUsed: 1, agentResponsesReceived: 4, lastActivityDateUtc: "2026-07-01T00:00:00.000Z" },
+      { username: "above", displayName: "Above", numberOfAgentsUsed: 1, agentResponsesReceived: 5, lastActivityDateUtc: "2026-07-01T00:00:00.000Z" },
+    );
+    const result = buildOfficialUsageUserView(source, {
+      staleAfterDays: 35,
+      lowResponseThreshold: 4,
+      cohort: "review",
+      userSortBy: "responses",
+      sortDirection: "desc",
+      limit: 1,
+    });
+
+    expect(result.cohorts).toMatchObject({ zeroResponses: 1, lowResponses: 2, reviewCandidates: 3, threshold: 4 });
+    expect(result.users.count).toBe(3);
+    expect(result.users.value[0]).toMatchObject({ reportedResponsesReceived: 4, reviewCohort: "low_responses" });
+    expect(result.users.value.map(user => user.username)).not.toContain("above");
+  });
+
+  it("anchors user inactivity to the latest observed Users date rather than today's clock", () => {
+    const result = buildOfficialUsageUserView(published(), {
+      staleAfterDays: 35,
+      activity: "recent",
+      inactiveDays: 1,
+      now: new Date("2036-01-01T00:00:00.000Z"),
+      limit: 100,
+    });
+
+    expect(result.recencyAnchorDateUtc).toBe("2026-07-06T00:00:00.000Z");
+    expect(result.users.value.map(user => user.username)).toEqual(expect.arrayContaining(["CaseSensitiveUser", "casesensitiveuser"]));
   });
 
   it("ignores old additive scalars and reports unknown per-agent totals without the identity bridge", () => {

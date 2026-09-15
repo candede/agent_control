@@ -65,21 +65,25 @@ function purviewCapabilityKey(views: ReturnType<typeof useCapabilityContext>["vi
 
 export function PurviewAuditView({
   initialJobId,
+  initialUserPrincipalName,
   onSelectedJobChange,
 }: {
   initialJobId?: string;
+  initialUserPrincipalName?: string;
   onSelectedJobChange?: (jobId: string | undefined) => void;
 } = {}) {
   const capability = useCapabilityContext();
   const accountKey = `${capability.user?.tenantId ?? ""}:${capability.user?.homeAccountId ?? ""}`;
-  return <PurviewAuditSession key={`${accountKey}:${purviewCapabilityKey(capability.views)}`} initialJobId={initialJobId} onSelectedJobChange={onSelectedJobChange} />;
+  return <PurviewAuditSession key={`${accountKey}:${purviewCapabilityKey(capability.views)}:${initialUserPrincipalName ?? ""}`} initialJobId={initialJobId} initialUserPrincipalName={initialUserPrincipalName} onSelectedJobChange={onSelectedJobChange} />;
 }
 
 function PurviewAuditSession({
   initialJobId,
+  initialUserPrincipalName,
   onSelectedJobChange,
 }: {
   initialJobId?: string;
+  initialUserPrincipalName?: string;
   onSelectedJobChange?: (jobId: string | undefined) => void;
 }) {
   const capability = useCapabilityContext();
@@ -102,7 +106,7 @@ function PurviewAuditSession({
   const [endDateTime, setEndDateTime] = useState(() =>
     localDateTime(new Date()),
   );
-  const [userPrincipalNames, setUserPrincipalNames] = useState("");
+  const [userPrincipalNames, setUserPrincipalNames] = useState(initialUserPrincipalName ?? "");
   const [ipAddresses, setIpAddresses] = useState("");
   const [objectIds, setObjectIds] = useState("");
   const [administrativeUnitIds, setAdministrativeUnitIds] = useState("");
@@ -585,7 +589,7 @@ function PurviewAuditSession({
           </div>
         ) : null}
 
-        <details className="purview-structured-filters">
+        <details className="purview-structured-filters" open={initialUserPrincipalName ? true : undefined}>
           <summary>Structured identity filters</summary>
           <div>
             <StructuredFilter

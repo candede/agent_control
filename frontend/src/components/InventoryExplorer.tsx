@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Download, Eye, RefreshCw, RotateCw, X } from "lucide-react";
 import {
   downloadInventoryCsv, getInventoryQuarantineSelection, getInventoryRefreshJob, getInventoryRefreshJobs, getInventoryResources, getInventorySnapshots, getInventorySourceAwareDetail, refreshInventory, resumeInventoryRefresh,
@@ -29,6 +29,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   const [reload, setReload] = useState(0);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [submittingRefresh, setSubmittingRefresh] = useState(false);
   const [error, setError] = useState<string>();
   const [jobError, setJobError] = useState<string>();
   const [job, setJob] = useState<InventoryRefreshJob>();
@@ -53,6 +54,26 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     type: type === "all" ? undefined : type, environmentId: deferredEnvironment.trim() || undefined, search: deferredSearch.trim() || undefined,
     sortBy, sortDirection, limit: pageSize, offset: pageIndex * pageSize,
   }), [deferredEnvironment, deferredSearch, pageIndex, snapshotId, sortBy, sortDirection, type]);
+
+  const selectSnapshot = useCallback((id: string) => {
+    setSnapshotId(id);
+    setPageIndex(0);
+    setPage(undefined);
+    setLoading(true);
+    setRouteSelectedIds(new Set());
+    setQuarantineSelection(undefined);
+    setDetail(undefined);
+    setRouteDetailId(undefined);
+    setRouteDetailType(undefined);
+    setRouteDetailEnvironmentId(undefined);
+    setRouteQuarantineJobId(undefined);
+  }, []);
+
+  const updateRefreshJob = useCallback((next: InventoryRefreshJob) => {
+    setJob(next);
+    if (next.status === "succeeded" && next.snapshotId) selectSnapshot(next.snapshotId);
+    if (next.status !== "running") setReload(value => value + 1);
+  }, [selectSnapshot]);
 
   useEffect(() => {
     active.current = true;
@@ -191,17 +212,18 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
       try {
         const next = await getInventoryRefreshJob(pollingJobId, { signal: controller.signal });
         if (controller.signal.aborted) return;
-        setJob(next);
-        if (next.status !== "running") setReload(value => value + 1);
-        else if (Date.now() < deadline) timer = window.setTimeout(() => void poll(), 1_000);
-        else setError("Inventory job polling reached its five-minute bound. Use Jobs for explicit status.");
+        updateRefreshJob(next);
+        if (next.status === "running") {
+          if (Date.now() < deadline) timer = window.setTimeout(() => void poll(), 1_000);
+          else setError("Inventory job polling reached its five-minute bound. Use Jobs for explicit status.");
+        }
       } catch (requestError) {
         if (!controller.signal.aborted) setError(errorMessage(requestError));
       }
     };
     timer = window.setTimeout(() => void poll(), 1_000);
     return () => { controller.abort(); if (timer !== undefined) window.clearTimeout(timer); };
-  }, [pollingJobId]);
+  }, [pollingJobId, updateRefreshJob]);
 
   const totalPages = Math.max(Math.ceil((page?.count ?? 0) / pageSize), 1);
   const covered = page?.typeCounts.filter(item => item.status === "covered").length ?? 0;
@@ -209,21 +231,30 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
 
   async function handleRefresh() {
     setError(undefined);
+    setJobError(undefined);
+    setSubmittingRefresh(true);
     try {
       const next = await refreshInventory({
         ...(refreshType === "all" ? {} : { types: [refreshType] }),
         ...(refreshEnvironment.trim() ? { environmentId: refreshEnvironment.trim() } : {}),
       });
       if (!active.current) return;
-      setJob(next);
+      setRouteRefreshJobId(undefined);
+      updateRefreshJob(next);
       setReload(value => value + 1);
     } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
+    finally { if (active.current) setSubmittingRefresh(false); }
   }
 
   async function handleResume() {
     if (!job) return;
     setError(undefined);
-    try { const next = await resumeInventoryRefresh(job.id); if (active.current) setJob(next); } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
+    try {
+      const next = await resumeInventoryRefresh(job.id);
+      if (!active.current) return;
+      updateRefreshJob(next);
+      setReload(value => value + 1);
+    } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
   }
 
   async function handleExport() {
@@ -267,7 +298,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
       <div className="inventory-actions">
         <button type="button" className="secondary icon-button" title="Export filtered inventory CSV" aria-label="Export filtered inventory CSV" disabled={exporting || !page?.snapshot} onClick={() => void handleExport()}><Download aria-hidden="true" /></button>
         <WorkbenchActionGate actionId="power-platform.refresh">
-          <button type="button" className="primary-link inventory-refresh" disabled={job?.status === "running"} onClick={() => void handleRefresh()}><RefreshCw aria-hidden="true" /> Refresh selected scope</button>
+          <button type="button" className="primary-link inventory-refresh" disabled={submittingRefresh || job?.status === "running"} onClick={() => void handleRefresh()}><RefreshCw aria-hidden="true" /> Refresh selected scope</button>
         </WorkbenchActionGate>
       </div>
     </div>
@@ -292,7 +323,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     </div> : null}
 
     <section className="controls inventory-controls" aria-label="Inventory filters">
-      <label><span>Saved scope</span><select value={snapshotId} onChange={event => { setSnapshotId(event.target.value); setPageIndex(0); setRouteSelectedIds(new Set()); setQuarantineSelection(undefined); setDetail(undefined); setRouteDetailId(undefined); }}><option value="">Preferred broad or latest</option>{snapshots.map(snapshot => <option key={snapshot.id} value={snapshot.id}>{scopeText(snapshot)} · {formatRelativeDate(snapshot.observedAt)}</option>)}</select></label>
+      <label><span>Saved scope</span><select value={snapshotId} onChange={event => selectSnapshot(event.target.value)}><option value="">Preferred broad or latest</option>{snapshots.map(snapshot => <option key={snapshot.id} value={snapshot.id}>{scopeText(snapshot)} · {formatRelativeDate(snapshot.observedAt)}</option>)}</select></label>
       <label className="filter-search"><span>Search</span><input type="search" value={search} placeholder="Name or native ID" onChange={event => { setSearch(event.target.value); setPageIndex(0); }} /></label>
       <label><span>Resource type</span><select value={type} onChange={event => { setType(event.target.value as typeof type); setPageIndex(0); }}><option value="all">All resource types</option>{page?.typeCounts.map(item => <option key={item.type} value={item.type}>{shortType(item.type)}</option>)}</select></label>
       <label><span>Environment ID</span><input value={environmentId} placeholder="All environments" onChange={event => { setEnvironmentId(event.target.value); setPageIndex(0); }} /></label>
@@ -425,7 +456,7 @@ type DetailKey = keyof PowerPlatformResource["details"] | "createdAt" | "created
 const commonOwnedFields: {key:DetailKey;label:string}[]=[{key:"location",label:"Location"},{key:"createdAt",label:"Created"},{key:"createdBy",label:"Created by"},{key:"ownerId",label:"Owner"},{key:"lastModifiedAt",label:"Last modified"},{key:"lastModifiedBy",label:"Last modified by"}];
 function detailFields(type: PowerPlatformResourceType): {key:DetailKey;label:string}[] {
   if(type==="microsoft.copilotstudio/agents")return [...commonOwnedFields,{key:"lastPublishedAt",label:"Last published"},{key:"isQuarantined",label:"Quarantined"},{key:"quarantinedAt",label:"Quarantined at"},{key:"isManaged",label:"Managed solution"},{key:"schemaName",label:"Schema name"},{key:"orchestration",label:"Orchestration"},{key:"model",label:"Model"},{key:"authentication",label:"Authentication"},{key:"isWebSearchEnabledForKnowledge",label:"Web search for knowledge"}];
-  if(type==="microsoft.powerplatformconnector/connectors")return [{key:"description",label:"Description"},{key:"connectorId",label:"Connector ID"},{key:"publisher",label:"Publisher"},{key:"tier",label:"Tier"},{key:"releaseTag",label:"Release tag"},{key:"isDeprecated",label:"Deprecated"}];
+  if(type==="microsoft.powerplatformconnector/connectors")return [{key:"sourceTenantId",label:"Source tenant ID"},{key:"description",label:"Description"},{key:"connectorId",label:"Connector ID"},{key:"publisher",label:"Publisher"},{key:"tier",label:"Tier"},{key:"releaseTag",label:"Release tag"},{key:"isDeprecated",label:"Deprecated"}];
   if(type==="microsoft.powerplatform/environments")return [{key:"location",label:"Location"},{key:"createdAt",label:"Created"},{key:"createdBy",label:"Created by"},{key:"lastModifiedAt",label:"Last modified"},{key:"environmentType",label:"Environment type"},{key:"isManaged",label:"Managed environment"},{key:"environmentGroup",label:"Environment group"},{key:"environmentGroupId",label:"Environment group ID"}];
   if(type==="microsoft.powerplatform/environmentgroups")return [{key:"location",label:"Location"},{key:"createdAt",label:"Created"},{key:"createdBy",label:"Created by"},{key:"lastModifiedAt",label:"Last modified"},{key:"description",label:"Description"}];
   const fields=[...commonOwnedFields,{key:"isQuarantined" as const,label:"Quarantined"}];

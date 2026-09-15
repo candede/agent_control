@@ -23,6 +23,7 @@ const quarantineSource = "https://learn.microsoft.com/en-us/microsoft-copilot-st
 const auditSource = "https://learn.microsoft.com/en-us/graph/api/security-auditcoreroot-post-auditlogqueries?view=graph-rest-1.0";
 const huntingSource = "https://learn.microsoft.com/en-us/graph/api/security-security-runhuntingquery?view=graph-rest-1.0";
 const reportsSource = "https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/activity-reports?view=o365-worldwide";
+const copilotUsageReportSource = "https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/reports/copilotreportroot-getmicrosoft365copilotusageuserdetail";
 
 const viewer: AppRole[] = ["AgentControl.Viewer"];
 const admin: AppRole[] = ["AgentControl.Admin"];
@@ -69,6 +70,13 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     permissions: ["User.ReadBasic.All", "Group.Read.All"], providerRoles: [], licenses: [], configuration: ["Delegated consent"],
     sources: [directorySource], dataClass: "directory", internalRoles: viewer, consentGroup: "graph.directory.read",
     probe: { kind: "provider_read", adapterRegistered: true, description: "Bounded directory lookup through the existing adapter." },
+  },
+  {
+    id: "graph.licenses.read", displayName: "Copilot license assignments", purpose: "Read current Microsoft 365 Copilot license assignments and user service-plan status.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
+    permissions: ["User.Read.All", "LicenseAssignment.Read.All"], providerRoles: ["Directory Readers", "Global Reader"], licenses: [], configuration: ["Delegated consent"],
+    sources: ["https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0", "https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0"], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "graph.licenses.read",
+    probe: { kind: "on_demand", adapterRegistered: true, description: "The explicit dashboard load validates the bounded license inventory request. Microsoft authorizes the delegated request when it runs." },
   },
   {
     id: "powerPlatform.inventory.read", displayName: "Power Platform inventory", purpose: "Read tenant Power Platform resource inventory on explicit request.",
@@ -118,6 +126,14 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     licenses: ["Microsoft Defender XDR and applicable Agent 365 or service licensing"], configuration: ["Admin-enabled application mode", "Admin-approved shared data scope"],
     sources: [huntingSource], dataClass: "hunting", internalRoles: viewer,
     probe: { kind: "live_qualification", adapterRegistered: true, description: "Token readiness never runs hunting KQL; explicit Admin approval remains required for the bounded application-scope qualification lifecycle." },
+  },
+  {
+    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D30 per-user Microsoft 365 Copilot app activity report on explicit dashboard load.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
+    permissions: ["Reports.Read.All"], providerRoles: ["Company Administrator", "AI Administrator", "Exchange Administrator", "SharePoint Administrator", "Lync Administrator", "Teams Service Administrator", "Teams Communications Administrator", "Reports Reader"], licenses: [],
+    configuration: ["Delegated consent", "Microsoft 365 usage report privacy settings can conceal user identities"],
+    sources: [copilotUsageReportSource], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "reports.copilotUsage.read",
+    probe: { kind: "on_demand", adapterRegistered: true, description: "The explicit dashboard load validates the bounded report request; no report is scanned by background capability checks." },
   },
   {
     id: "reports.official.import", displayName: "Official report import", purpose: "Validate and import administrator-supplied Microsoft 365 usage CSV reports.",

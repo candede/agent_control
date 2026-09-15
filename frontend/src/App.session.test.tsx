@@ -59,12 +59,12 @@ describe("App session revalidation", () => {
     vi.unstubAllGlobals();
   });
 
-  it("explains upfront delegated consent and offers an explicit identity-only sign-in", async () => {
+  it("offers one Entra sign-in with upfront delegated consent", async () => {
     const transport = appTransport({ revalidatedRoles: [], authenticated: false });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("link", { name: "Sign in with Entra ID" })).toHaveAttribute("href", "/api/auth/login");
-    expect(screen.getByRole("link", { name: "Sign in without provider setup" })).toHaveAttribute("href", "/api/auth/login?setup=defer&returnTo=%2Fpermissions");
+    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("link")).toHaveLength(1);
     expect(screen.getByText(/outstanding delegated permissions/)).toBeInTheDocument();
     expect(screen.getByText(/package changes, and Copilot Studio quarantine/)).toBeInTheDocument();
     expect(screen.getByText(/Consent does not run investigations/)).toBeInTheDocument();
@@ -76,8 +76,9 @@ describe("App session revalidation", () => {
     const transport = appTransport({ revalidatedRoles: [], authenticated: false });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("status")).toHaveTextContent("Microsoft permission setup was cancelled or denied");
-    expect(screen.getByRole("link", { name: "Sign in without provider setup" })).toBeInTheDocument();
+    expect(await screen.findByRole("status")).toHaveTextContent("Microsoft permission setup was cancelled or denied. Retry or contact your tenant administrator.");
+    expect(screen.getByRole("link", { name: "Sign in with Entra ID" })).toHaveAttribute("href", "/api/auth/login");
+    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("link")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/auth/consent"))).toBe(false);
   });
 
@@ -111,6 +112,21 @@ describe("App session revalidation", () => {
     await expect(getAgents()).rejects.toMatchObject({ status: 403 });
 
     expect(screen.getByText("Sensitive cached agent")).toBeInTheDocument();
+    expect(transport.meCalls()).toBe(1);
+  });
+
+  it("does not revalidate the current session for a provider authorization 401", async () => {
+    const transport = appTransport({ revalidatedRoles: [] });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
+
+    transport.failProtectedReadsWith = 401;
+    transport.protectedFailureCode = "interaction_required";
+    await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "interaction_required" });
+
+    expect(screen.getByText("Sensitive cached agent")).toBeInTheDocument();
+    expect(screen.queryByText("Checking sign-in...")).not.toBeInTheDocument();
     expect(transport.meCalls()).toBe(1);
   });
 
@@ -563,7 +579,7 @@ function appTransport({
   });
   const transport: {
     failProtectedReadsWith?: 401 | 403;
-    protectedFailureCode?: "forbidden" | "missing_internal_role";
+    protectedFailureCode?: "forbidden" | "interaction_required" | "missing_internal_role";
     fetchMock: ReturnType<typeof vi.fn<(input: string, init?: RequestInit) => Promise<Response>>>;
     meCalls: () => number;
     releaseRevalidation: () => void;
@@ -604,8 +620,10 @@ function appTransport({
         const status = transport.failProtectedReadsWith;
         return Response.json({
           status,
-          code: status === 401 ? "unauthorized" : transport.protectedFailureCode ?? "forbidden",
-          detail: status === 401 ? "The current session has expired." : "The provider permission is insufficient.",
+          code: transport.protectedFailureCode ?? (status === 401 ? "unauthorized" : "forbidden"),
+          detail: transport.protectedFailureCode === "interaction_required"
+            ? "Microsoft authorization is required for this capability."
+            : status === 401 ? "The current session has expired." : "The provider permission is insufficient.",
         }, { status });
       }
       return Response.json(packagePage);

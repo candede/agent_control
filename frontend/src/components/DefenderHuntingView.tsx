@@ -336,7 +336,7 @@ function DefenderHuntingSession() {
         <div><p className="eyebrow">Microsoft Graph v1.0 / Defender advanced hunting</p><h2>Defender and Agent 365 hunting</h2>
           <p>Curated investigation metadata, separate from Purview audit and official usage.</p></div>
         <div className="hunting-heading-actions">
-          <a className="secondary link-button" href={catalog?.defenderPortalUrl ?? "https://security.microsoft.com/v2/advanced-hunting"} target="_blank" rel="noreferrer">Defender portal <ExternalLink aria-hidden="true" /></a>
+          <a className="primary-link secondary" href={catalog?.defenderPortalUrl ?? "https://security.microsoft.com/v2/advanced-hunting"} target="_blank" rel="noreferrer">Defender portal <ExternalLink aria-hidden="true" /></a>
           <button type="button" className="secondary icon-button control-icon-button" aria-label="Refresh hunting history" title="Refresh hunting history" disabled={Boolean(busy)} onClick={() => void perform("refresh", (requestGeneration, requestAction) => Promise.all([loadHistory(historyOffset, requestGeneration, requestAction), loadCatalog(requestGeneration, requestAction)]).then(() => undefined))}><RefreshCw aria-hidden="true" /></button>
         </div>
       </header>

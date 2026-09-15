@@ -78,6 +78,7 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
         <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} />
       ) : <PurviewAuditView
         initialJobId={route.jobId}
+        initialUserPrincipalName={route.userPrincipalName}
         onSelectedJobChange={jobId => commitRoute({ ...route, source: "purview", jobId }, true)}
       />}
     </section>

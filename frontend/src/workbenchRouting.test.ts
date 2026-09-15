@@ -141,4 +141,12 @@ describe("workbench routing", () => {
     const officialUsage = parseOfficialUsageRoute("staging=stage-old&window=90");
     expect(parseOfficialUsageRoute(officialUsageRouteSearch(officialUsage).toString())).toEqual(officialUsage);
   });
+
+  it("carries an exact employee identity into an explicit Purview search", () => {
+    const route = parseAuditRoute("source=purview&user=employee%2Btest%40example.invalid");
+    expect(route.userPrincipalName).toBe("employee+test@example.invalid");
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
+    expect(auditRouteSearch({ ...route, source: "local" }).has("user")).toBe(false);
+    expect(parseAuditRoute(`source=purview&user=${"a".repeat(500)}`).userPrincipalName).toBeUndefined();
+  });
 });

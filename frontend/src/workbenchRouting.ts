@@ -56,6 +56,7 @@ export type AuditRouteState = {
   status: string;
   page: number;
   jobId?: string;
+  userPrincipalName?: string;
 };
 
 export type SecurityRouteState = {
@@ -227,6 +228,7 @@ export function parseAuditRoute(search: string): AuditRouteState {
     status: status && localAuditStatuses.has(status) ? status : "all",
     page: boundedPage(params.get("page")),
     jobId,
+    userPrincipalName: bounded(params.get("user"), 320),
   };
 }
 
@@ -238,6 +240,7 @@ export function auditRouteSearch(state: AuditRouteState) {
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
   if (state.page > 0) params.set("page", String(state.page + 1));
   if (state.jobId && validSelectedId(state.jobId)) params.set("job", state.jobId);
+  if (state.source === "purview" && state.userPrincipalName) params.set("user", state.userPrincipalName.slice(0, 320));
   return params;
 }
 

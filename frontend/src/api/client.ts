@@ -1,6 +1,7 @@
 import type { AppRole, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventoryResourcePage, InventorySnapshot, InventorySnapshotList, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
-import type { OfficialUsageAggregateView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+import type { OfficialUsageAggregateView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
@@ -10,6 +11,7 @@ export type { AppRole, CapabilityId, CapabilityStatus, CapabilityView } from "..
 export type { InventoryRefreshJob, InventoryResourcePage, InventorySnapshot, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export type { InventoryRefreshJobList, InventorySnapshotList } from "../../../backend/src/types/powerPlatformInventory";
 export type { OfficialUsageAggregateView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+export type { CopilotAppActivity, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus, QuarantineTargetCandidate, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
@@ -37,7 +39,7 @@ export type OfficialUsageStagingPreview = {
   schemaVersion: string;
   bundleId: string;
   correctionOfSetId: string | null;
-  reportingPeriod: { startDate: string; endDate: string; provenance: "source_metadata" | "operator_asserted" };
+  reportingPeriod: Pick<OfficialUsageReportBase["reportingPeriod"], "startDate" | "endDate" | "provenance">;
   sourceAsOf: string | null;
   sourceAsOfProvenance: "source_metadata" | "operator_asserted" | "absent";
   sourceFreshness: "known" | "unknown";
@@ -79,7 +81,7 @@ export type OfficialUsageBundlePreview = {
     kind: OfficialUsageReportKind;
     versionId: string;
     fileHash: string;
-    reportingPeriod: { startDate: string; endDate: string; provenance: "source_metadata" | "operator_asserted" };
+    reportingPeriod: Pick<OfficialUsageReportBase["reportingPeriod"], "startDate" | "endDate" | "provenance">;
     sourceAsOf: string | null;
     sourceAsOfProvenance: "source_metadata" | "operator_asserted" | "absent";
   }>;
@@ -474,7 +476,7 @@ export class ApiError extends Error {
   }
 
   get authenticationExpired() {
-    return this.status === 401 || ["interaction_required", "authorization_expired", "unauthorized"].includes(this.code);
+    return this.status === 401 && ["unauthorized", "session_invalidated"].includes(this.code);
   }
 }
 
@@ -693,15 +695,16 @@ export function getOfficialUsageAdminState(options: { signal?: AbortSignal } = {
 export function stageOfficialUsageReport(file: File, input: {
   bundleId: string;
   correctionOfSetId?: string;
-  reportingStart: string;
-  reportingEnd: string;
-  periodProvenance: "source_metadata" | "operator_asserted";
+  reportingStart?: string;
+  reportingEnd?: string;
+  periodProvenance?: "source_metadata" | "operator_asserted";
   sourceAsOf?: string;
   sourceAsOfProvenance?: "source_metadata" | "operator_asserted";
+  downloadedAt?: string;
 }) {
   const form = new FormData();
   form.append("file", file);
-  for (const [key, value] of Object.entries({ ...input, downloadedAt: new Date().toISOString() })) {
+  for (const [key, value] of Object.entries(input)) {
     if (value !== undefined) form.append(key, value);
   }
   return request<OfficialUsageStagingPreview>("/api/official-usage/staging", { method: "POST", body: form });
@@ -741,7 +744,18 @@ export function acknowledgeLegacyUsageCleanup(disposition: "reimported" | "disca
 }
 
 export function getOfficialUsageAggregate(
-  query: { inactiveDays?: number; activityWindowDays?: number; limit?: number; offset?: number } = {},
+  query: {
+    inactiveDays?: number;
+    activityWindowDays?: number;
+    search?: string;
+    creatorType?: string;
+    startDate?: string;
+    endDate?: string;
+    sortBy?: "agentName" | "responses" | "licensedUsers" | "unlicensedUsers" | "lastActivity";
+    sortDirection?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+  } = {},
   options: { signal?: AbortSignal } = {},
 ) {
   const params = new URLSearchParams();
@@ -755,6 +769,12 @@ export type OfficialUsageUserQuery = {
   activity?: "all" | "recent" | "inactive" | "no-activity";
   responsesOnly?: boolean;
   inactiveDays?: number;
+  startDate?: string;
+  endDate?: string;
+  lowResponseThreshold?: number;
+  cohort?: "all" | "zero" | "low" | "review";
+  sortBy?: "displayName" | "responses" | "agentsUsed" | "lastActivity";
+  sortDirection?: "asc" | "desc";
   limit?: number;
   offset?: number;
 };
@@ -763,6 +783,10 @@ export function getOfficialUsageUsers(query: OfficialUsageUserQuery = {}, option
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
   return request<OfficialUsageUserView>(`/api/official-usage/users${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
+
+export function getCopilotUsageUsers(options: { signal?: AbortSignal } = {}) {
+  return request<CopilotUsageUsersResponse>("/api/copilot-usage/users", { signal: options.signal });
 }
 
 export type PurviewAuditCatalog = {
@@ -890,8 +914,10 @@ export async function downloadDefenderHuntingCsv(id: string) {
   return response.blob();
 }
 
-export async function downloadOfficialUsageCsv(kind: "aggregate" | "users") {
-  const response = await fetch(`/api/official-usage/${kind}.csv`, { credentials: "include", headers: { Accept: "text/csv" } });
+export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  const response = await fetch(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { credentials: "include", headers: { Accept: "text/csv" } });
   if (!response.ok) throw await toApiError(response);
   return response.blob();
 }
@@ -1172,10 +1198,10 @@ async function toApiError(response: Response) {
       `Request failed with status ${response.status}.`,
     );
   }
-  const sessionRevalidationRequired = error.status === 401
+  const sessionRevalidationRequired = error.authenticationExpired
     || (error.status === 403 && error.code === "missing_internal_role");
   if (sessionRevalidationRequired) {
-    if (error.status === 401) csrfToken = undefined;
+    if (error.authenticationExpired) csrfToken = undefined;
     for (const listener of sessionRevalidationListeners) {
       try {
         listener(error);

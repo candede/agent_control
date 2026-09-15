@@ -211,13 +211,14 @@ function approvedQualification(
 
 describe("PurviewAuditView", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     window.history.replaceState({}, "", "/audit?source=purview");
     vi.mocked(getPurviewAuditCatalog).mockResolvedValue(catalog);
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     delete (URL as Partial<typeof URL>).createObjectURL;
   });
@@ -236,6 +237,20 @@ describe("PurviewAuditView", () => {
     expect(getPurviewAuditJobs).toHaveBeenCalledExactlyOnceWith(20, 0);
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     expect(approvePurviewAuditQualification).not.toHaveBeenCalled();
+    expect(startPurviewAuditQualification).not.toHaveBeenCalled();
+  });
+
+  it("prefills an employee interaction log without starting an investigation", async () => {
+    render(
+      <CapabilityContext value={context(viewer, true)}>
+        <PurviewAuditView initialUserPrincipalName="employee@example.invalid" />
+      </CapabilityContext>,
+    );
+    const identity = await screen.findByRole("textbox", { name: "User principal names" });
+    expect(identity).toBeVisible();
+    expect(identity).toHaveValue("employee@example.invalid");
+    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
+    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     expect(startPurviewAuditQualification).not.toHaveBeenCalled();
   });
 
@@ -665,6 +680,7 @@ describe("PurviewAuditView", () => {
   });
 
   it("ignores an active-job poll that resolves after the account changes", async () => {
+    vi.useFakeTimers();
     let resolveStalePoll!: (value: Awaited<ReturnType<typeof getPurviewAuditJobs>>) => void;
     const runningJob: PurviewAuditJob = {
       ...partialJob,
@@ -677,7 +693,6 @@ describe("PurviewAuditView", () => {
       homeAccountId: "reader-b",
       username: "reader-b@example.invalid",
     };
-    const timeout = vi.spyOn(window, "setTimeout");
     vi.mocked(getPurviewAuditJobs)
       .mockResolvedValueOnce({ value: [runningJob], count: 1, limit: 20, offset: 0 })
       .mockReturnValueOnce(new Promise((resolve) => { resolveStalePoll = resolve; }))
@@ -687,23 +702,25 @@ describe("PurviewAuditView", () => {
         <PurviewAuditView />
       </CapabilityContext>,
     );
-    await screen.findByRole("button", { name: /Cancel local polling 11111111/ });
-    const poll = timeout.mock.calls.find(([, milliseconds]) => milliseconds === 2_000)?.[0];
-    expect(poll).toBeTypeOf("function");
-    act(() => (poll as () => void)());
-    await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: /Cancel local polling 11111111/ })).toBeVisible();
+    await act(() => vi.advanceTimersByTimeAsync(2_000));
+    expect(getPurviewAuditJobs).toHaveBeenCalledTimes(2);
 
     view.rerender(
       <CapabilityContext value={context(currentUser, true)}>
         <PurviewAuditView />
       </CapabilityContext>,
     );
-    await waitFor(() => expect(getPurviewAuditJobs).toHaveBeenCalledTimes(3));
+    await act(async () => {});
+    expect(getPurviewAuditJobs).toHaveBeenCalledTimes(3);
     await act(async () => {
       resolveStalePoll({ value: [runningJob], count: 1, limit: 20, offset: 0 });
     });
 
     expect(screen.queryByRole("button", { name: /Cancel local polling 11111111/ })).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(getPurviewAuditJobs).toHaveBeenCalledTimes(3);
   });
 
   it("clears selected results when refreshed history no longer contains the job", async () => {

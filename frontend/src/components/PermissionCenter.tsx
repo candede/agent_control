@@ -25,9 +25,11 @@ export function CapabilityHealth() {
       || (view.definition.mode === "application" && view.decision.status === "not_configured")) counts.degraded++;
     else counts.blocked++;
   }
-  return <button className="capability-health secondary" type="button" onClick={openPermissions}>
+  const description = loading || pending ? "Checking permissions" : error ? "Permission status unavailable" : `${counts.provider} provider-verified / ${counts.local} local / ${counts.ready} ready to try / ${counts.degraded} degraded / ${counts.blocked} blocked`;
+  const attentionCount = counts.degraded + counts.blocked;
+  return <button className="capability-health secondary" type="button" onClick={openPermissions} aria-label={description} title={description}>
     <ShieldCheck size={18} aria-hidden="true" />
-    {loading || pending ? "Checking permissions" : error ? "Permission status unavailable" : `${counts.provider} provider-verified / ${counts.local} local / ${counts.ready} ready to try / ${counts.degraded} degraded / ${counts.blocked} blocked`}
+    {loading || pending ? "Checking permissions" : error ? "Check permissions" : attentionCount ? `Permissions: ${attentionCount} need attention` : "Permissions"}
   </button>;
 }
 

@@ -1,5 +1,11 @@
 import { AppError } from "../errors.js";
 
+export class ProviderResponseLimitError extends AppError {
+  constructor(readonly maximumBytes: number, readonly observedBytes: number) {
+    super(502, "provider_result_limit", "Provider response exceeded the byte limit.");
+  }
+}
+
 export async function boundedProviderText(response: Response, maximumBytes = 2_000_000, signal?: AbortSignal) {
   if (!response.body) throw new AppError(502, "provider_schema", "Provider response was empty.");
   const reader = response.body.getReader();
@@ -23,7 +29,7 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
       length += chunk.value.byteLength;
       if (length > maximumBytes) {
         await reader.cancel();
-        throw new AppError(502, "provider_result_limit", "Provider response exceeded the byte limit.");
+        throw new ProviderResponseLimitError(maximumBytes, length);
       }
       chunks.push(chunk.value);
     }
@@ -34,8 +40,8 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
-  const text = await boundedProviderText(response, undefined, signal);
+export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal, maximumBytes?: number): Promise<T> {
+  const text = await boundedProviderText(response, maximumBytes, signal);
   try { return JSON.parse(text) as T; }
   catch { throw new AppError(502, "provider_schema", "Provider response was not valid JSON."); }
 }

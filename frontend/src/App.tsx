@@ -51,6 +51,7 @@ import {
   type PackageListQuery,
   type PackageRefreshJob,
   type OfficialUsageAggregateView,
+  type OfficialUsageUserQuery,
   type OfficialUsageUserView,
   type SessionUser,
 } from "./api/client";
@@ -72,10 +73,10 @@ import { AgentTable } from "./components/AgentTable";
 import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
-import { UserAccessView } from "./components/UserAccessView";
+import { CopilotUsersView } from "./components/CopilotUsersView";
 import { InventoryExplorer } from "./components/InventoryExplorer";
 import { CopilotStudioQuarantineTargetPicker } from "./components/CopilotStudioQuarantineTargetPicker";
-import { OfficialUsageImportPanel } from "./components/OfficialUsageImportPanel";
+import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
 import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
 import { hasLegacyUsageStorage } from "./legacyUsageStorage";
@@ -121,7 +122,7 @@ function LinkedAgentJobStatus({
     <>
       {error ? <div className="error-banner" role="alert">{error}</div> : null}
       {refreshJob ? (
-        <section className="controls" aria-label="Selected package refresh job">
+        <section className="job-status-panel" aria-label="Selected package refresh job">
           <strong>Package refresh · {refreshJob.status.replaceAll("_", " ")}</strong>
           <span>{refreshJob.observedCount}{refreshJob.totalRecords === null ? "" : ` of ${refreshJob.totalRecords}`} packages observed</span>
           <code>{refreshJob.id}</code>
@@ -129,7 +130,7 @@ function LinkedAgentJobStatus({
         </section>
       ) : null}
       {controlJob ? (
-        <section className="controls" aria-label="Selected package control job">
+        <section className="job-status-panel" aria-label="Selected package control job">
           <strong>Package {controlJob.action} · {controlJob.status.replaceAll("_", " ")}</strong>
           <span>{controlJob.completed} of {controlJob.total} exact targets complete</span>
           <code>{controlJob.id}</code>
@@ -207,13 +208,18 @@ function App() {
     useState<OfficialUsageAggregateView>();
   const [officialUsageUsers, setOfficialUsageUsers] =
     useState<OfficialUsageUserView>();
-  const [officialUsageUserOffset, setOfficialUsageUserOffset] = useState(0);
-  const [officialUsageUserQuery, setOfficialUsageUserQuery] = useState<{
+  const [officialUsageAgentOffset, setOfficialUsageAgentOffset] = useState(0);
+  const [officialUsageAgentQuery, setOfficialUsageAgentQuery] = useState<{
     search?: string;
     creatorType?: string;
-    activity?: "all" | "recent" | "inactive" | "no-activity";
-    responsesOnly?: boolean;
+    startDate?: string;
+    endDate?: string;
+    sortBy?: "agentName" | "responses" | "licensedUsers" | "unlicensedUsers" | "lastActivity";
+    sortDirection?: "asc" | "desc";
   }>({});
+  const [officialUsageUserOffset, setOfficialUsageUserOffset] = useState(0);
+  const [officialUsageUserQuery, setOfficialUsageUserQuery] = useState<OfficialUsageUserQuery>({});
+  const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
   const inactiveDays = 30;
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(initialOfficialUsageRoute.activityWindowDays);
   const [requestedOfficialUsageStagingId, setRequestedOfficialUsageStagingId] = useState(initialOfficialUsageRoute.stagingId);
@@ -311,7 +317,7 @@ function App() {
     getWorkbenchMetadata({ signal: controller.signal })
       .then(value => setLoadedWorkbenchMetadata({ principalKey, value }))
       .catch((requestError) => {
-        if (!(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+        if (!controller.signal.aborted && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
           setError(errorMessage(requestError));
         }
       });
@@ -569,7 +575,7 @@ function App() {
     if (user) {
       loadSavedOfficialUsage();
     }
-  }, [inactiveDays, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
+  }, [inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
 
   useEffect(
     () => {
@@ -683,6 +689,16 @@ function App() {
       window.history.pushState({ view: "official-usage" }, "", next);
     }
     setReportActivityWindowDays(activityWindowDays);
+  }
+
+  function handleOfficialUsageChanged() {
+    setOfficialUsageAggregate(undefined);
+    setOfficialUsageUsers(undefined);
+    setOfficialUsageAgentOffset(0);
+    setOfficialUsageAgentQuery({});
+    setOfficialUsageUserOffset(0);
+    setOfficialUsageUserQuery({});
+    setOfficialUsageDashboardRevision(revision => revision + 1);
   }
 
   const displayedAgents = agents;
@@ -835,8 +851,11 @@ function App() {
     const [aggregateResult, usersResult] = await Promise.allSettled([
       hasRole(user, "AgentControl.Viewer")
         ? getOfficialUsageAggregate({
+            ...officialUsageAgentQuery,
             activityWindowDays: reportActivityWindowDays,
             inactiveDays,
+            limit: 100,
+            offset: officialUsageAgentOffset,
         }, { signal: controller.signal })
         : Promise.resolve(undefined),
       hasRole(user, "AgentControl.Viewer")
@@ -1501,7 +1520,7 @@ function App() {
   if (!user) {
     const authorizationOutcome = new URLSearchParams(window.location.search).get("authorization");
     const authorizationNotice = authorizationOutcome === "cancelled"
-      ? "Microsoft permission setup was cancelled or denied. You can retry, or sign in without provider setup and complete it later in Permissions."
+      ? "Microsoft permission setup was cancelled or denied. Retry or contact your tenant administrator."
       : authorizationOutcome === "interaction_required"
         ? "Microsoft requires additional sign-in, consent, or Conditional Access steps. Complete those steps or contact your tenant administrator."
         : authorizationOutcome === "failed"
@@ -1521,15 +1540,9 @@ function App() {
           {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
           {error ? <div className="error-banner">{error}</div> : null}
           {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
-          <div className="signin-actions">
-            <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
-              Sign in with Entra ID
-            </a>
-            <a aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login?setup=defer&returnTo=%2Fpermissions"}>
-              Sign in without provider setup
-            </a>
-            <span>Use deferred setup when an administrator must approve permissions or you only need locally saved data.</span>
-          </div>
+          <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
+            Sign in with Entra ID
+          </a>
         </section>
         <AppFooter />
       </main>
@@ -1648,7 +1661,7 @@ function App() {
         ) : (
         <>
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
-          <section className="summary-grid" aria-label="Agent summary">
+          <section className="summary-grid agent-summary-grid" aria-label="Agent summary">
             <Metric
               label="Total"
               value={agentPage?.summary.total ?? 0}
@@ -1700,7 +1713,7 @@ function App() {
             </div>
           ) : null}
           {canOperate && trackedJob && (isJobPolling(trackedJob.status) || trackedJob.canResume || trackedJob.status === "partial" || trackedJob.status === "waiting_authorization") ? (
-            <section className="controls" aria-label="Job controls">
+            <section className="job-status-panel" aria-label="Job controls">
               <span role="status">{jobStatusMessage(trackedJob.status) ?? "Job running"}</span>
               {trackedJob.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
               {trackedJob.canResume ? <WorkbenchActionGate actionId="packages.resume"><button type="button" onClick={() => void handleResumeJob()}><Play size={16} aria-hidden="true" /> Resume unsent items</button></WorkbenchActionGate> : null}
@@ -1901,6 +1914,14 @@ function App() {
                 >
                   <ExportIcon />
                 </button></WorkbenchActionGate>
+                <button
+                  type="button"
+                  className="secondary clear-filters-button"
+                  disabled={!hasActiveAgentFilters}
+                  onClick={handleClearAgentFilters}
+                >
+                  Clear filters
+                </button>
               </div>
               <span className="last-refresh" aria-live="polite">
                 {lastAgentListRefreshAt
@@ -1911,14 +1932,6 @@ function App() {
                     : "No saved package observation. An initial read-only load starts here when authorized; Refresh agents retries it."}
               </span>
             </div>
-            <button
-              type="button"
-              className="secondary clear-filters-button catalog-clear-filters-button"
-              disabled={!hasActiveAgentFilters}
-              onClick={handleClearAgentFilters}
-            >
-              Clear filters
-            </button>
           </section>
 
           {loadingBulkRefSearch ? (
@@ -1965,22 +1978,32 @@ function App() {
           ? <InventoryExplorer key={principalKey} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
           : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
       ) : visibleActiveView === "users" ? (
-        <UserAccessView
-          data={officialUsageUsers}
-          onPageChange={setOfficialUsageUserOffset}
-          onQueryChange={(query) => {
-            setOfficialUsageUserOffset(0);
-            setOfficialUsageUserQuery(query);
-          }}
-        />
+        <CopilotUsersView key={`${principalKey}:${officialUsageDashboardRevision}`} />
       ) : visibleActiveView === "official-usage" ? (
         <section className="official-usage-workbench" aria-label="Official usage">
-          {canImportReports ? <OfficialUsageImportPanel key={principalKey} initialStagingId={requestedOfficialUsageStagingId} onChanged={() => void loadOfficialUsage()} onLegacyCleared={() => setLegacyUsagePresent(false)} /> : null}
+          <header className="usage-page-header">
+            <div>
+              <h2>Official usage</h2>
+              <p>Microsoft 365 Copilot Agents activity</p>
+            </div>
+            {canImportReports ? <OfficialUsageImportModal key={`${principalKey}:${requestedOfficialUsageStagingId ?? ""}`} initialStagingId={requestedOfficialUsageStagingId} onChanged={handleOfficialUsageChanged} onLegacyCleared={() => setLegacyUsagePresent(false)} /> : null}
+          </header>
           {hasRole(user, "AgentControl.Viewer") ? <ReportingView
+            key={`${principalKey}:${officialUsageDashboardRevision}`}
             activityWindowDays={reportActivityWindowDays}
             data={officialUsageAggregate}
             inactiveDays={inactiveDays}
             onActivityWindowDaysChange={handleReportActivityWindowChange}
+            onAgentPageChange={setOfficialUsageAgentOffset}
+            onAgentQueryChange={(query) => {
+              setOfficialUsageAgentOffset(0);
+              setOfficialUsageAgentQuery(query);
+            }}
+            onUserPageChange={setOfficialUsageUserOffset}
+            onUserQueryChange={(query) => {
+              setOfficialUsageUserOffset(0);
+              setOfficialUsageUserQuery(query);
+            }}
             userData={canReadSensitiveUsage ? officialUsageUsers : undefined}
           /> : null}
         </section>

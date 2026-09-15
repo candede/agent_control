@@ -1618,6 +1618,67 @@ ALTER TABLE power_platform_refresh_jobs ADD CONSTRAINT power_platform_refresh_jo
 ALTER TABLE package_refresh_jobs DROP CONSTRAINT package_refresh_jobs_status_check;
 ALTER TABLE package_refresh_jobs ADD CONSTRAINT package_refresh_jobs_status_check CHECK (status IN ('waiting_authorization','running','succeeded','failed','cancelled'));
 ` },
+  { version: 28, sql: `
+ALTER TABLE official_usage_staging DROP CONSTRAINT official_usage_staging_period_provenance_check;
+ALTER TABLE official_usage_staging ADD CONSTRAINT official_usage_staging_period_provenance_check
+  CHECK (period_provenance IN ('source_metadata','operator_asserted','activity_range'));
+ALTER TABLE official_usage_staging ALTER COLUMN reporting_start DROP NOT NULL;
+ALTER TABLE official_usage_staging ALTER COLUMN reporting_end DROP NOT NULL;
+ALTER TABLE official_usage_staging ADD CONSTRAINT official_usage_staging_reporting_range_check
+  CHECK ((reporting_start IS NULL AND reporting_end IS NULL)
+    OR (reporting_start IS NOT NULL AND reporting_end IS NOT NULL AND reporting_start<=reporting_end));
+
+ALTER TABLE official_usage_versions DROP CONSTRAINT official_usage_versions_period_provenance_check;
+ALTER TABLE official_usage_versions ADD CONSTRAINT official_usage_versions_period_provenance_check
+  CHECK (period_provenance IN ('source_metadata','operator_asserted','activity_range'));
+ALTER TABLE official_usage_versions ALTER COLUMN reporting_start DROP NOT NULL;
+ALTER TABLE official_usage_versions ALTER COLUMN reporting_end DROP NOT NULL;
+ALTER TABLE official_usage_versions ADD CONSTRAINT official_usage_versions_reporting_range_check
+  CHECK ((reporting_start IS NULL AND reporting_end IS NULL)
+    OR (reporting_start IS NOT NULL AND reporting_end IS NOT NULL AND reporting_start<=reporting_end));
+
+ALTER TABLE official_usage_sets ALTER COLUMN reporting_start DROP NOT NULL;
+ALTER TABLE official_usage_sets ALTER COLUMN reporting_end DROP NOT NULL;
+ALTER TABLE official_usage_sets ADD COLUMN period_provenance text;
+UPDATE official_usage_sets report_set SET period_provenance=COALESCE(
+  (SELECT version.period_provenance FROM official_usage_set_versions membership
+    JOIN official_usage_versions version ON version.id=membership.version_id
+    WHERE membership.set_id=report_set.id ORDER BY membership.kind LIMIT 1),
+  'operator_asserted');
+ALTER TABLE official_usage_sets ALTER COLUMN period_provenance SET NOT NULL;
+ALTER TABLE official_usage_sets ADD CONSTRAINT official_usage_sets_period_provenance_check
+  CHECK (period_provenance IN ('source_metadata','operator_asserted','activity_range'));
+ALTER TABLE official_usage_sets ADD CONSTRAINT official_usage_sets_reporting_range_check
+  CHECK ((reporting_start IS NULL AND reporting_end IS NULL)
+    OR (reporting_start IS NOT NULL AND reporting_end IS NOT NULL AND reporting_start<=reporting_end));
+
+CREATE OR REPLACE FUNCTION protect_official_usage_set() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_user<>'agentcontrol_app' THEN RETURN NEW; END IF;
+  IF (NEW.id,NEW.tenant_id,NEW.bundle_id,NEW.actor_principal_id,NEW.period_provenance,
+      NEW.supersedes_set_id,NEW.created_at,NEW.expires_at)
+    IS DISTINCT FROM
+     (OLD.id,OLD.tenant_id,OLD.bundle_id,OLD.actor_principal_id,OLD.period_provenance,
+      OLD.supersedes_set_id,OLD.created_at,OLD.expires_at)
+  THEN RAISE EXCEPTION 'official usage set identity is immutable'; END IF;
+  IF OLD.complete AND (NEW.reporting_start,NEW.reporting_end)
+    IS DISTINCT FROM (OLD.reporting_start,OLD.reporting_end)
+  THEN RAISE EXCEPTION 'official usage complete set coverage is immutable'; END IF;
+  IF NOT OLD.complete AND (
+    (OLD.reporting_start IS NOT NULL AND (NEW.reporting_start IS NULL OR NEW.reporting_start>OLD.reporting_start))
+    OR (OLD.reporting_end IS NOT NULL AND (NEW.reporting_end IS NULL OR NEW.reporting_end<OLD.reporting_end)))
+  THEN RAISE EXCEPTION 'official usage set coverage cannot narrow'; END IF;
+  IF OLD.complete AND (NOT NEW.complete OR NEW.accepted_at IS DISTINCT FROM OLD.accepted_at)
+  THEN RAISE EXCEPTION 'official usage set completion is immutable'; END IF;
+  IF NOT OLD.complete AND NEW.complete AND NEW.accepted_at IS NULL
+  THEN RAISE EXCEPTION 'official usage set completion requires acceptance time'; END IF;
+  IF NOT OLD.complete AND NOT NEW.complete AND NEW.accepted_at IS DISTINCT FROM OLD.accepted_at
+  THEN RAISE EXCEPTION 'official usage incomplete set cannot have acceptance time'; END IF;
+  IF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS DISTINCT FROM OLD.deleted_at
+  THEN RAISE EXCEPTION 'official usage set deletion is immutable'; END IF;
+  RETURN NEW;
+END $$;
+` },
 ] as const;
 
 export function migrationChecksum(sql: string) {

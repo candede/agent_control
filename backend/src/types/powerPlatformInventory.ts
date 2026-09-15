@@ -60,6 +60,7 @@ export type InventoryConnector = {
 };
 
 export type PowerPlatformResourceDetails = {
+  sourceTenantId?: string | null;
   ownerId?: string;
   lastModifiedAt?: string;
   lastModifiedBy?: string;
@@ -95,6 +96,7 @@ export type PowerPlatformResourceDetails = {
 };
 
 export type PowerPlatformResource = {
+  // Authorized inventory partition; catalog source ownership is recorded separately.
   tenantId: string;
   nativeId: string;
   type: PowerPlatformResourceType;

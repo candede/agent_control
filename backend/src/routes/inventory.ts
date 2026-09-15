@@ -22,6 +22,7 @@ policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs", { access: "authe
     environmentScope: optionalText(request.body?.environmentId, 512),
     requestedTypes: parseTypes(request.body?.types),
   });
+  response.locals.jobId = job.id;
   const current = job.status === "waiting_authorization" ? await startOrWaiting(request.session.user!, job.id) : job;
   response.status(202).json(current);
 });
@@ -31,14 +32,20 @@ policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs", { access: "authen
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await powerPlatformInventory.get(request.session.user!, jobId(request.params.id)));
+  const id = jobId(request.params.id);
+  response.locals.jobId = id;
+  response.json(await powerPlatformInventory.get(request.session.user!, id));
 });
 
 policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/resume", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.inventory.read", csrf: true }, async (request, response) => {
-  response.status(202).json(await startOrWaiting(request.session.user!, jobId(request.params.id)));
+  const id = jobId(request.params.id);
+  response.locals.jobId = id;
+  response.status(202).json(await startOrWaiting(request.session.user!, id));
 });
 policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/cancel", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
-  response.json(await powerPlatformInventory.cancel(request.session.user!, jobId(request.params.id)));
+  const id = jobId(request.params.id);
+  response.locals.jobId = id;
+  response.json(await powerPlatformInventory.cancel(request.session.user!, id));
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/snapshots", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {

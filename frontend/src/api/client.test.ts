@@ -7,6 +7,9 @@ import {
   getDefenderHuntingJob,
   getAgents,
   getPackageRefreshJob,
+  getOfficialUsageAggregate,
+  getOfficialUsageUsers,
+  getCopilotUsageUsers,
   getPurviewAuditJob,
   getQuarantineJob,
   getQuarantineTargets,
@@ -17,6 +20,7 @@ import {
   searchDirectoryPrincipals,
   startExactPackageRefresh,
   startPackageRefresh,
+  stageOfficialUsageReport,
   subscribeSessionRevalidationRequired,
   submitQuarantine,
   updateAgentAccess,
@@ -40,6 +44,77 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it("loads the licensed usage snapshot with a cancellable read-only request", async () => {
+    const fetchMock = mockJsonResponse({ users: [] });
+    const controller = new AbortController();
+    await getCopilotUsageUsers({ signal: controller.signal });
+    const [path, init] = fetchMock.mock.calls[0];
+    expect(path).toBe("/api/copilot-usage/users");
+    expect(init?.signal).toBe(controller.signal);
+    expect(init?.body).toBeUndefined();
+    expect(init?.method ?? "GET").toBe("GET");
+  });
+  it("uploads official usage without requesting dates or inventing a download timestamp", async () => {
+    const fetchMock = mockJsonResponse({ id: "staging-id" });
+    const file = new File(["Username,Display name"], "users.csv", { type: "text/csv" });
+    await stageOfficialUsageReport(file, { bundleId: "bundle-id" });
+    const [path, init] = fetchMock.mock.calls[0];
+    expect(path).toBe("/api/official-usage/staging");
+    expect(init?.method).toBe("POST");
+    const form = init?.body;
+    expect(form).toBeInstanceOf(FormData);
+    if (!(form instanceof FormData)) throw new Error("Expected multipart upload");
+    expect([...form.keys()]).toEqual(["file", "bundleId"]);
+    expect(form.get("file")).toBe(file);
+    expect(form.get("bundleId")).toBe("bundle-id");
+  });
+
+  it("preserves explicitly supplied legacy import metadata", async () => {
+    const fetchMock = mockJsonResponse({ id: "staging-id" });
+    await stageOfficialUsageReport(new File(["report"], "agents.csv"), {
+      bundleId: "bundle-id",
+      reportingStart: "2026-08-14",
+      reportingEnd: "2026-09-12",
+      periodProvenance: "operator_asserted",
+      downloadedAt: "2026-09-12T14:41:53.000Z",
+    });
+
+    const form = fetchMock.mock.calls[0][1]?.body;
+    if (!(form instanceof FormData)) throw new Error("Expected multipart upload");
+    expect(form.get("reportingStart")).toBe("2026-08-14");
+    expect(form.get("reportingEnd")).toBe("2026-09-12");
+    expect(form.get("periodProvenance")).toBe("operator_asserted");
+    expect(form.get("downloadedAt")).toBe("2026-09-12T14:41:53.000Z");
+  });
+
+  it("encodes official usage dashboard filters, thresholds, sorting, and paging", async () => {
+    const fetchMock = mockJsonResponse({});
+    await getOfficialUsageAggregate({
+      search: "Agent & one",
+      creatorType: "Agent built by your org",
+      startDate: "2026-01-01",
+      endDate: "2026-09-12",
+      sortBy: "unlicensedUsers",
+      sortDirection: "asc",
+      limit: 100,
+      offset: 200,
+    });
+    await getOfficialUsageUsers({
+      search: "User + one",
+      cohort: "low",
+      lowResponseThreshold: 5,
+      startDate: "2026-01-01",
+      endDate: "2026-09-12",
+      sortBy: "responses",
+      sortDirection: "desc",
+      limit: 100,
+      offset: 100,
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+  });
+
   it("requests failed-check recovery only for an explicit retry", async () => {
     const fetchMock = mockJsonResponse({ value: [] });
     await checkCapabilities();
@@ -100,16 +175,22 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/agents", expect.objectContaining({ credentials: "include" }));
   });
 
-  it("notifies session owners for API 401 and internal role loss, but not provider 403 responses", async () => {
+  it("notifies session owners for session auth failures and internal role loss, but not provider authorization failures", async () => {
     const listener = vi.fn();
     const unsubscribe = subscribeSessionRevalidationRequired(listener);
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ status: 403, code: "forbidden", detail: "Current provider permission is insufficient." }, { status: 403 }))
+      .mockResolvedValueOnce(Response.json({ status: 401, code: "interaction_required", detail: "Microsoft authorization is required for this capability." }, { status: 401 }))
+      .mockResolvedValueOnce(Response.json({ status: 401, code: "authorization_expired", detail: "Microsoft authorization expired." }, { status: 401 }))
       .mockResolvedValueOnce(Response.json({ status: 403, code: "missing_internal_role", detail: "Viewer is required." }, { status: 403 }))
       .mockResolvedValueOnce(Response.json({ status: 401, code: "unauthorized", detail: "The current session has expired.", requestId: "request-401" }, { status: 401 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(getAgents()).rejects.toMatchObject({ status: 403 });
+    expect(listener).not.toHaveBeenCalled();
+    await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "interaction_required" });
+    expect(listener).not.toHaveBeenCalled();
+    await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "authorization_expired" });
     expect(listener).not.toHaveBeenCalled();
     await expect(getAgents()).rejects.toMatchObject({ status: 403, code: "missing_internal_role" });
     expect(listener).toHaveBeenCalledOnce();

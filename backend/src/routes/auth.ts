@@ -25,9 +25,7 @@ export const authRouter = Router();
 
 policyRoute(authRouter, "get", "/auth/login", { access: "public", dataClass: "identity" }, async (request, response, next) => {
   try {
-    const setup = firstQueryValue(request.query.setup);
-    if (setup !== undefined && setup !== "defer") throw new AppError(400, "invalid_auth_setup", "Provider setup may only be explicitly deferred.");
-    const flow = createAuthFlow("login", { returnTo: firstQueryValue(request.query.returnTo), providerConsent: setup !== "defer" });
+    const flow = createAuthFlow("login", { returnTo: firstQueryValue(request.query.returnTo) });
     request.session.authFlowHandle = storeAuthFlow(request.sessionID, request.session.authFlowHandle, flow);
     await saveSession(request);
     const loginUrl = await createAuthorizationUrl(flow);

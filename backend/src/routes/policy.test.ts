@@ -21,6 +21,7 @@ describe("route policy declarations", () => {
       "GET /quarantine/targets", "GET /quarantine/status", "POST /quarantine/preview", "POST /quarantine/jobs", "GET /quarantine/jobs", "GET /quarantine/audit", "GET /quarantine/jobs/:id",
       "POST /quarantine/jobs/:id/cancel", "POST /quarantine/jobs/:id/resume", "POST /quarantine/jobs/:id/reconcile",
       "POST /quarantine/canary-approvals", "GET /quarantine/canary-approvals", "POST /quarantine/canary-approvals/:id/execute",
+      "GET /copilot-usage/users",
       "POST /official-usage/staging", "GET /official-usage/admin", "DELETE /official-usage/staging/:id",
       "POST /official-usage/bundles/:id/preview", "POST /official-usage/bundles/:id/accept",
       "POST /official-usage/sets/:id/preview", "POST /official-usage/confirmations/:id", "POST /official-usage/legacy-cleanup-acknowledgements",

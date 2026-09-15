@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
+import { withTelemetryContext } from "./telemetry.js";
 
 const resource = {
   tenantId: "11111111-1111-1111-1111-111111111111",
@@ -9,7 +10,41 @@ const resource = {
   properties: { connectionIdSharedByMaker: "must-not-be-retained" },
 };
 
+function fakeDeadlineTimers() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+  vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException("Synthetic deadline", "TimeoutError")), milliseconds);
+    return controller.signal;
+  });
+}
+
+function delayedInventoryFetcher(delayMs: number) {
+  return vi.fn((_input: string | URL, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+    const { Options: options } = JSON.parse(String(init?.body));
+    const offset = Number(options.SkipToken ?? 0);
+    const end = Math.min(offset + options.Top, 4_008);
+    const timer = setTimeout(() => {
+      init?.signal?.removeEventListener("abort", abort);
+      resolve(Response.json({
+        totalRecords: 4_008, count: end - offset, resultTruncated: end < 4_008 ? 1 : 0,
+        ...(end < 4_008 ? { skipToken: String(end) } : {}),
+        data: Array.from({ length: end - offset }, (_, index) => ({ ...resource, name: `agent-${offset + index}`, properties: {} })),
+      }));
+    }, delayMs);
+    const abort = () => { clearTimeout(timer); reject(init?.signal?.reason); };
+    if (init?.signal?.aborted) abort();
+    else init?.signal?.addEventListener("abort", abort, { once: true });
+  }));
+}
+
 describe("PowerPlatformResourceQueryClient", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
   it("checks access with one bounded page and no continuation", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 0,
@@ -54,15 +89,220 @@ describe("PowerPlatformResourceQueryClient", () => {
     const firstBody = JSON.parse(fetcher.mock.calls[0][1].body as string);
     expect(firstBody).toEqual({
       TableName: "PowerPlatformResources",
-      Clauses: [{ $type: "where", FieldName: "type", Operator: "in~", Values: ["'microsoft.copilotstudio/agents'"] }],
+      Clauses: [
+        { $type: "where", FieldName: "type", Operator: "in~", Values: ["'microsoft.copilotstudio/agents'"] },
+        { $type: "orderby", FieldNamesAscDesc: { tenantId: "asc", type: "asc", "tostring(properties.environmentId)": "asc", name: "asc" } },
+      ],
       Options: { Top: 100, Skip: 0 },
     });
-    expect(JSON.parse(fetcher.mock.calls[1][1].body as string).Options.SkipToken).toBe("next");
+    const nextBody = JSON.parse(fetcher.mock.calls[1][1].body as string);
+    expect(nextBody.Clauses).toEqual(firstBody.Clauses);
+    expect(nextBody.Options).toEqual({ Top: 100, SkipToken: "next" });
     expect(result.resources[0]).not.toHaveProperty("connectionIdSharedByMaker");
     expect(progress).toEqual([
       { pages: 1, observedCount: 1, totalRecords: 2 },
       { pages: 2, observedCount: 2, totalRecords: 2 },
     ]);
+  });
+
+  it.each([[101, false], [201, false], [4_008, false], [4_008, true]] as const)("enumerates %i resources (catalog entries: %s) when explicit Skip overrides the continuation offset", async (totalRecords, includeCatalog) => {
+    const rows = Array.from({ length: totalRecords }, (_, index) => ({
+      ...resource, name: `agent-${String(index).padStart(4, "0")}`, properties: {},
+      ...(includeCatalog && index < 1_001 ? { type: "microsoft.powerplatformconnector/connectors", tenantId: "" } : {}),
+    }));
+    const progress = vi.fn();
+    const fetcher = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      const { Options: options }: { Options: { Top: number; Skip?: number; SkipToken?: string } } = JSON.parse(String(init?.body));
+      // Resource Query inherits Resource Graph's explicit Skip precedence over SkipToken.
+      const offset = options.Skip ?? Number(options.SkipToken ?? 0);
+      const data = rows.slice(offset, offset + options.Top);
+      const nextOffset = offset + data.length;
+      const hasMore = nextOffset < totalRecords;
+      return Response.json({
+        totalRecords, count: data.length, data, resultTruncated: hasMore ? 1 : 0,
+        ...(hasMore ? { skipToken: String(nextOffset) } : {}),
+      });
+    });
+
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId, onProgress: progress });
+
+    expect(result.resources.map(item => item.nativeId)).toEqual(rows.map(item => item.name));
+    expect(result.resources.every(item => item.tenantId === resource.tenantId)).toBe(true);
+    expect(result).toMatchObject({ totalRecords, pages: Math.ceil(totalRecords / 100) });
+    expect(fetcher).toHaveBeenCalledTimes(Math.ceil(totalRecords / 100));
+    expect(progress).toHaveBeenLastCalledWith({ pages: Math.ceil(totalRecords / 100), observedCount: totalRecords, totalRecords });
+    for (const [, init] of fetcher.mock.calls.slice(1)) {
+      expect(JSON.parse(String(init?.body)).Options).not.toHaveProperty("Skip");
+    }
+  });
+
+  it("rejects duplicate identities across continuation pages without reporting a complete result", async () => {
+    const progress = vi.fn();
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [resource] }));
+
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+      .rejects.toMatchObject({ code: "provider_schema", message: "Power Platform inventory returned a duplicate resource identity." });
+    expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 1, totalRecords: 2 });
+    expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_query_failed", page: 2, pages: 1, observedCount: 1,
+      reason: "duplicate_identity", resourceIndex: 1, firstSeenPage: 1, resourceType: resource.type,
+    }));
+  });
+
+  it.each([0, 1, 100, 101, 4_140, 5_000])("accepts a tokenless terminal page still marked truncated only after all %i resources are validated", async totalRecords => {
+    const progress = vi.fn();
+    const fetcher = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      const { Options: options } = JSON.parse(String(init?.body));
+      const offset = Number(options.SkipToken ?? 0);
+      const count = Math.min(options.Top, totalRecords - offset);
+      return Response.json({
+        totalRecords, count, resultTruncated: 1,
+        ...(offset + count < totalRecords ? { skipToken: String(offset + count) } : {}),
+        data: Array.from({ length: count }, (_, index) => ({ ...resource, name: `agent-${offset + index}`, properties: {} })),
+      });
+    });
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress });
+    const pages = Math.max(1, Math.ceil(totalRecords / 100));
+    expect(result).toMatchObject({ totalRecords, pages });
+    expect(result.resources).toHaveLength(totalRecords);
+    expect(new Set(result.resources.map(item => item.nativeId)).size).toBe(totalRecords);
+    expect(fetcher).toHaveBeenCalledTimes(pages);
+    expect(progress).toHaveBeenLastCalledWith({ pages, observedCount: totalRecords, totalRecords });
+  });
+
+  it.each([undefined, null, ""])("accepts a boolean terminal marker with absent continuation (%s) for both inventory and access checks", async skipToken => {
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 1, count: 1, resultTruncated: true, skipToken, data: [resource] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).resolves.toMatchObject({ totalRecords: 1, pages: 1 });
+    const check = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: true, skipToken,
+      data: [{ ...resource, type: "microsoft.powerplatform/environments" }],
+    }));
+    await expect(new PowerPlatformResourceQueryClient(check).checkAccess("opaque-token")).resolves.toBeUndefined();
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it("still rejects an early missing continuation and does not mistake a sampled access check for complete enumeration", async () => {
+    const progress = vi.fn();
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ totalRecords: 3, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
+      .mockResolvedValueOnce(Response.json({ totalRecords: 3, count: 1, resultTruncated: 1, data: [{ ...resource, name: "agent-b" }] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+      .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("without a continuation token") });
+    expect(progress).toHaveBeenCalledExactlyOnceWith({ pages: 1, observedCount: 1, totalRecords: 3 });
+    const check = vi.fn(async () => Response.json({
+      totalRecords: 2, count: 1, resultTruncated: true, data: [{ ...resource, type: "microsoft.powerplatform/environments" }],
+    }));
+    await expect(new PowerPlatformResourceQueryClient(check).checkAccess("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    { totalRecords: 2, resultTruncated: 1, data: [resource] },
+    { totalRecords: 2, resultTruncated: 1, skipToken: "unexpected", data: [{ ...resource, name: "agent-b" }] },
+    { totalRecords: 1, resultTruncated: 1, data: [{ ...resource, name: "agent-b" }] },
+    { totalRecords: 2, resultTruncated: 1, data: [{ ...resource, tenantId: "foreign-tenant", name: "agent-b" }] },
+    { totalRecords: 2, resultTruncated: 1, data: [{ ...resource, type: "microsoft.powerapps/canvasapps", name: "agent-b" }] },
+  ])("keeps total, identity, continuation and scope checks on a terminal page: %j", async terminal => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [resource] }))
+      .mockResolvedValueOnce(Response.json({ count: 1, ...terminal }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: resource.tenantId }))
+      .rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it("logs first-page identity failures with field lengths and correlation but no provider contents", async () => {
+    const privateName = "private-native-id".repeat(40);
+    const providerRequestId = "22222222-2222-2222-2222-222222222222";
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 4_008, count: 1, resultTruncated: 1, skipToken: "private-continuation",
+      data: [{ ...resource, name: privateName, properties: { privateValue: "private-content" } }],
+    }, { headers: { "x-ms-request-id": providerRequestId, "x-ms-correlation-request-id": "private-header" } }));
+
+    await expect(withTelemetryContext({ requestId: "request-a", jobId: "job-a" }, () =>
+      new PowerPlatformResourceQueryClient(fetcher).query("private-access-token"))).rejects.toMatchObject({ code: "provider_schema" });
+    const events = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls]
+      .map(([entry]) => JSON.parse(entry));
+    expect(events).toContainEqual(expect.objectContaining({
+      event: "inventory_query_failed", requestId: "request-a", jobId: "job-a", source: "inventory_refresh",
+      stage: "validation", page: 1, pages: 0, observedCount: 0, totalRecords: 4_008, returnedCount: 1,
+      errorCode: "provider_schema", reason: "identity_too_long", field: "name", length: privateName.length,
+      maximumLength: 512, resourceType: resource.type, resourceIndex: 1,
+    }));
+    expect(events).toContainEqual(expect.objectContaining({ event: "inventory_provider_response", status: 200, providerRequestId }));
+    expect(JSON.stringify(events)).not.toContain("private-");
+    expect(JSON.stringify(events)).not.toContain(resource.tenantId);
+  });
+
+  it("aggregates omitted-field counts by page instead of logging every resource", async () => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 2, count: 2, resultTruncated: 0, data: [resource, { ...resource, name: "agent-b" }],
+    }));
+    await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    const warnings = vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry));
+    expect(warnings).toEqual([expect.objectContaining({ event: "provider_schema_omission", page: 1, count: 2 })]);
+    expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_query_completed", pages: 1, observedCount: 2, totalRecords: 2, omittedFieldCount: 2,
+    }));
+  });
+
+  it("identifies transport timeouts without logging exception messages", async () => {
+    const timeout = new DOMException("private-network-details", "TimeoutError");
+    const fetcher = vi.fn().mockRejectedValue(timeout);
+    await expect(new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }).query("opaque-token"))
+      .rejects.toMatchObject({ status: 504, code: "provider_timeout", message: expect.stringContaining("page request timed out") });
+    expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_provider_failure", page: 1, attempt: 1, stage: "transport", errorKind: "timeout",
+    }));
+    expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_query_failed", page: 1, stage: "request", errorKind: "timeout",
+    }));
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("private-network-details");
+  });
+
+  it.each([1_500, 2_000])("enumerates all 4008 rows with %i ms provider pages beyond the old 30-second deadline", async pageDelay => {
+    fakeDeadlineTimers();
+    const fetcher = delayedInventoryFetcher(pageDelay);
+    const progress = vi.fn();
+    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress })
+      .then(result => ({ result }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(41 * pageDelay);
+    const outcome = await pending;
+    expect(outcome).not.toHaveProperty("error");
+    expect(outcome).toMatchObject({ result: { totalRecords: 4_008, pages: 41 } });
+    if ("result" in outcome) expect(outcome.result.resources).toHaveLength(4_008);
+    expect(progress).toHaveBeenLastCalledWith({ pages: 41, observedCount: 4_008, totalRecords: 4_008 });
+    expect(fetcher).toHaveBeenCalledTimes(41);
+  });
+
+  it("enforces the finite 120-second total deadline without returning partial inventory", async () => {
+    fakeDeadlineTimers();
+    const progress = vi.fn();
+    const pending = new PowerPlatformResourceQueryClient(delayedInventoryFetcher(3_000)).query("opaque-token", undefined, { onProgress: progress })
+      .then(result => ({ result }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(await pending).toMatchObject({
+      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("120-second enumeration limit") },
+    });
+    expect(progress).toHaveBeenLastCalledWith({ pages: 39, observedCount: 3_900, totalRecords: 4_008 });
+    expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_query_failed", errorCode: "provider_timeout", errorKind: "timeout", durationMs: 120_000,
+    }));
+  });
+
+  it("applies the ten-second page limit while consuming a stalled response body", async () => {
+    fakeDeadlineTimers();
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const fetcher = vi.fn().mockResolvedValue(new Response(body));
+    const pending = new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 }).query("opaque-token")
+      .then(result => ({ result }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await pending).toMatchObject({ error: { status: 504, code: "provider_timeout" } });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_provider_failure", stage: "response_body", errorKind: "timeout",
+    }));
   });
 
   it("rejects malformed and incomplete pages", async () => {
@@ -71,6 +311,94 @@ describe("PowerPlatformResourceQueryClient", () => {
 
     const incomplete = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [resource] })));
     await expect(incomplete.query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([
+    ["tenantId", "", "empty", 128],
+    ["tenantId", "private-tenant-id".repeat(10), "oversized", 128],
+    ["name", "", "empty", 512],
+    ["name", "private-resource-id".repeat(30), "oversized", 512],
+  ] as const)("identifies invalid %s length without exposing its value", async (field, value, reason, maximumLength) => {
+    const progress = vi.fn();
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, [field]: value }],
+    }));
+
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+      .rejects.toMatchObject({
+        code: "provider_schema",
+        message: `Power Platform inventory returned an ${reason} ${field} for ${resource.type} (length ${value.length}; expected 1-${maximumLength}).`,
+      });
+    expect(progress).not.toHaveBeenCalled();
+  });
+
+  it("preserves native identity values at their supported length limits", async () => {
+    const tenantId = "t".repeat(128);
+    const nativeId = "n".repeat(512);
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, tenantId, name: nativeId }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({ tenantId, nativeId });
+  });
+
+  it.each(["", null, undefined])("scopes connector catalog entries with absent tenant metadata (%s) to the authenticated query", async sourceTenantId => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: sourceTenantId }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId });
+
+    expect(result.resources[0]).toMatchObject({
+      tenantId: resource.tenantId, nativeId: resource.name, environmentId: null,
+      provenance: { tenantId: { path: "authenticated_query.tenantId" } },
+      identifiers: [{ kind: "power_platform_resource_id", value: resource.name }],
+    });
+    if (sourceTenantId === undefined) {
+      expect(result.resources[0].details).not.toHaveProperty("sourceTenantId");
+      expect(result.resources[0].provenance.sourceTenantId.path).toBe("not_supplied");
+    } else {
+      expect(result.resources[0].details.sourceTenantId).toBe(sourceTenantId);
+      expect(result.resources[0].provenance.sourceTenantId.path).toBe("tenantId");
+    }
+  });
+
+  it("does not infer catalog tenant scope without an authenticated query scope", async () => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: "" }],
+    }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token"))
+      .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("require an authenticated inventory tenant scope") });
+  });
+
+  it.each(["", null, undefined])("still rejects absent tenant metadata (%s) on tenant-owned resources", async tenantId => {
+    for (const type of ["microsoft.copilotstudio/agents", "microsoft.powerapps/canvasapps", "microsoft.powerplatform/environments"]) {
+      const fetcher = vi.fn().mockResolvedValue(Response.json({
+        totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, type, tenantId }],
+      }));
+      await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+        .rejects.toMatchObject({ code: "provider_schema" });
+    }
+  });
+
+  it.each(["foreign-tenant", 42, {}, "x".repeat(129)])("does not replace foreign or malformed connector tenant metadata (%s)", async tenantId => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId }],
+    }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+      .rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it("retains duplicate and environment-scope guards for connector catalog entries", async () => {
+    const connector = { ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: "" };
+    const duplicate = vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [connector, connector] }));
+    await expect(new PowerPlatformResourceQueryClient(duplicate).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
+      .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("duplicate resource identity") });
+    const outOfScope = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [connector] }));
+    await expect(new PowerPlatformResourceQueryClient(outOfScope).query("opaque-token", undefined, { expectedTenantId: resource.tenantId, environmentId: "environment-a" }))
+      .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("outside the requested") });
   });
 
   it("allowlists documented fields, preserves null semantics and discards secret or unknown values", async () => {
@@ -220,6 +548,9 @@ describe("PowerPlatformResourceQueryClient", () => {
     const client = new PowerPlatformResourceQueryClient(fetcher, { delay: async value => { delays.push(value); } });
     await expect(client.query("opaque-token")).resolves.toMatchObject({ totalRecords: 0 });
     expect(delays).toEqual([2_000]);
+    expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_provider_retry", page: 1, attempt: 1, reason: "throttled", retryDelayMs: 2_000,
+    }));
   });
 
   it("validates bounded page metadata and expected response scope", async () => {

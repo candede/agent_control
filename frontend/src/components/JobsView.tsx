@@ -155,7 +155,7 @@ export function JobsView({ user }: { user: SessionUser }) {
     <section className="jobs-view" aria-labelledby="jobs-heading">
       <div className="section-heading">
         <div><span className="eyebrow">Operational metadata</span><h2 id="jobs-heading">Jobs</h2></div>
-        <button type="button" className="secondary-button" onClick={() => {
+        <button type="button" className="secondary" onClick={() => {
           stop();
           pollDeadline.current = 0;
           startPolling(generation.current);
@@ -181,14 +181,14 @@ export function JobsView({ user }: { user: SessionUser }) {
             </div>
             <code className="job-id">{job.id}</code>
             <div className="inline-actions">
-              <a className="secondary-button" href={job.href}>Open source view</a>
+              <a className="primary-link secondary" href={job.href}>Open source view</a>
               {job.canResume ? <WorkbenchActionGate actionId={jobActionId(job, "resume")} compact>
                 <button type="button" disabled={busy !== ""} onClick={() => void perform(`resume:${job.id}`, () => resume(job))}>
                   {busy === `resume:${job.id}` ? "Resuming…" : "Resume unsent"}
                 </button>
               </WorkbenchActionGate> : null}
               {job.canCancel ? <WorkbenchActionGate actionId={jobActionId(job, "cancel")} compact>
-                <button type="button" className="danger-button" disabled={busy !== ""} onClick={() => void perform(`cancel:${job.id}`, () => cancel(job))}>
+                <button type="button" className="danger" disabled={busy !== ""} onClick={() => void perform(`cancel:${job.id}`, () => cancel(job))}>
                   {busy === `cancel:${job.id}` ? "Cancelling…" : "Cancel valid unsent"}
                 </button>
               </WorkbenchActionGate> : null}

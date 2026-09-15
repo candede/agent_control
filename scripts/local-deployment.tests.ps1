@@ -101,10 +101,10 @@ try {
     Assert-True (($manifest.appRoles.value -join ',') -ceq 'AgentControl.Viewer,AgentControl.Admin') 'Manifest must expose exactly Viewer and Admin.'
     Assert-True (@($manifest.appRoles | Where-Object { ($_.allowedMemberTypes -join ',') -cne 'User' }).Count -eq 0) 'App roles must be assignable to users/groups only.'
     foreach ($role in $manifest.appRoles) { Assert-True ($guidance.Contains($role.value)) 'Registration guidance omitted an application role.' }
-    foreach ($requiredText in @('openid and profile','Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Optional Microsoft Graph Application permissions','Admin includes Viewer access','only one role assignment','Assignment required','Users/Groups for Allowed member types','does not verify or grant permissions')) {
+    foreach ($requiredText in @('Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Optional Microsoft Graph Application permissions','Admin includes Viewer access','only one role assignment','Assignment required','Users/Groups for Allowed member types','does not verify or grant permissions')) {
         Assert-True ($guidance.Contains($requiredText)) "Registration guidance omitted distinction: $requiredText."
     }
-    foreach ($requiredText in @('checks delegated access automatically','Interactive consent, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Normal sign-in requests all implemented delegated permissions up front, including package changes','Sign in without provider setup defers consent')) {
+    foreach ($requiredText in @('checks delegated access automatically','Interactive consent, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Normal sign-in requests all implemented delegated permissions up front, including package changes')) {
         Assert-True ($guidance.Contains($requiredText)) "Automatic access-check guidance omitted distinction: $requiredText."
     }
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')

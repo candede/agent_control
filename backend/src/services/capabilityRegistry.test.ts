@@ -5,7 +5,7 @@ import { capabilityDefinitions, hasAnyRole, resolveCapabilityStatus } from "./ca
 describe("capability registry", () => {
   it("defines every retained capability exactly once with source-linked requirements", () => {
     expect(capabilityDefinitions.map(definition => definition.id)).toEqual(capabilityIds);
-    expect(new Set(capabilityDefinitions.map(definition => definition.id)).size).toBe(14);
+    expect(new Set(capabilityDefinitions.map(definition => definition.id)).size).toBe(16);
     for (const definition of capabilityDefinitions) {
       expect(definition.sources.every(source => source.startsWith("https://learn.microsoft.com/"))).toBe(true);
       expect(definition.internalRoles.every(role => appRoles.includes(role))).toBe(true);
@@ -24,14 +24,23 @@ describe("capability registry", () => {
   it("keeps application mode, preview writes, and local policy explicit", () => {
     expect(capabilityDefinitions.filter(definition => definition.mode === "application")).toHaveLength(3);
     expect(capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id)).toEqual([
-      "graph.package.access.manage", "graph.package.block.manage", "powerPlatform.quarantine.manage",
+      "graph.package.access.manage", "graph.package.block.manage", "graph.licenses.read", "powerPlatform.quarantine.manage",
+      "reports.copilotUsage.read",
     ]);
     expect(capabilityDefinitions.find(definition => definition.id === "reports.official.import")?.mode).toBe("local");
     expect(JSON.stringify(capabilityDefinitions)).not.toMatch(/Phase\s*0?5|owning.*phase/i);
-    for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand")) {
+    for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand"
+      && definition.id !== "reports.copilotUsage.read")) {
       expect(definition.probe.description).toContain("Microsoft authorizes the delegated request when it runs.");
       expect(definition.configuration.join(" ")).not.toMatch(/qualification|canary|disabled/i);
     }
+    expect(capabilityDefinitions.find(definition => definition.id === "reports.copilotUsage.read")).toMatchObject({
+      permissions: ["Reports.Read.All"],
+      mode: "delegated",
+      dataClass: "licensed_usage",
+    });
+    expect(capabilityDefinitions.find(definition => definition.id === "graph.directory.read")?.permissions).toEqual(["User.ReadBasic.All", "Group.Read.All"]);
+    expect(capabilityDefinitions.find(definition => definition.id === "graph.licenses.read")?.permissions).toEqual(["User.Read.All", "LicenseAssignment.Read.All"]);
     for (const definition of capabilityDefinitions.filter(definition => definition.id.startsWith("graph.package.read."))) {
       expect(definition.probe.description).toMatch(/Response-size\/time-bounded.*first-page.*documented filter.*without following pagination/);
     }

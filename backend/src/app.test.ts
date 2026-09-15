@@ -62,7 +62,7 @@ vi.mock("./services/capabilities.js", () => ({ capabilities: {
   quarantineAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
   quarantineApprovalAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
 } }));
-vi.mock("./services/powerPlatformResourceQuery.js", () => ({ PowerPlatformResourceQueryClient: class {
+vi.mock("./services/powerPlatformResourceQuery.js", async original => ({ ...await original<typeof import("./services/powerPlatformResourceQuery.js")>(), PowerPlatformResourceQueryClient: class {
   async query() { inventoryProviderFixture.queries += 1; return {resources:[],totalRecords:0,pages:1,unknownFieldCount:0}; }
 } }));
 vi.mock("./services/bulkJobs.js", async original => ({ ...await original<typeof import("./services/bulkJobs.js")>(), launchBulkJob: vi.fn() }));
@@ -1190,12 +1190,6 @@ describe.sequential("packaged API/session contracts", () => {
     for (const [kind, csv] of reports) {
       const form = new FormData();
       form.append("bundleId", bundleId);
-      form.append("reportingStart", "2026-06-07");
-      form.append("reportingEnd", "2026-07-06");
-      form.append("periodProvenance", "operator_asserted");
-      form.append("sourceAsOf", "2026-07-08T12:00:00Z");
-      form.append("sourceAsOfProvenance", "operator_asserted");
-      form.append("downloadedAt", "2026-07-08T12:10:00Z");
       form.append("file", new Blob([csv], { type: "application/octet-stream" }), `private-${kind}.not-trusted`);
       const response = await request("/api/official-usage/staging", { method: "POST", headers: { Cookie: administratorCookie }, body: form });
       expect(response.status).toBe(201);
@@ -1215,6 +1209,16 @@ describe.sequential("packaged API/session contracts", () => {
       }
     }
 
+    const partialMetadata = new FormData();
+    partialMetadata.append("bundleId", randomUUID());
+    partialMetadata.append("reportingStart", "2026-06-07");
+    partialMetadata.append("file", new Blob([reports[0][1]]), "partial-metadata.csv");
+    const partialMetadataResponse = await request("/api/official-usage/staging", {
+      method: "POST", headers: { Cookie: administratorCookie }, body: partialMetadata,
+    });
+    expect(partialMetadataResponse.status).toBe(400);
+    expect(await partialMetadataResponse.json()).toMatchObject({ code: "invalid_metadata" });
+
     const deniedForm = new FormData();
     deniedForm.append("file", new Blob([reports[0][1]]), "private.csv");
     expect((await request("/api/official-usage/staging", { method: "POST", headers: { Cookie: administratorCookie, "x-csrf-token": "wrong" }, body: deniedForm })).status).toBe(403);
@@ -1231,6 +1235,11 @@ describe.sequential("packaged API/session contracts", () => {
     expect(bundlePreviewResponse.status).toBe(200);
     const bundlePreview = await bundlePreviewResponse.json();
     expect(bundlePreview).toMatchObject({ bundleId, missingKinds: [], staging: expect.arrayContaining(reports.map(([kind]) => expect.objectContaining({ kind }))) });
+    expect(bundlePreview.staging.map((item: { reportingPeriod: unknown }) => item.reportingPeriod)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ startDate: "2026-07-06", endDate: "2026-07-06", provenance: "activity_range" }),
+      expect.objectContaining({ startDate: "2026-07-05", endDate: "2026-07-06", provenance: "activity_range" }),
+      expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-06", provenance: "activity_range" }),
+    ]));
     expect((await request(`/api/official-usage/staging/${bundlePreview.staging[0].id}/accept`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
       body: JSON.stringify({ stagingRevision: 1, fileHash: bundlePreview.staging[0].fileHash, expectedActiveRevision: 1 }),
@@ -1246,6 +1255,16 @@ describe.sequential("packaged API/session contracts", () => {
     expect(accepted.status).toBe(200);
     const acceptedBody = await accepted.json();
     expect(acceptedBody).toMatchObject({ complete: true });
+    const acceptedAdminState = await (await request("/api/official-usage/admin", {
+      headers: { Cookie: administratorCookie },
+    })).json();
+    expect(acceptedAdminState.activeSetId).toBe(acceptedBody.setId);
+    expect(acceptedAdminState.sets).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: acceptedBody.setId,
+        reportingPeriod: expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-06", provenance: "activity_range" }),
+      }),
+    ]));
     const exactRetry = await request(`/api/official-usage/bundles/${bundleId}/accept`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
       body: JSON.stringify({ bundleHash: bundlePreview.bundleHash, expectedActiveRevision: bundlePreview.expectedActiveRevision }),
@@ -1294,6 +1313,15 @@ describe.sequential("packaged API/session contracts", () => {
       datasetScope: { reportSetId: expect.any(String), usersVersionId: expect.any(String), userAgentsVersionId: expect.any(String) },
       rows: [expect.objectContaining({ creatorTypeSource: "users_and_agents_report", identityStatus: "unresolved" })],
     })]));
+    const filteredUsers = await request("/api/official-usage/users?startDate=2026-07-04&endDate=2026-07-04&cohort=low&lowResponseThreshold=3&sortBy=responses&sortDirection=asc", { headers: { Cookie: securityReaderCookie } });
+    expect(filteredUsers.status).toBe(200);
+    expect(await filteredUsers.json()).toMatchObject({
+      filters: { startDate: "2026-07-04", endDate: "2026-07-04", cohort: "low", lowResponseThreshold: 3 },
+      users: { count: 1, value: [expect.objectContaining({ username: "@users-only", reviewCohort: "low_responses", licenseAssignmentStatus: "unavailable", rows: [] })] },
+    });
+    expect((await request("/api/official-usage/users?startDate=2026-02-30", { headers: { Cookie: securityReaderCookie } })).status).toBe(400);
+    const filteredAgents = await request("/api/official-usage/aggregate?startDate=2026-07-05&endDate=2026-07-05&sortBy=responses&sortDirection=asc", { headers: { Cookie: readerCookie } });
+    expect(await filteredAgents.json()).toMatchObject({ agents: { count: 1, value: [expect.objectContaining({ agentId: "bridge-agent" })] } });
     const aggregateCsv = await (await request("/api/official-usage/aggregate.csv", { headers: { Cookie: readerCookie } })).text();
     const usersCsv = await (await request("/api/official-usage/users.csv?search=pseudonym&creatorType=Declarative&responsesOnly=true", { headers: { Cookie: securityReaderCookie } })).text();
     const allUsersCsv = await (await request("/api/official-usage/users.csv", { headers: { Cookie: securityReaderCookie } })).text();
@@ -1304,9 +1332,9 @@ describe.sequential("packaged API/session contracts", () => {
       activeUsersTotal: "1",
       activeUsersTotalBasis: "userAgents_distinct_identity",
       activeUsersIdentityCount: "1",
-      agentsPeriodProvenance: "operator_asserted",
+      agentsPeriodProvenance: "activity_range",
       agentsSourceFreshness: "unknown",
-      userAgentsPeriodProvenance: "operator_asserted",
+      userAgentsPeriodProvenance: "activity_range",
       userAgentsSourceFreshness: "unknown",
       reportSetId: aggregateBody.activeSet.id,
     });
@@ -1322,9 +1350,9 @@ describe.sequential("packaged API/session contracts", () => {
     const exportedUser = Object.fromEntries(usersHeader.map((column, index) => [column, usersRow[index]]));
     expect(exportedUser).toMatchObject({
       userMetricSource: "users_report",
-      usersPeriodProvenance: "operator_asserted",
+      usersPeriodProvenance: "activity_range",
       usersSourceFreshness: "unknown",
-      userAgentsPeriodProvenance: "operator_asserted",
+      userAgentsPeriodProvenance: "activity_range",
       userAgentsSourceFreshness: "unknown",
       reportSetId: aggregateBody.activeSet.id,
     });
@@ -1332,11 +1360,15 @@ describe.sequential("packaged API/session contracts", () => {
     const exportedUsersOnly = Object.fromEntries(allUsersHeader.map((column, index) => [column,
       allUsersRows.find(row => row[allUsersHeader.indexOf("username")] === "'@users-only")![index]]));
     expect(exportedUsersOnly).toMatchObject({
+      licenseAssignmentStatus: "unavailable",
+      reviewCohort: "low_responses",
+      reviewCandidate: "true",
       reportedAgentsUsed: "1",
       reportedResponsesReceived: "3",
       userLastActivityDateUtc: "2026-07-04T00:00:00.000Z",
       responsesSentToUsers: "Unknown",
       agentLastUsedByAnyoneDateUtc: "Unknown",
+      missingBridgeRows: "true",
     });
     const exportedBridgeOnly = Object.fromEntries(allUsersHeader.map((column, index) => [column,
       allUsersRows.find(row => row[allUsersHeader.indexOf("username")] === "'@bridge-only")![index]]));

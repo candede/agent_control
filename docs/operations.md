@@ -15,7 +15,7 @@ This runbook operates the single Express/React application and PostgreSQL databa
 
    `start` is also the default when omitted and runs the full build/migrate/test/start deployment for both new and retained installations. If settings are incomplete, complete the terminal wizard for tenant ID, client ID, hidden client secret and port (default `3001`); configured starts reuse all saved values, including the port. See [deployment setup](deployment-setup.md) for configuration and unattended-run prerequisites.
 
-5. Sign in. Normal sign-in requests outstanding consent for all implemented delegated capabilities, including package changes; **Sign in without provider setup** defers it explicitly. Existing installations should use normal sign-in again after redeployment to request newly included scopes. See `docs/deployment-setup.md` for tenant-wide consent and separate provider-role requirements. For an assigned Viewer/Admin session, Permission Center loads the capability catalog and immediately runs one bounded session-scoped delegated check, including token-only checks for Admin writes; consent return follows the same flow. Evidence expiry schedules one visible-tab check, while hidden tabs wait for visibility/focus. Interactive consent, MFA or Conditional Access still requires user action. Consent-required Entra errors are distinguished from expired/revoked authorization; a generic `invalid_grant` is not proof of expiry. The top-level **Check status** action is optional failure recovery, not an onboarding prerequisite. Request consent is shown for detected missing permission, not merely an untried operation. Never repair missing consent by editing capability evidence.
+5. Sign in. Sign-in requests outstanding consent for all implemented delegated capabilities, including package changes. Existing installations should sign in again after redeployment to request newly included scopes. See `docs/deployment-setup.md` for tenant-wide consent and separate provider-role requirements. For an assigned Viewer/Admin session, Permission Center loads the capability catalog and immediately runs one bounded session-scoped delegated check, including token-only checks for Admin writes; consent return follows the same flow. Evidence expiry schedules one visible-tab check, while hidden tabs wait for visibility/focus. Interactive consent, MFA or Conditional Access still requires user action. Consent-required Entra errors are distinguished from expired/revoked authorization; a generic `invalid_grant` is not proof of expiry. The top-level **Check status** action is optional failure recovery, not an onboarding prerequisite. Request consent is shown for detected missing permission, not merely an untried operation. Never repair missing consent by editing capability evidence.
 6. After an app-role change or removal, require a fresh login and use the approved restart/session-invalidation cutoff. Verify removed, unassigned, and legacy-only claims are denied; never rely on auto-promotion.
 
 Client-supplied identity headers never authenticate. A process restart loses the MSAL cache and requires provider token reacquisition; this is expected and does not authorize replay.
@@ -69,12 +69,55 @@ An authenticated Admin may call `GET /api/diagnostics`; it returns only auth-con
 - **Ready to try:** token-only quarantine-status, Purview and Defender readiness does not prove target-operation access. Package access/block and quarantine management use `on_demand` authorization and show the same **Ready to try** status, with **Microsoft validates permission on the actual operation** metadata—not a token-success or live-write claim. Both kinds count as ready to try, never provider-verified. Open the applicable view and explicitly select the intended bounded operation. Implemented writes validate current Admin/provider authority and confirmation when submitted, without prior canaries. Optional reversible canaries are described in [mutation-canaries.md](mutation-canaries.md); neither consent nor Check status executes them.
 - **Authorization actions:** delegated `missing_permission` with the current internal role renders **Request consent**. `interaction_required` remains unknown and renders **Continue sign-in / consent** because the required Microsoft interaction may include consent, MFA, or Conditional Access. `authorization_expired` remains unknown and renders **Sign in again** without implying missing permission or a new consent requirement. Every action is explicit and capability-scoped; none redirects automatically.
 - **No data:** distinguish a complete zero-row observation from missing permission, partial coverage, limit failure or stale cache. Do not turn a provider error into a successful empty snapshot.
+- **Power Platform inventory timeout:** `provider_timeout` is a failed read, not missing authorization. The inventory client permits 120 seconds for complete enumeration, and the enclosing job permits 150 seconds for enumeration, revalidation and publication. Individual pages remain capped at 100 rows, ten seconds including the body, and the existing response-byte limit; full scans remain limited to 50 pages/5,000 rows. A tenant with thousands of resources can legitimately take more than 30 seconds. Use the logged failing page, elapsed duration and progress to distinguish the total deadline from a slow page; retry a failed refresh explicitly or narrow its scope. No partial snapshot is published.
 - **Catalog verified but Agents empty:** the Permissions check validates only the first catalog page; it does not persist inventory. While Agents is open, a successful saved-data response with `snapshot: null` and no discovered refresh jobs or prior attempt/success metadata allows one initial delegated read-only refresh per account/UI session; saved data can load afterwards. Existing or failed work is not restarted automatically. Progress, terminal error and saved observation are separate from readiness. Use **Refresh agents** to retry deliberately; a failed or interrupted attempt must not become an empty successful snapshot.
 - **Preparing access changes:** opening the access editor refreshes the exact package read-only and fetches current detail; bulk preparation refreshes each selected target before confirmation. Loading these details changes no provider settings and does not replace confirmation, immediate dispatch-time prestate checks or post-write readback.
 - **On-demand provider writes:** no extra mode/configuration or prior qualification is required in local or Azure deployments. Sign-in, Admin role, provider permissions, same-origin/CSRF, exact targets, confirmation, immediate prestate checks, audit, one-shot dispatch and readback remain enforced. Package access lacks conditional concurrency protection and can overwrite a concurrent external change after the final pre-read. No write runs automatically. Owner reassignment has no implemented product workflow or documented owner readback.
 - **Schema drift:** an unknown provider shape fails that operation and retains the previous snapshot. An unknown PostgreSQL migration makes readiness `503`; enter maintenance and fix forward.
 - **Job age/failure:** inspect the source-specific job route from the workbench. Logs contain only structured request/job/provider IDs, status, durations, ages, attempts and counts.
 - **Uncertain write:** leave the sent item `inconclusive`. With current Admin and provider-read authority, use its existing GET-only reconciliation route. Mark observed-applied, observed-not-applied or conflict; never resend automatically or invert a partial batch automatically.
+
+### Troubleshooting a remote frontend through local container logs
+
+For a frontend reached through a dev tunnel, the approved remote browser performs sign-in and user actions; the local `app` container is the troubleshooting surface. If geographic or Conditional Access policy prevents local sign-in, **do not open a local browser, use another identity, or bypass the restriction**. Have the operator use their authorized production browser and report when they clicked the action. A container restart can require fresh sign-in from that approved location.
+
+For the retained `seha` project:
+
+```bash
+docker logs --since 10m --timestamps -f seha-app-1
+```
+
+For a focused history, without any frontend console access:
+
+```bash
+docker logs --since 10m seha-app-1 2>&1 \
+  | grep -E '"event":"inventory_|"provider":"power_platform"|"route":"/inventory/|"event":"request_rejected"|"event":"request_error"'
+```
+
+Each structured entry has a UTC `timestamp`, severity `level`, and `event`. HTTP logs include the server-generated `requestId`, the **code-owned route template** (never the raw URL/query or native path parameter), method in `mode`, status and safe `errorCode` when rejected. Non-GET actions log `http_request_started` before route authorization. `http_request_aborted` means the HTTP response did not finish; it does not mean an accepted background job was cancelled.
+
+Power Platform inventory adds:
+
+| Event | Meaning |
+| --- | --- |
+| `inventory_refresh_submitted`, `inventory_refresh_started` | Durable job creation/reuse and successful authorization/dispatch. Includes `jobId`; background events retain the initiating `requestId`. |
+| `inventory_refresh_start_failed` | Start failed at `load_job`, `revalidate_user`, `authorization`, `delegated_token`, `mark_running`, or `dispatch`. |
+| `inventory_provider_request`, `inventory_provider_response`, `inventory_provider_retry`, `inventory_provider_failure` | Page and attempt number, HTTP status, duration, continuation **presence only**, retry delay/reason, and valid GUID provider correlation headers. Transport and response-body failures are distinguished. |
+| `inventory_page_validated`, `inventory_refresh_progress` | Validated page metadata versus successfully recorded progress. Includes counts, total, omissions and the number of catalog rows using query-derived tenant scope. Omission warnings are aggregated per page, not per resource. |
+| `inventory_query_failed` | Exact failing page, completed-page/row counts, stage, safe error category and schema diagnostics. Identity failures identify `field`, allowlisted `resourceType`, `resourceIndex` (1-based within the page), `length`, and `maximumLength`. Duplicate diagnostics include `firstSeenPage`, never the identity itself. |
+| `inventory_query_completed` | Provider enumeration completed; snapshot publication has not necessarily succeeded. |
+| `inventory_refresh_execution_failed`, `inventory_refresh_failed`, `inventory_refresh_waiting_authorization`, `inventory_refresh_succeeded` | Execution failure and its stage, followed by the recorded durable outcome. Only `inventory_refresh_succeeded` confirms snapshot publication. |
+
+`source: capability_check` identifies the bounded Permissions probe, not an inventory refresh. HTTP `200` from a check or saved-data read and HTTP `202` accepting a refresh do **not** prove inventory success. If **Refresh selected scope** fails, trace its `requestId`, then its `jobId`; a `401`/`403` rejection before job creation explains why no new refresh appears. If no new matching request arrives, the displayed saved failure is not evidence of a new provider attempt.
+
+To isolate an exact attempt, copy its server-generated ID from the structured logs:
+
+```bash
+docker logs --since 15m seha-app-1 2>&1 | grep -F '"requestId":"REQUEST_UUID"'
+docker logs --since 15m seha-app-1 2>&1 | grep -F '"jobId":"JOB_UUID"'
+```
+
+Logs intentionally exclude tokens, cookies, authorization headers, native resource/tenant/environment IDs, names, continuation values, request/response bodies, raw exception messages/stacks and arbitrary provider header values. Do not enable raw payload logging to diagnose an identity error. Counts, types, lengths, stages and correlation are sufficient to distinguish malformed data, unsupported identity bounds, scope failures, pagination overlap, throttling, timeouts and publication failures. Existing authorization, pagination limits, snapshot publication rules and log retention remain unchanged.
 
 ## Retention
 

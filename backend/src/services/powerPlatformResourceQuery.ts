@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import {
   powerPlatformResourceTypes,
   type InventoryConnector,
@@ -20,7 +20,7 @@ const resourceQueryEndpoint = "https://api.powerplatform.com/resourcequery/resou
 const defaultPageSize = 100;
 const maximumPages = 50;
 const maximumRows = 5_000;
-const queryDeadlineMs = 30_000;
+export const powerPlatformInventoryQueryDeadlineMs = 120_000;
 const maximumConnectors = 200;
 const maximumOperations = 200;
 
@@ -51,6 +51,24 @@ type ResourceQueryPage = {
   data?: unknown;
 };
 
+type QueryLogContext = { provider: "power_platform"; source: "inventory_refresh" | "capability_check"; page: number };
+type SchemaDiagnostics = {
+  reason: string;
+  field?: string;
+  resourceType?: PowerPlatformResourceType;
+  actualType?: string;
+  length?: number;
+  maximumLength?: number;
+  resourceIndex?: number;
+  firstSeenPage?: number;
+};
+
+class InventorySchemaError extends AppError {
+  constructor(message: string, readonly diagnostics: SchemaDiagnostics) {
+    super(502, "provider_schema", message);
+  }
+}
+
 const defaultRetryPolicy: RetryPolicy = {
   maxAttempts: 3,
   baseDelayMs: 1_000,
@@ -73,7 +91,7 @@ export class PowerPlatformResourceQueryClient {
     const requestedTypes = validateTypes(types);
     const environmentId = validateEnvironmentId(options.environmentId);
     const expectedTenantId = validateExpectedTenantId(options.expectedTenantId);
-    const deadlineSignal = AbortSignal.timeout(queryDeadlineMs);
+    const deadlineSignal = AbortSignal.timeout(powerPlatformInventoryQueryDeadlineMs);
     const signal = options.signal ? AbortSignal.any([options.signal, deadlineSignal]) : deadlineSignal;
     const resources: PowerPlatformResource[] = [];
     const visitedTokens = new Set<string>();
@@ -81,50 +99,105 @@ export class PowerPlatformResourceQueryClient {
     let totalRecords: number | undefined;
     let pages = 0;
     let unknownFieldCount = 0;
-    const identities = new Set<string>();
+    const identities = new Map<string, number>();
+    const logContext: QueryLogContext = { provider: "power_platform", source: "inventory_refresh", page: 0 };
+    const startedAt = performance.now();
+    let completedPages = 0;
+    let completedCount = 0;
+    let stage = "request";
+    let metadata: ReturnType<typeof pageTelemetry> = {};
+    operationalLog("info", "inventory_query_started", {
+      ...logContext, requestedTypeCount: requestedTypes.length, environmentScoped: Boolean(environmentId),
+      pageSize: defaultPageSize, pageLimit: maximumPages, rowLimit: maximumRows, deadlineMs: powerPlatformInventoryQueryDeadlineMs,
+    });
 
-    do {
-      if (pages >= maximumPages || resources.length >= maximumRows) {
-        throw new AppError(502, "provider_result_limit", "Power Platform inventory exceeded the bounded page or row limit.");
-      }
-      if (skipToken) {
-        if (visitedTokens.has(skipToken)) throw new AppError(502, "provider_schema", "Power Platform inventory returned a repeated continuation token.");
-        visitedTokens.add(skipToken);
-      }
+    try {
+      do {
+        logContext.page = pages + 1;
+        metadata = {};
+        stage = "request";
+        if (pages >= maximumPages || resources.length >= maximumRows) {
+          throw new AppError(502, "provider_result_limit", "Power Platform inventory exceeded the bounded page or row limit.");
+        }
+        if (skipToken) {
+          if (visitedTokens.has(skipToken)) throw new InventorySchemaError("Power Platform inventory returned a repeated continuation token.", { reason: "repeated_continuation", field: "skipToken" });
+          visitedTokens.add(skipToken);
+        }
 
-      const page = await this.requestPage(accessToken, requestedTypes, skipToken, signal, environmentId);
-      const parsed = parsePage(page, requestedTypes, environmentId, expectedTenantId);
-      pages += 1;
-      totalRecords ??= parsed.totalRecords;
-      if (parsed.totalRecords !== totalRecords) throw new AppError(502, "provider_schema", "Power Platform inventory changed totalRecords during paging.");
-      if (resources.length + parsed.resources.length > maximumRows) throw new AppError(502, "provider_result_limit", "Power Platform inventory exceeded the bounded row limit.");
-      for (const resource of parsed.resources) {
-        const identity = `${resource.tenantId}\0${resource.type}\0${resource.environmentId ?? ""}\0${resource.nativeId}`;
-        if (identities.has(identity)) throw new AppError(502, "provider_schema", "Power Platform inventory returned a duplicate resource identity.");
-        identities.add(identity);
-        resources.push(resource);
-        unknownFieldCount += resource.unknownFieldCount;
-      }
-      skipToken = parsed.skipToken;
-      unknownFieldCount += parsed.unknownFieldCount;
-      await options.onProgress?.({ pages, observedCount: resources.length, totalRecords });
-    } while (skipToken);
+        const page = await this.requestPage(accessToken, requestedTypes, skipToken, signal, environmentId, defaultPageSize, logContext);
+        metadata = pageTelemetry(page);
+        stage = "validation";
+        const parsed = parsePage(page, requestedTypes, environmentId, expectedTenantId, resources.length);
+        pages += 1;
+        totalRecords ??= parsed.totalRecords;
+        if (parsed.totalRecords !== totalRecords) throw new InventorySchemaError("Power Platform inventory changed totalRecords during paging.", { reason: "changed_total", field: "totalRecords" });
+        if (resources.length + parsed.resources.length > maximumRows) throw new AppError(502, "provider_result_limit", "Power Platform inventory exceeded the bounded row limit.");
+        for (const [index, resource] of parsed.resources.entries()) {
+          const identity = `${resource.tenantId}\0${resource.type}\0${resource.environmentId ?? ""}\0${resource.nativeId}`;
+          const firstSeenPage = identities.get(identity);
+          if (firstSeenPage !== undefined) throw new InventorySchemaError("Power Platform inventory returned a duplicate resource identity.", {
+            reason: "duplicate_identity", resourceType: resource.type, resourceIndex: index + 1, firstSeenPage,
+          });
+          identities.set(identity, pages);
+          resources.push(resource);
+          unknownFieldCount += resource.unknownFieldCount;
+        }
+        skipToken = parsed.skipToken;
+        unknownFieldCount += parsed.unknownFieldCount;
+        const omittedFieldCount = parsed.unknownFieldCount + parsed.resources.reduce((count, resource) => count + resource.unknownFieldCount, 0);
+        if (omittedFieldCount) operationalLog("warn", "provider_schema_omission", { ...logContext, count: omittedFieldCount });
+        operationalLog("info", "inventory_page_validated", {
+          ...logContext, ...metadata, omittedFieldCount,
+          catalogScopedCount: parsed.resources.filter(resource => resource.provenance.tenantId.path === "authenticated_query.tenantId").length,
+        });
+        stage = "record_progress";
+        await options.onProgress?.({ pages, observedCount: resources.length, totalRecords });
+        completedPages = pages;
+        completedCount = resources.length;
+      } while (skipToken);
 
-    if (resources.length !== totalRecords) {
-      throw new AppError(502, "provider_schema", "Power Platform inventory ended before the documented total was enumerated.");
+      stage = "completion";
+      if (resources.length !== totalRecords) {
+        throw new InventorySchemaError("Power Platform inventory ended before the documented total was enumerated.", { reason: "incomplete_enumeration" });
+      }
+      operationalLog("info", "inventory_query_completed", {
+        ...logContext, pages, observedCount: resources.length, totalRecords,
+        omittedFieldCount: unknownFieldCount, durationMs: Math.round(performance.now() - startedAt),
+      });
+      return { resources, totalRecords: totalRecords ?? 0, pages, unknownFieldCount };
+    } catch (error) {
+      const failure = isTimeoutError(error) ? new AppError(504, "provider_timeout", deadlineSignal.aborted
+        ? `Power Platform inventory exceeded the ${powerPlatformInventoryQueryDeadlineMs / 1_000}-second enumeration limit. No incomplete snapshot was saved. Retry the refresh or select a narrower scope.`
+        : "Power Platform inventory page request timed out before complete enumeration. No incomplete snapshot was saved. Retry the refresh.") : error;
+      operationalLog("error", "inventory_query_failed", {
+        ...logContext, ...metadata, stage, pages: completedPages, observedCount: completedCount,
+        durationMs: Math.round(performance.now() - startedAt), ...errorTelemetry(failure, "provider_error"),
+        ...(error instanceof InventorySchemaError ? error.diagnostics : {}),
+      });
+      throw failure;
     }
-
-    return { resources, totalRecords: totalRecords ?? 0, pages, unknownFieldCount };
   }
 
   async checkAccess(accessToken: string, signal?: AbortSignal) {
     const requestedTypes = ["microsoft.powerplatform/environments"] as const;
-    const page = await this.requestPage(accessToken, requestedTypes, undefined, signal ?? AbortSignal.timeout(10_000), undefined, 1);
-    const parsed = parsePage(page, requestedTypes);
-    if (parsed.resources.length > 1) throw new AppError(502, "provider_schema", "Power Platform access check returned an oversized page.");
+    const logContext: QueryLogContext = { provider: "power_platform", source: "capability_check", page: 1 };
+    let metadata: ReturnType<typeof pageTelemetry> = {};
+    try {
+      const page = await this.requestPage(accessToken, requestedTypes, undefined, signal ?? AbortSignal.timeout(10_000), undefined, 1, logContext);
+      metadata = pageTelemetry(page);
+      const parsed = parsePage(page, requestedTypes);
+      if (parsed.resources.length > 1) throw new InventorySchemaError("Power Platform access check returned an oversized page.", { reason: "oversized_access_check", field: "count" });
+      operationalLog("info", "inventory_access_check_completed", { ...logContext, ...metadata });
+    } catch (error) {
+      operationalLog("warn", "inventory_query_failed", {
+        ...logContext, ...metadata, ...errorTelemetry(error, "provider_error"),
+        ...(error instanceof InventorySchemaError ? error.diagnostics : {}),
+      });
+      throw error;
+    }
   }
 
-  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId?: string, pageSize = defaultPageSize): Promise<ResourceQueryPage> {
+  private async requestPage(accessToken: string, types: readonly PowerPlatformResourceType[], skipToken: string | undefined, signal: AbortSignal, environmentId: string | undefined, pageSize: number, logContext: QueryLogContext): Promise<ResourceQueryPage> {
     const body = {
       TableName: "PowerPlatformResources",
       Clauses: [{
@@ -132,22 +205,32 @@ export class PowerPlatformResourceQueryClient {
         FieldName: "type",
         Operator: "in~",
         Values: types.map(type => `'${type.replaceAll("'", "''")}'`),
-      }, ...(environmentId ? [{ $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] }] : [])],
+      }, ...(environmentId ? [{ $type: "where", FieldName: "properties.environmentId", Operator: "==", Values: [JSON.stringify(environmentId)] }] : []), {
+        $type: "orderby",
+        FieldNamesAscDesc: { tenantId: "asc", type: "asc", "tostring(properties.environmentId)": "asc", name: "asc" },
+      }],
       Options: {
         Top: pageSize,
-        Skip: 0,
-        ...(skipToken ? { SkipToken: skipToken } : {}),
+        // Explicit Skip overrides the continuation offset, including when it is zero.
+        ...(skipToken ? { SkipToken: skipToken } : { Skip: 0 }),
       },
     };
 
     for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
       if (signal.aborted) throw signal.reason;
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      const startedAt = performance.now();
+      const retry = async (retryDelayMs: number, reason: string) => {
+        operationalLog("warn", "inventory_provider_retry", { ...logContext, attempt, retryDelayMs, reason });
+        await this.waitForRetry(retryDelayMs, signal);
+      };
+      operationalLog("info", "inventory_provider_request", { ...logContext, attempt, pageSize, hasContinuation: Boolean(skipToken) });
       let response: Response;
       try {
         response = await this.fetcher(resourceQueryEndpoint, {
           method: "POST",
           redirect: "error",
-          signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+          signal: requestSignal,
           headers: {
             Authorization: `Bearer ${accessToken}`,
             Accept: "application/json",
@@ -156,24 +239,37 @@ export class PowerPlatformResourceQueryClient {
           body: JSON.stringify(body),
         });
       } catch (error) {
+        operationalLog("warn", "inventory_provider_failure", {
+          ...logContext, attempt, stage: "transport", durationMs: Math.round(performance.now() - startedAt),
+          ...errorTelemetry(signal.aborted ? signal.reason : error, "provider_error"),
+        });
         if (signal.aborted) throw signal.reason;
         if (attempt === this.retryPolicy.maxAttempts) throw error;
-        await this.waitForRetry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), signal);
+        await retry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), "transport");
         continue;
       }
 
+      operationalLog(response.ok ? "info" : "warn", "inventory_provider_response", {
+        ...logContext, attempt, status: response.status, durationMs: Math.round(performance.now() - startedAt),
+        providerRequestId: response.headers.get("x-ms-request-id") ?? response.headers.get("request-id"),
+        providerCorrelationId: response.headers.get("x-ms-correlation-request-id"),
+      });
       if (response.redirected || response.url && new URL(response.url).origin !== new URL(resourceQueryEndpoint).origin) {
         await disposeResponse(response);
         throw new AppError(502, "invalid_provider_link", "Power Platform inventory refused a redirected or foreign-origin response.");
       }
       if (response.ok) {
         try {
-          return await boundedProviderJson<ResourceQueryPage>(response);
+          return await boundedProviderJson<ResourceQueryPage>(response, requestSignal);
         } catch (error) {
+          operationalLog("warn", "inventory_provider_failure", {
+            ...logContext, attempt, stage: "response_body", durationMs: Math.round(performance.now() - startedAt),
+            ...errorTelemetry(signal.aborted ? signal.reason : error, "provider_error"),
+          });
           if (signal.aborted) throw signal.reason;
           if (error instanceof AppError || attempt === this.retryPolicy.maxAttempts) throw error;
           await disposeResponse(response);
-          await this.waitForRetry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), signal);
+          await retry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), "response_body");
           continue;
         }
       }
@@ -181,7 +277,7 @@ export class PowerPlatformResourceQueryClient {
       if (attempt === this.retryPolicy.maxAttempts || (response.status !== 429 && response.status < 500)) {
         throw new AppError(response.status, "provider_error", "Power Platform inventory query failed.");
       }
-      await this.waitForRetry(retryAfterMs(response.headers.get("retry-after"), this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), signal);
+      await retry(retryAfterMs(response.headers.get("retry-after"), this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), response.status === 429 ? "throttled" : "server_error");
     }
 
     throw new AppError(500, "retry_exhausted", "Power Platform inventory retry attempts were exhausted.");
@@ -219,26 +315,65 @@ function validateTypes(types: readonly PowerPlatformResourceType[]) {
   return unique;
 }
 
-function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResourceType[], expectedEnvironmentId?: string, expectedTenantId?: string) {
-  if (!isRecord(page) || !Number.isSafeInteger(page.totalRecords) || (page.totalRecords as number) < 0 || (page.totalRecords as number) > maximumRows || !Number.isSafeInteger(page.count) || (page.count as number) < 0 || (page.count as number) > defaultPageSize || !Array.isArray(page.data) || page.data.length !== page.count) {
-    throw new AppError(502, "provider_schema", "Power Platform inventory returned an invalid page shape.");
+function pageTelemetry(page: unknown): {
+  totalRecords?: number; returnedCount?: number; dataCount?: number; hasContinuation?: boolean; resultTruncated?: boolean;
+} {
+  if (!isRecord(page)) return {};
+  return {
+    totalRecords: typeof page.totalRecords === "number" && Number.isSafeInteger(page.totalRecords) ? page.totalRecords : undefined,
+    returnedCount: typeof page.count === "number" && Number.isSafeInteger(page.count) ? page.count : undefined,
+    dataCount: Array.isArray(page.data) ? page.data.length : undefined,
+    hasContinuation: typeof page.skipToken === "string" && page.skipToken.length > 0,
+    resultTruncated: [0, 1, false, true].includes(page.resultTruncated as never) ? Boolean(page.resultTruncated) : undefined,
+  };
+}
+
+function valueType(value: unknown) {
+  return value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+}
+
+function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResourceType[], expectedEnvironmentId?: string, expectedTenantId?: string, previouslyObservedCount = 0) {
+  if (!isRecord(page)) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_page", actualType: valueType(page) });
+  }
+  if (!Number.isSafeInteger(page.totalRecords) || (page.totalRecords as number) < 0 || (page.totalRecords as number) > maximumRows) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_total", field: "totalRecords", actualType: valueType(page.totalRecords) });
+  }
+  if (!Number.isSafeInteger(page.count) || (page.count as number) < 0 || (page.count as number) > defaultPageSize) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_count", field: "count", actualType: valueType(page.count) });
+  }
+  if (!Array.isArray(page.data) || page.data.length !== page.count) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_page_data", field: "data", actualType: valueType(page.data) });
   }
   const skipToken = page.skipToken === undefined || page.skipToken === null || page.skipToken === ""
     ? undefined
     : typeof page.skipToken === "string" && page.skipToken.length <= 4_096
       ? page.skipToken
-      : invalidContinuationToken();
+      : invalidContinuationToken(page.skipToken);
   if (![0, 1, false, true].includes(page.resultTruncated as never)) {
-    throw new AppError(502, "provider_schema", "Power Platform inventory returned an invalid truncation marker.");
+    throw new InventorySchemaError("Power Platform inventory returned an invalid truncation marker.", { reason: "invalid_truncation", field: "resultTruncated", actualType: valueType(page.resultTruncated) });
   }
   const pageTruncated = page.resultTruncated === 1 || page.resultTruncated === true;
-  if (pageTruncated && !skipToken) throw new AppError(502, "provider_schema", "Power Platform inventory marked a page truncated without a continuation token.");
-  if (!pageTruncated && skipToken || skipToken && page.count === 0) throw new AppError(502, "provider_schema", "Power Platform inventory returned inconsistent continuation metadata.");
-  const resources = page.data.map(parseResource);
+  const observedCount = previouslyObservedCount + page.data.length;
+  if (observedCount > (page.totalRecords as number)) throw new InventorySchemaError("Power Platform inventory returned more resources than the documented total.", { reason: "exceeded_total", field: "totalRecords" });
+  // The provider can retain resultTruncated on the final page; exact enumeration, not that marker alone, proves completion.
+  if (pageTruncated && !skipToken && observedCount < (page.totalRecords as number)) throw new InventorySchemaError("Power Platform inventory marked a page truncated without a continuation token.", { reason: "missing_continuation", field: "skipToken" });
+  if (skipToken && (!pageTruncated || page.count === 0 || observedCount === page.totalRecords)) throw new InventorySchemaError("Power Platform inventory returned inconsistent continuation metadata.", { reason: "inconsistent_continuation" });
+  const resources = page.data.map((value, index) => {
+    try {
+      return parseResource(value, expectedTenantId);
+    } catch (error) {
+      if (error instanceof InventorySchemaError) error.diagnostics.resourceIndex = index + 1;
+      throw error;
+    }
+  });
   const requested = new Set(requestedTypes);
-  for (const resource of resources) {
+  for (const [index, resource] of resources.entries()) {
     if (!requested.has(resource.type) || expectedEnvironmentId && resource.environmentId !== expectedEnvironmentId || expectedTenantId && resource.tenantId !== expectedTenantId) {
-      throw new AppError(502, "provider_schema", "Power Platform inventory returned data outside the requested tenant, environment, or resource type scope.");
+      const field = !requested.has(resource.type) ? "type" : expectedEnvironmentId && resource.environmentId !== expectedEnvironmentId ? "environmentId" : "tenantId";
+      throw new InventorySchemaError("Power Platform inventory returned data outside the requested tenant, environment, or resource type scope.", {
+        reason: "scope_mismatch", field, resourceType: resource.type, resourceIndex: index + 1,
+      });
     }
   }
   return {
@@ -249,15 +384,39 @@ function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResource
   };
 }
 
-function parseResource(value: unknown): PowerPlatformResource {
-  if (!isRecord(value) || typeof value.tenantId !== "string" || typeof value.name !== "string" || typeof value.type !== "string" || !powerPlatformResourceTypes.includes(value.type as PowerPlatformResourceType)) {
-    throw new AppError(502, "provider_schema", "Power Platform inventory returned an invalid resource identity.");
+function parseResource(value: unknown, expectedTenantId?: string): PowerPlatformResource {
+  if (!isRecord(value)) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", { reason: "invalid_resource", actualType: valueType(value) });
   }
-  if (!validText(value.tenantId, 128) || !validText(value.name, 512)) throw new AppError(502, "provider_schema", "Power Platform inventory returned an oversized resource identity.");
-  if (value.location !== undefined && value.location !== null && typeof value.location !== "string") {
-    throw new AppError(502, "provider_schema", "Power Platform inventory returned an invalid resource location.");
+  if (typeof value.type !== "string" || !powerPlatformResourceTypes.includes(value.type as PowerPlatformResourceType)) {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", { reason: "invalid_resource_type", field: "type", actualType: valueType(value.type) });
   }
   const type = value.type as PowerPlatformResourceType;
+  if (typeof value.name !== "string") {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", { reason: "invalid_identity_type", field: "name", actualType: valueType(value.name), resourceType: type });
+  }
+  const catalogWithoutTenant = value.type === "microsoft.powerplatformconnector/connectors"
+    && (value.tenantId === "" || value.tenantId === null || value.tenantId === undefined);
+  if (catalogWithoutTenant && !expectedTenantId) {
+    throw new InventorySchemaError("Power Platform connector catalog entries without tenant metadata require an authenticated inventory tenant scope.", {
+      reason: "missing_catalog_scope", field: "tenantId", actualType: valueType(value.tenantId), resourceType: type,
+    });
+  }
+  // Catalog availability is scoped by the delegated query, not by connector ownership.
+  const tenantId = catalogWithoutTenant ? expectedTenantId : value.tenantId;
+  if (typeof tenantId !== "string") throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", {
+    reason: "invalid_identity_type", field: "tenantId", actualType: valueType(tenantId), resourceType: type,
+  });
+  for (const [field, length, maximumLength] of [["tenantId", tenantId.length, 128], ["name", value.name.length, 512]] as const) {
+    if (length === 0 || length > maximumLength) {
+      throw new InventorySchemaError(`Power Platform inventory returned an ${length === 0 ? "empty" : "oversized"} ${field} for ${value.type} (length ${length}; expected 1-${maximumLength}).`, {
+        reason: length === 0 ? "empty_identity" : "identity_too_long", field, length, maximumLength, resourceType: type,
+      });
+    }
+  }
+  if (value.location !== undefined && value.location !== null && typeof value.location !== "string") {
+    throw new InventorySchemaError("Power Platform inventory returned an invalid resource location.", { reason: "invalid_location", field: "location", actualType: valueType(value.location), resourceType: type });
+  }
   const context = projectionContext(value.properties, type);
   context.omittedCount += Object.keys(value).filter(key => !["tenantId", "name", "type", "location", "properties"].includes(key)).length;
   const displayName = optionalString(context, "displayName", "properties.displayName", "ga", 512);
@@ -278,18 +437,22 @@ function parseResource(value: unknown): PowerPlatformResource {
     ...identifier(context, "entraAgentBlueprintId", "entra_blueprint_id"),
   ];
   const details = projectDetails(context, type);
+  if (type === "microsoft.powerplatformconnector/connectors") {
+    if (typeof value.tenantId === "string" || value.tenantId === null) details.sourceTenantId = value.tenantId;
+    context.provenance.sourceTenantId = { sourceSystem: "power_platform", path: value.tenantId === undefined ? "not_supplied" : "tenantId", maturity: "ga" };
+  }
   const authoringTool = deriveAuthoringTool(type, createdIn);
   const agentKind = deriveAgentKind(type, createdIn, details.subType);
   const lifecycle = deriveLifecycle(type, context.properties.lastPublishedAt, Object.hasOwn(context.properties, "lastPublishedAt"), lastPublishedAt);
   context.provenance.sourceSystem = { sourceSystem: "power_platform", path: "PowerPlatformResources", maturity: "ga" };
+  context.provenance.tenantId = { sourceSystem: "power_platform", path: catalogWithoutTenant ? "authenticated_query.tenantId" : "tenantId", maturity: "ga" };
   context.provenance.authoringTool = { sourceSystem: "power_platform", path: authoringTool && type === "microsoft.copilotstudio/agents" ? "properties.createdIn" : authoringTool ? "type" : "not_supplied", maturity: "ga" };
   context.provenance.agentKind = { sourceSystem: "power_platform", path: details.subType ? "properties.subType" : type === "microsoft.copilotstudio/agents" && agentKind !== "agent" ? "properties.createdIn" : "type", maturity: "ga" };
   context.provenance.lifecycle = { sourceSystem: "power_platform", path: type === "microsoft.copilotstudio/agents" && Object.hasOwn(context.properties, "lastPublishedAt") ? "properties.lastPublishedAt" : "type", maturity: "ga" };
   context.provenance.creatorType = { sourceSystem: "power_platform", path: "not_supplied", maturity: "ga" };
   context.provenance.identityConfidence = { sourceSystem: "power_platform", path: "name", maturity: "ga" };
-  if (context.omittedCount) operationalLog("warn", "provider_schema_omission", { provider: "power_platform", count: context.omittedCount });
   return {
-    tenantId: value.tenantId,
+    tenantId,
     nativeId: value.name,
     type,
     location: type !== "microsoft.powerplatformconnector/connectors" && typeof value.location === "string" ? value.location.slice(0, 256) : null,
@@ -540,8 +703,11 @@ function validText(value: unknown, maximumLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maximumLength;
 }
 
-function invalidContinuationToken(): never {
-  throw new AppError(502, "provider_schema", "Power Platform inventory returned an invalid continuation token.");
+function invalidContinuationToken(value: unknown): never {
+  throw new InventorySchemaError("Power Platform inventory returned an invalid continuation token.", {
+    reason: "invalid_continuation", field: "skipToken", actualType: valueType(value),
+    ...(typeof value === "string" ? { length: value.length, maximumLength: 4_096 } : {}),
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

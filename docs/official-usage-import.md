@@ -10,7 +10,7 @@ This runbook imports the Microsoft 365 admin-center Copilot Agents usage exports
 4. Select each **Agents**, **Users & agents**, and **Users** table/tab and use its **Export CSV** action for that same period.
 5. Keep the original files until Agent Control confirms that the complete bundle is active.
 
-Microsoft says interaction usage can become visible within one hour. That is source latency, not proof that an exported or imported set is current. Record the reporting start/end shown by the report. Enter a source as-of timestamp only when the Microsoft report explicitly shows one.
+Microsoft says interaction usage can become visible within one hour. That is source latency, not proof that an exported or imported set is current. You do not need to record or enter dates to import the files.
 
 Microsoft source: [Copilot Agents usage report](https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide), rechecked 2026-09-09; source page updated 2026-08-18.
 
@@ -24,7 +24,9 @@ Header matching is case/whitespace normalized but otherwise exact. These labels 
 | Users & agents | `m365-users-agents-observed-v1` | Agent ID; Agent name; Creator type; Username; Responses sent to users; Last activity date (UTC) |
 | Users | `m365-users-observed-v1` | Username; Display name; Number of agents used; Agent responses received; Last activity date (UTC) |
 
-The CSVs do not contain reporting-period or source-as-of metadata columns. Agent Control therefore labels supplied values `operator_asserted` and source freshness `unknown`. Download time is retained separately. It is never used to infer period compatibility.
+The CSVs do not contain reporting-period or source-as-of metadata columns. Agent Control imports **all rows**, derives the minimum and maximum available UTC last-activity dates, and labels that coverage `activity_range`. This is observed activity coverage, **not** the actual reporting window or proof of complete daily coverage. Different files may have different activity ranges; that does not make the bundle incompatible. Reports without dated activity remain importable with unknown coverage.
+
+The source refresh time remains unknown. The app does not guess it from the filename, upload time, or last-activity date. Previously imported administrator-supplied periods remain labeled `operator_asserted`; API clients can still supply explicit metadata, but the import screen does not ask for it. Export all three files from the same Microsoft reporting selection: without period metadata, automatic import cannot prove that unrelated exports belong to the same reporting window.
 
 Microsoft documents the following interpretation constraints:
 
@@ -36,15 +38,52 @@ Microsoft documents the following interpretation constraints:
 ## Validate and accept
 
 1. Sign in with `AgentControl.Admin`. Admin includes all Viewer access, including aggregate and user-level accepted report views.
-2. Open **Official usage** and use its Admin-only import panel to enter the report start/end dates. Select **This bundle is an explicit correction** before replacing an active set.
+2. Open **Official usage > Import reports**. Upload, validation, approval, and retained-set management are contained in this dialog, separate from the reporting dashboard. Expand **How to export the CSV files** for Microsoft export instructions. No reporting start, reporting end, or source-as-of input is required. Select **This bundle is an explicit correction** before replacing an active set.
 3. Choose one or more original CSVs and select **Validate and stage**. The server, not the browser, identifies each kind and parses the rows.
 4. Review the full bundle hash, coverage, per-file hash/schema/period/source basis, warnings and reconciliation. Source values that disagree remain separate and visible.
 5. Add missing companions to the same bundle. Reloading restores the current Admin's active staging. Incomplete submissions remain non-published and cannot change active usage.
-6. Select **Accept reviewed bundle** only when all three kinds are present. The server rechecks the bundle hash and active-selection revision and commits all staged companions atomically.
+6. Select **Accept reviewed bundle** only when all three kinds are present. The server rechecks the bundle hash and active-selection revision and commits all staged companions atomically. Select **Back to reports** to see the refreshed dashboard.
+
+Closing the dialog does not accept or discard reports. Reopening it on the same page preserves selected files and validation results. After navigating away or reloading, reopen **Import reports** to restore server-side staging; files not yet staged must be selected again. Exact staging links open the dialog automatically. Retained-set selection and deletion remain inside this management experience, with a separate confirmation.
+
+If a file fails validation, its actual error and filename remain visible. Successful companion files remain staged; rejected files can be retried without restarting the bundle. An entirely rejected upload does not trigger a lookup for a nonexistent bundle.
 
 Exact retries use a finite content-free receipt containing tenant, actor, bundle, original hash/revision and original result. They return that result after staging cleanup without replaying or reselecting anything; changed intent fails. A correction creates a superseding set. Selecting or deleting a retained set requires a separate native confirmation dialog. Deleting the active set clears selection; Agent Control never chooses an older set automatically.
 
+## Read the dashboard and review licenses
+
+The dashboard starts with response, distinct-user, and agent totals followed by usage charts, not import controls. Activity coverage and availability remain visible. **Report details** expands source authority, freshness, versions, reconciliation, and interpretation limits; a compact **Source totals differ** indicator remains visible when totals disagree. Upload history and approval statistics are only in **Import reports**, available to Admins.
+
+The dashboard includes all imported data, including undated and zero-response rows. Optional date filters are applied **after import** to the last-activity values. The CSVs are aggregate snapshots, not daily activity logs: filtering a row by its last-activity date does not turn its full-export response count into a count for the selected interval.
+
+| Source | Information available for analysis |
+| --- | --- |
+| Agents | Every agent ID, name, creator type, licensed and unlicensed active-user category, response total, and agent-wide last-activity date |
+| Users | Every reported username, display name, agent count, responses received, and the user's last-activity date |
+| Users & agents | Each reported user-agent relationship, agent ID/name/creator, response count, and the agent-wide last-activity date |
+
+Response totals and agent counts from the Users export are shown separately from the user-agent relationship totals when they disagree. A source discrepancy is a data-quality signal, not a reason to discard rows or overwrite one report with another. Identifiers seen in only one report remain available with their missing-source status.
+
+Filtered agent and user CSV downloads preserve these source distinctions. The user download has one row per reported user-agent relationship, or one row with empty agent fields when the user has no relationship rows. User-level totals repeat on relationship rows; do not sum those repeated totals as though they were per-agent counts.
+
+For IT license reviews:
+
+1. Sort users by responses to see the most and least active reported users. Use a configurable low-response threshold to assemble a review cohort, and inspect each user's agent breakdown and creator types.
+2. Review zero-response, low-response, and stale-activity signals separately. A blank last-activity date means unknown, not inactive. User recency must come from Users, never from the agent-wide date on a Users & agents row.
+3. Inspect discrepancies before acting and retain the source totals in exported review data.
+4. Confirm the person's current Microsoft 365 Copilot license assignment, broader Copilot activity, role, and business need using your approved administration workflow before reclaiming or reallocating a license.
+
+**These exports cannot identify every unused Microsoft 365 Copilot license.** They do not include a tenant license roster, per-person license assignment, or all Copilot use in Word, Excel, Teams, Outlook, and other apps. A user absent from the files cannot be classified as having zero usage. Even a reported user with zero agent responses may use Copilot elsewhere. License status is therefore unavailable at user level; low agent usage is a candidate for review, not an automatic unassignment recommendation. Licensed and unlicensed agent-level categories cannot be joined back to individual users.
+
+## Export compatibility check
+
+The three supplied September 12, 2026 exports were checked against the header registry: all 7 Agents columns, 6 Users & agents columns, and 5 Users columns match. UTF-8 BOMs, quoted English UTC dates, and quoted comma-grouped counts are supported. No additional CSV columns are silently ignored.
+
+The supplied snapshot contains 244 agents, 517 user-agent relationships, and 300 users, with observed UTC last activity from August 14 through September 12. Agents and Users & agents each report 9,693 responses; Users reports 9,697. One user's source totals differ. There are 145 reported users with 1-5 responses and no zero-response rows in this Users export. This does **not** establish that the tenant has no inactive license holders.
+
 ## Limits and retention
+
+Existing installations must apply schema migration 28 through the normal [deployment workflow](deployment-setup.md) before starting the updated runtime. It adds nullable activity coverage and set-level provenance while retaining legacy report metadata and completed-set immutability. Use the migration operator, not the restricted runtime database role.
 
 | Boundary | Limit |
 | --- | --- |
@@ -60,7 +99,7 @@ Exact retries use a finite content-free receipt containing tenant, actor, bundle
 
 Run ordinary [operator retention](operations.md#retention) at least daily while the POC is active. Load the existing internal helper and use its exact project/database confirmation, preview and bounded-batch safeguards as documented there. Retention is not a `deploy-local.ps1` argument.
 
-`OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to 35 and accepts 1 through 365. A selected set is stale when either the report-period age or accepted-set age exceeds the threshold. Never treat `unknown` source freshness as current.
+`OFFICIAL_USAGE_STALE_AFTER_DAYS` defaults to 35 and accepts 1 through 365. Staleness uses the age of the available coverage endpoint and the accepted-set age; an absent activity date is not evidence of a fresh source. Never treat `unknown` source freshness as current.
 
 ## Failure recovery
 
@@ -74,4 +113,4 @@ Run ordinary [operator retention](operations.md#retention) at least daily while 
 
 ## API availability review
 
-The current Microsoft Graph [`copilotReportRoot`](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/reports/resources/copilotreportroot) lists exactly three `v1.0`/`beta` methods: `getMicrosoft365CopilotUserCountSummary`, `getMicrosoft365CopilotUserCountTrend`, and `getMicrosoft365CopilotUsageUserDetail`. They cover licensed Microsoft 365 Copilot app adoption/activity, not the Copilot Agents report's per-agent rows, user-agent bridge, licensed/unlicensed active-user categories and responses. Agent Control does not request `Reports.Read.All` or automate these methods for this feature.
+The current Microsoft Graph [`copilotReportRoot`](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/reports/resources/copilotreportroot) lists exactly three `v1.0`/`beta` methods: `getMicrosoft365CopilotUserCountSummary`, `getMicrosoft365CopilotUserCountTrend`, and `getMicrosoft365CopilotUsageUserDetail`. They cover licensed Microsoft 365 Copilot app adoption/activity, not the Copilot Agents report's per-agent rows, user-agent bridge, licensed/unlicensed active-user categories and responses. The import feature does not call those methods. The separate [license usage dashboard](copilot-license-usage.md) requests `Reports.Read.All` and calls only the per-user D30 detail report on explicit snapshot load; it does not substitute that app activity for Copilot Agents metrics.

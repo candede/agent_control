@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { inventoryProviderRoleIds } from "./inventoryRoleScope.js";
 import { PowerPlatformInventoryService } from "./powerPlatformInventory.js";
+import { withTelemetryContext } from "./telemetry.js";
 
 const user: AuthenticatedUser = {
   tenantId: "tenant-a", homeAccountId: "principal-a", displayName: "Reader", username: "reader@example.invalid",
@@ -32,6 +33,13 @@ function fixture(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Power Platform inventory refresh service", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
   it("starts only after current authorization and publishes complete results", async () => {
     const { service, repository, dependencies } = fixture();
     await expect(service.start(user, "11111111-1111-1111-1111-111111111111")).resolves.toMatchObject({ status: "waiting_authorization" });
@@ -47,6 +55,75 @@ describe("Power Platform inventory refresh service", () => {
     await expect(service.start(user, "11111111-1111-1111-1111-111111111111")).rejects.toMatchObject({ code: "interaction_required" });
     expect(repository.markRunning).not.toHaveBeenCalled();
     expect(dependencies.query).not.toHaveBeenCalled();
+    expect(vi.mocked(console.warn).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
+      event: "inventory_refresh_start_failed", stage: "delegated_token", errorCode: "interaction_required",
+    }));
+  });
+
+  it("correlates accepted requests with background progress and publication", async () => {
+    const { service, job, repository, dependencies } = fixture();
+    dependencies.query.mockImplementation(async (_token, _types, options) => {
+      await options.onProgress({ pages: 1, observedCount: 0, totalRecords: 0 });
+      return { resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 };
+    });
+    await withTelemetryContext({ requestId: "request-a", route: "/inventory/refresh-jobs" }, () => service.start(user, job.id));
+    await vi.waitFor(() => expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .toContainEqual(expect.objectContaining({ event: "inventory_refresh_succeeded" })));
+    const entries = vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry));
+    for (const event of ["inventory_refresh_started", "inventory_refresh_progress", "inventory_refresh_succeeded"]) {
+      expect(entries).toContainEqual(expect.objectContaining({ event, requestId: "request-a", jobId: job.id, route: "/inventory/refresh-jobs" }));
+    }
+    expect(repository.recordProgress).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, 1, 0, 0);
+    expect(JSON.stringify(entries)).not.toContain(user.homeAccountId);
+    expect(JSON.stringify(entries)).not.toContain(user.username);
+  });
+
+  it("logs asynchronous provider failures after submission without exposing error messages", async () => {
+    const { service, job, dependencies } = fixture();
+    dependencies.query.mockRejectedValue(new AppError(502, "provider_schema", "private-provider-row"));
+    await withTelemetryContext({ requestId: "request-failed" }, () => service.start(user, job.id));
+    await vi.waitFor(() => expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .toContainEqual(expect.objectContaining({
+        event: "inventory_refresh_failed", requestId: "request-failed", jobId: job.id,
+        status: "failed", errorCode: "provider_schema", stage: "query",
+      })));
+    expect(JSON.stringify([...vi.mocked(console.warn).mock.calls, ...vi.mocked(console.error).mock.calls])).not.toContain("private-provider-row");
+  });
+
+  it("allows a minute-long enumeration before publication with a bounded 150-second execution budget", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("Synthetic deadline", "TimeoutError")), milliseconds);
+      return controller.signal;
+    });
+    const { service, job, dependencies, repository } = fixture();
+    dependencies.query.mockImplementation((_token, _types, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+      setTimeout(() => resolve({ resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 }), 61_500);
+    }));
+    await service.start(user, job.id);
+    await vi.advanceTimersByTimeAsync(61_500);
+    expect(timeout).toHaveBeenCalledWith(150_000);
+    expect(repository.publish).toHaveBeenCalledOnce();
+    expect(repository.markFailed).not.toHaveBeenCalled();
+    expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    new AppError(504, "provider_timeout", "Power Platform inventory exceeded the 120-second enumeration limit."),
+    new DOMException("private execution timeout", "TimeoutError"),
+  ])("persists a clear timeout failure instead of generic failure or waiting authorization", async error => {
+    const { service, job, dependencies, repository } = fixture();
+    dependencies.query.mockRejectedValue(error);
+    await service.start(user, job.id);
+    await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledOnce());
+    expect(repository.markFailed).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "provider_timeout",
+      expect.stringMatching(/(?:120-second enumeration|150-second execution) limit/),
+    );
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
   });
 
   it("turns interrupted work into explicit reauthorization and drains all active refreshes", async () => {

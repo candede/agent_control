@@ -1,6 +1,7 @@
 import type { RequestHandler, Router } from "express";
 import { requireCapability, requireCsrf, requireRoles, requireSession } from "../middleware/auth.js";
 import type { AppRole, CapabilityId } from "../types/capability.js";
+import { operationalLog, withTelemetryContext } from "../services/telemetry.js";
 
 export type RoutePolicy =
   | { access: "public"; dataClass: "public" | "identity" }
@@ -14,7 +15,10 @@ export function policyRoute(router: Router, method: RouteMethod, path: string, p
   const previous = declaredRoutePolicies.get(key);
   if (previous && JSON.stringify(previous) !== JSON.stringify(policy)) throw new Error(`Conflicting route policy: ${key}`);
   declaredRoutePolicies.set(key, policy);
-  const middleware: RequestHandler[] = [];
+  const middleware: RequestHandler[] = [(_request, _response, next) => withTelemetryContext({ route: path }, () => {
+    if (method !== "get") operationalLog("info", "http_request_started", { mode: method.toUpperCase() });
+    next();
+  })];
   if (policy.access === "authenticated") {
     middleware.push(requireSession);
     if (policy.roles?.length) middleware.push(requireRoles(...policy.roles));

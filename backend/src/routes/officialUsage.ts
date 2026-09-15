@@ -267,7 +267,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
         const view = buildOfficialUsageAggregateView(published, packages.value, { ...aggregateOptions(request.query), limit: 100_000, offset: 0 });
         const datasetKey = officialDatasetKey(published);
         return {
-          columns: ["agentId", "agentName", "creatorType", "creatorTypeSource", "activeUsersLicensed", "activeUsersUnlicensed", "activeUsersTotal", "activeUsersTotalBasis", "activeUsersIdentityCount", "responsesSentToUsers", "responseComparisonStatus", "responsesAgentsReport", "responsesUsersAndAgentsReport", "lastActivityDateUtc", "sourceReports", "identityStatus", "reportSetId", "reportingStart", "reportingEnd", "agentsVersionId", "agentsPeriodProvenance", "agentsSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness"] as const,
+          columns: ["agentId", "agentName", "creatorType", "creatorTypeSource", "activeUsersLicensed", "activeUsersUnlicensed", "activeUsersTotal", "activeUsersTotalBasis", "activeUsersIdentityCount", "responsesSentToUsers", "responseComparisonStatus", "responseDifference", "responsesAgentsReport", "responsesUsersAndAgentsReport", "lastActivityDateUtc", "sourceReports", "identityStatus", "reportSetId", "reportingStart", "reportingEnd", "agentsVersionId", "agentsPeriodProvenance", "agentsSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness"] as const,
           rows: agentExportRows(view),
           metadata: { source: "official_usage", reportSetId: view.activeSet?.id ?? null,
             reportingStart: view.activeSet?.reportingPeriod.startDate ?? null, reportingEnd: view.activeSet?.reportingPeriod.endDate ?? null },
@@ -303,7 +303,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
         });
         const datasetKey = officialDatasetKey(published);
         return {
-          columns: ["username", "displayName", "userMetricSource", "reportedAgentsUsed", "reportedResponsesReceived", "userLastActivityDateUtc", "agentId", "agentName", "creatorType", "creatorTypeSource", "responsesSentToUsers", "agentLastUsedByAnyoneDateUtc", "reportSetId", "reportingStart", "reportingEnd", "usersVersionId", "usersPeriodProvenance", "usersSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness", "identityStatus"] as const,
+          columns: ["username", "displayName", "licenseAssignmentStatus", "reviewCohort", "reviewCandidate", "userMetricSource", "reportedAgentsUsed", "reportedResponsesReceived", "agentsAccessedTotal", "responseProducingAgentCount", "bridgeResponsesSentToUsers", "missingUserReport", "missingBridgeRows", "hasReportMismatch", "userLastActivityDateUtc", "agentId", "agentName", "creatorType", "creatorTypeSource", "responsesSentToUsers", "agentLastUsedByAnyoneDateUtc", "reportSetId", "reportingStart", "reportingEnd", "usersVersionId", "usersPeriodProvenance", "usersSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness", "identityStatus"] as const,
           rows: userExportRows(view),
           metadata: { source: "official_usage", reportSetId: view.activeSet?.id ?? null,
             reportingStart: view.activeSet?.reportingPeriod.startDate ?? null, reportingEnd: view.activeSet?.reportingPeriod.endDate ?? null },
@@ -320,35 +320,53 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   return router;
 }
 
-function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?: string; metadata: OfficialUsageMetadata } {
-  if (!body || typeof body !== "object") throw new AppError(400, "invalid_metadata", "Explicit report metadata is required.");
+function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?: string; metadata?: OfficialUsageMetadata } {
+  if (!body || typeof body !== "object") throw new AppError(400, "invalid_metadata", "The report upload fields are invalid.");
   const fields = body as Record<string, unknown>;
   const allowed = new Set(["bundleId", "correctionOfSetId", "reportingStart", "reportingEnd", "periodProvenance", "sourceAsOf", "sourceAsOfProvenance", "downloadedAt"]);
   if (Object.keys(fields).some(key => !allowed.has(key))) throw new AppError(400, "invalid_metadata", "The report metadata contains an unsupported field.");
-  const periodProvenance = provenance(fields.periodProvenance, "period provenance");
+  const suppliedPeriodFields = [fields.reportingStart, fields.reportingEnd, fields.periodProvenance]
+    .filter(value => value !== undefined && value !== "").length;
+  if (suppliedPeriodFields !== 0 && suppliedPeriodFields !== 3) {
+    throw new AppError(400, "invalid_metadata", "Reporting period start, end, and provenance must be supplied together.");
+  }
+  const periodProvenance = suppliedPeriodFields ? provenance(fields.periodProvenance, "period provenance") : undefined;
   const sourceAsOf = optionalText(fields.sourceAsOf, 128);
-  const sourceProvenance = fields.sourceAsOfProvenance === undefined ? undefined : provenance(fields.sourceAsOfProvenance, "source as-of provenance");
+  const sourceProvenanceValue = optionalText(fields.sourceAsOfProvenance, 64);
+  const sourceProvenance = sourceProvenanceValue ? provenance(sourceProvenanceValue, "source as-of provenance") : undefined;
   if (Boolean(sourceAsOf) !== Boolean(sourceProvenance)) throw new AppError(400, "invalid_metadata", "Source as-of value and provenance must be supplied together.");
+  const reportingPeriod = periodProvenance ? {
+    startDate: text(fields.reportingStart, "reporting period start", 10),
+    endDate: text(fields.reportingEnd, "reporting period end", 10),
+    provenance: periodProvenance,
+  } : undefined;
+  const downloadedAt = fields.downloadedAt ? text(fields.downloadedAt, "download time", 128) : undefined;
+  const metadata = reportingPeriod || sourceAsOf || downloadedAt ? {
+    ...(reportingPeriod ? { reportingPeriod } : {}),
+    ...(sourceAsOf && sourceProvenance ? { sourceAsOf: { value: sourceAsOf, provenance: sourceProvenance } } : {}),
+    ...(downloadedAt ? { downloadedAt } : {}),
+  } : undefined;
   return {
     bundleId: uuid(fields.bundleId),
     correctionOfSetId: fields.correctionOfSetId ? uuid(fields.correctionOfSetId) : undefined,
-    metadata: {
-      reportingPeriod: {
-        startDate: text(fields.reportingStart, "reporting period start", 10),
-        endDate: text(fields.reportingEnd, "reporting period end", 10),
-        provenance: periodProvenance,
-      },
-      ...(sourceAsOf && sourceProvenance ? { sourceAsOf: { value: sourceAsOf, provenance: sourceProvenance } } : {}),
-      ...(fields.downloadedAt ? { downloadedAt: text(fields.downloadedAt, "download time", 128) } : {}),
-    },
+    metadata,
   };
 }
 
 function aggregateOptions(query: Record<string, unknown>) {
+  const sortBy = queryEnum(first(query.sortBy), ["agentName", "responses", "licensedUsers", "unlicensedUsers", "lastActivity"] as const, "agent sort");
+  const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
+  const [startDate, endDate] = queryDateRange(query);
   return {
     staleAfterDays: config.officialUsageStaleDays,
     inactiveDays: queryInteger(first(query.inactiveDays), 30, 365, true),
     activityWindowDays: queryInteger(first(query.activityWindowDays), 30, 365, true),
+    search: queryText(first(query.search), 256),
+    creatorType: queryText(first(query.creatorType), 128),
+    startDate,
+    endDate,
+    agentSortBy: sortBy,
+    sortDirection,
     limit: queryInteger(first(query.limit), 5_000, 5_000, true),
     offset: queryInteger(first(query.offset), 0, 100_000, false),
   };
@@ -363,6 +381,10 @@ function userViewOptions(query: Record<string, unknown>) {
   if (responsesOnly !== undefined && responsesOnly !== "true" && responsesOnly !== "false") {
     throw new AppError(400, "invalid_usage_query", "The official usage response filter is invalid.");
   }
+  const cohort = queryEnum(first(query.cohort), ["all", "zero", "low", "review"] as const, "review cohort");
+  const sortBy = queryEnum(first(query.sortBy), ["displayName", "responses", "agentsUsed", "lastActivity"] as const, "user sort");
+  const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
+  const [startDate, endDate] = queryDateRange(query);
   return {
     staleAfterDays: config.officialUsageStaleDays,
     search: queryText(first(query.search), 256),
@@ -370,6 +392,12 @@ function userViewOptions(query: Record<string, unknown>) {
     activity: activity as "all" | "recent" | "inactive" | "no-activity" | undefined,
     responsesOnly: responsesOnly === "true",
     inactiveDays: queryInteger(first(query.inactiveDays), 30, 365, true),
+    startDate,
+    endDate,
+    lowResponseThreshold: queryInteger(first(query.lowResponseThreshold), 5, 100_000_000, true),
+    cohort,
+    userSortBy: sortBy,
+    sortDirection,
     limit: queryInteger(first(query.limit), 100, 500, true),
     offset: queryInteger(first(query.offset), 0, 100_000, false),
   };
@@ -395,6 +423,35 @@ function queryInteger(value: string | undefined, fallback: number, maximum: numb
   const parsed = Number(value);
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < (positive ? 1 : 0) || parsed > maximum) throw new AppError(400, "invalid_usage_query", "Official usage paging or window value is outside the supported range.");
   return parsed;
+}
+
+function queryDate(value: string | undefined) {
+  if (value === undefined || value === "") return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) throw new AppError(400, "invalid_usage_query", "The official usage date filter must use YYYY-MM-DD.");
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    throw new AppError(400, "invalid_usage_query", "The official usage date filter is not a valid UTC civil date.");
+  }
+  return value;
+}
+
+function queryDateRange(query: Record<string, unknown>) {
+  const startDate = queryDate(first(query.startDate));
+  const endDate = queryDate(first(query.endDate));
+  if (startDate && endDate && startDate > endDate) {
+    throw new AppError(400, "invalid_usage_query", "The official usage start date must not be after the end date.");
+  }
+  return [startDate, endDate] as const;
+}
+
+function queryEnum<const T extends readonly string[]>(value: string | undefined, allowed: T, label: string): T[number] | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (!allowed.includes(value)) throw new AppError(400, "invalid_usage_query", `The official usage ${label} is invalid.`);
+  return value as T[number];
 }
 
 function text(value: unknown, label: string, maximum: number) {
@@ -458,6 +515,7 @@ function* agentExportRows(view: OfficialUsageAggregateView) {
     activeUsersIdentityCount: agent.activeUsersIdentityCount ?? "Unknown",
     sourceReports: agent.sourceReports.join(" | "),
     responseComparisonStatus: agent.responseComparison.status,
+    responseDifference: agent.responseComparison.difference ?? "Unknown",
     responsesAgentsReport: agent.responseComparison.sourceValues.agents ?? "Unknown",
     responsesUsersAndAgentsReport: agent.responseComparison.sourceValues.userAgents ?? "Unknown",
     reportSetId: view.activeSet?.id,
@@ -484,8 +542,17 @@ function* userExportRows(view: OfficialUsageUserView) {
       username: user.username,
       displayName: user.displayName,
       userMetricSource: user.missingUserReport ? "users_and_agents_report" : "users_report",
+      licenseAssignmentStatus: user.licenseAssignmentStatus,
+      reviewCohort: user.reviewCohort,
+      reviewCandidate: user.reviewCandidate,
       reportedAgentsUsed: user.missingUserReport ? "Unknown" : user.reportedAgentsUsed,
       reportedResponsesReceived: user.missingUserReport ? "Unknown" : user.reportedResponsesReceived,
+      agentsAccessedTotal: user.agentsAccessedTotal,
+      responseProducingAgentCount: user.responseProducingAgentCount,
+      bridgeResponsesSentToUsers: user.bridgeResponsesSentToUsers,
+      missingUserReport: user.missingUserReport,
+      missingBridgeRows: user.rows.length === 0,
+      hasReportMismatch: user.hasReportMismatch,
       userLastActivityDateUtc: user.userLastActivityDateUtc ?? "Unknown",
       agentId: row.agentId,
       agentName: row.displayAgentName,

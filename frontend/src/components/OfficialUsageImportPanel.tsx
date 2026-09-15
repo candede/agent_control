@@ -29,9 +29,6 @@ export function OfficialUsageImportPanel({
 }) {
   const [adminState, setAdminState] = useState<OfficialUsageAdminState>();
   const [files, setFiles] = useState<File[]>([]);
-  const [reportingStart, setReportingStart] = useState("");
-  const [reportingEnd, setReportingEnd] = useState("");
-  const [sourceAsOf, setSourceAsOf] = useState("");
   const [replaceActive, setReplaceActive] = useState(false);
   const [bundlePreview, setBundlePreview] = useState<OfficialUsageBundlePreview>();
   const [confirmation, setConfirmation] = useState<OfficialUsageConfirmation>();
@@ -40,32 +37,37 @@ export function OfficialUsageImportPanel({
   const [legacyPresent, setLegacyPresent] = useState(hasLegacyUsageStorage);
   const [completedImport, setCompletedImport] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const pendingBundleId = useRef<string | undefined>(undefined);
   const confirmationReturnFocus = useRef<HTMLElement | null>(null);
   const loadGeneration = useRef(0);
   const previews = bundlePreview?.staging ?? [];
 
   function applyBundlePreview(preview: OfficialUsageBundlePreview) {
+    pendingBundleId.current = preview.bundleId;
     setBundlePreview(preview);
     setReplaceActive(preview.staging.some(stage => Boolean(stage.correctionOfSetId)));
-    const basis = preview.staging[0] ?? preview.acceptedVersions[0];
-    if (!basis) return;
-    setReportingStart(basis.reportingPeriod.startDate);
-    setReportingEnd(basis.reportingPeriod.endDate);
-    setSourceAsOf(basis.sourceAsOf ? toLocalDateTime(basis.sourceAsOf) : "");
   }
 
-  async function refresh(preferredBundleId: string | null | undefined = bundlePreview?.bundleId) {
+  async function refresh(preferredBundleId: string | null | undefined = pendingBundleId.current) {
     const generation = ++loadGeneration.current;
     try {
       const state = await getOfficialUsageAdminState();
       if (generation !== loadGeneration.current) return;
       setAdminState(state);
-      const bundleId = preferredBundleId === null ? undefined : preferredBundleId ?? state.staging.find(stage => stage.status === "active")?.bundleId;
+      const retainedBundle = state.staging.some(stage => stage.status === "active" && stage.bundleId === preferredBundleId)
+        || state.sets.some(reportSet => !reportSet.deletedAt && reportSet.bundleId === preferredBundleId);
+      const bundleId = preferredBundleId === null ? undefined : retainedBundle ? preferredBundleId : state.staging.find(stage => stage.status === "active")?.bundleId;
       if (bundleId) {
         const preview = await previewOfficialUsageBundle(bundleId);
         if (generation === loadGeneration.current) applyBundlePreview(preview);
       }
-      else setBundlePreview(undefined);
+      else {
+        pendingBundleId.current = undefined;
+        setBundlePreview(undefined);
+        if (preferredBundleId) {
+          setMessage({ tone: "error", text: "The staged bundle is no longer available. It may have expired or been discarded. Choose the CSV files to import again." });
+        }
+      }
     } catch (error) {
       if (generation === loadGeneration.current) setMessage({ tone: "error", text: errorMessage(error) });
     }
@@ -78,6 +80,7 @@ export function OfficialUsageImportPanel({
       if (controller.signal.aborted) return undefined;
       setAdminState(undefined);
       setBundlePreview(undefined);
+      pendingBundleId.current = undefined;
       setMessage(undefined);
       return getOfficialUsageAdminState({ signal: controller.signal });
     })
@@ -109,46 +112,53 @@ export function OfficialUsageImportPanel({
   }, [initialStagingId]);
 
   async function stageFiles() {
-    if (!files.length || !reportingStart || !reportingEnd) return;
-    const existingSet = adminState?.sets.find(reportSet => reportSet.bundleId === bundlePreview?.bundleId);
+    if (!files.length || !adminState) {
+      setMessage({ tone: "error", text: !files.length ? "Choose the original CSV files to import." : "Wait for import state to load, or refresh it before importing." });
+      return;
+    }
+    const existingSet = adminState.sets.find(reportSet => reportSet.bundleId === pendingBundleId.current);
     if (adminState?.activeSetId && !replaceActive && !existingSet) {
       setMessage({ tone: "error", text: "Confirm that this bundle is an explicit correction of the active set before staging it." });
       return;
     }
     setBusy(true);
+    setCompletedImport(false);
     setMessage(undefined);
-    const bundleId = bundlePreview?.bundleId ?? crypto.randomUUID();
+    const bundleId = pendingBundleId.current ?? crypto.randomUUID();
     const staged = new Map<string, OfficialUsageStagingPreview>();
     const failures: string[] = [];
+    const rejectedFiles: File[] = [];
     for (const file of files) {
       try {
         const preview = await stageOfficialUsageReport(file, {
           bundleId,
           correctionOfSetId: existingSet?.supersedesSetId ?? (replaceActive ? adminState?.activeSetId ?? undefined : undefined),
-          reportingStart,
-          reportingEnd,
-          periodProvenance: "operator_asserted",
-          ...(sourceAsOf ? { sourceAsOf: new Date(sourceAsOf).toISOString(), sourceAsOfProvenance: "operator_asserted" as const } : {}),
         });
         staged.set(preview.kind, preview);
       } catch (error) {
-        failures.push(errorMessage(error));
+        rejectedFiles.push(file);
+        failures.push(`${file.name}: ${errorMessage(error)}`);
       }
     }
-    setFiles([]);
+    setFiles(rejectedFiles);
     if (fileInput.current) fileInput.current.value = "";
-    if (staged.size || bundlePreview) {
+    if (staged.size) pendingBundleId.current = bundleId;
+    if (staged.size || pendingBundleId.current) {
       try {
         applyBundlePreview(await previewOfficialUsageBundle(bundleId));
       } catch (error) {
-        failures.push(errorMessage(error));
+        failures.push(`Could not load the staged bundle preview: ${errorMessage(error)} Use Refresh import state to retry.`);
       }
     }
+    try {
+      setAdminState(await getOfficialUsageAdminState());
+    } catch (error) {
+      failures.push(`Could not refresh import history: ${errorMessage(error)}`);
+    }
     setMessage(failures.length
-      ? { tone: "error", text: `${staged.size} report type(s) staged; ${failures.length} file(s) rejected. ${failures[0]}` }
-      : { tone: "success", text: `${staged.size} report type(s) validated into expiring server-side staging.` });
+      ? { tone: "error", text: `${staged.size} report type(s) staged; ${rejectedFiles.length} file(s) rejected. ${failures.join(" ")}` }
+      : { tone: "success", text: `${staged.size} report type(s) validated. All report rows are included; activity dates were read from the files.` });
     setBusy(false);
-    await refresh(bundleId);
   }
 
   async function acceptPreviews() {
@@ -158,6 +168,7 @@ export function OfficialUsageImportPanel({
     try {
       const accepted = await acceptOfficialUsageBundle(bundlePreview);
       setCompletedImport(accepted.complete);
+      pendingBundleId.current = undefined;
       setBundlePreview(undefined);
       setReplaceActive(false);
       setMessage({ tone: "success", text: accepted.complete
@@ -182,6 +193,7 @@ export function OfficialUsageImportPanel({
         setMessage({ tone: "error", text: `${failed.length} staged report(s) could not be discarded and remain available for retry. ${errorMessage(failed[0].reason)}` });
         await refresh(bundlePreview?.bundleId);
       } else {
+        pendingBundleId.current = undefined;
         setBundlePreview(undefined);
         setMessage({ tone: "success", text: "All staged rows were discarded." });
         await refresh(null);
@@ -260,17 +272,16 @@ export function OfficialUsageImportPanel({
     }
   }
 
-  const ready = files.length > 0 && Boolean(reportingStart) && Boolean(reportingEnd);
+  const ready = files.length > 0 && Boolean(adminState);
   const activeSet = adminState?.sets.find(reportSet => reportSet.id === adminState.activeSetId);
 
   return (
     <section className="official-usage-import" aria-labelledby="official-usage-import-title">
       <header className="report-section-header">
         <div>
-          <p className="eyebrow">Official authority</p>
           <h2 id="official-usage-import-title">Microsoft 365 usage reports</h2>
         </div>
-        <span>{activeSet ? `Active through ${activeSet.reportingPeriod.endDate}` : "No active set"}</span>
+        <span>{activeSet ? `Active set: ${formatCoverage(activeSet.reportingPeriod)}` : "No active set"}</span>
       </header>
 
       {legacyPresent ? (
@@ -284,25 +295,35 @@ export function OfficialUsageImportPanel({
         </div>
       ) : null}
 
-      <div className="official-usage-workflow">
-        <div>
-          <strong>Export all three files</strong>
-          <ol>
-            <li>In the Microsoft 365 admin center, open Reports (Show all if hidden), then Usage. Under Reports, select Microsoft Copilot and Agents.</li>
-            <li>For one 7- or 30-day period, select each Agents, Users &amp; agents, and Users table/tab and use Export CSV.</li>
-            <li>Enter the source period below and import the original CSV files. This app cannot fetch them through an API.</li>
-          </ol>
-          <a href={reportGuideUrl} target="_blank" rel="noreferrer">Microsoft report guidance</a>
+      <p>Use the Agents, Users &amp; agents, and Users exports from the same reporting period. All rows are included; no dates need to be entered.</p>
+      <details className="usage-import-guidance">
+        <summary>How to export the CSV files</summary>
+        <div className="official-usage-workflow">
+          <div>
+            <strong>Export all three files</strong>
+            <ol>
+              <li>In the Microsoft 365 admin center, open Reports (Show all if hidden), then Usage. Under Reports, select Microsoft Copilot and Agents.</li>
+              <li>For one 7- or 30-day period, select each Agents, Users &amp; agents, and Users table/tab and use Export CSV.</li>
+              <li>Choose the original CSV files below. All available rows are imported automatically; no dates need to be entered.</li>
+            </ol>
+            <a href={reportGuideUrl} target="_blank" rel="noreferrer">Microsoft report guidance</a>
+          </div>
+          <div>
+            <strong>Use all available data</strong>
+            <p>Activity coverage is read from the reports. After import, optional last-activity date filters help explore the data without changing the full-export response counts.</p>
+            <p>These exports do not state their reporting window or source refresh time. Observed activity dates are not a claim of complete period coverage.</p>
+          </div>
         </div>
-        <div className="official-usage-fields">
-          <label><span>Reporting start</span><input type="date" value={reportingStart} onChange={event => setReportingStart(event.target.value)} /></label>
-          <label><span>Reporting end</span><input type="date" value={reportingEnd} onChange={event => setReportingEnd(event.target.value)} /></label>
-          <label><span>Source as-of, if shown</span><input type="datetime-local" value={sourceAsOf} onChange={event => setSourceAsOf(event.target.value)} /></label>
-        </div>
-      </div>
+      </details>
+
+      <ol className="usage-import-steps" aria-label="Import progress">
+        <li aria-current={!bundlePreview && !completedImport ? "step" : undefined}>1. Choose CSVs</li>
+        <li aria-current={bundlePreview ? "step" : undefined}>2. Review and approve</li>
+        <li aria-current={completedImport && !bundlePreview ? "step" : undefined}>3. Report active</li>
+      </ol>
 
       {adminState?.activeSetId ? (
-        <label className="official-usage-correction"><input type="checkbox" checked={replaceActive} onChange={event => setReplaceActive(event.target.checked)} />This bundle is an explicit correction replacing the active set.</label>
+        <label className="official-usage-correction"><input type="checkbox" disabled={busy} checked={replaceActive} onChange={event => setReplaceActive(event.target.checked)} />This bundle is an explicit correction replacing the active set.</label>
       ) : null}
 
       <div className="report-actions official-usage-actions">
@@ -323,9 +344,9 @@ export function OfficialUsageImportPanel({
             <div><dt>Coverage</dt><dd>{bundlePreview.missingKinds.length ? `Missing ${bundlePreview.missingKinds.map(kindLabel).join(", ")}` : "All three kinds reviewed"}</dd></div>
             <div><dt>Reconciliation</dt><dd>{JSON.stringify(bundlePreview.reconciliation)}</dd></div>
           </dl>
-          <div className="table-shell"><table><thead><tr><th>Report</th><th>Rows</th><th>Hash / schema</th><th>Period / source basis</th><th>Warnings</th></tr></thead><tbody>
-            {previews.map(preview => <tr key={preview.id}><td>{kindLabel(preview.kind)}</td><td>{preview.rowCount.toLocaleString()}</td><td><code>{preview.fileHash.slice(0, 16)}</code><br />{preview.schemaVersion}</td><td>{preview.reportingPeriod.startDate} to {preview.reportingPeriod.endDate}<br />{preview.reportingPeriod.provenance}; source as-of {preview.sourceAsOf ?? "absent"} ({preview.sourceAsOfProvenance}); freshness {preview.sourceFreshness}</td><td>{preview.warnings.length ? <ul className="official-usage-warnings">{preview.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul> : "None"}</td></tr>)}
-            {bundlePreview.acceptedVersions.map(version => <tr key={version.versionId}><td>{kindLabel(version.kind)} (accepted)</td><td>-</td><td><code>{version.fileHash.slice(0, 16)}</code></td><td>{version.reportingPeriod.startDate} to {version.reportingPeriod.endDate}<br />{version.reportingPeriod.provenance}; source as-of {version.sourceAsOf ?? "absent"} ({version.sourceAsOfProvenance})</td><td>Immutable retained companion</td></tr>)}
+          <div className="table-shell" role="region" aria-label="Validated report rows" tabIndex={0}><table><thead><tr><th>Report</th><th>Rows</th><th>Hash / schema</th><th>Activity coverage / source basis</th><th>Warnings</th></tr></thead><tbody>
+            {previews.map(preview => <tr key={preview.id}><td>{kindLabel(preview.kind)}</td><td>{preview.rowCount.toLocaleString()}</td><td><code>{preview.fileHash.slice(0, 16)}</code><br />{preview.schemaVersion}</td><td>{formatCoverage(preview.reportingPeriod)}<br />{formatProvenance(preview.reportingPeriod.provenance)}; freshness {preview.sourceFreshness}{preview.sourceAsOf ? `; source as-of ${preview.sourceAsOf} (${preview.sourceAsOfProvenance})` : ""}</td><td>{preview.warnings.length ? <ul className="official-usage-warnings">{preview.warnings.map(warning => <li key={warning}>{warning}</li>)}</ul> : "None"}</td></tr>)}
+            {bundlePreview.acceptedVersions.map(version => <tr key={version.versionId}><td>{kindLabel(version.kind)} (accepted)</td><td>-</td><td><code>{version.fileHash.slice(0, 16)}</code></td><td>{formatCoverage(version.reportingPeriod)}<br />{formatProvenance(version.reportingPeriod.provenance)}{version.sourceAsOf ? `; source as-of ${version.sourceAsOf} (${version.sourceAsOfProvenance})` : ""}</td><td>Immutable retained companion</td></tr>)}
           </tbody></table></div>
           <div className="report-actions">{previews.length ? <button type="button" className="secondary" disabled={busy} onClick={() => void discardPreviews()}><Trash2 size={16} />Discard staging</button> : null}<button type="button" disabled={busy || bundlePreview.missingKinds.length > 0} onClick={() => void acceptPreviews()}><Check size={16} />Accept reviewed bundle</button></div>
         </section>
@@ -333,8 +354,8 @@ export function OfficialUsageImportPanel({
 
       <section className="official-usage-history" aria-label="Retained report sets">
         <h3>Retained sets</h3>
-        {adminState?.sets.length ? <div className="table-shell"><table><thead><tr><th>Period</th><th>Reports</th><th>Status</th><th>Lineage</th><th>Accepted</th><th>Actions</th></tr></thead><tbody>
-          {adminState.sets.map(reportSet => <tr key={reportSet.id}><td>{reportSet.reportingPeriod.startDate} to {reportSet.reportingPeriod.endDate}</td><td>{reportSet.kinds.map(kindLabel).join(", ")}</td><td>{reportSet.deletedAt ? "Deleted" : reportSet.id === adminState.activeSetId ? "Active" : reportSet.complete ? "Retained" : "Incomplete"}</td><td>{reportSet.supersedesSetId ? `Corrects ${reportSet.supersedesSetId.slice(0, 8)}` : "Original set"}</td><td>{reportSet.acceptedAt ? formatInstant(reportSet.acceptedAt) : "Pending companions"}</td><td><div className="table-actions">{!reportSet.complete && !reportSet.deletedAt ? <button type="button" className="secondary" disabled={busy} onClick={() => void resumeSet(reportSet.bundleId)}>Resume</button> : null}{reportSet.complete && !reportSet.deletedAt && reportSet.id !== adminState.activeSetId ? <button type="button" className="secondary" disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "select")}>Select</button> : null}{!reportSet.deletedAt ? <button type="button" className="icon-button danger" title="Delete retained set" aria-label={`Delete retained set for ${reportSet.reportingPeriod.startDate} to ${reportSet.reportingPeriod.endDate}`} disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "delete")}><Trash2 size={16} /></button> : null}</div></td></tr>)}
+        {adminState?.sets.length ? <div className="table-shell"><table><thead><tr><th>Activity coverage / supplied period</th><th>Reports</th><th>Status</th><th>Lineage</th><th>Accepted</th><th>Actions</th></tr></thead><tbody>
+          {adminState.sets.map(reportSet => <tr key={reportSet.id}><td>{formatCoverage(reportSet.reportingPeriod)}</td><td>{reportSet.kinds.map(kindLabel).join(", ")}</td><td>{reportSet.deletedAt ? "Deleted" : reportSet.id === adminState.activeSetId ? "Active" : reportSet.complete ? "Retained" : "Incomplete"}</td><td>{reportSet.supersedesSetId ? `Corrects ${reportSet.supersedesSetId.slice(0, 8)}` : "Original set"}</td><td>{reportSet.acceptedAt ? formatInstant(reportSet.acceptedAt) : "Pending companions"}</td><td><div className="table-actions">{!reportSet.complete && !reportSet.deletedAt ? <button type="button" className="secondary" disabled={busy} onClick={() => void resumeSet(reportSet.bundleId)}>Resume</button> : null}{reportSet.complete && !reportSet.deletedAt && reportSet.id !== adminState.activeSetId ? <button type="button" className="secondary" disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "select")}>Select</button> : null}{!reportSet.deletedAt ? <button type="button" className="icon-button danger" title="Delete retained set" aria-label={`Delete retained set for ${formatCoverage(reportSet.reportingPeriod)}`} disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "delete")}><Trash2 size={16} /></button> : null}</div></td></tr>)}
         </tbody></table></div> : <p>No retained official usage sets.</p>}
       </section>
 
@@ -351,9 +372,15 @@ function formatInstant(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-function toLocalDateTime(value: string) {
-  const date = new Date(value);
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+function formatCoverage(period: { startDate: string | null; endDate: string | null }) {
+  return period.startDate && period.endDate ? `${period.startDate} to ${period.endDate}` : "No activity dates supplied";
+}
+
+function formatProvenance(provenance: string) {
+  return provenance === "activity_range" ? "Observed last-activity dates; reporting window unknown"
+    : provenance === "unknown" ? "Reporting window unknown"
+      : provenance === "operator_asserted" ? "Previously supplied by administrator"
+        : "Source metadata";
 }
 
 function SetConfirmationDialog({ confirmation, reportSet, busy, onCancel, onConfirm }: {
@@ -366,13 +393,12 @@ function SetConfirmationDialog({ confirmation, reportSet, busy, onCancel, onConf
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current;
-    element?.showModal();
-    return () => element?.close();
+    if (element && !element.open) element.showModal();
   }, []);
   return <dialog ref={dialog} className="confirm-modal" aria-labelledby="usage-set-confirm-title" onCancel={event => { event.preventDefault(); onCancel(); }} onClose={onCancel}>
     <h2 id="usage-set-confirm-title">Confirm {confirmation.operation}</h2>
     <p>Set {confirmation.setId}</p>
-    <p>{reportSet ? `Reporting period ${reportSet.reportingPeriod.startDate} to ${reportSet.reportingPeriod.endDate}.` : "Reporting period unavailable."}</p>
+    <p>{reportSet ? `Activity coverage / supplied period: ${formatCoverage(reportSet.reportingPeriod)}.` : "Activity coverage unavailable."}</p>
     <p>{confirmation.operation === "delete" ? "Deletion removes retained content. Deleting the active set clears selection and never falls back automatically." : "Selection replaces the active pointer with this retained complete set."}</p>
     <div className="confirm-actions"><button type="button" className="secondary" autoFocus onClick={onCancel}>Cancel</button><button type="button" disabled={busy} onClick={onConfirm}>Confirm</button></div>
   </dialog>;

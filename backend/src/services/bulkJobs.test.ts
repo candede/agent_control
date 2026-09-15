@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { createJobConfirmation, JobRepository, type JobInput, type JobIntentInput } from "../db/jobs.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
@@ -13,6 +13,7 @@ const scope = { tenantId: "fixture-tenant", principalId: "fixture-principal" };
 const input = (): JobInput => confirmedInput({ targets: [{ id: "package-1", displayName: "Fixture", prestate: { kind: "block", isBlocked: false } }], action: "block", scope: "single", actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, displayName: "Fixture", username: "fixture@example.invalid" }, requestPath: "/api/agents/package-1/block" });
 function confirmedInput(intent: JobIntentInput): JobInput { return { ...intent, idempotencyKey: randomUUID(), confirmationHash: createJobConfirmation(intent).confirmationHash }; }
 beforeAll(async () => { fixture = await testDatabase(); jobs = new JobRepository(fixture.runtime); });
+afterEach(() => vi.restoreAllMocks());
 afterAll(async () => { await fixture?.close(); });
 
 describe("Durable bulk execution", () => {
@@ -48,9 +49,9 @@ describe("Durable bulk execution", () => {
     await runBulkJob(job.id, scope, true, jobs, provider, async () => "ephemeral-token");
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
     expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual({
+      timestamp: expect.any(String), level: "error",
       event: "job_write_uncertain", jobId: job.id, outcome: "requires_reconciliation",
     });
-    log.mockRestore();
   });
   it("emits a redacted stopped event when the finite item deadline expires before dispatch", async () => {
     const log=vi.spyOn(console,"error").mockImplementation(() => undefined);
@@ -62,9 +63,9 @@ describe("Durable bulk execution", () => {
     await runBulkJob(job.id,scope,false,jobs,provider,async () => "ephemeral-token");
     expect(await jobs.get(job.id,scope)).toMatchObject({ status: "failed", failed: 1 });
     expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual({
+      timestamp: expect.any(String), level: "error",
       event: "job_execution_stopped", jobId: job.id, outcome: "deadline_exceeded",
     });
-    log.mockRestore();
   });
   it("reconciles ambiguous outcomes by read only and never dispatches again", async () => {
     for (const applied of [false, true]) {

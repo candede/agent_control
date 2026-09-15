@@ -2,8 +2,10 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Request, Response } from "express";
-import { describe, expect, it, vi } from "vitest";
-import { httpTelemetry, observeDatabasePool, operationalLog, safeTelemetry } from "./telemetry.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { httpTelemetry, observeDatabasePool, operationalLog, safeTelemetry, withTelemetryContext } from "./telemetry.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("operational telemetry", () => {
   it("retains only bounded allowlisted metadata", () => {
@@ -17,19 +19,22 @@ describe("operational telemetry", () => {
     const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     operationalLog("warn", "provider_throttled", { provider: "graph", token: "Bearer secret", count: 1 });
     expect(log).toHaveBeenCalledOnce();
-    expect(log.mock.calls[0][0]).toBe('{"event":"provider_throttled","provider":"graph","count":1}');
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+      timestamp: expect.any(String), level: "warn", event: "provider_throttled", provider: "graph", count: 1,
+    });
     log.mockRestore();
   });
 
-  it("logs denied throttled requests without paths, bodies or headers", () => {
+  it("logs denied requests with code-owned route templates, not native paths, bodies or headers", () => {
     const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const response = Object.assign(new EventEmitter(), {
       statusCode: 429,
-      locals: { requestId: "request-throttled" },
+      locals: { requestId: "request-throttled", jobId: "job-1", errorCode: "provider_throttled" },
     }) as unknown as Response;
     const request = {
       method: "POST",
       originalUrl: "/api/private?code=never-log",
+      route: { path: "/inventory/refresh-jobs/:id" },
       headers: { authorization: "Bearer never-log", cookie: "never-log" },
       body: { reportRows: ["never-log"] },
     } as unknown as Request;
@@ -40,9 +45,60 @@ describe("operational telemetry", () => {
     expect(log).toHaveBeenCalledOnce();
     expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
       event: "http_request", requestId: "request-throttled", status: 429, mode: "POST",
+      route: "/inventory/refresh-jobs/:id", jobId: "job-1", errorCode: "provider_throttled",
     });
     expect(log.mock.calls[0][0]).not.toContain("never-log");
     log.mockRestore();
+  });
+
+  it("keeps concurrent asynchronous request and job contexts isolated", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const first = withTelemetryContext({ requestId: "request-a", route: "/inventory/refresh-jobs" }, () =>
+      withTelemetryContext({ jobId: "job-a" }, async () => {
+        await held;
+        operationalLog("info", "inventory_refresh_succeeded");
+      }));
+    await withTelemetryContext({ requestId: "request-b", jobId: "job-b" }, async () => {
+      await Promise.resolve();
+      operationalLog("info", "inventory_refresh_succeeded");
+    });
+    release();
+    await first;
+    operationalLog("info", "outside_request");
+    const entries = log.mock.calls.map(([entry]) => JSON.parse(entry));
+    expect(entries[0]).toMatchObject({ requestId: "request-b", jobId: "job-b" });
+    expect(entries[0]).not.toHaveProperty("route");
+    expect(entries[1]).toMatchObject({ requestId: "request-a", jobId: "job-a", route: "/inventory/refresh-jobs" });
+    expect(entries[2]).not.toHaveProperty("requestId");
+    expect(entries[2]).not.toHaveProperty("jobId");
+  });
+
+  it("reports incomplete HTTP responses without claiming the background job was cancelled", () => {
+    const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = Object.assign(new EventEmitter(), {
+      statusCode: 200, locals: { requestId: "request-a", jobId: "job-a" },
+    }) as unknown as Response;
+    httpTelemetry({ method: "POST", route: { path: "/inventory/refresh-jobs" } } as Request, response, vi.fn());
+    (response as unknown as EventEmitter).emit("close");
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+      event: "http_request_aborted", requestId: "request-a", jobId: "job-a", route: "/inventory/refresh-jobs",
+    });
+    expect(JSON.parse(log.mock.calls[0][0])).not.toHaveProperty("status");
+  });
+
+  it("retains safe diagnostics but never arbitrary provider headers, URLs or error objects", () => {
+    expect(safeTelemetry({
+      page: 2, resourceIndex: 7, field: "name", length: 513, maximumLength: 512,
+      providerRequestId: "11111111-1111-1111-1111-111111111111",
+      providerCorrelationId: "private-provider-header", errorCode: "private error text",
+      route: "/api/private?token=private-token", rawError: new Error("private-error"),
+      tenantId: "private-tenant", nativeId: "private-native-id", skipToken: "private-continuation",
+    })).toEqual({
+      page: 2, resourceIndex: 7, field: "name", length: 513, maximumLength: 512,
+      providerRequestId: "11111111-1111-1111-1111-111111111111",
+    });
   });
 
   it("keeps every managed log-alert event aligned with a real redacted producer", () => {
@@ -75,7 +131,7 @@ describe("operational telemetry", () => {
     observeDatabasePool(0);
     observeDatabasePool(2);
     expect(log).toHaveBeenCalledOnce();
-    expect(JSON.parse(log.mock.calls[0][0])).toEqual({ event: "database_pool_saturated", count: 2 });
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({ timestamp: expect.any(String), level: "error", event: "database_pool_saturated", count: 2 });
     log.mockRestore();
   });
 });

@@ -308,7 +308,8 @@ describe("Permission Center", () => {
     const failed = fixture("provider_error");
     const blocked = fixture("missing_permission");
     render(<CapabilityContext value={context([provider, local, ready, token, failed, blocked])}><CapabilityHealth /></CapabilityContext>);
-    expect(screen.getByRole("button")).toHaveTextContent("1 provider-verified / 1 local / 2 ready to try / 1 degraded / 1 blocked");
+    expect(screen.getByRole("button")).toHaveTextContent("Permissions: 2 need attention");
+    expect(screen.getByRole("button")).toHaveAccessibleName("1 provider-verified / 1 local / 2 ready to try / 1 degraded / 1 blocked");
   });
   it("does not label disabled application evidence current", () => {
     const application = fixture("available");

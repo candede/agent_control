@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { powerPlatformResourceTypes, type PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { PowerPlatformResourceQueryClient } from "../services/powerPlatformResourceQuery.js";
 import { buildCoverage, PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -215,5 +216,67 @@ describe.sequential("Power Platform inventory repository", () => {
     expect(after.lastSuccessAt).not.toBeNull();
     expect((await repository.list(retainedScope)).value[0].nativeId).toBe("retained-source");
     expect((await repository.listJobs({ ...retainedScope, principalId: "not-the-owner" })).lastSuccessAt).toBeNull();
+  });
+
+  it("persists connector source metadata separately from the private collection tenant", async () => {
+    const catalogScope = { tenantId: "catalog-tenant", principalId: "catalog-reader" };
+    const nativeId = "shared-catalog-native-id";
+    const query = new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ tenantId: "", name: nativeId, type: "microsoft.powerplatformconnector/connectors", properties: { displayName: "Catalog connector" } }],
+    })));
+    const result = await query.query("opaque-token", undefined, { expectedTenantId: catalogScope.tenantId });
+    const job = await repository.submit(catalogScope, { idempotencyKey: "catalog-metadata", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+    await repository.markRunning(catalogScope, job.id);
+    await repository.publish(catalogScope, job.id, result);
+
+    expect(await repository.getJob(catalogScope, job.id)).toMatchObject({ status: "succeeded", observedCount: 1 });
+    const page = await repository.list(catalogScope);
+    expect(page.value).toMatchObject([{
+      tenantId: catalogScope.tenantId, nativeId, environmentId: null,
+      details: { sourceTenantId: "" },
+      provenance: { tenantId: { path: "authenticated_query.tenantId" }, sourceTenantId: { path: "tenantId" } },
+    }]);
+    expect(await repository.list({ ...catalogScope, tenantId: "other-tenant" })).toMatchObject({ count: 0, snapshot: null });
+    expect(await repository.list({ ...catalogScope, principalId: "other-reader" })).toMatchObject({ count: 0, snapshot: null });
+    expect((await fixture.runtime.query("SELECT tenant_id,native_id FROM source_identifiers WHERE tenant_id=$1", [catalogScope.tenantId])).rows)
+      .toEqual([{ tenant_id: catalogScope.tenantId, native_id: nativeId }]);
+  });
+
+  it("publishes all 4140 resources when the 42nd page has a terminal truncation marker, preserving the snapshot on a later incomplete refresh", async () => {
+    const owner = { tenantId: "terminal-tenant", principalId: "terminal-reader" };
+    const job = await repository.submit(owner, { idempotencyKey: "terminal-page", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+    await repository.markRunning(owner, job.id);
+    const query = new PowerPlatformResourceQueryClient(vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const { Options: options } = JSON.parse(String(init?.body));
+      const offset = Number(options.SkipToken ?? 0);
+      const count = Math.min(100, 4_140 - offset);
+      return Response.json({
+        totalRecords: 4_140, count, resultTruncated: 1,
+        ...(offset + count < 4_140 ? { skipToken: String(offset + count) } : {}),
+        data: Array.from({ length: count }, (_, index) => ({
+          tenantId: owner.tenantId, name: `agent-${String(offset + index).padStart(4, "0")}`,
+          type: "microsoft.copilotstudio/agents", properties: {},
+        })),
+      });
+    }));
+    const result = await query.query("opaque-token", undefined, {
+      expectedTenantId: owner.tenantId,
+      onProgress: progress => repository.recordProgress(owner, job.id, progress.pages, progress.observedCount, progress.totalRecords),
+    });
+    await repository.publish(owner, job.id, result);
+    const complete = await repository.getJob(owner, job.id);
+    expect(complete).toMatchObject({ status: "succeeded", observedCount: 4_140, totalRecords: 4_140, pageCount: 42 });
+    expect(complete?.snapshotId).toEqual(expect.any(String));
+    expect(await repository.list(owner, { offset: 4_100, limit: 50 })).toMatchObject({
+      count: 4_140, snapshot: { id: complete?.snapshotId, pageCount: 42, observedCount: 4_140 },
+      value: Array.from({ length: 40 }, (_, index) => ({ nativeId: `agent-${4_100 + index}` })),
+    });
+    expect((await repository.listJobs(owner)).lastSuccessAt).not.toBeNull();
+    const failed = await repository.submit(owner, { idempotencyKey: "incomplete-next", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+    await repository.markRunning(owner, failed.id);
+    await expect(repository.publish(owner, failed.id, { ...result, resources: result.resources.slice(0, 4_100) })).rejects.toMatchObject({ code: "incomplete_inventory_coverage" });
+    expect((await repository.list(owner)).snapshot?.id).toBe(complete?.snapshotId);
+    expect(await repository.list({ ...owner, principalId: "another-reader" })).toMatchObject({ snapshot: null, count: 0 });
   });
 });

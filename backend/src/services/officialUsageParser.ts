@@ -73,7 +73,7 @@ const schemaRegistry = {
 
 export function parseOfficialUsageReport(
   bytes: Uint8Array,
-  metadata: OfficialUsageMetadata,
+  metadata?: OfficialUsageMetadata,
   limits: OfficialUsageParserLimits = defaultLimits,
 ): ParsedOfficialUsageReport {
   validateLimits(limits);
@@ -132,8 +132,31 @@ export function parseOfficialUsageReport(
     }
     return record;
   });
-  const provenance = validateMetadata(metadata);
-  const common = {
+  if (schema === "agents") {
+    const rows = records.map(parseAgentRow);
+    validateUnique(rows, row => row.agentId, "agent ID");
+    safeSum(rows.map(row => row.responsesSentToUsers));
+    return { ...reportBase(schema, metadata, rows), kind: schema, rows };
+  }
+  if (schema === "userAgents") {
+    const rows = records.map(parseUserAgentRow);
+    validateUnique(rows, row => `${row.agentId}\u0000${row.username}`, "agent and username pair");
+    safeSum(rows.map(row => row.responsesSentToUsers));
+    return { ...reportBase(schema, metadata, rows), kind: schema, rows };
+  }
+  const rows = records.map(parseUserRow);
+  validateUnique(rows, row => row.username, "username");
+  safeSum(rows.flatMap(row => [row.numberOfAgentsUsed, row.agentResponsesReceived]));
+  return { ...reportBase(schema, metadata, rows), kind: schema, rows };
+}
+
+function reportBase(
+  schema: OfficialUsageReportKind,
+  metadata: OfficialUsageMetadata | undefined,
+  rows: ReadonlyArray<{ lastActivityDateUtc?: string }>,
+): Omit<OfficialUsageReportBase, "kind"> {
+  const provenance = validateMetadata(metadata, rows);
+  return {
     parserVersion: officialUsageParserVersion,
     schemaVersion: schemaRegistry[schema].version,
     reportingPeriod: provenance.reportingPeriod,
@@ -141,25 +164,8 @@ export function parseOfficialUsageReport(
     sourceAsOfProvenance: provenance.sourceAsOfProvenance,
     sourceFreshness: provenance.sourceFreshness,
     downloadedAt: provenance.downloadedAt,
-    warnings: [] as string[],
+    warnings: [],
   };
-
-  if (schema === "agents") {
-    const report = { ...common, kind: schema, rows: records.map(parseAgentRow) };
-    validateUnique(report.rows, row => row.agentId, "agent ID");
-    safeSum(report.rows.map(row => row.responsesSentToUsers));
-    return report;
-  }
-  if (schema === "userAgents") {
-    const report = { ...common, kind: schema, rows: records.map(parseUserAgentRow) };
-    validateUnique(report.rows, row => `${row.agentId}\u0000${row.username}`, "agent and username pair");
-    safeSum(report.rows.map(row => row.responsesSentToUsers));
-    return report;
-  }
-  const report = { ...common, kind: schema, rows: records.map(parseUserRow) };
-  validateUnique(report.rows, row => row.username, "username");
-  safeSum(report.rows.flatMap(row => [row.numberOfAgentsUsed, row.agentResponsesReceived]));
-  return report;
 }
 
 function identifySchema(headers: string[]): OfficialUsageReportKind {
@@ -219,10 +225,10 @@ function parseUserRow(record: Record<string, string>, index: number): UserUsageR
 
 function requiredCount(record: Record<string, string>, field: string, index: number) {
   const value = record[field];
-  if (!/^(0|[1-9]\d*)$/.test(value)) {
+  if (!/^(?:0|[1-9]\d*|[1-9]\d{0,2}(?:,\d{3})+)$/.test(value)) {
     throw rowError(index, "invalid_number", `has an invalid ${field} value`);
   }
-  const parsed = Number(value);
+  const parsed = Number(value.replaceAll(",", ""));
   if (!Number.isSafeInteger(parsed)) {
     throw rowError(index, "invalid_number", `has an invalid ${field} value`);
   }
@@ -271,34 +277,68 @@ function parseReportDateParts(value: string) {
   return iso ? { year: Number(iso[1]), month: Number(iso[2]) - 1, day: Number(iso[3]) } : undefined;
 }
 
-function validateMetadata(metadata: OfficialUsageMetadata): Pick<OfficialUsageReportBase,
+function validateMetadata(
+  metadata: OfficialUsageMetadata | undefined,
+  rows: ReadonlyArray<{ lastActivityDateUtc?: string }>,
+): Pick<OfficialUsageReportBase,
   "reportingPeriod" | "sourceAsOf" | "sourceAsOfProvenance" | "sourceFreshness" | "downloadedAt"> {
-  const startDate = parseIsoDate(metadata.reportingPeriod.startDate, "reporting period start");
-  const endDate = parseIsoDate(metadata.reportingPeriod.endDate, "reporting period end");
-  if (Date.parse(startDate) > Date.parse(endDate)) {
-    throw new OfficialUsageValidationError("invalid_reporting_period", "The reporting period start must not follow its end.");
+  if (metadata !== undefined && (!metadata || typeof metadata !== "object")) {
+    throw new OfficialUsageValidationError("invalid_metadata", "The report metadata must be an object.");
   }
-  const days = Math.floor((Date.parse(endDate) - Date.parse(startDate)) / 86_400_000) + 1;
-  if (days !== 7 && days !== 30) {
-    throw new OfficialUsageValidationError("invalid_reporting_period", "The Microsoft Copilot Agents report period must be exactly 7 or 30 days.");
-  }
-  if (metadata.reportingPeriod.provenance !== "operator_asserted" || metadata.sourceAsOf?.provenance === "source_metadata") {
+  if (metadata?.reportingPeriod?.provenance === "source_metadata" || metadata?.sourceAsOf?.provenance === "source_metadata") {
     throw new OfficialUsageValidationError("unverified_source_metadata", "These CSV schemas do not contain report-period or source-as-of metadata; operator input cannot claim source metadata provenance.");
   }
-  const sourceAsOf = metadata.sourceAsOf
+  if (metadata?.reportingPeriod && metadata.reportingPeriod.provenance !== "operator_asserted") {
+    throw new OfficialUsageValidationError("invalid_metadata", "The reporting period provenance is invalid.");
+  }
+  if (metadata?.sourceAsOf && metadata.sourceAsOf.provenance !== "operator_asserted") {
+    throw new OfficialUsageValidationError("invalid_metadata", "The source as-of provenance is invalid.");
+  }
+  const reportingPeriod = metadata?.reportingPeriod
+    ? validateExplicitReportingPeriod(metadata.reportingPeriod)
+    : observedActivityRange(rows);
+  const sourceAsOf = metadata?.sourceAsOf
     ? parseInstant(metadata.sourceAsOf.value, "source as-of")
     : undefined;
-  const downloadedAt = metadata.downloadedAt
+  const downloadedAt = metadata?.downloadedAt
     ? parseInstant(metadata.downloadedAt, "download time")
     : undefined;
-  const sourceAsOfProvenance = metadata.sourceAsOf?.provenance ?? "absent";
+  const sourceAsOfProvenance = metadata?.sourceAsOf?.provenance ?? "absent";
   return {
-    reportingPeriod: { startDate, endDate, days, provenance: metadata.reportingPeriod.provenance },
+    reportingPeriod,
     sourceAsOf,
     sourceAsOfProvenance,
     sourceFreshness: "unknown" as const,
     downloadedAt,
   };
+}
+
+function validateExplicitReportingPeriod(metadata: NonNullable<OfficialUsageMetadata["reportingPeriod"]>) {
+  const startDate = parseIsoDate(metadata.startDate, "reporting period start");
+  const endDate = parseIsoDate(metadata.endDate, "reporting period end");
+  if (Date.parse(startDate) > Date.parse(endDate)) {
+    throw new OfficialUsageValidationError("invalid_reporting_period", "The reporting period start must not follow its end.");
+  }
+  const days = inclusiveDays(startDate, endDate);
+  if (days !== 7 && days !== 30) {
+    throw new OfficialUsageValidationError("invalid_reporting_period", "The Microsoft Copilot Agents report period must be exactly 7 or 30 days.");
+  }
+  return { startDate, endDate, days, provenance: metadata.provenance };
+}
+
+function observedActivityRange(rows: ReadonlyArray<{ lastActivityDateUtc?: string }>): OfficialUsageReportBase["reportingPeriod"] {
+  const dates = rows.flatMap(row => row.lastActivityDateUtc ? [row.lastActivityDateUtc.slice(0, 10)] : []);
+  if (!dates.length) {
+    return { startDate: null, endDate: null, days: null, provenance: "activity_range" };
+  }
+  dates.sort();
+  const startDate = dates[0];
+  const endDate = dates[dates.length - 1];
+  return { startDate, endDate, days: inclusiveDays(startDate, endDate), provenance: "activity_range" };
+}
+
+function inclusiveDays(startDate: string, endDate: string) {
+  return Math.floor((Date.parse(endDate) - Date.parse(startDate)) / 86_400_000) + 1;
 }
 
 function parseIsoDate(value: string, label: string) {

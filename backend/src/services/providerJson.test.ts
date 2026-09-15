@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { boundedProviderJson } from "./providerJson.js";
+import { boundedProviderJson, ProviderResponseLimitError } from "./providerJson.js";
 import { GraphPackagesClient, graphError } from "./graphPackages.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { allowlistedPackage } from "./packageObservation.js";
 
 describe("bounded provider observations", () => {
-  it("aborts and cancels a stalled JSON response body", async () => {
+  it.each([undefined, 16 * 1024 * 1024])("aborts and cancels a stalled JSON response body with budget %s", async maximumBytes => {
     const controller = new AbortController();
     const cancel = vi.fn();
-    const pending = boundedProviderJson(new Response(new ReadableStream({ cancel })), controller.signal);
+    const pending = boundedProviderJson(new Response(new ReadableStream({ cancel })), controller.signal, maximumBytes);
     const assertion = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
     controller.abort(new DOMException("deadline", "TimeoutError"));
     await assertion;
@@ -30,6 +30,30 @@ describe("bounded provider observations", () => {
     expect(JSON.stringify(error.details)).not.toContain("never-return");
   });
 
+  it("allows an explicit larger JSON budget without changing the shared 2 MB default", async () => {
+    const value = { value: "x".repeat(2_000_000) };
+    const body = JSON.stringify(value);
+    await expect(boundedProviderJson(new Response(body))).rejects.toMatchObject({
+      code: "provider_result_limit", maximumBytes: 2_000_000, observedBytes: Buffer.byteLength(body),
+    });
+    await expect(boundedProviderJson(new Response(body), undefined, 4_000_000)).resolves.toEqual(value);
+    await expect(boundedProviderJson(new Response("{"), undefined, 4_000_000)).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it("enforces the exact configured byte boundary and cancels over-budget streams", async () => {
+    const body = JSON.stringify({ value: "within budget" });
+    const maximumBytes = Buffer.byteLength(body);
+    await expect(boundedProviderJson(new Response(body), undefined, maximumBytes)).resolves.toEqual({ value: "within budget" });
+    const cancel = vi.fn();
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(body)); },
+      cancel,
+    });
+    await expect(boundedProviderJson(new Response(stream), undefined, maximumBytes - 1))
+      .rejects.toEqual(new ProviderResponseLimitError(maximumBytes - 1, maximumBytes));
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("omits unknown package fields with value-free diagnostics", () => {
     const diagnostics = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -38,7 +62,9 @@ describe("bounded provider observations", () => {
         creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native",
         provenance: { authoringTool: { sourceSystem: "graph_packages", path: "platform", maturity: "ga" } },
       });
-      expect(diagnostics).toHaveBeenCalledWith(JSON.stringify({ event: "provider_schema_omission", provider: "graph_packages", count: 1 }));
+      expect(JSON.parse(diagnostics.mock.calls[0][0])).toEqual({
+        timestamp: expect.any(String), level: "warn", event: "provider_schema_omission", provider: "graph_packages", count: 1,
+      });
       expect(() => allowlistedPackage({ id: 12, displayName: "Fixture", isBlocked: false })).toThrow();
     } finally { diagnostics.mockRestore(); }
   });

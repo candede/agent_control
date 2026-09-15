@@ -3,12 +3,19 @@ import type { OfficialUsageUserSummary, OfficialUsageUserView } from "../api/cli
 
 type UserAccessViewProps = {
   data?: OfficialUsageUserView;
+  compact?: boolean;
   onPageChange: (offset: number) => void;
   onQueryChange: (query: {
     search?: string;
     creatorType?: string;
     activity?: ActivityFilter;
     responsesOnly?: boolean;
+    startDate?: string;
+    endDate?: string;
+    lowResponseThreshold?: number;
+    cohort?: "all" | "zero" | "low" | "review";
+    sortBy?: "displayName" | "responses" | "agentsUsed" | "lastActivity";
+    sortDirection?: "asc" | "desc";
   }) => void;
 };
 
@@ -18,6 +25,7 @@ const emptyUserSummaries: OfficialUsageUserSummary[] = [];
 
 export function UserAccessView({
   data,
+  compact = false,
   onPageChange,
   onQueryChange,
 }: UserAccessViewProps) {
@@ -26,6 +34,12 @@ export function UserAccessView({
   const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
   const [accessRowFilter, setAccessRowFilter] =
     useState<AccessRowFilter>("all");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [lowResponseThreshold, setLowResponseThreshold] = useState(5);
+  const [cohort, setCohort] = useState<"all" | "zero" | "low" | "review">("all");
+  const [sortBy, setSortBy] = useState<"displayName" | "responses" | "agentsUsed" | "lastActivity">("responses");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [selectedUsername, setSelectedUsername] = useState<string>();
   const deferredQuery = useDeferredValue(query);
   const notifyQueryChange = useEffectEvent(onQueryChange);
@@ -40,8 +54,14 @@ export function UserAccessView({
       ...(creatorTypeFilter !== "all" ? { creatorType: creatorTypeFilter } : {}),
       ...(activityFilter !== "all" ? { activity: activityFilter } : {}),
       ...(accessRowFilter === "responses" ? { responsesOnly: true } : {}),
+      ...(startDate ? { startDate } : {}),
+      ...(endDate ? { endDate } : {}),
+      lowResponseThreshold,
+      ...(cohort !== "all" ? { cohort } : {}),
+      sortBy,
+      sortDirection,
     });
-  }, [accessRowFilter, activityFilter, creatorTypeFilter, deferredQuery]);
+  }, [accessRowFilter, activityFilter, cohort, creatorTypeFilter, deferredQuery, endDate, lowResponseThreshold, sortBy, sortDirection, startDate]);
 
   const selectedUser =
     filteredUsers.find((summary) => summary.username === selectedUsername) ??
@@ -56,21 +76,33 @@ export function UserAccessView({
     query.trim().length > 0 ||
     creatorTypeFilter !== "all" ||
     activityFilter !== "all" ||
-    accessRowFilter !== "all";
+    accessRowFilter !== "all" ||
+    startDate !== "" ||
+    endDate !== "" ||
+    lowResponseThreshold !== 5 ||
+    cohort !== "all" ||
+    sortBy !== "responses" ||
+    sortDirection !== "desc";
 
   function handleClearUserFilters() {
     setQuery("");
     setCreatorTypeFilter("all");
     setActivityFilter("all");
     setAccessRowFilter("all");
+    setStartDate("");
+    setEndDate("");
+    setLowResponseThreshold(5);
+    setCohort("all");
+    setSortBy("responses");
+    setSortDirection("desc");
   }
 
   if (!data) return <div className="screen-state">Loading official user usage...</div>;
 
-  if (!data.users.count) {
+  if (!data.counts.users) {
     return (
       <section className="user-access-view" aria-label="User agent access">
-        <UserUsageLineage data={data} />
+        {!compact ? <UserUsageLineage data={data} /> : null}
         <div className="empty-state user-report-empty-state">
           <h2>No published user usage rows</h2>
           <p>
@@ -101,10 +133,11 @@ export function UserAccessView({
   }
 
   return (
-    <section className="user-access-view" aria-label="User agent access">
-      <UserUsageLineage data={data} />
+    <section className={compact ? "user-access-view embedded-user-access" : "user-access-view"} aria-label="User agent access">
+      {!compact ? <UserUsageLineage data={data} /> : null}
       <div className="summary-grid user-summary-grid" aria-label="User summary">
-        <Metric label="Users" value={data.users.count} />
+        <Metric label="All imported identities" value={data.counts.users} />
+        <Metric label="Matching identities" value={data.users.count} />
         <Metric label="User rows" value={importedUserCount} />
         <Metric label="Access rows" value={bridgeRowCount} />
         <Metric label="Report-only rows" value={reportOnlyRowCount} />
@@ -137,6 +170,12 @@ export function UserAccessView({
             ))}
           </select>
         </label>
+        <label><span>User activity start (UTC)</span><input type="date" value={startDate} max={endDate || undefined} onChange={event => setStartDate(event.target.value)} /></label>
+        <label><span>User activity end (UTC)</span><input type="date" value={endDate} min={startDate || undefined} onChange={event => setEndDate(event.target.value)} /></label>
+        <label><span>Review cohort</span><select value={cohort} onChange={event => setCohort(event.target.value as typeof cohort)}><option value="all">All users</option><option value="review">All review candidates</option><option value="zero">0 responses</option><option value="low">Low responses (1–threshold)</option></select></label>
+        <label><span>Low-response threshold</span><input type="number" min="1" max="100000000" value={lowResponseThreshold} onChange={event => setLowResponseThreshold(clampInteger(event.target.value, 1, 100_000_000, 5))} /></label>
+        <label><span>Sort</span><select value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="responses">Responses</option><option value="agentsUsed">Agents used</option><option value="lastActivity">User last activity</option><option value="displayName">Display name</option></select></label>
+        <label><span>Direction</span><select value={sortDirection} onChange={event => setSortDirection(event.target.value as typeof sortDirection)}><option value="desc">Highest / newest first</option><option value="asc">Lowest / oldest first</option></select></label>
         <label>
           <span>Activity</span>
           <select
@@ -183,8 +222,9 @@ export function UserAccessView({
 
       {filteredUsers.length === 0 ? (
         <div className="empty-state">
-          <h2>No matching users</h2>
+          <h2>No users match</h2>
           <p>Try clearing the search or filters.</p>
+          <button type="button" className="secondary" onClick={handleClearUserFilters}>Reset user filters</button>
         </div>
       ) : (
         <div className="user-access-layout">
@@ -240,6 +280,8 @@ function UserSummaryTable({
             <th scope="col">Agents with responses</th>
             <th scope="col">Responses</th>
             <th scope="col">User last activity (Users report)</th>
+            <th scope="col">Review cohort</th>
+            <th scope="col">License assignment</th>
             <th scope="col">Action</th>
           </tr>
         </thead>
@@ -270,14 +312,19 @@ function UserSummaryTable({
                 <td>
                   <div className="user-count-stack">
                     <strong>
-                      {user.bridgeResponsesSentToUsers.toLocaleString()}
+                      {(user.missingUserReport ? user.bridgeResponsesSentToUsers : user.reportedResponsesReceived).toLocaleString()}
                     </strong>
                     <small>
-                      reported {user.missingUserReport ? "Unknown" : user.reportedResponsesReceived.toLocaleString()}
+                      {user.missingUserReport ? "Users report unavailable; Users & agents total shown" : `Users & agents: ${user.bridgeResponsesSentToUsers.toLocaleString()}`}
                     </small>
                   </div>
                 </td>
                 <td>{formatReportDate(user.userLastActivityDateUtc)}</td>
+                <td>
+                  <span className={user.reviewCandidate ? "status warning" : "status neutral"}>{cohortLabel(user.reviewCohort)}</span>
+                  {user.reviewCandidate ? <small>Confirm assignment and full Copilot usage</small> : null}
+                </td>
+                <td>Unavailable in exports</td>
                 <td>
                   <button
                     type="button"
@@ -312,7 +359,7 @@ function UserAgentDetail({
   const emptyMessage =
     accessRowFilter === "responses"
       ? "Switch Access rows back to all accessed agents to see 0-response history."
-      : "Import and activate Agents, Users & agents, and Users for one compatible period to show this user's agent access history.";
+      : "The imported Users & agents report contains no agent rows for this user. This does not establish that their Copilot license is unused.";
 
   return (
     <section
@@ -328,8 +375,13 @@ function UserAgentDetail({
         </div>
         <div className="user-detail-stats" aria-label="Selected user summary">
           <SummaryStat label="Access rows" value={rows.length} />
+          <SummaryStat label="Agents used (Users report)" value={user.missingUserReport ? "Unknown" : user.reportedAgentsUsed} />
           <SummaryStat
-            label="Responses"
+            label="Responses (Users report)"
+            value={user.missingUserReport ? "Unknown" : user.reportedResponsesReceived}
+          />
+          <SummaryStat
+            label="Responses (displayed agent rows)"
             value={rows.reduce(
               (total, row) => total + row.responsesSentToUsers,
               0,
@@ -339,6 +391,8 @@ function UserAgentDetail({
             label="User last activity"
             value={formatReportDate(user.userLastActivityDateUtc)}
           />
+          <SummaryStat label="License assignment" value="Unavailable" />
+          <SummaryStat label="Reconciliation" value={user.hasReportMismatch ? "Mismatch" : user.missingUserReport ? "Users row absent" : "Matching"} />
         </div>
       </div>
 
@@ -414,10 +468,12 @@ function UserUsageLineage({ data }: { data: OfficialUsageUserView }) {
     <section className="official-usage-lineage" aria-label="Official user usage lineage">
       <div><span>Authority</span><strong>{data.authority}</strong></div>
       <div><span>State</span><strong>{formatAvailability(data.availability)}</strong></div>
-      <div><span>Source period</span><strong>{data.activeSet ? `${data.activeSet.reportingPeriod.startDate} to ${data.activeSet.reportingPeriod.endDate}` : "Unavailable"}</strong></div>
-      <div><span>Age / staleness</span><strong>{data.periodAgeDays === null ? "Unknown" : `Period ${data.periodAgeDays} day(s); import ${data.acceptedAgeDays} day(s); threshold ${data.staleAfterDays}`}</strong></div>
+      <div><span>{data.activeSet?.reportingPeriod.provenance === "activity_range" ? "Observed activity range" : "Source period"}</span><strong>{formatCoverage(data.activeSet?.reportingPeriod)}</strong></div>
+      <div><span>Age / staleness</span><strong>{`Coverage ${data.periodAgeDays === null ? "unknown" : `${data.periodAgeDays} day(s)`}; import ${data.acceptedAgeDays === null ? "unknown" : `${data.acceptedAgeDays} day(s)`}; threshold ${data.staleAfterDays}`}</strong></div>
       <div><span>Versions</span><strong>{data.lineages.map(lineage => `${kindLabel(lineage.kind)} ${lineage.fileHash.slice(0, 10)} / ${lineage.schemaVersion} / ${lineage.sourceFreshness} / ${lineage.reportingPeriod.provenance}${lineage.warnings.length ? ` / ${lineage.warnings.length} warning(s)` : ""}`).join("; ") || "None"}</strong></div>
       <div><span>Identity</span><strong>Dataset-scoped; exact IDs unresolved</strong></div>
+      <div><span>User recency anchor</span><strong>{formatReportDate(data.recencyAnchorDateUtc)} (latest observed Users date)</strong></div>
+      <div><span>Decision rule</span><strong>{data.decisionNotice}</strong></div>
     </section>
   );
 }
@@ -470,10 +526,31 @@ function formatReportDate(value?: string) {
   }).format(new Date(value));
 }
 
+function cohortLabel(value: OfficialUsageUserSummary["reviewCohort"]) {
+  return value === "zero_responses"
+    ? "0 responses — review candidate"
+    : value === "low_responses"
+      ? "Low responses — review candidate"
+      : value === "unknown"
+        ? "Unknown (Users row absent)"
+        : "Outside threshold";
+}
+
+function clampInteger(value: string, minimum: number, maximum: number, fallback: number) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
 function formatAvailability(value: OfficialUsageUserView["availability"]) {
   return value.split("_").map(part => part[0].toUpperCase() + part.slice(1)).join(" ");
 }
 
 function kindLabel(value: OfficialUsageUserView["lineages"][number]["kind"]) {
   return value === "agents" ? "Agents" : value === "userAgents" ? "Users & agents" : "Users";
+}
+
+function formatCoverage(period?: { startDate: string | null; endDate: string | null }) {
+  if (!period?.startDate && !period?.endDate) return "Unknown; the source export period is not provided";
+  if (period.startDate && period.endDate) return `${period.startDate} to ${period.endDate}`;
+  return period.startDate ? `From ${period.startDate}` : `Through ${period.endDate}`;
 }

@@ -16,6 +16,7 @@ export const capabilityIds = [
   "graph.package.block.manage",
   "graph.package.reassign.manage",
   "graph.directory.read",
+  "graph.licenses.read",
   "powerPlatform.inventory.read",
   "powerPlatform.quarantine.read",
   "powerPlatform.quarantine.manage",
@@ -23,6 +24,7 @@ export const capabilityIds = [
   "purview.audit.search.application",
   "defender.hunting.delegated",
   "defender.hunting.application",
+  "reports.copilotUsage.read",
   "reports.official.import",
 ] as const;
 
@@ -46,6 +48,7 @@ export type DataClass =
   | "provider_audit"
   | "hunting"
   | "aggregate_usage"
+  | "licensed_usage"
   | "report_import";
 
 export type CapabilityDefinition = {

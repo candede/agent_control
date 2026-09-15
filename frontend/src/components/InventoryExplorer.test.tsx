@@ -19,6 +19,12 @@ vi.mock("../api/client", async importOriginal => ({
 const savedSnapshot = { id: "snapshot-a", roleScope: "ai" as const, environmentScope: null, requestedTypes: ["microsoft.copilotstudio/agents" as const], coverage: [], observedCount: 1, totalRecords: 1, pageCount: 1, unknownFieldCount: 2, observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const botId = "22222222-2222-4222-8222-222222222222";
+const runningRefresh = {
+  id: "job-a", status: "running" as const, roleScope: "ai" as const, environmentScope: null,
+  requestedTypes: ["microsoft.copilotstudio/agents" as const], pageCount: 0, observedCount: 0, totalRecords: null,
+  unknownFieldCount: 0, snapshotId: null, createdAt: new Date().toISOString(), attemptedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(), finishedAt: null,
+};
 
 const resource = {
   tenantId: "tenant-a", nativeId: "agent-a", type: "microsoft.copilotstudio/agents" as const, location: null, displayName: null,
@@ -61,7 +67,8 @@ describe("InventoryExplorer", () => {
       controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
     });
     vi.mocked(getInventoryQuarantineSelection).mockResolvedValue({ value: [resource], snapshot: savedSnapshot });
-    vi.mocked(refreshInventory).mockResolvedValue({ id: "job-a", status: "running", roleScope: "ai", environmentScope: null, requestedTypes: ["microsoft.copilotstudio/agents"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, createdAt: new Date().toISOString(), attemptedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), finishedAt: null });
+    vi.mocked(refreshInventory).mockResolvedValue(runningRefresh);
+    vi.mocked(getInventoryRefreshJob).mockResolvedValue(runningRefresh);
     vi.mocked(getQuarantineJobs).mockResolvedValue({ value: [] });
     vi.mocked(getQuarantineStatus).mockResolvedValue(quarantineStatus());
     vi.mocked(previewQuarantine).mockResolvedValue(quarantinePreview());
@@ -103,6 +110,92 @@ describe("InventoryExplorer", () => {
     fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
     await waitFor(() => expect(refreshInventory).toHaveBeenCalledTimes(1));
     expect(refreshInventory).toHaveBeenCalledWith({ types: ["microsoft.copilotstudio/agents"], environmentId: "environment-a" });
+  });
+
+  it("displays the first saved snapshot after a 42-page refresh completes", async () => {
+    const complete = { ...runningRefresh, status: "succeeded" as const, snapshotId: "snapshot-new", pageCount: 42, observedCount: 4_140, totalRecords: 4_140 };
+    const snapshot = { ...savedSnapshot, id: complete.snapshotId, pageCount: 42, observedCount: 4_140, totalRecords: 4_140 };
+    vi.mocked(getInventoryResources).mockImplementation(async query => query?.snapshotId === snapshot.id
+      ? { ...savedPage, count: 4_140, snapshot }
+      : { value: [], count: 0, typeCounts: [], snapshot: null });
+    vi.mocked(getInventoryRefreshJob).mockResolvedValue(complete);
+    vi.mocked(getInventorySnapshots).mockResolvedValue({ value: [snapshot] });
+    render(<InventoryExplorer />);
+    expect(await screen.findByText("No saved inventory")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
+    await waitFor(() => expect(screen.getByText("42 pages, 4140 of 4140 resources observed")).toBeVisible(), { timeout: 3_000 });
+    expect(await screen.findByText("agent-a")).toBeVisible();
+    expect(screen.queryByText("No saved inventory")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Saved scope")).toHaveValue(snapshot.id);
+  });
+
+  it("replaces an older pinned snapshot with the exact refreshed scope and clears old paging and selections", async () => {
+    const snapshot = { ...savedSnapshot, id: "snapshot-new", environmentScope: "narrow-environment" };
+    const nextPage = { ...savedPage, snapshot, value: [{ ...resource, nativeId: "agent-new" }] };
+    vi.mocked(getInventoryResources).mockImplementation(async query => query?.snapshotId === snapshot.id ? nextPage : { ...savedPage, count: 100 });
+    vi.mocked(getInventoryRefreshJob).mockResolvedValue({ ...runningRefresh, status: "succeeded", snapshotId: snapshot.id, pageCount: 1, observedCount: 1, totalRecords: 1 });
+    vi.mocked(getInventorySnapshots).mockResolvedValue({ value: [savedSnapshot, snapshot] });
+    render(<InventoryExplorer />);
+    fireEvent.click(await screen.findByRole("checkbox", { name: /Select agent-a for quarantine/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Next inventory page" }));
+    await waitFor(() => expect(getInventoryResources).toHaveBeenLastCalledWith(expect.objectContaining({ snapshotId: savedSnapshot.id, offset: 50 }), expect.anything()));
+    fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
+    await waitFor(() => expect(screen.getByText("agent-new")).toBeVisible(), { timeout: 3_000 });
+    expect(getInventoryResources).toHaveBeenLastCalledWith(expect.objectContaining({ snapshotId: snapshot.id, offset: 0 }), expect.anything());
+    expect(screen.getByLabelText("Saved scope")).toHaveValue(snapshot.id);
+    expect(screen.getByText("0 of 25 exact Copilot Studio agents selected")).toBeVisible();
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([]);
+    expect(screen.queryByText("agent-a")).not.toBeInTheDocument();
+  });
+
+  it("preserves the previous snapshot when the next refresh fails before complete publication", async () => {
+    vi.mocked(getInventoryRefreshJob).mockResolvedValue({
+      ...runningRefresh, status: "failed", pageCount: 41, observedCount: 4_100, totalRecords: 4_140, message: "Incomplete provider enumeration",
+    });
+    render(<InventoryExplorer />);
+    expect(await screen.findByText("agent-a")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
+    await waitFor(() => expect(screen.getByText("Incomplete provider enumeration")).toBeVisible(), { timeout: 3_000 });
+    expect(screen.getByLabelText("Saved scope")).toHaveValue(savedSnapshot.id);
+    expect(screen.getByText("agent-a")).toBeVisible();
+    expect(screen.queryByText("No saved inventory")).not.toBeInTheDocument();
+  });
+
+  it("disables duplicate submissions and follows an immediately completed refresh instead of a stale job deep link", async () => {
+    window.history.replaceState({}, "", "/power-platform?refreshJob=job-old");
+    vi.mocked(getInventoryRefreshJob).mockResolvedValue({ ...runningRefresh, id: "job-old", status: "failed" });
+    const snapshot = { ...savedSnapshot, id: "snapshot-immediate" };
+    vi.mocked(getInventorySnapshots).mockResolvedValue({ value: [savedSnapshot, snapshot] });
+    vi.mocked(getInventoryResources).mockImplementation(async query => query?.snapshotId === snapshot.id
+      ? { ...savedPage, snapshot, value: [{ ...resource, nativeId: "agent-immediate" }] } : savedPage);
+    let resolveRefresh!: (value: Awaited<ReturnType<typeof refreshInventory>>) => void;
+    vi.mocked(refreshInventory).mockReturnValue(new Promise(resolve => { resolveRefresh = resolve; }));
+    render(<InventoryExplorer />);
+    expect(await screen.findByText("Failed")).toBeVisible();
+    const refresh = screen.getByRole("button", { name: /Refresh selected scope/ });
+    fireEvent.click(refresh);
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh);
+    expect(refreshInventory).toHaveBeenCalledOnce();
+    await act(async () => resolveRefresh({ ...runningRefresh, status: "succeeded", snapshotId: snapshot.id, pageCount: 1, observedCount: 1, totalRecords: 1 }));
+    expect(await screen.findByText("agent-immediate")).toBeVisible();
+    expect(new URLSearchParams(window.location.search).has("refreshJob")).toBe(false);
+    expect(screen.queryByText("Failed")).not.toBeInTheDocument();
+    expect(refresh).toBeEnabled();
+  });
+
+  it("does not present the collection tenant as connector source ownership", async () => {
+    vi.mocked(getInventoryResources).mockResolvedValue({
+      ...savedPage,
+      value: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", environmentId: null, details: { sourceTenantId: "" } }],
+    });
+    render(<InventoryExplorer packages={[]} />);
+    fireEvent.click(await screen.findByRole("button", { name: "View details for agent-a" }));
+    const dialog = screen.getByRole("dialog", { name: "agent-a" });
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Power Platform" }));
+    const sourceTenant = within(dialog).getByText("Source tenant ID").parentElement!;
+    expect(within(sourceTenant).getByText("Not supplied")).toBeInTheDocument();
+    expect(within(sourceTenant).queryByText(resource.tenantId)).not.toBeInTheDocument();
   });
 
   it("discovers and resumes durable waiting work after reload", async () => {

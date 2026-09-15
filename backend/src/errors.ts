@@ -1,6 +1,6 @@
 import type { ErrorRequestHandler } from "express";
 import { config } from "./config.js";
-import { operationalLog } from "./services/telemetry.js";
+import { operationalLog, requestRouteTemplate } from "./services/telemetry.js";
 
 export class AppError extends Error {
   status: number;
@@ -30,17 +30,18 @@ export class AppError extends Error {
 
 export const errorHandler: ErrorRequestHandler = (
   error,
-  _request,
+  request,
   response,
   _next,
 ) => {
-  if (error instanceof AppError && error.code === "provider_throttled") {
-    operationalLog("warn", "provider_throttled", { requestId: response.locals.requestId, status: error.status });
-  } else if (!(error instanceof AppError)) {
-    operationalLog("error", "request_error", { requestId: response.locals.requestId, outcome: "internal_error" });
-  }
-
   const appError = normalizeError(error);
+  response.locals.errorCode = appError.code;
+  const event = appError.code === "provider_throttled" ? "provider_throttled"
+    : appError.status >= 500 ? "request_error" : "request_rejected";
+  operationalLog(appError.status >= 500 ? "error" : "warn", event, {
+    requestId: response.locals.requestId, jobId: response.locals.jobId,
+    route: requestRouteTemplate(request), ...errorTelemetry(error), errorCode: appError.code, status: appError.status,
+  });
 
   const requestId = typeof response.locals.requestId === "string"
     ? response.locals.requestId
@@ -58,6 +59,21 @@ export const errorHandler: ErrorRequestHandler = (
       ...(appError.details === undefined ? {} : { details: appError.details }),
     });
 };
+
+export function errorTelemetry(error: unknown, fallbackCode = "internal_error") {
+  const errorKind = isTimeoutError(error) || error instanceof AppError && error.code === "provider_timeout" ? "timeout"
+    : error instanceof Error && error.name === "AbortError" ? "aborted"
+      : error instanceof AppError ? "application" : "unexpected";
+  return {
+    errorCode: error instanceof AppError ? error.code : fallbackCode,
+    errorKind,
+    ...(error instanceof AppError ? { status: error.status } : {}),
+  };
+}
+
+export function isTimeoutError(error: unknown): error is Error {
+  return error instanceof Error && error.name === "TimeoutError";
+}
 
 export function normalizeError(error: unknown) {
   if (error instanceof AppError) {

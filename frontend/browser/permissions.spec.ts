@@ -4,6 +4,7 @@ import { statusLabels } from "../src/capabilityState";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import type { CapabilityView, QuarantineTargetPage } from "../src/api/client";
+import { mockLayoutApi } from "./layoutFixtures";
 
 const primaryCapabilityCount = capabilityDefinitions.filter(definition => definition.probe.adapterRegistered && definition.mode !== "application").length;
 
@@ -30,6 +31,7 @@ test.afterEach(async ({ page }) => {
 });
 
 test("consented Admin permissions do not ask for consent until a token check reports it missing", async ({ page }) => {
+  const unexpectedRequests = await mockLayoutApi(page);
   let missingConsent = false;
   const posts: string[] = [];
   function views(): CapabilityView[] {
@@ -57,12 +59,12 @@ test("consented Admin permissions do not ask for consent until a token check rep
     if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
     if (path === "/api/capabilities" || path === "/api/capabilities/check") return route.fulfill({ json: { value: views() } });
     if (path === "/api/agents") return route.fulfill({ json: savedPackagePage(new Date().toISOString(), new Date(Date.now() + 300_000).toISOString()) });
-    return route.fulfill({ json: { value: [] } });
+    return route.fallback();
   });
   await page.goto("/permissions");
   const check = page.getByRole("button", { name: "Check status", exact: true });
   await expect(check).toBeEnabled();
-  await expect(page.getByRole("button", { name: "3 provider-verified / 1 local / 6 ready to try / 0 degraded / 0 blocked" })).toBeVisible();
+  await expect(page.getByRole("button", { name: `3 provider-verified / 1 local / ${primaryCapabilityCount - 4} ready to try / 0 degraded / 0 blocked` })).toBeVisible();
   await expect(page.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
   const packageRow = page.getByRole("article", { name: "Package block management" });
   await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
@@ -77,6 +79,7 @@ test("consented Admin permissions do not ask for consent until a token check rep
   await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
   expect(posts.length).toBeGreaterThanOrEqual(3);
   expect(posts.every(path => path === "/api/capabilities/check")).toBe(true);
+  expect(unexpectedRequests).toEqual([]);
 });
 
 test("primary navigation uses the full header width at every screen size", async ({ page }, info) => {

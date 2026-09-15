@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -70,7 +70,7 @@ describe("OfficialUsageImportPanel", () => {
   let staged: OfficialUsageStagingPreview[];
 
   beforeEach(() => {
-      staged = [];
+    staged = [];
     vi.clearAllMocks();
     localStorage.clear();
     api.getAdminState.mockResolvedValue(emptyAdminState);
@@ -107,8 +107,9 @@ describe("OfficialUsageImportPanel", () => {
     render(<OfficialUsageImportPanel onChanged={onChanged} />);
     await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
 
-    fireEvent.change(screen.getByLabelText("Reporting start"), { target: { value: "2026-06-07" } });
-    fireEvent.change(screen.getByLabelText("Reporting end"), { target: { value: "2026-07-06" } });
+    expect(screen.queryByLabelText("Reporting start")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Reporting end")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/Source as-of/)).not.toBeInTheDocument();
     await user.upload(screen.getByLabelText("Official usage CSV files"), [
       new File(["agents"], "agents.csv", { type: "text/csv" }),
       new File(["user agents"], "user-agents.csv", { type: "text/csv" }),
@@ -118,6 +119,9 @@ describe("OfficialUsageImportPanel", () => {
 
     expect(await screen.findByRole("region", { name: "Validated report previews" })).toBeVisible();
     expect(api.stage).toHaveBeenCalledTimes(3);
+    for (const [, input] of api.stage.mock.calls) {
+      expect(input).toEqual({ bundleId: expect.any(String), correctionOfSetId: undefined });
+    }
     expect(screen.getByText("Users & agents", { exact: true })).toBeVisible();
     expect(screen.getByText("Pseudonymous usernames remain dataset-scoped.")).toBeVisible();
     expect(screen.getAllByText((_text, element) => element?.tagName === "TD" && element.textContent?.includes("freshness unknown") === true)).toHaveLength(3);
@@ -126,6 +130,89 @@ describe("OfficialUsageImportPanel", () => {
     await waitFor(() => expect(api.acceptBundle).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/three-file set is active/i)).toBeVisible();
     expect(onChanged).toHaveBeenCalledOnce();
+  });
+
+  it("keeps every file validation error visible without looking up a bundle that was never created", async () => {
+    api.stage.mockRejectedValueOnce(new Error("Invalid count in row 2"))
+      .mockRejectedValueOnce(new Error("Unsupported CSV headers"));
+    api.previewBundle.mockRejectedValue(new Error("The official usage bundle was not found for this administrator."));
+    const user = userEvent.setup();
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
+    await user.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["bad count"], "agents.csv", { type: "text/csv" }),
+      new File(["bad headers"], "users.csv", { type: "text/csv" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Validate and stage" }));
+
+    expect(await screen.findByText(/0 report type\(s\) staged; 2 file\(s\) rejected/)).toHaveTextContent(
+      "agents.csv: Invalid count in row 2 users.csv: Unsupported CSV headers",
+    );
+    expect(api.previewBundle).not.toHaveBeenCalled();
+    expect(screen.queryByText(/bundle was not found/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Validate and stage" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Refresh import state" }));
+    expect(api.previewBundle).not.toHaveBeenCalled();
+    expect(screen.getByText(/Invalid count in row 2/)).toBeVisible();
+  });
+
+  it("retains successful companions and retries rejected files in the same bundle", async () => {
+    api.stage.mockRejectedValueOnce(new Error("Malformed CSV"));
+    const user = userEvent.setup();
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
+    await user.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["agents"], "agents.csv", { type: "text/csv" }),
+      new File(["user agents"], "user-agents.csv", { type: "text/csv" }),
+      new File(["users"], "users.csv", { type: "text/csv" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Validate and stage" }));
+
+    expect(await screen.findByText(/2 report type\(s\) staged; 1 file\(s\) rejected/)).toBeVisible();
+    expect(screen.getByText("Missing Agents")).toBeVisible();
+    expect(screen.getByText("1 file(s) selected")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeDisabled();
+    const bundleId = api.stage.mock.calls[0][1].bundleId;
+    await user.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await waitFor(() => expect(api.stage).toHaveBeenCalledTimes(4));
+    expect(api.stage.mock.calls[3][0].name).toBe("agents.csv");
+    expect(api.stage.mock.calls[3][1].bundleId).toBe(bundleId);
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+  });
+
+  it("does not count preview failures as file rejections or lose the staged bundle intent", async () => {
+    api.previewBundle.mockRejectedValueOnce(new Error("Temporary preview failure"));
+    const user = userEvent.setup();
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
+    await user.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["agents"], "agents.csv", { type: "text/csv" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Validate and stage" }));
+    expect(await screen.findByText(/1 report type\(s\) staged; 0 file\(s\) rejected/)).toHaveTextContent("Temporary preview failure");
+    const bundleId = api.stage.mock.calls[0][1].bundleId;
+    await user.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["users"], "users.csv", { type: "text/csv" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await screen.findByRole("region", { name: "Validated report previews" });
+    expect(api.stage.mock.calls[1][1].bundleId).toBe(bundleId);
+  });
+
+  it("clears an expired bundle on refresh rather than requesting a nonexistent preview", async () => {
+    staged = [preview("agents")];
+    api.getAdminState.mockResolvedValueOnce({ ...emptyAdminState, staging: staged })
+      .mockResolvedValue(emptyAdminState);
+    const user = userEvent.setup();
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await screen.findByRole("region", { name: "Validated report previews" });
+    expect(api.previewBundle).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "Refresh import state" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Validated report previews" })).not.toBeInTheDocument());
+    expect(api.previewBundle).toHaveBeenCalledOnce();
+    expect(screen.getByText(/staged bundle is no longer available/)).toBeVisible();
+    expect(screen.queryByText(/bundle was not found/)).not.toBeInTheDocument();
   });
 
   it("preserves legacy browser data until explicit acknowledged cleanup", async () => {
@@ -178,6 +265,22 @@ describe("OfficialUsageImportPanel", () => {
     expect(await screen.findByRole("region", { name: "Validated report previews" })).toBeVisible();
     expect(screen.getByText("Missing Users & agents, Users")).toBeVisible();
     expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeDisabled();
+  });
+
+  it("allows a complete empty bundle with unknown activity coverage and no date prompts", async () => {
+    staged = (["agents", "userAgents", "users"] as const).map(kind => ({
+      ...preview(kind),
+      rowCount: 0,
+      reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
+    }));
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+
+    await screen.findByRole("region", { name: "Validated report previews" });
+    expect(screen.getAllByText("No activity dates supplied", { exact: false })).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+    expect(screen.queryByText(/null to null/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Reporting start")).not.toBeInTheDocument();
   });
 
   it("resolves the exact actor-owned staging link instead of the latest bundle", async () => {

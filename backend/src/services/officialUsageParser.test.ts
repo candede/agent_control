@@ -26,6 +26,41 @@ function userAgentCsv(date: string, agentName = "Research assistant") {
 }
 
 describe("parseOfficialUsageReport", () => {
+  it("derives only the observed activity range when operator metadata is omitted", () => {
+    const report = parseOfficialUsageReport(bytes([
+      userAgentCsv("2026-07-06"),
+      "agent-2,Other,Declarative,other@example.com,1,2026-06-29",
+    ].join("\n")));
+    expect(report).toMatchObject({
+      reportingPeriod: {
+        startDate: "2026-06-29",
+        endDate: "2026-07-06",
+        days: 8,
+        provenance: "activity_range",
+      },
+      sourceAsOfProvenance: "absent",
+      sourceFreshness: "unknown",
+    });
+    expect(report.sourceAsOf).toBeUndefined();
+    expect(report.downloadedAt).toBeUndefined();
+  });
+
+  it("keeps empty and no-activity-date exports explicitly unknown", () => {
+    const header = "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)";
+    for (const csv of [header, `${header}\nuser@example.com,User,0,0,`]) {
+      expect(parseOfficialUsageReport(bytes(csv))).toMatchObject({
+        reportingPeriod: {
+          startDate: null,
+          endDate: null,
+          days: null,
+          provenance: "activity_range",
+        },
+        sourceAsOfProvenance: "absent",
+        sourceFreshness: "unknown",
+      });
+    }
+  });
+
   it.each(["Jul 6, 2026", "July 6, 2026", "6 Jul 2026", "6 July 2026", "6 Jul, 2026", "2026-07-06", "2026/07/06"])(
     "ports the observed usage date format %s without deriving provenance from a filename",
     (date) => {
@@ -51,7 +86,7 @@ describe("parseOfficialUsageReport", () => {
 
   it("labels operator assertions while keeping source freshness unknown", () => {
     const report = parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06")), {
-      reportingPeriod: { ...metadata.reportingPeriod, provenance: "operator_asserted" },
+      reportingPeriod: { ...metadata.reportingPeriod!, provenance: "operator_asserted" },
       sourceAsOf: { value: "2026-07-08T12:00:00Z", provenance: "operator_asserted" },
     });
     expect(report).toMatchObject({ sourceAsOfProvenance: "operator_asserted", sourceFreshness: "unknown" });
@@ -64,10 +99,40 @@ describe("parseOfficialUsageReport", () => {
     expect(report.rows[0]).not.toHaveProperty("activeUsersTotal");
   });
 
+  it.each([
+    [
+      "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)",
+      'a,Assistant,User-created agent,"1,234","2,345","1,175","Sep 12, 2026"',
+      { activeUsersLicensed: 1234, activeUsersUnlicensed: 2345, responsesSentToUsers: 1175 },
+    ],
+    [
+      "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)",
+      'a,Assistant,User-created agent,user@example.invalid,"1,175","Sep 12, 2026"',
+      { responsesSentToUsers: 1175 },
+    ],
+    [
+      "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)",
+      'user@example.invalid,User,"1,234","1,048","Sep 12, 2026"',
+      { numberOfAgentsUsed: 1234, agentResponsesReceived: 1048 },
+    ],
+  ])("parses Microsoft-exported comma-grouped counts for %s", (header, row, expected) => {
+    const report = parseOfficialUsageReport(bytes(`\uFEFF${header}\r\n${row}\r\n`));
+    expect(report.rows[0]).toMatchObject(expected);
+    expect(report.rows[0].lastActivityDateUtc).toBe("2026-09-12T00:00:00.000Z");
+  });
+
+  it.each(["1,00", "12,34", "1234,567", "1,,000", "0,123", "01,234", "1.000", "-1,000", "1,000.5", "1 000", "1e3", "9,007,199,254,740,992"])(
+    "rejects malformed or unsafe numeric counts %s",
+    value => {
+      const csv = `Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nuser@example.invalid,User,1,"${value}",2026-09-12`;
+      expect(() => parseOfficialUsageReport(bytes(csv))).toThrowError(expect.objectContaining({ code: "invalid_number" }));
+    },
+  );
+
   it("rejects caller claims of source metadata because supported CSVs contain no metadata columns", () => {
     expect(() => parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06")), {
       ...metadata,
-      reportingPeriod: { ...metadata.reportingPeriod, provenance: "source_metadata" },
+      reportingPeriod: { ...metadata.reportingPeriod!, provenance: "source_metadata" },
     })).toThrowError(expect.objectContaining({ code: "unverified_source_metadata" }));
   });
 
@@ -101,7 +166,7 @@ describe("parseOfficialUsageReport", () => {
   it("requires exact documented periods and unambiguous real timestamps", () => {
     expect(() => parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06")), {
       ...metadata,
-      reportingPeriod: { ...metadata.reportingPeriod, startDate: "2026-06-08" },
+      reportingPeriod: { ...metadata.reportingPeriod!, startDate: "2026-06-08" },
     })).toThrowError(expect.objectContaining({ code: "invalid_reporting_period" }));
     for (const downloadedAt of ["2026-07-08", "2026-02-30T12:00:00Z", "2026-07-08T12:00:00"]) {
       expect(() => parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06")), { ...metadata, downloadedAt }))

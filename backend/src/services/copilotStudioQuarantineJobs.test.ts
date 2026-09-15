@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { CopilotStudioQuarantineCanaryRepository } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
@@ -20,6 +20,7 @@ const botId = "22222222-2222-4222-8222-222222222222";
 const updatedAt = "2026-09-09T19:00:00.1234567Z";
 
 beforeAll(async () => { fixture = await testDatabase(); repository = new CopilotStudioQuarantineRepository(fixture.runtime); });
+afterEach(() => vi.restoreAllMocks());
 afterAll(async () => { await fixture?.close(); });
 
 function scope(tenantId = `fixture-tenant-${randomUUID()}`): QuarantineScope { return { tenantId, principalId: randomUUID() }; }
@@ -122,9 +123,9 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     await runCopilotStudioQuarantineJob(job.id,value,false,repository,provider,authorize);
     expect(await repository.get(value,job.id)).toMatchObject({ status: "inconclusive", inconclusive: 1 });
     expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual({
+      timestamp: expect.any(String), level: "error",
       event: "quarantine_write_uncertain", jobId: job.id, outcome: "requires_reconciliation",
     });
-    log.mockRestore();
   });
 
   it("emits a redacted stopped event when the finite item deadline expires before dispatch", async () => {
@@ -138,9 +139,9 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     await runCopilotStudioQuarantineJob(job.id,value,false,repository,provider,authorize);
     expect(await repository.get(value,job.id)).toMatchObject({ status: "failed", failed: 1 });
     expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual({
+      timestamp: expect.any(String), level: "error",
       event: "quarantine_job_stopped", jobId: job.id, outcome: "deadline_exceeded",
     });
-    log.mockRestore();
   });
 
   it.each(["quarantine", "unquarantine"] as const)("dispatches normal %s without qualification, persisting sent before one POST and verifying GET readback", async action => {

@@ -27,10 +27,16 @@ function csv(kind: "agents" | "userAgents" | "users", marker = "1") {
   return `Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nUser-${marker}@example.invalid,User ${marker},1,4,2026-07-06`;
 }
 
-async function stage(kind: "agents" | "userAgents" | "users", bundleId: string, options: { marker?: string; correctionOfSetId?: string; scope?: typeof administrator; metadata?: OfficialUsageMetadata } = {}) {
-  const content = csv(kind, options.marker);
+async function stage(kind: "agents" | "userAgents" | "users", bundleId: string, options: {
+  marker?: string;
+  correctionOfSetId?: string;
+  scope?: typeof administrator;
+  metadata?: OfficialUsageMetadata | null;
+  content?: string;
+} = {}) {
+  const content = options.content ?? csv(kind, options.marker);
   return repository.stage(options.scope ?? administrator, {
-    report: parseOfficialUsageReport(Buffer.from(content), options.metadata ?? metadata),
+    report: parseOfficialUsageReport(Buffer.from(content), options.metadata === null ? undefined : options.metadata ?? metadata),
     fileHash: createHash("sha256").update(content).digest("hex"),
     bundleId,
     correctionOfSetId: options.correctionOfSetId,
@@ -55,6 +61,59 @@ async function completeSet(marker = "1", correctionOfSetId?: string, sourceMetad
 }
 
 describe.sequential("Official usage repository", () => {
+  it("atomically accepts metadata-free reports with different observed ranges and empty unknown coverage", async () => {
+    const scope = { tenantId: "tenant-automatic-usage", principalId: "administrator-automatic-usage" };
+    const bundleId = randomUUID();
+    const contents = {
+      agents: csv("agents").replace(",4,", ',"1,175",'),
+      userAgents: csv("userAgents").replace(",4,", ',"1,175",').replace("2026-07-06", "2026-07-04"),
+      users: csv("users").replace(",4,", ',"1,179",').replace("2026-07-06", "2026-06-29"),
+    };
+    await Promise.all((Object.keys(contents) as Array<keyof typeof contents>).map(kind =>
+      stage(kind, bundleId, { scope, metadata: null, content: contents[kind] })));
+    const reviewed = await repository.previewBundle(scope, bundleId);
+    expect(reviewed.missingKinds).toEqual([]);
+    expect(reviewed.staging.map(item => item.reportingPeriod)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ startDate: "2026-07-06", endDate: "2026-07-06", provenance: "activity_range" }),
+      expect.objectContaining({ startDate: "2026-07-04", endDate: "2026-07-04", provenance: "activity_range" }),
+      expect.objectContaining({ startDate: "2026-06-29", endDate: "2026-06-29", provenance: "activity_range" }),
+    ]));
+    expect(await repository.acceptBundle(scope, bundleId, reviewed)).toMatchObject({ complete: true });
+    const published = await repository.getPublished(scope.tenantId);
+    expect(published.activeSet?.reportingPeriod).toEqual({
+      startDate: "2026-06-29",
+      endDate: "2026-07-06",
+      provenance: "activity_range",
+    });
+    expect(Object.values(published.reports).map(report => report?.lineage.reportingPeriod.provenance))
+      .toEqual(["activity_range", "activity_range", "activity_range"]);
+    expect(published.reports.agents?.rows[0].responsesSentToUsers).toBe(1175);
+    expect(published.reports.userAgents?.rows[0].responsesSentToUsers).toBe(1175);
+    expect(published.reports.users?.rows[0].agentResponsesReceived).toBe(1179);
+
+    const emptyScope = { tenantId: "tenant-empty-usage", principalId: "administrator-empty-usage" };
+    const emptyBundleId = randomUUID();
+    const empty = {
+      agents: csv("agents").split("\n")[0],
+      userAgents: csv("userAgents").split("\n")[0],
+      users: csv("users").split("\n")[0],
+    };
+    await Promise.all((Object.keys(empty) as Array<keyof typeof empty>).map(kind =>
+      stage(kind, emptyBundleId, { scope: emptyScope, metadata: null, content: empty[kind] })));
+    const emptyReviewed = await repository.previewBundle(emptyScope, emptyBundleId);
+    expect(await repository.acceptBundle(emptyScope, emptyBundleId, emptyReviewed)).toMatchObject({ complete: true });
+    const emptyPublished = await repository.getPublished(emptyScope.tenantId);
+    expect(emptyPublished.activeSet?.reportingPeriod).toEqual({
+      startDate: null,
+      endDate: null,
+      provenance: "activity_range",
+    });
+    expect(Object.values(emptyPublished.reports).every(report =>
+      report?.reportingPeriod.startDate === null &&
+      report.reportingPeriod.endDate === null &&
+      report.reportingPeriod.days === null)).toBe(true);
+  });
+
   it("keeps incomplete submissions durable without replacing active data, then activates all three compatible kinds atomically", async () => {
     const bundleId = randomUUID();
     const agents = await stage("agents", bundleId);
@@ -68,7 +127,7 @@ describe.sequential("Official usage repository", () => {
     const completed = await accept(users);
     expect(completed).toMatchObject({ complete: true, activeRevision: 2, setId: acceptedAgents.setId });
     expect(await repository.getAdminState(administrator)).toMatchObject({ activeSetId: completed.setId, activeRevision: 2, sets: [{ complete: true, kinds: ["agents", "userAgents", "users"] }] });
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows")).rows[0].count).toBe(3);
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE tenant_id=$1", [administrator.tenantId])).rows[0].count).toBe(3);
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staged_rows")).rows[0].count).toBe(0);
   });
 
@@ -336,8 +395,8 @@ describe.sequential("Official usage repository", () => {
     await fixture.operator.query("UPDATE official_usage_versions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
     await fixture.operator.query("UPDATE official_usage_artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
     await fixture.operator.query(`INSERT INTO official_usage_sets
-      (id,tenant_id,bundle_id,reporting_start,reporting_end,complete,accepted_at,deleted_at,expires_at,actor_principal_id)
-      SELECT gen_random_uuid(),$1,gen_random_uuid(),'2026-01-01','2026-01-31',true,clock_timestamp(),clock_timestamp(),
+      (id,tenant_id,bundle_id,reporting_start,reporting_end,period_provenance,complete,accepted_at,deleted_at,expires_at,actor_principal_id)
+      SELECT gen_random_uuid(),$1,gen_random_uuid(),'2026-01-01','2026-01-31','operator_asserted',true,clock_timestamp(),clock_timestamp(),
         clock_timestamp()-interval '1 second','retention-terminal'
       FROM generate_series(1,5001)`, [scope.tenantId]);
     const firstPreview=await retain(fixture.operator,{batchSize:5000,dryRun:true});
