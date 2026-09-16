@@ -129,6 +129,133 @@ describe.sequential("Package inventory repository", () => {
     expect(secondPage.value[0].id > secondPage.value.at(-1)!.id).toBe(true);
   });
 
+  it("overlays exact state without resurrecting stale identity details across provider revisions", async () => {
+    const unifiedScope = { tenantId: "tenant-package-unified", principalId: "reader-package-unified" };
+    const revisionA = "2026-09-10T10:00:00.000Z";
+    const revisionB = "2026-09-11T10:00:00.000Z";
+    const broad = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-broad",
+    });
+    expect(await repository.markRunning(unifiedScope, broad.id)).toBe(true);
+    await repository.publish(unifiedScope, broad.id, {
+      packages: [packageValue("retain"), packageValue("delete")],
+      totalRecords: 2,
+      pages: 1,
+    });
+    const exact = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-exact",
+      requestedIds: ["delete", "new"],
+    });
+    expect(await repository.markRunning(unifiedScope, exact.id)).toBe(true);
+    await repository.publish(unifiedScope, exact.id, {
+      packages: [packageValue("new", false, {
+        lastModifiedDateTime: revisionA,
+        version: "1",
+        elementDetails: [{
+          elementType: "AgentMetadatas",
+          elements: [{ id: "metadata", definition: "{\"fixture\":\"synthetic\"}" }],
+        }],
+      })],
+      totalRecords: 1,
+      pages: 1,
+    });
+    const application = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "application",
+      idempotencyKey: "unified-application",
+    });
+    expect(await repository.markRunning(unifiedScope, application.id)).toBe(true);
+    await repository.publish(unifiedScope, application.id, {
+      packages: [packageValue("application-only")],
+      totalRecords: 1,
+      pages: 1,
+    });
+    const newerBroad = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-newer-broad",
+    });
+    expect(await repository.markRunning(unifiedScope, newerBroad.id)).toBe(true);
+    await repository.publish(unifiedScope, newerBroad.id, {
+      packages: [packageValue("retain"), packageValue("new", true, {
+        lastModifiedDateTime: revisionA,
+        version: "1",
+      })],
+      totalRecords: 2,
+      pages: 1,
+    });
+
+    const source = await repository.readUnifiedSource(unifiedScope);
+    expect(source.packages.map(value => value.id)).toEqual(["new", "retain"]);
+    expect(source.packages.find(value => value.id === "new")).toMatchObject({
+      isBlocked: true,
+      elementDetails: [{ elementType: "AgentMetadatas" }],
+    });
+    expect(source.observations.new).toMatchObject({
+      scopeKind: "broad",
+      identityDetails: { snapshotId: expect.any(String) },
+    });
+    expect(source.snapshot).toMatchObject({ scopeKind: "broad", tokenMode: "delegated", observedCount: 2 });
+
+    const changedBroad = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-changed-broad",
+    });
+    expect(await repository.markRunning(unifiedScope, changedBroad.id)).toBe(true);
+    await repository.publish(unifiedScope, changedBroad.id, {
+      packages: [packageValue("retain"), packageValue("new", false, {
+        lastModifiedDateTime: revisionB,
+        version: "2",
+        appId: "changed-app-new",
+      })],
+      totalRecords: 2,
+      pages: 1,
+    });
+    const changed = await repository.readUnifiedSource(unifiedScope);
+    expect(changed.packages.find(value => value.id === "new")).not.toHaveProperty("elementDetails");
+    expect(changed.observations.new).not.toHaveProperty("identityDetails");
+
+    const emptyExact = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-empty-exact",
+      requestedIds: ["new"],
+    });
+    expect(await repository.markRunning(unifiedScope, emptyExact.id)).toBe(true);
+    await repository.publish(unifiedScope, emptyExact.id, {
+      packages: [packageValue("new", false, {
+        lastModifiedDateTime: revisionA,
+        version: "1",
+        elementDetails: [],
+      })],
+      totalRecords: 1,
+      pages: 1,
+    });
+    const explicitlyEmpty = await repository.readUnifiedSource(unifiedScope);
+    expect(explicitlyEmpty.packages.find(value => value.id === "new")).toMatchObject({ elementDetails: [] });
+    expect(explicitlyEmpty.observations.new).toMatchObject({ scopeKind: "exact" });
+    expect(explicitlyEmpty.observations.new).not.toHaveProperty("identityDetails");
+
+    const absentExact = await repository.submit(unifiedScope, {
+      authorizationPrincipalId: unifiedScope.principalId,
+      tokenMode: "delegated",
+      idempotencyKey: "unified-absent-exact",
+      requestedIds: ["new"],
+    });
+    expect(await repository.markRunning(unifiedScope, absentExact.id)).toBe(true);
+    await repository.publish(unifiedScope, absentExact.id, {
+      packages: [],
+      totalRecords: 0,
+      pages: 1,
+    });
+    expect((await repository.readUnifiedSource(unifiedScope)).packages.map(value => value.id)).toEqual(["retain"]);
+  });
+
   it("applies finite retention without granting runtime snapshot deletion", async () => {
     await fixture.operator.query("UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second'");
     await fixture.operator.query("UPDATE package_refresh_jobs SET expires_at=clock_timestamp()-interval '1 second' WHERE status<>'running'");

@@ -25,6 +25,103 @@
   margin-bottom: 0.35rem;
 }
 
+.official-usage-history-panel {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.official-usage-history-panel .report-section-header p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+}
+
+.usage-history-selection,
+.usage-history-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1rem;
+  border-radius: 0.6rem;
+}
+
+.usage-history-selection {
+  border: 1px solid #8fb8af;
+  background: #edf6f3;
+}
+
+.usage-history-selection > div,
+.usage-history-warning {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.usage-history-selection span,
+.usage-history-warning span {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.usage-history-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+}
+
+.usage-history-metrics > div {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+}
+
+.usage-history-metrics span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.usage-history-metrics strong {
+  font-size: 1.5rem;
+}
+
+.usage-history-warning {
+  align-items: start;
+  justify-content: start;
+  border-left: 3px solid #9b7727;
+  background: #fff5df;
+}
+
+.usage-history-table table {
+  min-width: 1120px;
+}
+
+.usage-history-table td small,
+.usage-history-observations small {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+}
+
+.usage-history-table details summary {
+  margin-top: 0.4rem;
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.usage-history-observations {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.5rem 0 0;
+  padding-left: 1rem;
+}
+
 .usage-report-context {
   justify-content: flex-start;
   flex-wrap: wrap;
@@ -260,6 +357,15 @@
 }
 
 @media (max-width: 720px) {
+  .usage-history-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-history-selection {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .catalog-analysis > .summary-grid {
     grid-template-columns: 1fr;
   }

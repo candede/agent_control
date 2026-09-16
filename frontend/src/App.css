@@ -133,6 +133,52 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.agent-catalog-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.agent-catalog-heading h2 {
+  margin: 0;
+}
+
+.agent-catalog-title {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-catalog-title .last-refresh {
+  white-space: normal;
+  text-align: left;
+}
+
+.agent-catalog-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-catalog-heading h2 span {
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 500;
+  margin-left: 8px;
+}
+
+.sync-setup-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  color: #79551c;
+  background: #fff3d6;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
 .metric,
 .bulk-panel,
 .empty-state,
@@ -475,7 +521,12 @@ button.view-button.active {
 
 .catalog-controls {
   grid-template-columns: minmax(0, 1fr);
-  row-gap: 18px;
+  row-gap: 10px;
+}
+
+.controls.catalog-controls label {
+  gap: 4px;
+  line-height: 16px;
 }
 
 .filter-section {
@@ -491,11 +542,67 @@ button.view-button.active {
 }
 
 .filter-section-primary {
+  grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr));
+}
+
+.filter-section-advanced {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.filter-section-metadata {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.agent-filter-toolbar {
+  grid-template-columns: minmax(90px, 1fr) minmax(110px, 1fr) minmax(164px, 1.3fr) max-content;
+}
+
+.agent-filter-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.controls.catalog-controls .advanced-filter-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+}
+
+.advanced-filter-toggle {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.advanced-filter-toggle input {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 0;
+  accent-color: var(--ink);
+}
+
+.advanced-filter-count {
+  border-radius: 12px;
+  background: #e9f2ed;
+  color: #2f645b;
+  padding: 3px 7px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-filter-note {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.agent-advanced-filters {
+  display: grid;
+  gap: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+.agent-advanced-filters[hidden] {
+  display: none;
 }
 
 .filter-section-title {
@@ -522,16 +629,6 @@ button.view-button.active {
   align-content: end;
   justify-items: end;
   gap: 6px;
-}
-
-.catalog-filter-actions {
-  justify-items: stretch;
-}
-
-.catalog-filter-actions .last-refresh {
-  text-align: left;
-  white-space: normal;
-  overflow-wrap: anywhere;
 }
 
 .filter-action-buttons {
@@ -676,11 +773,6 @@ button:disabled {
   opacity: 0.58;
 }
 
-@media (min-width: 1440px) {
-  .filter-section-metadata {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-}
 
 button.danger {
   color: #fff8f2;
@@ -2417,6 +2509,17 @@ button.icon-button.danger:hover {
   gap: 16px;
 }
 
+.jobs-source-filter {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-self: start;
+}
+
+.jobs-source-filter select {
+  min-width: 180px;
+}
+
 .section-heading,
 .job-card-heading,
 .job-progress,
@@ -2783,11 +2886,26 @@ button.icon-button.danger:hover {
 }
 
 .official-usage-correction {
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
   padding: 12px;
   border-left: 3px solid #b85c48;
   background: #fff6f2;
+}
+
+.official-usage-correction summary {
+  cursor: pointer;
+  color: var(--text-h);
+}
+
+.official-usage-correction label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.official-usage-correction p {
+  margin: 0;
+  font-weight: 400;
+  line-height: 1.45;
 }
 
 .official-usage-actions {
@@ -4553,7 +4671,6 @@ button.audit-result-button:focus-visible {
 }
 
 @media (max-width: 920px) {
-  .filter-section-metadata,
   .user-controls,
   .inventory-controls,
   .hunting-filters > div,
@@ -4871,7 +4988,8 @@ button.audit-result-button:focus-visible {
 
   .filter-section,
   .filter-section-primary,
-  .filter-section-metadata,
+  .filter-section-advanced,
+  .agent-filter-toolbar,
   .filter-section-usage {
     grid-column: auto;
     grid-template-columns: minmax(0, 1fr);
@@ -4879,6 +4997,11 @@ button.audit-result-button:focus-visible {
 
   .filter-action-buttons {
     justify-content: stretch;
+  }
+
+  .agent-filter-toolbar-actions {
+    flex-wrap: wrap;
+    justify-content: space-between;
   }
 
   .filter-action-buttons .control-icon-button {
@@ -4893,12 +5016,6 @@ button.audit-result-button:focus-visible {
 
   .last-refresh {
     text-align: left;
-  }
-
-  .catalog-filter-actions .last-refresh {
-    position: static;
-    white-space: normal;
-    overflow-wrap: anywhere;
   }
 
   .app-footer {

@@ -1,7 +1,8 @@
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
 import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
+import { operationalLog } from "./telemetry.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
@@ -21,6 +22,8 @@ import type {
 const graphV1 = "https://graph.microsoft.com/v1.0";
 const graphBeta = "https://graph.microsoft.com/beta";
 export const packageReadTimeoutMs = 30_000;
+export const packageInventoryReadPolicy = { minimumReadIntervalMs: 250, maxThrottleAttempts: 6 };
+const maximumRetryAfterMs = 5 * 60_000;
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
 const bulkWriteConcurrency = 4;
@@ -54,7 +57,11 @@ const defaultRetryPolicy = {
   maxAttempts: 3,
   baseDelayMs: 2_000,
   maxDelayMs: 30_000,
-  delay,
+  throttleBaseDelayMs: 30_000,
+  maxThrottleDelayMs: 120_000,
+  minimumReadIntervalMs: 0,
+  now: () => performance.now(),
+  delay: (ms: number, signal?: AbortSignal) => delay(ms, undefined, { signal }),
 };
 
 export type FetchLike = (
@@ -66,7 +73,12 @@ type RetryPolicy = {
   maxAttempts: number;
   baseDelayMs: number;
   maxDelayMs: number;
-  delay: (delayMs: number) => Promise<unknown>;
+  maxThrottleAttempts: number;
+  throttleBaseDelayMs: number;
+  maxThrottleDelayMs: number;
+  minimumReadIntervalMs: number;
+  now: () => number;
+  delay: (delayMs: number, signal?: AbortSignal) => Promise<unknown>;
 };
 
 type BulkSetBlockedStateOptions = {
@@ -93,6 +105,7 @@ export type PackageReadOptions = {
   signal?: AbortSignal;
   correlationId?: string;
   onProgress?: (progress: { pages: number; observedCount: number }) => void | Promise<void>;
+  onRetry?: (retry: { attempt: number; retryDelayMs: number; throttled: boolean }) => void | Promise<void>;
 };
 
 export type PackageMutationOptions = {
@@ -109,13 +122,18 @@ export type PackageReadbackOptions = PackageReadOptions & {
 export class GraphPackagesClient {
   private fetcher: FetchLike;
   private retryPolicy: RetryPolicy;
+  private readQueue: Promise<void> = Promise.resolve();
+  private nextReadAt = 0;
+  private cooldownUntil = 0;
+  private cooldownError?: AppError;
 
   constructor(
     fetcher: FetchLike = fetch,
     retryPolicy: Partial<RetryPolicy> = {},
   ) {
     this.fetcher = fetcher;
-    this.retryPolicy = { ...defaultRetryPolicy, ...retryPolicy };
+    this.retryPolicy = { ...defaultRetryPolicy, ...retryPolicy,
+      maxThrottleAttempts: retryPolicy.maxThrottleAttempts ?? retryPolicy.maxAttempts ?? defaultRetryPolicy.maxAttempts };
   }
 
   async listCopilotAgents(accessToken: string, options: PackageReadOptions = {}) {
@@ -218,34 +236,35 @@ export class GraphPackagesClient {
     }
     options.signal?.throwIfAborted();
     const correlationId = options.correlationId ?? randomUUID();
-    const timeoutSignal = AbortSignal.timeout(!init.method || init.method === "GET" ? packageReadTimeoutMs : 10_000);
+    const read = !init.method || init.method === "GET";
+    const timeoutSignal = AbortSignal.timeout(read ? packageReadTimeoutMs : 10_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
-    const response = await this.fetcher(url, {
-      ...init,
-      signal,
-      redirect: "error",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json",
-        "client-request-id": correlationId,
-        "return-client-request-id": "true",
-        ...init.headers,
-      },
-    }).catch(error => {
+    try {
+      const response = await this.fetcher(url, {
+        ...init,
+        signal,
+        redirect: "error",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/json",
+          "client-request-id": correlationId,
+          "return-client-request-id": "true",
+          ...init.headers,
+        },
+      });
+
+      if (!response.ok) throw await graphError(response, signal);
+      if (response.status === 204) return undefined as T;
+      return await boundedProviderJson<T>(response, signal);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      if (read && timeoutSignal.aborted) {
+        throw new AppError(504, "provider_timeout", "Microsoft Graph did not finish the package read within 30 seconds.");
+      }
       signal.throwIfAborted();
       if (error instanceof TypeError) throw new AppError(502, "provider_network_error", "Microsoft Graph could not be reached.");
       throw error;
-    });
-
-    if (!response.ok) {
-      throw await graphError(response, signal);
     }
-
-    if (response.status === 204) {
-      return undefined as T;
-    }
-
-    return boundedProviderJson<T>(response, signal);
   }
 
   private async requestReadWithRetry<T>(
@@ -255,21 +274,42 @@ export class GraphPackagesClient {
   ): Promise<T> {
     for (
       let attempt = 1;
-      attempt <= this.retryPolicy.maxAttempts;
+      attempt <= Math.max(this.retryPolicy.maxAttempts, this.retryPolicy.maxThrottleAttempts);
       attempt += 1
     ) {
+      await this.waitForReadSlot(options.signal);
       try {
         return await this.request<T>(url, accessToken, {}, options);
       } catch (error) {
+        options.signal?.throwIfAborted();
+        const throttled = error instanceof AppError && isGraphThrottling(error);
+        const retryable = error instanceof AppError && isRetryableGraphError(error);
+        const retryDelayMs = retryable ? getRetryDelayMs(error, attempt, this.retryPolicy) : undefined;
+        if (throttled && this.retryPolicy.minimumReadIntervalMs > 0) {
+          const cooldownMs = retryDelayMs ?? retryAfterFromDetails(error.details);
+          if (cooldownMs !== undefined && this.retryPolicy.now() + cooldownMs > this.cooldownUntil) {
+            this.cooldownUntil = this.retryPolicy.now() + cooldownMs;
+            this.cooldownError = error;
+          }
+        }
+        const fields = {
+          provider: "graph_packages",
+          stage: new URL(url).pathname.endsWith("/packages") ? "catalog" : "identity",
+          attempt,
+          ...graphErrorTelemetry(error),
+        };
         if (
-          !(error instanceof AppError) ||
-          attempt === this.retryPolicy.maxAttempts ||
-          !isRetryableGraphError(error)
+          !retryable ||
+          attempt >= (throttled ? this.retryPolicy.maxThrottleAttempts : this.retryPolicy.maxAttempts) ||
+          retryDelayMs === undefined
         ) {
+          operationalLog("warn", "package_provider_read_failed", fields);
           throw error;
         }
 
-        await waitForReadRetry(this.retryPolicy.delay, getRetryDelayMs(error, attempt, this.retryPolicy), options.signal);
+        operationalLog("warn", "package_provider_read_retry", { ...fields, retryDelayMs });
+        await options.onRetry?.({ attempt, retryDelayMs, throttled });
+        await waitForReadRetry(this.retryPolicy.delay, retryDelayMs, options.signal);
       }
     }
 
@@ -278,6 +318,25 @@ export class GraphPackagesClient {
       "retry_exhausted",
       "Retry attempts were exhausted.",
     );
+  }
+
+  private async waitForReadSlot(signal?: AbortSignal) {
+    if (this.retryPolicy.minimumReadIntervalMs === 0) return;
+    const admission = this.readQueue.then(async () => {
+      signal?.throwIfAborted();
+      for (;;) {
+        const now = this.retryPolicy.now();
+        if (this.cooldownUntil - now > maximumRetryAfterMs && this.cooldownError) throw this.cooldownError;
+        const waitMs = Math.max(this.nextReadAt, this.cooldownUntil) - now;
+        if (waitMs <= 0) break;
+        await waitForReadRetry(this.retryPolicy.delay, waitMs, signal);
+      }
+      signal?.throwIfAborted();
+      this.nextReadAt = this.retryPolicy.now() + this.retryPolicy.minimumReadIntervalMs;
+    });
+    // A cancelled waiter must not reject the admission queue for other jobs.
+    this.readQueue = admission.then(() => undefined, () => undefined);
+    await waitForReadRetry(() => admission, 0, signal);
   }
 
   private requestMutationOnce<T>(url: string, accessToken: string, init: RequestInit, options: PackageMutationOptions) {
@@ -886,7 +945,10 @@ export async function bulkGetPackageDetails(
 }
 
 export async function graphError(response: Response, signal?: AbortSignal) {
-  const body = await boundedProviderText(response, 65_536, signal).catch(() => "");
+  const body = await boundedProviderText(response, 65_536, signal).catch(() => {
+    signal?.throwIfAborted();
+    return "";
+  });
   const message = `Microsoft Graph request failed with status ${response.status}.`;
   let code = "graph_error";
   let providerErrorCode: string | undefined;
@@ -930,12 +992,47 @@ export async function graphError(response: Response, signal?: AbortSignal) {
 
 function isRetryableGraphError(error: AppError) {
   return (
-    error.status === 429 ||
+    error.code === "provider_network_error" ||
+    error.code === "provider_timeout" ||
+    ([500, 502].includes(error.status) && graphResponseDiagnostics(error) !== undefined) ||
+    isGraphThrottling(error) ||
     error.status === 503 ||
-    error.status === 504 ||
-    (error.status === 424 && typeof error.details === "object" && error.details !== null &&
-      "throttled" in error.details && error.details.throttled === true)
+    error.status === 504
   );
+}
+
+function isGraphThrottling(error: AppError) {
+  return error.status === 429 || error.status === 424 && typeof error.details === "object" && error.details !== null
+    && "throttled" in error.details && error.details.throttled === true;
+}
+
+export function graphResponseDiagnostics(error: unknown) {
+  if (!(error instanceof AppError) || !Number.isInteger(error.status) || error.status < 400 || error.status > 599
+    || typeof error.details !== "object" || error.details === null
+    || !("httpStatus" in error.details) || error.details.httpStatus !== error.status) return undefined;
+  const details = error.details;
+  return {
+    status: error.status,
+    throttled: isGraphThrottling(error),
+    providerCode: "providerErrorCode" in details && typeof details.providerErrorCode === "string"
+      && /^[A-Za-z0-9_.-]{1,128}$/.test(details.providerErrorCode) ? details.providerErrorCode : undefined,
+    requestId: "correlationId" in details && typeof details.correlationId === "string"
+      && /^[A-Za-z0-9-]{1,128}$/.test(details.correlationId) ? details.correlationId : undefined,
+  };
+}
+
+export function graphErrorTelemetry(error: unknown) {
+  const diagnostics = graphResponseDiagnostics(error);
+  return {
+    ...errorTelemetry(error, "provider_error"),
+    ...(diagnostics ? {
+      errorCode: `graph_http_${diagnostics.status}`,
+      reason: diagnostics.providerCode,
+      providerRequestId: diagnostics.requestId,
+      ...(diagnostics.throttled ? { outcome: "throttled" } : {}),
+    } : error instanceof Error && !(error instanceof AppError) && /^[A-Za-z0-9_]{1,64}$/.test(error.name)
+      ? { reason: error.name } : {}),
+  };
 }
 
 function getRetryDelayMs(
@@ -946,9 +1043,12 @@ function getRetryDelayMs(
   const retryAfter = retryAfterFromDetails(error.details);
 
   if (retryAfter !== undefined) {
-    return Math.min(retryAfter, retryPolicy.maxDelayMs);
+    return retryAfter <= maximumRetryAfterMs ? retryAfter : undefined;
   }
 
+  if (isGraphThrottling(error)) {
+    return Math.min(retryPolicy.throttleBaseDelayMs * 2 ** (attempt - 1), retryPolicy.maxThrottleDelayMs);
+  }
   return Math.min(
     retryPolicy.baseDelayMs * 2 ** (attempt - 1),
     retryPolicy.maxDelayMs,
@@ -958,7 +1058,7 @@ function getRetryDelayMs(
 function retryAfterFromDetails(details: unknown) {
   if (typeof details === "object" && details && "retryAfterMs" in details) {
     const retryAfter = (details as { retryAfterMs?: unknown }).retryAfterMs;
-    return typeof retryAfter === "number" ? retryAfter : undefined;
+    return typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined;
   }
 
   return undefined;
@@ -969,12 +1069,12 @@ function retryAfterMs(value: string | null) {
     return undefined;
   }
 
-  const seconds = Number.parseInt(value, 10);
-
-  if (!Number.isNaN(seconds)) {
-    return seconds * 1000;
+  if (/^\d+$/.test(value.trim())) {
+    const milliseconds = Number(value) * 1000;
+    return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
   }
 
+  if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value.trim())) return undefined;
   const date = Date.parse(value);
 
   if (!Number.isNaN(date)) {
@@ -984,7 +1084,7 @@ function retryAfterMs(value: string | null) {
   return undefined;
 }
 
-async function waitForReadRetry(wait: (delayMs: number) => Promise<unknown>, delayMs: number, signal?: AbortSignal) {
+async function waitForReadRetry(wait: (delayMs: number, signal?: AbortSignal) => Promise<unknown>, delayMs: number, signal?: AbortSignal) {
   signal?.throwIfAborted();
   if (!signal) {
     await wait(delayMs);
@@ -997,7 +1097,11 @@ async function waitForReadRetry(wait: (delayMs: number) => Promise<unknown>, del
     removeAbort = () => signal.removeEventListener("abort", onAbort);
   });
   try {
-    await Promise.race([wait(delayMs), aborted]);
+    await Promise.race([wait(delayMs, signal), aborted]);
+    signal.throwIfAborted();
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
   } finally {
     removeAbort();
   }

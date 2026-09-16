@@ -35,10 +35,20 @@ Microsoft documents the following interpretation constraints:
 - In Users & agents, **Last activity date (UTC)** is when that agent was last used by anyone. It is preserved with that exact meaning and is not used as the named user's recency. User recency comes from the Users export and is `Unknown` when no Users row exists.
 - Usernames can be anonymized according to Microsoft 365 report settings. They remain case-sensitive dataset-scoped identifiers and are never guessed back to people.
 
+## Initial setup and cumulative history
+
+First-use data sync includes a manual official-usage step. After initialization of an empty database, the step asks for the three companion Microsoft exports again; an empty report table is not treated as completed setup. An Admin must validate and accept a complete bundle. Other source collection and saved-data browsing can continue while upload or permissions are pending.
+
+Ordinary later uploads add to retained history rather than requiring a correction of the previous report. Exact repeated content is deduplicated; unchanged row payloads can be reused across imports while their source associations and metadata remain available. Changed counts, names, or activity values remain distinct observations. Content reuse does not prove that two anonymized users in different reports are the same person.
+
+This preserves historical observations beyond Microsoft's rolling 7/30-day export window. It does not turn aggregate CSVs into event logs: adjacent exports overlap, and neither adding their response totals nor subtracting one snapshot from another establishes exact daily activity. Last-activity ranges do not establish report-window boundaries. Historical report views keep the original source metrics and lineage rather than presenting an invented all-time usage total.
+
+Full resync preserves accepted report history, including the Sync tab's explicitly confirmed **Clear saved data and resync** option. That option clears the current account's saved users and inventory, not official reports. Deleting official reports remains a separate, explicitly confirmed Admin operation; it is not part of re-running setup. Opening the report uploader from Sync leaves the page and its server-owned jobs in place; closing the uploader returns to the sync page.
+
 ## Validate and accept
 
 1. Sign in with `AgentControl.Admin`. Admin includes all Viewer access, including aggregate and user-level accepted report views.
-2. Open **Official usage > Import reports**. Upload, validation, approval, and retained-set management are contained in this dialog, separate from the reporting dashboard. Expand **How to export the CSV files** for Microsoft export instructions. No reporting start, reporting end, or source-as-of input is required. Select **This bundle is an explicit correction** before replacing an active set.
+2. Use the usage-upload step in initial setup or open **Official usage > Import reports**. Expand **How to export the CSV files** for Microsoft export instructions. No reporting start, reporting end, or source-as-of input is required. An ordinary new export is an addition to history, not a correction; use explicit correction only for an intentionally superseding report.
 3. Choose one or more original CSVs and select **Validate and stage**. The server, not the browser, identifies each kind and parses the rows.
 4. Review the full bundle hash, coverage, per-file hash/schema/period/source basis, warnings and reconciliation. Source values that disagree remain separate and visible.
 5. Add missing companions to the same bundle. Reloading restores the current Admin's active staging. Incomplete submissions remain non-published and cannot change active usage.
@@ -52,9 +62,9 @@ Exact retries use a finite content-free receipt containing tenant, actor, bundle
 
 ## Read the dashboard and review licenses
 
-The dashboard starts with response, distinct-user, and agent totals followed by usage charts, not import controls. Activity coverage and availability remain visible. **Report details** expands source authority, freshness, versions, reconciliation, and interpretation limits; a compact **Source totals differ** indicator remains visible when totals disagree. Upload history and approval statistics are only in **Import reports**, available to Admins.
+The dashboard starts with response, distinct-user, and agent totals for the selected report snapshot followed by usage charts, not import controls. Activity coverage and availability remain visible. **Report details** expands source authority, freshness, versions, reconciliation, and interpretation limits; a compact **Source totals differ** indicator remains visible when totals disagree. Retained report history is readable by Viewers and Admins; import approval, corrections, active-set selection and deletion remain Admin operations.
 
-The dashboard includes all imported data, including undated and zero-response rows. Optional date filters are applied **after import** to the last-activity values. The CSVs are aggregate snapshots, not daily activity logs: filtering a row by its last-activity date does not turn its full-export response count into a count for the selected interval.
+A snapshot dashboard includes all its rows, including undated and zero-response rows; the accumulated history preserves previous snapshots separately. Optional date filters are applied **after import** to the last-activity values. The CSVs are aggregate snapshots, not daily activity logs: filtering a row by its last-activity date does not turn its full-export response count into a count for the selected interval.
 
 | Source | Information available for analysis |
 | --- | --- |
@@ -83,7 +93,7 @@ The supplied snapshot contains 244 agents, 517 user-agent relationships, and 300
 
 ## Limits and retention
 
-Existing installations must apply schema migration 28 through the normal [deployment workflow](deployment-setup.md) before starting the updated runtime. It adds nullable activity coverage and set-level provenance while retaining legacy report metadata and completed-set immutability. Use the migration operator, not the restricted runtime database role.
+Existing installations must apply schema migrations through 31 using the normal [deployment workflow](deployment-setup.md) before starting the updated runtime. Migration 29 backfills deduplicated report payloads and semantic content identities while preserving existing lineage; migration 30 adds private source-sync and saved user data; migration 31 adds explicitly admitted, principal-scoped clean resync while preserving accepted usage reports. Earlier migrations and their checksums are unchanged. Use the migration operator, not the restricted runtime database role. No in-app full resync applies migrations or wipes the database.
 
 | Boundary | Limit |
 | --- | --- |
@@ -93,7 +103,7 @@ Existing installations must apply schema migration 28 through the normal [deploy
 | Tenant staging | 30 retained rows, 500,000 parsed rows, 256 MiB |
 | Staging lifetime | 30 minutes; abandoned rows cleaned before admission, at startup and periodically |
 | Atomic acceptance receipt | 180 days; content-free and independent of staging cleanup |
-| Accepted content | 180 days, independent of staging |
+| Accepted content | Retained until explicit deletion; shared payloads remain while referenced by another retained report |
 | Minimal import audit | 90 days |
 | Operation confirmations | 10 minutes; at most 20 live per actor |
 

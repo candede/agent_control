@@ -13,6 +13,7 @@ export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
     "power-platform",
     "users",
     "official-usage",
+    "sync",
     "audit",
     "security",
     "permissions",

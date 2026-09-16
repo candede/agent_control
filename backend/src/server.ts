@@ -7,6 +7,7 @@ import { bulkJobs, drainBulkJobs } from "./services/bulkJobs.js";
 import { copilotStudioQuarantineJobs, drainCopilotStudioQuarantineJobs } from "./services/copilotStudioQuarantineJobs.js";
 import { enterMaintenance } from "./services/maintenance.js";
 import { defenderHunting } from "./services/defenderHunting.js";
+import { dataSync } from "./services/dataSync.js";
 import { packageInventory } from "./services/packageInventory.js";
 import { powerPlatformInventory } from "./services/powerPlatformInventory.js";
 import { purviewAudit } from "./services/purviewAudit.js";
@@ -18,6 +19,7 @@ const operationalState = await loadOperationalState(pool);
 if (operationalState.mode === "normal") {
   await powerPlatformInventory.recover();
   await packageInventory.recover();
+  await dataSync.recover();
   await purviewAudit.recover();
   await defenderHunting.recover();
   await copilotStudioQuarantineJobs.recoverInterrupted(true);
@@ -38,7 +40,8 @@ async function shutdown() {
   server.close();
   const deadline = setTimeout(() => process.exit(1), 125_000);
   deadline.unref();
-  const drained = await Promise.allSettled([drainBulkJobs(), drainCopilotStudioQuarantineJobs(), packageInventory.drain(), powerPlatformInventory.drain(), purviewAudit.drain(), defenderHunting.drain()]);
+  const syncDrained = await Promise.allSettled([dataSync.drain()]);
+  const drained = [...syncDrained, ...await Promise.allSettled([drainBulkJobs(), drainCopilotStudioQuarantineJobs(), packageInventory.drain(), powerPlatformInventory.drain(), purviewAudit.drain(), defenderHunting.drain()])];
   const failure = drained.find(result => result.status === "rejected");
   if (failure?.status === "rejected") throw failure.reason;
   store.close();

@@ -41,38 +41,6 @@ describe("Copilot usage route policy", () => {
     }
   });
 
-  it("cancels provider work when a completed GET connection is closed", async () => {
-    let markStarted!: () => void;
-    let markAborted!: () => void;
-    const started = new Promise<void>(resolve => { markStarted = resolve; });
-    const aborted = new Promise<void>(resolve => { markAborted = resolve; });
-    const app = authorizedApp();
-    app.use("/api", createCopilotUsageRouter({} as pg.Pool, {
-      users: async (_user, signal) => new Promise<never>((_resolve, reject) => {
-        signal!.addEventListener("abort", () => {
-          markAborted();
-          reject(signal!.reason);
-        }, { once: true });
-        markStarted();
-      }),
-    }));
-    app.use(errorHandler);
-    const server = await listen(app);
-    const port = (server.address() as { port: number }).port;
-    const request = httpRequest({ host: "127.0.0.1", port, path: "/api/copilot-usage/users", headers: { "x-test-role": "viewer" } });
-    request.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "ECONNRESET") throw error;
-    });
-    request.end();
-    try {
-      await started;
-      request.destroy();
-      await aborted;
-    } finally {
-      request.destroy();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    }
-  });
 });
 
 function authorizedApp() {

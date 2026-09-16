@@ -29,7 +29,7 @@ export function OfficialUsageImportPanel({
 }) {
   const [adminState, setAdminState] = useState<OfficialUsageAdminState>();
   const [files, setFiles] = useState<File[]>([]);
-  const [replaceActive, setReplaceActive] = useState(false);
+  const [correctionMode, setCorrectionMode] = useState(false);
   const [bundlePreview, setBundlePreview] = useState<OfficialUsageBundlePreview>();
   const [confirmation, setConfirmation] = useState<OfficialUsageConfirmation>();
   const [busy, setBusy] = useState(false);
@@ -45,7 +45,7 @@ export function OfficialUsageImportPanel({
   function applyBundlePreview(preview: OfficialUsageBundlePreview) {
     pendingBundleId.current = preview.bundleId;
     setBundlePreview(preview);
-    setReplaceActive(preview.staging.some(stage => Boolean(stage.correctionOfSetId)));
+    setCorrectionMode(preview.staging.some(stage => Boolean(stage.correctionOfSetId)));
   }
 
   async function refresh(preferredBundleId: string | null | undefined = pendingBundleId.current) {
@@ -68,8 +68,10 @@ export function OfficialUsageImportPanel({
           setMessage({ tone: "error", text: "The staged bundle is no longer available. It may have expired or been discarded. Choose the CSV files to import again." });
         }
       }
+      return state;
     } catch (error) {
       if (generation === loadGeneration.current) setMessage({ tone: "error", text: errorMessage(error) });
+      return undefined;
     }
   }
 
@@ -117,10 +119,6 @@ export function OfficialUsageImportPanel({
       return;
     }
     const existingSet = adminState.sets.find(reportSet => reportSet.bundleId === pendingBundleId.current);
-    if (adminState?.activeSetId && !replaceActive && !existingSet) {
-      setMessage({ tone: "error", text: "Confirm that this bundle is an explicit correction of the active set before staging it." });
-      return;
-    }
     setBusy(true);
     setCompletedImport(false);
     setMessage(undefined);
@@ -132,7 +130,7 @@ export function OfficialUsageImportPanel({
       try {
         const preview = await stageOfficialUsageReport(file, {
           bundleId,
-          correctionOfSetId: existingSet?.supersedesSetId ?? (replaceActive ? adminState?.activeSetId ?? undefined : undefined),
+          correctionOfSetId: existingSet?.supersedesSetId ?? (correctionMode ? adminState.activeSetId ?? undefined : undefined),
         });
         staged.set(preview.kind, preview);
       } catch (error) {
@@ -163,6 +161,7 @@ export function OfficialUsageImportPanel({
 
   async function acceptPreviews() {
     if (!bundlePreview || bundlePreview.missingKinds.length) return;
+    const priorState = adminState;
     setBusy(true);
     setMessage(undefined);
     try {
@@ -170,11 +169,14 @@ export function OfficialUsageImportPanel({
       setCompletedImport(accepted.complete);
       pendingBundleId.current = undefined;
       setBundlePreview(undefined);
-      setReplaceActive(false);
-      setMessage({ tone: "success", text: accepted.complete
-        ? "The compatible three-file set is active. Original upload bytes were discarded."
-        : "Accepted reports remain an incomplete retained set and did not replace active official usage." });
-      await refresh(null);
+      setCorrectionMode(false);
+      const refreshedState = await refresh(null);
+      if (refreshedState) {
+        setMessage({
+          tone: "success",
+          text: acceptedBundleMessage(accepted, priorState, refreshedState),
+        });
+      }
       onChanged();
     } catch (error) {
       setMessage({ tone: "error", text: errorMessage(error) });
@@ -222,7 +224,7 @@ export function OfficialUsageImportPanel({
       const preview = await previewOfficialUsageBundle(bundleId);
       applyBundlePreview(preview);
       const reportSet = adminState?.sets.find(value => value.bundleId === bundleId);
-      setReplaceActive(Boolean(reportSet?.supersedesSetId));
+      setCorrectionMode(Boolean(reportSet?.supersedesSetId));
       setMessage({ tone: "success", text: `Resuming bundle ${bundleId.slice(0, 8)}. Add ${preview.missingKinds.map(kindLabel).join(", ") || "no missing reports"}.` });
     } catch (error) {
       setMessage({ tone: "error", text: errorMessage(error) });
@@ -281,7 +283,7 @@ export function OfficialUsageImportPanel({
         <div>
           <h2 id="official-usage-import-title">Microsoft 365 usage reports</h2>
         </div>
-        <span>{activeSet ? `Active set: ${formatCoverage(activeSet.reportingPeriod)}` : "No active set"}</span>
+        <span>{activeSet ? `Current snapshot: ${formatCoverage(activeSet.reportingPeriod)}` : "No current snapshot"}</span>
       </header>
 
       {legacyPresent ? (
@@ -295,7 +297,9 @@ export function OfficialUsageImportPanel({
         </div>
       ) : null}
 
-      <p>Use the Agents, Users &amp; agents, and Users exports from the same reporting period. All rows are included; no dates need to be entered.</p>
+      <p>Use the Agents, Users &amp; agents, and Users exports from the same reporting period. Each accepted bundle is added to retained history; ordinary uploads do not require a replacement acknowledgement.</p>
+      <p>Exact duplicate observations reuse their original retained identity and acceptance time. Ordinary independent snapshots append without replacing prior history.</p>
+      <p>For a known reporting window, changed aggregate metrics require the intentional correction option below. Activity-range-only imports have an unknown reporting window and remain independent observations.</p>
       <details className="usage-import-guidance">
         <summary>How to export the CSV files</summary>
         <div className="official-usage-workflow">
@@ -312,6 +316,7 @@ export function OfficialUsageImportPanel({
             <strong>Use all available data</strong>
             <p>Activity coverage is read from the reports. After import, optional last-activity date filters help explore the data without changing the full-export response counts.</p>
             <p>These exports do not state their reporting window or source refresh time. Observed activity dates are not a claim of complete period coverage.</p>
+            <p>Rolling 7- and 30-day exports are aggregate snapshots, not event logs. Overlapping snapshot totals are never added together, and pseudonymous usernames are not assumed stable across report sets.</p>
           </div>
         </div>
       </details>
@@ -323,7 +328,11 @@ export function OfficialUsageImportPanel({
       </ol>
 
       {adminState?.activeSetId ? (
-        <label className="official-usage-correction"><input type="checkbox" disabled={busy} checked={replaceActive} onChange={event => setReplaceActive(event.target.checked)} />This bundle is an explicit correction replacing the active set.</label>
+        <details className="official-usage-correction">
+          <summary>Intentional correction options</summary>
+          <label><input type="checkbox" disabled={busy} checked={correctionMode} onChange={event => setCorrectionMode(event.target.checked)} />This upload intentionally corrects the current snapshot.</label>
+          <p>Leave this off for ordinary cumulative uploads. Corrections preserve earlier observations in history; retained-set deletion remains a separate confirmed action below.</p>
+        </details>
       ) : null}
 
       <div className="report-actions official-usage-actions">
@@ -353,9 +362,10 @@ export function OfficialUsageImportPanel({
       ) : null}
 
       <section className="official-usage-history" aria-label="Retained report sets">
-        <h3>Retained sets</h3>
+        <h3>Accumulated snapshot history</h3>
+        <p>Accepted snapshots remain available beyond the current 30-day view. Coverage labels describe source-supplied windows or observed activity ranges; unknown windows stay explicit. Metrics from overlapping aggregate exports are non-additive.</p>
         {adminState?.sets.length ? <div className="table-shell"><table><thead><tr><th>Activity coverage / supplied period</th><th>Reports</th><th>Status</th><th>Lineage</th><th>Accepted</th><th>Actions</th></tr></thead><tbody>
-          {adminState.sets.map(reportSet => <tr key={reportSet.id}><td>{formatCoverage(reportSet.reportingPeriod)}</td><td>{reportSet.kinds.map(kindLabel).join(", ")}</td><td>{reportSet.deletedAt ? "Deleted" : reportSet.id === adminState.activeSetId ? "Active" : reportSet.complete ? "Retained" : "Incomplete"}</td><td>{reportSet.supersedesSetId ? `Corrects ${reportSet.supersedesSetId.slice(0, 8)}` : "Original set"}</td><td>{reportSet.acceptedAt ? formatInstant(reportSet.acceptedAt) : "Pending companions"}</td><td><div className="table-actions">{!reportSet.complete && !reportSet.deletedAt ? <button type="button" className="secondary" disabled={busy} onClick={() => void resumeSet(reportSet.bundleId)}>Resume</button> : null}{reportSet.complete && !reportSet.deletedAt && reportSet.id !== adminState.activeSetId ? <button type="button" className="secondary" disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "select")}>Select</button> : null}{!reportSet.deletedAt ? <button type="button" className="icon-button danger" title="Delete retained set" aria-label={`Delete retained set for ${formatCoverage(reportSet.reportingPeriod)}`} disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "delete")}><Trash2 size={16} /></button> : null}</div></td></tr>)}
+          {adminState.sets.map(reportSet => <tr key={reportSet.id}><td>{formatCoverage(reportSet.reportingPeriod)}<br /><small>{formatProvenance(reportSet.reportingPeriod.provenance)}</small></td><td>{reportSet.kinds.map(kindLabel).join(", ")}</td><td>{reportSet.deletedAt ? "Deleted" : reportSet.id === adminState.activeSetId ? "Current" : reportSet.complete ? "Retained" : "Incomplete"}</td><td>{reportSet.supersedesSetId ? `Corrects ${reportSet.supersedesSetId.slice(0, 8)}` : "Cumulative snapshot"}</td><td>{reportSet.acceptedAt ? formatInstant(reportSet.acceptedAt) : "Pending companions"}</td><td><div className="table-actions">{!reportSet.complete && !reportSet.deletedAt ? <button type="button" className="secondary" disabled={busy} onClick={() => void resumeSet(reportSet.bundleId)}>Resume</button> : null}{reportSet.complete && !reportSet.deletedAt && reportSet.id !== adminState.activeSetId ? <button type="button" className="secondary" disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "select")}>Make current</button> : null}{!reportSet.deletedAt ? <button type="button" className="icon-button danger" title="Delete retained set" aria-label={`Delete retained set for ${formatCoverage(reportSet.reportingPeriod)}`} disabled={busy} onClick={() => void beginSetOperation(reportSet.id, "delete")}><Trash2 size={16} /></button> : null}</div></td></tr>)}
         </tbody></table></div> : <p>No retained official usage sets.</p>}
       </section>
 
@@ -381,6 +391,44 @@ function formatProvenance(provenance: string) {
     : provenance === "unknown" ? "Reporting window unknown"
       : provenance === "operator_asserted" ? "Previously supplied by administrator"
         : "Source metadata";
+}
+
+function acceptedBundleMessage(
+  accepted: Awaited<ReturnType<typeof acceptOfficialUsageBundle>>,
+  priorState: OfficialUsageAdminState | undefined,
+  refreshedState: OfficialUsageAdminState,
+) {
+  if (!accepted.complete) {
+    return "Accepted reports remain an incomplete retained snapshot and did not replace the current official usage view.";
+  }
+
+  const priorSet = priorState?.sets.find(reportSet => reportSet.id === accepted.setId);
+  const refreshedSet = refreshedState.sets.find(reportSet => reportSet.id === accepted.setId);
+  const isCurrent = refreshedState.activeSetId === accepted.setId;
+  const selectionUnchanged = Boolean(
+    priorState
+    && priorState.activeSetId === refreshedState.activeSetId
+    && priorState.activeRevision === refreshedState.activeRevision
+    && accepted.activeRevision === refreshedState.activeRevision,
+  );
+  const acceptance = priorSet?.acceptedAt ? ` Original acceptance remains ${formatInstant(priorSet.acceptedAt)}.` : "";
+
+  if (priorSet) {
+    if (isCurrent) {
+      return `The upload exactly matched the current retained snapshot. No new history entry was created.${acceptance}${selectionUnchanged ? " Current selection and revision are unchanged." : " Current selection remains on the matched snapshot."} Original upload bytes were discarded.`;
+    }
+    const current = refreshedState.activeSetId ? refreshedState.activeSetId.slice(0, 8) : "none";
+    return `The upload exactly matched retained snapshot ${accepted.setId.slice(0, 8)}. No new history entry was created.${acceptance} Current selection remains ${current}${selectionUnchanged ? " and its revision is unchanged" : ""}. Original upload bytes were discarded.`;
+  }
+
+  if (!refreshedSet) {
+    return "The reports were accepted, but refreshed history could not confirm the retained snapshot or active selection. Refresh import state before relying on its status.";
+  }
+  if (isCurrent) {
+    return "The compatible three-file snapshot was added to cumulative history and is current. Prior snapshots remain retained, and original upload bytes were discarded.";
+  }
+  const current = refreshedState.activeSetId ? refreshedState.activeSetId.slice(0, 8) : "none";
+  return `The compatible three-file snapshot was added to retained cumulative history. Current selection remains ${current}; the new snapshot was not made current. Original upload bytes were discarded.`;
 }
 
 function SetConfirmationDialog({ confirmation, reportSet, busy, onCancel, onConfirm }: {

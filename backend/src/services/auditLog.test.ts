@@ -43,4 +43,18 @@ describe("PostgreSQL audit projection", () => {
     expect(await audit.listEvents({ limit: 1, offset: 1 })).toHaveLength(1);
     await expect(audit.startEvent({ operationId: "bad", scope: "single", action: "block", targetBlockedState: true, agentId: "package-1", actor: { ...actor, tenantId: "other" }, requestPath: "/bad" })).rejects.toThrow("scope");
   });
+
+  it("resolves bulk references only within the current tenant, principal and exact package set", async () => {
+    await audit.startEvent({ operationId: "ref_case_1", scope: "bulk", action: "block", targetBlockedState: true, agentId: "included", actor, requestPath: "/api/agents/block" });
+    await audit.startEvent({ operationId: "ref_case_2", scope: "bulk", action: "block", targetBlockedState: true, agentId: "not-in-current-inventory", actor, requestPath: "/api/agents/block" });
+    await audit.startEvent({ operationId: "refXcase_3", scope: "bulk", action: "block", targetBlockedState: true, agentId: "wildcard-lookalike", actor, requestPath: "/api/agents/block" });
+    await audit.startEvent({ operationId: "ref_case_4", scope: "single", action: "block", targetBlockedState: true, agentId: "single", actor, requestPath: "/api/agents/block" });
+    const foreignPrincipal = new AuditLog({ ...scope, principalId: "foreign" }, fixture.runtime);
+    await foreignPrincipal.startEvent({ operationId: "ref_case_5", scope: "bulk", action: "block", targetBlockedState: true, agentId: "foreign-principal", actor: { ...actor, homeAccountId: "foreign" }, requestPath: "/api/agents/block" });
+    const foreignTenant = new AuditLog({ ...scope, tenantId: "foreign" }, fixture.runtime);
+    await foreignTenant.startEvent({ operationId: "ref_case_6", scope: "bulk", action: "block", targetBlockedState: true, agentId: "foreign-tenant", actor: { ...actor, tenantId: "foreign" }, requestPath: "/api/agents/block" });
+    expect(await audit.matchingOperationPackageIds(["included", "single", "foreign-principal", "foreign-tenant", "wildcard-lookalike"], "REF_CASE")).toEqual(["included"]);
+    expect(await audit.matchingOperationPackageIds([], "REF_CASE")).toEqual([]);
+    await expect(audit.matchingOperationPackageIds(["included"], "ref%")).rejects.toMatchObject({ code: "invalid_operation_reference" });
+  });
 });

@@ -70,6 +70,7 @@ export type ParsedOfficialUsageReport =
 export type OfficialUsageLineage = {
   kind: OfficialUsageReportKind;
   versionId: string;
+  contentHash?: string;
   fileHash: string;
   parserVersion: string;
   schemaVersion: string;
@@ -98,6 +99,7 @@ export type AcceptedOfficialUsageReports = {
 export type OfficialUsageSetSummary = {
   id: string;
   bundleId: string;
+  contentHash?: string;
   reportingPeriod: {
     startDate: string | null;
     endDate: string | null;
@@ -109,7 +111,7 @@ export type OfficialUsageSetSummary = {
   acceptedAt: string | null;
   deletedAt: string | null;
   createdAt: string;
-  expiresAt: string;
+  expiresAt: string | null;
 };
 
 export type PublishedOfficialUsage = {
@@ -340,4 +342,61 @@ export type OfficialUsageUserView = {
   topUsersByResponses: OfficialUsageTopUser[];
   leastUsersByResponses: OfficialUsageTopUser[];
   users: { value: OfficialUsageUserSummary[]; count: number; limit: number; offset: number };
+};
+
+export type OfficialUsageHistoryObservationSummary = {
+  versionId: string;
+  kind: OfficialUsageReportKind;
+  contentHash: string;
+  rowCount: number;
+  uniquePayloadCount: number;
+  repeatedRowsReused: number;
+  lineage: OfficialUsageLineage;
+};
+
+export type OfficialUsageHistoryBundleSummary = OfficialUsageSetSummary & {
+  isActive: boolean;
+  observationCount: number;
+  rowCount: number;
+  uniquePayloadCount: number;
+  repeatedRowsReused: number;
+  reportingWindowKnown: boolean;
+  activityRangeIsCoverage: false;
+  observations: OfficialUsageHistoryObservationSummary[];
+};
+
+export type OfficialUsageHistorySummary = {
+  importCount: number;
+  uniqueObservationCount: number;
+  observationRowCount: number;
+  uniquePayloadCount: number;
+  repeatedRowsReused: number;
+  earliestObservedAt: string | null;
+  latestObservedAt: string | null;
+  activityDateRange: {
+    earliestDateUtc: string | null;
+    latestDateUtc: string | null;
+    provenance: "last_activity_dates";
+    provesReportingCoverage: false;
+  };
+  reportingWindows: {
+    knownCount: number;
+    unknownCount: number;
+    overlappingKnownWindowCount: number;
+    additive: false;
+  };
+  warning: {
+    code: "rolling_snapshots_not_additive";
+    message: string;
+  };
+};
+
+export type OfficialUsageHistoryView = {
+  summary: OfficialUsageHistorySummary;
+  bundles: {
+    value: OfficialUsageHistoryBundleSummary[];
+    count: number;
+    limit: number;
+    offset: number;
+  };
 };

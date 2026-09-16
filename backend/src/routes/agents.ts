@@ -18,6 +18,7 @@ import { capturePackageMutationState } from "../services/packageMutationState.js
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import type { CopilotPackageDetail, PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 import type { AuditAction } from "../types/audit.js";
+import { isAuditOperationPrefix } from "../types/audit.js";
 import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 
@@ -43,7 +44,8 @@ policyRoute(agentsRouter, "post", "/directory/principals/resolve", { access: "au
 
 policyRoute(agentsRouter, "post", "/agents/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const tokenMode = packageMode(request.body?.mode);
-  const job = await packageInventory.submit(request.session.user!, { tokenMode, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() });
+  const requestedIds = parsePackageRefreshIds(request.body?.ids);
+  const job = await packageInventory.submit(request.session.user!, { tokenMode, requestedIds, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() });
   response.status(202).json(job.status === "waiting_authorization" ? await startPackageRefreshOrWaiting(request, job.id, tokenMode) : job);
 });
 policyRoute(agentsRouter, "post", "/agents/:id/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
@@ -369,6 +371,10 @@ export function inventoryPackageDetail(detail: CopilotPackageDetail): CopilotPac
   return inventory;
 }
 
+export function parsePackageRefreshIds(value: unknown) {
+  return value === undefined ? undefined : parseIds(value, 100);
+}
+
 async function savedPackageScope(request: Request, mode: "delegated" | "application"): Promise<PackageDataScope> {
   const owner = requestScope(request);
   if (mode === "delegated") return owner;
@@ -452,7 +458,7 @@ function optionalText(value: unknown, maximum: number) {
 
 function optionalOperationIdPrefix(value: string | undefined) {
   if (value === undefined) return undefined;
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value)) return invalidPackageQuery("operation reference is invalid");
+  if (!isAuditOperationPrefix(value)) return invalidPackageQuery("operation reference is invalid");
   return value;
 }
 

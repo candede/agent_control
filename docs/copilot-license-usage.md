@@ -1,6 +1,8 @@
 # Microsoft 365 Copilot license usage
 
-`GET /api/copilot-usage/users` is a read-only Viewer/Admin snapshot. It performs bounded, explicitly requested delegated Microsoft Graph reads and joins the result to the active imported official Copilot Agents usage set. It does not run on navigation keystrokes, cache one user's delegated result for another user, change licenses, or create synthetic activity.
+`GET /api/copilot-usage/users` is a read-only Viewer/Admin view of saved tenant/principal-private directory/license and app-activity snapshots. It joins those saved sources to the current imported official Copilot Agents usage set without calling Microsoft Graph. First-use setup and explicit user-source sync perform the bounded delegated Graph reads. A new usage import is reflected on the next saved-data read without another provider scan. One user's delegated snapshot is never shared with another principal.
+
+Data sync distinguishes an uncollected source from an authorized collection with zero licensed users. A failed resync does not erase the last successful data. Source timestamps and errors remain visible; saved state is not represented as a fresh live observation. Syncing does not change license assignments or create synthetic activity.
 
 ## Provider requirements
 

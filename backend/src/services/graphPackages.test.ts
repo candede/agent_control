@@ -132,9 +132,73 @@ describe("GraphPackagesClient", () => {
 
   it("categorizes network failures without exposing their messages or retrying a mutation", async () => {
     const fetcher = vi.fn(async () => { throw new TypeError("private-url private-token"); });
-    const client = new GraphPackagesClient(fetcher);
+    const client = new GraphPackagesClient(fetcher, { delay: async () => undefined });
     await expect(client.checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_network_error" });
     await expect(client.blockPackage("token", "P_1")).rejects.toMatchObject({ code: "provider_network_error" });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries a terminated successful response body, not just a failed connection", async () => {
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(new Response(new ReadableStream({ start(controller) {
+        controller.error(new TypeError("terminated private-url private-token"));
+      } })))
+      .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Agent", isBlocked: false }));
+    await expect(new GraphPackagesClient(fetcher, { delay: async () => undefined }).getPackageDetails("token", "P_1"))
+      .resolves.toMatchObject({ id: "P_1" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["headers", "body"])("retries a local 30-second %s timeout without treating it as caller cancellation", async stage => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>()
+      .mockImplementationOnce(async (_url, init) => stage === "body"
+        ? new Response(new ReadableStream({ cancel }))
+        : new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        }))
+      .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Agent", isBlocked: false }));
+    try {
+      const result = new GraphPackagesClient(fetcher, { delay: async () => undefined }).getPackageDetails("token", "P_1");
+      const assertion = expect(result).resolves.toMatchObject({ id: "P_1" });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      if (stage === "body") expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      timeout.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps cancellation authoritative while reading a Graph error body", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream({ cancel }), { status: 500 }));
+    const result = new GraphPackagesClient(fetcher).getPackageDetails("token", "P_1", { signal: controller.signal });
+    const assertion = expect(result).rejects.toMatchObject({ code: "read_job_cancelled" });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
+    await assertion;
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry local schema failures or actual mutations with a 5xx status", async () => {
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(new Response("{"))
+      .mockResolvedValueOnce(Response.json({ error: { code: "InternalServerError" } }, { status: 500 }));
+    const client = new GraphPackagesClient(fetcher, { delay: async () => undefined });
+    await expect(client.getPackageDetails("token", "P_1")).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    await expect(client.blockPackage("token", "P_1")).rejects.toMatchObject({ code: "InternalServerError" });
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 

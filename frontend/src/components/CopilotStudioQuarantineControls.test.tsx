@@ -1,16 +1,17 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import { previewQuarantine, submitQuarantine, type CapabilityView, type QuarantinePreview, type SessionUser } from "../api/client";
+import { getQuarantineJobs, previewQuarantine, submitQuarantine, type CapabilityView, type QuarantineJob, type QuarantinePreview, type SessionUser } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof import("../api/client")>(),
-  previewQuarantine: vi.fn(), submitQuarantine: vi.fn(),
+  getQuarantineJobs: vi.fn(), previewQuarantine: vi.fn(), submitQuarantine: vi.fn(),
 }));
 
 const user: SessionUser = { homeAccountId: "admin-a", displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
@@ -65,6 +66,7 @@ function preview(): QuarantinePreview {
 describe("on-demand quarantine changes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getQuarantineJobs).mockResolvedValue({ value: [] });
     vi.mocked(previewQuarantine).mockResolvedValue(preview());
     vi.mocked(submitQuarantine).mockResolvedValue({
       id: "job-a", action: "quarantine", status: "succeeded", confirmationHash: "c".repeat(64), confirmation: preview().summary,
@@ -121,5 +123,35 @@ describe("on-demand quarantine changes", () => {
     expect(within(dialog).getByRole("button", { name: "Confirm quarantine" })).toBeDisabled();
     await userEvent.click(within(dialog).getByRole("button", { name: "Confirm quarantine" }));
     expect(submitQuarantine).not.toHaveBeenCalled();
+  });
+
+  it("keeps the submitted durable job mounted after clearing its targets", async () => {
+    const onJobChange = vi.fn<(job: QuarantineJob) => void>();
+    function Harness() {
+      const [targets, setTargets] = useState([target]);
+      return <CopilotStudioQuarantineControls
+        snapshot={snapshot}
+        targets={targets}
+        variant="bulk"
+        canManage
+        onClear={() => setTargets([])}
+        onJobChange={onJobChange}
+      />;
+    }
+    render(<CapabilityContext value={{
+      views: [onDemandDecision()], user, now: Date.now(), loading: false, pending: false,
+      error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
+    }}>
+      <WorkbenchActionProvider value={workbenchActions}><Harness /></WorkbenchActionProvider>
+    </CapabilityContext>);
+
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine selected" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+
+    expect(await screen.findByText("Quarantine job: Succeeded")).toBeInTheDocument();
+    expect(screen.getByText("0 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+    expect(onJobChange).toHaveBeenCalledWith(expect.objectContaining({ id: "job-a" }));
   });
 });

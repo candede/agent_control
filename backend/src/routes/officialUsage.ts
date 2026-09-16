@@ -9,6 +9,7 @@ import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { parseOfficialUsageReport, OfficialUsageValidationError } from "../services/officialUsageParser.js";
+import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
 import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
@@ -136,6 +137,7 @@ const csvUpload: RequestHandler = (request: UploadRequest, response, next) => {
 export function createOfficialUsageRouter(database: pg.Pool = pool) {
   const router = Router();
   const repository = new OfficialUsageRepository(database);
+  const history = new OfficialUsageHistoryService(database);
   const packageRepository = new PackageInventoryRepository(database);
 
   policyRoute(router, "post", "/official-usage/staging", {
@@ -191,6 +193,16 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     response.json(await repository.getAdminState(requestScope(request)));
   });
 
+  policyRoute(router, "get", "/official-usage/history", {
+    access: "authenticated", dataClass: "official_usage_history", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    const scope = requestScope(request);
+    response.json(await history.getHistory(scope.tenantId, {
+      limit: queryInteger(first(request.query.limit), 25, 100, true),
+      offset: queryInteger(first(request.query.offset), 0, 100_000, false),
+    }));
+  });
+
   policyRoute(router, "delete", "/official-usage/staging/:id", {
     access: "authenticated", dataClass: "official_usage_import", roles: ["AgentControl.Admin"], csrf: true,
   }, async (request, response) => {
@@ -244,8 +256,9 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     access: "authenticated", dataClass: "official_usage_aggregate", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
+    const setId = querySetId(request.query);
     const [published, packages] = await Promise.all([
-      repository.getPublished(scope.tenantId),
+      repository.getPublished(scope.tenantId, setId),
       packageRepository.list(scope, { limit: 5_000, offset: 0 }),
     ]);
     response.json(buildOfficialUsageAggregateView(published, packages.value, aggregateOptions(request.query)));
@@ -260,8 +273,9 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
       filename: "official-agent-usage.csv",
       load: async () => {
         const scope = requestScope(request);
+        const setId = querySetId(request.query);
         const [published, packages] = await Promise.all([
-          repository.getPublished(scope.tenantId),
+          repository.getPublished(scope.tenantId, setId),
           packageRepository.list(scope, { limit: 5_000, offset: 0 }),
         ]);
         const view = buildOfficialUsageAggregateView(published, packages.value, { ...aggregateOptions(request.query), limit: 100_000, offset: 0 });
@@ -272,7 +286,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
           metadata: { source: "official_usage", reportSetId: view.activeSet?.id ?? null,
             reportingStart: view.activeSet?.reportingPeriod.startDate ?? null, reportingEnd: view.activeSet?.reportingPeriod.endDate ?? null },
           validateSource: async () => {
-            if (officialDatasetKey(await repository.getPublished(scope.tenantId)) !== datasetKey) {
+            if (officialDatasetKey(await repository.getPublished(scope.tenantId, setId)) !== datasetKey) {
               throw new AppError(409, "dataset_invalidated", "The official usage dataset changed or was deleted before export publication completed.");
             }
           },
@@ -285,7 +299,10 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
-    response.json(buildOfficialUsageUserView(await repository.getPublished(scope.tenantId), userViewOptions(request.query)));
+    response.json(buildOfficialUsageUserView(
+      await repository.getPublished(scope.tenantId, querySetId(request.query)),
+      userViewOptions(request.query),
+    ));
   });
 
   policyRoute(router, "get", "/official-usage/users.csv", {
@@ -297,7 +314,8 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
       filename: "official-user-usage.csv",
       load: async () => {
         const scope = requestScope(request);
-        const published = await repository.getPublished(scope.tenantId);
+        const setId = querySetId(request.query);
+        const published = await repository.getPublished(scope.tenantId, setId);
         const view = buildOfficialUsageUserView(published, {
           ...userViewOptions(request.query), limit: 100_000, offset: 0,
         });
@@ -308,7 +326,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
           metadata: { source: "official_usage", reportSetId: view.activeSet?.id ?? null,
             reportingStart: view.activeSet?.reportingPeriod.startDate ?? null, reportingEnd: view.activeSet?.reportingPeriod.endDate ?? null },
           validateSource: async () => {
-            if (officialDatasetKey(await repository.getPublished(scope.tenantId)) !== datasetKey) {
+            if (officialDatasetKey(await repository.getPublished(scope.tenantId, setId)) !== datasetKey) {
               throw new AppError(409, "dataset_invalidated", "The official usage dataset changed or was deleted before export publication completed.");
             }
           },
@@ -446,6 +464,11 @@ function queryDateRange(query: Record<string, unknown>) {
     throw new AppError(400, "invalid_usage_query", "The official usage start date must not be after the end date.");
   }
   return [startDate, endDate] as const;
+}
+
+function querySetId(query: Record<string, unknown>) {
+  const value = first(query.setId);
+  return value === undefined || value === "" ? undefined : uuid(value);
 }
 
 function queryEnum<const T extends readonly string[]>(value: string | undefined, allowed: T, label: string): T[number] | undefined {

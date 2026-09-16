@@ -6,10 +6,24 @@ import {
   parsePackageAccessUpdate,
   parseMutationScope,
   inventoryPackageDetail,
+  parsePackageRefreshIds,
 } from "./agents.js";
 
 const groupId = "11111111-1111-4111-8111-111111111111";
 const userId = "22222222-2222-4222-8222-222222222222";
+
+describe("package identity refresh targets", () => {
+  it("retains the broad scan only when exact IDs are omitted", () => {
+    expect(parsePackageRefreshIds(undefined)).toBeUndefined();
+    expect(parsePackageRefreshIds(["package-a", "package-b"])).toEqual(["package-a", "package-b"]);
+  });
+
+  it("rejects empty, duplicate, malformed and oversized selections", () => {
+    for (const input of [[], null, ["same", "same"], [1], Array.from({ length: 101 }, (_, index) => `package-${index}`)]) {
+      expect(() => parsePackageRefreshIds(input)).toThrow();
+    }
+  });
+});
 
 describe("parsePackageAccessUpdate", () => {
   it("parses a specific principal update", () => {

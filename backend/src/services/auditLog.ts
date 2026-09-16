@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { pool } from "../db/pool.js";
 import type { AuditEvent, CompleteAuditEvent, ListAuditEventsQuery, StartAuditEvent } from "../types/audit.js";
+import { isAuditOperationPrefix } from "../types/audit.js";
+import { AppError } from "../errors.js";
 
 export type DataScope = { tenantId: string; principalId: string };
 type Database = Pick<pg.Pool, "query">;
@@ -123,6 +125,20 @@ export class AuditLog {
     const filter = this.filter(query);
     const result = await this.database.query(`SELECT count(*)::int AS count FROM audit_projection WHERE ${filter.sql}`, filter.values);
     return result.rows[0].count as number;
+  }
+
+  async matchingOperationPackageIds(ids: readonly string[], prefix: string): Promise<string[]> {
+    if (!isAuditOperationPrefix(prefix)) throw new AppError(400, "invalid_operation_reference", "The audit operation reference is invalid.");
+    if (ids.length > 5000 || ids.some(id => !id || id.length > 512)) {
+      throw new AppError(400, "invalid_targets", "An audit reference lookup requires at most 5,000 exact package IDs.");
+    }
+    if (!ids.length) return [];
+    const result = await this.database.query<{ agent_id: string }>(`SELECT DISTINCT agent_id COLLATE "C" AS agent_id FROM audit_events
+      WHERE tenant_id=$1 AND principal_id=$2 AND scope='bulk'
+        AND operation_id ILIKE $3 ESCAPE '\\' AND agent_id=ANY($4::text[])
+      ORDER BY agent_id`,
+    [this.scope.tenantId, this.scope.principalId, `${escapeLike(prefix)}%`, [...ids]]);
+    return result.rows.map(row => row.agent_id);
   }
 }
 

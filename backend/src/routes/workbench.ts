@@ -6,9 +6,11 @@ import { requestScope } from "../middleware/auth.js";
 import { bulkJobs } from "../services/bulkJobs.js";
 import { copilotStudioQuarantineJobs } from "../services/copilotStudioQuarantineJobs.js";
 import { defenderHunting } from "../services/defenderHunting.js";
+import { dataSync } from "../services/dataSync.js";
 import { purviewAudit } from "../services/purviewAudit.js";
 import { getWorkbenchMetadata } from "../services/workbenchMetadata.js";
 import type { WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../types/workbench.js";
+import type { DataSyncRun } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 
@@ -16,6 +18,26 @@ export const workbenchRouter = Router();
 const packageRepository = new PackageInventoryRepository();
 const inventoryRepository = new PowerPlatformInventoryRepository();
 const officialUsageRepository = new OfficialUsageRepository();
+
+export function dataSyncJobSummary(run: DataSyncRun): WorkbenchJobSummary {
+  const completed = run.sources.filter(source => source.status === "succeeded").length;
+  return {
+    id: run.id,
+    source: "data-sync",
+    label: run.mode === "initial" ? "Initial data sync" : run.mode === "full" ? "Full data resync" : "Data sync",
+    target: `${run.sources.length} source${run.sources.length === 1 ? "" : "s"}`,
+    status: run.status,
+    total: run.sources.length,
+    completed,
+    partial: run.status === "partial" || run.sources.some(source => ["partial", "failed", "permission_required"].includes(source.status)),
+    canResume: run.sources.some(source => source.canRetry),
+    canCancel: !["completed", "cancelled"].includes(run.status)
+      && run.sources.some(source => ["queued", "running", "waiting_authorization", "awaiting_upload"].includes(source.status)),
+    canReconcile: false,
+    updatedAt: run.updatedAt,
+    href: `/sync?syncRun=${encodeURIComponent(run.id)}`,
+  };
+}
 
 policyRoute(workbenchRouter, "get", "/workbench/metadata", {
   access: "authenticated",
@@ -33,6 +55,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
   const user = request.session.user!;
   const scope = requestScope(request);
   const loaders: Array<{ source: WorkbenchJobSource; load: () => Promise<WorkbenchJobSummary[]> }> = [];
+  loaders.push({ source: "data-sync", load: async () => (await dataSync.listRuns(scope, 20)).map(dataSyncJobSummary) });
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {
     loaders.push({ source: "package-refresh", load: async () => (await packageRepository.listJobs(scope, user.homeAccountId, 20)).value.map(job => ({
       id: job.id, source: "package-refresh", label: "Package inventory refresh",
@@ -40,7 +63,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
       status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
       canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
       updatedAt: job.updatedAt,
-      href: `/agents?refreshJob=${encodeURIComponent(job.id)}${job.tokenMode === "application" ? "&mode=application" : ""}` as const,
+      href: `/sync?refreshJob=${encodeURIComponent(job.id)}${job.tokenMode === "application" ? "&mode=application" : ""}` as const,
     })) });
   }
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {

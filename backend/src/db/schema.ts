@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import type pg from "pg";
+import { officialUsageHistoryMigrationSql } from "./officialUsageHistorySchema.js";
+import { dataSyncMigrationSql } from "./dataSyncSchema.js";
+import { dataSyncCleanupMigrationSql } from "./dataSyncCleanupSchema.js";
 
 export const migrations = [
   { version: 1, sql: `
@@ -1679,6 +1682,9 @@ BEGIN
   RETURN NEW;
 END $$;
 ` },
+  { version: 29, sql: officialUsageHistoryMigrationSql },
+  { version: 30, sql: dataSyncMigrationSql },
+  { version: 31, sql: dataSyncCleanupMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {

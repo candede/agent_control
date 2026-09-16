@@ -2,6 +2,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import { ChevronLeft, ChevronRight, Download, Eye, RefreshCw, RotateCw, X } from "lucide-react";
 import {
   downloadInventoryCsv, getInventoryQuarantineSelection, getInventoryRefreshJob, getInventoryRefreshJobs, getInventoryResources, getInventorySnapshots, getInventorySourceAwareDetail, refreshInventory, resumeInventoryRefresh,
+  powerPlatformResourceTypes,
   type InventoryListQuery, type InventoryRefreshJob, type InventoryRefreshJobList, type InventoryResourcePage, type InventorySnapshot, type InventorySourceAwareDetail, type PowerPlatformResource, type PowerPlatformResourceType,
 } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
@@ -11,6 +12,10 @@ import { parsePowerPlatformRoute, powerPlatformRouteSearch, workbenchUrl } from 
 
 const pageSize = 50;
 const noQuarantineTargets = new Map<string, PowerPlatformResource>();
+const nonAgentResourceTypes = powerPlatformResourceTypes.filter(
+  (resourceType): resourceType is Exclude<PowerPlatformResourceType, "microsoft.copilotstudio/agents"> =>
+    resourceType !== "microsoft.copilotstudio/agents",
+);
 
 export function InventoryExplorer({ canManageQuarantine = true }: { canManageQuarantine?: boolean; packages?: unknown[] }) {
   const [initialRoute] = useState(() => parsePowerPlatformRoute(window.location.search));
@@ -50,7 +55,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   const deferredEnvironment = useDeferredValue(environmentId);
   const quarantineTargets = quarantineSelection && quarantineSelection.snapshotId === page?.snapshot?.id ? quarantineSelection.targets : noQuarantineTargets;
   const query = useMemo<InventoryListQuery>(() => ({
-    snapshotId: snapshotId || undefined,
+    snapshotId: snapshotId || undefined, excludeAgents: true,
     type: type === "all" ? undefined : type, environmentId: deferredEnvironment.trim() || undefined, search: deferredSearch.trim() || undefined,
     sortBy, sortDirection, limit: pageSize, offset: pageIndex * pageSize,
   }), [deferredEnvironment, deferredSearch, pageIndex, snapshotId, sortBy, sortDirection, type]);
@@ -235,7 +240,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     setSubmittingRefresh(true);
     try {
       const next = await refreshInventory({
-        ...(refreshType === "all" ? {} : { types: [refreshType] }),
+        types: refreshType === "all" ? nonAgentResourceTypes : [refreshType],
         ...(refreshEnvironment.trim() ? { environmentId: refreshEnvironment.trim() } : {}),
       });
       if (!active.current) return;
@@ -329,7 +334,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
       <label><span>Environment ID</span><input value={environmentId} placeholder="All environments" onChange={event => { setEnvironmentId(event.target.value); setPageIndex(0); }} /></label>
       <label><span>Sort</span><select value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="displayName">Name</option><option value="type">Type</option><option value="environmentId">Environment</option><option value="createdAt">Created</option><option value="lastPublishedAt">Published</option></select></label>
       <label><span>Direction</span><select value={sortDirection} onChange={event => setSortDirection(event.target.value as typeof sortDirection)}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
-      <label><span>Refresh resource scope</span><select value={refreshType} onChange={event => setRefreshType(event.target.value as typeof refreshType)}><option value="all">All supported types</option>{page?.typeCounts.map(item => <option key={item.type} value={item.type}>{shortType(item.type)}</option>)}</select></label>
+      <label><span>Refresh resource scope</span><select value={refreshType} onChange={event => setRefreshType(event.target.value as typeof refreshType)}><option value="all">All non-agent types</option>{page?.typeCounts.filter(item => item.type !== "microsoft.copilotstudio/agents").map(item => <option key={item.type} value={item.type}>{shortType(item.type)}</option>)}</select></label>
       <label><span>Refresh environment scope</span><input value={refreshEnvironment} placeholder="All environments" onChange={event => setRefreshEnvironment(event.target.value)} /></label>
     </section>
 
@@ -389,7 +394,6 @@ function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManag
     });
     return () => controller.abort();
   }, [resource.environmentId, resource.nativeId, resource.type, snapshot?.id]);
-  const approvedFields = detailFields(resource.type);
   return <dialog ref={dialog} className="inventory-detail-modal" aria-labelledby="inventory-detail-title" onClose={onClose} onMouseDown={event => { if (event.target === event.currentTarget) closeDialog(); }} onKeyDown={event => {
     if (event.key === "Escape") { event.preventDefault(); closeDialog(); return; }
     if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && (event.target as HTMLElement).getAttribute("role") === "tab") {
@@ -416,10 +420,7 @@ function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManag
     {!related && !relatedError ? <div className="screen-state" role="status">Loading authorized source associations…</div> : null}
     <section id={`inventory-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`inventory-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
       {selectedTab === "identity" ? <><h3>Exact identities</h3><div className="inventory-detail-grid"><Detail label="Native ID" value={resource.nativeId} /><Detail label="Source" value="Power Platform inventory" /><Detail label="Identity confidence" value={title(resource.identityConfidence)} /><Detail label="Environment" value={resource.environmentId} /><Detail label="Snapshot observed" value={related?.observedAt ?? snapshot?.observedAt} /><Detail label="Snapshot ID" value={snapshot?.id} /></div><p className="association-status">{associationText(resource.association)}</p><dl className="inventory-identifiers">{resource.identifiers.map(identifier => <div key={`${identifier.kind}:${identifier.value}`}><dt>{title(identifier.kind)}</dt><dd>{identifier.value}</dd></div>)}</dl></> : null}
-      {selectedTab === "power-platform" ? <><h3>Power Platform data</h3><div className="inventory-detail-grid embedded"><Detail label="Creator type" value={title(resource.creatorType)} /><Detail label="Authoring tool" value={resource.authoringTool} maturity={resource.provenance.authoringTool?.maturity} /><Detail label="Agent kind" value={title(resource.agentKind)} /><Detail label="Lifecycle" value={title(resource.lifecycle)} />{approvedFields.map(field => <Detail key={field.key} label={field.label} value={fieldValue(resource, field.key)} maturity={resource.provenance[field.key]?.maturity} />)}</div>
-        {resource.details.capabilityDetailsTruncated ? <p>Capability details are partial; the source response reached its bounded projection limit.</p> : null}
-        {resource.details.connectors?.length ? <><h4>Connector capability details</h4><dl className="inventory-identifiers">{resource.details.connectors.map(connector => <div key={connector.connectorId}><dt>{connector.connectorId}</dt><dd>{connector.operations?.length ? <ul>{connector.operations.map(operation => <li key={operation.operationId}><strong>{operation.displayName ?? operation.operationId}</strong> · {[operation.method, operation.usedAs].filter(Boolean).join(" · ") || "Operation metadata not supplied"}</li>)}</ul> : "No allowlisted operation metadata supplied"}</dd></div>)}</dl></> : null}
-        <p>{resource.unknownFieldCount} unknown or malformed fields were omitted without retaining their values.</p></> : null}
+      {selectedTab === "power-platform" ? <><h3>Power Platform data</h3><PowerPlatformResourceData resource={resource} /></> : null}
       {selectedTab === "package" ? <SourceState title="Package source" source={related?.package} /> : null}
       {selectedTab === "reports" ? <SourceState title="Official reports" source={related?.reports} /> : null}
       {selectedTab === "audit" ? <><SourceState title="Purview audit" source={related?.audit} />{related?.audit.status === "available" ? <dl className="inventory-identifiers">{related.audit.value.map(record => <div key={`${record.jobId}:${record.wrapperId}`}><dt>{record.operation} · {formatDate(record.observedAt)}</dt><dd>Exact {title(record.matchedKind)} · event {record.nativeEventId ?? record.wrapperId} · job {record.jobId} · correlation {record.correlationId ?? "Not supplied"}</dd></div>)}</dl> : null}</> : null}
@@ -427,6 +428,21 @@ function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManag
       {selectedTab === "controls" ? <><h3>Native controls</h3>{related?.controls.quarantineTarget && resource.type === "microsoft.copilotstudio/agents" ? <CopilotStudioQuarantineControls snapshot={snapshot} targets={[resource]} variant="detail" canManage={canManageQuarantine} /> : <p>Direct quarantine status is unavailable without one exact environment/CDS bot target.</p>}<p>{canManageQuarantine ? "Admin mutation controls remain subject to delegated provider access and current capability qualification." : "Viewer can inspect direct status; AgentControl.Admin is required for quarantine changes."} Package block/access controls are unavailable because no package native ID is associated. Power Platform native IDs are never substituted.</p></> : null}
     </section>
   </dialog>;
+}
+
+export function PowerPlatformResourceData({ resource }: { resource: PowerPlatformResource }) {
+  return <>
+    <div className="inventory-detail-grid embedded">
+      <Detail label="Creator type" value={title(resource.creatorType)} />
+      <Detail label="Authoring tool" value={resource.authoringTool} maturity={resource.provenance.authoringTool?.maturity} />
+      <Detail label="Agent kind" value={title(resource.agentKind)} />
+      <Detail label="Lifecycle" value={title(resource.lifecycle)} />
+      {detailFields(resource.type).map(field => <Detail key={field.key} label={field.label} value={fieldValue(resource, field.key)} maturity={resource.provenance[field.key]?.maturity} />)}
+    </div>
+    {resource.details.capabilityDetailsTruncated ? <p>Capability details are partial; the source response reached its bounded projection limit.</p> : null}
+    {resource.details.connectors?.length ? <><h4>Connector capability details</h4><dl className="inventory-identifiers">{resource.details.connectors.map(connector => <div key={connector.connectorId}><dt>{connector.connectorId}</dt><dd>{connector.operations?.length ? <ul>{connector.operations.map(operation => <li key={operation.operationId}><strong>{operation.displayName ?? operation.operationId}</strong> · {[operation.method, operation.usedAs].filter(Boolean).join(" · ") || "Operation metadata not supplied"}</li>)}</ul> : "No allowlisted operation metadata supplied"}</dd></div>)}</dl></> : null}
+    <p>{resource.unknownFieldCount} unknown or malformed fields were omitted without retaining their values.</p>
+  </>;
 }
 
 function SourceState({ title: heading, source }: { title: string; source: InventorySourceAwareDetail["audit"] | InventorySourceAwareDetail["security"] | InventorySourceAwareDetail["package"] | undefined }) {

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   agentRouteSearch,
   auditRouteSearch,
+  dataSyncRouteSearch,
+  parseDataSyncRoute,
   officialUsageRouteSearch,
   parseAgentRoute,
   parseAuditRoute,
@@ -13,6 +15,7 @@ import {
   securityRouteSearch,
   workbenchUrl,
   maximumInlinePackageRouteBytes,
+  migratePowerPlatformAgentRoute,
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
@@ -22,7 +25,16 @@ describe("workbench routing", () => {
     expect(parseWorkbenchView("/official-usage")).toBe("official-usage");
     expect(parseWorkbenchView("/security")).toBe("security");
     expect(parseWorkbenchView("/jobs")).toBe("jobs");
+    expect(parseWorkbenchView("/sync")).toBe("sync");
     expect(parseWorkbenchView("/unknown")).toBe("agents");
+  });
+
+  it("round trips exact sync and package refresh jobs on the dedicated sync route", () => {
+    const route = parseDataSyncRoute("?syncRun=retained-run&refreshJob=exact-package-job&mode=application&q=not-a-sync-filter");
+    expect(route).toEqual({ syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application" });
+    expect(workbenchUrl("sync", dataSyncRouteSearch(route))).toBe("/sync?syncRun=retained-run&refreshJob=exact-package-job&mode=application");
+    expect(parseDataSyncRoute(`?syncRun=${"x".repeat(513)}&mode=invalid`).syncRunId).toBeUndefined();
+    expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
   });
 
   it("round trips bounded agent search, status and selection", () => {
@@ -39,6 +51,10 @@ describe("workbench routing", () => {
       page: 0,
       selectedIds: ["native-1", "native-1", "native-2"],
       refreshMode: "delegated",
+      source: "all",
+      linkState: "all",
+      environmentId: "",
+      selectedPowerPlatformIds: [],
     });
     expect(workbenchUrl("agents", query)).toBe(
       "/agents?q=owned+bot&status=blocked&selected=native-1&selected=native-2",
@@ -60,6 +76,13 @@ describe("workbench routing", () => {
       refreshJobId: undefined,
       refreshMode: "delegated",
       controlJobId: undefined,
+      syncRunId: undefined,
+      source: "all",
+      linkState: "all",
+      environmentId: "",
+      inventorySnapshotId: undefined,
+      selectedPowerPlatformIds: [],
+      quarantineJobId: undefined,
     });
   });
 
@@ -88,6 +111,10 @@ describe("workbench routing", () => {
       page: 0,
       selectedIds,
       refreshMode: "delegated",
+      source: "all",
+      linkState: "all",
+      environmentId: "",
+      selectedPowerPlatformIds: [],
     });
 
     expect(query.toString().length).toBeLessThanOrEqual(maximumInlinePackageRouteBytes);
@@ -109,6 +136,7 @@ describe("workbench routing", () => {
       detailId: "native-24", detailType: "microsoft.copilotstudio/agents", detailEnvironmentId: "environment-1",
       detailTab: "audit", selectedIds, refreshJobId: undefined, quarantineJobId: undefined,
     });
+
     expect(parsePowerPlatformRoute(query.toString())).toEqual({
       search: "maker bot", type: "microsoft.copilotstudio/agents", environmentId: "environment-1",
       sortBy: "lastPublishedAt", sortDirection: "desc", page: 3, snapshotId: "snapshot-1",
@@ -118,16 +146,81 @@ describe("workbench routing", () => {
     });
   });
 
-  it("keeps package refresh and package controls explicitly source-discriminated", () => {
-    const route = parseAgentRoute("refreshJob=refresh-old&mode=application&controlJob=control-old&job=ambiguous");
+  it("migrates only legacy Power Platform agent and quarantine links to Agents", () => {
+    const migrated = migratePowerPlatformAgentRoute(
+      "q=builder&type=microsoft.copilotstudio%2Fagents&environment=environment-1&snapshot=snapshot-1&detail=agent-1&detailType=microsoft.copilotstudio%2Fagents&detailTab=controls&selected=agent-1&quarantineJob=job-1",
+    );
+    expect(migrated).toBeDefined();
+    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+      search: "builder",
+      environmentId: "environment-1",
+      detailId: "power_platform:environment-1:agent-1",
+      detailTab: "controls",
+      inventorySnapshotId: "snapshot-1",
+      selectedPowerPlatformIds: ["power_platform:environment-1:agent-1"],
+      source: "all",
+      quarantineJobId: "job-1",
+    });
+    expect(migratePowerPlatformAgentRoute("type=microsoft.powerapps%2Fapps")).toBeUndefined();
+  });
+
+  it("preserves the detail environment independently of the old Power Platform list filter", () => {
+    const migrated = migratePowerPlatformAgentRoute("detail=bot-1&detailType=microsoft.copilotstudio%2Fagents&detailEnvironment=env-1&detailTab=audit");
+    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+      detailId: "power_platform:env-1:bot-1",
+      environmentId: "",
+      source: "all",
+      detailTab: "audit-security",
+    });
+    const anotherEnvironment = migratePowerPlatformAgentRoute("detail=bot-1&detailType=microsoft.copilotstudio%2Fagents&detailEnvironment=env-2");
+    expect(parseAgentRoute(anotherEnvironment!.toString()).detailId).toBe("power_platform:env-2:bot-1");
+  });
+
+  it("retains source-qualified links for native IDs at the existing length limit", () => {
+    const nativeId = "a".repeat(512);
+    const migrated = migratePowerPlatformAgentRoute(`type=microsoft.copilotstudio%2Fagents&environment=env-1&detail=${nativeId}&selected=${nativeId}`);
+    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+      detailId: `power_platform:env-1:${nativeId}`,
+      selectedPowerPlatformIds: [`power_platform:env-1:${nativeId}`],
+    });
+    expect(parseAgentRoute("detail=power_platform%3Aenv-1%3A%250A").detailId).toBeUndefined();
+  });
+
+  it("keeps quarantine job-only links independently of a saved selection", () => {
+    const migrated = migratePowerPlatformAgentRoute("quarantineJob=job-1");
+    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+      source: "all",
+      selectedPowerPlatformIds: [],
+      quarantineJobId: "job-1",
+    });
+  });
+
+  it("keeps package refresh, controls, and data sync explicitly source-discriminated", () => {
+    const route = parseAgentRoute("refreshJob=refresh-old&mode=application&controlJob=control-old&syncRun=sync-old&job=ambiguous");
     expect(route).toMatchObject({
       refreshJobId: "refresh-old",
       refreshMode: "application",
       controlJobId: "control-old",
+      syncRunId: "sync-old",
     });
+
     expect(agentRouteSearch(route).toString()).toContain("refreshJob=refresh-old");
     expect(agentRouteSearch(route).toString()).toContain("controlJob=control-old");
+    expect(agentRouteSearch(route).toString()).toContain("syncRun=sync-old");
     expect(agentRouteSearch(route).toString()).not.toContain("job=ambiguous");
+  });
+
+  it("drops obsolete source/link filters without losing legacy exact resource identities", () => {
+    const route = parseAgentRoute("source=power_platform&linkState=matched&environment=env-a&detail=bot-a&selectedResource=power_platform%3Aenv-a%3Abot-a");
+    expect(route).toMatchObject({
+      source: "all", linkState: "all", environmentId: "env-a",
+      detailId: "power_platform:env-a:bot-a",
+      selectedPowerPlatformIds: ["power_platform:env-a:bot-a"],
+    });
+    expect(agentRouteSearch(route).has("source")).toBe(false);
+    expect(agentRouteSearch(route).has("linkState")).toBe(false);
+    expect(parseAgentRoute(agentRouteSearch(route).toString()).detailId).toBe(route.detailId);
+    expect(parseAgentRoute("source=power_platform&environment=env-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
   });
 
   it("round trips source-specific audit, security and official-usage state", () => {
@@ -138,8 +231,24 @@ describe("workbench routing", () => {
     const security = parseSecurityRoute("job=older&mode=application&template=agent_activity&operation=InvokeAgent&agentIds=agent-a");
     expect(parseSecurityRoute(securityRouteSearch(security).toString())).toEqual(security);
 
-    const officialUsage = parseOfficialUsageRoute("staging=stage-old&window=90");
+    const officialUsage = parseOfficialUsageRoute("staging=stage-old&snapshot=11111111-1111-4111-8111-111111111111&window=90");
     expect(parseOfficialUsageRoute(officialUsageRouteSearch(officialUsage).toString())).toEqual(officialUsage);
+  });
+
+  it("defaults retained usage snapshots to the full historical activity window", () => {
+    const reportSetId = "11111111-1111-4111-8111-111111111111";
+    const historical = parseOfficialUsageRoute(`snapshot=${reportSetId}`);
+    expect(historical).toEqual({
+      stagingId: undefined,
+      reportSetId,
+      activityWindowDays: 365,
+    });
+    expect(officialUsageRouteSearch(historical).toString()).toBe(`snapshot=${reportSetId}`);
+    expect(parseOfficialUsageRoute("")).toEqual({
+      stagingId: undefined,
+      reportSetId: undefined,
+      activityWindowDays: 30,
+    });
   });
 
   it("carries an exact employee identity into an explicit Purview search", () => {

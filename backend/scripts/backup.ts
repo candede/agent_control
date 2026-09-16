@@ -122,6 +122,15 @@ async function invalidateRestoredAuthority(restored: pg.PoolClient) {
     lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE status IN ('queued','running','waiting_authorization')`);
   await restored.query("UPDATE power_platform_refresh_jobs SET status='waiting_authorization',finished_at=NULL,updated_at=clock_timestamp() WHERE status='running'");
   await restored.query("UPDATE package_refresh_jobs SET status='waiting_authorization',finished_at=NULL,updated_at=clock_timestamp() WHERE status='running'");
+  await restored.query(`UPDATE data_sync_run_sources source
+    SET status='waiting_authorization',message='Restore requires explicit resume with current authorization.',
+      can_retry=true,updated_at=clock_timestamp()
+    FROM data_sync_runs run
+    WHERE source.run_id=run.id AND source.tenant_id=run.tenant_id AND source.principal_id=run.principal_id
+      AND run.status IN ('running','waiting') AND source.source_id<>'usage_reports'
+      AND source.status IN ('queued','running')`);
+  await restored.query(`UPDATE data_sync_runs SET status='waiting',completed_at=NULL,updated_at=clock_timestamp()
+    WHERE status IN ('running','waiting')`);
   await restored.query(`UPDATE purview_audit_jobs SET status=CASE WHEN attempted_at IS NULL THEN 'waiting_authorization' ELSE 'inconclusive' END,
     execution_owner=NULL,updated_at=clock_timestamp(),remote_work_may_continue=(attempted_at IS NOT NULL) WHERE status IN ('running','reconciling_create')`);
   await restored.query("UPDATE defender_hunting_jobs SET status='waiting_authorization',execution_owner=NULL,updated_at=clock_timestamp() WHERE status='running'");
@@ -159,6 +168,18 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
     SELECT snapshot.id,md5(jsonb_build_array(snapshot.id,snapshot.tenant_id,snapshot.principal_id,snapshot.query_hash,
       snapshot.role_scope,snapshot.cloud,snapshot.environment_scope,snapshot.requested_types)::text) AS signature
     FROM power_platform_inventory_snapshots snapshot WHERE snapshot.expires_at>clock_timestamp()`));
+  await purgeMismatched(restored, "copilot_usage_snapshots", await exactCurrentIds(current, restored, `
+    SELECT snapshot.id,md5(jsonb_build_array(snapshot.id,snapshot.tenant_id,snapshot.principal_id,
+      snapshot.source_id,snapshot.observed_at)::text) AS signature
+    FROM copilot_usage_snapshots snapshot WHERE snapshot.is_current AND snapshot.expires_at>clock_timestamp()`));
+  await restored.query(`UPDATE copilot_usage_source_state state
+    SET attempt_status='failed',message='The restored saved snapshot is unavailable; explicit resync is required.',
+      current_snapshot_id=NULL,row_count=NULL,updated_at=clock_timestamp()
+    WHERE current_snapshot_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM copilot_usage_snapshots snapshot
+      WHERE snapshot.id=state.current_snapshot_id AND snapshot.tenant_id=state.tenant_id
+        AND snapshot.principal_id=state.principal_id AND snapshot.source_id=state.source_id
+        AND snapshot.is_current AND snapshot.expires_at>clock_timestamp())`);
   await purgeMismatched(restored, "purview_audit_jobs", await exactCurrentIds(current, restored, `
     SELECT job.id,md5(jsonb_build_array(job.id,job.tenant_id,job.authorization_principal_id,job.result_scope_id,
       job.result_scope_kind,job.result_scope_configuration_revision,job.token_mode)::text) AS signature
@@ -189,24 +210,39 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
 
   const safeSets = await exactCurrentIds(current, restored, `
     SELECT report_set.id,md5(jsonb_build_array(report_set.id,report_set.tenant_id,report_set.actor_principal_id,
-      report_set.bundle_id,report_set.reporting_start,report_set.reporting_end,report_set.complete,
+      report_set.bundle_id,report_set.content_hash,report_set.reporting_start,report_set.reporting_end,
+      report_set.period_provenance,report_set.supersedes_set_id,report_set.complete,report_set.accepted_at,
       (SELECT jsonb_agg(jsonb_build_array(membership.kind,membership.version_id) ORDER BY membership.kind)
        FROM official_usage_set_versions membership WHERE membership.set_id=report_set.id))::text) AS signature
-    FROM official_usage_sets report_set WHERE report_set.deleted_at IS NULL AND report_set.expires_at>clock_timestamp()`);
+    FROM official_usage_sets report_set WHERE report_set.complete AND report_set.deleted_at IS NULL`);
   await restored.query("UPDATE official_usage_sets SET deleted_at=COALESCE(deleted_at,clock_timestamp()) WHERE deleted_at IS NULL AND NOT (id=ANY($1::uuid[]))", [[...safeSets]]);
+  await restored.query("DELETE FROM official_usage_set_versions WHERE NOT (set_id=ANY($1::uuid[]))", [[...safeSets]]);
   const safeVersions = await exactCurrentIds(current, restored, `
     SELECT version.id,md5(jsonb_build_array(version.id,version.tenant_id,version.accepted_by,version.kind,version.artifact_id,
-      membership.set_id)::text) AS signature
+      version.staging_id,version.content_hash,version.reporting_start,version.reporting_end,version.period_provenance,
+      version.source_as_of,version.source_as_of_provenance,version.source_freshness,version.downloaded_at,
+      version.warnings,version.reconciliation,version.supersedes_version_id,version.accepted_at,version.row_count,
+      (SELECT jsonb_build_array(count(*),md5(coalesce(string_agg(
+         jsonb_build_array(row.ordinal,row.payload_hash)::text,E'\\n' ORDER BY row.ordinal),'')))
+       FROM official_usage_version_rows row WHERE row.version_id=version.id
+         AND row.tenant_id=version.tenant_id AND row.kind=version.kind))::text) AS signature
     FROM official_usage_versions version
-    JOIN official_usage_set_versions membership ON membership.version_id=version.id
-    JOIN official_usage_sets report_set ON report_set.id=membership.set_id AND report_set.deleted_at IS NULL
-      AND report_set.expires_at>clock_timestamp()
-    WHERE version.deleted_at IS NULL AND version.expires_at>clock_timestamp()`);
+    WHERE version.deleted_at IS NULL AND EXISTS (
+      SELECT 1 FROM official_usage_set_versions membership
+      JOIN official_usage_sets report_set ON report_set.id=membership.set_id AND report_set.deleted_at IS NULL
+      WHERE membership.version_id=version.id AND membership.tenant_id=version.tenant_id)`);
   await restored.query(`UPDATE official_usage_versions version SET deleted_at=COALESCE(version.deleted_at,clock_timestamp())
-    WHERE version.deleted_at IS NULL AND (NOT (version.id=ANY($1::uuid[])) OR EXISTS (
+    WHERE version.deleted_at IS NULL AND (NOT (version.id=ANY($1::uuid[])) OR NOT EXISTS (
       SELECT 1 FROM official_usage_set_versions membership WHERE membership.version_id=version.id
-        AND NOT (membership.set_id=ANY($2::uuid[]))))`, [[...safeVersions], [...safeSets]]);
+        AND membership.set_id=ANY($2::uuid[])))`, [[...safeVersions], [...safeSets]]);
   await restored.query("DELETE FROM official_usage_version_rows row USING official_usage_versions version WHERE version.id=row.version_id AND version.deleted_at IS NOT NULL");
+  await restored.query(`UPDATE official_usage_sets report_set SET deleted_at=clock_timestamp()
+    WHERE report_set.deleted_at IS NULL AND report_set.complete AND (
+      (SELECT count(*) FROM official_usage_set_versions membership WHERE membership.set_id=report_set.id)<>3
+      OR EXISTS (
+        SELECT 1 FROM official_usage_set_versions membership JOIN official_usage_versions version ON version.id=membership.version_id
+        WHERE membership.set_id=report_set.id AND (version.deleted_at IS NOT NULL OR version.row_count<>(
+          SELECT count(*) FROM official_usage_version_rows row WHERE row.version_id=version.id))))`);
   await reconcileOfficialSelection(current, restored, safeSets);
 }
 
@@ -238,7 +274,7 @@ async function reconcileOfficialSelection(current: pg.PoolClient, restored: pg.P
     if (row.active_set_id && safeSets.has(row.active_set_id)) {
       await restored.query(`UPDATE official_usage_state SET active_set_id=$2,updated_at=clock_timestamp()
         WHERE tenant_id=$1 AND EXISTS(SELECT 1 FROM official_usage_sets
-          WHERE id=$2 AND tenant_id=$1 AND deleted_at IS NULL AND expires_at>clock_timestamp())`, [row.tenant_id, row.active_set_id]);
+          WHERE id=$2 AND tenant_id=$1 AND complete AND deleted_at IS NULL)`, [row.tenant_id, row.active_set_id]);
     }
   }
 }

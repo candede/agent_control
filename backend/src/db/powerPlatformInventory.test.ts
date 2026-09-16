@@ -44,6 +44,36 @@ async function submitAndRun(idempotencyKey: string, roleScope: "full" | "ai" | "
 }
 
 describe.sequential("Power Platform inventory repository", () => {
+  it("joins saved environment names across current snapshots without crossing owner or expiry boundaries", async () => {
+    const environmentFixture = await testDatabase();
+    const environmentRepository = new PowerPlatformInventoryRepository(environmentFixture.runtime);
+    try {
+      const owner = { tenantId: "environment-picker-tenant", principalId: "reader" };
+      const publish = async (principalId: string, key: string, values: PowerPlatformResource[]) => {
+        const partition = { ...owner, principalId };
+        const job = await environmentRepository.submit(partition, {
+          idempotencyKey: key, roleScope: "full", requestedTypes: [...new Set(values.map(value => value.type))],
+        });
+        expect(await environmentRepository.markRunning(partition, job.id)).toBe(true);
+        return environmentRepository.publish(partition, job.id, { resources: values, totalRecords: values.length, pages: 1, unknownFieldCount: 0 });
+      };
+      const environment = resource("environment-a", {
+        tenantId: owner.tenantId, type: "microsoft.powerplatform/environments", environmentId: null, displayName: "Finance production",
+      });
+      const saved = await publish(owner.principalId, "picker-environments", [environment]);
+      await publish(owner.principalId, "picker-agents", [resource("agent-a", { tenantId: owner.tenantId })]);
+      await publish("another-reader", "picker-other-owner", [{ ...environment, displayName: "Another owner's environment" }]);
+      expect((await environmentRepository.readUnifiedSource(owner)).environmentNames).toEqual({ "environment-a": "Finance production" });
+      expect((await environmentRepository.readUnifiedSource({ ...owner, tenantId: "another-tenant" })).environmentNames).toEqual({});
+      await environmentFixture.operator.query("UPDATE power_platform_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [saved.snapshotId]);
+      const expired = await environmentRepository.readUnifiedSource(owner);
+      expect(expired.resources).toHaveLength(1);
+      expect(expired.environmentNames).toEqual({});
+    } finally {
+      await environmentFixture.close();
+    }
+  });
+
   it("cancels only the owning principal's unfinished read job", async () => {
     const job = await repository.submit(scope, { idempotencyKey: "inventory-cancel", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
     expect(await repository.cancel({ ...scope, principalId: "principal-b" }, job.id)).toBeUndefined();
@@ -56,6 +86,9 @@ describe.sequential("Power Platform inventory repository", () => {
     const page = await repository.list(scope, { search: "agent", sortBy: "displayName", limit: 1 });
     expect(page).toMatchObject({ count: 2, value: [{ nativeId: "agent-a" }], snapshot: { observedCount: 2, pageCount: 2 } });
     expect(page.typeCounts.find(value => value.type === "microsoft.copilotstudio/agents")).toMatchObject({ status: "covered", count: 2 });
+    const withoutAgents = await repository.list(scope, { excludeAgents: true, limit: 1 });
+    expect(withoutAgents).toMatchObject({ count: 0, value: [] });
+    expect(withoutAgents.typeCounts.some(value => value.type === "microsoft.copilotstudio/agents")).toBe(false);
     expect(await repository.list({ ...scope, principalId: "principal-b" })).toMatchObject({ count: 0, value: [], snapshot: null });
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM source_identifiers WHERE source='power_platform'")).rows[0].count).toBe(4);
   });
@@ -100,6 +133,78 @@ describe.sequential("Power Platform inventory repository", () => {
       "microsoft.copilotstudio/agents:environment-b:same",
       "microsoft.powerautomate/agentflows:environment-a:same",
     ]);
+    const withoutAgents = await repository.list(scope, { snapshotId, excludeAgents: true, limit: 1 });
+    expect(withoutAgents).toMatchObject({
+      count: 1,
+      value: [{ type: "microsoft.powerautomate/agentflows" }],
+    });
+    expect(withoutAgents.typeCounts.some(value => value.type === "microsoft.copilotstudio/agents")).toBe(false);
+    expect(withoutAgents.typeCounts.find(value => value.type === "microsoft.powerautomate/agentflows")).toMatchObject({
+      count: 1,
+    });
+  });
+
+  it("uses the newest tenant-wide agent snapshot without displacing broad non-agent coverage or crossing environment scopes", async () => {
+    const unifiedScope = { tenantId: "tenant-pp-unified", principalId: "principal-pp-unified" };
+    const unifiedRepository = new PowerPlatformInventoryRepository(fixture.runtime);
+    const global = await unifiedRepository.submit(unifiedScope, {
+      idempotencyKey: "unified-global",
+      roleScope: "full",
+      requestedTypes: powerPlatformResourceTypes,
+    });
+    expect(await unifiedRepository.markRunning(unifiedScope, global.id)).toBe(true);
+    await unifiedRepository.publish(unifiedScope, global.id, {
+      resources: [
+        resource("global-agent", { tenantId: unifiedScope.tenantId }),
+        resource("excluded-flow", {
+          tenantId: unifiedScope.tenantId,
+          type: "microsoft.powerautomate/agentflows",
+          agentKind: "agent_flow",
+        }),
+      ],
+      totalRecords: 2,
+      pages: 1,
+      unknownFieldCount: 0,
+    });
+    const agentsOnly = await unifiedRepository.submit(unifiedScope, {
+      idempotencyKey: "unified-agents-only",
+      roleScope: "full",
+      requestedTypes: ["microsoft.copilotstudio/agents"],
+    });
+    expect(await unifiedRepository.markRunning(unifiedScope, agentsOnly.id)).toBe(true);
+    await unifiedRepository.publish(unifiedScope, agentsOnly.id, {
+      resources: [resource("newer-global-agent", { tenantId: unifiedScope.tenantId })],
+      totalRecords: 1,
+      pages: 1,
+      unknownFieldCount: 0,
+    });
+    const scoped = await unifiedRepository.submit(unifiedScope, {
+      idempotencyKey: "unified-scoped",
+      roleScope: "full",
+      environmentScope: "environment-a",
+      requestedTypes: ["microsoft.copilotstudio/agents"],
+    });
+    expect(await unifiedRepository.markRunning(unifiedScope, scoped.id)).toBe(true);
+    await unifiedRepository.publish(unifiedScope, scoped.id, {
+      resources: [resource("scoped-newer", { tenantId: unifiedScope.tenantId })],
+      totalRecords: 1,
+      pages: 1,
+      unknownFieldCount: 0,
+    });
+
+    const source = await unifiedRepository.readUnifiedSource(unifiedScope);
+    expect(source.resources.map(value => value.nativeId)).toEqual(["newer-global-agent"]);
+    expect(source.snapshot).toMatchObject({
+      environmentScope: null,
+      requestedTypes: ["microsoft.copilotstudio/agents"],
+    });
+
+    const nonAgentInventory = await unifiedRepository.list(unifiedScope, { excludeAgents: true, limit: 10 });
+    expect(nonAgentInventory.value.map(value => value.nativeId)).toEqual(["excluded-flow"]);
+    expect(nonAgentInventory.snapshot).toMatchObject({
+      environmentScope: null,
+      requestedTypes: expect.arrayContaining(powerPlatformResourceTypes),
+    });
   });
 
   it("keeps old rows visible until atomic commit and restores them after a mid-publication rollback", async () => {
@@ -137,7 +242,7 @@ describe.sequential("Power Platform inventory repository", () => {
     }
   });
 
-  it("preserves prior rows after failed progress and unknown-role omissions", async () => {
+  it("preserves prior rows after failed progress and incomplete unknown-role enumeration", async () => {
     const failedId = await submitAndRun("failed-a");
     await repository.recordProgress(scope, failedId, 1, 1, 2);
     await repository.markFailed(scope, failedId, "provider_error", "The provider query failed.");
@@ -147,9 +252,35 @@ describe.sequential("Power Platform inventory repository", () => {
     const firstUnknown = await submitAndRun("unknown-a", "unknown");
     await repository.publish(scope, firstUnknown, { resources: [resource("unknown-a"), resource("unknown-b")], totalRecords: 2, pages: 1, unknownFieldCount: 0 });
     const secondUnknown = await submitAndRun("unknown-b", "unknown");
-    await expect(repository.publish(scope, secondUnknown, { resources: [resource("unknown-a")], totalRecords: 1, pages: 1, unknownFieldCount: 0 })).rejects.toMatchObject({ code: "incomplete_inventory_coverage" });
+    await expect(repository.publish(scope, secondUnknown, { resources: [resource("unknown-a")], totalRecords: 2, pages: 1, unknownFieldCount: 0 })).rejects.toMatchObject({ code: "incomplete_inventory_coverage" });
     const unknownSnapshot = (await repository.getJob(scope, firstUnknown))!.snapshotId!;
     expect((await repository.list(scope, { snapshotId: unknownSnapshot })).count).toBe(2);
+  });
+
+  it.each([
+    { name: "fewer resources", names: ["retained"] },
+    { name: "different resources at the same count", names: ["replacement-a", "replacement-b"] },
+    { name: "no visible resources", names: [] },
+  ])("publishes a complete unknown-role observation with $name without claiming full coverage", async ({ name, names }) => {
+    const owner = { ...scope, principalId: `unknown-reader-${name}` };
+    async function publish(key: string, nativeIds: string[]) {
+      const job = await repository.submit(owner, { idempotencyKey: key, roleScope: "unknown", requestedTypes: powerPlatformResourceTypes });
+      await repository.markRunning(owner, job.id);
+      return repository.publish(owner, job.id, {
+        resources: nativeIds.map(nativeId => resource(nativeId)), totalRecords: nativeIds.length, pages: 1, unknownFieldCount: 0,
+      });
+    }
+    const previous = await publish("previous", ["retained", "removed"]);
+    const current = await publish("current", names);
+    expect(current.job).toMatchObject({ status: "succeeded", observedCount: names.length });
+    const saved = await repository.list(owner);
+    expect(saved.snapshot).toMatchObject({ id: current.snapshotId, roleScope: "unknown" });
+    expect(saved.value.map(row => row.nativeId)).toEqual(names);
+    expect(saved.typeCounts.every(coverage => coverage.status === "unknown")).toBe(true);
+    expect(saved.typeCounts.find(coverage => coverage.type === "microsoft.copilotstudio/agents")?.count).toBe(names.length || null);
+    expect((await repository.listSnapshots(owner)).value.map(snapshot => snapshot.id)).toEqual([current.snapshotId]);
+    expect((await fixture.runtime.query("SELECT is_current FROM power_platform_inventory_snapshots WHERE id=$1", [previous.snapshotId])).rows)
+      .toEqual([{ is_current: false }]);
   });
 
   it("rolls back tenant-mismatched publication and requires explicit authorization resume", async () => {
@@ -243,19 +374,21 @@ describe.sequential("Power Platform inventory repository", () => {
       .toEqual([{ tenant_id: catalogScope.tenantId, native_id: nativeId }]);
   });
 
-  it("publishes all 4140 resources when the 42nd page has a terminal truncation marker, preserving the snapshot on a later incomplete refresh", async () => {
-    const owner = { tenantId: "terminal-tenant", principalId: "terminal-reader" };
-    const job = await repository.submit(owner, { idempotencyKey: "terminal-page", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+  it.each(["full", "unknown"] as const)("publishes 4140 then 4173 changed resources over 42 pages for %s roles, preserving the snapshot on a later incomplete refresh", async roleScope => {
+    const owner = { tenantId: "terminal-tenant", principalId: `terminal-reader-${roleScope}` };
+    const job = await repository.submit(owner, { idempotencyKey: "terminal-page", roleScope, requestedTypes: powerPlatformResourceTypes });
     await repository.markRunning(owner, job.id);
+    let totalRecords = 4_140;
+    let identityOffset = 0;
     const query = new PowerPlatformResourceQueryClient(vi.fn(async (_url: string | URL, init?: RequestInit) => {
       const { Options: options } = JSON.parse(String(init?.body));
       const offset = Number(options.SkipToken ?? 0);
-      const count = Math.min(100, 4_140 - offset);
+      const count = Math.min(100, totalRecords - offset);
       return Response.json({
-        totalRecords: 4_140, count, resultTruncated: 1,
-        ...(offset + count < 4_140 ? { skipToken: String(offset + count) } : {}),
+        totalRecords, count, resultTruncated: 1,
+        ...(offset + count < totalRecords ? { skipToken: String(offset + count) } : {}),
         data: Array.from({ length: count }, (_, index) => ({
-          tenantId: owner.tenantId, name: `agent-${String(offset + index).padStart(4, "0")}`,
+          tenantId: owner.tenantId, name: `agent-${String(identityOffset + offset + index).padStart(4, "0")}`,
           type: "microsoft.copilotstudio/agents", properties: {},
         })),
       });
@@ -273,10 +406,26 @@ describe.sequential("Power Platform inventory repository", () => {
       value: Array.from({ length: 40 }, (_, index) => ({ nativeId: `agent-${4_100 + index}` })),
     });
     expect((await repository.listJobs(owner)).lastSuccessAt).not.toBeNull();
-    const failed = await repository.submit(owner, { idempotencyKey: "incomplete-next", roleScope: "full", requestedTypes: powerPlatformResourceTypes });
+
+    totalRecords = 4_173;
+    identityOffset = 1;
+    const next = await repository.submit(owner, { idempotencyKey: "changed-next", roleScope, requestedTypes: powerPlatformResourceTypes });
+    await repository.markRunning(owner, next.id);
+    const changed = await query.query("opaque-token", undefined, {
+      expectedTenantId: owner.tenantId,
+      onProgress: progress => repository.recordProgress(owner, next.id, progress.pages, progress.observedCount, progress.totalRecords),
+    });
+    const published = await repository.publish(owner, next.id, changed);
+    expect(published.job).toMatchObject({ status: "succeeded", observedCount: 4_173, totalRecords: 4_173, pageCount: 42 });
+    expect(await repository.list(owner, { search: "agent-0000" })).toMatchObject({ count: 0 });
+    expect(await repository.list(owner, { offset: 4_100, limit: 100 })).toMatchObject({
+      count: 4_173, snapshot: { id: published.snapshotId, roleScope, pageCount: 42, observedCount: 4_173 },
+      value: Array.from({ length: 73 }, (_, index) => ({ nativeId: `agent-${4_101 + index}` })),
+    });
+    const failed = await repository.submit(owner, { idempotencyKey: "incomplete-next", roleScope, requestedTypes: powerPlatformResourceTypes });
     await repository.markRunning(owner, failed.id);
-    await expect(repository.publish(owner, failed.id, { ...result, resources: result.resources.slice(0, 4_100) })).rejects.toMatchObject({ code: "incomplete_inventory_coverage" });
-    expect((await repository.list(owner)).snapshot?.id).toBe(complete?.snapshotId);
+    await expect(repository.publish(owner, failed.id, { ...changed, resources: changed.resources.slice(0, 4_100) })).rejects.toMatchObject({ code: "incomplete_inventory_coverage" });
+    expect((await repository.list(owner)).snapshot?.id).toBe(published.snapshotId);
     expect(await repository.list({ ...owner, principalId: "another-reader" })).toMatchObject({ snapshot: null, count: 0 });
   });
 });

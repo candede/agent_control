@@ -18,6 +18,8 @@ import {
 } from "../types/powerPlatformInventory.js";
 import type { InventoryQuarantineTarget, QuarantineTargetCandidate, QuarantineTargetEligibilityCode, QuarantineTargetPage } from "../types/copilotStudioQuarantine.js";
 import { validateQuarantineTarget } from "../services/copilotStudioQuarantine.js";
+import { resolvePackageAgentLinks, withVerifiedControlIdentities } from "../services/packageAgentIdentity.js";
+import { PackageInventoryRepository } from "./packageInventory.js";
 import { pool, transaction } from "./pool.js";
 
 export type InventoryDataScope = { tenantId: string; principalId: string };
@@ -29,6 +31,7 @@ export type InventoryRefreshInput = {
 };
 export type InventoryListQuery = {
   includeAssociations?: boolean;
+  excludeAgents?: boolean;
   snapshotId?: string;
   type?: PowerPlatformResourceType;
   environmentId?: string;
@@ -37,6 +40,11 @@ export type InventoryListQuery = {
   sortDirection?: "asc" | "desc";
   limit?: number;
   offset?: number;
+};
+export type UnifiedPowerPlatformSourceResult = {
+  resources: PowerPlatformResource[];
+  environmentNames: Record<string, string>;
+  snapshot: InventorySnapshot | null;
 };
 
 type JobRow = {
@@ -222,13 +230,6 @@ export class PowerPlatformInventoryRepository {
           AND (created_at,id)>(SELECT created_at,id FROM power_platform_refresh_jobs WHERE id=$4) LIMIT 1`, [scope.tenantId, scope.principalId, job.request_hash, job.id]);
       if (newer.rowCount) throw new AppError(409, "inventory_job_superseded", "A newer refresh for this scope superseded this publication.");
       validatePublication(scope, job, result);
-      const identities = new Set(result.resources.map(resource => resourceIdentity(resource)));
-      if (job.role_scope === "unknown") {
-        const previous = await client.query<{ resource_type: PowerPlatformResourceType; environment_id: string; native_id: string }>(`SELECT resource.resource_type,resource.environment_id,resource.native_id
-          FROM power_platform_inventory_snapshots snapshot JOIN power_platform_inventory_resources resource ON resource.snapshot_id=snapshot.id
-          WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.query_hash=$3 AND snapshot.is_current`, [scope.tenantId, scope.principalId, job.query_hash]);
-        if (previous.rows.some(row => !identities.has(`${row.resource_type}\0${row.environment_id}\0${row.native_id}`))) throw new AppError(409, "incomplete_inventory_coverage", "Unknown role scope omitted previously retained resources; the prior snapshot was preserved.");
-      }
       const coverage = buildCoverage(job.role_scope, job.requested_types, result.resources);
       await client.query("UPDATE power_platform_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND query_hash=$3 AND is_current", [scope.tenantId, scope.principalId, job.query_hash]);
       const createdSnapshotId = randomUUID();
@@ -261,7 +262,14 @@ export class PowerPlatformInventoryRepository {
     validateScope(scope);
     const snapshot = await this.resolveSnapshot(scope, query.snapshotId);
     if (!snapshot && query.snapshotId) throw new AppError(404, "not_found", "Inventory snapshot was not found.");
-    if (!snapshot) return { value: [], count: 0, typeCounts: emptyCoverage(), snapshot: null };
+    if (!snapshot) return {
+      value: [],
+      count: 0,
+      typeCounts: query.excludeAgents
+        ? emptyCoverage().filter(item => item.type !== "microsoft.copilotstudio/agents")
+        : emptyCoverage(),
+      snapshot: null,
+    };
     const { sql, values } = listFilters(snapshot.id, scope, query);
     const countResult = await this.database.query<{ count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT count(*)::int AS count FROM scoped WHERE ${sql}`, values);
     const countRows = await this.database.query<{ resource_type: PowerPlatformResourceType; count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT resource_type,count(*)::int AS count FROM scoped WHERE ${sql} GROUP BY resource_type`, values);
@@ -272,7 +280,9 @@ export class PowerPlatformInventoryRepository {
     const rows = await this.database.query<ResourceRow>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
       SELECT * FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,resource_type COLLATE "C" ASC,environment_id COLLATE "C" ASC,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]);
     const filteredCounts = new Map(countRows.rows.map(row => [row.resource_type, row.count]));
-    const typeCounts = snapshot.coverage.map(item => ({ ...item, count: item.count === null ? null : filteredCounts.get(item.type) ?? 0 }));
+    const typeCounts = snapshot.coverage
+      .filter(item => !query.excludeAgents || item.type !== "microsoft.copilotstudio/agents")
+      .map(item => ({ ...item, count: item.count === null ? null : filteredCounts.get(item.type) ?? 0 }));
     const resources = rows.rows.map(projectResource);
     if (resources.length && query.includeAssociations !== false) {
       const candidates = await this.database.query<Pick<ResourceRow, "tenant_id" | "native_id" | "resource_type" | "environment_id" | "identifiers">>(
@@ -286,6 +296,44 @@ export class PowerPlatformInventoryRepository {
       }
     }
     return { value: resources, count: countResult.rows[0].count, typeCounts, snapshot: projectSnapshot(snapshot) };
+  }
+
+  async readUnifiedSource(scope: InventoryDataScope): Promise<UnifiedPowerPlatformSourceResult> {
+    validateScope(scope);
+    const snapshotResult = await this.database.query<SnapshotRow>(`SELECT * FROM power_platform_inventory_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
+        AND requested_types @> '["microsoft.copilotstudio/agents"]'::jsonb
+      ORDER BY CASE WHEN environment_scope='' THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1`,
+    [scope.tenantId, scope.principalId]);
+    const snapshot = snapshotResult.rows[0];
+    if (!snapshot) return { resources: [], environmentNames: {}, snapshot: null };
+    const resources = await this.database.query<ResourceRow>(`SELECT * FROM power_platform_inventory_resources
+      WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
+        AND resource_type='microsoft.copilotstudio/agents'
+      ORDER BY environment_id COLLATE "C",native_id COLLATE "C" LIMIT 5001`,
+    [snapshot.id, scope.tenantId, scope.principalId]);
+    if (resources.rows.length > 5000) {
+      throw new AppError(409, "source_result_limit", "Saved Power Platform agent inventory exceeds the 5,000-row unified inventory limit.");
+    }
+    const environmentIds = [...new Set(resources.rows.map(row => row.environment_id.toLocaleLowerCase("en-US")).filter(Boolean))];
+    const environments = environmentIds.length ? await this.database.query<{ id: string; display_name: string | null }>(`
+      SELECT DISTINCT ON (lower(resource.native_id)) lower(resource.native_id) AS id,resource.display_name
+      FROM power_platform_inventory_resources resource
+      JOIN power_platform_inventory_snapshots saved ON saved.id=resource.snapshot_id
+        AND saved.tenant_id=resource.tenant_id AND saved.principal_id=resource.principal_id
+      WHERE resource.tenant_id=$1 AND resource.principal_id=$2
+        AND saved.is_current AND saved.expires_at>clock_timestamp()
+        AND resource.resource_type='microsoft.powerplatform/environments'
+        AND lower(resource.native_id)=ANY($3::text[])
+        AND (saved.environment_scope='' OR lower(saved.environment_scope)=lower(resource.native_id))
+      ORDER BY lower(resource.native_id),saved.observed_at DESC,saved.id DESC,resource.native_id COLLATE "C"`,
+    [scope.tenantId, scope.principalId, environmentIds]) : { rows: [] };
+    return {
+      resources: resources.rows.map(projectResource),
+      environmentNames: Object.fromEntries(environments.rows.flatMap(row => row.display_name?.trim()
+        ? [[row.id, row.display_name.trim()]] : [])),
+      snapshot: projectSnapshot(snapshot),
+    };
   }
 
   async getResource(scope: InventoryDataScope, snapshotId: string, resourceType: PowerPlatformResourceType, environmentId: string, nativeId: string) {
@@ -324,7 +372,9 @@ export class PowerPlatformInventoryRepository {
       WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3 AND resource_type='microsoft.copilotstudio/agents'
       ORDER BY native_id COLLATE "C",environment_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId]);
     const grouped = new Map<string, ResourceRow[]>();
-    for (const resource of resources.rows) grouped.set(resource.native_id, [...(grouped.get(resource.native_id) ?? []), resource]);
+    for (const resource of await this.withVerifiedQuarantineIdentities(scope, snapshot, resources.rows)) {
+      grouped.set(resource.native_id, [...(grouped.get(resource.native_id) ?? []), resource]);
+    }
     const stale = snapshot.observed_at.getTime() < Date.now() - 24 * 60 * 60 * 1000;
     const normalizedSearch = query.search?.trim().toLocaleLowerCase("en-US") ?? "";
     const candidates = [...grouped.values()].map(matches => projectQuarantineCandidate(snapshot, matches, stale)).filter(candidate => !normalizedSearch
@@ -367,13 +417,31 @@ export class PowerPlatformInventoryRepository {
       WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3 AND resource_type='microsoft.copilotstudio/agents' AND native_id=ANY($4::text[])
       ORDER BY native_id COLLATE "C",environment_id COLLATE "C"`, [snapshotId, scope.tenantId, scope.principalId, nativeIds]);
     const byNativeId = new Map<string, ResourceRow[]>();
-    for (const resource of resources.rows) byNativeId.set(resource.native_id, [...(byNativeId.get(resource.native_id) ?? []), resource]);
+    for (const resource of await this.withVerifiedQuarantineIdentities(scope, selectedSnapshot, resources.rows, maximumAgeMs)) {
+      byNativeId.set(resource.native_id, [...(byNativeId.get(resource.native_id) ?? []), resource]);
+    }
     return nativeIds.map(resourceNativeId => {
       const matches = byNativeId.get(resourceNativeId) ?? [];
       if (!matches.length) throw new AppError(409, "quarantine_target_unavailable", "The native Copilot Studio inventory target is missing from the selected current snapshot.");
       const resolution = quarantineTargetResolution(selectedSnapshot, matches);
       if (!resolution.target) throw new AppError(409, resolution.errorCode!, resolution.reason!);
       return resolution.target;
+    });
+  }
+
+  private async withVerifiedQuarantineIdentities(
+    scope: InventoryDataScope, snapshot: SnapshotRow, rows: ResourceRow[], maximumAgeMs = 24 * 60 * 60 * 1000,
+  ): Promise<ResourceRow[]> {
+    if (!rows.some(row => !row.identifiers.some(identifier => identifier.kind === "cds_bot_id"))) return rows;
+    const inventory = await this.readUnifiedSource(scope);
+    if (inventory.snapshot?.id !== snapshot.id) return rows;
+    const packages = await new PackageInventoryRepository(this.database).readUnifiedSource(scope);
+    const links = resolvePackageAgentLinks(scope.tenantId, packages.packages, inventory.resources);
+    const verified = withVerifiedControlIdentities(inventory.resources, links, packages.observations, Date.now(), maximumAgeMs);
+    const byIdentity = new Map(verified.map(resource => [`${resource.environmentId}\0${resource.nativeId}`, resource]));
+    return rows.map(row => {
+      const resource = byIdentity.get(`${row.environment_id}\0${row.native_id}`);
+      return resource ? { ...row, identifiers: resource.identifiers, provenance: resource.provenance } : row;
     });
   }
 
@@ -419,6 +487,7 @@ function emptyCoverage(): InventoryTypeCoverage[] {
 function listFilters(snapshotId: string, scope: InventoryDataScope, query: InventoryListQuery) {
   const conditions = ["true"];
   const values: unknown[] = [snapshotId, scope.tenantId, scope.principalId];
+  if (query.excludeAgents) conditions.push(`resource_type<>'microsoft.copilotstudio/agents'`);
   if (query.type) { values.push(query.type); conditions.push(`resource_type=$${values.length}`); }
   if (query.environmentId) { values.push(query.environmentId); conditions.push(`environment_id=$${values.length}`); }
   if (query.search) { values.push(`%${query.search}%`); conditions.push(`(display_name ILIKE $${values.length} OR native_id ILIKE $${values.length})`); }
@@ -514,10 +583,6 @@ function validateEnvironment(value: string | undefined) {
 
 function queryHash(roleScope: InventoryRoleScope, environmentScope: string, requestedTypes: readonly PowerPlatformResourceType[]) {
   return createHash("sha256").update(JSON.stringify({ cloud: "global", roleScope, environmentScope, requestedTypes })).digest("hex");
-}
-
-function resourceIdentity(resource: PowerPlatformResource) {
-  return `${resource.type}\0${resource.environmentId ?? ""}\0${resource.nativeId}`;
 }
 
 function safeCode(value: string) {

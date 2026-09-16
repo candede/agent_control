@@ -65,11 +65,11 @@ export function BulkActions({
   const sideEffectErrors = result?.sideEffectErrors ?? [];
 
   return (
-    <section className="bulk-panel" aria-label="Bulk actions">
+    <section className="bulk-panel" aria-label="Exact package bulk actions">
       <div>
-        <h2>Tenant-wide controls</h2>
+        <h2>Access and availability</h2>
         <PreviewBadge />
-        <span className="selected-count">{selectedCount} selected</span>
+        <span className="selected-count"><span>{selectedCount} selected</span> · published versions</span>
       </div>
       <div className="bulk-buttons">
         <WorkbenchActionGate actionId="packages.block">
@@ -79,7 +79,7 @@ export function BulkActions({
           disabled={disabled || selectedCount === 0}
           onClick={onBlockAll}
         >
-          {busyAction === "block" ? "Blocking selected" : "Block selected"}
+          {busyAction === "block" ? "Blocking selected packages" : "Block selected packages"}
         </button>
         </WorkbenchActionGate>
         <WorkbenchActionGate actionId="packages.unblock">
@@ -89,8 +89,8 @@ export function BulkActions({
           onClick={onUnblockAll}
         >
           {busyAction === "unblock"
-            ? "Unblocking selected"
-            : "Unblock selected"}
+            ? "Unblocking selected packages"
+            : "Unblock selected packages"}
         </button>
         </WorkbenchActionGate>
         <WorkbenchActionGate actionId="packages.access">

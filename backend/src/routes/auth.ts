@@ -16,6 +16,7 @@ import { getCapabilityDefinition, hasAnyRole } from "../services/capabilityRegis
 import { capabilities } from "../services/capabilities.js";
 import { pauseCopilotStudioQuarantineForPrincipal } from "../services/copilotStudioQuarantineJobs.js";
 import { defenderHunting } from "../services/defenderHunting.js";
+import { dataSync } from "../services/dataSync.js";
 import { pauseBulkJobsForPrincipal } from "../services/bulkJobs.js";
 import { packageInventory } from "../services/packageInventory.js";
 import { powerPlatformInventory } from "../services/powerPlatformInventory.js";
@@ -95,6 +96,7 @@ policyRoute(authRouter, "get", "/auth/callback", { access: "public", dataClass: 
             powerPlatformInventory.waitForPrincipalAuthorization({ tenantId: previousTenantId, principalId: previousAccountId }),
             purviewAudit.waitForPrincipalAuthorization({ tenantId: previousTenantId, principalId: previousAccountId }),
             defenderHunting.waitForPrincipalAuthorization({ tenantId: previousTenantId, principalId: previousAccountId }),
+            dataSync.waitForPrincipalAuthorization({ tenantId: previousTenantId, principalId: previousAccountId }),
           ] : []),
         ]);
         const failure = cleanup.find(value => value.status === "rejected");
@@ -142,7 +144,11 @@ policyRoute(authRouter, "post", "/auth/logout", { access: "authenticated", dataC
         capabilities.invalidatePrincipal(request.session.user!),
         revokeAccountSessions(pool, tenantId!, accountId!),
       ]));
-    const failure = cleanup.find(result => result.status === "rejected");
+    // Coordinator operations may be waiting on account-session validation, so join them only after releasing the mutation lock.
+    const coordinatorCleanup = await Promise.allSettled([
+      dataSync.waitForPrincipalAuthorization({ tenantId: tenantId!, principalId: accountId! }),
+    ]);
+    const failure = [...cleanup, ...coordinatorCleanup].find(result => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
     response.clearCookie("agent-control.sid");
     response.status(204).end();

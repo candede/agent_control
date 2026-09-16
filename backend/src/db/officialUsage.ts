@@ -26,6 +26,7 @@ type StagingRow = {
   status: "active" | "accepted" | "replaced" | "expired" | "cancelled";
   kind: ParsedOfficialUsageReport["kind"];
   file_hash: string;
+  content_hash: string;
   parser_version: string;
   schema_version: string;
   bundle_id: string;
@@ -51,6 +52,7 @@ type StagingRow = {
 type SetRow = {
   id: string;
   bundle_id: string;
+  content_hash: string | null;
   actor_principal_id: string;
   reporting_start: string | Date | null;
   reporting_end: string | Date | null;
@@ -60,7 +62,7 @@ type SetRow = {
   accepted_at: Date | null;
   deleted_at: Date | null;
   created_at: Date;
-  expires_at: Date;
+  expires_at: Date | null;
   kinds: ParsedOfficialUsageReport["kind"][];
 };
 type ConfirmationRow = {
@@ -83,6 +85,7 @@ type BundleReceiptRow = {
 type PublishedVersionRow = {
   id: string;
   kind: ParsedOfficialUsageReport["kind"];
+  content_hash: string;
   file_hash: string;
   parser_version: string;
   schema_version: string;
@@ -133,7 +136,7 @@ export class OfficialUsageRepository {
       }
       if (input.correctionOfSetId) {
         const correction = await client.query(`SELECT 1 FROM official_usage_sets
-          WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL AND expires_at>clock_timestamp()`, [input.correctionOfSetId, scope.tenantId]);
+          WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL`, [input.correctionOfSetId, scope.tenantId]);
         if (!correction.rowCount) throw new AppError(409, "invalid_correction", "The superseded report set is unavailable.");
       }
       await client.query(`UPDATE official_usage_staging SET status='replaced'
@@ -165,23 +168,27 @@ export class OfficialUsageRepository {
           Number(quotas.bundle_bytes) + storedBytes > 96 * 1024 * 1024) {
         throw new AppError(429, "staging_quota", "The finite official usage staging count, row, or byte quota is full.");
       }
-      const overlap = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM official_usage_versions
-        WHERE tenant_id=$1 AND kind=$2 AND deleted_at IS NULL AND expires_at>clock_timestamp()
-          AND reporting_start<=$4::date AND reporting_end>=$3::date`, [scope.tenantId, input.report.kind, input.report.reportingPeriod.startDate, input.report.reportingPeriod.endDate]);
+      const overlapCount = input.report.reportingPeriod.provenance === "activity_range" ? 0
+        : (await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM official_usage_versions
+          WHERE tenant_id=$1 AND kind=$2 AND deleted_at IS NULL
+            AND reporting_start<=$4::date AND reporting_end>=$3::date`,
+        [scope.tenantId, input.report.kind, input.report.reportingPeriod.startDate, input.report.reportingPeriod.endDate])).rows[0].count;
       const companions = await companionMetrics(client, scope, input.bundleId);
       const warnings = [...new Set([...(input.report.warnings ?? []), ...(input.warnings ?? []),
-        ...(overlap.rows[0].count ? [`${overlap.rows[0].count} retained ${input.report.kind} version(s) overlap this reporting period.`] : [])])].slice(0, 100);
+        ...(overlapCount ? [`${overlapCount} retained ${input.report.kind} observation(s) overlap this known reporting window; snapshots are not additive.`] : [])])].slice(0, 100);
       const reconciliation = buildReconciliation(input.report, companions);
       await client.query(`INSERT INTO official_usage_staging
         (id,tenant_id,actor_principal_id,kind,file_hash,parser_version,schema_version,bundle_id,correction_of_set_id,
          reporting_start,reporting_end,period_provenance,source_as_of,source_as_of_provenance,source_freshness,downloaded_at,
-         row_count,stored_bytes,warnings,reconciliation,active_revision)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11::date,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20::jsonb,$21)`,
+         row_count,stored_bytes,warnings,reconciliation,content_hash,active_revision)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::date,$11::date,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20::jsonb,
+          official_usage_report_content_hash($4,$7,$10::date,$11::date,$12,$13,$14,$15,$21::jsonb),$22)`,
       [stagingId, scope.tenantId, scope.principalId, input.report.kind, input.fileHash, input.report.parserVersion,
         input.report.schemaVersion, input.bundleId, input.correctionOfSetId ?? null, input.report.reportingPeriod.startDate,
         input.report.reportingPeriod.endDate, input.report.reportingPeriod.provenance, input.report.sourceAsOf ?? null,
         input.report.sourceAsOfProvenance, input.report.sourceFreshness, input.report.downloadedAt ?? null,
-        input.report.rows.length, storedBytes, JSON.stringify(warnings), JSON.stringify(reconciliation), state.revision]);
+        input.report.rows.length, storedBytes, JSON.stringify(warnings), JSON.stringify(reconciliation),
+        JSON.stringify(input.report.rows), state.revision]);
       if (rowPayload.length) {
         await client.query(`INSERT INTO official_usage_staged_rows(staging_id,tenant_id,actor_principal_id,ordinal,row_data)
           SELECT $1,$2,$3,row.ordinal,row.row_data FROM jsonb_to_recordset($4::jsonb) AS row(ordinal integer,row_data jsonb)`,
@@ -237,7 +244,7 @@ export class OfficialUsageRepository {
       }
       if (stage.status === "accepted") {
         const retained = await client.query(`SELECT 1 FROM official_usage_sets
-          WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL AND expires_at>clock_timestamp()`,
+          WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL`,
         [stage.accepted_set_id, scope.tenantId]);
         return {
           setId: stage.accepted_set_id!,
@@ -258,21 +265,14 @@ export class OfficialUsageRepository {
         const duplicates = await client.query<StagingRow & { version_id: string }>(`SELECT staging.*,membership.version_id
           FROM official_usage_staging staging
           JOIN official_usage_sets report_set ON report_set.id=$4 AND report_set.tenant_id=staging.tenant_id
-            AND report_set.complete AND report_set.deleted_at IS NULL AND report_set.expires_at>clock_timestamp()
+            AND report_set.complete AND report_set.deleted_at IS NULL
           JOIN official_usage_set_versions membership ON membership.set_id=report_set.id
             AND membership.tenant_id=staging.tenant_id AND membership.kind=staging.kind
           JOIN official_usage_versions version ON version.id=membership.version_id
             AND version.tenant_id=membership.tenant_id AND version.kind=membership.kind AND version.deleted_at IS NULL
-          JOIN official_usage_artifacts artifact ON artifact.id=version.artifact_id
-            AND artifact.tenant_id=version.tenant_id AND artifact.kind=version.kind
           WHERE staging.tenant_id=$1 AND staging.actor_principal_id=$2 AND staging.bundle_id=$3
             AND staging.status='active' AND staging.expires_at>clock_timestamp()
-            AND artifact.file_hash=staging.file_hash
-            AND version.reporting_start IS NOT DISTINCT FROM staging.reporting_start
-            AND version.reporting_end IS NOT DISTINCT FROM staging.reporting_end
-            AND version.period_provenance=staging.period_provenance
-            AND version.source_as_of IS NOT DISTINCT FROM staging.source_as_of
-            AND version.source_as_of_provenance=staging.source_as_of_provenance`,
+            AND version.content_hash=staging.content_hash`,
         [scope.tenantId, scope.principalId, stage.bundle_id, duplicateTargetSetId]);
         if (duplicates.rows.length === 3 && new Set(duplicates.rows.map(row => row.kind)).size === 3) {
           for (const duplicate of duplicates.rows) {
@@ -287,6 +287,7 @@ export class OfficialUsageRepository {
       let reportSet = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds FROM official_usage_sets report_set
         WHERE tenant_id=$1 AND bundle_id=$2 FOR UPDATE`, [scope.tenantId, stage.bundle_id])).rows[0];
       if (!reportSet) {
+        await enforceHistoryQuota(client, scope.tenantId, { sets: 1 });
         const setId = randomUUID();
         reportSet = (await client.query<SetRow>(`INSERT INTO official_usage_sets
           (id,tenant_id,bundle_id,actor_principal_id,reporting_start,reporting_end,period_provenance,supersedes_set_id)
@@ -323,15 +324,9 @@ export class OfficialUsageRepository {
         throw new AppError(409, "incompatible_bundle", "This preview is incompatible with the retained report bundle.");
       }
       const existing = await client.query<{
-        version_id: string; file_hash: string; parser_version: string; schema_version: string;
-        reporting_start: string | Date | null; reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"];
-        source_as_of: Date | null; source_as_of_provenance: StagingRow["source_as_of_provenance"];
-        downloaded_at: Date | null; row_count: number; warnings: string[];
-      }>(`SELECT membership.version_id,artifact.file_hash,artifact.parser_version,artifact.schema_version,
-          version.reporting_start,version.reporting_end,version.period_provenance,version.source_as_of,
-          version.source_as_of_provenance,version.downloaded_at,version.row_count,version.warnings
+        version_id: string; content_hash: string;
+      }>(`SELECT membership.version_id,version.content_hash
         FROM official_usage_set_versions membership JOIN official_usage_versions version ON version.id=membership.version_id
-        JOIN official_usage_artifacts artifact ON artifact.id=version.artifact_id
         WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND membership.kind=$3`, [reportSet.id, scope.tenantId, stage.kind]);
       if (existing.rows[0]) {
         if (!sameImmutableVersionIntent(existing.rows[0], stage)) {
@@ -341,37 +336,79 @@ export class OfficialUsageRepository {
         return { setId: reportSet.id, versionId: existing.rows[0].version_id, activeRevision: Number(state.revision), complete: reportSet.complete };
       }
 
-      const artifactId = randomUUID();
-      const artifact = await client.query<{ id: string }>(`INSERT INTO official_usage_artifacts
-        (id,tenant_id,kind,file_hash,parser_version,schema_version) VALUES($1,$2,$3,$4,$5,$6)
-        ON CONFLICT(tenant_id,kind,file_hash) DO UPDATE SET expires_at=GREATEST(official_usage_artifacts.expires_at,clock_timestamp()+interval '180 days') RETURNING id`,
-      [artifactId, scope.tenantId, stage.kind, stage.file_hash, stage.parser_version, stage.schema_version]);
-      const superseded = stage.correction_of_set_id ? await client.query<{ version_id: string }>(`SELECT version_id FROM official_usage_set_versions
-        WHERE set_id=$1 AND tenant_id=$2 AND kind=$3`, [stage.correction_of_set_id, scope.tenantId, stage.kind]) : undefined;
-      const versionId = randomUUID();
-      await client.query(`INSERT INTO official_usage_versions
-        (id,tenant_id,artifact_id,staging_id,kind,reporting_start,reporting_end,period_provenance,source_as_of,
-         source_as_of_provenance,source_freshness,downloaded_at,row_count,warnings,reconciliation,accepted_by,supersedes_version_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17)`,
-      [versionId, scope.tenantId, artifact.rows[0].id, stage.id, stage.kind, stage.reporting_start, stage.reporting_end,
-        stage.period_provenance, stage.source_as_of, stage.source_as_of_provenance, stage.source_freshness, stage.downloaded_at,
-        stage.row_count, JSON.stringify(stage.warnings), JSON.stringify(stage.reconciliation), scope.principalId, superseded?.rows[0]?.version_id ?? null]);
-      await client.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,row_data)
-        SELECT $1,$2,$3,ordinal,row_data FROM official_usage_staged_rows
-        WHERE staging_id=$4 AND tenant_id=$2 AND actor_principal_id=$5 ORDER BY ordinal`,
-      [versionId, scope.tenantId, stage.kind, stage.id, scope.principalId]);
+      const reusable = (await client.query<{ id: string }>(`SELECT id FROM official_usage_versions
+        WHERE tenant_id=$1 AND kind=$2 AND content_hash=$3 AND deleted_at IS NULL
+        ORDER BY accepted_at,id LIMIT 1`, [scope.tenantId, stage.kind, stage.content_hash])).rows[0];
+      let versionId = reusable?.id;
+      if (!versionId) {
+        await enforceHistoryQuota(client, scope.tenantId, { versions: 1, rows: stage.row_count });
+        const artifactId = randomUUID();
+        const artifact = await client.query<{ id: string }>(`INSERT INTO official_usage_artifacts
+          (id,tenant_id,kind,file_hash,parser_version,schema_version) VALUES($1,$2,$3,$4,$5,$6)
+          ON CONFLICT(tenant_id,kind,file_hash) DO UPDATE SET expires_at=official_usage_artifacts.expires_at RETURNING id`,
+        [artifactId, scope.tenantId, stage.kind, stage.file_hash, stage.parser_version, stage.schema_version]);
+        const superseded = stage.correction_of_set_id ? await client.query<{ version_id: string }>(`SELECT version_id FROM official_usage_set_versions
+          WHERE set_id=$1 AND tenant_id=$2 AND kind=$3`, [stage.correction_of_set_id, scope.tenantId, stage.kind]) : undefined;
+        versionId = randomUUID();
+        await client.query(`INSERT INTO official_usage_versions
+          (id,tenant_id,artifact_id,staging_id,kind,content_hash,reporting_start,reporting_end,period_provenance,source_as_of,
+           source_as_of_provenance,source_freshness,downloaded_at,row_count,warnings,reconciliation,accepted_by,supersedes_version_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17,$18)`,
+        [versionId, scope.tenantId, artifact.rows[0].id, stage.id, stage.kind, stage.content_hash,
+          stage.reporting_start, stage.reporting_end, stage.period_provenance, stage.source_as_of,
+          stage.source_as_of_provenance, stage.source_freshness, stage.downloaded_at, stage.row_count,
+          JSON.stringify(stage.warnings), JSON.stringify(stage.reconciliation), scope.principalId,
+          superseded?.rows[0]?.version_id ?? null]);
+        await client.query(`INSERT INTO official_usage_row_facts(tenant_id,kind,payload_hash,row_data,first_observed_at)
+          SELECT tenant_id,$3,official_usage_payload_hash(row_data),row_data,clock_timestamp()
+          FROM official_usage_staged_rows
+          WHERE staging_id=$1 AND tenant_id=$2 AND actor_principal_id=$4
+          GROUP BY tenant_id,row_data
+          ON CONFLICT(tenant_id,kind,payload_hash) DO NOTHING`,
+        [stage.id, scope.tenantId, stage.kind, scope.principalId]);
+        const factCount = Number((await client.query<{ count: string }>(
+          "SELECT count(*)::text AS count FROM official_usage_row_facts WHERE tenant_id=$1", [scope.tenantId])).rows[0].count);
+        if (factCount > 2_000_000) {
+          throw new AppError(429, "official_usage_history_quota", "The finite official usage history payload quota is full.");
+        }
+        const associated = await client.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
+          SELECT $1,$2,$3,row.ordinal,official_usage_payload_hash(row.row_data)
+          FROM official_usage_staged_rows row
+          JOIN official_usage_row_facts fact ON fact.tenant_id=row.tenant_id AND fact.kind=$3
+            AND fact.payload_hash=official_usage_payload_hash(row.row_data) AND fact.row_data=row.row_data
+          WHERE row.staging_id=$4 AND row.tenant_id=$2 AND row.actor_principal_id=$5
+          ORDER BY row.ordinal`,
+        [versionId, scope.tenantId, stage.kind, stage.id, scope.principalId]);
+        if (associated.rowCount !== stage.row_count) {
+          throw new AppError(500, "official_usage_payload_integrity", "The official usage row payload association could not be verified.");
+        }
+      }
       await client.query(`INSERT INTO official_usage_set_versions(set_id,tenant_id,kind,version_id) VALUES($1,$2,$3,$4)`,
       [reportSet.id, scope.tenantId, stage.kind, versionId]);
       const membershipCount = (await client.query<{ count: number }>("SELECT count(*)::int AS count FROM official_usage_set_versions WHERE set_id=$1 AND tenant_id=$2", [reportSet.id, scope.tenantId])).rows[0].count;
       let activeRevision = Number(state.revision);
       if (membershipCount === 3) {
-        if (state.active_set_id && state.active_set_id !== reportSet.id && reportSet.supersedes_set_id !== state.active_set_id) {
-          throw new AppError(409, "correction_required", "Replacing the active official usage set requires an explicit correction preview.");
+        const completed = await client.query<{ content_hash: string }>(`UPDATE official_usage_sets report_set
+          SET complete=true,accepted_at=clock_timestamp(),content_hash=(
+            SELECT official_usage_bundle_content_hash(jsonb_agg(
+              jsonb_build_object('kind',membership.kind,'contentHash',version.content_hash)
+              ORDER BY membership.kind))
+            FROM official_usage_set_versions membership
+            JOIN official_usage_versions version ON version.id=membership.version_id
+            WHERE membership.set_id=report_set.id AND membership.tenant_id=report_set.tenant_id)
+          WHERE report_set.id=$1 AND report_set.tenant_id=$2 RETURNING content_hash`,
+        [reportSet.id, scope.tenantId]);
+        if (!completed.rows[0]?.content_hash) {
+          throw new AppError(500, "official_usage_content_identity", "The official usage bundle content identity could not be verified.");
         }
-        await client.query("UPDATE official_usage_sets SET complete=true,accepted_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2", [reportSet.id, scope.tenantId]);
-        const updated = await client.query<{ revision: string }>(`UPDATE official_usage_state SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp()
-          WHERE tenant_id=$1 RETURNING revision`, [scope.tenantId, reportSet.id]);
-        activeRevision = Number(updated.rows[0].revision);
+        const activate = !reportSet.supersedes_set_id || !state.active_set_id ||
+          reportSet.supersedes_set_id === state.active_set_id;
+        if (activate) {
+          const updated = await client.query<{ revision: string }>(`UPDATE official_usage_state
+            SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp()
+            WHERE tenant_id=$1 RETURNING revision`, [scope.tenantId, reportSet.id]);
+          activeRevision = Number(updated.rows[0].revision);
+        }
       }
       await markAccepted(client, scope, stage, versionId, reportSet.id, activeRevision);
       await insertAudit(client, scope, "accepted", stage.kind, versionId, stage.row_count);
@@ -416,6 +453,14 @@ export class OfficialUsageRepository {
         if (receipt.expires_at.getTime() <= Date.now()) {
           throw new AppError(409, "bundle_unavailable", "The reviewed report bundle receipt expired and cannot be republished.");
         }
+        const retained = await client.query<{ deleted_at: Date | null }>(`SELECT deleted_at FROM official_usage_sets
+          WHERE id=$1 AND tenant_id=$2`, [receipt.result_set_id, scope.tenantId]);
+        if (retained.rows[0]?.deleted_at) {
+          throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
+        }
+        if (!retained.rows[0]) {
+          throw new AppError(409, "bundle_unavailable", "The retained report bundle no longer exists.");
+        }
         return {
           setId: receipt.result_set_id,
           versionId: receipt.result_version_id,
@@ -431,17 +476,54 @@ export class OfficialUsageRepository {
         throw new AppError(409, "incomplete_bundle", "All three compatible report kinds must be reviewed before atomic publication.");
       }
       let result: { setId: string; versionId: string; activeRevision: number; complete: boolean } | undefined;
-      for (const stage of preview.staging) {
-        result = await this.acceptLocked(client, scope, stage.id, {
-          stagingRevision: stage.revision,
-          fileHash: stage.fileHash,
-          expectedActiveRevision: preview.expectedActiveRevision,
-        }, state);
+      if (preview.contentHash && preview.staging.length === requiredKinds.length && preview.acceptedVersions.length === 0) {
+        const duplicate = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds
+          FROM official_usage_sets report_set
+          WHERE report_set.tenant_id=$1 AND report_set.content_hash=$2 AND report_set.complete
+          ORDER BY report_set.deleted_at NULLS FIRST,report_set.accepted_at,report_set.id
+          LIMIT 1 FOR UPDATE`, [scope.tenantId, preview.contentHash])).rows[0];
+        if (duplicate?.deleted_at) {
+          throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
+        }
+        if (duplicate) {
+          const versions = await client.query<{ kind: ParsedOfficialUsageReport["kind"]; version_id: string }>(
+            `SELECT kind,version_id FROM official_usage_set_versions
+             WHERE set_id=$1 AND tenant_id=$2 ORDER BY kind`, [duplicate.id, scope.tenantId]);
+          const versionByKind = new Map(versions.rows.map(version => [version.kind, version.version_id]));
+          const stages = await client.query<StagingRow>(`SELECT * FROM official_usage_staging
+            WHERE tenant_id=$1 AND actor_principal_id=$2 AND bundle_id=$3 AND status='active'
+            ORDER BY kind FOR UPDATE`, [scope.tenantId, scope.principalId, bundleId]);
+          if (stages.rows.length !== requiredKinds.length || versions.rows.length !== requiredKinds.length) {
+            throw new AppError(409, "bundle_unavailable", "The exact retained bundle is incomplete and cannot satisfy this import.");
+          }
+          for (const stage of stages.rows) {
+            const versionId = versionByKind.get(stage.kind);
+            if (!versionId) throw new AppError(409, "bundle_unavailable", "The exact retained bundle is missing a report observation.");
+            await markAccepted(client, scope, stage, versionId, duplicate.id, Number(state.revision));
+            await insertAudit(client, scope, "accepted", stage.kind, versionId, stage.row_count);
+          }
+          result = {
+            setId: duplicate.id,
+            versionId: versionByKind.get(preview.staging[0].kind)!,
+            activeRevision: Number(state.revision),
+            complete: true,
+          };
+        }
+      }
+      if (!result) await validateBundleHistoryIntent(client, scope, preview);
+      if (!result) {
+        for (const stage of preview.staging) {
+          result = await this.acceptLocked(client, scope, stage.id, {
+            stagingRevision: stage.revision,
+            fileHash: stage.fileHash,
+            expectedActiveRevision: preview.expectedActiveRevision,
+          }, state);
+        }
       }
       if (!result) {
         const reportSet = await client.query<{ id: string }>(`SELECT id FROM official_usage_sets
           WHERE tenant_id=$1 AND bundle_id=$2 AND actor_principal_id=$3 AND complete
-            AND deleted_at IS NULL AND expires_at>clock_timestamp()`, [scope.tenantId, bundleId, scope.principalId]);
+            AND deleted_at IS NULL`, [scope.tenantId, bundleId, scope.principalId]);
         if (!reportSet.rows[0]) throw new AppError(409, "bundle_unavailable", "The reviewed report bundle is no longer available.");
         result = { setId: reportSet.rows[0].id, versionId: preview.acceptedVersions[0]!.versionId, activeRevision: Number(state.revision), complete: true };
       }
@@ -473,40 +555,57 @@ export class OfficialUsageRepository {
     };
   }
 
-  async getPublished(tenantId: string): Promise<PublishedOfficialUsage> {
+  async getPublished(tenantId: string, setId?: string): Promise<PublishedOfficialUsage> {
     validateTenant(tenantId);
+    if (setId) validateUuid(setId, "report set ID");
     return transaction(this.database, async client => {
     await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const state = await client.query<StateRow>("SELECT active_set_id,revision FROM official_usage_state WHERE tenant_id=$1", [tenantId]);
     const retained = await client.query<{ complete: boolean; count: number }>(`SELECT complete,count(*)::int AS count FROM official_usage_sets
-      WHERE tenant_id=$1 AND deleted_at IS NULL AND expires_at>clock_timestamp() GROUP BY complete`, [tenantId]);
-    const history = await client.query(`SELECT 1 FROM official_usage_audit
-      WHERE tenant_id=$1 AND action='accepted' AND outcome='succeeded' AND expires_at>clock_timestamp() LIMIT 1`, [tenantId]);
+      WHERE tenant_id=$1 AND deleted_at IS NULL GROUP BY complete`, [tenantId]);
+    const history = await client.query(`SELECT 1 FROM official_usage_sets WHERE tenant_id=$1
+      UNION ALL SELECT 1 FROM official_usage_audit
+      WHERE tenant_id=$1 AND action='accepted' AND outcome='succeeded' LIMIT 1`, [tenantId]);
     const retainedCounts = Object.fromEntries(retained.rows.map(row => [String(row.complete), row.count]));
-    const activeSetId = state.rows[0]?.active_set_id ?? null;
-    if (!activeSetId) {
+    const selectedSetId = setId ?? state.rows[0]?.active_set_id ?? null;
+    if (!selectedSetId) {
       return { activeRevision: Number(state.rows[0]?.revision ?? 1), activeSet: null, reports: {}, retainedCompleteSets: retainedCounts.true ?? 0, retainedIncompleteSets: retainedCounts.false ?? 0, hasImportHistory: Boolean(history.rowCount), activeSelectionIncomplete: false };
     }
     const reportSet = (await client.query<SetRow>(`SELECT report_set.*,coalesce(array_agg(membership.kind ORDER BY membership.kind),'{}') AS kinds
       FROM official_usage_sets report_set JOIN official_usage_set_versions membership ON membership.set_id=report_set.id AND membership.tenant_id=report_set.tenant_id
-      WHERE report_set.id=$1 AND report_set.tenant_id=$2 AND report_set.complete AND report_set.deleted_at IS NULL AND report_set.expires_at>clock_timestamp()
-      GROUP BY report_set.id`, [activeSetId, tenantId])).rows[0];
+      WHERE report_set.id=$1 AND report_set.tenant_id=$2 AND report_set.complete AND report_set.deleted_at IS NULL
+        AND (SELECT count(*) FROM official_usage_set_versions candidate
+          WHERE candidate.set_id=report_set.id AND candidate.tenant_id=report_set.tenant_id)=3
+        AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions candidate
+          JOIN official_usage_versions candidate_version ON candidate_version.id=candidate.version_id
+            AND candidate_version.tenant_id=candidate.tenant_id AND candidate_version.kind=candidate.kind
+          WHERE candidate.set_id=report_set.id AND candidate.tenant_id=report_set.tenant_id
+            AND (candidate_version.deleted_at IS NOT NULL OR candidate_version.row_count<>(
+              SELECT count(*) FROM official_usage_version_rows candidate_row
+              WHERE candidate_row.version_id=candidate_version.id
+                AND candidate_row.tenant_id=candidate_version.tenant_id
+                AND candidate_row.kind=candidate_version.kind)))
+      GROUP BY report_set.id`, [selectedSetId, tenantId])).rows[0];
     if (!reportSet) {
+      if (setId) throw new AppError(404, "official_usage_set_not_found", "The retained official usage report set was not found.");
       return { activeRevision: Number(state.rows[0]?.revision ?? 1), activeSet: null, reports: {}, retainedCompleteSets: retainedCounts.true ?? 0, retainedIncompleteSets: retainedCounts.false ?? 0, hasImportHistory: Boolean(history.rowCount), activeSelectionIncomplete: true };
     }
-    const versions = await client.query<PublishedVersionRow>(`SELECT version.id,version.kind,artifact.file_hash,artifact.parser_version,artifact.schema_version,
+    const versions = await client.query<PublishedVersionRow>(`SELECT version.id,version.kind,version.content_hash,
+      artifact.file_hash,artifact.parser_version,artifact.schema_version,
       version.reporting_start,version.reporting_end,version.period_provenance,version.source_as_of,version.source_as_of_provenance,
       version.source_freshness,version.downloaded_at,version.row_count,version.warnings,version.reconciliation,
       version.supersedes_version_id,version.accepted_at,
-      coalesce(jsonb_agg(row.row_data ORDER BY row.ordinal) FILTER (WHERE row.version_id IS NOT NULL),'[]'::jsonb) AS rows
+      coalesce(jsonb_agg(fact.row_data ORDER BY row.ordinal) FILTER (WHERE row.version_id IS NOT NULL),'[]'::jsonb) AS rows
       FROM official_usage_set_versions membership
       JOIN official_usage_versions version ON version.id=membership.version_id AND version.tenant_id=membership.tenant_id AND version.kind=membership.kind
       JOIN official_usage_artifacts artifact ON artifact.id=version.artifact_id AND artifact.tenant_id=version.tenant_id AND artifact.kind=version.kind
       LEFT JOIN official_usage_version_rows row ON row.version_id=version.id AND row.tenant_id=version.tenant_id AND row.kind=version.kind
+      LEFT JOIN official_usage_row_facts fact ON fact.tenant_id=row.tenant_id AND fact.kind=row.kind AND fact.payload_hash=row.payload_hash
       WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND version.deleted_at IS NULL
-        AND version.expires_at>clock_timestamp() AND artifact.expires_at>clock_timestamp()
+        AND artifact.id IS NOT NULL
       GROUP BY version.id,artifact.file_hash,artifact.parser_version,artifact.schema_version
-      ORDER BY version.kind`, [activeSetId, tenantId]);
+      HAVING count(row.ordinal)=version.row_count
+      ORDER BY version.kind`, [selectedSetId, tenantId]);
     if (versions.rows.length !== 3 || new Set(versions.rows.map(version => version.kind)).size !== 3) {
       return { activeRevision: Number(state.rows[0]?.revision ?? 1), activeSet: null, reports: {}, retainedCompleteSets: retainedCounts.true ?? 0, retainedIncompleteSets: retainedCounts.false ?? 0, hasImportHistory: Boolean(history.rowCount), activeSelectionIncomplete: true };
     }
@@ -529,6 +628,7 @@ export class OfficialUsageRepository {
       lineage: {
         kind: version.kind,
         versionId: version.id,
+        contentHash: version.content_hash,
         fileHash: version.file_hash,
         parserVersion: version.parser_version,
         schemaVersion: version.schema_version,
@@ -578,7 +678,7 @@ export class OfficialUsageRepository {
         throw new AppError(429, "confirmation_quota", "The finite official usage confirmation quota is full.");
       }
       const reportSet = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds FROM official_usage_sets report_set
-        WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL AND expires_at>clock_timestamp()`, [setId, scope.tenantId])).rows[0];
+        WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, [setId, scope.tenantId])).rows[0];
       if (!reportSet || operation === "select" && !reportSet.complete) {
         throw new AppError(409, "set_unavailable", operation === "select" ? "Only a retained complete report set can be selected." : "The retained report set cannot be deleted.");
       }
@@ -618,7 +718,7 @@ export class OfficialUsageRepository {
         throw new AppError(409, "active_revision_mismatch", "The active official usage selection changed; create a new preview.");
       }
       const reportSet = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds FROM official_usage_sets report_set
-        WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL AND expires_at>clock_timestamp() FOR UPDATE`, [input.setId, scope.tenantId])).rows[0];
+        WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL FOR UPDATE`, [input.setId, scope.tenantId])).rows[0];
       if (!reportSet || input.operation === "select" && !reportSet.complete) {
         throw new AppError(409, "set_unavailable", "The retained report set is incomplete, deleted, or expired.");
       }
@@ -632,9 +732,15 @@ export class OfficialUsageRepository {
         }
         await client.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2", [input.setId, scope.tenantId]);
         await client.query(`UPDATE official_usage_versions version SET deleted_at=clock_timestamp()
-          FROM official_usage_set_versions membership WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND version.id=membership.version_id`, [input.setId, scope.tenantId]);
-        await client.query(`DELETE FROM official_usage_version_rows row USING official_usage_set_versions membership
-          WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND row.version_id=membership.version_id`, [input.setId, scope.tenantId]);
+          FROM official_usage_set_versions membership
+          WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND version.id=membership.version_id
+            AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions live_membership
+              JOIN official_usage_sets live_set ON live_set.id=live_membership.set_id
+                AND live_set.tenant_id=live_membership.tenant_id
+              WHERE live_membership.version_id=version.id AND live_set.deleted_at IS NULL)`,
+        [input.setId, scope.tenantId]);
+        await client.query(`DELETE FROM official_usage_version_rows row USING official_usage_versions version
+          WHERE row.tenant_id=$1 AND row.version_id=version.id AND version.deleted_at IS NOT NULL`, [scope.tenantId]);
         await insertAudit(client, scope, "deleted", null, input.setId, null);
       }
       await client.query("UPDATE official_usage_confirmations SET consumed_at=clock_timestamp() WHERE id=$1", [confirmationId]);
@@ -697,9 +803,10 @@ async function insertAudit(client: pg.PoolClient, scope: OfficialUsageScope, act
 }
 
 async function companionMetrics(client: pg.PoolClient, scope: OfficialUsageScope, bundleId: string) {
-  const result = await client.query<{ kind: ParsedOfficialUsageReport["kind"]; rows: unknown[] }>(`SELECT membership.kind,jsonb_agg(row.row_data ORDER BY row.ordinal) AS rows
+  const result = await client.query<{ kind: ParsedOfficialUsageReport["kind"]; rows: unknown[] }>(`SELECT membership.kind,jsonb_agg(fact.row_data ORDER BY row.ordinal) AS rows
     FROM official_usage_sets report_set JOIN official_usage_set_versions membership ON membership.set_id=report_set.id
     JOIN official_usage_version_rows row ON row.version_id=membership.version_id
+    JOIN official_usage_row_facts fact ON fact.tenant_id=row.tenant_id AND fact.kind=row.kind AND fact.payload_hash=row.payload_hash
     WHERE report_set.tenant_id=$1 AND report_set.actor_principal_id=$2 AND report_set.bundle_id=$3 GROUP BY membership.kind
     UNION ALL
     SELECT staging.kind,jsonb_agg(row.row_data ORDER BY row.ordinal) AS rows
@@ -716,7 +823,7 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
     id: string; actor_principal_id: string; reporting_start: string | Date | null; reporting_end: string | Date | null;
     supersedes_set_id: string | null;
   }>(`SELECT id,actor_principal_id,reporting_start,reporting_end,supersedes_set_id FROM official_usage_sets
-    WHERE tenant_id=$1 AND bundle_id=$2 AND deleted_at IS NULL AND expires_at>clock_timestamp()`, [scope.tenantId, bundleId]);
+    WHERE tenant_id=$1 AND bundle_id=$2 AND deleted_at IS NULL`, [scope.tenantId, bundleId]);
   if (reportSet.rows[0] && reportSet.rows[0].actor_principal_id !== scope.principalId) {
     throw new AppError(409, "bundle_owner_mismatch", "This unpublished report bundle belongs to another administrator.");
   }
@@ -724,16 +831,17 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
     WHERE tenant_id=$1 AND actor_principal_id=$2 AND bundle_id=$3 AND status='active' AND expires_at>clock_timestamp()
     ORDER BY kind,id FOR UPDATE`, [scope.tenantId, scope.principalId, bundleId]);
   const accepted = await client.query<{
-    kind: ParsedOfficialUsageReport["kind"]; version_id: string; file_hash: string;
+    kind: ParsedOfficialUsageReport["kind"]; version_id: string; file_hash: string; content_hash: string;
     reporting_start: string | Date | null; reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"];
     source_as_of: Date | null; source_as_of_provenance: StagingRow["source_as_of_provenance"];
-  }>(`SELECT membership.kind,membership.version_id,artifact.file_hash,version.reporting_start,version.reporting_end,
+  }>(`SELECT membership.kind,membership.version_id,artifact.file_hash,version.content_hash,
+      version.reporting_start,version.reporting_end,
       version.period_provenance,version.source_as_of,version.source_as_of_provenance
     FROM official_usage_sets report_set JOIN official_usage_set_versions membership ON membership.set_id=report_set.id AND membership.tenant_id=report_set.tenant_id
     JOIN official_usage_versions version ON version.id=membership.version_id
     JOIN official_usage_artifacts artifact ON artifact.id=version.artifact_id
     WHERE report_set.tenant_id=$1 AND report_set.bundle_id=$2 AND report_set.actor_principal_id=$3
-      AND report_set.deleted_at IS NULL AND report_set.expires_at>clock_timestamp() AND version.deleted_at IS NULL
+      AND report_set.deleted_at IS NULL AND version.deleted_at IS NULL
     ORDER BY membership.kind`, [scope.tenantId, bundleId, scope.principalId]);
   if (!stages.rowCount && !accepted.rowCount) throw new AppError(404, "bundle_not_found", "The official usage bundle was not found for this administrator.");
   if (stages.rows.some(stage => Number(stage.active_revision) !== expectedActiveRevision)) {
@@ -789,6 +897,7 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
       id: stage.id,
       revision: stage.revision,
       kind: stage.kind,
+      contentHash: stage.content_hash,
       fileHash: stage.file_hash,
       reportingStart: dateValue(stage.reporting_start),
       reportingEnd: dateValue(stage.reporting_end),
@@ -796,16 +905,31 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
       sourceAsOf: stage.source_as_of?.toISOString() ?? null,
       sourceAsOfProvenance: stage.source_as_of_provenance,
     })),
-    accepted: accepted.rows.map(version => ({ kind: version.kind, versionId: version.version_id, fileHash: version.file_hash })),
+    accepted: accepted.rows.map(version => ({
+      kind: version.kind,
+      versionId: version.version_id,
+      fileHash: version.file_hash,
+      contentHash: version.content_hash,
+    })),
   };
+  const contentHash = kinds.size === requiredKinds.length
+    ? (await client.query<{ content_hash: string }>(`SELECT official_usage_bundle_content_hash($1::jsonb) AS content_hash`, [
+        JSON.stringify([
+          ...stages.rows.map(stage => ({ kind: stage.kind, contentHash: stage.content_hash })),
+          ...accepted.rows.map(version => ({ kind: version.kind, contentHash: version.content_hash })),
+        ]),
+      ])).rows[0].content_hash
+    : null;
   return {
     bundleId,
     bundleHash: hash(intent),
+    contentHash,
     expectedActiveRevision,
     staging: stages.rows.map(projectStaging),
     acceptedVersions: accepted.rows.map(version => ({
       kind: version.kind,
       versionId: version.version_id,
+      contentHash: version.content_hash,
       fileHash: version.file_hash,
       reportingPeriod: { startDate: dateValue(version.reporting_start), endDate: dateValue(version.reporting_end), provenance: version.period_provenance },
       sourceAsOf: version.source_as_of?.toISOString() ?? null,
@@ -821,6 +945,66 @@ async function bundlePreview(client: pg.PoolClient, scope: OfficialUsageScope, b
 }
 
 const requiredKinds = ["agents", "userAgents", "users"] as const;
+
+async function validateBundleHistoryIntent(
+  client: pg.PoolClient,
+  scope: OfficialUsageScope,
+  preview: Awaited<ReturnType<typeof bundlePreview>>,
+) {
+  if (!preview.contentHash || !preview.staging.length) return;
+  const reports = [...preview.staging, ...preview.acceptedVersions];
+  const basis = reports[0];
+  if (!basis) return;
+  const starts = reports.map(report => report.reportingPeriod.startDate).filter((value): value is string => value !== null);
+  const ends = reports.map(report => report.reportingPeriod.endDate).filter((value): value is string => value !== null);
+  const reportingStart = starts.length ? starts.sort()[0] : null;
+  const reportingEnd = ends.length ? ends.sort().at(-1)! : null;
+  const correctionOfSetId = preview.staging[0]?.correctionOfSetId ?? null;
+  if (correctionOfSetId) {
+    const correction = await client.query(`SELECT 1 FROM official_usage_sets report_set
+      WHERE report_set.id=$1 AND report_set.tenant_id=$2 AND report_set.complete AND report_set.deleted_at IS NULL
+        AND report_set.period_provenance=$3
+        AND ($3='activity_range' OR (
+          report_set.reporting_start IS NOT DISTINCT FROM $4::date
+          AND report_set.reporting_end IS NOT DISTINCT FROM $5::date))`,
+    [correctionOfSetId, scope.tenantId, basis.reportingPeriod.provenance, reportingStart, reportingEnd]);
+    if (!correction.rowCount) {
+      throw new AppError(409, "invalid_correction", "A correction must target a retained observation with the same reporting-window provenance and, when known, dates.");
+    }
+    return;
+  }
+  if (basis.reportingPeriod.provenance === "activity_range") return;
+  const samePeriod = await client.query<{ id: string }>(`SELECT report_set.id
+    FROM official_usage_sets report_set
+    WHERE report_set.tenant_id=$1 AND report_set.complete AND report_set.deleted_at IS NULL
+      AND report_set.content_hash<>$2 AND report_set.period_provenance=$3
+      AND report_set.reporting_start IS NOT DISTINCT FROM $4::date
+      AND report_set.reporting_end IS NOT DISTINCT FROM $5::date
+    LIMIT 1`,
+  [scope.tenantId, preview.contentHash, basis.reportingPeriod.provenance, reportingStart, reportingEnd]);
+  if (samePeriod.rowCount) {
+    throw new AppError(409, "correction_required", "Changed content for the same known reporting window requires an explicit correction target.");
+  }
+}
+
+async function enforceHistoryQuota(
+  client: pg.PoolClient,
+  tenantId: string,
+  additions: { sets?: number; versions?: number; rows?: number },
+) {
+  const counts = (await client.query<{ sets: number; versions: number; rows: string }>(`SELECT
+      (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1 AND deleted_at IS NULL) AS sets,
+      (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1 AND deleted_at IS NULL) AS versions,
+      (SELECT count(*)::text FROM official_usage_version_rows row
+        JOIN official_usage_versions version ON version.id=row.version_id
+        WHERE row.tenant_id=$1 AND version.deleted_at IS NULL) AS rows`,
+  [tenantId])).rows[0];
+  if (counts.sets + (additions.sets ?? 0) > 5_000 ||
+      counts.versions + (additions.versions ?? 0) > 15_000 ||
+      Number(counts.rows) + (additions.rows ?? 0) > 25_000_000) {
+    throw new AppError(429, "official_usage_history_quota", "The finite official usage history set, observation, or row-association quota is full.");
+  }
+}
 
 function sourceComparisonFromMetrics(metricsByKind: Record<string, unknown>, field: string) {
   return Object.fromEntries(Object.entries(metricsByKind).map(([kind, value]) => [kind,
@@ -857,6 +1041,7 @@ function projectStaging(row: StagingRow) {
     status: row.status,
     kind: row.kind,
     fileHash: row.file_hash,
+    contentHash: row.content_hash,
     parserVersion: row.parser_version,
     schemaVersion: row.schema_version,
     bundleId: row.bundle_id,
@@ -882,6 +1067,7 @@ function projectSet(row: SetRow) {
   return {
     id: row.id,
     bundleId: row.bundle_id,
+    contentHash: row.content_hash ?? undefined,
     reportingPeriod: {
       startDate: dateValue(row.reporting_start),
       endDate: dateValue(row.reporting_end),
@@ -893,7 +1079,7 @@ function projectSet(row: SetRow) {
     acceptedAt: row.accepted_at?.toISOString() ?? null,
     deletedAt: row.deleted_at?.toISOString() ?? null,
     createdAt: row.created_at.toISOString(),
-    expiresAt: row.expires_at.toISOString(),
+    expiresAt: row.expires_at?.toISOString() ?? null,
   };
 }
 
@@ -953,21 +1139,10 @@ function unionCoverage(
 }
 
 function sameImmutableVersionIntent(
-  version: {
-    file_hash: string; parser_version: string; schema_version: string; reporting_start: string | Date | null;
-    reporting_end: string | Date | null; period_provenance: StagingRow["period_provenance"]; source_as_of: Date | null;
-    source_as_of_provenance: StagingRow["source_as_of_provenance"]; downloaded_at: Date | null;
-    row_count: number; warnings: string[];
-  },
+  version: { content_hash: string },
   stage: StagingRow,
 ) {
-  return version.file_hash === stage.file_hash && version.parser_version === stage.parser_version &&
-    version.schema_version === stage.schema_version && dateValue(version.reporting_start) === dateValue(stage.reporting_start) &&
-    dateValue(version.reporting_end) === dateValue(stage.reporting_end) && version.period_provenance === stage.period_provenance &&
-    version.source_as_of?.getTime() === stage.source_as_of?.getTime() &&
-    version.source_as_of_provenance === stage.source_as_of_provenance &&
-    version.downloaded_at?.getTime() === stage.downloaded_at?.getTime() && version.row_count === stage.row_count &&
-    JSON.stringify(version.warnings) === JSON.stringify(stage.warnings);
+  return version.content_hash === stage.content_hash;
 }
 
 async function purgeExpiredPreviews(client: pg.PoolClient, tenantId: string | undefined, limit: number) {

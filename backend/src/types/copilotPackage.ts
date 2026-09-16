@@ -76,6 +76,7 @@ export type CopilotPackage = {
 };
 
 export type CopilotPackageDetail = CopilotPackage & {
+  identityDetailsCollected?: true;
   longDescription?: string;
   categories?: string[];
   sensitivity?: string;
@@ -83,6 +84,18 @@ export type CopilotPackageDetail = CopilotPackage & {
   acquireUsersAndGroups?: PackageAccessEntity[];
   elementDetails?: PackageElementDetail[];
 };
+
+export function formatPackageFacetLabel(value: string) {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").trim();
+}
+
+export function normalizePackageAuthoringTool(value: string) {
+  return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+}
+
+export function formatAgentAuthoringTool(value: string) {
+  return normalizePackageAuthoringTool(value).includes("copilotstudio") ? "Copilot Studio" : formatPackageFacetLabel(value);
+}
 
 export type BulkPackageResult = {
   id: string;

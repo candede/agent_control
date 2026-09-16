@@ -20,6 +20,10 @@ export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingRe
 
 export type AuditScope = "single" | "bulk";
 
+export function isAuditOperationPrefix(value: unknown): value is string {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(value);
+}
+
 export type AuditStatus = "requested" | "started" | "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
 
 export type AuditActor = {

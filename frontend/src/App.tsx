@@ -2,7 +2,6 @@ import {
   useDeferredValue,
   useEffect,
   useEffectEvent,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -12,16 +11,21 @@ import {
   Globe2,
   Play,
   Square,
+  Upload,
 } from "lucide-react";
 import {
   ApiError,
   blockAgent,
   blockAgents,
+  downloadInventoryCsv,
   downloadPackageInventoryCsv,
   getAgentDetails,
   getAgents,
+  getUnifiedAgents,
   getPackageRefreshJob,
   getPackageRefreshJobs,
+  getInventoryRefreshJob,
+  getInventoryRefreshJobs,
   getBulkActionJob,
   getCurrentUser,
   getWorkbenchMetadata,
@@ -34,6 +38,9 @@ import {
   signOut,
   startExactPackageRefresh,
   startPackageRefresh,
+  refreshPackageIdentityDetails,
+  refreshInventory,
+  resumeInventoryRefresh,
   subscribeSessionRevalidationRequired,
   unblockAgent,
   unblockAgents,
@@ -44,16 +51,21 @@ import {
   type AuditAction,
   type CopilotPackage,
   type CopilotPackageDetail,
+  type DataSyncSourceId,
   type PackageMutationPreview,
   type PackageAccessUpdate,
   type PackageAccessTarget,
   type PackagePage,
   type PackageListQuery,
   type PackageRefreshJob,
+  type InventoryRefreshJob,
+  type PowerPlatformResource,
   type OfficialUsageAggregateView,
   type OfficialUsageUserQuery,
   type OfficialUsageUserView,
   type SessionUser,
+  type UnifiedAgentInventoryPage,
+  type UnifiedAgentRecord,
 } from "./api/client";
 import { downloadBlob } from "./agentExport";
 import "./App.css";
@@ -63,31 +75,43 @@ import { projectVerifiedAccessScope } from "./packageMutationState";
 import { clearPackageSelection, restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
 import { providerActionAllowed } from "./capabilityState";
+import { quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
 import { CapabilityGate } from "./components/CapabilityGate";
 import { CapabilityContext } from "./capabilityContext";
 import { CapabilityHealth, PermissionCenter } from "./components/PermissionCenter";
 import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
-import { AgentTable } from "./components/AgentTable";
+import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
+import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
 import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
 import { CopilotUsersView } from "./components/CopilotUsersView";
 import { InventoryExplorer } from "./components/InventoryExplorer";
+import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
 import { CopilotStudioQuarantineTargetPicker } from "./components/CopilotStudioQuarantineTargetPicker";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
+import { OfficialUsageHistoryPanel } from "./components/OfficialUsageHistoryPanel";
+import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
+import { AgentSyncTools } from "./components/AgentSyncTools";
+import { EnvironmentFilter } from "./components/EnvironmentFilter";
 import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
 import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
   agentRouteSearch,
+  dataSyncRouteSearch,
+  parseDataSyncRoute,
   officialUsageRouteSearch,
+  migratePowerPlatformAgentRoute,
   parseAgentRoute,
   parseOfficialUsageRoute,
   parsePowerPlatformRoute,
   parseWorkbenchView,
   workbenchUrl,
+  type AgentRouteState,
   type WorkbenchViewId,
 } from "./workbenchRouting";
 import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionContext";
@@ -95,8 +119,16 @@ import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionC
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
 const packageRefreshPollIntervalMs = 750;
+const inventoryRefreshPollIntervalMs = 1_000;
 const foregroundJobPollBudgetMs = 5 * 60_000;
+const identityCollectionPollBudgetMs = 16 * 60_000;
 const agentDisplayPageSize = 50;
+const agentSortOptions = [
+  { value: "displayName:asc", label: "Name (A-Z)", sortBy: "displayName", direction: "asc" },
+  { value: "displayName:desc", label: "Name (Z-A)", sortBy: "displayName", direction: "desc" },
+  { value: "lastModifiedAt:desc", label: "Modified (newest)", sortBy: "lastModifiedAt", direction: "desc" },
+  { value: "lastModifiedAt:asc", label: "Modified (oldest)", sortBy: "lastModifiedAt", direction: "asc" },
+] as const;
 
 function withPackageSummaryFallback(
   detail: CopilotPackageDetail,
@@ -140,8 +172,22 @@ function LinkedAgentJobStatus({
   );
 }
 
+function readInitialAgentRoute() {
+  const syncRoute = parseDataSyncRoute(window.location.search);
+  if (parseWorkbenchView(window.location.pathname) === "agents" && (syncRoute.syncRunId || (syncRoute.refreshJobId && !parseAgentRoute(window.location.search).controlJobId))) {
+    window.history.replaceState({ view: "sync" }, "", workbenchUrl("sync", dataSyncRouteSearch(syncRoute)));
+  }
+  if (parseWorkbenchView(window.location.pathname) === "power-platform") {
+    const migrated = migratePowerPlatformAgentRoute(window.location.search);
+    if (migrated) {
+      window.history.replaceState({ view: "agents" }, "", workbenchUrl("agents", migrated));
+    }
+  }
+  return parseAgentRoute(window.location.search);
+}
+
 function App() {
-  const initialAgentRoute = useRef(parseAgentRoute(window.location.search)).current;
+  const [initialAgentRoute] = useState(readInitialAgentRoute);
   const initialOfficialUsageRoute = useRef(parseOfficialUsageRoute(window.location.search)).current;
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
@@ -157,6 +203,14 @@ function App() {
   const [authSetup, setAuthSetup] = useState<{ authConfigured: boolean; callback: string; setup?: string }>();
   const [agents, setAgents] = useState<CopilotPackage[]>([]);
   const [agentPage, setAgentPage] = useState<PackagePage>();
+  const [unifiedAgentPage, setUnifiedAgentPage] = useState<UnifiedAgentInventoryPage>();
+  const [selectedUnifiedAgent, setSelectedUnifiedAgent] = useState<UnifiedAgentRecord>();
+  const [selectedPowerPlatformTargets, setSelectedPowerPlatformTargets] = useState<Map<string, PowerPlatformResource>>(new Map());
+  const [selectedPowerPlatformSnapshot, setSelectedPowerPlatformSnapshot] = useState<QuarantineSelectionSnapshot | null>(null);
+  const [pendingPowerPlatformIds, setPendingPowerPlatformIds] = useState<Set<string>>(() => new Set(initialAgentRoute.selectedPowerPlatformIds));
+  const [agentEnvironmentFilter, setAgentEnvironmentFilter] = useState(initialAgentRoute.environmentId);
+  const [requestedQuarantineJobId, setRequestedQuarantineJobId] = useState(initialAgentRoute.quarantineJobId);
+  const [requestedInventorySnapshotId, setRequestedInventorySnapshotId] = useState(initialAgentRoute.inventorySnapshotId);
   const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number }>();
   const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
@@ -171,6 +225,7 @@ function App() {
   const [hostFilter, setHostFilter] = useState(initialAgentRoute.host);
   const [platformFilter, setPlatformFilter] = useState(initialAgentRoute.platform);
   const [createdWithinDays, setCreatedWithinDays] = useState(initialAgentRoute.createdWithinDays);
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(() => countAdvancedAgentFilters(initialAgentRoute) > 0);
   const [agentSortBy, setAgentSortBy] = useState<NonNullable<PackageListQuery["sortBy"]>>(initialAgentRoute.sortBy);
   const [agentSortDirection, setAgentSortDirection] = useState<NonNullable<PackageListQuery["sortDirection"]>>(initialAgentRoute.sortDirection);
   const [agentPageIndex, setAgentPageIndex] = useState(initialAgentRoute.page);
@@ -193,6 +248,9 @@ function App() {
   const [requestedPackageRefreshJobId, setRequestedPackageRefreshJobId] = useState(initialAgentRoute.refreshJobId);
   const [requestedPackageRefreshMode, setRequestedPackageRefreshMode] = useState(initialAgentRoute.refreshMode);
   const [requestedPackageControlJobId, setRequestedPackageControlJobId] = useState(initialAgentRoute.controlJobId);
+  const [requestedDataSyncRunId, setRequestedDataSyncRunId] = useState(initialAgentRoute.syncRunId);
+  const [syncSetupRequired, setSyncSetupRequired] = useState(false);
+  const [syncHistoryRevision, setSyncHistoryRevision] = useState(0);
   const [singleAccessAgentDetail, setSingleAccessAgentDetail] =
     useState<CopilotPackageDetail>();
   const [singleAccessTarget, setSingleAccessTarget] = useState<PackageAccessTarget>("availability");
@@ -200,14 +258,24 @@ function App() {
   const [agentDetailError, setAgentDetailError] = useState<string>();
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
   const [exportingCsv, setExportingCsv] = useState(false);
+  const [exportingPowerPlatformCsv, setExportingPowerPlatformCsv] = useState(false);
+  const [refreshingPowerPlatformAgents, setRefreshingPowerPlatformAgents] = useState(false);
+  const [powerPlatformAgentRefreshJob, setPowerPlatformAgentRefreshJob] = useState<InventoryRefreshJob>();
+  const [agentReloadRevision, setAgentReloadRevision] = useState(0);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportProgressTotal, setExportProgressTotal] = useState(0);
   const [exportProgressMode, setExportProgressMode] =
     useState<ExportMode>("full");
   const [officialUsageAggregate, setOfficialUsageAggregate] =
     useState<OfficialUsageAggregateView>();
+  const [officialUsageAggregateSetId, setOfficialUsageAggregateSetId] =
+    useState<string | null>();
   const [officialUsageUsers, setOfficialUsageUsers] =
     useState<OfficialUsageUserView>();
+  const [officialUsageUsersSetId, setOfficialUsageUsersSetId] =
+    useState<string | null>();
+  const [loadingOfficialUsage, setLoadingOfficialUsage] = useState(false);
+  const [officialUsageLoadError, setOfficialUsageLoadError] = useState<string>();
   const [officialUsageAgentOffset, setOfficialUsageAgentOffset] = useState(0);
   const [officialUsageAgentQuery, setOfficialUsageAgentQuery] = useState<{
     search?: string;
@@ -220,28 +288,34 @@ function App() {
   const [officialUsageUserOffset, setOfficialUsageUserOffset] = useState(0);
   const [officialUsageUserQuery, setOfficialUsageUserQuery] = useState<OfficialUsageUserQuery>({});
   const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
+  const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
+  const [powerPlatformDataRevision, setPowerPlatformDataRevision] = useState(0);
+  const [usageImportOpenRequest, setUsageImportOpenRequest] = useState(0);
   const inactiveDays = 30;
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(initialOfficialUsageRoute.activityWindowDays);
   const [requestedOfficialUsageStagingId, setRequestedOfficialUsageStagingId] = useState(initialOfficialUsageRoute.stagingId);
+  const [officialUsageReportSetId, setOfficialUsageReportSetId] = useState(initialOfficialUsageRoute.reportSetId);
   const [activeView, setActiveView] = useState<WorkbenchViewId>(() => parseWorkbenchView(window.location.pathname));
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
   const [packageSnapshotExpiresAt, setPackageSnapshotExpiresAt] = useState<Date>();
   const [refreshingAgents, setRefreshingAgents] = useState(false);
-  const [recentlyChangedAgentIds, setRecentlyChangedAgentIds] = useState<
+  const [, setRecentlyChangedAgentIds] = useState<
     Set<string>
   >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
+  const agentDetailAbortController = useRef<AbortController | undefined>(undefined);
   const agentListRequestId = useRef(0);
   const agentListAbortController = useRef<AbortController | undefined>(undefined);
+  const forceCurrentAgentReload = useRef(false);
   const bulkJobPollRequestId = useRef(0);
   const packageRefreshRequestId = useRef(0);
-  const initialAgentRefreshAttempts = useRef(new Set<string>());
-  const initialAgentRefreshChecks = useRef(new Set<string>());
-  const initialAgentRefreshMounted = useRef(true);
+  const identityBackfills = useRef(new Set<string>());
+  const inventoryRefreshRequestId = useRef(0);
   const linkedPackageRefreshRequestId = useRef(0);
   const officialUsageRequestId = useRef(0);
   const officialUsageAbortController = useRef<AbortController | undefined>(undefined);
+  const dataSyncPanelRef = useRef<DataSyncPanelHandle>(null);
   const sessionRevalidationInFlight = useRef(false);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
@@ -253,6 +327,8 @@ function App() {
   const principalKey = user
     ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
     : `signed-out:${sessionEpoch}`;
+  const sessionOwnerRef = useRef(principalKey);
+  const activeViewRef = useRef(activeView);
   const workbenchMetadata = loadedWorkbenchMetadata?.principalKey === principalKey
     ? loadedWorkbenchMetadata.value
     : undefined;
@@ -261,8 +337,11 @@ function App() {
   });
   const loadLinkedControlJob = useEffectEvent((jobId: string) =>
     followBulkJob(jobId, undefined, false));
-  const loadSavedAgents = useEffectEvent(() => {
-    void loadAgents();
+  const loadSavedAgents = useEffectEvent((forceCurrentSnapshot = false) => {
+    void loadAgents(forceCurrentSnapshot);
+  });
+  const collectMissingAgentIdentities = useEffectEvent((snapshotId: string) => {
+    void handleRefreshAgents(`agent-identities-${snapshotId}`);
   });
   const loadSavedOfficialUsage = useEffectEvent(() => {
     void loadOfficialUsage();
@@ -278,6 +357,11 @@ function App() {
   });
 
   useEffect(() => {
+    sessionOwnerRef.current = principalKey;
+    activeViewRef.current = activeView;
+  }, [activeView, principalKey]);
+
+  useEffect(() => {
     return subscribeSessionRevalidationRequired(() => revalidateCurrentSession());
   }, []);
 
@@ -287,10 +371,12 @@ function App() {
 
   useEffect(() => {
     agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
     bulkJobPollRequestId.current += 1;
     packageRefreshRequestId.current += 1;
+    inventoryRefreshRequestId.current += 1;
     linkedPackageRefreshRequestId.current += 1;
     officialUsageRequestId.current += 1;
     officialUsageAbortController.current?.abort();
@@ -299,6 +385,10 @@ function App() {
     void Promise.resolve().then(() => {
       setAgents([]);
       setAgentPage(undefined);
+      setUnifiedAgentPage(undefined);
+      setSelectedUnifiedAgent(undefined);
+      setSelectedPowerPlatformTargets(new Map());
+      setSelectedPowerPlatformSnapshot(null);
       setAgentDetail(undefined);
       setTrackedJob(undefined);
       setLinkedPackageRefreshJob(undefined);
@@ -306,7 +396,11 @@ function App() {
       setBulkProgress(undefined);
       setBulkResult(undefined);
       setOfficialUsageAggregate(undefined);
+      setOfficialUsageAggregateSetId(undefined);
       setOfficialUsageUsers(undefined);
+      setOfficialUsageUsersSetId(undefined);
+      setOfficialUsageLoadError(undefined);
+      setLoadingOfficialUsage(false);
       setLoadingAgentDetailId(undefined);
     });
   }, [principalKey]);
@@ -326,17 +420,28 @@ function App() {
 
   useEffect(() => {
     function restoreRoute() {
+      readInitialAgentRoute();
       agentDetailRequestId.current += 1;
+      agentDetailAbortController.current?.abort();
+      packageRefreshRequestId.current += 1;
+      inventoryRefreshRequestId.current += 1;
       setLoadingAgentDetailId(undefined);
+      setBusyAgentId(undefined);
       setSingleAccessAgentDetail(undefined);
       setBulkAccessAgentIds(undefined);
       setBulkConfirmation(undefined);
+      setRefreshingAgents(false);
+      setRefreshingPowerPlatformAgents(false);
       const view = parseWorkbenchView(window.location.pathname);
-      if (view !== "agents") setAgentDetail(undefined);
+      if (view !== "agents") {
+        setAgentDetail(undefined);
+        setSelectedUnifiedAgent(undefined);
+      }
       savedViewSearches.current.set(view, window.location.search);
       setActiveView(view);
       if (view === "agents") {
         const route = parseAgentRoute(window.location.search);
+        if (countAdvancedAgentFilters(route) > 0) setShowAdvancedFilters(true);
         setQuery(route.search);
         setStatusFilter(route.status);
         setPublisherFilter(route.publisher);
@@ -355,11 +460,28 @@ function App() {
         setRequestedPackageRefreshJobId(route.refreshJobId);
         setRequestedPackageRefreshMode(route.refreshMode);
         setRequestedPackageControlJobId(route.controlJobId);
+        setAgentEnvironmentFilter(route.environmentId);
+        setSelectedPowerPlatformTargets(new Map());
+        setSelectedPowerPlatformSnapshot(null);
+        setPendingPowerPlatformIds(new Set(route.selectedPowerPlatformIds));
+        setRequestedQuarantineJobId(route.quarantineJobId);
+        setRequestedInventorySnapshotId(route.inventorySnapshotId);
         setAgentDetail(current => current?.id === route.detailId ? current : undefined);
+      } else if (view === "sync") {
+        const route = parseDataSyncRoute(window.location.search);
+        setRequestedDataSyncRunId(route.syncRunId);
+        setRequestedPackageRefreshJobId(route.refreshJobId);
+        setRequestedPackageRefreshMode(route.refreshMode);
       } else if (view === "official-usage") {
         const route = parseOfficialUsageRoute(window.location.search);
         setRequestedOfficialUsageStagingId(route.stagingId);
+        setOfficialUsageReportSetId(route.reportSetId);
         setReportActivityWindowDays(route.activityWindowDays);
+        setOfficialUsageAgentOffset(0);
+        setOfficialUsageAgentQuery({});
+        setOfficialUsageUserOffset(0);
+        setOfficialUsageUserQuery({});
+        setOfficialUsageLoadError(undefined);
       }
     }
     window.addEventListener("popstate", restoreRoute);
@@ -408,9 +530,14 @@ function App() {
       detailId: agentDetail?.id ?? requestedAgentDetailId,
       detailTab: agentDetailTab,
       selectedIds: [...selectedAgentIds],
-      refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
       controlJobId: requestedPackageControlJobId,
+      source: "all",
+      linkState: "all",
+      environmentId: agentEnvironmentFilter,
+      inventorySnapshotId: requestedInventorySnapshotId,
+      selectedPowerPlatformIds: [...new Set([...pendingPowerPlatformIds, ...selectedPowerPlatformTargets.keys()])],
+      quarantineJobId: requestedQuarantineJobId,
     });
     const selectionStored = search.get("selectionState") === "session";
     const selectionSaved = selectionStored && user
@@ -428,47 +555,87 @@ function App() {
           : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, selectedAgentIds, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, statusFilter, user]);
+
+  useEffect(() => {
+    if (activeView !== "sync") return;
+    const search = dataSyncRouteSearch({
+      syncRunId: requestedDataSyncRunId,
+      refreshJobId: requestedPackageRefreshJobId,
+      refreshMode: requestedPackageRefreshMode,
+    });
+    const next = workbenchUrl("sync", search);
+    savedViewSearches.current.set("sync", search.toString());
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.replaceState({ view: "sync" }, "", next);
+    }
+  }, [activeView, requestedDataSyncRunId, requestedPackageRefreshJobId, requestedPackageRefreshMode]);
 
   useEffect(() => {
     if (activeView !== "official-usage") return;
     const next = workbenchUrl("official-usage", officialUsageRouteSearch({
       stagingId: requestedOfficialUsageStagingId,
+      reportSetId: officialUsageReportSetId,
       activityWindowDays: reportActivityWindowDays,
     }));
     savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
     if (`${window.location.pathname}${window.location.search}` !== next) {
       window.history.replaceState({ view: "official-usage" }, "", next);
     }
-  }, [activeView, reportActivityWindowDays, requestedOfficialUsageStagingId]);
+  }, [activeView, officialUsageReportSetId, reportActivityWindowDays, requestedOfficialUsageStagingId]);
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
-    const summary = agents.find(agent => agent.id === requestedAgentDetailId);
-    if (summary) {
-      void handleViewAgentDetails(summary);
-      return;
+    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId || selectedUnifiedAgent?.id === requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
+    const exact = unifiedAgentPage?.value.find(record =>
+      record.id === requestedAgentDetailId ||
+      record.packages.some(item => item.id === requestedAgentDetailId));
+    const legacyPowerPlatform = !exact && agentEnvironmentFilter
+      ? unifiedAgentPage?.value.filter(record =>
+          record.powerPlatformResource?.nativeId === requestedAgentDetailId
+          && record.environmentId === agentEnvironmentFilter) ?? []
+      : [];
+    const unified = exact ?? (legacyPowerPlatform.length === 1 ? legacyPowerPlatform[0] : undefined);
+    if (unified) {
+      const requestId = ++agentDetailRequestId.current;
+      let active = true;
+      void Promise.resolve().then(() => {
+        if (!active || requestId !== agentDetailRequestId.current) return;
+        setSelectedUnifiedAgent(unified);
+        setRequestedAgentDetailId(unified.id);
+        setAgentDetail(undefined);
+      });
+      return () => { active = false; };
     }
     const requestId = ++agentDetailRequestId.current;
-    void Promise.resolve().then(() => {
-      if (requestId !== agentDetailRequestId.current) return;
-      setLoadingAgentDetailId(requestedAgentDetailId);
+    const controller = new AbortController();
+    void Promise.resolve().then(async () => {
+      if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
       setAgentDetailError(undefined);
-      return getAgentDetails(requestedAgentDetailId);
-    }).then(detail => {
-      if (detail && requestId === agentDetailRequestId.current) setAgentDetail(detail);
+      const target = parseUnifiedAgentRecordId(requestedAgentDetailId)
+        ?? { source: "graph_packages" as const, packageId: requestedAgentDetailId };
+      const resolved = await getUnifiedAgents({ recordId: unifiedAgentRecordId(target) }, { signal: controller.signal });
+      if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
+      if (resolved.count > 1) throw new Error("The agent link is ambiguous; select an exact source-qualified agent.");
+      if (resolved.value.length === 1) {
+        setSelectedUnifiedAgent(resolved.value[0]);
+        setRequestedAgentDetailId(resolved.value[0].id);
+        setAgentDetail(undefined);
+        return;
+      }
+      if (target.source !== "graph_packages") throw new Error("The exact Power Platform agent is not available in the current saved inventory. Refresh Power Platform agents and retry.");
+      const detail = await getAgentDetails(target.packageId, { signal: controller.signal });
+      if (!controller.signal.aborted && requestId === agentDetailRequestId.current) setAgentDetail(detail);
     }).catch(requestError => {
-      if (requestId === agentDetailRequestId.current) {
+      if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
         setRequestedAgentDetailId(undefined);
         setAgentDetailError(errorMessage(requestError));
       }
-    }).finally(() => {
-      if (requestId === agentDetailRequestId.current) setLoadingAgentDetailId(undefined);
     });
-  }, [activeView, agentDetail?.id, agents, loadingAgentDetailId, requestedAgentDetailId, user]);
+    return () => controller.abort();
+  }, [activeView, agentDetail?.id, agentEnvironmentFilter, loadingAgentDetailId, requestedAgentDetailId, selectedUnifiedAgent?.id, unifiedAgentPage?.value, user]);
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedPackageRefreshJobId) {
+    if (!user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && activeView !== "sync") || !requestedPackageRefreshJobId) {
       void Promise.resolve().then(() => setLinkedPackageRefreshJob(undefined));
       return;
     }
@@ -536,11 +703,71 @@ function App() {
   }, [principalKey, requestedPackageControlJobId, requestedPackageRefreshJobId, user]);
 
   useEffect(() => {
+    if (
+      activeView !== "sync"
+      || refreshingPowerPlatformAgents
+      || powerPlatformAgentRefreshJob?.status !== "running"
+    ) {
+      return;
+    }
+    const controller = new AbortController();
+    const requestId = ++inventoryRefreshRequestId.current;
+    const owner = principalKey;
+    const jobId = powerPlatformAgentRefreshJob.id;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      try {
+        const job = await getInventoryRefreshJob(jobId, { signal: controller.signal });
+        if (
+          controller.signal.aborted
+          || requestId !== inventoryRefreshRequestId.current
+          || sessionOwnerRef.current !== owner
+          || activeViewRef.current !== "sync"
+        ) return;
+        setPowerPlatformAgentRefreshJob(job);
+        if (job.status === "succeeded") {
+          resetPowerPlatformSelection();
+          forceCurrentAgentReload.current = true;
+          setAgentReloadRevision(revision => revision + 1);
+        } else if (job.status === "running" && Date.now() < deadline) {
+          timer = window.setTimeout(() => void poll(), inventoryRefreshPollIntervalMs);
+        } else if (job.status === "running") {
+          setError("Power Platform agent refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
+        } else if (job.status !== "waiting_authorization") {
+          setError(job.message ?? "Power Platform agent refresh did not complete.");
+        }
+      } catch (requestError) {
+        if (
+          !controller.signal.aborted
+          && requestId === inventoryRefreshRequestId.current
+          && sessionOwnerRef.current === owner
+          && activeViewRef.current === "sync"
+        ) {
+          setError(errorMessage(requestError));
+        }
+      }
+    };
+
+    timer = window.setTimeout(() => void poll(), inventoryRefreshPollIntervalMs);
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (requestId === inventoryRefreshRequestId.current) inventoryRefreshRequestId.current += 1;
+    };
+  }, [activeView, powerPlatformAgentRefreshJob?.id, powerPlatformAgentRefreshJob?.status, principalKey, refreshingPowerPlatformAgents]);
+
+  useEffect(() => {
     if (!user) {
       agentListAbortController.current?.abort();
       void Promise.resolve().then(() => {
         setAgents([]);
         setAgentPage(undefined);
+        setUnifiedAgentPage(undefined);
+        setSelectedUnifiedAgent(undefined);
+        setSelectedPowerPlatformTargets(new Map());
+        setSelectedPowerPlatformSnapshot(null);
         setAgentDetail(undefined);
       });
       return;
@@ -551,6 +778,10 @@ function App() {
         clearPackageSelection(user);
         setAgents([]);
         setAgentPage(undefined);
+        setUnifiedAgentPage(undefined);
+        setSelectedUnifiedAgent(undefined);
+        setSelectedPowerPlatformTargets(new Map());
+        setSelectedPowerPlatformSnapshot(null);
         setAgentSnapshotId(undefined);
         setSelectedAgentIds(new Set());
         setPendingStoredAgentSelectionCount(undefined);
@@ -561,30 +792,65 @@ function App() {
         setRequestedAgentDetailId(undefined);
         setRequestedPackageRefreshJobId(undefined);
         setRequestedPackageControlJobId(undefined);
+        setRequestedDataSyncRunId(undefined);
         setTrackedJob(undefined);
         setLinkedPackageRefreshJob(undefined);
         setLinkedJobError(undefined);
       });
       return;
     }
-    loadSavedAgents();
+    const forceCurrentSnapshot = forceCurrentAgentReload.current;
+    forceCurrentAgentReload.current = false;
+    loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
+  }, [agentEnvironmentFilter, agentPageIndex, agentReloadRevision, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
 
   useEffect(() => {
     if (user) {
       loadSavedOfficialUsage();
     }
-  }, [inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
+  }, [inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageReportSetId, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
+
+  useEffect(() => {
+    if (!unifiedAgentPage || pendingPowerPlatformIds.size === 0) return;
+    const resolved = new Map<string, PowerPlatformResource>();
+    const unresolved = new Set(pendingPowerPlatformIds);
+    let snapshot: UnifiedAgentRecord["observations"]["powerPlatform"] = null;
+    for (const key of pendingPowerPlatformIds) {
+      const exact = unifiedAgentPage.value.find(record => record.id === key && record.powerPlatformResource);
+      const legacy = !exact && agentEnvironmentFilter
+        ? unifiedAgentPage.value.filter(record =>
+            record.powerPlatformResource?.nativeId === key
+            && record.powerPlatformResource.environmentId === agentEnvironmentFilter)
+        : [];
+      const record = exact ?? (legacy.length === 1 ? legacy[0] : undefined);
+      if (!record?.powerPlatformResource || !record.observations.powerPlatform) continue;
+      resolved.set(record.id, record.powerPlatformResource);
+      unresolved.delete(key);
+      snapshot = record.observations.powerPlatform;
+    }
+    if (resolved.size && snapshot) {
+      let active = true;
+      const selectedSnapshot = snapshot;
+      void Promise.resolve().then(() => {
+        if (!active) return;
+        setRequestedInventorySnapshotId(selectedSnapshot.snapshotId);
+        setSelectedPowerPlatformSnapshot(selectedSnapshot);
+        setSelectedPowerPlatformTargets(current => new Map([...current, ...resolved]));
+        setPendingPowerPlatformIds(unresolved);
+      });
+      return () => { active = false; };
+    }
+  }, [agentEnvironmentFilter, pendingPowerPlatformIds, unifiedAgentPage]);
 
   useEffect(
     () => {
-      initialAgentRefreshMounted.current = true;
       const timerIds = stateChangeTimerIds.current;
       return () => {
-        initialAgentRefreshMounted.current = false;
         agentDetailRequestId.current += 1;
+        agentDetailAbortController.current?.abort();
         packageRefreshRequestId.current += 1;
+        inventoryRefreshRequestId.current += 1;
         for (const timerId of timerIds) {
           window.clearTimeout(timerId);
         }
@@ -593,16 +859,13 @@ function App() {
     [],
   );
 
-  const usageByAgentId = useMemo(() => new Map(), []);
-
-  const allowedAgentCount = agentPage?.summary.allowed ?? 0;
-  const blockedAgentCount = agentPage?.summary.blocked ?? 0;
+  const effectivePlatformFilter = platformFilter;
   const publisherOptions = agentPage?.facets.publishers ?? [];
   const hostOptions = agentPage?.facets.hosts ?? [];
   const availableToOptions = agentPage?.facets.availability ?? [];
-  const platformOptions = agentPage?.facets.platforms ?? [];
-
-  const effectivePlatformFilter = platformFilter;
+  const platformOptions = unifiedAgentPage?.facets?.platforms ?? agentPage?.facets.platforms ?? [];
+  const agentEnvironmentNames = Object.fromEntries((unifiedAgentPage?.facets?.environments ?? [])
+    .map(option => [option.value.toLowerCase(), option.label]));
 
   const canReadSensitiveUsage = hasRole(user, "AgentControl.Viewer");
   const normalizedBulkRefQuery = parseBulkRefSearch(deferredQuery);
@@ -617,43 +880,20 @@ function App() {
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
-  const initialAgentRefreshAllowed = useEffectEvent((owner: string) => {
-    const refreshAction = workbenchMetadata?.actions.find(action => action.id === "packages.refresh");
-    const readCapability = capabilityState.views.find(view => view.definition.id === "graph.package.read.delegated");
-    return initialAgentRefreshMounted.current && principalKey === owner && user && hasRole(user, "AgentControl.Viewer")
-      && !loadingSession && !sessionRevalidationInFlight.current && visibleActiveView === "agents"
-      && !loadingAgents && savedAgentPageOwner?.principalKey === owner && savedAgentPageOwner.requestId === agentListRequestId.current
-      && agentPage?.snapshot === null && !agentSnapshotId && !refreshingAgents
-      && !linkedPackageRefreshJob && !requestedPackageRefreshJobId && !requestedPackageControlJobId
-      && refreshAction?.roles.some(role => hasRole(user, role))
-      && providerActionAllowed(readCapability, false, capabilityState.now);
-  });
-  const loadInitialAgents = useEffectEvent(async () => {
-    const owner = principalKey;
-    if (!initialAgentRefreshAllowed(owner) || !user) return;
-    const account = `${user.tenantId ?? ""}\0${user.homeAccountId}`;
-    if (initialAgentRefreshAttempts.current.has(account) || initialAgentRefreshChecks.current.has(account)) return;
-    initialAgentRefreshChecks.current.add(account);
-    const refreshRequest = packageRefreshRequestId.current;
-    try {
-      const jobs = await getPackageRefreshJobs("delegated");
-      if (!initialAgentRefreshAllowed(owner) || refreshRequest !== packageRefreshRequestId.current) return;
-      initialAgentRefreshAttempts.current.add(account);
-      if (jobs.value.length || jobs.lastAttemptAt || jobs.lastSuccessAt) return;
-      await handleRefreshAgents();
-    } catch (requestError) {
-      initialAgentRefreshAttempts.current.add(account);
-      if (initialAgentRefreshAllowed(owner)) setError(errorMessage(requestError));
-    } finally {
-      initialAgentRefreshChecks.current.delete(account);
-    }
-  });
+  const canCollectIdentities = canReadSensitiveUsage
+    && providerActionAllowed(capabilityState.views.find(view => view.definition.id === "graph.package.read.delegated"));
+  const identitySnapshotId = savedAgentPageOwner?.principalKey === principalKey
+    && unifiedAgentPage?.identityCollection?.pendingPackages
+    && unifiedAgentPage.sources.powerPlatform.state !== "unavailable"
+    ? unifiedAgentPage.sources.graphPackages.observation?.snapshotId : undefined;
 
   useEffect(() => {
-    let active = true;
-    void Promise.resolve().then(() => { if (active) return loadInitialAgents(); });
-    return () => { active = false; };
-  }, [agentPage, agentSnapshotId, capabilityState.now, capabilityState.views, linkedPackageRefreshJob, loadingAgents, loadingSession, principalKey, refreshingAgents, requestedPackageControlJobId, requestedPackageRefreshJobId, savedAgentPageOwner, user, visibleActiveView, workbenchMetadata]);
+    if (!identitySnapshotId || !canCollectIdentities || visibleActiveView !== "agents" || refreshingAgents) return;
+    const key = `${principalKey}:${identitySnapshotId}`;
+    if (identityBackfills.current.has(key)) return;
+    identityBackfills.current.add(key);
+    collectMissingAgentIdentities(identitySnapshotId);
+  }, [canCollectIdentities, identitySnapshotId, principalKey, refreshingAgents, visibleActiveView]);
 
   useEffect(() => {
     if (!user || visibleActiveView === activeView) return;
@@ -662,17 +902,29 @@ function App() {
 
   function navigateToView(view: WorkbenchViewId) {
     agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
+    inventoryRefreshRequestId.current += 1;
     setLoadingAgentDetailId(undefined);
+    setBusyAgentId(undefined);
     savedViewSearches.current.set(activeView, window.location.search);
     setAgentDetail(undefined);
+    setSelectedUnifiedAgent(undefined);
     setRequestedAgentDetailId(undefined);
     setSingleAccessAgentDetail(undefined);
     setBulkAccessAgentIds(undefined);
     setBulkConfirmation(undefined);
     setExportChoiceOpen(false);
+    setExportingPowerPlatformCsv(false);
+    setRefreshingPowerPlatformAgents(false);
     setActiveView(view);
     const savedSearch = savedViewSearches.current.get(view) ?? "";
     const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
+    if (view === "sync") {
+      const route = parseDataSyncRoute(search.toString());
+      setRequestedDataSyncRunId(route.syncRunId);
+      setRequestedPackageRefreshJobId(route.refreshJobId);
+      setRequestedPackageRefreshMode(route.refreshMode);
+    }
     const next = workbenchUrl(view, search);
     if (`${window.location.pathname}${window.location.search}` !== next) {
       window.history.pushState({ view }, "", next);
@@ -682,6 +934,7 @@ function App() {
   function handleReportActivityWindowChange(activityWindowDays: number) {
     const next = workbenchUrl("official-usage", officialUsageRouteSearch({
       stagingId: requestedOfficialUsageStagingId,
+      reportSetId: officialUsageReportSetId,
       activityWindowDays,
     }));
     savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
@@ -691,9 +944,20 @@ function App() {
     setReportActivityWindowDays(activityWindowDays);
   }
 
-  function handleOfficialUsageChanged() {
-    setOfficialUsageAggregate(undefined);
-    setOfficialUsageUsers(undefined);
+  function handleOfficialUsageSnapshotChange(reportSetId: string | undefined) {
+    const activityWindowDays = reportSetId ? 365 : 30;
+    const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      stagingId: requestedOfficialUsageStagingId,
+      reportSetId,
+      activityWindowDays,
+    }));
+    savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.pushState({ view: "official-usage" }, "", next);
+    }
+    setOfficialUsageLoadError(undefined);
+    setOfficialUsageReportSetId(reportSetId);
+    setReportActivityWindowDays(activityWindowDays);
     setOfficialUsageAgentOffset(0);
     setOfficialUsageAgentQuery({});
     setOfficialUsageUserOffset(0);
@@ -701,11 +965,64 @@ function App() {
     setOfficialUsageDashboardRevision(revision => revision + 1);
   }
 
-  const displayedAgents = agents;
-  const filteredAllowedAgentCount = agentPage?.filteredSummary.allowed ?? 0;
-  const filteredBlockedAgentCount = agentPage?.filteredSummary.blocked ?? 0;
+  function handleOfficialUsageChanged() {
+    setOfficialUsageAgentOffset(0);
+    setOfficialUsageAgentQuery({});
+    setOfficialUsageUserOffset(0);
+    setOfficialUsageUserQuery({});
+    setOfficialUsageDashboardRevision(revision => revision + 1);
+    setCopilotUsersDataRevision(revision => revision + 1);
+    void dataSyncPanelRef.current?.refresh();
+  }
 
+  function handleDataSyncSourcesChanged(sources: DataSyncSourceId[]) {
+    setSyncHistoryRevision(revision => revision + 1);
+    const changed = new Set(sources);
+    if (changed.has("graph_packages") || changed.has("power_platform")) {
+      requestCurrentAgentReload();
+    }
+    if (changed.has("power_platform")) {
+      setPowerPlatformDataRevision(revision => revision + 1);
+    }
+    if (changed.has("users")) {
+      setCopilotUsersDataRevision(revision => revision + 1);
+    }
+    if (changed.has("usage_reports")) {
+      handleOfficialUsageChanged();
+    }
+  }
+
+  function handleSyncRunsChanged() {
+    setSyncHistoryRevision(revision => revision + 1);
+  }
+
+  function handleRequestedSyncRunChange(runId: string | undefined) {
+    setRequestedDataSyncRunId(runId);
+    const next = workbenchUrl("sync", dataSyncRouteSearch({
+      syncRunId: runId,
+      refreshJobId: requestedPackageRefreshJobId,
+      refreshMode: requestedPackageRefreshMode,
+    }));
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.pushState({ view: "sync" }, "", next);
+    }
+  }
+
+  const displayedUnifiedAgents = unifiedAgentPage?.value ?? [];
+  const advancedFilterCount = countAdvancedAgentFilters({
+    environmentId: agentEnvironmentFilter,
+    publisher: publisherFilter,
+  });
   const hasActiveAgentFilters =
+    deferredQuery.trim().length > 0 ||
+    agentEnvironmentFilter.trim().length > 0 ||
+    statusFilter !== "all" ||
+    publisherFilter !== "all" ||
+    availableToFilter !== "all" ||
+    hostFilter !== "all" ||
+    effectivePlatformFilter !== "all" ||
+    parseOptionalPositiveInteger(createdWithinDays) !== undefined;
+  const hasActivePackageFilters =
     deferredQuery.trim().length > 0 ||
     statusFilter !== "all" ||
     publisherFilter !== "all" ||
@@ -714,22 +1031,22 @@ function App() {
     effectivePlatformFilter !== "all" ||
     parseOptionalPositiveInteger(createdWithinDays) !== undefined;
 
-  const matchingSelectedCount = agents.filter((agent) =>
-    selectedAgentIds.has(agent.id),
-  ).length;
-  const allMatchingSelected =
-    agents.length > 0 &&
-    matchingSelectedCount === agents.length;
-  const exportableAgentCount = agentPage?.count ?? 0;
+  const exportableAgentCount = agentPage?.count ?? unifiedAgentPage?.summary.graphOnly ?? 0;
+  const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
+    record => record.observations.powerPlatform,
+  )?.observations.powerPlatform ?? null;
 
   function clearPrivateState() {
+    setShowAdvancedFilters(false);
     clearPackageSelection(user);
     setSessionEpoch(current => current + 1);
     agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
     bulkJobPollRequestId.current += 1;
     packageRefreshRequestId.current += 1;
+    inventoryRefreshRequestId.current += 1;
     linkedPackageRefreshRequestId.current += 1;
     officialUsageRequestId.current += 1;
     officialUsageAbortController.current?.abort();
@@ -742,11 +1059,16 @@ function App() {
     setLoadedWorkbenchMetadata(undefined);
     setAgents([]);
     setAgentPage(undefined);
+    setUnifiedAgentPage(undefined);
+    setSelectedUnifiedAgent(undefined);
+    setSelectedPowerPlatformTargets(new Map());
+    setSelectedPowerPlatformSnapshot(null);
     setSavedAgentPageOwner(undefined);
     setAgentSnapshotId(undefined);
     setSelectedAgentIds(new Set());
     setPendingStoredAgentSelectionCount(undefined);
     setSelectionRouteNotice(undefined);
+    setRequestedDataSyncRunId(undefined);
     setBulkConfirmation(undefined);
     setBulkAccessAgentIds(undefined);
     setAgentDetail(undefined);
@@ -756,6 +1078,9 @@ function App() {
     setBusyAgentId(undefined);
     setBusyBulkAction(undefined);
     setExportChoiceOpen(false);
+    setExportingPowerPlatformCsv(false);
+    setRefreshingPowerPlatformAgents(false);
+    setPowerPlatformAgentRefreshJob(undefined);
     setLastAgentListRefreshAt(undefined);
     setPackageSnapshotExpiresAt(undefined);
     setLoadingAgents(false);
@@ -770,7 +1095,11 @@ function App() {
     setLinkedPackageRefreshJob(undefined);
     setLinkedJobError(undefined);
     setOfficialUsageAggregate(undefined);
+    setOfficialUsageAggregateSetId(undefined);
     setOfficialUsageUsers(undefined);
+    setOfficialUsageUsersSetId(undefined);
+    setOfficialUsageLoadError(undefined);
+    setLoadingOfficialUsage(false);
     setOfficialUsageUserOffset(0);
   }
 
@@ -801,28 +1130,57 @@ function App() {
     setError(undefined);
 
     try {
-      const response = await getAgents({
-        ...(!forceCurrentSnapshot && agentSnapshotId && savedAgentPageOwner?.principalKey === principalKey ? { snapshotId: agentSnapshotId } : {}),
-        ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-        ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-        ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
-        ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
-        ...(hostFilter === "all" ? {} : { host: hostFilter }),
-        ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
-        ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-        sortBy: agentSortBy,
-        sortDirection: agentSortDirection,
-        limit: agentDisplayPageSize,
-        offset: agentPageIndex * agentDisplayPageSize,
-      }, { signal: controller.signal });
+      const [response, unifiedResponse, inventoryRefreshJobs] = await Promise.all([
+        getAgents({
+          ...(!forceCurrentSnapshot && agentSnapshotId && savedAgentPageOwner?.principalKey === principalKey ? { snapshotId: agentSnapshotId } : {}),
+          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
+          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
+          ...(hostFilter === "all" ? {} : { host: hostFilter }),
+          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+          sortBy: agentSortBy,
+          sortDirection: agentSortDirection,
+          limit: agentDisplayPageSize,
+          offset: 0,
+        }, { signal: controller.signal }),
+        getUnifiedAgents({
+          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+          ...(agentEnvironmentFilter.trim() ? { environmentId: agentEnvironmentFilter.trim() } : {}),
+          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
+          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
+          ...(hostFilter === "all" ? {} : { host: hostFilter }),
+          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+          sortBy: agentSortBy === "lastModifiedAt" ? "lastModifiedAt" : "displayName",
+          sortDirection: agentSortDirection,
+          limit: agentDisplayPageSize,
+          offset: agentPageIndex * agentDisplayPageSize,
+        }, { signal: controller.signal }),
+        getInventoryRefreshJobs({ signal: controller.signal }).catch(() => ({
+          value: [],
+          lastAttemptAt: null,
+          lastSuccessAt: null,
+        })),
+      ]);
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
-      const lastPage = Math.max(Math.ceil(response.count / agentDisplayPageSize) - 1, 0);
+      const lastPage = Math.max(Math.ceil(unifiedResponse.count / agentDisplayPageSize) - 1, 0);
       if (agentPageIndex > lastPage) {
         setAgentPageIndex(lastPage);
         return;
       }
       setAgents(response.value);
       setAgentPage(response);
+      setUnifiedAgentPage(unifiedResponse);
+      setSelectedUnifiedAgent(current =>
+        current ? unifiedResponse.value.find(record => record.id === current.id
+          || current.packages.some(item => record.packages.some(candidate => candidate.id === item.id))) ?? current : current);
+      const latestPowerPlatformAgentJob = inventoryRefreshJobs.value.find((job) =>
+        job.requestedTypes.includes("microsoft.copilotstudio/agents"),
+      );
+      if (latestPowerPlatformAgentJob) setPowerPlatformAgentRefreshJob(latestPowerPlatformAgentJob);
       setSavedAgentPageOwner({ principalKey, requestId });
       setAgentSnapshotId(response.snapshot?.id);
       setLastAgentListRefreshAt(response.snapshot ? new Date(response.snapshot.observedAt) : undefined);
@@ -839,19 +1197,27 @@ function App() {
 
   async function loadOfficialUsage() {
     const requestId = ++officialUsageRequestId.current;
+    const requestedSetId = officialUsageReportSetId ?? null;
     officialUsageAbortController.current?.abort();
     const controller = new AbortController();
     officialUsageAbortController.current = controller;
     if (!user) {
       setOfficialUsageAggregate(undefined);
+      setOfficialUsageAggregateSetId(undefined);
       setOfficialUsageUsers(undefined);
+      setOfficialUsageUsersSetId(undefined);
+      setOfficialUsageLoadError(undefined);
+      setLoadingOfficialUsage(false);
       return;
     }
+    setLoadingOfficialUsage(true);
+    setOfficialUsageLoadError(undefined);
 
     const [aggregateResult, usersResult] = await Promise.allSettled([
       hasRole(user, "AgentControl.Viewer")
         ? getOfficialUsageAggregate({
             ...officialUsageAgentQuery,
+            ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
             activityWindowDays: reportActivityWindowDays,
             inactiveDays,
             limit: 100,
@@ -860,84 +1226,140 @@ function App() {
         : Promise.resolve(undefined),
       hasRole(user, "AgentControl.Viewer")
         ? getOfficialUsageUsers(
-          { ...officialUsageUserQuery, inactiveDays, limit: 100, offset: officialUsageUserOffset },
+          {
+            ...officialUsageUserQuery,
+            ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
+            inactiveDays,
+            limit: 100,
+            offset: officialUsageUserOffset,
+          },
           { signal: controller.signal },
         )
         : Promise.resolve(undefined),
     ]);
 
     if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
+    let loadError: string | undefined;
     if (aggregateResult.status === "fulfilled") {
       setOfficialUsageAggregate(aggregateResult.value);
+      setOfficialUsageAggregateSetId(requestedSetId);
     } else if (!(aggregateResult.reason instanceof ApiError && aggregateResult.reason.kind === "aborted")) {
-      setError(errorMessage(aggregateResult.reason));
+      loadError = errorMessage(aggregateResult.reason);
     }
 
     if (usersResult.status === "fulfilled") {
       setOfficialUsageUsers(usersResult.value);
+      setOfficialUsageUsersSetId(requestedSetId);
     } else if (!(usersResult.reason instanceof ApiError && usersResult.reason.kind === "aborted")) {
-      setError(errorMessage(usersResult.reason));
+      loadError ??= errorMessage(usersResult.reason);
     }
+    setOfficialUsageLoadError(loadError);
     if (officialUsageAbortController.current === controller) officialUsageAbortController.current = undefined;
+    if (requestId === officialUsageRequestId.current) setLoadingOfficialUsage(false);
   }
 
-  async function handleRefreshAgents() {
+  async function handleRefreshAgents(idempotencyKey?: string) {
     if (!user || sessionRevalidationInFlight.current) return;
-    initialAgentRefreshAttempts.current.add(`${user.tenantId ?? ""}\0${user.homeAccountId}`);
     const requestId = ++packageRefreshRequestId.current;
-    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    const owner = principalKey;
+    const deadline = Date.now() + identityCollectionPollBudgetMs;
     setRefreshingAgents(true);
     setError(undefined);
 
     try {
-      let job = await startPackageRefresh("delegated");
-      if (packageRefreshRequestId.current !== requestId) return;
+      const existingJobs = idempotencyKey ? await getPackageRefreshJobs("delegated") : undefined;
+      if (!ownsPackageRefreshRequest(requestId, owner)) return;
+      let job = existingJobs?.value.find(candidate => candidate.scopeKind === "broad" && candidate.status === "running")
+        ?? await (idempotencyKey ? startPackageRefresh("delegated", { idempotencyKey }) : startPackageRefresh("delegated"));
+      if (!ownsPackageRefreshRequest(requestId, owner)) return;
+      setLinkedPackageRefreshJob(job);
+      handleSyncRunsChanged();
       while (job.status === "running" && Date.now() < deadline) {
         await wait(packageRefreshPollIntervalMs);
-        if (packageRefreshRequestId.current !== requestId) return;
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
         job = await getPackageRefreshJob(job.id, job.tokenMode);
-        if (packageRefreshRequestId.current !== requestId) return;
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
+        setLinkedPackageRefreshJob(job);
       }
 
-      if (job.status === "running") throw new Error("Package refresh status polling reached its five-minute bound. The durable job remains available in Jobs.");
+      if (job.status === "running") throw new Error("Agent identity collection status polling reached its sixteen-minute bound. The durable job remains available in Sync and Jobs.");
       if (job.status !== "succeeded") {
         throw new Error(job.message ?? (job.status === "waiting_authorization"
           ? "Package refresh requires current delegated read authorization. Open Permissions to request consent or retry the probe."
           : "Package refresh failed without replacing the last complete saved observation."));
       }
-      await loadAgents(true);
+      requestCurrentAgentReload();
     } catch (requestError) {
-      if (packageRefreshRequestId.current === requestId) setError(errorMessage(requestError));
+      if (ownsPackageRefreshRequest(requestId, owner)) setError(errorMessage(requestError));
     } finally {
-      if (packageRefreshRequestId.current === requestId) setRefreshingAgents(false);
+      if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
+    }
+  }
+
+  async function handleRefreshMatchingDetails() {
+    const ids = [...selectedAgentIds];
+    if (ids.length < 1 || ids.length > 100 || !user || sessionRevalidationInFlight.current) return;
+    const requestId = ++packageRefreshRequestId.current;
+    const owner = principalKey;
+    const deadline = Date.now() + foregroundJobPollBudgetMs;
+    setRefreshingAgents(true);
+    setError(undefined);
+    try {
+      let job = await refreshPackageIdentityDetails(ids);
+      if (!ownsPackageRefreshRequest(requestId, owner)) return;
+      handleSyncRunsChanged();
+      setLinkedPackageRefreshJob(job);
+      while (job.status === "running" && Date.now() < deadline) {
+        await wait(packageRefreshPollIntervalMs);
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
+        job = await getPackageRefreshJob(job.id, job.tokenMode);
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
+        setLinkedPackageRefreshJob(job);
+      }
+      if (job.status === "running") throw new Error("Matching-detail refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
+      if (job.status !== "succeeded") {
+        throw new Error(job.message ?? (job.status === "waiting_authorization"
+          ? "Matching-detail refresh requires current delegated package-read authorization."
+          : "Matching-detail refresh failed without replacing the last complete saved observations."));
+      }
+      requestCurrentAgentReload();
+    } catch (requestError) {
+      if (ownsPackageRefreshRequest(requestId, owner)) setError(errorMessage(requestError));
+    } finally {
+      if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
     }
   }
 
   async function handleRefreshExactPackage(id: string) {
     const requestId = ++packageRefreshRequestId.current;
+    const owner = principalKey;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
     setRefreshingAgents(true);
     setError(undefined);
     setAgentDetailError(undefined);
     try {
       let job = await startExactPackageRefresh(id, "delegated");
+      if (!ownsPackageRefreshRequest(requestId, owner)) return;
       while (job.status === "running" && Date.now() < deadline) {
         await wait(packageRefreshPollIntervalMs);
-        if (packageRefreshRequestId.current !== requestId) return;
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
         job = await getPackageRefreshJob(job.id, job.tokenMode);
+        if (!ownsPackageRefreshRequest(requestId, owner)) return;
       }
       if (job.status === "running") throw new Error("Exact package refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
       if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current delegated package-read authorization.");
       setRequestedAgentDetailId(id);
+      requestCurrentAgentReload();
     } catch (requestError) {
-      setAgentDetailError(errorMessage(requestError));
+      if (ownsPackageRefreshRequest(requestId, owner)) setAgentDetailError(errorMessage(requestError));
     } finally {
-      if (packageRefreshRequestId.current === requestId) setRefreshingAgents(false);
+      if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
     }
   }
 
   async function handleSignOut() {
     agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
 
     try {
       await signOut();
@@ -955,8 +1377,11 @@ function App() {
   }
 
   async function handleViewAgentDetails(agent: CopilotPackage) {
-    const requestId = agentDetailRequestId.current + 1;
-    agentDetailRequestId.current = requestId;
+    const requestId = ++agentDetailRequestId.current;
+    agentDetailAbortController.current?.abort();
+    const controller = new AbortController();
+    agentDetailAbortController.current = controller;
+    const owner = principalKey;
 
     setAgentDetailError(undefined);
     setAgentDetail(undefined);
@@ -965,20 +1390,58 @@ function App() {
 
     try {
       const detail = withPackageSummaryFallback(
-        await getAgentDetails(agent.id),
+        await getAgentDetails(agent.id, { signal: controller.signal }),
         agent,
       );
 
-      if (agentDetailRequestId.current === requestId) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
         agentDetailsCache.current.set(agent.id, detail);
         setAgentDetail(detail);
       }
+
     } catch (requestError) {
-      if (agentDetailRequestId.current === requestId) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
         setAgentDetailError(errorMessage(requestError));
       }
     } finally {
-      if (agentDetailRequestId.current === requestId) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
+        setLoadingAgentDetailId(undefined);
+      }
+    }
+  }
+
+  async function handleViewUnifiedAgentDetails(record: UnifiedAgentRecord) {
+    const requestId = ++agentDetailRequestId.current;
+    agentDetailAbortController.current?.abort();
+    const controller = new AbortController();
+    agentDetailAbortController.current = controller;
+    const owner = principalKey;
+    setAgentDetailError(undefined);
+    if (record.packages.length !== 1) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
+        setLoadingAgentDetailId(undefined);
+        setRequestedAgentDetailId(record.id);
+        setSelectedUnifiedAgent(record);
+      }
+      return;
+    }
+    const item = record.packages[0];
+    setLoadingAgentDetailId(item.id);
+    try {
+      const detail = withPackageSummaryFallback(
+        await getAgentDetails(item.id, { signal: controller.signal }),
+        item,
+      );
+      if (!ownsAgentDetailRequest(requestId, owner, controller.signal)) return;
+      agentDetailsCache.current.set(item.id, detail);
+      setRequestedAgentDetailId(record.id);
+      setSelectedUnifiedAgent(record);
+    } catch (requestError) {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
+        setAgentDetailError(errorMessage(requestError));
+      }
+    } finally {
+      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
         setLoadingAgentDetailId(undefined);
       }
     }
@@ -1008,6 +1471,7 @@ function App() {
   async function handleManageAgentAccess(agent: CopilotPackage, target: PackageAccessTarget = "availability") {
     const requestId = agentDetailRequestId.current + 1;
     agentDetailRequestId.current = requestId;
+    agentDetailAbortController.current?.abort();
 
     setAgentDetailError(undefined);
     setSingleAccessAgentDetail(undefined);
@@ -1037,6 +1501,9 @@ function App() {
     agent: CopilotPackage,
     targetBlockedState: boolean,
   ) {
+    const requestId = ++agentDetailRequestId.current;
+    agentDetailAbortController.current?.abort();
+    const owner = principalKey;
     setBusyAgentId(agent.id);
     setError(undefined);
     setBulkResult(undefined);
@@ -1044,11 +1511,12 @@ function App() {
     try {
       const action = targetBlockedState ? "block" : "unblock";
       const preview = await previewPackageMutation({ action, ids: [agent.id], mutationScope: "single" });
+      if (!ownsAgentFlowRequest(requestId, owner)) return;
       setBulkConfirmation({ action, ids: [agent.id], mutationScope: "single", preview });
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (ownsAgentFlowRequest(requestId, owner)) setError(errorMessage(requestError));
     } finally {
-      setBusyAgentId(undefined);
+      if (ownsAgentFlowRequest(requestId, owner)) setBusyAgentId(undefined);
     }
   }
 
@@ -1120,6 +1588,90 @@ function App() {
       setExportingCsv(false);
       setExportProgress(0);
       setExportProgressTotal(0);
+    }
+  }
+
+  async function handleExportPowerPlatformAgentCsv() {
+    const snapshotId = unifiedAgentPage?.sources.powerPlatform.observation?.snapshotId;
+    if (!snapshotId || exportingPowerPlatformCsv) {
+      return;
+    }
+
+    setExportChoiceOpen(false);
+    setError(undefined);
+    setExportingPowerPlatformCsv(true);
+    try {
+      const blob = await downloadInventoryCsv({
+        snapshotId,
+        type: "microsoft.copilotstudio/agents",
+        search: deferredQuery.trim() || undefined,
+        environmentId: agentEnvironmentFilter.trim() || undefined,
+      });
+      downloadBlob(`power-platform-agent-inventory-${snapshotId}.csv`, blob);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to export Power Platform agent inventory.");
+    } finally {
+      setExportingPowerPlatformCsv(false);
+    }
+  }
+
+  async function handleRefreshPowerPlatformAgents() {
+    if (refreshingPowerPlatformAgents || powerPlatformAgentRefreshJob?.status === "running") {
+      return;
+    }
+
+    setError(undefined);
+    setRefreshingPowerPlatformAgents(true);
+    const requestId = ++inventoryRefreshRequestId.current;
+    const owner = principalKey;
+    try {
+      const job = await refreshInventory({
+        types: ["microsoft.copilotstudio/agents"],
+      });
+      if (!ownsInventoryRefreshRequest(requestId, owner)) return;
+      setPowerPlatformAgentRefreshJob(job);
+      handleSyncRunsChanged();
+      if (job.status === "succeeded") {
+        resetPowerPlatformSelection();
+        requestCurrentAgentReload();
+      } else if (job.status !== "waiting_authorization" && job.status !== "running") {
+        setError(job.message ?? "Power Platform agent refresh did not complete.");
+      }
+    } catch (caught) {
+      if (ownsInventoryRefreshRequest(requestId, owner)) {
+        setError(caught instanceof Error ? caught.message : "Unable to refresh Power Platform agents.");
+      }
+    } finally {
+      if (ownsInventoryRefreshRequest(requestId, owner)) setRefreshingPowerPlatformAgents(false);
+    }
+  }
+
+  async function handleResumePowerPlatformAgentRefresh() {
+    if (!powerPlatformAgentRefreshJob || refreshingPowerPlatformAgents) {
+      return;
+    }
+    setError(undefined);
+    setRefreshingPowerPlatformAgents(true);
+    const requestId = ++inventoryRefreshRequestId.current;
+    const owner = principalKey;
+    try {
+      const job = await resumeInventoryRefresh(powerPlatformAgentRefreshJob.id);
+      if (!ownsInventoryRefreshRequest(requestId, owner)) return;
+      setPowerPlatformAgentRefreshJob(job);
+      handleSyncRunsChanged();
+      if (job.status === "succeeded") {
+        resetPowerPlatformSelection();
+        requestCurrentAgentReload();
+      }
+      else if (job.status !== "running" && job.status !== "waiting_authorization") {
+        setError(job.message ?? "Power Platform agent refresh did not complete.");
+      }
+    } catch (caught) {
+      if (ownsInventoryRefreshRequest(requestId, owner)) {
+        setError(caught instanceof Error ? caught.message : "Unable to resume the Power Platform agent refresh.");
+      }
+    } finally {
+      if (ownsInventoryRefreshRequest(requestId, owner)) setRefreshingPowerPlatformAgents(false);
     }
   }
 
@@ -1311,9 +1863,23 @@ function App() {
         agentDetailsCache.current.delete(id);
       }
 
-      setAgents((currentAgents) => currentAgents.map(agent => changedIds.includes(agent.id)
-        ? projectVerifiedAccessScope(agent, result.accessUpdate!)
-        : agent));
+      const changedAgentIds = new Set(changedIds);
+      const projectAccess = (item: CopilotPackage) => changedAgentIds.has(item.id)
+        ? projectVerifiedAccessScope(item, result.accessUpdate!)
+        : item;
+
+      setAgents((currentAgents) => currentAgents.map(projectAccess));
+      setUnifiedAgentPage(current => current ? {
+        ...current,
+        value: current.value.map(record => ({
+          ...record,
+          packages: record.packages.map(projectAccess),
+        })),
+      } : current);
+      setSelectedUnifiedAgent(current => current ? {
+        ...current,
+        packages: current.packages.map(projectAccess),
+      } : current);
 
       if (agentDetail && changedIds.includes(agentDetail.id)) {
         setAgentDetail(undefined);
@@ -1369,6 +1935,8 @@ function App() {
 
   function handleClearAgentFilters() {
     handleSearchQueryChange("");
+    resetPowerPlatformSelection();
+    setAgentEnvironmentFilter("");
     setStatusFilter("all");
     setPublisherFilter("all");
     setAvailableToFilter("all");
@@ -1376,6 +1944,13 @@ function App() {
     setPlatformFilter("all");
     setCreatedWithinDays("");
     setAgentPageIndex(0);
+  }
+
+  function resetPowerPlatformSelection() {
+    setSelectedPowerPlatformTargets(new Map());
+    setSelectedPowerPlatformSnapshot(null);
+    setPendingPowerPlatformIds(new Set());
+    setRequestedInventorySnapshotId(undefined);
   }
 
   function updateCachedAgentBlockedStates(
@@ -1415,6 +1990,21 @@ function App() {
 
       return updatedAnyAgent ? nextAgents : currentAgents;
     });
+    setUnifiedAgentPage(current => current ? {
+      ...current,
+      value: current.value.map(record => ({
+        ...record,
+        packages: record.packages.map(item => changedAgentIds.has(item.id)
+          ? { ...item, isBlocked: targetBlockedState }
+          : item),
+      })),
+    } : current);
+    setSelectedUnifiedAgent(current => current ? {
+      ...current,
+      packages: current.packages.map(item => changedAgentIds.has(item.id)
+        ? { ...item, isBlocked: targetBlockedState }
+        : item),
+    } : current);
     setAgentDetail((currentDetail) =>
       currentDetail &&
       changedAgentIds.has(currentDetail.id) &&
@@ -1479,38 +2069,69 @@ function App() {
     stateChangeTimerIds.current.add(timerId);
   }
 
-  function toggleAgentSelection(agentId: string) {
+  function toggleUnifiedAgentSelection(record: UnifiedAgentRecord) {
     setSelectionRouteNotice(undefined);
-    setSelectedAgentIds((current) => {
-      const next = new Set(current);
-
-      if (next.has(agentId)) {
-        next.delete(agentId);
-      } else {
-        next.add(agentId);
+    const resource = record.powerPlatformResource;
+    const observation = record.observations.powerPlatform;
+    const canSelectQuarantine = Boolean(canOperate && resource && !quarantineTargetReason(resource, observation));
+    const ids = record.packages.map(item => item.id);
+    const allSelected = ids.every(id => selectedAgentIds.has(id))
+      && (!canSelectQuarantine || selectedPowerPlatformTargets.has(record.id));
+    if (!allSelected && canSelectQuarantine && !selectedPowerPlatformTargets.has(record.id)) {
+      if (selectedPowerPlatformTargets.size >= 25) {
+        setSelectionRouteNotice({ tone: "error", text: "Quarantine supports up to 25 selected agents. Clear an agent from the selection before adding another." });
+        return;
       }
-
+      if (selectedPowerPlatformTargets.size && selectedPowerPlatformSnapshot?.id !== observation?.snapshotId) {
+        setSelectionRouteNotice({ tone: "error", text: "The saved inventory changed. Clear the previous quarantine selection before selecting more agents." });
+        return;
+      }
+    }
+    setSelectedAgentIds(current => {
+      const next = new Set(current);
+      for (const id of ids) {
+        if (allSelected) next.delete(id);
+        else next.add(id);
+      }
       return next;
     });
+    if (canSelectQuarantine && resource && observation) {
+      setRequestedInventorySnapshotId(observation.snapshotId);
+      setSelectedPowerPlatformSnapshot(observation);
+      setSelectedPowerPlatformTargets(current => {
+        const next = new Map(current);
+        if (allSelected) next.delete(record.id);
+        else next.set(record.id, resource);
+        return next;
+      });
+    }
   }
 
-  function toggleMatchingSelection(matchingAgents: CopilotPackage[]) {
-    setSelectionRouteNotice(undefined);
-    setSelectedAgentIds((current) => {
-      const next = new Set(current);
-      const matchingIds = matchingAgents.map((agent) => agent.id);
-      const allSelected = matchingIds.every((agentId) => next.has(agentId));
+  function ownsAgentDetailRequest(requestId: number, owner: string, signal: AbortSignal) {
+    return !signal.aborted
+      && ownsAgentFlowRequest(requestId, owner);
+  }
 
-      for (const agentId of matchingIds) {
-        if (allSelected) {
-          next.delete(agentId);
-        } else {
-          next.add(agentId);
-        }
-      }
+  function ownsAgentFlowRequest(requestId: number, owner: string) {
+    return agentDetailRequestId.current === requestId
+      && sessionOwnerRef.current === owner
+      && activeViewRef.current === "agents";
+  }
 
-      return next;
-    });
+  function ownsPackageRefreshRequest(requestId: number, owner: string) {
+    return packageRefreshRequestId.current === requestId
+      && sessionOwnerRef.current === owner;
+  }
+
+  function ownsInventoryRefreshRequest(requestId: number, owner: string) {
+    return inventoryRefreshRequestId.current === requestId
+      && sessionOwnerRef.current === owner
+      && activeViewRef.current === "sync";
+  }
+
+  function requestCurrentAgentReload() {
+    forceCurrentAgentReload.current = true;
+    setAgentReloadRevision(revision => revision + 1);
   }
 
   if (loadingSession) {
@@ -1531,12 +2152,14 @@ function App() {
           <p className="eyebrow">Microsoft 365 Copilot administration</p>
           <h1 id="signin-title">Agent Control</h1>
           <p className="signin-lede">
-            Sign in with an assigned Viewer or Admin work account. Microsoft will
-            request any outstanding delegated permissions for all implemented
-            features, including inventory, directory lookup, investigations,
-            package changes, and Copilot Studio quarantine during sign-in.
+            Understand and manage your organization's AI agents in one place.
           </p>
-          <p>Already approved permissions normally need no further consent. Consent does not run investigations or change provider data; Microsoft roles and licenses still apply.</p>
+          <p>
+            Discover agents across Microsoft 365 and Copilot Studio, explore
+            Copilot usage and license insights, and investigate activity. Make
+            informed decisions about adoption and access, with the controls to
+            take action.
+          </p>
           {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
           {error ? <div className="error-banner">{error}</div> : null}
           {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
@@ -1548,6 +2171,19 @@ function App() {
       </main>
     );
   }
+
+  const selectedOfficialUsageSetId = officialUsageReportSetId ?? null;
+  const displayedOfficialUsageAggregate = officialUsageAggregateSetId === selectedOfficialUsageSetId
+    ? officialUsageAggregate
+    : undefined;
+  const displayedOfficialUsageUsers = officialUsageUsersSetId === selectedOfficialUsageSetId
+    ? officialUsageUsers
+    : undefined;
+  const historicalUsageLoaded = Boolean(
+    officialUsageReportSetId
+    && officialUsageAggregateSetId === officialUsageReportSetId
+    && officialUsageUsersSetId === officialUsageReportSetId,
+  );
 
   return (
     <CapabilityContext value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
@@ -1630,12 +2266,57 @@ function App() {
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("security") ? <CapabilityGate roles={["AgentControl.Viewer"]}><button type="button" className={visibleActiveView === "security" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "security" ? "page" : undefined} onClick={() => navigateToView("security")}>Security</button></CapabilityGate> : null}
+              {visibleViews.includes("sync") ? <button type="button" className={visibleActiveView === "sync" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "sync" ? "page" : undefined} onClick={() => navigateToView("sync")}>Sync{syncSetupRequired ? <small className="sync-setup-hint">Setup needed</small> : null}</button> : null}
               <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
               {visibleViews.includes("jobs") ? <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button> : null}
         </nav>
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
+      {hasRole(user, "AgentControl.Viewer") ? (
+        <DataSyncPanel
+          ref={dataSyncPanelRef}
+          principalKey={principalKey}
+          canUploadUsage={canImportReports}
+          active={visibleActiveView === "sync"}
+          onSetupRequiredChange={setSyncSetupRequired}
+          onRunsChanged={handleSyncRunsChanged}
+          requestedRunId={requestedDataSyncRunId}
+          onOpenUsageImport={() => setUsageImportOpenRequest(request => request + 1)}
+          onRequestedRunChange={handleRequestedSyncRunChange}
+          onSourcesChanged={handleDataSyncSourcesChanged}
+        />
+      ) : null}
+      {visibleActiveView === "sync" ? (
+        <>
+          <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
+          <AgentSyncTools
+            inventory={unifiedAgentPage}
+            selectedPackageCount={selectedAgentIds.size}
+            refreshingPackages={refreshingAgents}
+            refreshingPowerPlatform={refreshingPowerPlatformAgents}
+            exportingPowerPlatform={exportingPowerPlatformCsv}
+            powerPlatformJob={powerPlatformAgentRefreshJob}
+            onRefreshPackages={() => void handleRefreshAgents()}
+            onRefreshMatchingDetails={() => void handleRefreshMatchingDetails()}
+            onRefreshPowerPlatform={() => void handleRefreshPowerPlatformAgents()}
+            onResumePowerPlatform={() => void handleResumePowerPlatformAgentRefresh()}
+            onExportPowerPlatform={() => void handleExportPowerPlatformAgentCsv()}
+            onOpenAgents={() => navigateToView("agents")}
+          />
+          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} />
+        </>
+      ) : null}
+      {canImportReports ? (
+        <OfficialUsageImportModal
+          key={`${principalKey}:${requestedOfficialUsageStagingId ?? ""}`}
+          initialStagingId={requestedOfficialUsageStagingId}
+          openRequest={usageImportOpenRequest}
+          showTrigger={false}
+          onChanged={handleOfficialUsageChanged}
+          onLegacyCleared={() => setLegacyUsagePresent(false)}
+        />
+      ) : null}
       {legacyUsagePresent && visibleActiveView !== "official-usage" ? (
         <div className="report-status error" role="status">
           <strong>Legacy browser report data is present in this browser.</strong>
@@ -1660,32 +2341,33 @@ function App() {
           </>
         ) : (
         <>
-          <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedJobError} />
-          <section className="summary-grid agent-summary-grid" aria-label="Agent summary">
-            <Metric
-              label="Total"
-              value={agentPage?.summary.total ?? 0}
-              filteredValue={
-                hasActiveAgentFilters ? agentPage?.filteredSummary.total : undefined
-              }
-            />
-            <Metric
-              label="Allowed"
-              value={allowedAgentCount}
-              filteredValue={
-                hasActiveAgentFilters ? filteredAllowedAgentCount : undefined
-              }
-            />
-            <Metric
-              label="Blocked"
-              value={blockedAgentCount}
-              filteredValue={
-                hasActiveAgentFilters ? filteredBlockedAgentCount : undefined
-              }
-            />
-          </section>
+          <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} />
+          <div className="agent-catalog-heading">
+            <div className="agent-catalog-title">
+              <h2>Agents <span>{(unifiedAgentPage?.count ?? 0).toLocaleString()}{hasActiveAgentFilters ? ` of ${(unifiedAgentPage?.summary.total ?? 0).toLocaleString()}` : ""}</span></h2>
+              <span className="last-refresh" aria-live="polite">
+                {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
+                  : lastAgentListRefreshAt
+                  ? `Last synced ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
+                    : "No saved package observation. Open Data sync on the Sync tab to collect workspace data."}
+              </span>
+            </div>
+            <div className="agent-catalog-actions">
+              {unifiedAgentPage?.partial ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentPage.errors.map(item => item.message).join(" ")}>Partial inventory · View sync details</button> : null}
+              <WorkbenchActionGate actionId="packages.export" compact><button
+                type="button"
+                className="secondary icon-button control-icon-button"
+                aria-label={exportingCsv ? `Exporting ${exportProgress} of ${exportableAgentCount} package records` : "Export package inventory CSV"}
+                title={exportingCsv ? `Exporting ${exportProgress}/${exportableAgentCount}` : "Export exact package inventory CSV"}
+                disabled={loadingAgents || exportingCsv || exportableAgentCount === 0}
+                onClick={requestExportCsv}
+              >
+                <ExportIcon />
+              </button></WorkbenchActionGate>
+            </div>
+          </div>
 
-          {canOperate ? <BulkActions
+          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult || exportingCsv) ? <BulkActions
             disabled={
               loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
             }
@@ -1706,7 +2388,6 @@ function App() {
             onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => void requestBulkAction(false)}
           /> : null}
-
           {selectionRouteNotice ? (
             <div className={selectionRouteNotice.tone === "error" ? "error-banner" : "report-status"} role="status">
               {selectionRouteNotice.text}
@@ -1727,7 +2408,6 @@ function App() {
               className="filter-section filter-section-primary"
               aria-label="Find agents"
             >
-              <span className="filter-section-title">Find agents</span>
               <label className="filter-search">
                 <span>Search</span>
                 <input
@@ -1743,196 +2423,119 @@ function App() {
                 />
               </label>
               <label>
-                <span>Status</span>
-                <select
-                  className={
-                    statusFilter === "all" ? undefined : "active-filter-select"
-                  }
-                  value={statusFilter}
-                  onChange={(event) =>
-                    { setStatusFilter(event.target.value as "all" | "allowed" | "blocked"); setAgentPageIndex(0); }
-                  }
-                >
-                  <option value="all">All</option>
-                  <option value="allowed">Allowed</option>
-                  <option value="blocked">Blocked</option>
+                <span>Built with</span>
+                <select value={effectivePlatformFilter} className={effectivePlatformFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setPlatformFilter(event.target.value); setAgentPageIndex(0); }}>
+                  <option value="all">All platforms</option>
+                  {platformOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </label>
               <label>
                 <span>Available to</span>
-                <select
-                  className={
-                    availableToFilter === "all"
-                      ? undefined
-                      : "active-filter-select"
-                  }
-                  value={availableToFilter}
-                  onChange={(event) => { setAvailableToFilter(event.target.value); setAgentPageIndex(0); }}
-                >
+                <select value={availableToFilter} className={availableToFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setAvailableToFilter(event.target.value); setAgentPageIndex(0); }}>
                   <option value="all">All availability</option>
-                  {availableToOptions.map((availability) => (
-                    <option key={availability.value} value={availability.value}>
-                      {availability.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <div
-              className="filter-section filter-section-metadata"
-              aria-label="Catalog details"
-            >
-              <span className="filter-section-title">Catalog details</span>
-              <label>
-                <span>Publisher</span>
-                <select
-                  className={
-                    publisherFilter === "all"
-                      ? undefined
-                      : "active-filter-select"
-                  }
-                  value={publisherFilter}
-                  onChange={(event) => { setPublisherFilter(event.target.value); setAgentPageIndex(0); }}
-                >
-                  <option value="all">All publishers</option>
-                  {publisherOptions.map((publisher) => (
-                    <option key={publisher.value} value={publisher.value}>
-                      {publisher.label}
-                    </option>
-                  ))}
+                  {availableToOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </label>
               <label>
                 <span>Host</span>
-                <select
-                  className={
-                    hostFilter === "all" ? undefined : "active-filter-select"
-                  }
-                  value={hostFilter}
-                  onChange={(event) => { setHostFilter(event.target.value); setAgentPageIndex(0); }}
-                >
+                <select value={hostFilter} className={hostFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setHostFilter(event.target.value); setAgentPageIndex(0); }}>
                   <option value="all">All hosts</option>
-                  {hostOptions.map((host) => (
-                    <option key={host.value} value={host.value}>
-                      {host.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>Built with</span>
-                <select
-                  className={
-                    effectivePlatformFilter === "all"
-                      ? undefined
-                      : "active-filter-select"
-                  }
-                  value={effectivePlatformFilter}
-                  onChange={(event) => { setPlatformFilter(event.target.value); setAgentPageIndex(0); }}
-                >
-                  <option value="all">All platforms</option>
-                  {platformOptions.map((platform) => (
-                    <option key={platform.value} value={platform.value}>
-                      {platform.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="threshold-filter">
-                <span>Created in last</span>
-                <div className="number-with-unit">
-                  <input
-                    className={
-                      parseOptionalPositiveInteger(createdWithinDays)
-                        ? "active-filter-input"
-                        : undefined
-                    }
-                    type="number"
-                    min="1"
-                    max="3650"
-                    value={createdWithinDays}
-                    onChange={(event) =>
-                      { setCreatedWithinDays(event.target.value); setAgentPageIndex(0); }
-                    }
-                    placeholder="Any"
-                  />
-                  <span>days</span>
-                </div>
-              </label>
-              <label>
-                <span>Sort by</span>
-                <select value={agentSortBy} onChange={(event) => { setAgentSortBy(event.target.value as NonNullable<PackageListQuery["sortBy"]>); setAgentPageIndex(0); }}>
-                  <option value="displayName">Name</option>
-                  <option value="publisher">Publisher</option>
-                  <option value="lastModifiedAt">Last modified</option>
-                </select>
-              </label>
-              <label>
-                <span>Direction</span>
-                <select value={agentSortDirection} onChange={(event) => { setAgentSortDirection(event.target.value as "asc" | "desc"); setAgentPageIndex(0); }}>
-                  <option value="asc">Ascending</option>
-                  <option value="desc">Descending</option>
+                  {hostOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </label>
             </div>
 
-            <div
-              className="filter-actions catalog-filter-actions"
-              aria-label="Table actions"
-            >
-              <div className="filter-action-buttons">
-                <WorkbenchActionGate actionId="packages.refresh"><button
-                  type="button"
-                  className="icon-button control-icon-button"
-                  aria-label={
-                    refreshingAgents ? "Refreshing agents" : "Refresh agents"
-                  }
-                  title={refreshingAgents ? "Refreshing agents" : "Refresh agents"}
-                  disabled={loadingAgents || refreshingAgents}
-                  onClick={() => void handleRefreshAgents()}
+            <div className="filter-section agent-filter-toolbar">
+              <label className="threshold-filter">
+                <span>Created within</span>
+                <div className="number-with-unit">
+                  <input type="number" min="1" max="3650" value={createdWithinDays} className={parseOptionalPositiveInteger(createdWithinDays) ? "active-filter-input" : undefined} placeholder="Any" onChange={event => { setCreatedWithinDays(event.target.value); setAgentPageIndex(0); }} />
+                  <span>days</span>
+                </div>
+              </label>
+              <label>
+                <span>Package status</span>
+                <select
+                  className={statusFilter === "all" ? undefined : "active-filter-select"}
+                  value={statusFilter}
+                  onChange={(event) => {
+                    setStatusFilter(event.target.value as "all" | "allowed" | "blocked");
+                    setAgentPageIndex(0);
+                  }}
                 >
-                  <RefreshIcon />
-                </button></WorkbenchActionGate>
-                <WorkbenchActionGate actionId="packages.export"><button
-                  type="button"
-                  className="secondary icon-button control-icon-button"
-                  aria-label={
-                    exportingCsv
-                      ? `Exporting ${exportProgress} of ${exportableAgentCount} filtered agents`
-                      : "Export filtered agents CSV"
-                  }
-                  title={
-                    exportingCsv
-                      ? `Exporting ${exportProgress}/${exportableAgentCount}`
-                      : "Export filtered CSV"
-                  }
-                  disabled={
-                    loadingAgents || exportingCsv || exportableAgentCount === 0
-                  }
-                  onClick={requestExportCsv}
+                  <option value="all">All states</option>
+                  <option value="allowed">Allowed</option>
+                  <option value="blocked">Blocked</option>
+                </select>
+              </label>
+              <label className="agent-sort-control">
+                <span>Sort</span>
+                <select
+                  value={`${agentSortBy === "lastModifiedAt" ? "lastModifiedAt" : "displayName"}:${agentSortDirection}`}
+                  onChange={event => {
+                    const option = agentSortOptions.find(item => item.value === event.target.value);
+                    if (!option) {
+                      setError("Choose a supported agent sort order.");
+                      return;
+                    }
+                    setAgentSortBy(option.sortBy);
+                    setAgentSortDirection(option.direction);
+                    setAgentPageIndex(0);
+                  }}
                 >
-                  <ExportIcon />
-                </button></WorkbenchActionGate>
-                <button
-                  type="button"
-                  className="secondary clear-filters-button"
-                  disabled={!hasActiveAgentFilters}
-                  onClick={handleClearAgentFilters}
-                >
+                  {agentSortOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
+              <div className="agent-filter-toolbar-actions">
+                <label className="advanced-filter-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showAdvancedFilters}
+                    onChange={event => setShowAdvancedFilters(event.target.checked)}
+                    aria-controls="agent-advanced-filters"
+                    aria-expanded={showAdvancedFilters}
+                  />
+                  <span>Advanced filters</span>
+                  {advancedFilterCount > 0 ? <> <span className="advanced-filter-count">{advancedFilterCount} active</span></> : null}
+                </label>
+                <button type="button" className="secondary clear-filters-button" disabled={!hasActiveAgentFilters} onClick={handleClearAgentFilters}>
                   Clear filters
                 </button>
               </div>
-              <span className="last-refresh" aria-live="polite">
-                {lastAgentListRefreshAt
-                  ? `Saved Graph observation ${formatRefreshTime(
-                      lastAgentListRefreshAt,
-                    )}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : " / v1.0 read, preview controls"}`
-                  : refreshingAgents ? "Loading your agents from Microsoft Graph; no provider settings are changed."
-                    : "No saved package observation. An initial read-only load starts here when authorized; Refresh agents retries it."}
-              </span>
+            </div>
+
+            <div id="agent-advanced-filters" className="agent-advanced-filters" role="region" aria-label="Advanced agent filters" hidden={!showAdvancedFilters}>
+              <div className="filter-section filter-section-advanced">
+                <label>
+                  <span>Publisher</span>
+                  <select value={publisherFilter} className={publisherFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setPublisherFilter(event.target.value); setAgentPageIndex(0); }}>
+                    <option value="all">All publishers</option>
+                    {publisherOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                </label>
+                <EnvironmentFilter
+                  key={agentEnvironmentFilter}
+                  options={unifiedAgentPage?.facets?.environments ?? []}
+                  value={agentEnvironmentFilter}
+                  loading={loadingAgents}
+                  onChange={value => { setAgentEnvironmentFilter(value); setAgentPageIndex(0); resetPowerPlatformSelection(); }}
+                />
+              </div>
             </div>
           </section>
+
+          {canOperate && (selectedPowerPlatformTargets.size > 0 || pendingPowerPlatformIds.size > 0 || requestedQuarantineJobId) ? <CopilotStudioQuarantineControls
+            snapshot={selectedQuarantineObservation}
+            targets={[...selectedPowerPlatformTargets.values()]}
+            variant="bulk"
+            canManage={canOperate}
+            onClear={() => {
+              setSelectedPowerPlatformTargets(new Map());
+              setSelectedPowerPlatformSnapshot(null);
+            }}
+            initialJobId={requestedQuarantineJobId}
+            onJobChange={job => setRequestedQuarantineJobId(job.id)}
+          /> : null}
 
           {loadingBulkRefSearch ? (
             <div className="screen-state">
@@ -1943,29 +2546,38 @@ function App() {
             <div className="screen-state">Loading Copilot agents...</div>
           ) : (
             <div className="agent-table-stack">
-              <AgentTable
-                agents={displayedAgents}
-                busyAgentId={busyAgentId}
-                selectedIds={selectedAgentIds}
-                recentlyChangedIds={recentlyChangedAgentIds}
-                operationsAllowed={canOperate}
-                selectionDisabled={Boolean(busyBulkAction)}
-                usageByAgentId={usageByAgentId}
-                allMatchingSelected={allMatchingSelected}
-                selectedCount={selectedAgentIds.size}
-                onToggleAgentSelection={toggleAgentSelection}
-                onToggleMatchingSelection={() =>
-                  toggleMatchingSelection(agents)
-                }
-                onViewDetails={(agent) => void handleViewAgentDetails(agent)}
-                onManageAccess={(agent) => void handleManageAgentAccess(agent)}
-                onBlock={(agent) => void handleAgentAction(agent, true)}
-                onUnblock={(agent) => void handleAgentAction(agent, false)}
+              <UnifiedAgentTable
+                records={displayedUnifiedAgents}
+                busyPackageId={busyAgentId}
+                selectedPackageIds={selectedAgentIds}
+                selectedPowerPlatformKeys={new Set(selectedPowerPlatformTargets.keys())}
+                packageSelectionAllowed
+                packageOperationsAllowed={canOperate}
+                quarantineSelectionAllowed={canOperate}
+                selectionDisabled={Boolean(busyBulkAction) || refreshingAgents}
+                environmentNames={agentEnvironmentNames}
+                onToggleSelection={toggleUnifiedAgentSelection}
+                onViewDetails={record => {
+                  setAgentDetailTab("identities");
+                  void handleViewUnifiedAgentDetails(record);
+                }}
+                onManage={record => {
+                  setAgentDetailTab("controls");
+                  void handleViewUnifiedAgentDetails(record);
+                }}
+                onManageAccess={record => {
+                  const item = record.packages[0];
+                  if (item) void handleManageAgentAccess(item);
+                }}
+                onSetBlocked={(record, blocked) => {
+                  const item = record.packages[0];
+                  if (item) void handleAgentAction(item, blocked);
+                }}
               />
               <AgentPageControls
                 pageIndex={agentPageIndex}
                 pageSize={agentDisplayPageSize}
-                totalCount={agentPage?.count ?? 0}
+                totalCount={unifiedAgentPage?.count ?? 0}
                 loading={loadingAgents}
                 onPageChange={setAgentPageIndex}
               />
@@ -1975,10 +2587,18 @@ function App() {
         )
       ) : visibleActiveView === "power-platform" ? (
         hasRole(user, "AgentControl.Viewer")
-          ? <InventoryExplorer key={principalKey} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
+          ? <InventoryExplorer key={`${principalKey}:${powerPlatformDataRevision}`} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
           : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
       ) : visibleActiveView === "users" ? (
-        <CopilotUsersView key={`${principalKey}:${officialUsageDashboardRevision}`} />
+        <CopilotUsersView
+          key={principalKey}
+          dataRevision={copilotUsersDataRevision}
+          onSyncUsers={() => {
+            navigateToView("sync");
+            setSyncHistoryRevision(revision => revision + 1);
+            return dataSyncPanelRef.current?.start("incremental", ["users"]) ?? Promise.resolve();
+          }}
+        />
       ) : visibleActiveView === "official-usage" ? (
         <section className="official-usage-workbench" aria-label="Official usage">
           <header className="usage-page-header">
@@ -1986,13 +2606,35 @@ function App() {
               <h2>Official usage</h2>
               <p>Microsoft 365 Copilot Agents activity</p>
             </div>
-            {canImportReports ? <OfficialUsageImportModal key={`${principalKey}:${requestedOfficialUsageStagingId ?? ""}`} initialStagingId={requestedOfficialUsageStagingId} onChanged={handleOfficialUsageChanged} onLegacyCleared={() => setLegacyUsagePresent(false)} /> : null}
+            {canImportReports ? <button type="button" className="secondary" onClick={() => setUsageImportOpenRequest(request => request + 1)}><Upload size={16} />Import reports</button> : null}
           </header>
+          {officialUsageReportSetId ? (
+            <div className="usage-history-selection" role="status">
+              <div>
+                <strong>Historical snapshot view</strong>
+                <span>
+                  {loadingOfficialUsage
+                    ? `Loading retained set ${officialUsageReportSetId.slice(0, 8)}. Data from a different snapshot is not shown here.`
+                    : officialUsageLoadError
+                      ? historicalUsageLoaded
+                        ? `Showing the last loaded data for retained set ${officialUsageReportSetId.slice(0, 8)}; refresh failed.`
+                        : `Retained set ${officialUsageReportSetId.slice(0, 8)} is unavailable.`
+                      : historicalUsageLoaded
+                        ? `Showing retained set ${officialUsageReportSetId.slice(0, 8)}.`
+                        : `Retained set ${officialUsageReportSetId.slice(0, 8)} has not loaded.`}
+                  {" "}The tenant’s current snapshot selection is unchanged.
+                </span>
+              </div>
+              <button type="button" className="secondary" onClick={() => handleOfficialUsageSnapshotChange(undefined)}>Return to current snapshot</button>
+            </div>
+          ) : null}
+          {officialUsageLoadError ? <div className="error-banner" role="alert">{officialUsageLoadError}</div> : null}
           {hasRole(user, "AgentControl.Viewer") ? <ReportingView
             key={`${principalKey}:${officialUsageDashboardRevision}`}
             activityWindowDays={reportActivityWindowDays}
-            data={officialUsageAggregate}
+            data={displayedOfficialUsageAggregate}
             inactiveDays={inactiveDays}
+            reportSetId={officialUsageReportSetId}
             onActivityWindowDaysChange={handleReportActivityWindowChange}
             onAgentPageChange={setOfficialUsageAgentOffset}
             onAgentQueryChange={(query) => {
@@ -2004,8 +2646,13 @@ function App() {
               setOfficialUsageUserOffset(0);
               setOfficialUsageUserQuery(query);
             }}
-            userData={canReadSensitiveUsage ? officialUsageUsers : undefined}
+            userData={canReadSensitiveUsage ? displayedOfficialUsageUsers : undefined}
           /> : null}
+          <OfficialUsageHistoryPanel
+            revision={officialUsageDashboardRevision}
+            selectedSetId={officialUsageReportSetId}
+            onSelect={handleOfficialUsageSnapshotChange}
+          />
         </section>
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />
@@ -2013,7 +2660,7 @@ function App() {
         <DefenderHuntingView key={principalKey} />
       ) : visibleActiveView === "jobs" ? (
         <JobsView key={principalKey} user={user} />
-      ) : <div className="screen-state">No Agent Control app role is assigned.</div>}
+      ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
       {loadingAgentDetailId ? (
         <div className="detail-loading" role="status" aria-live="polite">
@@ -2023,6 +2670,29 @@ function App() {
 
       {agentDetailError && !agentDetail ? (
         <div className="error-banner" role="alert">{agentDetailError}</div>
+      ) : null}
+
+      {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && !bulkConfirmation ? (
+        <UnifiedAgentDetailModal
+          record={selectedUnifiedAgent}
+          environmentNames={agentEnvironmentNames}
+          activeTab={agentDetailTab}
+          onTabChange={setAgentDetailTab}
+          roles={user?.roles ?? []}
+          externalAccessEditorOpen={Boolean(singleAccessAgentDetail)}
+          onClose={() => {
+            setSelectedUnifiedAgent(undefined);
+            setRequestedAgentDetailId(undefined);
+          }}
+          onInspectPackage={item => {
+            setSelectedUnifiedAgent(undefined);
+            void handleViewAgentDetails(item);
+          }}
+          onManagePackageAccess={(item, target) => void handleManageAgentAccess(item, target)}
+          onSetPackageBlocked={(item, blocked) => {
+            void handleAgentAction(item, blocked);
+          }}
+        />
       ) : null}
 
       {agentDetail ? (
@@ -2080,7 +2750,7 @@ function App() {
       {exportChoiceOpen ? (
         <ExportChoiceModal
           agentCount={exportableAgentCount}
-          isFiltered={hasActiveAgentFilters}
+          isFiltered={hasActivePackageFilters}
           onCancel={() => setExportChoiceOpen(false)}
           onExport={() => void handleExportCsv()}
         />
@@ -2184,33 +2854,6 @@ function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
   </section>;
 }
 
-function Metric({
-  label,
-  value,
-  filteredValue,
-}: {
-  label: string;
-  value: number;
-  filteredValue?: number;
-}) {
-  const isFiltered = filteredValue !== undefined;
-
-  return (
-    <div className="metric">
-      <span>{isFiltered ? `${label} / Filtered` : label}</span>
-      <strong>
-        {value.toLocaleString()}
-        {isFiltered ? (
-          <>
-            {" / "}
-            {filteredValue.toLocaleString()}
-          </>
-        ) : null}
-      </strong>
-    </div>
-  );
-}
-
 function ExportProgressMeter({
   completed,
   mode,
@@ -2270,27 +2913,6 @@ function AgentPageControls({
         <button type="button" className="secondary" disabled={loading || pageIndex + 1 >= pageCount} onClick={() => onPageChange(pageIndex + 1)}>Next</button>
       </div>
     </div>
-  );
-}
-
-function RefreshIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      width="18"
-      height="18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M21 12a9 9 0 0 1-15.3 6.4" />
-      <path d="M3 12A9 9 0 0 1 18.3 5.6" />
-      <path d="M18 2v4h-4" />
-      <path d="M6 22v-4h4" />
-    </svg>
   );
 }
 
@@ -2366,6 +2988,13 @@ function formatDetailLabel(value?: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
+}
+
+function countAdvancedAgentFilters(filters: Pick<AgentRouteState, "environmentId" | "publisher">) {
+  return [
+    filters.environmentId.trim().length > 0,
+    filters.publisher !== "all",
+  ].filter(Boolean).length;
 }
 
 function parseOptionalPositiveInteger(value: string) {
@@ -2513,7 +3142,7 @@ function ExportChoiceModal({
         </div>
         <p>
           Export {agentCount.toLocaleString()}{" "}
-          {isFiltered ? "filtered" : "loaded"} agents from the current saved
+          {isFiltered ? "filtered" : "loaded"} package records from the current saved
           package snapshot. The server rechecks your current role and scope.
         </p>
         <div className="export-choice-grid">

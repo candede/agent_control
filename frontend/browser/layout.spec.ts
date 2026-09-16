@@ -4,7 +4,7 @@ import { huntingJob, layoutTime, mockLayoutApi, purviewJob } from "./layoutFixtu
 const viewports = [360, 768, 1280, 1920];
 const cases = [
   { name: "agents", path: "/agents", ready: ".agent-table-stack tbody tr",
-    fields: [".filter-section-primary", ".filter-section-metadata"] },
+    fields: [".filter-section-primary", ".filter-section-advanced"] },
   { name: "power-platform", path: "/power-platform", ready: ".inventory-table tbody tr",
     fields: [".inventory-controls"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
@@ -43,6 +43,9 @@ for (const scenario of cases) {
     await page.goto(scenario.path);
     await expect(page.locator(scenario.ready).first()).toBeVisible();
     await expect(page.getByRole("button", { name: /provider-verified.*degraded/ })).toBeVisible();
+    if (scenario.name === "agents") {
+      await page.getByRole("checkbox", { name: "Advanced filters" }).check();
+    }
 
     if (scenario.name === "audit-purview") {
       await page.getByText("Structured identity filters", { exact: true }).click();
@@ -69,7 +72,10 @@ for (const scenario of cases) {
       await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeVisible();
       await expect(page.locator(".recharts-surface").first()).toBeVisible();
     }
-    if (["agents", "power-platform"].includes(scenario.name)) {
+    if (scenario.name === "agents") {
+      await expect(page.locator(".agent-table-stack .capability-gate > button:disabled").first()).toBeVisible();
+    }
+    if (scenario.name === "power-platform") {
       await expect(page.locator(".gate-explanation").first()).toBeVisible();
       await expect(page.locator(".capability-gate > button:disabled").first()).toBeVisible();
     }
@@ -93,9 +99,8 @@ for (const scenario of cases) {
         await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}.png`), fullPage: true, animations: "disabled" });
         await assertLayout(page, scenario.fields, `${scenario.name} at ${width}px`);
         if (scenario.name === "agents" || scenario.name === "power-platform") {
-          const selector = scenario.name === "agents" ? ".filter-section-metadata" : ".inventory-controls";
-          const expectedColumns = width === 360 ? 1 : width === 768 ? 2
-            : scenario.name === "power-platform" ? 4 : width === 1920 ? 6 : 3;
+          const selector = scenario.name === "agents" ? ".filter-section-advanced" : ".inventory-controls";
+          const expectedColumns = width === 360 ? 1 : scenario.name === "agents" ? 3 : width === 768 ? 2 : 4;
           const columns = await page.locator(selector).evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
           expect.soft(columns, `${selector} column contract at ${width}px`).toBe(expectedColumns);
         }
@@ -197,10 +202,11 @@ async function assertLayout(page: Page, fields: string[], description: string) {
       }
     };
     const equalWidth = (elements: Element[], group: string) => {
-      // Full-row timestamps/lineage are deliberate spans, not unequal grid tracks.
+      // Wide search fields and full-row timestamps/lineage are deliberate spans.
       const widths = elements.filter(element => {
         const css = getComputedStyle(element);
-        return ![css.gridColumnStart, css.gridColumnEnd].some(value => value.includes("span") || value === "-1");
+        return !element.classList.contains("filter-search")
+          && ![css.gridColumnStart, css.gridColumnEnd].some(value => value.includes("span") || value === "-1");
       }).map(element => element.getBoundingClientRect().width);
       if (widths.length > 1 && Math.max(...widths) - Math.min(...widths) > tolerance) {
         failures.push(`${group} has unequal field/card widths: ${widths.map(value => value.toFixed(1)).join(", ")}`);

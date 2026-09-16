@@ -262,8 +262,10 @@ describe("migration 15 official usage publication receipts and content closure",
       await verifySchema(upgradeFixture.runtime);
 
       expect((await upgradeFixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=$1", [ids.version_id])).rows[0].count).toBe(1);
-      await expect(upgradeFixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,row_data)
-        VALUES($1,'tenant-15','agents',1,'{}')`, [ids.version_id])).rejects.toThrow("published or deleted");
+      expect((await upgradeFixture.runtime.query(`SELECT fact.row_data FROM official_usage_version_rows row
+        JOIN official_usage_row_facts fact USING(tenant_id,kind,payload_hash) WHERE row.version_id=$1`, [ids.version_id])).rows).toEqual([{ row_data: {} }]);
+      await expect(upgradeFixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
+        VALUES($1,'tenant-15','agents',1,official_usage_payload_hash('{}'::jsonb))`, [ids.version_id])).rejects.toThrow("published or deleted");
       await upgradeFixture.runtime.query(`INSERT INTO official_usage_bundle_receipts
         (tenant_id,actor_principal_id,bundle_id,bundle_hash,expected_active_revision,result_set_id,result_version_id,result_active_revision,result_complete)
         VALUES('tenant-15','administrator',$1,repeat('b',64),1,$2,$3,2,true)`, [ids.bundle_id, ids.set_id, ids.version_id]);

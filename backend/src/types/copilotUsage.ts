@@ -96,6 +96,13 @@ export type CopilotUsageUsersResponse = {
   generatedAt: string;
   readOnly: true;
   period: typeof copilotUsagePeriod;
+  snapshot?: {
+    state: "not_synced" | "available" | "partial";
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    directoryObservedAt: string | null;
+    appActivityObservedAt: string | null;
+  };
   sources: {
     directory: CopilotUsageSourceSummary;
     appActivity: CopilotUsageSourceSummary;

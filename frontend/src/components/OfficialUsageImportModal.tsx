@@ -3,21 +3,36 @@ import { Upload, X } from "lucide-react";
 import { OfficialUsageImportPanel } from "./OfficialUsageImportPanel";
 import "./officialUsage.css";
 
-type OfficialUsageImportModalProps = Parameters<typeof OfficialUsageImportPanel>[0];
+type OfficialUsageImportModalProps = Parameters<typeof OfficialUsageImportPanel>[0] & {
+  openRequest?: number;
+  showTrigger?: boolean;
+};
 
-export function OfficialUsageImportModal(props: OfficialUsageImportModalProps) {
-  const [open, setOpen] = useState(Boolean(props.initialStagingId));
-  const [visited, setVisited] = useState(Boolean(props.initialStagingId));
+export function OfficialUsageImportModal({
+  openRequest = 0,
+  showTrigger = true,
+  ...panelProps
+}: OfficialUsageImportModalProps) {
+  const [open, setOpen] = useState(Boolean(panelProps.initialStagingId));
+  const [visited, setVisited] = useState(Boolean(panelProps.initialStagingId));
   const dialog = useRef<HTMLDialogElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const returnButton = useRef<HTMLButtonElement>(null);
+  const lastOpenRequest = useRef(openRequest);
 
   useEffect(() => {
     const element = dialog.current;
     if (open && !element?.open) element?.showModal();
     else if (!open && element?.open) element.close();
   }, [open]);
+
+  useEffect(() => {
+    if (openRequest === lastOpenRequest.current) return;
+    lastOpenRequest.current = openRequest;
+    setVisited(true);
+    setOpen(true);
+  }, [openRequest]);
 
   useEffect(() => {
     if (!open) return;
@@ -28,9 +43,11 @@ export function OfficialUsageImportModal(props: OfficialUsageImportModalProps) {
 
   return (
     <>
-      <button ref={trigger} type="button" className="secondary" aria-haspopup="dialog" onClick={() => { setVisited(true); setOpen(true); }}>
-        <Upload size={16} />Import reports
-      </button>
+      {showTrigger ? (
+        <button ref={trigger} type="button" className="secondary" aria-haspopup="dialog" onClick={() => { setVisited(true); setOpen(true); }}>
+          <Upload size={16} />Import reports
+        </button>
+      ) : null}
       <dialog
         ref={dialog}
         className="official-usage-modal"
@@ -60,12 +77,12 @@ export function OfficialUsageImportModal(props: OfficialUsageImportModalProps) {
         <header className="usage-modal-header">
           <div>
             <h2 id="usage-import-modal-title">Import and manage reports</h2>
-            <p id="usage-import-modal-description">Upload CSVs, review validation results, and approve a report set. Reporting changes only after approval.</p>
+            <p id="usage-import-modal-description">Upload a cumulative CSV snapshot, review authoritative validation, and approve it without replacing prior accepted history.</p>
           </div>
           <button ref={closeButton} type="button" className="icon-button" aria-label="Close report import" autoFocus onClick={() => setOpen(false)}><X size={20} /></button>
         </header>
         <div className="usage-modal-content">
-          {visited ? <OfficialUsageImportPanel {...props} /> : null}
+          {visited ? <OfficialUsageImportPanel {...panelProps} /> : null}
         </div>
         <footer className="usage-modal-footer">
           <span>Closing does not discard staging. Staged reports remain available until accepted, discarded, or expired.</span>

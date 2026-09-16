@@ -84,6 +84,10 @@ describe("InventoryExplorer", () => {
     expect(screen.getByText(/Unknown fields omitted: 2/i)).toBeInTheDocument();
     expect(getInventorySnapshots).toHaveBeenCalledTimes(1);
     expect(getInventoryRefreshJobs).toHaveBeenCalledTimes(1);
+    expect(getInventoryResources).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeAgents: true }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(getQuarantineStatus).not.toHaveBeenCalled();
     expect(previewQuarantine).not.toHaveBeenCalled();
   });
@@ -105,11 +109,22 @@ describe("InventoryExplorer", () => {
     render(<InventoryExplorer packages={[]} />);
     await waitFor(() => expect(getInventoryRefreshJobs).toHaveBeenCalledTimes(1));
     expect(refreshInventory).not.toHaveBeenCalled();
-    fireEvent.change(screen.getByLabelText("Refresh resource scope"), { target: { value: "microsoft.copilotstudio/agents" } });
+    expect(screen.queryByRole("option", { name: "Copilot Studio agents" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Refresh resource scope"), { target: { value: "microsoft.powerapps/canvasapps" } });
     fireEvent.change(screen.getByLabelText("Refresh environment scope"), { target: { value: "environment-a" } });
     fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
     await waitFor(() => expect(refreshInventory).toHaveBeenCalledTimes(1));
-    expect(refreshInventory).toHaveBeenCalledWith({ types: ["microsoft.copilotstudio/agents"], environmentId: "environment-a" });
+    expect(refreshInventory).toHaveBeenCalledWith({ types: ["microsoft.powerapps/canvasapps"], environmentId: "environment-a" });
+  });
+
+  it("keeps broad Power Platform refreshes non-agent scoped", async () => {
+    render(<InventoryExplorer packages={[]} />);
+    await screen.findByLabelText("Refresh resource scope");
+    fireEvent.click(screen.getByRole("button", { name: /Refresh selected scope/ }));
+    await waitFor(() => expect(refreshInventory).toHaveBeenCalledTimes(1));
+    const request = vi.mocked(refreshInventory).mock.calls[0]![0];
+    expect(request?.types?.length).toBeGreaterThan(0);
+    expect(request?.types).not.toContain("microsoft.copilotstudio/agents");
   });
 
   it("displays the first saved snapshot after a 42-page refresh completes", async () => {

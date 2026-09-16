@@ -1,0 +1,718 @@
+import { randomUUID } from "node:crypto";
+import type pg from "pg";
+import { pool } from "../db/pool.js";
+import { DataSyncRepository, type DataSyncScope } from "../db/dataSync.js";
+import { OfficialUsageRepository } from "../db/officialUsage.js";
+import { AppError, errorTelemetry } from "../errors.js";
+import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../types/dataSync.js";
+import { hasAppRole } from "../types/capability.js";
+import type { AuthenticatedUser } from "../types/session.js";
+import type { PublishedOfficialUsage } from "../types/officialUsage.js";
+import { CopilotUsageService, type CopilotUsageRefreshResult } from "./copilotUsage.js";
+import { packageInventory, type PackageInventoryService } from "./packageInventory.js";
+import { powerPlatformInventory, type PowerPlatformInventoryService } from "./powerPlatformInventory.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
+import { operationalLog } from "./telemetry.js";
+
+type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
+type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>>;
+
+type DataSyncDependencies = {
+  repository: Pick<DataSyncRepository,
+    "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listMarkers" | "attachJob" | "updateSource"
+    | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted">;
+  officialUsage: Pick<OfficialUsageRepository, "getPublished">;
+  packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
+  powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
+  copilotUsage: Pick<CopilotUsageService, "refreshUsers">;
+  wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+};
+
+type ActiveRun = {
+  runId: string;
+  scope: DataSyncScope;
+  user: AuthenticatedUser;
+  controller: AbortController;
+  operation: Promise<void>;
+  children: Map<string, TrackedChild>;
+  cleanupFailures: Map<string, unknown>;
+};
+
+type TrackedChild = {
+  source: "graph_packages" | "power_platform";
+  jobId: string;
+};
+
+const maximumActiveRuns = 4;
+const childPollIntervalMs = 250;
+
+export class DataSyncService {
+  private readonly active = new Map<string, ActiveRun>();
+  private starting = 0;
+
+  constructor(
+    database: pg.Pool = pool,
+    private readonly dependencies: DataSyncDependencies = defaultDependencies(database),
+  ) {}
+
+  async state(user: AuthenticatedUser): Promise<DataSyncState> {
+    requireViewer(user);
+    const scope = dataScope(user);
+    let run = await this.dependencies.repository.getLatestRun(scope);
+    const published = await this.dependencies.officialUsage.getPublished(scope.tenantId);
+    if (run) run = await this.reconcileRun(user, scope, run, published);
+    else if (hasAcceptedUsage(published)) {
+      await this.dependencies.repository.recordSuccessMarker(scope, "usage_reports", usageRowCount(published), usageAcceptedAt(published));
+    }
+    const markers = await this.dependencies.repository.listMarkers(scope);
+    const usageImportRequired = !hasAcceptedUsage(published);
+    const sources = run?.sources ?? reconcileUsageMarker(markers, published);
+    return {
+      onboardingRequired: markers.some(source => source.status !== "succeeded"),
+      usageImportRequired,
+      run: run ?? null,
+      sources,
+    };
+  }
+
+  listRuns(scope: DataSyncScope, limit = 20) {
+    return this.dependencies.repository.listRuns(scope, limit);
+  }
+
+  async getRun(scope: DataSyncScope, id: string) {
+    validateRunId(id);
+    const run = await this.dependencies.repository.getRun(scope, id);
+    if (!run) throw new AppError(404, "not_found", "Data sync run was not found.");
+    return this.reconcileUsage(scope, run);
+  }
+
+  async start(user: AuthenticatedUser, input: StartDataSyncInput): Promise<DataSyncRun> {
+    requireViewer(user);
+    if (this.active.size + this.starting >= maximumActiveRuns) {
+      throw new AppError(429, "data_sync_capacity", "At most four data sync runs can execute at once.");
+    }
+    this.starting += 1;
+    try {
+      const scope = dataScope(user);
+      const submitted = await this.dependencies.repository.submit(scope, input);
+      let run = await this.reconcileUsage(scope, submitted.run);
+      if (submitted.created && run.sources.some(source => executableSource(source))) {
+        this.launch(user, scope, run.id, run.sources.filter(executableSource).map(source => source.source), false);
+        run = (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
+      }
+      return run;
+    } finally {
+      this.starting -= 1;
+    }
+  }
+
+  async retry(user: AuthenticatedUser, id: string, sources?: readonly DataSyncSourceId[]): Promise<DataSyncRun> {
+    requireViewer(user);
+    validateRunId(id);
+    if (this.active.has(id)) throw new AppError(409, "data_sync_active", "The data sync run is already executing.");
+    if (this.active.size + this.starting >= maximumActiveRuns) {
+      throw new AppError(429, "data_sync_capacity", "At most four data sync runs can execute at once.");
+    }
+    this.starting += 1;
+    try {
+      const scope = dataScope(user);
+      const current = await this.dependencies.repository.getRun(scope, id);
+      if (!current) throw new AppError(404, "not_found", "Data sync run was not found.");
+      const reconciled = await this.reconcileRun(user, scope, current, await this.dependencies.officialUsage.getPublished(scope.tenantId));
+      const candidates = reconciled.sources.filter(source => source.canRetry).map(source => source.source);
+      const requested = sources ?? candidates;
+      if (!requested.length) throw new AppError(409, "data_sync_nothing_to_retry", "This data sync run has no incomplete sources to retry.");
+      if (requested.some(source => !candidates.includes(source))) {
+        throw new AppError(409, "data_sync_source_complete", "Only incomplete data sync sources can be retried.");
+      }
+      const cancelFailures = await this.cancelChildJobs(user, reconciled, requested);
+      if (cancelFailures.length) throw cancelFailures[0];
+      const selected = await this.dependencies.repository.retry(scope, id, requested);
+      this.launch(user, scope, id, selected.filter(source => source !== "usage_reports"), true);
+      return (await this.dependencies.repository.getRun(scope, id))!;
+    } finally {
+      this.starting -= 1;
+    }
+  }
+
+  async cancel(user: AuthenticatedUser, id: string): Promise<DataSyncRun> {
+    requireViewer(user);
+    validateRunId(id);
+    const scope = dataScope(user);
+    const before = await this.dependencies.repository.getRun(scope, id);
+    if (!before) throw new AppError(404, "not_found", "Data sync run was not found.");
+    const active = this.active.get(id);
+    const tracker = active ?? childTracker(id, scope, user);
+    active?.controller.abort(new AppError(409, "read_job_cancelled", "Data sync was cancelled."));
+    const cancelled = await this.dependencies.repository.cancel(scope, id);
+    this.trackPersistedChildren(tracker, before);
+    await this.cleanupTrackedChildren(tracker);
+    if (active) await active.operation;
+    const current = await this.dependencies.repository.getRun(scope, id);
+    if (current) this.trackPersistedChildren(tracker, current);
+    await this.cleanupTrackedChildren(tracker);
+    this.throwIfCleanupFailed(id, tracker);
+    return current ?? cancelled;
+  }
+
+  async recover() {
+    const count = await this.dependencies.repository.recoverInterrupted();
+    if (count) operationalLog("warn", "data_sync_recovered", { count });
+    return count;
+  }
+
+  async drain() {
+    const active = [...this.active.values()];
+    for (const run of active) {
+      run.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit data sync authorization."));
+      await this.dependencies.repository.pausePrincipal(run.scope, "Application shutdown requires explicit resume with current authorization.");
+    }
+    const results = await Promise.allSettled(active.map(run => run.operation));
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    for (const run of active) {
+      const current = await this.dependencies.repository.getRun(run.scope, run.runId);
+      if (current) this.trackPersistedChildren(run, current);
+      await this.cleanupTrackedChildren(run);
+      this.throwIfCleanupFailed(run.runId, run);
+    }
+  }
+
+  async waitForPrincipalAuthorization(scope: DataSyncScope) {
+    const active = [...this.active.values()].filter(run =>
+      run.scope.tenantId === scope.tenantId && run.scope.principalId === scope.principalId);
+    for (const run of active) {
+      run.controller.abort(new AppError(401, "interaction_required", "The signed-in account changed during data sync."));
+    }
+    const results = await Promise.allSettled([
+      this.dependencies.packages.waitForPrincipalAuthorization(scope),
+      this.dependencies.powerPlatform.waitForPrincipalAuthorization(scope),
+      this.dependencies.repository.pausePrincipal(scope, "Sign-out requires explicit resume with current authorization."),
+    ]);
+    const operations = await Promise.allSettled(active.map(run => run.operation));
+    for (const run of active) {
+      const current = await this.dependencies.repository.getRun(run.scope, run.runId);
+      if (current) this.trackPersistedChildren(run, current);
+      await this.cleanupTrackedChildren(run);
+      this.throwIfCleanupFailed(run.runId, run);
+    }
+    const failure = [...results, ...operations].find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+  }
+
+  private launch(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    runId: string,
+    sources: readonly DataSyncSourceId[],
+    incompleteOnly: boolean,
+  ) {
+    if (this.active.has(runId) || !sources.length) return;
+    const controller = new AbortController();
+    const activeRun: ActiveRun = {
+      runId,
+      scope,
+      user,
+      controller,
+      operation: Promise.resolve(),
+      children: new Map(),
+      cleanupFailures: new Map(),
+    };
+    this.active.set(runId, activeRun);
+    const operation = Promise.resolve()
+      .then(() => this.run(user, scope, runId, sources, incompleteOnly, controller.signal, activeRun))
+      .catch(async error => {
+        operationalLog("error", "data_sync_worker_failed", { runId, ...errorTelemetry(error) });
+        const current = await this.dependencies.repository.getRun(scope, runId);
+        for (const source of current?.sources ?? []) {
+          if (sources.includes(source.source) && ["queued", "running"].includes(source.status)) {
+            await this.dependencies.repository.updateSource(scope, runId, source.source, {
+              status: authorizationStatus(error),
+              message: safeSyncFailure(error),
+              canRetry: true,
+            });
+          }
+        }
+      })
+      .finally(() => {
+        if (this.active.get(runId)?.operation === operation) this.active.delete(runId);
+      });
+    activeRun.operation = operation;
+  }
+
+  private async run(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    runId: string,
+    sources: readonly DataSyncSourceId[],
+    incompleteOnly: boolean,
+    signal: AbortSignal,
+    activeRun: ActiveRun,
+  ) {
+    await Promise.all(sources.map(source => {
+      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal);
+      if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun);
+      if (source === "power_platform") return this.runPowerPlatform(user, scope, runId, signal, activeRun);
+      return Promise.resolve();
+    }));
+  }
+
+  private async runUsers(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    runId: string,
+    incompleteOnly: boolean,
+    signal: AbortSignal,
+  ) {
+    const jobId = randomUUID();
+    try {
+      await this.dependencies.repository.attachJob(scope, runId, "users", jobId);
+      signal.throwIfAborted();
+      await this.dependencies.repository.updateSource(scope, runId, "users", {
+        status: "running",
+        jobId,
+        message: "Reading normalized directory/license and app-activity sources.",
+        canRetry: false,
+      });
+      signal.throwIfAborted();
+      const result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
+        incompleteOnly, publication: { runId, jobId },
+      });
+      signal.throwIfAborted();
+      await this.dependencies.repository.updateSource(scope, runId, "users", userSourceUpdate(jobId, result));
+    } catch (error) {
+      await this.handleSourceFailure(scope, runId, "users", jobId, error);
+    }
+  }
+
+  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun) {
+    let jobId: string | null = null;
+    try {
+      signal.throwIfAborted();
+      const attempt = await this.dependencies.repository.getSourceAttempt(scope, runId, "graph_packages");
+      signal.throwIfAborted();
+      const job = await this.dependencies.packages.submit(user, {
+        tokenMode: "delegated",
+        requestedIds: [],
+        idempotencyKey: childIdempotencyKey(runId, "graph-packages", attempt),
+      });
+      jobId = job.id;
+      this.trackChild(activeRun, "graph_packages", jobId);
+      signal.throwIfAborted();
+      await this.dependencies.repository.attachJob(scope, runId, "graph_packages", jobId);
+      signal.throwIfAborted();
+      await this.dependencies.repository.updateSource(scope, runId, "graph_packages", {
+        status: "waiting_authorization",
+        jobId,
+        count: job.totalRecords,
+        message: "Waiting for delegated authorization to collect the agent list and matching identities.",
+        canRetry: true,
+      });
+      signal.throwIfAborted();
+      const started = job.status === "waiting_authorization"
+        ? await this.dependencies.packages.start(user, job.id, "delegated")
+        : job;
+      signal.throwIfAborted();
+      await this.trackPackageJob(user, scope, runId, started, signal);
+    } catch (error) {
+      if (jobId) await this.cleanupTrackedChildren(activeRun, new Set([childKey("graph_packages", jobId)]));
+      await this.handleSourceFailure(scope, runId, "graph_packages", jobId, error);
+    }
+  }
+
+  private async runPowerPlatform(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun) {
+    let jobId: string | null = null;
+    try {
+      signal.throwIfAborted();
+      const attempt = await this.dependencies.repository.getSourceAttempt(scope, runId, "power_platform");
+      signal.throwIfAborted();
+      const job = await this.dependencies.powerPlatform.submit(user, {
+        idempotencyKey: childIdempotencyKey(runId, "power-platform", attempt),
+        requestedTypes: powerPlatformResourceTypes,
+      });
+      jobId = job.id;
+      this.trackChild(activeRun, "power_platform", jobId);
+      signal.throwIfAborted();
+      await this.dependencies.repository.attachJob(scope, runId, "power_platform", jobId);
+      signal.throwIfAborted();
+      await this.dependencies.repository.updateSource(scope, runId, "power_platform", {
+        status: "waiting_authorization",
+        jobId,
+        count: job.totalRecords,
+        message: "Waiting for explicit delegated authorization to read Power Platform agents and non-agent resources.",
+        canRetry: true,
+      });
+      signal.throwIfAborted();
+      const started = job.status === "waiting_authorization"
+        ? await this.dependencies.powerPlatform.start(user, job.id)
+        : job;
+      signal.throwIfAborted();
+      await this.trackPowerPlatformJob(user, scope, runId, started, signal);
+    } catch (error) {
+      if (jobId) await this.cleanupTrackedChildren(activeRun, new Set([childKey("power_platform", jobId)]));
+      await this.handleSourceFailure(scope, runId, "power_platform", jobId, error);
+    }
+  }
+
+  private async trackPackageJob(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    runId: string,
+    initial: PackageJob,
+    signal: AbortSignal,
+  ) {
+    let job = initial;
+    while (job.status === "running") {
+      await this.reconcilePackageJob(scope, runId, job);
+      await this.dependencies.wait(childPollIntervalMs, signal);
+      job = await this.dependencies.packages.get(user, job.id, "delegated");
+    }
+    await this.reconcilePackageJob(scope, runId, job);
+  }
+
+  private async trackPowerPlatformJob(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    runId: string,
+    initial: PowerPlatformJob,
+    signal: AbortSignal,
+  ) {
+    let job = initial;
+    while (job.status === "running") {
+      await this.reconcilePowerPlatformJob(scope, runId, job);
+      await this.dependencies.wait(childPollIntervalMs, signal);
+      job = await this.dependencies.powerPlatform.get(user, job.id);
+    }
+    await this.reconcilePowerPlatformJob(scope, runId, job);
+  }
+
+  private reconcilePackageJob(scope: DataSyncScope, runId: string, job: PackageJob) {
+    return this.dependencies.repository.updateSource(scope, runId, "graph_packages", childSourceUpdate(
+      "Graph package",
+      job,
+    ));
+  }
+
+  private reconcilePowerPlatformJob(scope: DataSyncScope, runId: string, job: PowerPlatformJob) {
+    return this.dependencies.repository.updateSource(scope, runId, "power_platform", childSourceUpdate(
+      "Power Platform",
+      job,
+    ));
+  }
+
+  private async handleSourceFailure(
+    scope: DataSyncScope,
+    runId: string,
+    source: Exclude<DataSyncSourceId, "usage_reports">,
+    jobId: string | null,
+    error: unknown,
+  ) {
+    const cancelled = error instanceof AppError && error.code === "read_job_cancelled";
+    await this.dependencies.repository.updateSource(scope, runId, source, {
+      status: cancelled ? "cancelled" : authorizationStatus(error),
+      jobId,
+      message: cancelled ? "Cancelled by the requesting principal." : safeSyncFailure(error),
+      canRetry: true,
+    });
+  }
+
+  private async reconcileRun(
+    user: AuthenticatedUser,
+    scope: DataSyncScope,
+    run: DataSyncRun,
+    published: PublishedOfficialUsage,
+  ) {
+    run = await this.reconcileUsage(scope, run, published);
+    for (const source of run.sources) {
+      if (!source.jobId || !["queued", "running", "waiting_authorization"].includes(source.status)) continue;
+      if (source.source === "graph_packages") {
+        try {
+          const job = await this.dependencies.packages.get(user, source.jobId, "delegated");
+          await this.reconcilePackageJob(scope, run.id, job);
+        } catch (error) {
+          if (!(error instanceof AppError) || error.status !== 404) throw error;
+          await this.dependencies.repository.updateSource(scope, run.id, source.source, {
+            status: "failed",
+            jobId: source.jobId,
+            message: "The retained Graph package child job is no longer available.",
+            canRetry: true,
+          });
+        }
+      }
+      if (source.source === "power_platform") {
+        try {
+          const job = await this.dependencies.powerPlatform.get(user, source.jobId);
+          await this.reconcilePowerPlatformJob(scope, run.id, job);
+        } catch (error) {
+          if (!(error instanceof AppError) || error.status !== 404) throw error;
+          await this.dependencies.repository.updateSource(scope, run.id, source.source, {
+            status: "failed",
+            jobId: source.jobId,
+            message: "The retained Power Platform child job is no longer available.",
+            canRetry: true,
+          });
+        }
+      }
+    }
+    return (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
+  }
+
+  private async reconcileUsage(scope: DataSyncScope, run: DataSyncRun, published?: PublishedOfficialUsage) {
+    if (run.status === "cancelled") return run;
+    const source = run.sources.find(value => value.source === "usage_reports");
+    if (!source || source.status === "succeeded") return run;
+    const current = published ?? await this.dependencies.officialUsage.getPublished(scope.tenantId);
+    if (hasAcceptedUsage(current)) {
+      await this.dependencies.repository.updateSource(scope, run.id, "usage_reports", {
+        status: "succeeded",
+        count: usageRowCount(current),
+        lastSuccessAt: usageAcceptedAt(current),
+        message: "A complete accepted three-CSV Microsoft admin-center usage bundle is available.",
+        canRetry: false,
+      });
+    } else {
+      await this.dependencies.repository.updateSource(scope, run.id, "usage_reports", {
+        status: "awaiting_upload",
+        count: null,
+        message: "requiresAdmin: An AgentControl.Admin must download and import the three official Microsoft admin-center usage CSV reports.",
+        canRetry: false,
+      });
+    }
+    return (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
+  }
+
+  private trackChild(tracker: ActiveRun, source: TrackedChild["source"], jobId: string) {
+    tracker.children.set(childKey(source, jobId), { source, jobId });
+  }
+
+  private trackPersistedChildren(tracker: ActiveRun, run: DataSyncRun) {
+    for (const source of run.sources) {
+      if (!source.jobId || source.status === "succeeded") continue;
+      if (source.source === "graph_packages" || source.source === "power_platform") {
+        this.trackChild(tracker, source.source, source.jobId);
+      }
+    }
+  }
+
+  private async cleanupTrackedChildren(tracker: ActiveRun, selectedKeys?: ReadonlySet<string>) {
+    const children = [...tracker.children.entries()].filter(([key]) => !selectedKeys || selectedKeys.has(key));
+    await Promise.all(children.map(async ([key, child]) => {
+      try {
+        if (child.source === "graph_packages") {
+          await this.dependencies.packages.cancel(tracker.user, child.jobId, "delegated");
+        } else {
+          await this.dependencies.powerPlatform.cancel(tracker.user, child.jobId);
+        }
+        tracker.cleanupFailures.delete(key);
+      } catch (error) {
+        tracker.cleanupFailures.set(key, error);
+        operationalLog("warn", "data_sync_child_cancel_failed", {
+          source: child.source,
+          count: 1,
+          ...errorTelemetry(error),
+        });
+      }
+    }));
+  }
+
+  private throwIfCleanupFailed(runId: string, tracker: ActiveRun) {
+    if (!tracker.cleanupFailures.size) return;
+    throw new AppError(
+      502,
+      "data_sync_child_cleanup_failed",
+      "The data sync stopped, but one or more child jobs could not be confirmed cancelled.",
+      { runId, childJobCount: tracker.cleanupFailures.size },
+    );
+  }
+
+  private async cancelChildJobs(user: AuthenticatedUser, run: DataSyncRun, selectedSources?: readonly DataSyncSourceId[]) {
+    const operations: Promise<unknown>[] = [];
+    for (const source of run.sources) {
+      if (!source.jobId || source.status === "succeeded" || (selectedSources && !selectedSources.includes(source.source))) continue;
+      if (source.source === "graph_packages") operations.push(this.dependencies.packages.cancel(user, source.jobId, "delegated"));
+      if (source.source === "power_platform") operations.push(this.dependencies.powerPlatform.cancel(user, source.jobId));
+    }
+    const results = await Promise.allSettled(operations);
+    return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
+  }
+}
+
+function defaultDependencies(database: pg.Pool): DataSyncDependencies {
+  return {
+    repository: new DataSyncRepository(database),
+    officialUsage: new OfficialUsageRepository(database),
+    packages: packageInventory,
+    powerPlatform: powerPlatformInventory,
+    copilotUsage: new CopilotUsageService(database),
+    wait: waitFor,
+  };
+}
+
+export const dataSync = new DataSyncService();
+
+function dataScope(user: AuthenticatedUser): DataSyncScope {
+  if (!user.tenantId) throw AppError.unauthorized("Data sync requires a tenant-scoped session.");
+  return { tenantId: user.tenantId, principalId: user.homeAccountId };
+}
+
+function requireViewer(user: AuthenticatedUser) {
+  if (!hasAppRole(user.roles, "AgentControl.Viewer")) {
+    throw new AppError(403, "missing_internal_role", "Data sync requires Viewer.");
+  }
+}
+
+function validateRunId(value: string) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new AppError(400, "invalid_data_sync_run", "Data sync run ID is invalid.");
+  }
+}
+
+function executableSource(source: DataSyncSourceStatus) {
+  return source.source !== "usage_reports" && source.status === "queued";
+}
+
+function userSourceUpdate(jobId: string, result: CopilotUsageRefreshResult) {
+  return {
+    status: result.status,
+    jobId,
+    count: result.count,
+    message: result.message,
+    canRetry: result.status !== "succeeded",
+  };
+}
+
+function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
+  const count = job.totalRecords ?? job.observedCount;
+  if (job.status === "succeeded") {
+    return {
+      status: "succeeded" as const,
+      jobId: job.id,
+      count,
+      lastSuccessAt: job.finishedAt ?? job.updatedAt,
+      message: `${label} saved snapshot completed with ${count} records.`,
+      canRetry: false,
+    };
+  }
+  if (job.status === "running") {
+    return {
+      status: "running" as const,
+      jobId: job.id,
+      count,
+      message: job.message ?? `${label} source is running (${job.observedCount} records observed).`,
+      canRetry: false,
+    };
+  }
+  if (job.status === "waiting_authorization") {
+    return {
+      status: "waiting_authorization" as const,
+      jobId: job.id,
+      count,
+      message: job.message ?? `${label} source requires explicit current authorization.`,
+      canRetry: true,
+    };
+  }
+  if (job.status === "cancelled") {
+    return {
+      status: "cancelled" as const,
+      jobId: job.id,
+      count,
+      message: job.message ?? `${label} source was cancelled.`,
+      canRetry: true,
+    };
+  }
+  return {
+    status: "failed" as const,
+    jobId: job.id,
+    count,
+    message: job.message ?? `${label} source failed before complete publication.`,
+    canRetry: true,
+  };
+}
+
+function authorizationStatus(error: unknown): Extract<DataSyncSourceStatus["status"], "waiting_authorization" | "permission_required" | "failed"> {
+  if (error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "unauthorized"].includes(error.code))) {
+    return "waiting_authorization";
+  }
+  if (error instanceof AppError && (error.status === 403 || ["missing_permission", "missing_internal_role", "capability_unavailable", "not_configured"].includes(error.code))) {
+    return "permission_required";
+  }
+  return "failed";
+}
+
+function safeSyncFailure(error: unknown) {
+  const status = authorizationStatus(error);
+  if (status === "waiting_authorization") return "Explicit resume with renewed Microsoft authorization is required.";
+  if (status === "permission_required") return "Required delegated Microsoft read permission or provider role is unavailable.";
+  if (error instanceof AppError && [
+    "provider_error", "provider_timeout", "provider_schema", "provider_result_limit",
+    "provider_response_size_limit", "provider_count_mismatch", "report_download_failed",
+  ].includes(error.code)) return error.message.slice(0, 1024);
+  return "The source failed before complete saved-data publication.";
+}
+
+function hasAcceptedUsage(published: PublishedOfficialUsage) {
+  return published.activeSet?.complete === true && Object.keys(published.reports).length === 3;
+}
+
+function usageRowCount(published: PublishedOfficialUsage) {
+  return Object.values(published.reports).reduce((count, report) => count + (report?.rows.length ?? 0), 0);
+}
+
+function usageAcceptedAt(published: PublishedOfficialUsage) {
+  return published.activeSet?.acceptedAt
+    ?? Object.values(published.reports).map(report => report?.lineage.acceptedAt).filter((value): value is string => Boolean(value)).sort().at(-1)
+    ?? new Date().toISOString();
+}
+
+function reconcileUsageMarker(sources: DataSyncSourceStatus[], published: PublishedOfficialUsage) {
+  if (!hasAcceptedUsage(published)) return sources;
+  return sources.map(source => source.source === "usage_reports" ? {
+    ...source,
+    status: "succeeded" as const,
+    count: usageRowCount(published),
+    lastSuccessAt: usageAcceptedAt(published),
+    message: "A complete accepted three-CSV Microsoft admin-center usage bundle is available.",
+    canRetry: false,
+  } : source);
+}
+
+function childTracker(runId: string, scope: DataSyncScope, user: AuthenticatedUser): ActiveRun {
+  return {
+    runId,
+    scope,
+    user,
+    controller: new AbortController(),
+    operation: Promise.resolve(),
+    children: new Map(),
+    cleanupFailures: new Map(),
+  };
+}
+
+function childKey(source: TrackedChild["source"], jobId: string) {
+  return `${source}\0${jobId}`;
+}
+
+function childIdempotencyKey(runId: string, source: string, attempt: number) {
+  return `data-sync-${source}-${runId}-${attempt}`.slice(0, 128);
+}
+
+function waitFor(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const timeout = setTimeout(done, milliseconds);
+    timeout.unref();
+    const aborted = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", aborted);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", aborted, { once: true });
+    function done() {
+      signal.removeEventListener("abort", aborted);
+      resolve();
+    }
+  });
+}

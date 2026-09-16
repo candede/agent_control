@@ -157,10 +157,11 @@ describe.sequential("Official usage repository", () => {
   it("requires explicit immutable correction and makes retries idempotent", async () => {
     const activeBefore = (await repository.getAdminState(administrator)).activeSetId!;
     const unlabelledBundle = randomUUID();
-    const unlabelled = await Promise.all(["agents", "userAgents", "users"].map(kind => stage(kind as "agents" | "userAgents" | "users", unlabelledBundle, { marker: "2" })));
-    await accept(unlabelled[0]);
-    await accept(unlabelled[1]);
-    await expect(accept(unlabelled[2])).rejects.toMatchObject({ code: "correction_required" });
+    await Promise.all(["agents", "userAgents", "users"].map(kind =>
+      stage(kind as "agents" | "userAgents" | "users", unlabelledBundle, { marker: "2" })));
+    const unlabelled = await repository.previewBundle(administrator, unlabelledBundle);
+    await expect(repository.acceptBundle(administrator, unlabelledBundle, unlabelled))
+      .rejects.toMatchObject({ code: "correction_required" });
     expect((await repository.getAdminState(administrator)).activeSetId).toBe(activeBefore);
 
     const corrected = await completeSet("2", activeBefore);
@@ -266,7 +267,8 @@ describe.sequential("Official usage repository", () => {
 
     const deletion = await repository.previewSetOperation(scope, "delete", accepted.setId);
     await repository.confirmSetOperation(scope, deletion.id, { ...deletion, operation: "delete", setId: accepted.setId });
-    expect(await repository.acceptBundle(scope, bundleId, reviewed)).toEqual(accepted);
+    await expect(repository.acceptBundle(scope, bundleId, reviewed))
+      .rejects.toMatchObject({ code: "deleted_report_duplicate" });
     expect(await repository.getAdminState(scope)).toMatchObject({ activeSetId: null, activeRevision: accepted.activeRevision + 1 });
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_versions WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(3);
   });
@@ -367,15 +369,16 @@ describe.sequential("Official usage repository", () => {
       WHERE version.deleted_at IS NULL LIMIT 1`)).rows[0];
     if (version) {
       await expect(fixture.runtime.query("UPDATE official_usage_versions SET row_count=row_count+1 WHERE id=$1", [version.id])).rejects.toThrow("immutable");
-      await expect(fixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,row_data)
-        VALUES($1,$2,$3,49999,'{}')`, [version.id, version.tenant_id, version.kind])).rejects.toThrow("published or deleted");
+      await expect(fixture.runtime.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
+        SELECT $1,$2,$3,49999,payload_hash FROM official_usage_row_facts
+        WHERE tenant_id=$2 AND kind=$3 LIMIT 1`, [version.id, version.tenant_id, version.kind])).rejects.toThrow("published or deleted");
     }
     await fixture.operator.query("UPDATE official_usage_staging SET expires_at=clock_timestamp()-interval '1 second' WHERE status='active'");
     await retain(fixture.operator);
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staged_rows")).rows[0].count).toBe(0);
   });
 
-  it("retains populated accepted content after day-one staging expiry and removes content independently at 180 days", async () => {
+  it("retains accepted content past legacy expiry boundaries until explicit deletion", async () => {
     const scope = { tenantId: "tenant-retention", principalId: "administrator-retention" };
     const bundleId = randomUUID();
     const previews = await Promise.all(["agents", "userAgents", "users"].map(kind =>
@@ -391,37 +394,33 @@ describe.sequential("Official usage repository", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_staging WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(0);
     expect((await repository.getPublished(scope.tenantId)).reports.agents?.rows).toHaveLength(1);
 
-    await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
+    await fixture.operator.query(`UPDATE official_usage_sets
+      SET expires_at=clock_timestamp()-interval '1 second',accepted_at=clock_timestamp()-interval '181 days'
+      WHERE tenant_id=$1`, [scope.tenantId]);
     await fixture.operator.query("UPDATE official_usage_versions SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
     await fixture.operator.query("UPDATE official_usage_artifacts SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
-    await fixture.operator.query(`INSERT INTO official_usage_sets
-      (id,tenant_id,bundle_id,reporting_start,reporting_end,period_provenance,complete,accepted_at,deleted_at,expires_at,actor_principal_id)
-      SELECT gen_random_uuid(),$1,gen_random_uuid(),'2026-01-01','2026-01-31','operator_asserted',true,clock_timestamp(),clock_timestamp(),
-        clock_timestamp()-interval '1 second','retention-terminal'
-      FROM generate_series(1,5001)`, [scope.tenantId]);
-    const firstPreview=await retain(fixture.operator,{batchSize:5000,dryRun:true});
-    const secondPreview=await retain(fixture.operator,{batchSize:5000,dryRun:true});
-    expect(firstPreview.affected.officialSetsExpired).toBe(1);
-    expect(secondPreview.affected.officialSetsExpired).toBe(1);
-    const convergence=await retainUntilConverged(fixture.operator,{batchSize:5000});
-    expect(convergence.affected.officialSetsExpired).toBe(1);
-    expect(convergence.passes).toBeGreaterThan(1);
-    expect(Object.values((await retain(fixture.operator,{batchSize:5000})).affected).every(count=>count===0)).toBe(true);
-    const afterContentExpiry = await repository.getPublished(scope.tenantId);
-    expect(afterContentExpiry.activeSet).toBeNull();
-    expect(afterContentExpiry.hasImportHistory).toBe(true);
-    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE tenant_id=$1", [scope.tenantId])).rows[0].count).toBe(0);
-    await fixture.operator.query("DELETE FROM official_usage_sets WHERE tenant_id=$1 AND actor_principal_id='retention-terminal'", [scope.tenantId]);
+    await retain(fixture.operator);
+    const afterLegacyExpiry = await repository.getPublished(scope.tenantId);
+    expect(afterLegacyExpiry.activeSet?.id).toBe(published.activeSet?.id);
+    expect(afterLegacyExpiry.reports.agents?.rows).toHaveLength(1);
 
+    const deletion = await repository.previewSetOperation(scope, "delete", published.activeSet!.id);
+    await repository.confirmSetOperation(scope, deletion.id, {
+      ...deletion,
+      operation: "delete",
+      setId: published.activeSet!.id,
+    });
+    expect((await repository.getPublished(scope.tenantId)).activeSet).toBeNull();
     await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [scope.tenantId]);
     await fixture.operator.query("UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [scope.tenantId]);
     await fixture.operator.query("UPDATE official_usage_audit SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1", [scope.tenantId]);
-    await retain(fixture.operator);
+    await retainUntilConverged(fixture.operator, { batchSize: 5_000 });
     expect((await fixture.runtime.query(`SELECT
       (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
       (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions,
-      (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1) AS artifacts`, [scope.tenantId])).rows[0])
-      .toEqual({ sets: 0, versions: 0, artifacts: 0 });
+      (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1) AS artifacts,
+      (SELECT count(*)::int FROM official_usage_row_facts WHERE tenant_id=$1) AS facts`, [scope.tenantId])).rows[0])
+      .toEqual({ sets: 0, versions: 0, artifacts: 0, facts: 0 });
   });
 
   it("records legacy cleanup acknowledgement without receiving legacy report content", async () => {

@@ -5,6 +5,7 @@ export const workbenchViewIds = [
   "power-platform",
   "users",
   "official-usage",
+  "sync",
   "audit",
   "security",
   "permissions",
@@ -26,13 +27,13 @@ export type WorkbenchActionDefinition = {
   label: string;
   roles: AppRole[];
   capabilityId: CapabilityId | null;
-  nativeTarget: "none" | "graph_package_id" | "power_platform_resource_id" | "copilot_environment_bot" | "provider_job_id" | "official_usage_set" | "purview_query_window" | "defender_fixed_template_window";
+  nativeTarget: "none" | "graph_package_id" | "power_platform_resource_id" | "copilot_environment_bot" | "provider_job_id" | "official_usage_set" | "purview_query_window" | "defender_fixed_template_window" | "sync_run";
   preview: "none" | "required";
   confirmation: "none" | "explicit" | "risk_and_exact_targets";
   recovery: "none" | "resume_unsent" | "cancel_unsent" | "reconcile_get_only" | "reauthorize";
   method: "GET" | "POST" | "PATCH" | "DELETE";
   route: `/api/${string}`;
-  source: "graph_packages" | "power_platform" | "official_usage" | "local_audit" | "purview" | "defender";
+  source: "unified_inventory" | "graph_packages" | "power_platform" | "official_usage" | "local_audit" | "purview" | "defender" | "data_sync";
 };
 
 export type WorkbenchMetadata = {
@@ -41,6 +42,7 @@ export type WorkbenchMetadata = {
 };
 
 export type WorkbenchJobSource =
+  | "data-sync"
   | "package-refresh"
   | "package-controls"
   | "power-platform"

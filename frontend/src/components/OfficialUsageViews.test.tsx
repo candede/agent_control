@@ -226,6 +226,28 @@ describe("usage source clarity and export recovery", () => {
       download.mockRestore();
     }
   });
+
+  it("keeps exports pinned to the historical snapshot being viewed", async () => {
+    const reportSetId = "11111111-1111-4111-8111-111111111111";
+    const download = vi.spyOn(usageApi, "downloadOfficialUsageCsv").mockResolvedValue(new Blob(["csv"]));
+    try {
+      render(<ReportingView
+        data={aggregate}
+        userData={userView}
+        reportSetId={reportSetId}
+        activityWindowDays={30}
+        inactiveDays={30}
+        onActivityWindowDaysChange={vi.fn()}
+      />);
+      await userEvent.click(screen.getByRole("button", { name: "Export filtered agents CSV" }));
+      expect(download).toHaveBeenCalledWith(
+        "aggregate",
+        expect.objectContaining({ setId: reportSetId }),
+      );
+    } finally {
+      download.mockRestore();
+    }
+  });
 });
 
 describe("official usage views", () => {

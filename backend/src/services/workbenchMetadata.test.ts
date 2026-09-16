@@ -39,5 +39,18 @@ describe("workbench metadata", () => {
       confirmation: "risk_and_exact_targets",
       capabilityId: "powerPlatform.quarantine.manage",
     });
+    expect(metadata.actions.find(action => action.id === "packages.refresh.identities")).toMatchObject({
+      route: "/api/agents/refresh-jobs",
+      method: "POST",
+      nativeTarget: "graph_package_id",
+      capabilityId: "graph.package.read.delegated",
+      recovery: "reauthorize",
+    });
+    expect(metadata.actions.filter(action => action.source === "data_sync").map(action => action.id)).toEqual([
+      "data-sync.read", "data-sync.start", "data-sync.retry", "data-sync.cancel",
+    ]);
+    expect(metadata.actions.find(action => action.id === "data-sync.retry")).toMatchObject({
+      nativeTarget: "sync_run", roles: ["AgentControl.Viewer"], recovery: "reauthorize",
+    });
   });
 });

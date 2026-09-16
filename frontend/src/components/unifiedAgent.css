@@ -1,0 +1,50 @@
+.agent-summary-status {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.unified-agent-detail-modal .agent-summary-status {
+  display: grid;
+  color: inherit;
+  font: inherit;
+}
+
+.unified-agent-detail-modal .agent-summary-status > span {
+  display: block;
+  color: inherit;
+  font: inherit;
+}
+
+.unified-agent-detail-modal .expanded-detail-list > li > span:first-child {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-technical-details {
+  margin-top: 1.5rem;
+}
+
+.agent-technical-details > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.agent-technical-details[open] > summary {
+  margin-bottom: 1rem;
+}
+
+@media (max-width: 640px) {
+  .unified-agent-detail-modal .detail-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .unified-agent-detail-modal .detail-tabs button {
+    min-height: 44px;
+    padding: 0.7rem 0.3rem;
+    font-size: 0.82rem;
+    overflow-wrap: anywhere;
+  }
+}

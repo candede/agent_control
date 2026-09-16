@@ -3,7 +3,10 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { packageInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
-import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import {
+  formatAgentAuthoringTool, formatPackageFacetLabel as formatFacetLabel, normalizePackageAuthoringTool as normalizeBuiltWith,
+  type CopilotPackageDetail,
+} from "../types/copilotPackage.js";
 import { pool, transaction } from "./pool.js";
 
 export type PackageDataScope = { tenantId: string; principalId: string };
@@ -44,6 +47,21 @@ export type PackageListResult = {
     hosts: PackageFacetOption[];
     platforms: PackageFacetOption[];
   };
+};
+export type UnifiedPackageSourceResult = {
+  packages: CopilotPackageDetail[];
+  observations: Record<string, {
+    snapshotId: string;
+    scopeKind: "broad" | "exact";
+    observedAt: string;
+    expiresAt: string;
+    identityDetails?: {
+      snapshotId: string;
+      observedAt: string;
+      expiresAt: string;
+    };
+  }>;
+  snapshot: ReturnType<typeof projectSnapshot> | null;
 };
 export type PackageScanResult = {
   packages: CopilotPackageDetail[];
@@ -106,7 +124,7 @@ export class PackageInventoryRepository {
     const queryHash = hash({ tokenMode: input.tokenMode, scopeKind, requestedIds });
     const requestHash = hash({ authorizationPrincipalId: input.authorizationPrincipalId, queryHash });
     const id = await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}:${input.tokenMode}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}`]);
       const existing = await client.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM package_refresh_jobs job
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND idempotency_key=$4`, [scope.tenantId, scope.principalId, input.tokenMode, input.idempotencyKey]);
       if (existing.rows[0]) {
@@ -167,9 +185,9 @@ export class PackageInventoryRepository {
     return result.rowCount === 1;
   }
 
-  async recordProgress(scope: PackageDataScope, id: string, pageCount: number, observedCount: number, totalRecords: number) {
-    const result = await this.database.query(`UPDATE package_refresh_jobs SET page_count=$4,observed_count=$5,total_records=$6,updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId, pageCount, observedCount, totalRecords]);
+  async recordProgress(scope: PackageDataScope, id: string, pageCount: number, observedCount: number, totalRecords: number, message?: string) {
+    const result = await this.database.query(`UPDATE package_refresh_jobs SET page_count=$4,observed_count=$5,total_records=$6,message=$7,updated_at=clock_timestamp()
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId, pageCount, observedCount, totalRecords, message?.slice(0, 1024) ?? null]);
     if (result.rowCount !== 1) throw new AppError(409, "package_refresh_expired", "Package refresh progress arrived after its job expired or stopped.");
   }
 
@@ -289,6 +307,138 @@ export class PackageInventoryRepository {
       summary,
       filteredSummary,
       facets: packageFacets(allResources.rows.map(row => row.package_data)),
+    };
+  }
+
+  async readUnifiedSource(scope: PackageDataScope): Promise<UnifiedPackageSourceResult> {
+    validateScope(scope);
+    const snapshotResult = await this.database.query<SnapshotRow>(`SELECT * FROM package_inventory_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND scope_kind='broad'
+        AND is_current AND expires_at>clock_timestamp()
+      ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+    const snapshot = snapshotResult.rows[0];
+    if (!snapshot) return { packages: [], observations: {}, snapshot: null };
+    const base = await this.database.query<ResourceRow>(`SELECT package_data FROM package_inventory_resources
+      WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
+      ORDER BY native_id COLLATE "C" LIMIT 5001`, [snapshot.id, scope.tenantId, scope.principalId]);
+    if (base.rows.length > 5000) {
+      throw new AppError(409, "source_result_limit", "Saved Graph package inventory exceeds the 5,000-row unified inventory limit.");
+    }
+    const overlays = await this.database.query<{
+      native_id: string;
+      package_data: CopilotPackageDetail | null;
+      snapshot_id: string;
+      observed_at: Date;
+      expires_at: Date;
+    }>(`WITH exact_targets AS (
+        SELECT snapshot.id,snapshot.observed_at,snapshot.expires_at,target.native_id
+        FROM package_inventory_snapshots snapshot
+        CROSS JOIN LATERAL jsonb_array_elements_text(snapshot.requested_ids) target(native_id)
+        WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current
+          AND snapshot.expires_at>clock_timestamp() AND snapshot.token_mode='delegated' AND snapshot.scope_kind='exact'
+      ), latest AS (
+        SELECT DISTINCT ON (native_id) id,native_id,observed_at,expires_at FROM exact_targets
+        ORDER BY native_id,observed_at DESC,id DESC
+      )
+      SELECT latest.native_id,latest.id AS snapshot_id,latest.observed_at,latest.expires_at,resource.package_data FROM latest
+      LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=latest.id
+        AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=latest.native_id
+      ORDER BY latest.native_id COLLATE "C" LIMIT 5001`,
+    [scope.tenantId, scope.principalId]);
+    if (overlays.rows.length > 5000) {
+      throw new AppError(409, "source_result_limit", "Saved exact Graph package observations exceed the 5,000-row unified inventory limit.");
+    }
+    const details = await this.database.query<{
+      native_id: string;
+      package_data: CopilotPackageDetail;
+      snapshot_id: string;
+      observed_at: Date;
+      expires_at: Date;
+    }>(`WITH detailed AS (
+        SELECT snapshot.id,snapshot.observed_at,snapshot.expires_at,resource.native_id,resource.package_data
+        FROM package_inventory_snapshots snapshot
+        JOIN package_inventory_resources resource ON resource.snapshot_id=snapshot.id
+          AND resource.tenant_id=$1 AND resource.principal_id=$2
+        WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current
+          AND snapshot.expires_at>clock_timestamp() AND snapshot.token_mode='delegated'
+          AND CASE WHEN jsonb_typeof(resource.package_data->'elementDetails')='array'
+            THEN jsonb_array_length(resource.package_data->'elementDetails')>0 ELSE false END
+      ), latest AS (
+        SELECT DISTINCT ON (native_id) * FROM detailed
+        ORDER BY native_id,observed_at DESC,id DESC
+      )
+      SELECT native_id,package_data,id AS snapshot_id,observed_at,expires_at FROM latest
+      ORDER BY native_id COLLATE "C" LIMIT 5001`, [scope.tenantId, scope.principalId]);
+    if (details.rows.length > 5000) {
+      throw new AppError(409, "source_result_limit", "Saved detailed Graph package observations exceed the 5,000-row unified inventory limit.");
+    }
+    const packages = new Map(base.rows.map(row => [row.package_data.id, row.package_data]));
+    const observations: UnifiedPackageSourceResult["observations"] = Object.fromEntries(base.rows.map(row => [row.package_data.id, {
+      snapshotId: snapshot.id,
+      scopeKind: "broad",
+      observedAt: snapshot.observed_at.toISOString(),
+      expiresAt: snapshot.expires_at.toISOString(),
+      ...(row.package_data.elementDetails?.length ? {
+        identityDetails: {
+          snapshotId: snapshot.id,
+          observedAt: snapshot.observed_at.toISOString(),
+          expiresAt: snapshot.expires_at.toISOString(),
+        },
+      } : {}),
+    }]));
+    for (const overlay of overlays.rows) {
+      const overlayIsNewer = newerObservation(
+        overlay.observed_at,
+        overlay.snapshot_id,
+        snapshot.observed_at,
+        snapshot.id,
+      );
+      if (overlay.package_data && overlayIsNewer) {
+        packages.set(overlay.native_id, overlay.package_data);
+        observations[overlay.native_id] = {
+          snapshotId: overlay.snapshot_id,
+          scopeKind: "exact",
+          observedAt: overlay.observed_at.toISOString(),
+          expiresAt: overlay.expires_at.toISOString(),
+          ...(overlay.package_data.elementDetails?.length ? {
+            identityDetails: {
+              snapshotId: overlay.snapshot_id,
+              observedAt: overlay.observed_at.toISOString(),
+              expiresAt: overlay.expires_at.toISOString(),
+            },
+          } : {}),
+        };
+      } else if (!overlay.package_data && overlayIsNewer) {
+        packages.delete(overlay.native_id);
+        delete observations[overlay.native_id];
+      }
+    }
+    for (const detail of details.rows) {
+      const current = packages.get(detail.native_id);
+      const observation = observations[detail.native_id];
+      if (!current || !observation) continue;
+      if (observation.scopeKind === "exact" || !canReuseDetailedIdentity(current, detail.package_data)) continue;
+      const currentDetails = observation.identityDetails;
+      if (currentDetails && !newerObservation(
+        detail.observed_at,
+        detail.snapshot_id,
+        new Date(currentDetails.observedAt),
+        currentDetails.snapshotId,
+      )) continue;
+      packages.set(detail.native_id, { ...current, elementDetails: detail.package_data.elementDetails });
+      observation.identityDetails = {
+        snapshotId: detail.snapshot_id,
+        observedAt: detail.observed_at.toISOString(),
+        expiresAt: detail.expires_at.toISOString(),
+      };
+    }
+    if (packages.size > 5000) {
+      throw new AppError(409, "source_result_limit", "Combined saved Graph package observations exceed the 5,000-row unified inventory limit.");
+    }
+    return {
+      packages: [...packages.values()].sort((left, right) => ordinal(left.id, right.id)),
+      observations,
+      snapshot: projectSnapshot(snapshot),
     };
   }
 
@@ -428,7 +578,7 @@ function summarizePackages(values: readonly CopilotPackageDetail[]) {
   return { total: values.length, allowed: values.length - blocked, blocked };
 }
 
-function packageFacets(values: readonly CopilotPackageDetail[]): PackageListResult["facets"] {
+export function packageFacets(values: readonly CopilotPackageDetail[]): PackageListResult["facets"] {
   const publishers = new Map<string, string>();
   const availability = new Map<string, string>();
   const hosts = new Map<string, string>();
@@ -457,15 +607,7 @@ function packageFacets(values: readonly CopilotPackageDetail[]): PackageListResu
 function builtWithLabel(value: CopilotPackageDetail) {
   const raw = value.authoringTool ?? value.platform ?? value.shortDescription?.trim().match(/^built\s+using\s+(.+?)\.?$/i)?.[1]?.trim();
   if (!raw) return undefined;
-  return normalizeBuiltWith(raw).includes("copilotstudio") ? "Copilot Studio" : formatFacetLabel(raw);
-}
-
-function formatFacetLabel(value: string) {
-  return value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").trim();
-}
-
-function normalizeBuiltWith(value: string) {
-  return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+  return formatAgentAuthoringTool(raw);
 }
 
 function escapeLike(value: string) {
@@ -532,4 +674,32 @@ function safeCode(value: string) {
 
 function ordinal(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function newerObservation(leftAt: Date, leftId: string, rightAt: Date, rightId: string) {
+  const difference = leftAt.getTime() - rightAt.getTime();
+  return difference > 0 || difference === 0 && ordinal(leftId, rightId) > 0;
+}
+
+function canReuseDetailedIdentity(current: CopilotPackageDetail, detailed: CopilotPackageDetail) {
+  if (current.identityDetailsCollected) return false;
+  const currentModifiedAt = current.lastModifiedDateTime;
+  const detailedModifiedAt = detailed.lastModifiedDateTime;
+  if (!currentModifiedAt || currentModifiedAt !== detailedModifiedAt || !Number.isFinite(Date.parse(currentModifiedAt))) {
+    return false;
+  }
+  const markers = ["appId", "manifestId", "assetId", "version", "manifestVersion"] as const;
+  let matchedMarker = false;
+  for (const marker of markers) {
+    const currentValue = nonemptyMarker(current[marker]);
+    const detailedValue = nonemptyMarker(detailed[marker]);
+    if (currentValue === undefined && detailedValue === undefined) continue;
+    if (currentValue === undefined || detailedValue === undefined || currentValue !== detailedValue) return false;
+    matchedMarker = true;
+  }
+  return matchedMarker;
+}
+
+function nonemptyMarker(value: string | undefined) {
+  return typeof value === "string" && value.trim() ? value : undefined;
 }

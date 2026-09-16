@@ -25,6 +25,7 @@ type Props = {
   canManage: boolean;
   onClear?: () => void;
   initialJobId?: string;
+  onJobChange?: (job: QuarantineJob) => void;
 };
 
 type FrozenPreview = {
@@ -39,7 +40,7 @@ type FrozenPreview = {
 const quarantineJobPollIntervalMs = 1_000;
 const maximumAutomaticJobPolls = 60;
 
-export function CopilotStudioQuarantineControls({ snapshot, targets, variant, canManage, onClear, initialJobId }: Props) {
+export function CopilotStudioQuarantineControls({ snapshot, targets, variant, canManage, onClear, initialJobId, onJobChange }: Props) {
   const [boundStatus, setBoundStatus] = useState<{ selectionKey: string; status: QuarantineStatusView }>();
   const [frozenPreview, setFrozenPreview] = useState<FrozenPreview>();
   const [confirmed, setConfirmed] = useState(false);
@@ -168,6 +169,7 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
     try {
       const next = await submitQuarantine({ action: frozenPreview.action, snapshotId: frozenPreview.snapshotId, resourceNativeIds: frozenPreview.resourceNativeIds, confirmationHash: frozenPreview.preview.confirmationHash }, frozenPreview.idempotencyKey);
       setJob(next);
+      onJobChange?.(next);
       setFrozenPreview(undefined);
       setConfirmed(false);
       onClear?.();
@@ -179,7 +181,11 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
     if (!job) return;
     setBusyKey("job");
     setBoundError(undefined);
-    try { setJob(await operation(job.id)); }
+    try {
+      const next = await operation(job.id);
+      setJob(next);
+      onJobChange?.(next);
+    }
     catch (requestError) { setBoundError({ message: errorMessage(requestError) }); }
     finally { setBusyKey(current => current === "job" ? undefined : current); }
   }

@@ -8,7 +8,7 @@ import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
   InventoryResourcePage, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView,
   PackagePage, PurviewAuditCatalog, PurviewAuditJob, PurviewAuditRecordPage, SessionUser,
-  WorkbenchJobsResponse,
+  WorkbenchJobsResponse, UnifiedAgentInventoryPage,
 } from "../src/api/client";
 
 export const layoutTime = "2026-09-12T10:00:00.000Z";
@@ -60,6 +60,32 @@ const packages: PackagePage = {
     id: "11111111-1111-4111-8111-111111111111", tokenMode: "delegated", requestedIds: [],
     observedCount: 3, totalRecords: 3, pageCount: 1, observedAt, expiresAt, scopeKind: "broad",
   },
+};
+
+const graphObservation = {
+  id: packages.snapshot!.id, snapshotId: packages.snapshot!.id,
+  observedAt, expiresAt, current: true as const,
+  tokenMode: "delegated" as const, scopeKind: "broad" as const,
+  observedCount: packages.count, totalRecords: packages.count,
+};
+const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
+export const unifiedAgents: UnifiedAgentInventoryPage = {
+  value: packages.value.map(item => ({
+    id: `graph_packages:${item.id}`, displayName: item.displayName,
+    presence: "graph_packages", environmentId: null, packages: [item], powerPlatformResource: null,
+    identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "Matching metadata has not been observed." },
+    observations: { graphPackages: graphObservation, packageSnapshots: {}, powerPlatform: null },
+  })),
+  count: 3, offset: 0, limit: 50, summary: agentSummary, filteredSummary: agentSummary,
+  facets: { environments: [], platforms: packages.facets.platforms },
+  sources: {
+    graphPackages: { state: "available", observation: graphObservation, error: null },
+    powerPlatform: { state: "unavailable", observation: null, error: {
+      source: "power_platform", code: "snapshot_unavailable", message: "Power Platform saved inventory is unavailable.",
+    } },
+  },
+  partial: true,
+  errors: [{ source: "power_platform", code: "snapshot_unavailable", message: "Power Platform saved inventory is unavailable." }],
 };
 
 const inventory: InventoryResourcePage = {
@@ -309,6 +335,14 @@ export async function mockLayoutApi(page: Page) {
     "/api/workbench/metadata": { views: workbenchViews, actions: workbenchActions },
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
     "/api/agents": packages,
+    "/api/agent-inventory": unifiedAgents,
+    "/api/data-sync/state": {
+      onboardingRequired: false, usageImportRequired: false, run: null,
+      sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
+        source, status: "succeeded", count: 3, lastSuccessAt: observedAt, updatedAt: observedAt,
+        jobId: null, message: "", canRetry: false,
+      })),
+    },
     "/api/agents/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/inventory/resources": inventory, "/api/inventory/snapshots": { value: [inventory.snapshot] },
     "/api/inventory/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },

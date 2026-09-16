@@ -27,6 +27,7 @@ type ReportingViewProps = {
   activityWindowDays: number;
   data?: OfficialUsageAggregateView;
   inactiveDays: number;
+  reportSetId?: string;
   onActivityWindowDaysChange: (activityWindowDays: number) => void;
   onAgentPageChange?: (offset: number) => void;
   onAgentQueryChange?: (query: {
@@ -58,6 +59,7 @@ export function ReportingView({
   activityWindowDays,
   data,
   inactiveDays,
+  reportSetId,
   onActivityWindowDaysChange,
   onAgentPageChange = () => undefined,
   onAgentQueryChange = () => undefined,
@@ -89,7 +91,10 @@ export function ReportingView({
   async function handleExport(kind: "aggregate" | "users", filters: object) {
     setExportError(undefined);
     try {
-      await exportUsage(kind, filters, setExporting);
+      await exportUsage(kind, {
+        ...filters,
+        ...(reportSetId ? { setId: reportSetId } : {}),
+      }, setExporting);
     } catch (error) {
       setExportError(error instanceof Error ? error.message : "The official usage export failed.");
     }

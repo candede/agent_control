@@ -2,14 +2,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   blockAgent,
+  cancelDataSyncRun,
   checkCapabilities,
   getBulkActionJob,
   getDefenderHuntingJob,
   getAgents,
+  getUnifiedAgents,
   getPackageRefreshJob,
   getOfficialUsageAggregate,
+  getOfficialUsageHistory,
   getOfficialUsageUsers,
   getCopilotUsageUsers,
+  getDataSyncRun,
+  getDataSyncState,
   getPurviewAuditJob,
   getQuarantineJob,
   getQuarantineTargets,
@@ -17,10 +22,13 @@ import {
   previewQuarantine,
   previewPackageMutation,
   reconcileBulkActionJob,
+  retryDataSyncRun,
+  refreshPackageIdentityDetails,
   searchDirectoryPrincipals,
   startExactPackageRefresh,
   startPackageRefresh,
   stageOfficialUsageReport,
+  startDataSync,
   subscribeSessionRevalidationRequired,
   submitQuarantine,
   updateAgentAccess,
@@ -44,6 +52,39 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it("uses the durable data-sync state and run contracts", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+
+    await getDataSyncState({ signal: controller.signal });
+    await getDataSyncRun("run/one", { signal: controller.signal });
+    await startDataSync({ mode: "initial" });
+    await startDataSync({ mode: "incremental", sources: ["users"] });
+    await startDataSync({ mode: "full", clearSavedData: true });
+    await retryDataSyncRun("run/one", ["users", "usage_reports"]);
+    await cancelDataSyncRun("run/one");
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/data-sync/state",
+      expect.objectContaining({ signal: controller.signal }),
+    ]);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/data-sync/runs/run%2Fone",
+      expect.objectContaining({ signal: controller.signal }),
+    ]);
+    expect(fetchMock.mock.calls.slice(2).map(([path, init]) => [
+      path,
+      init?.method,
+      init?.body,
+    ])).toEqual([
+      ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "initial" })],
+      ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "incremental", sources: ["users"] })],
+      ["/api/data-sync/runs", "POST", JSON.stringify({ mode: "full", clearSavedData: true })],
+      ["/api/data-sync/runs/run%2Fone/retry", "POST", JSON.stringify({ sources: ["users", "usage_reports"] })],
+      ["/api/data-sync/runs/run%2Fone/cancel", "POST", undefined],
+    ]);
+  });
+
   it("loads the licensed usage snapshot with a cancellable read-only request", async () => {
     const fetchMock = mockJsonResponse({ users: [] });
     const controller = new AbortController();
@@ -90,6 +131,7 @@ describe("access API client", () => {
   it("encodes official usage dashboard filters, thresholds, sorting, and paging", async () => {
     const fetchMock = mockJsonResponse({});
     await getOfficialUsageAggregate({
+      setId: "11111111-1111-4111-8111-111111111111",
       search: "Agent & one",
       creatorType: "Agent built by your org",
       startDate: "2026-01-01",
@@ -99,7 +141,9 @@ describe("access API client", () => {
       limit: 100,
       offset: 200,
     });
+
     await getOfficialUsageUsers({
+      setId: "11111111-1111-4111-8111-111111111111",
       search: "User + one",
       cohort: "low",
       lowResponseThreshold: 5,
@@ -111,8 +155,20 @@ describe("access API client", () => {
       offset: 100,
     });
 
-    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?setId=11111111-1111-4111-8111-111111111111&search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+  });
+
+  it("loads paginated cumulative official usage history without changing active selection", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    await getOfficialUsageHistory({ limit: 25, offset: 50 }, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/official-usage/history?limit=25&offset=50",
+      expect.objectContaining({ signal: controller.signal, credentials: "include" }),
+    );
+    expect(fetchMock.mock.calls[0][1]?.method ?? "GET").toBe("GET");
+    expect(fetchMock.mock.calls[0][1]?.body).toBeUndefined();
   });
 
   it("requests failed-check recovery only for an explicit retry", async () => {
@@ -212,6 +268,49 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/package%2Fone/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=delegated", expect.objectContaining({ credentials: "include" }));
+  });
+
+  it("uses a stable idempotency key when collecting missing agent identities", async () => {
+    const fetchMock = mockJsonResponse({ id: "identity-job", status: "running" });
+    await startPackageRefresh("delegated", { idempotencyKey: "agent-identities-snapshot-one" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/agents/refresh-jobs", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ mode: "delegated" }),
+      headers: expect.objectContaining({ "Idempotency-Key": "agent-identities-snapshot-one" }),
+    }));
+  });
+
+  it("requests unified saved rows and explicitly refreshes selected matching details", async () => {
+    const fetchMock = mockJsonResponse({ value: [] });
+    await getUnifiedAgents({
+      search: "Builder & one",
+      source: "both",
+      linkState: "matched",
+      environmentId: "environment/one",
+      blocked: true,
+      publisher: "__unknown__",
+      availableTo: "__some_or_all__",
+      host: "__unknown_host__",
+      platform: "Copilot Studio",
+      createdWithinDays: 30,
+      limit: 50,
+      offset: 100,
+    });
+    await refreshPackageIdentityDetails(["package-1", "package-2"]);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/agent-inventory?search=Builder+%26+one&source=both&linkState=matched&environmentId=environment%2Fone&blocked=true&publisher=__unknown__&availableTo=__some_or_all__&host=__unknown_host__&platform=Copilot+Studio&createdWithinDays=30&limit=50&offset=100",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/refresh-jobs",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ ids: ["package-1", "package-2"], mode: "delegated" }),
+      }),
+    );
   });
 
   it("uses distinct encoded GET routes for exact saved job sources", async () => {

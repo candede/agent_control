@@ -35,6 +35,8 @@ describe("Copilot license usage dashboard", () => {
     expect(screen.queryByText("Unavailable in exports")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.getByText(/base licenses and free Copilot Chat alone are not counted/)).toBeVisible();
+    expect(screen.getByText("Saved user snapshot is available.")).toBeVisible();
+    expect(screen.getByText(/Last successful sync:/)).toHaveTextContent("Sep 12, 2026");
   });
 
   it("ranks measured users in both directions without treating unknown as zero", async () => {
@@ -169,17 +171,24 @@ describe("Copilot license usage dashboard", () => {
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
-  it("clears previously loaded private data if refresh is denied and supports retry", async () => {
+  it("starts an explicit users sync and preserves the last saved view while a post-sync reload fails", async () => {
+    const onSyncUsers = vi.fn().mockResolvedValue(undefined);
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
       .mockRejectedValueOnce(new Error("Authorization changed"))
       .mockResolvedValueOnce(structuredClone(copilotUsageFixture));
-    render(<CopilotUsersView />);
+    const view = render(<CopilotUsersView dataRevision={0} onSyncUsers={onSyncUsers} />);
     await screen.findByRole("button", { name: "Ada" });
-    await userEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
+    await userEvent.click(screen.getByRole("button", { name: "Sync users" }));
+    expect(onSyncUsers).toHaveBeenCalledOnce();
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+
+    view.rerender(<CopilotUsersView dataRevision={1} onSyncUsers={onSyncUsers} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Authorization changed");
-    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
+    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+
+    view.rerender(<CopilotUsersView dataRevision={2} onSyncUsers={onSyncUsers} />);
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(getCopilotUsageUsers).toHaveBeenCalledTimes(3);
   });
 
   it("aborts an old principal request and ignores its late completion", async () => {

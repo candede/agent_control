@@ -5,8 +5,13 @@ import type { PublishedOfficialUsage, UserAgentUsageRow, UserUsageRow } from "..
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotUsageService } from "./copilotUsage.js";
 import type { CopilotDirectoryUser, CopilotReportResult, CopilotUsageGraphClient } from "./copilotUsageGraph.js";
+import type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../db/dataSync.js";
 
 const now = new Date("2026-09-13T01:00:00.000Z");
+const publication = {
+  runId: "11111111-1111-4111-8111-111111111111",
+  jobId: "22222222-2222-4222-8222-222222222222",
+};
 const user: AuthenticatedUser = {
   tenantId: "11111111-1111-1111-1111-111111111111",
   homeAccountId: "principal",
@@ -16,6 +21,63 @@ const user: AuthenticatedUser = {
 };
 
 describe("CopilotUsageService", () => {
+  it("blocks restored provider-disabled user collection before token or Graph access", async () => {
+    const graph = {
+      listLicensedUsers: vi.fn(),
+      listAppActivity: vi.fn(),
+    } as unknown as CopilotUsageGraphClient;
+    const delegatedToken = vi.fn();
+    const value = new CopilotUsageService({} as pg.Pool, {
+      graph,
+      delegatedToken: delegatedToken as never,
+      usageStore: memoryUsageStore(),
+      requireProviderAdmissions: vi.fn(() => {
+        throw new AppError(503, "provider_requalification_required", "Provider work is fenced.");
+      }),
+    });
+    await expect(value.refreshUsers(user, undefined, { publication })).rejects.toMatchObject({ code: "provider_requalification_required" });
+    expect(delegatedToken).not.toHaveBeenCalled();
+    expect(graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(graph.listAppActivity).not.toHaveBeenCalled();
+  });
+
+  it("reads saved user sources without invoking Microsoft Graph and reflects later accepted usage immediately", async () => {
+    let published = emptyPublished();
+    const directory = [directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")];
+    const graph = {
+      listLicensedUsers: vi.fn(async () => { throw new Error("GET must not call Graph"); }),
+      listAppActivity: vi.fn(async () => { throw new Error("GET must not call Graph"); }),
+    } as unknown as CopilotUsageGraphClient;
+    const usageStore = memoryUsageStore(directory, { users: [], reportRefreshDate: null });
+    const value = new CopilotUsageService({} as pg.Pool, {
+      graph,
+      usageStore,
+      now: () => now,
+      loadPublished: vi.fn(async () => published),
+    });
+
+    expect((await value.users(user)).users[0].importedUsage).toBeNull();
+    published = importedPublished(
+      [{ username: "saved@example.com", displayName: "Saved", numberOfAgentsUsed: 1, agentResponsesReceived: 7 }],
+      [],
+    );
+    expect((await value.users(user)).users[0].importedUsage).toMatchObject({ reportedResponsesReceived: 7 });
+    expect(graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(graph.listAppActivity).not.toHaveBeenCalled();
+  });
+
+  it("returns explicit unknown counts before a first saved-data sync", async () => {
+    const value = new CopilotUsageService({} as pg.Pool, {
+      usageStore: memoryUsageStore(),
+      now: () => now,
+      loadPublished: vi.fn(async () => emptyPublished()),
+    });
+    const result = await value.users(user);
+    expect(result.snapshot).toMatchObject({ state: "not_synced", lastSuccessAt: null });
+    expect(result.counts).toMatchObject({ licensedUsers: null, measuredActivityUsers: null });
+    expect(result.users).toEqual([]);
+  });
+
   it("distinguishes response byte limits from user-count limits and missing consent", async () => {
     const result = await service({
       directoryError: new AppError(502, "provider_response_size_limit", "Private provider details"),
@@ -290,13 +352,75 @@ function service(options: {
       return options.report;
     }),
   } as unknown as CopilotUsageGraphClient;
-  return new CopilotUsageService({} as pg.Pool, {
+  const usageStore = memoryUsageStore();
+  const value = new CopilotUsageService({} as pg.Pool, {
     graph,
+    usageStore,
     now: () => now,
     requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
     delegatedToken: vi.fn(async (_principal: string, capability: string) => `${capability}-token`) as never,
+    revalidateUser: vi.fn(async () => user),
+    requireProviderAdmissions: vi.fn(),
     loadPublished: vi.fn(async () => options.published),
   });
+  return {
+    async users(authenticatedUser: AuthenticatedUser) {
+      await value.refreshUsers(authenticatedUser, undefined, { publication });
+      return value.users(authenticatedUser);
+    },
+  };
+}
+
+function memoryUsageStore(
+  directoryValue?: CopilotDirectoryUser[],
+  appActivityValue?: CopilotReportResult,
+) {
+  const sources: {
+    directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
+    appActivity: SavedCopilotUsageSource<CopilotReportResult>;
+  } = {
+    directory: savedSource("directory", directoryValue),
+    appActivity: savedSource("app_activity", appActivityValue),
+  };
+  return {
+    getUserSources: vi.fn(async () => sources),
+    publishDirectory: vi.fn(async (_scope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string) => {
+      sources.directory = savedSource("directory", [...value], observedAt, message);
+      return "11111111-1111-4111-8111-111111111111";
+    }),
+    publishAppActivity: vi.fn(async (_scope, value: CopilotReportResult, observedAt: string, message: string) => {
+      sources.appActivity = savedSource("app_activity", value, observedAt, message);
+      return "22222222-2222-4222-8222-222222222222";
+    }),
+    recordUserSourceFailure: vi.fn(async (
+      _scope,
+      sourceId: CopilotUsageSnapshotSource,
+      status: Exclude<CopilotUsageAttemptStatus, "available">,
+      message: string,
+      attemptedAt: string,
+    ) => {
+      const key = sourceId === "directory" ? "directory" : "appActivity";
+      sources[key] = { ...sources[key], attemptStatus: status, message, attemptedAt };
+    }),
+  };
+}
+
+function savedSource<T>(
+  source: CopilotUsageSnapshotSource,
+  value?: T,
+  observedAt = now.toISOString(),
+  message = "Saved normalized source.",
+): SavedCopilotUsageSource<T> {
+  return {
+    source,
+    attemptStatus: value === undefined ? null : "available",
+    message: value === undefined ? null : message,
+    attemptedAt: value === undefined ? null : observedAt,
+    lastSuccessAt: value === undefined ? null : observedAt,
+    rowCount: value === undefined ? null : Array.isArray(value) ? value.length : "users" in (value as object) ? (value as CopilotReportResult).users.length : null,
+    observedAt: value === undefined ? null : observedAt,
+    value: value ?? null,
+  };
 }
 
 function directoryUser(objectId: string, userPrincipalName: string, displayName = userPrincipalName): CopilotDirectoryUser {

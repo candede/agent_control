@@ -5,10 +5,11 @@ import type {
 } from "../types/workbench.js";
 
 export const workbenchViews: WorkbenchViewDefinition[] = [
-  { id: "agents", label: "Agents", path: "/agents", roles: ["AgentControl.Viewer"], source: "Graph packages and exact control targets" },
+  { id: "agents", label: "Agents", path: "/agents", roles: ["AgentControl.Viewer"], source: "Unified saved Graph package and Power Platform Copilot Studio agent inventory" },
   { id: "power-platform", label: "Power Platform", path: "/power-platform", roles: ["AgentControl.Viewer"], source: "Power Platform Resource Query" },
-  { id: "users", label: "Users", path: "/users", roles: ["AgentControl.Viewer"], source: "Official usage Users and Users & agents exports" },
+  { id: "users", label: "Users", path: "/users", roles: ["AgentControl.Viewer"], source: "Saved Microsoft Graph directory/license and app activity snapshots with imported official agent usage" },
   { id: "official-usage", label: "Official usage", path: "/official-usage", roles: ["AgentControl.Viewer"], source: "Microsoft 365 admin-center three-file exports" },
+  { id: "sync", label: "Sync", path: "/sync", roles: ["AgentControl.Viewer"], source: "Saved data collection, source coverage, and durable sync history" },
   { id: "audit", label: "Audit", path: "/audit", roles: ["AgentControl.Viewer"], source: "Local administrative audit and Microsoft Purview Audit Search" },
   { id: "security", label: "Security", path: "/security", roles: ["AgentControl.Viewer"], source: "Defender fixed-template hunting" },
   { id: "permissions", label: "Permissions", path: "/permissions", roles: ["AgentControl.Viewer"], source: "Agent Control capability registry" },
@@ -16,10 +17,21 @@ export const workbenchViews: WorkbenchViewDefinition[] = [
 ];
 
 export const workbenchActions: WorkbenchActionDefinition[] = [
+  { id: "data-sync.read", label: "Read saved data sync status", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "none", preview: "none", confirmation: "none", recovery: "none", method: "GET", route: "/api/data-sync/state", source: "data_sync" },
+  { id: "data-sync.start", label: "Sync authorized source data", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "none", preview: "none", confirmation: "explicit", recovery: "reauthorize", method: "POST", route: "/api/data-sync/runs", source: "data_sync" },
+  { id: "data-sync.retry", label: "Retry incomplete sync sources", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "sync_run", preview: "none", confirmation: "explicit", recovery: "reauthorize", method: "POST", route: "/api/data-sync/runs/:id/retry", source: "data_sync" },
+  { id: "data-sync.cancel", label: "Cancel current data sync", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "sync_run", preview: "none", confirmation: "explicit", recovery: "cancel_unsent", method: "POST", route: "/api/data-sync/runs/:id/cancel", source: "data_sync" },
   { id: "audit.export", label: "Export exact administrative audit page", roles: ["AgentControl.Viewer"], capabilityId: null,
     nativeTarget: "none", preview: "none", confirmation: "explicit", recovery: "none", method: "POST", route: "/api/audit/events/export.csv", source: "local_audit" },
+  { id: "agent-inventory.read", label: "Read unified agent inventory", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "none", preview: "none", confirmation: "none", recovery: "none", method: "GET", route: "/api/agent-inventory", source: "unified_inventory" },
   { id: "packages.inspect", label: "Inspect saved package", roles: ["AgentControl.Viewer"], capabilityId: null, nativeTarget: "graph_package_id", preview: "none", confirmation: "none", recovery: "none", method: "GET", route: "/api/agents/:id", source: "graph_packages" },
   { id: "packages.refresh", label: "Refresh package inventory", roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.delegated", nativeTarget: "none", preview: "none", confirmation: "explicit", recovery: "reauthorize", method: "POST", route: "/api/agents/refresh-jobs", source: "graph_packages" },
+  { id: "packages.refresh.identities", label: "Refresh matching details", roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.delegated", nativeTarget: "graph_package_id", preview: "none", confirmation: "explicit", recovery: "reauthorize", method: "POST", route: "/api/agents/refresh-jobs", source: "graph_packages" },
   { id: "packages.refresh.exact", label: "Refresh exact package", roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.delegated", nativeTarget: "graph_package_id", preview: "none", confirmation: "explicit", recovery: "reauthorize", method: "POST", route: "/api/agents/:id/refresh-jobs", source: "graph_packages" },
   { id: "packages.refresh.resume", label: "Resume package inventory refresh", roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.delegated", nativeTarget: "provider_job_id", preview: "none", confirmation: "explicit", recovery: "resume_unsent", method: "POST", route: "/api/agents/refresh-jobs/:id/resume", source: "graph_packages" },
   { id: "packages.refresh.exact.resume", label: "Resume exact package refresh", roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.delegated", nativeTarget: "provider_job_id", preview: "none", confirmation: "explicit", recovery: "resume_unsent", method: "POST", route: "/api/agents/refresh-jobs/:id/resume", source: "graph_packages" },

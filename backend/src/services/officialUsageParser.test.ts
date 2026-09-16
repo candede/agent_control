@@ -173,4 +173,23 @@ describe("parseOfficialUsageReport", () => {
         .toThrowError(expect.objectContaining({ code: "invalid_metadata" }));
     }
   });
+
+  it("normalizes header order, CSV quoting, whitespace and row order to the same semantic rows", () => {
+    const conventional = [
+      "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)",
+      "agent-1,Agent One,Declarative,user-1@example.invalid,1000,2026-07-06",
+      "agent-2,Agent Two,Custom,user-2@example.invalid,4,2026-07-05",
+    ].join("\n");
+    const reformatted = [
+      '"Username","Responses sent to users","Agent name","Last activity date (UTC)","Creator type","Agent ID"',
+      '" user-2@example.invalid ","4","Agent Two","2026/07/05","Custom","agent-2"',
+      '"user-1@example.invalid","1,000"," Agent One ","Jul 6, 2026","Declarative","agent-1"',
+    ].join("\r\n");
+    const normalize = (report: ReturnType<typeof parseOfficialUsageReport>) =>
+      [...report.rows].sort((left, right) => ("agentId" in left ? left.agentId : "")
+        .localeCompare("agentId" in right ? right.agentId : ""));
+
+    expect(normalize(parseOfficialUsageReport(bytes(reformatted), metadata)))
+      .toEqual(normalize(parseOfficialUsageReport(bytes(conventional), metadata)));
+  });
 });

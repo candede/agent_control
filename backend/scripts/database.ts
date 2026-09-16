@@ -66,6 +66,13 @@ export async function grantRuntime(database: pg.Pool) {
   if ((await database.query("SELECT to_regclass('public.operational_state') AS table_name")).rows[0].table_name) {
     await database.query("GRANT SELECT ON operational_state TO agentcontrol_app");
   }
+  if ((await database.query("SELECT to_regclass('public.data_sync_runs') AS table_name")).rows[0].table_name) {
+    await database.query(`
+      GRANT SELECT,INSERT,UPDATE ON data_sync_runs,data_sync_run_sources,data_sync_success_markers,
+        copilot_usage_snapshots,copilot_usage_source_state TO agentcontrol_app;
+      GRANT SELECT,INSERT ON data_sync_source_jobs TO agentcontrol_app;
+    `);
+  }
   if ((await database.query("SELECT to_regclass('public.purview_audit_jobs') AS table_name")).rows[0].table_name) {
     await database.query(`
       GRANT SELECT, INSERT, UPDATE ON purview_audit_qualifications TO agentcontrol_app;
@@ -95,6 +102,14 @@ export async function grantRuntime(database: pg.Pool) {
       GRANT SELECT, INSERT, DELETE ON official_usage_version_rows, official_usage_set_versions TO agentcontrol_app;
       GRANT SELECT, INSERT ON official_usage_bundle_receipts TO agentcontrol_app;
       GRANT SELECT, INSERT ON official_usage_audit TO agentcontrol_app;
+    `);
+  }
+  if ((await database.query("SELECT to_regclass('public.official_usage_row_facts') AS table_name")).rows[0].table_name) {
+    await database.query(`
+      GRANT SELECT,INSERT ON official_usage_row_facts TO agentcontrol_app;
+      GRANT EXECUTE ON FUNCTION official_usage_payload_hash(jsonb) TO agentcontrol_app;
+      GRANT EXECUTE ON FUNCTION official_usage_report_content_hash(text,text,date,date,text,timestamptz,text,text,jsonb) TO agentcontrol_app;
+      GRANT EXECUTE ON FUNCTION official_usage_bundle_content_hash(jsonb) TO agentcontrol_app;
     `);
   }
 }
@@ -128,6 +143,21 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
     await remove("administrativeAudit", "audit_events", "observed_at<clock_timestamp()-interval '90 days'");
     await remove("legacyImportReceipts", "legacy_audit_imports", "imported_at<clock_timestamp()-interval '90 days'");
     await remove("capabilityEvidence", "capability_evidence", "expires_at<clock_timestamp()");
+    if ((await client.query("SELECT to_regclass('public.data_sync_runs') AS name")).rows[0].name) {
+      await remove("dataSyncRuns", "data_sync_runs", "expires_at<clock_timestamp()");
+      await remove("copilotUsageSnapshots", "copilot_usage_snapshots", "expires_at<clock_timestamp()");
+      await update("copilotUsageMissingSnapshots", "copilot_usage_source_state",
+        `current_snapshot_id IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM copilot_usage_snapshots snapshot
+          WHERE snapshot.id=copilot_usage_source_state.current_snapshot_id
+            AND snapshot.tenant_id=copilot_usage_source_state.tenant_id
+            AND snapshot.principal_id=copilot_usage_source_state.principal_id
+            AND snapshot.source_id=copilot_usage_source_state.source_id
+            AND snapshot.is_current AND snapshot.expires_at>clock_timestamp())`,
+        "attempt_status='failed',message='The saved snapshot expired; explicit resync is required.',current_snapshot_id=NULL,row_count=NULL,updated_at=clock_timestamp()");
+      await remove("copilotUsageSourceState", "copilot_usage_source_state",
+        `current_snapshot_id IS NULL AND updated_at<clock_timestamp()-interval '30 days'`);
+    }
     await update("powerPlatformExpiredWork", "power_platform_refresh_jobs",
       "status='running' AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())",
       "status='failed',error_code='inventory_job_expired',message='The inventory refresh expired during retention.',finished_at=clock_timestamp(),updated_at=clock_timestamp()");
@@ -167,15 +197,21 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
     await remove("officialStagedRows", "official_usage_staged_rows",
       "EXISTS (SELECT 1 FROM official_usage_staging staging WHERE staging.id=official_usage_staged_rows.staging_id AND staging.status IN ('expired','replaced','cancelled'))");
     await remove("officialConfirmations", "official_usage_confirmations", "expires_at<clock_timestamp() OR consumed_at<clock_timestamp()-interval '1 day'");
-    await update("officialActiveSelection", "official_usage_state",
-      "EXISTS (SELECT 1 FROM official_usage_sets report_set WHERE report_set.id=official_usage_state.active_set_id AND report_set.expires_at<clock_timestamp())",
-      "active_set_id=NULL,revision=revision+1,updated_at=clock_timestamp()");
-    await update("officialSetsExpired", "official_usage_sets", "deleted_at IS NULL AND expires_at<clock_timestamp()", "deleted_at=clock_timestamp()");
     await update("officialVersionsExpired", "official_usage_versions",
-      "deleted_at IS NULL AND (expires_at<clock_timestamp() OR EXISTS (SELECT 1 FROM official_usage_set_versions membership JOIN official_usage_sets report_set ON report_set.id=membership.set_id WHERE membership.version_id=official_usage_versions.id AND report_set.deleted_at IS NOT NULL))",
+      `deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM official_usage_set_versions membership
+          JOIN official_usage_sets report_set ON report_set.id=membership.set_id
+          WHERE membership.version_id=official_usage_versions.id AND report_set.deleted_at IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership
+          JOIN official_usage_sets report_set ON report_set.id=membership.set_id
+          WHERE membership.version_id=official_usage_versions.id AND report_set.deleted_at IS NULL)`,
       "deleted_at=clock_timestamp()");
     await remove("officialRows", "official_usage_version_rows",
       "EXISTS (SELECT 1 FROM official_usage_versions version WHERE version.id=official_usage_version_rows.version_id AND version.deleted_at IS NOT NULL)");
+    await remove("officialRowFacts", "official_usage_row_facts",
+      `NOT EXISTS (SELECT 1 FROM official_usage_version_rows row
+        WHERE row.tenant_id=official_usage_row_facts.tenant_id AND row.kind=official_usage_row_facts.kind
+          AND row.payload_hash=official_usage_row_facts.payload_hash)`);
     await remove("officialStaging", "official_usage_staging", "status<>'active' AND created_at<clock_timestamp()-interval '1 day'");
     await remove("officialBundleReceipts", "official_usage_bundle_receipts", "expires_at<clock_timestamp()");
     await remove("officialAudit", "official_usage_audit", "expires_at<clock_timestamp()");
@@ -184,7 +220,7 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
     await remove("officialVersions", "official_usage_versions",
       "deleted_at<clock_timestamp()-interval '90 days' AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership WHERE membership.version_id=official_usage_versions.id)");
     await remove("officialArtifacts", "official_usage_artifacts",
-      "expires_at<clock_timestamp() AND NOT EXISTS (SELECT 1 FROM official_usage_versions version WHERE version.artifact_id=official_usage_artifacts.id)");
+      "NOT EXISTS (SELECT 1 FROM official_usage_versions version WHERE version.artifact_id=official_usage_artifacts.id)");
     await remove("officialSets", "official_usage_sets",
       "deleted_at<clock_timestamp()-interval '90 days' AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=official_usage_sets.id)");
     await remove("sourceIdentifiers", "source_identifiers", `

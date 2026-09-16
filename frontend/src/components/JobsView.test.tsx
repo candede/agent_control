@@ -1,7 +1,7 @@
-import { render as rtlRender, screen, waitFor } from "@testing-library/react";
+import { act, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
@@ -42,7 +42,35 @@ beforeEach(() => {
   fetchMock.mockResolvedValue(Response.json(emptyProjection));
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("JobsView", () => {
+  it("limits embedded sync history to collection/import sources and opens exact sync runs without reloading", async () => {
+    fetchMock.mockResolvedValue(Response.json({
+      ...emptyProjection,
+      value: [
+        { id: "sync-history", source: "data-sync", label: "Retained sync", target: "4 saved-data sources",
+          status: "completed", total: 4, completed: 4, partial: false, canResume: false, canCancel: false,
+          canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=sync-history" },
+        { id: "mutation-history", source: "package-controls", label: "Package mutation", target: "1 target",
+          status: "completed", total: 1, completed: 1, partial: false, canResume: false, canCancel: false,
+          canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/agents?controlJob=mutation-history" },
+      ],
+      unavailableSources: [{ source: "defender", code: "source_unavailable" }],
+    }));
+    const onOpenSyncRun = vi.fn();
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Admin"] }} scope="sync" onOpenSyncRun={onOpenSyncRun} />);
+    expect(await screen.findByText("Retained sync")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Sync history" })).toBeVisible();
+    expect(screen.queryByText("Package mutation")).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Package controls" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/authorized source.*temporarily unavailable/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("link", { name: "Open sync details" }));
+    expect(onOpenSyncRun).toHaveBeenCalledWith("sync-history");
+  });
+
   it("loads one backend-minimized authorized projection", async () => {
     render(<JobsView user={{ ...user, roles: [...user.roles] }} />);
     expect(await screen.findByText(/No retained jobs are visible/)).toBeInTheDocument();
@@ -100,6 +128,144 @@ describe("JobsView", () => {
     expect(screen.getByRole("button", { name: /Resume unsent/ })).toBeInTheDocument();
     expect(screen.queryByText("Package block")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /GET-only reconcile/ })).not.toBeInTheDocument();
+  });
+
+  it("lets a Viewer retry incomplete data-sync sources and cancel the server-owned run", async () => {
+    const projection = {
+      ...emptyProjection,
+      value: [{
+        id: "sync-job",
+        source: "data-sync",
+        label: "Full data sync",
+        target: "4 saved-data sources",
+        status: "partial",
+        total: 4,
+        completed: 2,
+        partial: true,
+        canResume: true,
+        canCancel: true,
+        canReconcile: false,
+        updatedAt: "2026-09-10T07:00:00.000Z",
+        href: "/agents",
+      }],
+    };
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input === "/api/workbench/jobs") return Response.json(projection);
+      if (input === "/api/data-sync/runs/sync-job/retry") return Response.json({ id: "sync-job" });
+      if (input === "/api/data-sync/runs/sync-job/cancel") return Response.json({ id: "sync-job" });
+      throw new Error(`Unexpected request ${input}`);
+    });
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+
+    expect(await screen.findByRole("link", { name: "Open sync details" })).toHaveAttribute(
+      "href",
+      "/sync?syncRun=sync-job",
+    );
+    expect(screen.getByText(/Data sync · 4 saved-data sources/)).toBeVisible();
+    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/data-sync/runs/sync-job/retry",
+      expect.objectContaining({ method: "POST", body: "{}" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/data-sync/runs/sync-job/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("keeps polling an admitted data-sync run after the retry response is lost", async () => {
+    vi.useFakeTimers();
+    let projectionLoads = 0;
+    const projection = (otherStatus: "running" | "succeeded") => ({
+      ...emptyProjection,
+      value: [
+        {
+          id: "sync-job",
+          source: "data-sync",
+          label: "Full data sync",
+          target: "4 saved-data sources",
+          status: "partial",
+          total: 4,
+          completed: 2,
+          partial: true,
+          canResume: true,
+          canCancel: false,
+          canReconcile: false,
+          updatedAt: "2026-09-10T07:00:00.000Z",
+          href: "/agents?syncRun=sync-job",
+        },
+        {
+          id: "other-job",
+          source: "package-refresh",
+          label: "Other inventory refresh",
+          target: "Current principal Graph package catalog",
+          status: otherStatus,
+          total: 1,
+          completed: otherStatus === "succeeded" ? 1 : 0,
+          partial: false,
+          canResume: false,
+          canCancel: false,
+          canReconcile: false,
+          updatedAt: "2026-09-10T07:00:00.000Z",
+          href: "/agents?refreshJob=other-job",
+        },
+      ],
+    });
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input === "/api/workbench/jobs") {
+        projectionLoads += 1;
+        return Response.json(projection(projectionLoads >= 3 ? "succeeded" : "running"));
+      }
+      if (input === "/api/data-sync/runs/sync-job/retry") throw new Error("Retry response lost");
+      throw new Error(`Unexpected request ${input}`);
+    });
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Retry incomplete" }).click();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("The server could not be reached.");
+    expect(projectionLoads).toBe(2);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/data-sync/runs/sync-job/retry")).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(projectionLoads).toBe(3);
+    const otherJob = screen.getByText("Other inventory refresh").closest("article");
+    expect(otherJob).not.toBeNull();
+    expect(otherJob).toHaveTextContent("succeeded");
+    expect(screen.getByRole("alert")).toHaveTextContent("The server could not be reached.");
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/data-sync/runs/sync-job/retry")).toHaveLength(1);
+  });
+
+  it("filters authorized jobs by their human-readable source", async () => {
+    fetchMock.mockResolvedValue(Response.json({
+      ...emptyProjection,
+      value: [
+        { id: "sync-job", source: "data-sync", label: "Full data sync", target: "4 saved-data sources",
+          status: "completed", total: 4, completed: 4, partial: false, canResume: false, canCancel: false,
+          canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/agents" },
+        { id: "audit-job", source: "purview", label: "Purview Audit Search", target: "fixed preset",
+          status: "succeeded", total: 1, completed: 1, partial: false, canResume: false, canCancel: false,
+          canReconcile: false, updatedAt: "2026-09-10T07:00:00.000Z", href: "/audit?job=audit-job" },
+      ],
+    }));
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+
+    expect(await screen.findByText("Full data sync")).toBeVisible();
+    expect(screen.getByText(/Purview audit · fixed preset/)).toBeVisible();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Filter jobs by source" }), "purview");
+    expect(screen.queryByText("Full data sync")).not.toBeInTheDocument();
+    expect(screen.getByText("Purview Audit Search")).toBeVisible();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Filter jobs by source" }), "data-sync");
+    expect(screen.getByText("Full data sync")).toBeVisible();
+    expect(screen.queryByText("Purview Audit Search")).not.toBeInTheDocument();
   });
 
   it("drops a settled response owned by the previous principal", async () => {

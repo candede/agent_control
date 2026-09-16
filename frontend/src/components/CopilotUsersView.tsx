@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, X } from "lucide-react";
 import {
+  ApiError,
   getCopilotUsageUsers,
   type CopilotAppActivity,
   type CopilotUsageSourceSummary,
@@ -23,32 +24,52 @@ const appFields = [
   ["Loop", "loopCopilotLastActivityDate"],
 ] as const satisfies ReadonlyArray<readonly [string, keyof CopilotAppActivity]>;
 
-export function CopilotUsersView() {
+export function CopilotUsersView({
+  dataRevision = 0,
+  onSyncUsers,
+}: {
+  dataRevision?: number;
+  onSyncUsers?: () => Promise<void>;
+}) {
   const [data, setData] = useState<CopilotUsageUsersResponse>();
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(true);
-  const [revision, setRevision] = useState(0);
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
-    void getCopilotUsageUsers({ signal: controller.signal }).then(result => {
+    void Promise.resolve().then(() => {
+      if (controller.signal.aborted) return undefined;
+      setLoading(true);
+      setError(undefined);
+      return getCopilotUsageUsers({ signal: controller.signal });
+    }).then(result => {
+      if (!result) return;
       if (!controller.signal.aborted) setData(result);
     }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
-        setData(undefined);
+        if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
+          setData(undefined);
+        }
         setError(failure instanceof Error ? failure.message : "License usage could not be loaded.");
       }
     }).finally(() => {
       if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [revision]);
+  }, [dataRevision]);
 
-  function refresh() {
-    setLoading(true);
+  async function syncUsers() {
+    if (!onSyncUsers) return;
+    setSyncing(true);
     setError(undefined);
-    setData(undefined);
-    setRevision(value => value + 1);
+    try {
+      await onSyncUsers();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "The users sync could not be started.");
+    } finally {
+      setSyncing(false);
+    }
   }
 
   return (
@@ -58,12 +79,12 @@ export function CopilotUsersView() {
           <h2>Copilot license usage</h2>
           <p>Current Microsoft 365 Copilot assignments, including qualifying bundles. Microsoft 365 or Office 365 base licenses and free Copilot Chat alone are not counted.</p>
         </div>
-        <button type="button" className="secondary" disabled={loading} onClick={refresh}>
-          <RefreshCw size={16} aria-hidden="true" />{loading ? "Loading..." : "Refresh usage"}
+        <button type="button" className="secondary" disabled={!onSyncUsers || syncing} onClick={() => void syncUsers()}>
+          <RefreshCw size={16} className={syncing ? "spin" : undefined} aria-hidden="true" />{syncing ? "Starting sync..." : "Sync users"}
         </button>
       </header>
       {error ? <div className="error-banner" role="alert">{error} <a href="/permissions">Check permissions</a>, then retry.</div> : null}
-      {loading ? <p role="status">Loading license assignments and usage reports...</p> : null}
+      {loading ? <p role="status">Loading saved license assignments and usage snapshots...</p> : null}
       {data ? <CopilotUsersDashboard data={data} /> : null}
     </section>
   );
@@ -114,6 +135,20 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
   }
 
   return <>
+    {data.snapshot ? (
+      <div className="copilot-users-snapshot" role="status">
+        <strong>
+          {data.snapshot.state === "not_synced"
+            ? "Saved user data has never been collected."
+            : data.snapshot.state === "partial" ? "Saved user snapshot is partial." : "Saved user snapshot is available."}
+        </strong>
+        <span>
+          Last successful sync: {data.snapshot.lastSuccessAt ? formatDateTime(data.snapshot.lastSuccessAt) : "never"}.
+          Directory observed: {data.snapshot.directoryObservedAt ? formatDateTime(data.snapshot.directoryObservedAt) : "never"}.
+          App activity observed: {data.snapshot.appActivityObservedAt ? formatDateTime(data.snapshot.appActivityObservedAt) : "never"}.
+        </span>
+      </div>
+    ) : null}
     <div className="copilot-user-metrics" aria-label="Licensed user summary">
       <Metric label="Licensed users" value={directoryKnown ? data.users.length : null} hint="Microsoft 365 Copilot, not all Microsoft 365 licenses" />
       <Metric label="Using agents" value={directoryKnown && agentUsageFresh ? data.users.filter(user => (responses(user) ?? 0) > 0).length : null} hint="At least one reported agent response" />
@@ -203,6 +238,10 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
     </details> : null}
     {selected ? <CopilotUserDetail user={selected} data={data} threshold={threshold} onClose={() => setSelectedId(undefined)} /> : null}
   </>;
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
 function CopilotUserDetail({ user, data, threshold, onClose }: { user: CopilotUsageUser; data: CopilotUsageUsersResponse; threshold: number; onClose: () => void }) {

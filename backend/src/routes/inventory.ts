@@ -53,7 +53,7 @@ policyRoute(inventoryRouter, "get", "/inventory/snapshots", { access: "authentic
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/resources", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await inventoryRepository.list(requestScope(request), listQuery(request.query)));
+  response.json(await inventoryRepository.list(requestScope(request), inventoryListQuery(request.query)));
 });
 
 policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
@@ -126,7 +126,7 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
   });
   try {
     await validatePublication();
-    const result = await inventoryRepository.list(scope, { ...listQuery(request.query), snapshotId, limit: 5_000, offset: 0, includeAssociations: false });
+    const result = await inventoryRepository.list(scope, { ...inventoryListQuery(request.query), snapshotId, limit: 5_000, offset: 0, includeAssociations: false });
     if (!result.snapshot) throw new AppError(409, "snapshot_unavailable", "The exact Power Platform snapshot is no longer available.");
     if (result.count > 5_000 || result.value.length !== result.count) {
       throw new AppError(413, "export_row_limit", "The filtered Power Platform selection exceeds the 5,000 row export limit.");
@@ -154,10 +154,11 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
   }
 });
 
-function listQuery(query: Record<string, unknown>) {
+export function inventoryListQuery(query: Record<string, unknown>) {
   return {
     snapshotId: optionalUuid(first(query.snapshotId)), type: optionalType(first(query.type)), environmentId: optionalText(first(query.environmentId), 512),
     search: optionalText(first(query.search), 256), sortBy: parseSort(first(query.sortBy)), sortDirection: first(query.sortDirection) === "desc" ? "desc" as const : "asc" as const,
+    excludeAgents: optionalBoolean(first(query.excludeAgents), "excludeAgents") ?? false,
     limit: positiveInteger(first(query.limit), 50, 500), offset: positiveInteger(first(query.offset), 0, 100_000, true),
   };
 }
@@ -184,6 +185,13 @@ function optionalText(value: unknown, maximum: number) {
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value !== "string" || value.length > maximum || /[\r\n\0]/.test(value)) throw new AppError(400, "invalid_inventory_query", "Inventory query text is invalid.");
   return value;
+}
+
+function optionalBoolean(value: string | undefined, name: string) {
+  if (value === undefined) return undefined;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new AppError(400, "invalid_inventory_query", `${name} must be true or false.`);
 }
 
 function exactNativeId(value: string | string[] | undefined) {

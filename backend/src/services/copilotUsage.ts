@@ -1,7 +1,16 @@
 import type pg from "pg";
-import { acquireDelegatedToken } from "../auth/msal.js";
+import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { config } from "../config.js";
+import {
+  DataSyncRepository,
+  type CopilotUsageAttemptStatus,
+  type CopilotUsageSnapshotSource,
+  type DataSyncScope,
+  type SavedCopilotUsageSource,
+  type UserSourcePublication,
+} from "../db/dataSync.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
+import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type {
   CopilotUsageAttention,
@@ -13,6 +22,8 @@ import type {
 import { copilotUsagePeriod } from "../types/copilotUsage.js";
 import type { OfficialUsageUserSummary, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import type { DataSyncSourceState } from "../types/dataSync.js";
+import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import {
   CopilotUsageGraphClient,
@@ -22,6 +33,7 @@ import {
   type CopilotReportUser,
 } from "./copilotUsageGraph.js";
 import { buildOfficialUsageUserView } from "./officialUsageViews.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
 
 const appReportStaleAfterDays = 3;
@@ -29,40 +41,220 @@ const appReportStaleAfterDays = 3;
 type CopilotUsageDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
   delegatedToken: typeof acquireDelegatedToken;
+  revalidateUser: typeof revalidateAuthenticatedUser;
   graph: CopilotUsageGraphClient;
   loadPublished: (tenantId: string) => Promise<PublishedOfficialUsage>;
+  usageStore: Pick<DataSyncRepository,
+    "getUserSources" | "publishDirectory" | "publishAppActivity" | "recordUserSourceFailure">;
+  requireProviderAdmissions: typeof requireProviderAdmissions;
   now: () => Date;
 };
 
 type Loaded<T> =
   | { ok: true; value: T; fetchedAt: string }
-  | { ok: false; message: string };
+  | { ok: false; message: string; status: Exclude<CopilotUsageAttemptStatus, "available"> };
+
+export type CopilotUsageRefreshResult = {
+  status: Extract<DataSyncSourceState, "succeeded" | "partial" | "waiting_authorization" | "permission_required" | "failed">;
+  count: number | null;
+  message: string;
+};
 
 export class CopilotUsageService {
   private readonly dependencies: CopilotUsageDependencies;
 
   constructor(database: pg.Pool, dependencies: Partial<CopilotUsageDependencies> = {}) {
     const repository = new OfficialUsageRepository(database);
+    const usageStore = new DataSyncRepository(database);
     this.dependencies = {
       requireAvailable: capabilities.requireAvailable.bind(capabilities),
       delegatedToken: acquireDelegatedToken,
+      revalidateUser: revalidateAuthenticatedUser,
       graph: new CopilotUsageGraphClient(),
       loadPublished: tenantId => repository.getPublished(tenantId),
+      usageStore,
+      requireProviderAdmissions,
       now: () => new Date(),
       ...dependencies,
     };
   }
 
-  async users(user: AuthenticatedUser, signal?: AbortSignal): Promise<CopilotUsageUsersResponse> {
-    signal?.throwIfAborted();
-    if (!user.tenantId) throw AppError.unauthorized("Copilot usage requires a tenant-scoped session.");
+  async users(user: AuthenticatedUser): Promise<CopilotUsageUsersResponse> {
+    const scope = dataScope(user);
     const generatedAt = this.dependencies.now().toISOString();
-    const [directory, appActivity, imported] = await Promise.all([
-      this.loadDirectory(user, signal),
-      this.loadAppActivity(user, signal),
-      this.loadImported(user.tenantId),
+    const [saved, imported] = await Promise.all([
+      this.dependencies.usageStore.getUserSources(scope),
+      this.loadImported(scope.tenantId),
     ]);
+    const directory = saved.directory.value && saved.directory.observedAt
+      ? { ok: true as const, value: saved.directory.value, fetchedAt: saved.directory.observedAt }
+      : { ok: false as const, message: saved.directory.message ?? "Directory and license data has not been synced for this account.", status: saved.directory.attemptStatus === "permission_required" ? "permission_required" as const : saved.directory.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const };
+    const appActivity = saved.appActivity.value && saved.appActivity.observedAt
+      ? { ok: true as const, value: saved.appActivity.value, fetchedAt: saved.appActivity.observedAt }
+      : { ok: false as const, message: saved.appActivity.message ?? "Microsoft 365 Copilot app activity has not been synced for this account.", status: saved.appActivity.attemptStatus === "permission_required" ? "permission_required" as const : saved.appActivity.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const };
+    return composeCopilotUsageUsers({
+      generatedAt,
+      directory,
+      appActivity,
+      imported,
+      saved,
+    });
+  }
+
+  async refreshUsers(
+    user: AuthenticatedUser,
+    signal: AbortSignal | undefined,
+    options: { incompleteOnly?: boolean; publication: UserSourcePublication },
+  ): Promise<CopilotUsageRefreshResult> {
+    const scope = dataScope(user);
     signal?.throwIfAborted();
+    const before = await this.dependencies.usageStore.getUserSources(scope);
+    const requested: CopilotUsageSnapshotSource[] = options.incompleteOnly
+      ? [
+        ...(before.directory.attemptStatus === "available" ? [] : ["directory" as const]),
+        ...(before.appActivity.attemptStatus === "available" ? [] : ["app_activity" as const]),
+      ]
+      : ["directory", "app_activity"];
+    if (!requested.length) {
+      return { status: "succeeded", count: before.directory.rowCount, message: "All saved user sources already completed successfully." };
+    }
+    this.dependencies.requireProviderAdmissions();
+    await Promise.all(requested.map(sourceId => this.refreshUserSource(scope, user, sourceId, options.publication, signal)));
+    const after = await this.dependencies.usageStore.getUserSources(scope);
+    return userRefreshResult(after);
+  }
+
+  private async refreshUserSource(
+    scope: DataSyncScope,
+    user: AuthenticatedUser,
+    sourceId: CopilotUsageSnapshotSource,
+    publication: UserSourcePublication,
+    signal?: AbortSignal,
+  ) {
+    const attemptedAt = this.dependencies.now().toISOString();
+    const loaded = sourceId === "directory"
+      ? await this.loadDirectory(user, signal)
+      : await this.loadAppActivity(user, signal);
+    signal?.throwIfAborted();
+    if (!loaded.ok) {
+      await this.dependencies.usageStore.recordUserSourceFailure(scope, sourceId, loaded.status, loaded.message, attemptedAt, publication);
+      return;
+    }
+    try {
+      await this.publishWithCurrentAuthorization(scope, user, capabilityForUserSource(sourceId), async () => {
+        signal?.throwIfAborted();
+        if (sourceId === "directory") {
+          const value = loaded.value as CopilotDirectoryUser[];
+          await this.dependencies.usageStore.publishDirectory(
+            scope,
+            value,
+            loaded.fetchedAt,
+            `Saved ${value.length} normalized Microsoft 365 Copilot directory and license records.`,
+            publication,
+          );
+        } else {
+          const value = loaded.value as CopilotReportResult;
+          await this.dependencies.usageStore.publishAppActivity(
+            scope,
+            value,
+            loaded.fetchedAt,
+            `Saved ${value.users.length} normalized Microsoft 365 Copilot app activity records.`,
+            publication,
+          );
+        }
+      });
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (error instanceof AppError && error.code === "data_sync_publication_superseded") throw error;
+      const failure = sourceFailure(error, sourceId === "directory" ? "Directory license data" : "Microsoft 365 Copilot app activity");
+      await this.dependencies.usageStore.recordUserSourceFailure(scope, sourceId, failure.status, failure.message, attemptedAt, publication);
+    }
+  }
+
+  private async publishWithCurrentAuthorization(
+    scope: DataSyncScope,
+    user: AuthenticatedUser,
+    capabilityId: CapabilityId,
+    publish: () => Promise<void>,
+  ) {
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    await commitAccountSessionValidation(validation, async () => {
+      requireSamePrincipal(scope, freshUser);
+      requireViewer(freshUser);
+      await this.dependencies.requireAvailable(capabilityId, freshUser);
+      requireSamePrincipal(scope, user);
+      await publish();
+    });
+  }
+
+  private async loadDirectory(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotDirectoryUser[]>> {
+    try {
+      const token = await this.currentDelegatedToken(dataScope(user), "graph.licenses.read");
+      const value = await this.dependencies.graph.listLicensedUsers(token, signal);
+      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
+    } catch (error) {
+      signal?.throwIfAborted();
+      return sourceFailure(error, "Directory license data", "User.Read.All and LicenseAssignment.Read.All");
+    }
+  }
+
+  private async loadAppActivity(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotReportResult>> {
+    try {
+      const token = await this.currentDelegatedToken(dataScope(user), "reports.copilotUsage.read");
+      const value = await this.dependencies.graph.listAppActivity(token, signal);
+      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
+    } catch (error) {
+      signal?.throwIfAborted();
+      return sourceFailure(error, "Microsoft 365 Copilot app activity", "Reports.Read.All");
+    }
+  }
+
+  private async currentDelegatedToken(scope: DataSyncScope, capabilityId: CapabilityId) {
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    let token = "";
+    await commitAccountSessionValidation(validation, async () => {
+      requireSamePrincipal(scope, freshUser);
+      requireViewer(freshUser);
+      await this.dependencies.requireAvailable(capabilityId, freshUser);
+      token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
+    });
+    return token;
+  }
+
+  private async loadImported(tenantId: string): Promise<Loaded<OfficialUsageUserView>> {
+    try {
+      const published = await this.dependencies.loadPublished(tenantId);
+      const value = buildOfficialUsageUserView(published, {
+        staleAfterDays: config.officialUsageStaleDays,
+        lowResponseThreshold: 5,
+        limit: 100_000,
+        offset: 0,
+        now: this.dependencies.now(),
+      });
+      if (value.users.value.length !== value.users.count) {
+        return { ok: false, message: "Imported agent usage exceeds the dashboard result limit; no imported rows were joined.", status: "failed" };
+      }
+      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      return sourceFailure(error, "Imported agent usage");
+    }
+  }
+}
+
+export function composeCopilotUsageUsers(input: {
+  generatedAt: string;
+  directory: Loaded<CopilotDirectoryUser[]>;
+  appActivity: Loaded<CopilotReportResult>;
+  imported: Loaded<OfficialUsageUserView>;
+  saved?: {
+    directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
+    appActivity: SavedCopilotUsageSource<CopilotReportResult>;
+  };
+}): CopilotUsageUsersResponse {
+    const { generatedAt, directory, appActivity, imported } = input;
     const importedView = imported.ok ? imported.value : null;
     const directoryUsers = directory.ok ? directory.value : [];
     const matching = matchImportedUsage(directoryUsers, importedView?.users.value ?? [], directory.ok);
@@ -74,10 +266,10 @@ export class CopilotUsageService {
       const activity = appMatching.get(directoryUser.identity.objectId) ?? null;
       return buildUser(directoryUser, importedUsage, activity, importedMetricsFresh, appMetricsFresh);
     }).sort(compareUsers);
-    const directorySource = directory.ok
+    let directorySource = directory.ok
       ? source("available", `Loaded ${directoryUsers.length} Microsoft 365 Copilot users from the tenant license catalog, including qualifying bundles. All directory pages were checked against Microsoft Graph totals.`, directory.fetchedAt)
       : unavailableSource(directory.message);
-    const appSource = appActivity.ok
+    let appSource = appActivity.ok
       ? appActivitySource(appActivity, appMatching.size)
       : unavailableSource(appActivity.message, copilotUsagePeriod, "v1");
     const importedSource = imported.ok
@@ -85,10 +277,15 @@ export class CopilotUsageService {
       : unavailableSource(imported.message);
     const metricsAvailable = importedMetricsFresh || appMetricsFresh;
 
+    if (input.saved) {
+      directorySource = savedSourceSummary(input.saved.directory, directorySource);
+      appSource = savedSourceSummary(input.saved.appActivity, appSource);
+    }
     return {
       generatedAt,
       readOnly: true,
       period: copilotUsagePeriod,
+      ...(input.saved ? { snapshot: snapshotMetadata(input.saved) } : {}),
       sources: {
         directory: directorySource,
         appActivity: appSource,
@@ -118,51 +315,106 @@ export class CopilotUsageService {
         "Inactive app attention means no D30 activity date was observed; blank or delayed Office telemetry is not proof that Copilot was never used.",
       ],
     };
-  }
+}
 
-  private async loadDirectory(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotDirectoryUser[]>> {
-    try {
-      await this.dependencies.requireAvailable("graph.licenses.read", user);
-      const token = await this.dependencies.delegatedToken(user.homeAccountId, "graph.licenses.read");
-      const value = await this.dependencies.graph.listLicensedUsers(token, signal);
-      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
-    } catch (error) {
-      signal?.throwIfAborted();
-      return { ok: false, message: sourceErrorMessage(error, "Directory license data", "User.Read.All and LicenseAssignment.Read.All") };
-    }
+function userRefreshResult(saved: {
+  directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
+  appActivity: SavedCopilotUsageSource<CopilotReportResult>;
+}): CopilotUsageRefreshResult {
+  const values = [saved.directory, saved.appActivity];
+  if (values.every(value => value.attemptStatus === "available")) {
+    return {
+      status: "succeeded",
+      count: saved.directory.rowCount,
+      message: `Saved normalized directory/license and app-activity sources${saved.directory.rowCount === null ? "." : ` for ${saved.directory.rowCount} licensed users.`}`,
+    };
   }
+  if (values.some(value => value.value !== null)) {
+    const incomplete = values.filter(value => value.attemptStatus !== "available").map(value => value.source);
+    return {
+      status: "partial",
+      count: saved.directory.rowCount,
+      message: `Saved user data remains available, but ${incomplete.join(" and ")} did not complete the latest refresh.`,
+    };
+  }
+  if (values.some(value => value.attemptStatus === "waiting_authorization")) {
+    return { status: "waiting_authorization", count: null, message: "Explicit resume with renewed Microsoft authorization is required." };
+  }
+  if (values.some(value => value.attemptStatus === "permission_required")) {
+    return { status: "permission_required", count: null, message: "Required delegated Microsoft read permission or provider role is unavailable." };
+  }
+  return { status: "failed", count: null, message: "User sources failed before any normalized saved data could be published." };
+}
 
-  private async loadAppActivity(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotReportResult>> {
-    try {
-      await this.dependencies.requireAvailable("reports.copilotUsage.read", user);
-      const token = await this.dependencies.delegatedToken(user.homeAccountId, "reports.copilotUsage.read");
-      const value = await this.dependencies.graph.listAppActivity(token, signal);
-      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
-    } catch (error) {
-      signal?.throwIfAborted();
-      return { ok: false, message: sourceErrorMessage(error, "Microsoft 365 Copilot app activity", "Reports.Read.All") };
-    }
-  }
+function savedSourceSummary<T>(saved: SavedCopilotUsageSource<T>, current: CopilotUsageSourceSummary): CopilotUsageSourceSummary {
+  if (saved.value === null) return current;
+  if (saved.attemptStatus === "available") return current;
+  const reason = saved.message ?? "The latest refresh did not complete.";
+  return {
+    ...current,
+    state: "partial",
+    message: `${reason} Retained saved data from ${saved.observedAt ?? "the prior successful sync"} is still shown.`,
+    fetchedAt: saved.observedAt,
+  };
+}
 
-  private async loadImported(tenantId: string): Promise<Loaded<OfficialUsageUserView>> {
-    try {
-      const published = await this.dependencies.loadPublished(tenantId);
-      const value = buildOfficialUsageUserView(published, {
-        staleAfterDays: config.officialUsageStaleDays,
-        lowResponseThreshold: 5,
-        limit: 100_000,
-        offset: 0,
-        now: this.dependencies.now(),
-      });
-      if (value.users.value.length !== value.users.count) {
-        return { ok: false, message: "Imported agent usage exceeds the dashboard result limit; no imported rows were joined." };
-      }
-      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
-    } catch (error) {
-      if (!(error instanceof AppError)) throw error;
-      return { ok: false, message: sourceErrorMessage(error, "Imported agent usage") };
-    }
+function snapshotMetadata(saved: {
+  directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
+  appActivity: SavedCopilotUsageSource<CopilotReportResult>;
+}): NonNullable<CopilotUsageUsersResponse["snapshot"]> {
+  const values = [saved.directory, saved.appActivity];
+  const observed = values.map(value => value.observedAt).filter((value): value is string => value !== null).sort();
+  const attempted = values.map(value => value.attemptedAt).filter((value): value is string => value !== null).sort();
+  const success = values.map(value => value.lastSuccessAt).filter((value): value is string => value !== null).sort();
+  const state = observed.length === 0
+    ? "not_synced"
+    : values.every(value => value.value !== null && value.attemptStatus === "available")
+      ? "available"
+      : "partial";
+  return {
+    state,
+    lastAttemptAt: attempted.at(-1) ?? null,
+    lastSuccessAt: success.at(-1) ?? null,
+    directoryObservedAt: saved.directory.observedAt,
+    appActivityObservedAt: saved.appActivity.observedAt,
+  };
+}
+
+function dataScope(user: AuthenticatedUser): DataSyncScope {
+  if (!user.tenantId) throw AppError.unauthorized("Copilot usage requires a tenant-scoped session.");
+  return { tenantId: user.tenantId, principalId: user.homeAccountId };
+}
+
+function capabilityForUserSource(sourceId: CopilotUsageSnapshotSource): CapabilityId {
+  return sourceId === "directory" ? "graph.licenses.read" : "reports.copilotUsage.read";
+}
+
+function requireSamePrincipal(scope: DataSyncScope, user: AuthenticatedUser) {
+  if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) {
+    throw AppError.unauthorized("The signed-in account changed during the user source refresh.");
   }
+}
+
+function requireViewer(user: AuthenticatedUser) {
+  if (!hasAppRole(user.roles, "AgentControl.Viewer")) {
+    throw new AppError(403, "missing_internal_role", "User source refresh requires Viewer.");
+  }
+}
+
+function sourceFailure(
+  error: unknown,
+  label: string,
+  permission?: "User.Read.All and LicenseAssignment.Read.All" | "Reports.Read.All",
+): Extract<Loaded<never>, { ok: false }> {
+  const message = sourceErrorMessage(error, label, permission);
+  const status = error instanceof AppError && (
+    error.status === 401 || ["interaction_required", "authorization_expired", "unauthorized"].includes(error.code)
+  ) ? "waiting_authorization"
+    : error instanceof AppError && (
+      error.status === 403 || ["capability_unavailable", "missing_permission", "missing_internal_role", "Authorization_RequestDenied"].includes(error.code)
+    ) ? "permission_required"
+      : "failed";
+  return { ok: false, message, status };
 }
 
 function matchImportedUsage(

@@ -59,7 +59,10 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   ];
   const acceptBundle = async (correctionOfSetId?: string) => {
     const bundleId=randomUUID();
-    for (const content of reports) {
+    for (const [index, original] of reports.entries()) {
+      const content = correctionOfSetId && index === 2
+        ? original.replace("Fixture user,1,2,2026-06-30", "Fixture user,1,3,2026-06-30")
+        : original;
       const staged=await usage.stage(usageScope,{report:parseOfficialUsageReport(Buffer.from(content),metadata),fileHash:createHash("sha256").update(content).digest("hex"),bundleId,correctionOfSetId});
       await usage.accept(usageScope,staged.id,{stagingRevision:staged.revision,fileHash:staged.fileHash,expectedActiveRevision:staged.activeRevision});
     }
@@ -67,6 +70,13 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   };
   const historicalReports = await acceptBundle();
   const currentReports = await acceptBundle(historicalReports.activeSet!.id);
+  expect(currentReports.activeSet!.id).not.toBe(historicalReports.activeSet!.id);
+  const historicalVersionIds = Object.values(historicalReports.reports).map(report => report!.lineage.versionId);
+  const currentVersionIds = new Set(Object.values(currentReports.reports).map(report => report!.lineage.versionId));
+  const sharedVersionIds = historicalVersionIds.filter(id => currentVersionIds.has(id));
+  const historicalOnlyVersionIds = historicalVersionIds.filter(id => !currentVersionIds.has(id));
+  expect(sharedVersionIds).toHaveLength(2);
+  expect(historicalOnlyVersionIds).toHaveLength(1);
 
   const hunting = new DefenderHuntingRepository(fixture.runtime);
   const huntingScope: DefenderHuntingScope = { tenantId:"fixture-tenant",authorizationPrincipalId:"fixture-principal",
@@ -133,7 +143,9 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect((await new PackageInventoryRepository(restoredRuntime).list({...packageScope,principalId:"other"})).count).toBe(0);
     expect((await new OfficialUsageRepository(restoredRuntime).getPublished(usageScope.tenantId)).reports.users?.rows).toHaveLength(1);
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
-      Object.values(historicalReports.reports).map(report=>report!.versionId)])).rows[0].count).toBe(0);
+      historicalOnlyVersionIds])).rows[0].count).toBe(0);
+    expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
+      sharedVersionIds])).rows[0].count).toBe(2);
     const restoredHunting=new DefenderHuntingRepository(restoredRuntime);
     expect(await restoredHunting.getJob(huntingScope,historicalHunt.jobId)).toBeUndefined();
     expect(await restoredHunting.getJob(huntingScope,currentHunt.jobId)).toBeTruthy();
@@ -164,7 +176,10 @@ async function softDeleteOfficialSet(database: pg.Pool, setId: string) {
   await database.query("UPDATE official_usage_state SET active_set_id=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE active_set_id=$1",[setId]);
   await database.query("UPDATE official_usage_sets SET deleted_at=COALESCE(deleted_at,clock_timestamp()) WHERE id=$1",[setId]);
   await database.query(`UPDATE official_usage_versions version SET deleted_at=COALESCE(version.deleted_at,clock_timestamp())
-    WHERE EXISTS(SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=$1 AND membership.version_id=version.id)`,[setId]);
+    WHERE EXISTS(SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=$1 AND membership.version_id=version.id)
+      AND NOT EXISTS(SELECT 1 FROM official_usage_set_versions membership
+        JOIN official_usage_sets report_set ON report_set.id=membership.set_id
+        WHERE membership.version_id=version.id AND report_set.deleted_at IS NULL)`,[setId]);
 }
 
 function huntingInventoryRow(agentId: string): DefenderAgentInventoryRow {

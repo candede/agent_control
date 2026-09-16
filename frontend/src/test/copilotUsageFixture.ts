@@ -48,6 +48,13 @@ export function licensedUser(index: number, displayName: string, count: number |
 
 export const copilotUsageFixture: CopilotUsageUsersResponse = {
   generatedAt: "2026-09-12T10:00:00.000Z", readOnly: true, period: "D30",
+  snapshot: {
+    state: "available",
+    lastAttemptAt: "2026-09-12T10:00:00.000Z",
+    lastSuccessAt: "2026-09-12T10:00:00.000Z",
+    directoryObservedAt: "2026-09-12T10:00:00.000Z",
+    appActivityObservedAt: "2026-09-12T10:00:00.000Z",
+  },
   sources: {
     directory: {
       state: "available", message: "Current Entra license assignments.",
