@@ -107,6 +107,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const [error, setError] = useState("");
   const [pollingPaused, setPollingPaused] = useState(false);
   const generation = useRef(0);
+  const pollingGeneration = useRef(0);
   const loadController = useRef<AbortController | undefined>(undefined);
   const actionController = useRef<AbortController | undefined>(undefined);
   const timer = useRef<number | undefined>(undefined);
@@ -135,10 +136,11 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
 
   useEffect(() => {
     requestedRunIdRef.current = requestedRunId;
-    sourceStatuses.current = undefined;
-  }, [requestedRunId]);
+    requestedSourceStatuses.current = undefined;
+  }, [principalKey, requestedRunId]);
 
   const stopPolling = useCallback(() => {
+    pollingGeneration.current += 1;
     loadController.current?.abort();
     loadController.current = undefined;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
@@ -157,6 +159,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     statuses: typeof sourceStatuses,
   ) => {
     const priorStatuses = statuses.current;
+    statuses.current = new Map(sources.map(source => [source.source, sourceObservationIdentity(source)]));
     if (priorStatuses) {
       const changed = sources
         .filter(source => {
@@ -168,11 +171,10 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         .map(source => source.source);
       if (changed.length) onSourcesChangedRef.current(changed);
     }
-    statuses.current = new Map(sources.map(source => [source.source, sourceObservationIdentity(source)]));
   }, []);
 
   const applyState = useCallback((next: DataSyncState) => {
-    if (!requestedRunIdRef.current) observeSources(next.sources, sourceStatuses);
+    observeSources(next.sources, sourceStatuses);
 
     stateRef.current = next;
     setState(next);
@@ -201,19 +203,21 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       return false;
     } finally {
       if (loadController.current === controller) loadController.current = undefined;
-      if (owner === generation.current) setLoading(false);
+      if (!controller.signal.aborted && owner === generation.current) setLoading(false);
     }
   }, [applyState]);
 
   const startPolling = useCallback((owner: number, resetBudget: boolean, preserveActionError = false) => {
     stopPolling();
+    const pollingOwner = pollingGeneration.current;
     setPollingPaused(false);
     if (resetBudget || pollDeadline.current === 0) {
       pollDeadline.current = Date.now() + pollBudgetMs;
     }
     const poll = async () => {
       const progressing = await load(owner, preserveActionError);
-      if (owner !== generation.current || !progressing) {
+      if (owner !== generation.current || pollingOwner !== pollingGeneration.current) return;
+      if (!progressing) {
         pollDeadline.current = 0;
         return;
       }
@@ -260,7 +264,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     requestedRunGeneration.current += 1;
     const owner = requestedRunGeneration.current;
     stopRequestedRunPolling();
-    requestedSourceStatuses.current = undefined;
     void Promise.resolve().then(() => {
       if (owner !== requestedRunGeneration.current) return;
       setRequestedRun(undefined);
@@ -308,7 +311,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   ) => {
     if (actionController.current) return;
     const owner = generation.current;
-    const selectedRunId = requestedRunIdRef.current;
     stopPolling();
     const controller = new AbortController();
     actionController.current = controller;
@@ -316,29 +318,22 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     setError("");
     try {
       const run = await operation(controller.signal);
-      if (
-        controller.signal.aborted
-        || owner !== generation.current
-        || selectedRunId !== requestedRunIdRef.current
-      ) return;
-      if (requestedRunId === run.id) {
+      if (controller.signal.aborted || owner !== generation.current) return;
+      if (requestedRunIdRef.current === run.id) {
         requestedRunGeneration.current += 1;
         stopRequestedRunPolling();
         setRequestedRun(run);
         setRequestedRunError("");
+        observeSources(run.sources, requestedSourceStatuses);
         setRequestedRunReload(value => value + 1);
-      } else {
+      } else if (key === "start" || stateRef.current?.run?.id === run.id) {
         applyRun(run);
       }
       startPolling(owner, true);
     } catch (reason) {
-      if (
-        controller.signal.aborted
-        || owner !== generation.current
-        || selectedRunId !== requestedRunIdRef.current
-      ) return;
+      if (controller.signal.aborted || owner !== generation.current) return;
       setError(requestError(reason, "The data sync operation failed."));
-      if (selectedRunId) setRequestedRunReload(value => value + 1);
+      if (requestedRunIdRef.current) setRequestedRunReload(value => value + 1);
       startPolling(owner, true, true);
     } finally {
       if (actionController.current === controller) actionController.current = undefined;
@@ -347,7 +342,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         onRunsChangedRef.current?.();
       }
     }
-  }, [applyRun, requestedRunId, startPolling, stopPolling, stopRequestedRunPolling]);
+  }, [applyRun, observeSources, startPolling, stopPolling, stopRequestedRunPolling]);
 
   const start = useCallback(async (mode: DataSyncMode, sources?: DataSyncSourceId[], clearSavedData = false) => {
     setConfirmClean(false);
@@ -645,7 +640,7 @@ function SyncProgress({ run }: { run: DataSyncRun }) {
       </div>
       {!complete && run.sources.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={run.sources.length} /> : null}
       <p>{complete
-        ? "Your saved data is ready to browse."
+        ? "Your saved data is ready to browse. Sync completion confirms collection, not complete tenant-wide inventory coverage."
         : active && (running.length > 0 || queued)
           ? "Sources can run in parallel. Counts appear as results are saved; this is source progress, not an estimated time."
           : "Review the source statuses below. Completed sources remain available; retry only the sources that need it."}</p>

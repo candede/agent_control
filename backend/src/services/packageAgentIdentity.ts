@@ -93,6 +93,7 @@ export function resolvePackageAgentLinks(
         || identifier.kind === "environment_id" && !sameId(identifier.value, identity.environmentId),
       );
       if (invalidIdentifier || entraIds.length > 1 || botIds.length > 1
+        || supplied(resource.details.schemaName) && !resourceSchemaName
         || identity.entraAgentId && entraIds.length && !entraMatch
         || identity.cdsBotId && botIds.length && !botMatch
         || identity.schemaName && resourceSchemaName && identity.schemaName !== resourceSchemaName) {
@@ -135,28 +136,34 @@ export function resolvePackageAgentLinks(
     };
     return { packageId: value.id, status: "unmatched", reason: "No Power Platform agent matches the package's explicit environment and typed agent identifiers." };
   });
-  const groupedIdentities = new Map<string, { bots: Set<string>; agents: Set<string> }>();
+  const groupedIdentities = new Map<string, { bots: Set<string>; agents: Set<string>; schemas: Set<string> }>();
   for (const resolution of resolutions) {
     if (resolution.status !== "matched") continue;
     const key = identityKey(resolution.resource.environmentId, "native", resolution.resource.nativeId);
-    const group = groupedIdentities.get(key) ?? { bots: new Set<string>(), agents: new Set<string>() };
+    const group = groupedIdentities.get(key) ?? { bots: new Set<string>(), agents: new Set<string>(), schemas: new Set<string>() };
     const identity = identities.get(resolution.packageId)!;
     if (identity.cdsBotId) group.bots.add(identity.cdsBotId);
     if (identity.entraAgentId) group.agents.add(identity.entraAgentId);
+    if (identity.schemaName) group.schemas.add(identity.schemaName);
     groupedIdentities.set(key, group);
   }
   return resolutions.map(resolution => {
     if (resolution.status !== "matched") return resolution;
     const group = groupedIdentities.get(identityKey(resolution.resource.environmentId, "native", resolution.resource.nativeId))!;
-    return group.bots.size > 1 || group.agents.size > 1
-      ? { packageId: resolution.packageId, status: "conflicting", reason: "Package representations disagree about this agent's native identities; no link was created." }
+    return group.bots.size > 1 || group.agents.size > 1 || group.schemas.size > 1
+      ? { packageId: resolution.packageId, status: "conflicting", reason: "Package representations disagree about this agent's native identities or schema name; no link was created." }
       : resolution;
   });
 }
 
 function packageAgentIdentity(value: CopilotPackageDetail): IdentityObservation {
   const groups = value.elementDetails?.filter(group => group.elementType === "AgentMetadatas");
-  if (!groups?.length) return { status: "unmatched", reason: "Agent identity metadata has not been supplied. Refresh package details to check for a source-declared link." };
+  if (!groups?.length) return {
+    status: "unmatched",
+    reason: value.identityDetailsCollected
+      ? "Package details were collected, but Microsoft Graph did not supply agent identity metadata. No cross-source link can be proven from the saved details."
+      : "Agent identity metadata has not been supplied. Refresh package details to check for a source-declared link.",
+  };
   const identities = new Map<string, PackageAgentIdentity>();
   const elementIds = new Set<string>();
   let elementCount = 0;
@@ -180,7 +187,8 @@ function packageAgentIdentity(value: CopilotPackageDetail): IdentityObservation 
       const schemaName = normalizedId(source.SchemaName, schemaNamePattern);
       if (!environmentId || !cdsBotId && !entraAgentId
         || supplied(source.CdsBotId) && !cdsBotId
-        || supplied(metadata.AgentIdentityId) && !entraAgentId) return malformedIdentity("invalid_typed_identity");
+        || supplied(metadata.AgentIdentityId) && !entraAgentId
+        || supplied(source.SchemaName) && !schemaName) return malformedIdentity("invalid_typed_identity");
       const identity = {
         environmentId, ...(cdsBotId ? { cdsBotId } : {}), ...(entraAgentId ? { entraAgentId } : {}),
         ...(schemaName ? { schemaName } : {}),

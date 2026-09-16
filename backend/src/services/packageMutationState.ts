@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { AppError } from "../errors.js";
 import type { AuditAction } from "../types/audit.js";
+import { normalizePackageStatus } from "../types/copilotPackage.js";
 import type { CopilotPackageDetail, PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 
 export type PackageBlockMutationState = {
@@ -61,7 +62,17 @@ export function expectedPackageMutationState(before: PackageMutationState, actio
 }
 
 export function packageMutationStateHash(state: PackageMutationState) {
-  return createHash("sha256").update(JSON.stringify(state)).digest("hex");
+  // Preserve capture's field order for existing hashes; JSONB does not retain object key order.
+  const canonical: PackageMutationState = state.kind === "block"
+    ? { kind: "block", isBlocked: state.isBlocked }
+    : {
+      kind: "access",
+      availableTo: state.availableTo,
+      deployedTo: state.deployedTo,
+      allowedUsersAndGroups: canonicalAccessEntities(state.allowedUsersAndGroups),
+      acquireUsersAndGroups: canonicalAccessEntities(state.acquireUsersAndGroups),
+    };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 export function packageMutationStatesEqual(left: PackageMutationState, right: PackageMutationState) {
@@ -81,11 +92,7 @@ export function canonicalAccessEntities(entities: readonly PackageAccessEntity[]
 }
 
 function normalizeScope(value: string | undefined, principals: PackageAccessEntity[]) {
-  const normalized = value?.replace(/[^a-z0-9]/gi, "").toLowerCase() ?? "";
-  if (["all", "everyone", "allowedforall", "availabletoall", "deployedtoall", "installedforall"].includes(normalized)) return "all" as const;
-  if (["none", "noone", "allowedfornoone", "availabletonoone", "deployedtonone", "installedfornoone", "notavailable", "notdeployed"].includes(normalized)) return "none" as const;
-  if (["some", "allowedforsome", "availabletosome", "deployedtosome", "installedforsome"].includes(normalized) || principals.length) return "some" as const;
-  return "unknown" as const;
+  return normalizePackageStatus(value) ?? (principals.length ? "some" : "unknown");
 }
 
 function ordinal(left: string, right: string) {

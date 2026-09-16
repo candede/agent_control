@@ -5,6 +5,7 @@ import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { normalizePackageStatus } from "../types/copilotPackage.js";
 import type {
   BulkActionResult,
   BulkPackageDetailResult,
@@ -28,31 +29,6 @@ const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
 const bulkWriteConcurrency = 4;
 const bulkWritePauseMs = 250;
-const allAccessScopeIndicators = new Set([
-  "all",
-  "everyone",
-  "allowedforall",
-  "availabletoall",
-  "deployedtoall",
-  "installedforall",
-]);
-const noAccessScopeIndicators = new Set([
-  "none",
-  "noone",
-  "allowedfornoone",
-  "availabletonoone",
-  "deployedtonoone",
-  "installedfornoone",
-  "notavailable",
-  "notdeployed",
-]);
-const specificAccessScopeIndicators = new Set([
-  "some",
-  "allowedforsome",
-  "availabletosome",
-  "deployedtosome",
-  "installedforsome",
-]);
 const defaultRetryPolicy = {
   maxAttempts: 3,
   baseDelayMs: 2_000,
@@ -148,10 +124,14 @@ export class GraphPackagesClient {
       visited.add(nextUrl);
       const page: GraphCollectionResponse<CopilotPackage> =
         await this.requestReadWithRetry(nextUrl, accessToken, options);
-      if (!Array.isArray(page.value) || page.value.length + packages.length > 5000) throw new AppError(502, "provider_schema", "Package collection is invalid or oversized.");
+      if (!page || !Array.isArray(page.value) || page.value.length + packages.length > 5000) throw new AppError(502, "provider_schema", "Package collection is invalid or oversized.");
+      const nextLink = page["@odata.nextLink"];
+      if (nextLink !== undefined && (typeof nextLink !== "string" || !nextLink.trim())) {
+        throw new AppError(502, "provider_schema", "Package collection continuation link is invalid.");
+      }
       packages.push(...page.value.map(allowlistedPackage));
       await options.onProgress?.({ pages: visited.size, observedCount: packages.length });
-      nextUrl = page["@odata.nextLink"];
+      nextUrl = nextLink;
     }
 
     return packages;
@@ -230,8 +210,8 @@ export class GraphPackagesClient {
     init: RequestInit = {},
     options: PackageReadOptions | PackageMutationOptions = {},
   ): Promise<T> {
-    const target = new URL(url);
-    if (target.origin !== "https://graph.microsoft.com" || target.username || target.password || !/^\/(v1\.0|beta)\/copilot\/admin\/catalog\/packages(?:\/|$)/.test(target.pathname)) {
+    const target = URL.parse(url);
+    if (!target || target.origin !== "https://graph.microsoft.com" || target.username || target.password || !/^\/(v1\.0|beta)\/copilot\/admin\/catalog\/packages(?:\/|$)/.test(target.pathname)) {
       throw new AppError(502, "invalid_provider_link", "Provider pagination left the documented package endpoint.");
     }
     options.signal?.throwIfAborted();
@@ -292,9 +272,10 @@ export class GraphPackagesClient {
             this.cooldownError = error;
           }
         }
+        const pathname = URL.parse(url)?.pathname;
         const fields = {
           provider: "graph_packages",
-          stage: new URL(url).pathname.endsWith("/packages") ? "catalog" : "identity",
+          stage: pathname === undefined ? "pagination" : pathname.endsWith("/packages") ? "catalog" : "identity",
           attempt,
           ...graphErrorTelemetry(error),
         };
@@ -576,19 +557,19 @@ function inferCurrentAccessScope(
   target: PackageAccessUpdate["target"],
   principals: PackageAccessEntity[],
 ) {
-  const indicator = normalizeAccessScopeIndicator(
+  const indicator = normalizePackageStatus(
     target === "availability" ? details.availableTo : details.deployedTo,
   );
 
-  if (allAccessScopeIndicators.has(indicator)) {
+  if (indicator === "all") {
     return "all" as const;
   }
 
-  if (noAccessScopeIndicators.has(indicator)) {
+  if (indicator === "none") {
     return "none" as const;
   }
 
-  if (specificAccessScopeIndicators.has(indicator)) {
+  if (indicator === "some") {
     return "specific" as const;
   }
 
@@ -597,10 +578,6 @@ function inferCurrentAccessScope(
   }
 
   return "unknown" as const;
-}
-
-function normalizeAccessScopeIndicator(value: string | undefined) {
-  return value?.replace(/[^a-z0-9]/gi, "").toLowerCase() ?? "";
 }
 
 function formatAccessScope(scope: "all" | "specific" | "none" | "unknown") {

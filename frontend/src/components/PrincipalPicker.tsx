@@ -10,9 +10,10 @@ type PrincipalFilter = "all" | "users" | "security" | "microsoft365";
 type PrincipalPickerProps = {
   selected: DirectoryPrincipal[];
   onChange: (selected: DirectoryPrincipal[]) => void;
+  disabled?: boolean;
 };
 
-export function PrincipalPicker({ selected, onChange }: PrincipalPickerProps) {
+export function PrincipalPicker({ selected, onChange, disabled = false }: PrincipalPickerProps) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<PrincipalFilter>("all");
   const [results, setResults] = useState<DirectoryPrincipal[]>([]);
@@ -71,6 +72,7 @@ export function PrincipalPicker({ selected, onChange }: PrincipalPickerProps) {
             <input
               type="search"
               value={query}
+              disabled={disabled}
               placeholder="Name or email"
               onChange={(event) => {
                 const nextQuery = event.target.value;
@@ -87,6 +89,7 @@ export function PrincipalPicker({ selected, onChange }: PrincipalPickerProps) {
           <span>Type</span>
           <select
             value={filter}
+            disabled={disabled}
             onChange={(event) =>
               setFilter(event.target.value as PrincipalFilter)
             }
@@ -119,6 +122,7 @@ export function PrincipalPicker({ selected, onChange }: PrincipalPickerProps) {
           <button
             type="button"
             className="principal-result"
+            disabled={disabled}
             key={principalKey(principal)}
             onClick={() => onChange([...selected, principal])}
           >
@@ -156,6 +160,7 @@ export function PrincipalPicker({ selected, onChange }: PrincipalPickerProps) {
               <button
                 type="button"
                 className="icon-button"
+                disabled={disabled}
                 aria-label={`Remove ${principal.displayName}`}
                 title={`Remove ${principal.displayName}`}
                 onClick={() =>

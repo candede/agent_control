@@ -5,6 +5,7 @@ import { packageInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import {
   formatAgentAuthoringTool, formatPackageFacetLabel as formatFacetLabel, normalizePackageAuthoringTool as normalizeBuiltWith,
+  normalizePackageStatus, packageStatusAliases,
   type CopilotPackageDetail,
 } from "../types/copilotPackage.js";
 import { pool, transaction } from "./pool.js";
@@ -530,7 +531,8 @@ function listFilters(snapshotId: string, scope: PackageDataScope, query: Package
     const availableTo = query.availableTo.startsWith("available:") ? query.availableTo.slice("available:".length) : query.availableTo;
     if (availableTo === "__unknown__") conditions.push("available_to IS NULL");
     else if (availableTo === "__some_or_all__") {
-      conditions.push("lower(regexp_replace(available_to,'[^a-z0-9]','','g'))=ANY(ARRAY['all','some','allowedforall','allowedforsome'])");
+      values.push([...packageStatusAliases.all, ...packageStatusAliases.some]);
+      conditions.push(`regexp_replace(lower(available_to),'[^a-z0-9]','','g')=ANY($${values.length}::text[])`);
     } else {
       values.push(availableTo);
       conditions.push(`available_to=$${values.length}`);
@@ -549,9 +551,13 @@ function listFilters(snapshotId: string, scope: PackageDataScope, query: Package
     }
   }
   if (query.platform) {
-    values.push(normalizeBuiltWith(query.platform));
-    conditions.push(`regexp_replace(lower(COALESCE(NULLIF(package_data->>'authoringTool',''),NULLIF(package_data->>'platform',''),
-      substring(package_data->>'shortDescription' from '(?i)^built\\s+using\\s+(.+?)[.]?$'),'')),'[^a-z0-9]','','g')=$${values.length}`);
+    const platform = normalizeBuiltWith(query.platform);
+    values.push(platform);
+    const savedPlatform = `regexp_replace(lower(COALESCE(NULLIF(package_data->>'authoringTool',''),NULLIF(package_data->>'platform',''),
+      substring(package_data->>'shortDescription' from '(?i)^built\\s+using\\s+(.+?)[.]?$'),'')),'[^a-z0-9]','','g')`;
+    conditions.push(platform === "copilotstudio"
+      ? `${savedPlatform} LIKE '%' || $${values.length} || '%'`
+      : `${savedPlatform}=$${values.length}`);
   }
   if (query.createdWithinDays !== undefined) {
     values.push(query.createdWithinDays);
@@ -596,7 +602,10 @@ export function packageFacets(values: readonly CopilotPackageDetail[]): PackageL
     const builtWith = builtWithLabel(value);
     if (builtWith) platforms.set(builtWith, builtWith);
   }
-  if ([...availability.keys()].some(value => ["available:all", "available:some", "available:allowedForAll", "available:allowedForSome"].includes(value))) {
+  if (values.some(value => {
+    const status = normalizePackageStatus(value.availableTo);
+    return status === "all" || status === "some";
+  })) {
     availability.set("__some_or_all__", "Allowed for Some or All");
   }
   const options = (map: Map<string, string>) => [...map].map(([value, label]) => ({ value, label }))

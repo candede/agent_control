@@ -9,14 +9,22 @@ export type PackageAccessMutationMode = "add" | "replace";
 
 export type PackageAccessScope = "specific" | "none";
 
-export type PackageStatus =
-  | "all"
-  | "some"
-  | "none"
-  | "allowedForAll"
-  | "allowedForSome"
-  | "allowedForNoOne"
-  | "unknownFutureValue";
+// Provider strings, including future values, stay raw until normalized for an access decision.
+export type PackageStatus = string;
+
+export const packageStatusAliases = {
+  all: ["all", "everyone", "allowedforall", "availabletoall", "deployedtoall", "installedforall"],
+  some: ["some", "allowedforsome", "availabletosome", "deployedtosome", "installedforsome"],
+  none: ["none", "noone", "allowedfornoone", "availabletonoone", "deployedtonoone", "deployedtonone", "installedfornoone", "notavailable", "notdeployed"],
+} as const;
+
+export function normalizePackageStatus(value: PackageStatus | undefined): "all" | "some" | "none" | undefined {
+  const normalized = value?.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  for (const status of ["all", "some", "none"] as const) {
+    if (packageStatusAliases[status].some(alias => alias === normalized)) return status;
+  }
+  return undefined;
+}
 
 export type PackageAccessUpdate =
   | {
@@ -90,11 +98,12 @@ export function formatPackageFacetLabel(value: string) {
 }
 
 export function normalizePackageAuthoringTool(value: string) {
-  return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+  const normalized = value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+  return normalized.includes("copilotstudio") ? "copilotstudio" : normalized;
 }
 
 export function formatAgentAuthoringTool(value: string) {
-  return normalizePackageAuthoringTool(value).includes("copilotstudio") ? "Copilot Studio" : formatPackageFacetLabel(value);
+  return normalizePackageAuthoringTool(value) === "copilotstudio" ? "Copilot Studio" : formatPackageFacetLabel(value);
 }
 
 export type BulkPackageResult = {

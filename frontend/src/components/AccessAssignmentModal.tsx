@@ -43,18 +43,24 @@ export function AccessAssignmentModal({
   const capabilities = useCapabilityContext();
   const directory = capabilities.views.find(view => view.definition.id === "graph.directory.read");
   const directoryAllowed = providerActionAllowed(directory, false, capabilities.now);
-  const initialScope = getInitialAccessScope(initialStatus, initialPrincipals);
+  const [initialAccess] = useState(() => ({
+    status: initialStatus,
+    principals: initialPrincipals,
+    scope: getInitialAccessScope(initialStatus, initialPrincipals),
+  }));
   const [target, setTarget] = useState<PackageAccessTarget>(initialTarget);
   const [mode, setMode] = useState<PackageAccessMutationMode>("replace");
   const [scope, setScope] = useState<AccessScopeSelection | undefined>(
-    initialScope,
+    initialAccess.scope,
   );
   const [selected, setSelected] = useState<DirectoryPrincipal[]>([]);
-  const [resolving, setResolving] = useState(
-    initialScope === "specific" && initialPrincipals.length > 0,
-  );
+  const [principalsInitialized, setPrincipalsInitialized] = useState(false);
+  const resolving = initialAccess.scope === "specific"
+    && initialAccess.principals.length > 0
+    && !principalsInitialized;
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const locked = busy || submitting;
   const [error, setError] = useState<string>();
   const dialogRef = useRef<HTMLElement>(null);
 
@@ -87,13 +93,13 @@ export function AccessAssignmentModal({
   }, [busy, onCancel, submitting]);
 
   useEffect(() => {
-    if (!directoryAllowed || initialScope !== "specific" || initialPrincipals.length === 0) {
+    if (!directoryAllowed || !resolving) {
       return;
     }
 
     let cancelled = false;
 
-    void resolveDirectoryPrincipals(initialPrincipals)
+    void resolveDirectoryPrincipals(initialAccess.principals)
       .then((response) => {
         if (!cancelled) {
           setSelected(response.value);
@@ -101,20 +107,20 @@ export function AccessAssignmentModal({
       })
       .catch((requestError) => {
         if (!cancelled) {
-          setSelected(initialPrincipals.map(fallbackPrincipal));
+          setSelected(initialAccess.principals.map(fallbackPrincipal));
           setError(errorMessage(requestError));
         }
       })
       .finally(() => {
         if (!cancelled) {
-          setResolving(false);
+          setPrincipalsInitialized(true);
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [initialPrincipals, initialScope, directoryAllowed]);
+  }, [initialAccess, resolving, directoryAllowed]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
@@ -190,6 +196,7 @@ export function AccessAssignmentModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="access-assignment-title"
+        aria-busy={locked}
         tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
       >
@@ -225,7 +232,7 @@ export function AccessAssignmentModal({
             <button
               type="button"
               aria-current={target === "availability" ? "page" : undefined}
-              disabled={context === "single" && target !== "availability"}
+              disabled={locked || (context === "single" && target !== "availability")}
               onClick={() => {
                 setTarget("availability");
                 setConfirming(false);
@@ -237,7 +244,7 @@ export function AccessAssignmentModal({
             <button
               type="button"
               aria-current={target === "installation" ? "page" : undefined}
-              disabled={context === "single" && target !== "installation"}
+              disabled={locked || (context === "single" && target !== "installation")}
               onClick={() => {
                 setTarget("installation");
                 setConfirming(false);
@@ -270,6 +277,7 @@ export function AccessAssignmentModal({
                   <button
                     type="button"
                     aria-pressed={mode === "add"}
+                    disabled={locked}
                     onClick={() => handleModeChange("add")}
                   >
                     Add
@@ -277,6 +285,7 @@ export function AccessAssignmentModal({
                   <button
                     type="button"
                     aria-pressed={mode === "replace"}
+                    disabled={locked}
                     onClick={() => handleModeChange("replace")}
                   >
                     Replace
@@ -291,7 +300,7 @@ export function AccessAssignmentModal({
                 {context === "single" ? (
                   <span className="access-current-setting">
                     Current:{" "}
-                    {formatAccessScope(initialStatus, initialPrincipals)}
+                    {formatAccessScope(initialAccess.status, initialAccess.principals)}
                   </span>
                 ) : null}
               </legend>
@@ -318,7 +327,7 @@ export function AccessAssignmentModal({
                     type="radio"
                     name="access-scope"
                     checked={scope === "none"}
-                    disabled={mode === "add"}
+                    disabled={locked || mode === "add"}
                     onChange={() => {
                       setScope("none");
                       setConfirming(false);
@@ -334,6 +343,7 @@ export function AccessAssignmentModal({
                     type="radio"
                     name="access-scope"
                     checked={scope === "specific"}
+                    disabled={locked}
                     onChange={() => {
                       setScope("specific");
                       setConfirming(false);
@@ -370,6 +380,7 @@ export function AccessAssignmentModal({
                 ) : (
                   <PrincipalPicker
                     selected={selected}
+                    disabled={locked}
                     onChange={(principals) => {
                       setSelected(principals);
                       setConfirming(false);
@@ -420,10 +431,9 @@ export function AccessAssignmentModal({
             disabled={
               busy ||
               submitting ||
-              resolving ||
               !scope ||
               scope === "all" ||
-              (scope === "specific" && selected.length === 0)
+              (scope === "specific" && (!directoryAllowed || resolving || selected.length === 0))
             }
             onClick={() => void handleApply()}
           >

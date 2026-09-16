@@ -57,6 +57,17 @@ describe("explicit package-to-agent identity", () => {
     })])[0].status).toBe("unmatched");
   });
 
+  it("distinguishes uncollected details from collected details without provider identity metadata", () => {
+    const value = packaged();
+    delete value.elementDetails;
+    expect(resolvePackageAgentLinks("tenant-a", [value], [resource()])[0]).toMatchObject({
+      status: "unmatched", reason: expect.stringContaining("Refresh package details"),
+    });
+    expect(resolvePackageAgentLinks("tenant-a", [{ ...value, identityDetailsCollected: true }], [resource()])[0]).toMatchObject({
+      status: "unmatched", reason: "Package details were collected, but Microsoft Graph did not supply agent identity metadata. No cross-source link can be proven from the saved details.",
+    });
+  });
+
   it("requires environment, schema name and source-declared CDS identity together for inventory native IDs", () => {
     const value = packaged({ SourceIds: { EnvironmentId: environmentId, SchemaName: "cr123_clinicalAgent", CdsBotId: cdsBotId } });
     const saved = resource({
@@ -81,6 +92,91 @@ describe("explicit package-to-agent identity", () => {
     const different = { ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: otherId }, AgentIdentityId: entraAgentId }), id: "other-package" };
     expect(resolvePackageAgentLinks("tenant-a", [packaged(), different], [resource()]).map(result => result.status))
       .toEqual(["conflicting", "conflicting"]);
+  });
+
+  it("rejects cross-package schema disagreements", () => {
+    const packages = ["cr123_agent", "cr123_other"].map((SchemaName, index) => ({
+      ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName }, AgentIdentityId: entraAgentId }),
+      id: `package-${index}`,
+    }));
+    for (const ordered of [packages, [...packages].reverse()]) {
+      expect(resolvePackageAgentLinks("tenant-a", ordered, [resource()]).map(result => result.status))
+        .toEqual(["conflicting", "conflicting"]);
+    }
+  });
+
+  it("allows absent and case-equivalent schema names across package representations", () => {
+    const packages = [undefined, "", null, "cr123_agent", "CR123_AGENT", "cr123_agent"].map((SchemaName, index) => ({
+      ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName }, AgentIdentityId: entraAgentId }),
+      id: `package-${index}`,
+    }));
+    expect(resolvePackageAgentLinks("tenant-a", packages, [resource()]).map(result => result.status))
+      .toEqual(packages.map(() => "matched"));
+    const otherEnvironment = {
+      ...packaged({ SourceIds: { EnvironmentId: otherId, CdsBotId: cdsBotId, SchemaName: "cr123_other" }, AgentIdentityId: entraAgentId }),
+      id: "other-environment",
+    };
+    expect(resolvePackageAgentLinks("tenant-a", [...packages, otherEnvironment], [
+      resource(), resource({ environmentId: otherId, identifiers: [{ kind: "entra_agent_id", value: entraAgentId }] }),
+    ]).map(result => result.status)).toEqual([...packages, otherEnvironment].map(() => "matched"));
+  });
+
+  it.each([
+    { name: "invalid characters", SchemaName: "invalid-schema" },
+    { name: "trailing newline", SchemaName: "cr123_agent\n" },
+    { name: "overlong string", SchemaName: "a".repeat(513) },
+    { name: "number", SchemaName: 123 },
+    { name: "boolean", SchemaName: false },
+    { name: "array", SchemaName: [] },
+    { name: "object", SchemaName: {} },
+  ])(
+    "rejects malformed supplied package schema names ($name)",
+    ({ SchemaName }) => {
+      const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const value = packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName }, AgentIdentityId: entraAgentId });
+      expect(resolvePackageAgentLinks("tenant-a", [value], [resource()])[0]).toMatchObject({
+        status: "unmatched", reason: expect.stringContaining("invalid"),
+      });
+      expect(log).toHaveBeenCalledOnce();
+      expect(JSON.stringify(log.mock.calls)).toContain("invalid_typed_identity");
+    },
+  );
+
+  it.each([1, 512])("accepts corroborated schema names at the %i-character boundary", length => {
+    const schemaName = "a".repeat(length);
+    const value = packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: schemaName } });
+    const saved = resource({
+      identifiers: [{ kind: "environment_id", value: environmentId }],
+      details: { schemaName: schemaName.toUpperCase() },
+    });
+    expect(resolvePackageAgentLinks("tenant-a", [value], [saved])[0]).toMatchObject({
+      status: "matched", controlBotId: cdsBotId, evidence: [{ kind: "environment_schema_native_id" }],
+    });
+  });
+
+  it.each([
+    { name: "invalid characters", schemaName: "invalid-schema" },
+    { name: "trailing newline", schemaName: "cr123_agent\n" },
+    { name: "overlong string", schemaName: "a".repeat(513) },
+  ])(
+    "rejects malformed supplied inventory schema names ($name)",
+    ({ schemaName }) => {
+      expect(resolvePackageAgentLinks("tenant-a", [packaged()], [resource({ details: { schemaName } })])[0])
+        .toMatchObject({ status: "conflicting", reason: expect.stringContaining("conflicting") });
+    },
+  );
+
+  it("never qualifies a control identity using schema names with a trailing newline", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const SchemaName = "cr123_agent\n";
+    const value = packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName } });
+    const saved = resource({ identifiers: [{ kind: "environment_id", value: environmentId }], details: { schemaName: SchemaName } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    const now = Date.parse("2026-09-16T12:00:00.000Z");
+    expect(withVerifiedControlIdentities([saved], links, {
+      [value.id]: { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString() },
+    }, now)[0]).toBe(saved);
+    expect(links[0].status).toBe("unmatched");
   });
 
   it("qualifies control identities only from fresh corroborated observations without mutating saved resources", () => {

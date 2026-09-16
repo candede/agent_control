@@ -18,8 +18,7 @@ export function providerActionAllowed(view: CapabilityView | undefined, _write?:
 
 function isOnDemandDecision(view: CapabilityView) {
   const { definition, decision } = view;
-  const packageWrite = definition.id === "graph.package.block.manage" || definition.id === "graph.package.access.manage";
-  return (packageWrite || definition.id === "powerPlatform.quarantine.manage")
+  return definition.probe.kind === "on_demand"
     && definition.mode === "delegated" && definition.probe.adapterRegistered
     && decision.capabilityId === definition.id
     && decision.status === "available" && decision.authorized === true && decision.fresh === true
@@ -40,8 +39,7 @@ export function currentVerification(view: CapabilityView, now = Date.now()) {
   if (!capabilityModeEnabled(view) || !decision.authorized || decision.status !== "available") return undefined;
   if (decision.verification === "on_demand") return isOnDemandDecision(view) ? "on_demand" : undefined;
   if (definition.mode === "local") return decision.verification === "local" ? "local" : undefined;
-  const checkedAt = Date.parse(decision.checkedAt ?? "");
-  if (!Number.isFinite(checkedAt) || checkedAt > now || !evidenceIsFresh(view, now)) return undefined;
+  if (!evidenceIsFresh(view, now)) return undefined;
   return decision.verification === "provider" || decision.verification === "token" ? decision.verification : undefined;
 }
 
@@ -110,7 +108,10 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
         : "Not checked yet. Automatic safe checks run while this signed-in UI is active.";
     case "available":
       if (!decision.authorized) return "Current authorization is not established. Previous successful checks do not grant access.";
-      if (currentVerification(view, now) === "on_demand") return "Ready to try. Microsoft validates delegated permissions and provider roles on the actual operation. Review and confirm the exact targets before submitting a change.";
+      if (currentVerification(view, now) === "on_demand") {
+        const confirmation = definition.dataClass === "package_control" ? " Review and confirm the exact targets before submitting a change." : "";
+        return `Ready to try. Microsoft validates delegated permissions and provider roles on the actual operation.${confirmation}`;
+      }
       if (definition.mode !== "local" && !decision.checkedAt) return "Not checked yet. Current token or provider verification is not established.";
       if (definition.mode !== "local" && !providerEvidenceIsFresh(view, now)) return staleExplanation(view);
       if (currentVerification(view, now) === "token") return "Token acquired. Ready to try; provider role, license, and operation access have not been verified.";
@@ -161,11 +162,13 @@ export function capabilityNextStep(view: CapabilityView, now = Date.now()): { te
 }
 
 function providerEvidenceIsFresh(view: CapabilityView, now: number) {
-  return view.decision.fresh && Boolean(view.decision.expiresAt) && Date.parse(view.decision.expiresAt!) > now;
+  const checkedAt = Date.parse(view.decision.checkedAt ?? "");
+  const expiresAt = Date.parse(view.decision.expiresAt ?? "");
+  return view.decision.fresh && Number.isFinite(checkedAt) && checkedAt <= now && expiresAt > now;
 }
 
 function staleExplanation(view: CapabilityView) {
   return view.definition.probe.kind === "live_qualification" && view.definition.mode === "application"
       ? "Provider operation evidence is stale. An Admin must explicitly approve a new bounded application-scope operation; automatic refresh does not run it. Authorized saved data remains readable."
-    : "Evidence is stale. An automatic safe check is pending; authorized saved data remains readable.";
+    : "Evidence is stale. Open Permissions and use Check status to retry; authorized saved data remains readable.";
 }

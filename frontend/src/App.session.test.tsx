@@ -7,6 +7,7 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import App from "./App";
 import {
   getAgents,
+  type BulkActionJob,
   type CopilotPackage,
   type InventoryRefreshJob,
   type PackagePage,
@@ -953,6 +954,119 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("heading", { name: "Sync history" })).toBeInTheDocument();
   });
 
+  it.each([
+    ["refresh", "succeeded", "running"],
+    ["resume", "waiting_authorization", "running"],
+    ["poll", "running", "waiting_authorization"],
+  ] as const)(
+    "does not let delayed Power Platform history replace a newer %s",
+    async (action, previousStatus, nextStatus) => {
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const previousJob = inventoryRefreshJob(previousStatus, "previous-job");
+      const nextJob = inventoryRefreshJob(nextStatus, action === "refresh" ? "new-job" : previousJob.id);
+      let delayHistory = false;
+      let delayedHistoryRequested = false;
+      let releaseHistory!: (response: Response) => void;
+      const delayedHistory = new Promise<Response>(resolve => { releaseHistory = resolve; });
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === "/api/inventory/refresh-jobs" && !init?.method) {
+          if (delayHistory) {
+            delayedHistoryRequested = true;
+            return delayedHistory.then(response => response.clone());
+          }
+          return Response.json({ value: [previousJob], lastAttemptAt: null, lastSuccessAt: null });
+        }
+        if (
+          (input === "/api/inventory/refresh-jobs" && init?.method === "POST")
+          || input === `/api/inventory/refresh-jobs/${previousJob.id}/resume`
+          || input === `/api/inventory/refresh-jobs/${nextJob.id}`
+        ) return Response.json(nextJob);
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+
+      delayHistory = true;
+      await userEvent.click(screen.getByRole("searchbox", { name: "Search" }));
+      await userEvent.paste("Sensitive");
+      await waitFor(() => expect(delayedHistoryRequested).toBe(true));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      if (action !== "poll") {
+        await userEvent.click(screen.getByRole("button", {
+          name: action === "resume" ? "Resume PP agent refresh" : "Refresh PP agent inventory",
+        }));
+      }
+      const latestStatus = new RegExp(`Latest agent refresh: ${nextStatus.replaceAll("_", " ")}`);
+      expect(await screen.findByText(latestStatus, {}, { timeout: 3_000 })).toBeVisible();
+
+      await act(async () => {
+        releaseHistory(Response.json({ value: [previousJob], lastAttemptAt: null, lastSuccessAt: null }));
+      });
+      expect(screen.getByText(latestStatus)).toBeVisible();
+      if (nextStatus === "running") {
+        expect(screen.getByRole("button", { name: "Refresh PP agent inventory" })).toBeDisabled();
+        expect(screen.queryByRole("button", { name: "Resume PP agent refresh" })).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByRole("button", { name: "Resume PP agent refresh" })).toBeEnabled();
+      }
+      await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith(
+        `/api/inventory/refresh-jobs/${nextJob.id}`,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ), { timeout: 3_000 });
+    },
+  );
+
+  it("reports Power Platform history failures without discarding saved agent inventory", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/inventory/refresh-jobs") {
+        return Response.json({
+          code: "inventory_history_unavailable",
+          detail: "Synthetic inventory history failure.",
+        }, { status: 503 });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(await screen.findByText(/Unable to load Power Platform agent refresh history: Synthetic inventory history failure/)).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(screen.getByRole("heading", { name: "Agent inventory sources" })).toBeVisible();
+    expect(screen.getByText("Total").nextElementSibling).toHaveTextContent("1");
+  });
+
+  it("ignores Power Platform history failures from a superseded inventory read", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let historyRequests = 0;
+    let releaseHistory!: (response: Response) => void;
+    const delayedHistory = new Promise<Response>(resolve => { releaseHistory = resolve; });
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/inventory/refresh-jobs" && ++historyRequests === 1) return delayedHistory;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(historyRequests).toBe(1));
+    await userEvent.click(screen.getByRole("searchbox", { name: "Search" }));
+    await userEvent.paste("Sensitive");
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+
+    await act(async () => {
+      releaseHistory(Response.json({
+        code: "inventory_history_unavailable",
+        detail: "Superseded history failure.",
+      }, { status: 503 }));
+    });
+    expect(screen.queryByText(/Unable to load Power Platform agent refresh history/)).not.toBeInTheDocument();
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+  });
+
   it.each(["matching details", "Power Platform inventory"] as const)(
     "preserves selection and filters across Sync navigation when a delayed %s refresh completes",
     async refreshKind => {
@@ -1681,7 +1795,370 @@ describe("App session revalidation", () => {
     expect(preview).toBeGreaterThan(detail);
     expect(calls.some(([path]) => String(path).endsWith("/access"))).toBe(false);
   });
+
+  it.each(["navigation", "session revalidation"] as const)(
+    "discards a delayed bulk preview after %s",
+    async scenario => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let preview: Response | undefined;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === "/api/agents/mutation-preview") {
+          preview = await base(input, init);
+          return pending.promise;
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+      await waitFor(() => expect(preview).toBeDefined());
+      if (scenario === "navigation") {
+        await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+      } else {
+        await revalidateTransportSession(transport.session);
+      }
+      await act(async () => pending.resolve(preview!));
+      expect(screen.queryByRole("dialog", { name: /block package/i })).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps the newest bulk preview when responses arrive out of order", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let blockPreview: Response | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/agents/mutation-preview" && JSON.parse(String(init?.body)).action === "block") {
+        blockPreview = await base(input, init);
+        return pending.promise;
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+    await userEvent.click(screen.getByRole("button", { name: "Unblock selected packages" }));
+    await screen.findByRole("dialog", { name: /^unblock package/i });
+    await act(async () => pending.resolve(blockPreview!));
+    expect(screen.getByRole("dialog", { name: /^unblock package/i })).toBeInTheDocument();
+  });
+
+  it.each(["single", "bulk"] as const)(
+    "does not track a delayed %s mutation response in a revalidated session",
+    async scope => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const endpoint = scope === "single" ? `/api/agents/${agent.id}/block` : "/api/agents/block";
+      transport.fetchMock.mockImplementation(async (input, init) =>
+        input === endpoint ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      if (scope === "single") {
+        await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+      } else {
+        await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+        await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+      }
+      await userEvent.click(await screen.findByRole("button", { name: "Confirm block" }));
+      await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === endpoint)).toBe(true));
+      await revalidateTransportSession(transport.session);
+      await act(async () => pending.resolve(Response.json(waitingBulkJob())));
+      expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+      expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["resume", "cancel", "reconcile"] as const)(
+    "discards a delayed package-job %s response after session revalidation",
+    async operation => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const job = waitingBulkJob();
+      const endpoint = `/api/agents/bulk-jobs/${job.id}/${operation}`;
+      window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === endpoint) return pending.promise;
+        if (input === `/api/agents/bulk-jobs/${job.id}`) return Response.json(job);
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      const label = operation === "resume" ? "Resume unsent items"
+        : operation === "cancel" ? "Cancel unsent items" : "Reconcile inconclusive";
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const button = await screen.findByRole("button", { name: label });
+      await waitFor(() => expect(button).toBeEnabled());
+      await userEvent.click(button);
+      await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === endpoint)).toBe(true));
+      await revalidateTransportSession(transport.session);
+      await act(async () => pending.resolve(Response.json({
+        ...job, reconciliation: { attempted: 1, failed: 0, errors: [] },
+      })));
+      expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+      expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["package", "success"],
+    ["package", "failure"],
+    ["Power Platform", "success"],
+    ["Power Platform", "failure"],
+  ] as const)("discards a delayed %s export %s after session revalidation", async (source, outcome) => {
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles,
+      unifiedResponse: unifiedRecordsPage(unifiedPage.value),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const isExport = (path: string) => source === "package"
+      ? path === "/api/agents/export.csv" : path.startsWith("/api/inventory/export.csv?");
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      isExport(input) ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:expired-export") });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    if (source === "package") {
+      await userEvent.click(screen.getByRole("button", { name: "Export package inventory CSV" }));
+      await userEvent.click(await screen.findByRole("button", { name: /Download package inventory/ }));
+    } else {
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      const button = await screen.findByRole("button", { name: "Export PP agent inventory CSV" });
+      await waitFor(() => expect(button).toBeEnabled());
+      await userEvent.click(button);
+    }
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => isExport(path))).toBe(true));
+    await revalidateTransportSession(transport);
+    await act(async () => pending.resolve(outcome === "success"
+      ? new Response("ID,Name\r\n")
+      : Response.json({ code: "export_failed", detail: "Old session export failed" }, { status: 500 })));
+    expect(download).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Old session export failed/)).not.toBeInTheDocument();
+  });
+
+  it("purges private state even when browser storage removal fails", async () => {
+    const transport = appTransport({ revalidatedRoles: [], deferRevalidation: true });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const remove = Storage.prototype.removeItem;
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(function (this: Storage, key: string) {
+      if (this === window.localStorage) throw new DOMException("Storage is blocked", "SecurityError");
+      remove.call(this, key);
+    });
+    transport.failProtectedReadsWith = 401;
+    await act(async () => { await expect(getAgents()).rejects.toMatchObject({ status: 401 }); });
+    await waitFor(() => expect(transport.meCalls()).toBe(2));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    await act(async () => transport.releaseRevalidation());
+    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+    expect(screen.getByText(/Unable to clear the saved package job/)).toBeInTheDocument();
+  });
+
+  it("tracks an accepted package job when browser storage writes fail", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === `/api/agents/${agent.id}/block` ? Response.json(waitingBulkJob()) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+    const store = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) {
+      if (this === window.localStorage) throw new DOMException("Storage is full", "QuotaExceededError");
+      store.call(this, key, value);
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Confirm block" }));
+    expect(await screen.findByRole("region", { name: "Job controls" })).toBeInTheDocument();
+    expect(screen.getByText(/Unable to save the active package job/)).toBeInTheDocument();
+    expect(screen.queryByText("Storage is full")).not.toBeInTheDocument();
+  });
+
+  it.each(["navigation", "unmount"] as const)(
+    "preserves accepted-job ownership across %s",
+    async scenario => {
+      const transport = accessEditorTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      transport.fetchMock.mockImplementation(async (input, init) =>
+        input === `/api/agents/${agent.id}/block` ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      const app = render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `Block ${agent.displayName}` }));
+      await userEvent.click(await screen.findByRole("button", { name: "Confirm block" }));
+      if (scenario === "navigation") await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+      else app.unmount();
+      await act(async () => pending.resolve(Response.json(waitingBulkJob())));
+      if (scenario === "navigation") {
+        expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBe(waitingBulkJob().id);
+        await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+        expect(screen.getByRole("region", { name: "Job controls" })).toBeInTheDocument();
+      } else {
+        expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+      }
+    },
+  );
+
+  it.each(["package", "Power Platform"] as const)(
+    "finishes an in-flight %s export across tabs without starting a duplicate",
+    async source => {
+      const transport = appTransport({
+        revalidatedRoles: viewer.roles,
+        unifiedResponse: unifiedRecordsPage(unifiedPage.value),
+      });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const isExport = (path: string) => source === "package"
+        ? path === "/api/agents/export.csv" : path.startsWith("/api/inventory/export.csv?");
+      transport.fetchMock.mockImplementation(async (input, init) =>
+        isExport(input) ? pending.promise : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+      Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:current-export") });
+      Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+      render(<App />);
+      await screen.findByText(agent.displayName);
+      if (source === "package") {
+        await userEvent.click(screen.getByRole("button", { name: "Export package inventory CSV" }));
+        await userEvent.click(await screen.findByRole("button", { name: /Download package inventory/ }));
+      } else {
+        await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+        await userEvent.click(await screen.findByRole("button", { name: "Export PP agent inventory CSV" }));
+      }
+      await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => isExport(path))).toHaveLength(1));
+      await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+      await userEvent.click(screen.getByRole("button", { name: source === "package" ? "Agents" : /^Sync/ }));
+      expect(screen.getByRole("button", { name: source === "package" ? /^Exporting/ : "Exporting PP agents..." })).toBeDisabled();
+      await act(async () => pending.resolve(new Response("ID,Name\r\n")));
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(transport.fetchMock.mock.calls.filter(([path]) => isExport(path))).toHaveLength(1);
+    },
+  );
+
+  it("does not replace a cancellation response with an older running poll", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const job = { ...waitingBulkJob(), status: "running", canResume: false } satisfies BulkActionJob;
+    const jobEndpoint = `/api/agents/bulk-jobs/${job.id}`;
+    let polls = 0;
+    window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === jobEndpoint) {
+        polls += 1;
+        return polls === 1 ? Response.json(job) : pending.promise;
+      }
+      if (input === `${jobEndpoint}/cancel`) return Response.json({ ...job, status: "cancelled" });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(polls).toBe(2), { timeout: 3_000 });
+    await userEvent.click(screen.getByRole("button", { name: "Cancel unsent items" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument());
+    await act(async () => pending.resolve(Response.json(job)));
+    expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+    expect(screen.getByText("Cancelled. Already dispatched changes may have finished.")).toBeInTheDocument();
+  });
+
+  it("reports unavailable browser job storage without blocking saved inventory", async () => {
+    const transport = accessEditorTransport();
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const read = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, key: string) {
+      if (this === window.localStorage && key === "agent-control:active-bulk-job:v1") {
+        throw new DOMException("Storage is blocked", "SecurityError");
+      }
+      return read.call(this, key);
+    });
+    render(<App />);
+    expect(await screen.findByText(agent.displayName)).toBeInTheDocument();
+    expect(screen.getByText(/Unable to read the saved package job/)).toBeInTheDocument();
+  });
+
+  it("completes sign-out even when removing the saved package job fails", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === "/api/auth/logout" ? new Response(null, { status: 204 }) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const remove = Storage.prototype.removeItem;
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(function (this: Storage, key: string) {
+      if (this === window.localStorage) throw new DOMException("Storage is blocked", "SecurityError");
+      remove.call(this, key);
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("link", { name: "Sign in with Entra ID" })).toBeInTheDocument();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(screen.getByText(/Unable to clear the saved package job/)).toBeInTheDocument();
+  });
+
+  it("clears superseded detail loading when preparing a bulk preview", async () => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === `/api/agents/${agent.id}` ? pending.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    expect(screen.getByText("Loading agent details...")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
+    await screen.findByRole("dialog", { name: /block package/i });
+    await act(async () => pending.resolve(Response.json(agent)));
+    expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
+  });
 });
+
+function deferredResponse() {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>(resolveResponse => { resolve = resolveResponse; });
+  return { promise, resolve };
+}
+
+async function revalidateTransportSession(transport: ReturnType<typeof appTransport>) {
+  const previousCalls = transport.meCalls();
+  await act(async () => {
+    transport.failProtectedReadsWith = 401;
+    const expiredRequest = getAgents();
+    transport.failProtectedReadsWith = undefined;
+    await expect(expiredRequest).rejects.toMatchObject({ status: 401 });
+  });
+  await waitFor(() => expect(transport.meCalls()).toBeGreaterThan(previousCalls));
+  await waitFor(() => expect(screen.queryByText("Checking sign-in...")).not.toBeInTheDocument());
+}
+
+function waitingBulkJob(): BulkActionJob {
+  return {
+    id: "pending-package-job",
+    action: "block",
+    targetBlockedState: true,
+    status: "waiting_authorization",
+    canResume: true,
+    total: 2,
+    completed: 1,
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+    results: [{ id: agent.id, displayName: agent.displayName, status: "inconclusive", reconciliationStatus: "required" }],
+    createdAt: "2026-09-15T08:00:00.000Z",
+    updatedAt: "2026-09-15T08:00:00.000Z",
+  };
+}
 
 function appTransport({
   revalidatedRoles,
@@ -1690,6 +2167,7 @@ function appTransport({
   authenticated = true,
   revalidatedUser = viewer,
   unifiedResponse = unifiedPage,
+  inventoryReadAuthorized = false,
 }: {
   revalidatedRoles: SessionUser["roles"];
   deferRevalidation?: boolean;
@@ -1697,6 +2175,7 @@ function appTransport({
   authenticated?: boolean;
   revalidatedUser?: SessionUser;
   unifiedResponse?: UnifiedAgentInventoryPage;
+  inventoryReadAuthorized?: boolean;
 }) {
   let currentUserCalls = 0;
   let resolveRevalidation!: (response: Response) => void;
@@ -1729,7 +2208,23 @@ function appTransport({
       if (currentUserCalls === 1) return Response.json({ user: { ...viewer, roles: initialRoles }, csrfToken: "csrf-1", roleAssignmentRequired: false });
       return deferRevalidation ? revalidation : revalidatedResponse();
     }
-    if (input === "/api/capabilities") return Response.json({ value: [] });
+    if (input === "/api/capabilities") {
+      const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.inventory.read")!;
+      return Response.json({ value: inventoryReadAuthorized ? [{
+        definition,
+        decision: {
+          capabilityId: definition.id,
+          status: "available",
+          authorized: true,
+          fresh: true,
+          verification: "provider",
+          checkedAt: new Date(Date.now() - 1_000).toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          previewQualification: "not_required",
+          remediation: [],
+        },
+      }] : [] });
+    }
     if (input === "/api/workbench/metadata") return Response.json({ views: workbenchViews, actions: workbenchActions });
     if (input === "/api/workbench/jobs") return Response.json({
       value: [], unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "sync-history",
@@ -1913,6 +2408,7 @@ function accessEditorTransport() {
   const base = initialCatalogTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
   base.page = packagePage;
   const transport = {
+    session: base.session,
     accessAuthorized: true,
     exactStatus: "succeeded" as PackageRefreshJob["status"],
     exactMessage: undefined as string | undefined,

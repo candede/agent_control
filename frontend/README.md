@@ -50,17 +50,27 @@ Changing the saved client/application ID on an existing volume records `control/
 2. Request only the package read capability needed for the selected delegated/application mode.
 3. Explicitly refresh package observations; navigation itself never calls Microsoft Graph.
 4. Search/filter saved rows and inspect package source, freshness, deployment, block state and assignments according to the current app role.
-5. Use a block/unblock action only when its separate preview qualification is current, review the risk preview, then monitor the durable job and provider verification.
+5. For block/unblock, review the exact targets and risk preview, confirm the change, then monitor the durable job and provider verification. Ready to try does not require a prior canary; Microsoft authorizes the actual operation.
 6. Reconcile an inconclusive item by read only; a new write always requires a new preview and confirmation.
 7. Sign out when finished.
 
 ## Notes
 
+- Package previews belong to the current Agents flow: navigation, session revalidation, or a newer request discards late responses. Accepted package jobs continue across ordinary tab navigation, but responses from a cleared session or unmounted app cannot restore job state or overwrite current controls.
+- Package and Power Platform exports can finish across tabs in the same session. Clearing the session or unmounting the app prevents late downloads and stale error/progress updates; an in-flight Power Platform export stays busy across tabs to prevent duplicate requests.
+- Browser storage is optional for package-job continuity. Read, write, and removal failures produce a visible warning without preventing private-state cleanup or tracking an accepted durable job. Retained work remains recoverable through Jobs with current authorization.
+- Sync preserves newer Power Platform refresh/resume and polling results when a saved-history read finishes late. A failed history read is reported explicitly without discarding successfully loaded saved agent inventory.
+- Evidence-backed provider actions require a valid check timestamp at or before the UI clock and an expiry strictly after it, as well as current backend authorization and freshness. Missing, invalid, or future check timestamps cannot enable actions. An omitted verification level remains compatible with otherwise valid evidence but never claims provider verification.
+- Delegated and application evidence continues to expire in the UI during catalog reloads and pending permission checks. Only delegated expiries trigger automatic checks; application evidence expires without starting an application operation. Failed catalog reloads expose an error and allow another Check status attempt, including when they replace the initial catalog request.
+- A delayed expiry retry spends its one-attempt budget only when a check starts. If its deadline passes during another check, it remains due unless that check renews the expired evidence.
+- On-demand readiness follows the registered delegated probe contract, including license assignments and Copilot usage reads as well as package and quarantine changes. These rows are Ready to try, not provider-verified, and require no check timestamps. Exact-target change confirmation applies to control operations, not read-only license or usage operations; viewing Permissions does not execute either.
 - Microsoft Graph package list/detail use v1.0; block/unblock, access update and reassignment remain beta preview operations.
 - HTTP `204` is acceptance, never mutation success without provider read-back.
 - Access update fixtures prove exact payload preservation/readback, but product writes remain disabled because the endpoint has no documented `If-Match` or equivalent lost-update bound.
 - Reassignment uses the documented beta `{ "userId": "<Entra user object ID>" }` adapter fixture but remains disabled because detail has no owner read-back field and the operation has no conditional-write header.
 - Directory assignment IDs must be native Entra UUIDs and resolve exactly to current users, security groups or Microsoft 365 groups; deleted, duplicate, unresolved or redirected identities are rejected.
+- In the access editor, specific users or groups require current directory access and completion of the initial assignment lookup. Restoring directory access preserves edits after initialization; cancelled lookups restart when access returns. Choosing No users does not depend on that lookup because the replacement contains no principals. Package capability checks and replacement confirmation still apply to both scopes.
+- The access editor captures its initial scope and assignments when opened; parent rerenders cannot restore removed principals or change a pending confirmation. Close and reopen to load a new starting state. While an access submission or caller-reported busy operation is pending, target, mode, scope, and directory picker controls remain locked. A failed submission preserves the draft and requires replacement confirmation again before retrying.
 - Package selections keep the 5,000-target authority. When inline selection would exceed the 4,096-byte route budget, the URL carries only a count marker and the complete non-authoritative UI selection is kept in principal-scoped browser session storage; an unavailable or mismatched session record restores no partial selection and is reported visibly.
 - [Package mutation canaries](../docs/mutation-canaries.md) documents the fixture-proven restoration command. Phase 13 owns any real approved tenant execution.
 

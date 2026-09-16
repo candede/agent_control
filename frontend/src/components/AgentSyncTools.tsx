@@ -31,7 +31,9 @@ export function AgentSyncTools({
   onExportPowerPlatform,
   onOpenAgents,
 }: Props) {
-  const snapshotId = inventory?.sources.powerPlatform.observation?.snapshotId;
+  const observation = inventory?.sources.powerPlatform.observation;
+  const powerPlatformObservation = observation && "roleScope" in observation ? observation : undefined;
+  const snapshotId = observation?.snapshotId;
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">
       <div className="section-heading">
@@ -52,6 +54,10 @@ export function AgentSyncTools({
         <h3>Agent identity matching</h3>
         <p>Refresh agents collects the full list and exact identity details automatically. Records are combined only when their environment and native identities are corroborated, never by display name alone.</p>
         {inventory?.identityCollection ? <p>{inventory.identityCollection.checkedPackages.toLocaleString()} package identities checked; {inventory.identityCollection.pendingPackages.toLocaleString()} still need collection.</p> : null}
+        <p>Checked means package details were collected, not that Microsoft supplied matching identity metadata. Source-only records do not by themselves prove missing agents.</p>
+        {inventory && (inventory.summary.conflicting > 0 || inventory.summary.ambiguous > 0) ? <p role="status">
+          {inventory.summary.conflicting.toLocaleString()} conflicting and {inventory.summary.ambiguous.toLocaleString()} ambiguous package identities remain unlinked. Inspect their matching details on Agents; names alone cannot resolve them.
+        </p> : null}
         <p>{selectedPackageCount.toLocaleString()} published target{selectedPackageCount === 1 ? "" : "s"} selected. You can also recheck 1-100 selected targets without refreshing the full list.</p>
         <div className="inline-actions">
           <WorkbenchActionGate actionId="packages.refresh">
@@ -70,6 +76,12 @@ export function AgentSyncTools({
       <section className="sync-source-tools" aria-label="Power Platform agent source">
         <h3>Power Platform agent source</h3>
         <p>Refresh retained Copilot Studio agent observations or export the exact saved Power Platform snapshot. These controls do not infer links or change agent state. Exports use the search and environment filters saved on Agents.</p>
+        {powerPlatformObservation ? <dl className="sync-inventory-counts" aria-label="Saved Power Platform coverage">
+          <div><dt>Resources collected in saved scope</dt><dd>{powerPlatformObservation.observedCount.toLocaleString()} / {powerPlatformObservation.totalRecords.toLocaleString()}</dd></div>
+          <div><dt>Copilot Studio agents observed</dt><dd>{powerPlatformObservation.coveredCount?.toLocaleString() ?? "Not established"}</dd></div>
+          <div><dt>Provider role scope</dt><dd>{powerPlatformObservation.roleScope === "unknown" ? "Unknown" : powerPlatformObservation.roleScope === "ai" ? "AI-scoped" : "Full"}</dd></div>
+          <div><dt>Copilot Studio type coverage</dt><dd>{powerPlatformObservation.coverage === "covered" ? "Covered in saved scope" : powerPlatformObservation.coverage === "not_authorized_scope" ? "Not authorized in saved scope" : "Unknown"}</dd></div>
+        </dl> : null}
         {powerPlatformJob ? <p role="status">
           Latest agent refresh: {powerPlatformJob.status.replaceAll("_", " ")}
           {powerPlatformJob.message ? ` - ${powerPlatformJob.message}` : ""}

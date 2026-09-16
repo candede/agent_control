@@ -164,6 +164,30 @@ describe("UnifiedAgentsService", () => {
     expect(filtered).toMatchObject({ count: 0, identityCollection: { checkedPackages: 2, pendingPackages: 1 } });
   });
 
+  it("keeps schema-conflicting package representations separate before counts and pagination", async () => {
+    const packages = ["cr123_agent", "cr123_other"].map((SchemaName, index) => ({
+      ...packageValue(`package-${index}`, "Same displayed name"),
+      elementDetails: [{
+        elementType: "AgentMetadatas",
+        elements: [{ id: "metadata", definition: JSON.stringify({
+          SourceIds: { EnvironmentId: environmentA, CdsBotId: botA, SchemaName },
+        }) }],
+      }],
+    }));
+    const service = new UnifiedAgentsService(dependencies({ packages, resources: [resource(environmentA)] }));
+    const full = await service.list({ tenantId, principalId: "viewer" });
+    expect(full).toMatchObject({
+      count: 3,
+      summary: { total: 3, linked: 0, graphOnly: 2, powerPlatformOnly: 1, conflicting: 2 },
+    });
+    expect(full.value.filter(value => value.presence === "graph_packages").map(value => value.identity.state))
+      .toEqual(["conflicting", "conflicting"]);
+    const paged = await service.list({ tenantId, principalId: "viewer" }, { limit: 1, offset: 1 });
+    expect(paged.count).toBe(3);
+    expect(paged.summary).toEqual(full.summary);
+    expect(paged.value).toHaveLength(1);
+  });
+
   it("returns all authorized environment and authoring choices independently of filtering and pagination", async () => {
     const pkg = { ...packageValue("custom", "Custom agent"), authoringTool: "CustomSDK" };
     const service = new UnifiedAgentsService(dependencies({
@@ -186,6 +210,125 @@ describe("UnifiedAgentsService", () => {
       resources: [resource(environmentA)], environmentNames: { [environmentA]: "Must not be exposed" }, powerPlatformSnapshot: null,
     })).list({ tenantId, principalId: "viewer" });
     expect(unavailable.facets).toEqual({ environments: [], platforms: [] });
+  });
+
+  it.each([
+    { authoringTool: "MicrosoftCopilotStudio" },
+    { authoringTool: null, platform: "Microsoft Copilot Studio" },
+    { authoringTool: null, shortDescription: "Built using Microsoft Copilot Studio." },
+  ])("round-trips canonical authoring facets for %j", async fields => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [{ ...packageValue("studio", "Studio package"), ...fields }],
+      resources: [resource(environmentA)],
+    }));
+    const scope = { tenantId, principalId: "viewer" };
+    const unfiltered = await service.list(scope);
+    expect(unfiltered.facets.platforms).toEqual([{ value: "Copilot Studio", label: "Copilot Studio" }]);
+    for (const platform of ["Copilot Studio", "MicrosoftCopilotStudio"]) {
+      const filtered = await service.list(scope, { platform });
+      expect(filtered.count).toBe(2);
+      expect(filtered.value.map(value => value.id)).toEqual(unfiltered.value.map(value => value.id));
+    }
+  });
+
+  it.each([
+    ["UTC offsets", "2026-09-16T01:00:00+04:00", "2026-09-15T22:00:00.000Z"],
+    ["fractional seconds", "2026-09-15T22:00:00Z", "2026-09-15T22:00:00.500Z"],
+  ])("sorts modification times chronologically across %s before paging", async (_case, older, newer) => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [
+        { ...packageValue("older", "Z"), lastModifiedDateTime: older },
+        { ...packageValue("newer", "A"), lastModifiedDateTime: newer },
+        packageValue("undated", "Undated"),
+      ],
+    }));
+    const scope = { tenantId, principalId: "viewer" };
+    for (const sortDirection of ["asc", "desc"] as const) {
+      const expected = sortDirection === "asc" ? ["undated", "older", "newer"] : ["newer", "older", "undated"];
+      const query = { sortBy: "lastModifiedAt" as const, sortDirection };
+      const result = await service.list(scope, query);
+      expect(result.value.map(value => value.packages[0].id)).toEqual(expected);
+      const paged = await service.list(scope, { ...query, offset: 1, limit: 1 });
+      expect(paged.count).toBe(3);
+      expect(paged.value.map(value => value.packages[0].id)).toEqual(expected.slice(1, 2));
+    }
+  });
+
+  it("uses exact record IDs to break ties between equivalent modification instants", async () => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [
+        { ...packageValue("b", "First name"), lastModifiedDateTime: "2026-09-15T22:00:00.000Z" },
+        { ...packageValue("a", "Last name"), lastModifiedDateTime: "2026-09-16T02:00:00+04:00" },
+      ],
+    }));
+    for (const sortDirection of ["asc", "desc"] as const) {
+      const result = await service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt", sortDirection });
+      expect(result.value.map(value => value.packages[0].id)).toEqual(sortDirection === "asc" ? ["a", "b"] : ["b", "a"]);
+    }
+  });
+
+  it("sorts grouped rows using the latest instant across both saved sources", async () => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [
+        { ...packageValue("linked-old", "Linked older package", true), lastModifiedDateTime: "2026-09-16T01:00:00+04:00" },
+        { ...packageValue("linked-older", "Linked oldest package", true), lastModifiedDateTime: "2026-09-15T20:00:00Z" },
+        { ...packageValue("graph-newer", "Newer standalone package"), lastModifiedDateTime: "2026-09-15T23:00:00Z" },
+      ],
+      resources: [
+        { ...resource(environmentA), lastPublishedAt: "2026-09-15T22:00:00.000Z" },
+        { ...resource(environmentB), createdAt: "2026-09-15T21:30:00.000Z" },
+      ],
+    }));
+    const result = await service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt", sortDirection: "desc" });
+    expect(result.value.map(value => value.presence)).toEqual(["graph_packages", "both", "power_platform"]);
+    expect(result.value[1].packages).toHaveLength(2);
+  });
+
+  it("keeps undated modification ties deterministic without changing name sorting", async () => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [packageValue("a", "Z"), packageValue("b", "A")],
+    }));
+    const scope = { tenantId, principalId: "viewer" };
+    expect((await service.list(scope)).value.map(value => value.packages[0].id)).toEqual(["b", "a"]);
+    for (const sortDirection of ["asc", "desc"] as const) {
+      const result = await service.list(scope, { sortBy: "lastModifiedAt", sortDirection });
+      expect(result.value.map(value => value.packages[0].id)).toEqual(sortDirection === "asc" ? ["a", "b"] : ["b", "a"]);
+    }
+  });
+
+  it("surfaces invalid saved modification timestamps instead of treating them as a sort tie", async () => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [
+        { ...packageValue("invalid", "Invalid date"), lastModifiedDateTime: "invalid-date" },
+        { ...packageValue("valid", "Valid date"), lastModifiedDateTime: "2026-09-15T22:00:00.000Z" },
+      ],
+    }));
+    await expect(service.list({ tenantId, principalId: "viewer" }, { sortBy: "lastModifiedAt" }))
+      .rejects.toMatchObject({ code: "saved_source_invalid" });
+  });
+
+  it.each(["exact", "retained"] as const)("uses %s detail evidence consistently for collection counts and missing-metadata explanations", async evidence => {
+    const pkg = packageValue("legacy-detail", "Legacy collected package");
+    if (evidence === "retained") pkg.elementDetails = [{
+      elementType: "DeclarativeAgents", elements: [{ id: "declarative", definition: "{}" }],
+    }];
+    const scope = { tenantId, principalId: "viewer" };
+    const deps = dependencies({ packages: [pkg] });
+    const source = await deps.packages.readUnifiedSource(scope);
+    const observation = source.observations[pkg.id];
+    if (evidence === "exact") observation.scopeKind = "exact";
+    else observation.identityDetails = {
+      snapshotId: observation.snapshotId,
+      observedAt: observation.observedAt,
+      expiresAt: observation.expiresAt,
+    };
+    deps.packages.readUnifiedSource = vi.fn(async () => source);
+
+    const result = await new UnifiedAgentsService(deps).list(scope);
+    expect(result.identityCollection).toEqual({ checkedPackages: 1, pendingPackages: 0 });
+    expect(result.value[0].identity.reason).toContain("Package details were collected");
+    expect(result.value[0].identity.reason).not.toContain("Refresh package details");
+    expect(pkg.identityDetailsCollected).toBeUndefined();
   });
 
   it("filters Copilot Studio-only agents by saved authoring tool and creation age without inventing package properties", async () => {
@@ -313,7 +456,50 @@ describe("UnifiedAgentsService", () => {
     }));
     const partial = await incompletePowerPlatform.list({ tenantId, principalId: "viewer" });
     expect(partial.sources.powerPlatform).toMatchObject({ state: "partial", error: { code: "coverage_unknown" } });
+    expect(partial.errors[0].message).toContain("no recognized Microsoft Entra inventory role evidence (wids)");
+    expect(partial.errors[0].message).toContain("sign in again, then refresh Power Platform inventory");
     expect(partial.count).toBe(2);
+  });
+
+  it.each(["full", "ai"] as const)("accepts proven agent coverage for %s roles without requiring every resource type", async roleScope => {
+    const result = await new UnifiedAgentsService(dependencies({
+      resources: [resource(environmentA)],
+      powerPlatformSnapshot: { ...powerPlatformSnapshot(), roleScope },
+    })).list({ tenantId, principalId: "viewer" });
+    expect(result.partial).toBe(false);
+    expect(result.sources.powerPlatform).toMatchObject({ state: "available", error: null });
+    expect(result.count).toBe(1);
+  });
+
+  it("keeps an environment-only snapshot partial even with proven type coverage", async () => {
+    const result = await new UnifiedAgentsService(dependencies({
+      resources: [resource(environmentA)],
+      powerPlatformSnapshot: { ...powerPlatformSnapshot(), environmentScope: environmentA },
+    })).list({ tenantId, principalId: "viewer" });
+    expect(result.partial).toBe(true);
+    expect(result.errors[0].message).toContain("covers only one environment");
+    expect(result.errors[0].message).not.toContain("wids");
+    expect(result.count).toBe(1);
+  });
+
+  it("reports both environment restriction and missing role evidence for the same snapshot", async () => {
+    const result = await new UnifiedAgentsService(dependencies({
+      resources: [resource(environmentA)],
+      powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), environmentScope: environmentA },
+    })).list({ tenantId, principalId: "viewer" });
+    expect(result.partial).toBe(true);
+    expect(result.errors[0].message).toContain("covers only one environment");
+    expect(result.errors[0].message).toContain("no recognized Microsoft Entra inventory role evidence (wids)");
+  });
+
+  it("does not misdiagnose unknown type coverage as missing role evidence when the role is known", async () => {
+    const result = await new UnifiedAgentsService(dependencies({
+      resources: [resource(environmentA)],
+      powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), roleScope: "full" },
+    })).list({ tenantId, principalId: "viewer" });
+    expect(result.partial).toBe(true);
+    expect(result.errors[0].message).toContain("does not prove complete Copilot Studio agent coverage");
+    expect(result.errors[0].message).not.toContain("wids");
   });
 
   it("converts only bounded source-limit errors and propagates unexpected repository failures", async () => {
@@ -371,4 +557,29 @@ describe("UnifiedAgentsService", () => {
       expect(result.value[0].packages).toHaveLength(2);
     }
   });
+
+  it.each([
+    "all", "everyone", "allowedForAll", "availableToAll", "deployedToAll", "installedForAll",
+    "some", "allowedForSome", "availableToSome", "deployedToSome", "installedForSome",
+    " ALLOWED_FOR-ALL ", "AVAILABLE TO SOME",
+  ])("matches the combined availability filter for %s", async availableTo => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [{ ...packageValue("package", "Package"), availableTo }],
+    }));
+    const result = await service.list({ tenantId, principalId: "viewer" }, { availableTo: "__some_or_all__" });
+    expect(result.count).toBe(1);
+    expect(result.filteredSummary.total).toBe(1);
+    expect(result.value[0].packages[0].availableTo).toBe(availableTo);
+  });
+
+  it.each([undefined, "", "none", "allowedForNoOne", "deployedToNone", "unknownFutureValue", "futureStatus"])(
+    "excludes status %s from combined availability without changing exact filters", async availableTo => {
+      const service = new UnifiedAgentsService(dependencies({
+        packages: [{ ...packageValue("package", "Package"), availableTo }],
+      }));
+      const scope = { tenantId, principalId: "viewer" };
+      expect((await service.list(scope, { availableTo: "__some_or_all__" })).count).toBe(0);
+      expect((await service.list(scope, { availableTo: `available:${availableTo ?? "__unknown__"}` })).count).toBe(1);
+    },
+  );
 });

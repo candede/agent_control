@@ -47,6 +47,35 @@ describe("Permission Center", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Request consent" })).not.toBeInTheDocument();
   });
+  it("counts registered on-demand reads as ready without claiming verification or requiring a write", () => {
+    const views = (["graph.licenses.read", "reports.copilotUsage.read"] as const).map(onDemandFixture);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<CapabilityContext value={{ ...context(views), user: { ...user, roles: ["AgentControl.Viewer"] } }}>
+      <CapabilityHealth /><PermissionCenter />
+    </CapabilityContext>);
+    expect(screen.getByRole("button", { name: "0 provider-verified / 0 local / 2 ready to try / 0 degraded / 0 blocked" })).toBeVisible();
+    expect(screen.getAllByText("Ready to try", { exact: true })).toHaveLength(2);
+    expect(screen.getAllByText("Ready to try; Microsoft validates permission on the actual operation")).toHaveLength(2);
+    expect(screen.queryByText(/Review and confirm the exact targets/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Request consent" })).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+  it.each([undefined, "invalid", "2026-09-12T09:00:01.000Z"])(
+    "disables actions when check time %s cannot establish current evidence", checkedAt => {
+      const candidate = fixture("available");
+      candidate.decision.checkedAt = checkedAt;
+      candidate.decision.expiresAt = "2026-09-12T09:01:00.000Z";
+      const perform = vi.fn();
+      render(<CapabilityContext value={{ ...context([candidate]), now: Date.parse("2026-09-12T09:00:00.000Z") }}>
+        <CapabilityHealth />
+        <CapabilityGate capability={candidate.definition.id}><button onClick={perform}>Refresh provider data</button></CapabilityGate>
+      </CapabilityContext>);
+      expect(screen.getByRole("button", { name: "Refresh provider data" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "0 provider-verified / 0 local / 0 ready to try / 1 degraded / 0 blocked" })).toBeVisible();
+      expect(perform).not.toHaveBeenCalled();
+    },
+  );
   it.each(["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"] as const)(
     "offers %s consent only after a missing-permission check and removes it after token recovery", async id => {
       const ready = onDemandFixture(id);

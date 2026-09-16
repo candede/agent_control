@@ -7,6 +7,8 @@ function view(status: CapabilityStatus): CapabilityView {
   return { definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
 }
 
+const onDemandIds = capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id);
+
 describe("capability UX decisions", () => {
   function onDemandView(id: CapabilityId): CapabilityView {
     return {
@@ -35,6 +37,21 @@ describe("capability UX decisions", () => {
       expect(capabilityNextStep(ready)?.href).toBe(id === "powerPlatform.quarantine.manage" ? "/power-platform" : "/agents");
     },
   );
+  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+    "recognizes registered on-demand read readiness for %s without write instructions", id => {
+      const ready = onDemandView(id);
+      expect(providerActionAllowed(ready)).toBe(true);
+      expect(currentVerification(ready)).toBe("on_demand");
+      expect(evidenceIsFresh(ready)).toBe(false);
+      expect(evidenceIsStale(ready)).toBe(false);
+      expect(capabilityStatusLabel(ready)).toBe("Ready to try");
+      expect(verificationLabel(ready)).toBe("Ready to try; Microsoft validates permission on the actual operation");
+      expect(operationAccessLabel(ready)).toBe("Microsoft validates permission when the operation is requested");
+      expect(capabilityExplanation(ready)).toContain("Microsoft validates delegated permissions and provider roles on the actual operation");
+      expect(capabilityExplanation(ready)).not.toMatch(/confirm|submitting a change|Not checked|provider request succeeded/);
+      expect(capabilityNextStep(ready)).toBeUndefined();
+    },
+  );
   it.each([
     { fresh: false },
     { authorized: false },
@@ -52,7 +69,7 @@ describe("capability UX decisions", () => {
     { lastSuccessAt: new Date(0).toISOString() },
     { capabilityId: "graph.package.read.delegated" },
   ] satisfies Partial<CapabilityView["decision"]>[])("rejects inconsistent on-demand decisions: %j", override => {
-    for (const id of ["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"] as const) {
+    for (const id of onDemandIds) {
       const ready = onDemandView(id);
       Object.assign(ready.decision, override);
       expect(providerActionAllowed(ready, true)).toBe(false);
@@ -60,8 +77,8 @@ describe("capability UX decisions", () => {
       expect(capabilityNextStep(ready)).toBeUndefined();
     }
   });
-  it("does not extend on-demand readiness to nonallowlisted capabilities or modes", () => {
-    for (const definition of capabilityDefinitions.filter(definition => !["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"].includes(definition.id))) {
+  it("does not extend on-demand readiness to other probe kinds or modes", () => {
+    for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind !== "on_demand")) {
       const forged = onDemandView(definition.id);
       expect(providerActionAllowed(forged, true)).toBe(false);
       expect(currentVerification(forged)).toBeUndefined();
@@ -70,6 +87,10 @@ describe("capability UX decisions", () => {
     unregistered.definition = { ...unregistered.definition, probe: { ...unregistered.definition.probe, adapterRegistered: false } };
     expect(providerActionAllowed(unregistered, true)).toBe(false);
     expect(currentVerification(unregistered)).toBeUndefined();
+    const wrongProbe = onDemandView("graph.package.block.manage");
+    wrongProbe.definition = { ...wrongProbe.definition, probe: { ...wrongProbe.definition.probe, kind: "provider_read" } };
+    expect(providerActionAllowed(wrongProbe, true)).toBe(false);
+    expect(currentVerification(wrongProbe)).toBeUndefined();
     for (const mode of ["application", "local"] as const) {
       const wrongMode = onDemandView("graph.package.block.manage");
       wrongMode.definition = { ...wrongMode.definition, mode };
@@ -91,9 +112,51 @@ describe("capability UX decisions", () => {
     expect(providerActionAllowed(available, write, expiresAt)).toBe(false);
     expect(providerActionAllowed(available, write, expiresAt + 1)).toBe(false);
   });
+  it.each([undefined, "invalid", "2026-09-12T09:00:01.000Z"])(
+    "rejects evidence without a valid check at or before the current clock: %s", checkedAt => {
+      const now = Date.parse("2026-09-12T09:00:00.000Z");
+      const candidate = view("available");
+      candidate.decision = {
+        ...candidate.decision, checkedAt, expiresAt: "2026-09-12T09:01:00.000Z",
+        lastSuccessAt: "2026-09-12T08:59:00.000Z",
+      };
+      for (const verification of ["provider", "token", undefined] as const) {
+        candidate.decision.verification = verification;
+        expect(evidenceIsFresh(candidate, now)).toBe(false);
+        expect(currentVerification(candidate, now)).toBeUndefined();
+        expect(capabilityStatusLabel(candidate, now)).not.toMatch(/^(Available|Ready to try)$/);
+        for (const write of [undefined, false, true]) {
+          expect(providerActionAllowed(candidate, write, now)).toBe(false);
+        }
+      }
+    },
+  );
+  it("accepts a check at the current clock until, but not at, its expiry", () => {
+    const now = Date.parse("2026-09-12T09:00:00.000Z");
+    const candidate = view("available");
+    candidate.decision.checkedAt = new Date(now).toISOString();
+    candidate.decision.expiresAt = new Date(now + 1).toISOString();
+    expect(evidenceIsFresh(candidate, now)).toBe(true);
+    expect(currentVerification(candidate, now)).toBe("provider");
+    expect(providerActionAllowed(candidate, false, now)).toBe(true);
+    expect(evidenceIsFresh(candidate, now + 1)).toBe(false);
+    expect(currentVerification(candidate, now + 1)).toBeUndefined();
+    expect(providerActionAllowed(candidate, false, now + 1)).toBe(false);
+  });
   it("names backend permissions and independent roles exactly", () => {
     expect(capabilityExplanation(view("missing_permission"))).toContain("delegated CopilotPackages.Read.All");
     expect(capabilityExplanation(view("missing_internal_role"))).toContain("AgentControl.Viewer");
+  });
+  it("provides stale-evidence recovery without claiming an automatic check is pending", () => {
+    for (const status of ["available", "unknown"] as const) {
+      const stale = view(status);
+      stale.decision.expiresAt = new Date(Date.now() - 1).toISOString();
+      stale.decision.fresh = false;
+      expect(capabilityExplanation(stale)).toContain("Check status");
+      expect(capabilityExplanation(stale)).toContain("authorized saved data remains readable");
+      expect(capabilityExplanation(stale)).not.toContain("pending");
+      expect(providerActionAllowed(stale)).toBe(false);
+    }
   });
   it.each(["token_acquisition", "provider_read"] as const)("identifies a %s timeout instead of implying a permission failure", phase => {
     const failed = view("provider_error");
@@ -117,7 +180,7 @@ describe("capability UX decisions", () => {
   });
   it.each(Object.keys(statusLabels).filter(status => status !== "available") as CapabilityStatus[])(
     "does not let on-demand readiness override %s", status => {
-      for (const id of ["graph.package.block.manage", "graph.package.access.manage", "powerPlatform.quarantine.manage"] as const) {
+      for (const id of onDemandIds) {
         const unavailable = onDemandView(id);
         unavailable.decision.status = status;
         expect(providerActionAllowed(unavailable, true)).toBe(false);

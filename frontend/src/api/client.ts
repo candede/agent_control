@@ -1,4 +1,6 @@
 import type { AppRole, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
+import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
+export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventoryResourcePage, InventorySnapshot, InventorySnapshotList, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import type { OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
@@ -108,15 +110,6 @@ export type SessionUser = {
   tenantId?: string;
   roles: AppRole[];
 };
-
-export type PackageStatus =
-  | "all"
-  | "some"
-  | "none"
-  | "allowedForAll"
-  | "allowedForSome"
-  | "allowedForNoOne"
-  | "unknownFutureValue";
 
 export type CopilotPackage = {
   id: string;

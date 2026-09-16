@@ -47,6 +47,35 @@ describe("GraphPackagesClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it.each([null, {}, { value: null }, { value: {} }])("rejects invalid inventory page schemas: %j", async body => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json(body));
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an inventory page with no response body", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 204 }));
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([null, false, true, 0, 1, "", "   ", {}, []].map(nextLink => ({ nextLink })))("rejects an invalid inventory continuation link: $nextLink", async ({ nextLink }) => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: [{ id: "P_1", displayName: "Package", isBlocked: false }],
+      "@odata.nextLink": nextLink,
+    }));
+    const onProgress = vi.fn();
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token", { onProgress })).rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(onProgress).not.toHaveBeenCalled();
+  });
+
+  it.each(["not a URL", "/v1.0/copilot/admin/catalog/packages?page=2", "https://["])("rejects a malformed continuation URL without fetching it: %s", async nextLink => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [], "@odata.nextLink": nextLink }));
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token")).rejects.toMatchObject({ code: "invalid_provider_link" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("retains the response byte limit for catalog checks without requesting an undocumented row limit", async () => {
     const fetcher = vi.fn<FetchLike>(async () => new Response("x".repeat(2_000_001)));
     await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_result_limit" });

@@ -198,6 +198,7 @@ function App() {
   const [legacyUsagePresent, setLegacyUsagePresent] = useState(hasLegacyUsageStorage);
   const capabilityState = useCapabilities(user);
   const [trackedJob, setTrackedJob] = useState<BulkActionJob>();
+  const [bulkJobStorageError, setBulkJobStorageError] = useState<string>();
   const [linkedPackageRefreshJob, setLinkedPackageRefreshJob] = useState<PackageRefreshJob>();
   const [linkedJobError, setLinkedJobError] = useState<string>();
   const [authSetup, setAuthSetup] = useState<{ authConfigured: boolean; callback: string; setup?: string }>();
@@ -327,7 +328,7 @@ function App() {
   const principalKey = user
     ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
     : `signed-out:${sessionEpoch}`;
-  const sessionOwnerRef = useRef(principalKey);
+  const sessionOwnerRef = useRef<string | undefined>(principalKey);
   const activeViewRef = useRef(activeView);
   const workbenchMetadata = loadedWorkbenchMetadata?.principalKey === principalKey
     ? loadedWorkbenchMetadata.value
@@ -692,7 +693,11 @@ function App() {
     }
     if (requestedPackageControlJobId || requestedPackageRefreshJobId) return;
 
-    const jobId = loadStoredActiveBulkJobId();
+    const stored = loadStoredActiveBulkJobId();
+    if (stored.error) {
+      void Promise.resolve().then(() => setBulkJobStorageError(stored.error));
+    }
+    const jobId = stored.jobId;
 
     if (!jobId || resumedBulkJobIds.current.has(jobId)) {
       return;
@@ -847,10 +852,16 @@ function App() {
     () => {
       const timerIds = stateChangeTimerIds.current;
       return () => {
+        sessionOwnerRef.current = undefined;
         agentDetailRequestId.current += 1;
         agentDetailAbortController.current?.abort();
+        agentListRequestId.current += 1;
+        agentListAbortController.current?.abort();
+        bulkJobPollRequestId.current += 1;
         packageRefreshRequestId.current += 1;
         inventoryRefreshRequestId.current += 1;
+        officialUsageRequestId.current += 1;
+        officialUsageAbortController.current?.abort();
         for (const timerId of timerIds) {
           window.clearTimeout(timerId);
         }
@@ -914,7 +925,6 @@ function App() {
     setBulkAccessAgentIds(undefined);
     setBulkConfirmation(undefined);
     setExportChoiceOpen(false);
-    setExportingPowerPlatformCsv(false);
     setRefreshingPowerPlatformAgents(false);
     setActiveView(view);
     const savedSearch = savedViewSearches.current.get(view) ?? "";
@@ -1037,6 +1047,7 @@ function App() {
   )?.observations.powerPlatform ?? null;
 
   function clearPrivateState() {
+    sessionOwnerRef.current = undefined;
     setShowAdvancedFilters(false);
     clearPackageSelection(user);
     setSessionEpoch(current => current + 1);
@@ -1055,7 +1066,7 @@ function App() {
     stateChangeVersions.current.clear();
     for (const timerId of stateChangeTimerIds.current) window.clearTimeout(timerId);
     stateChangeTimerIds.current.clear();
-    clearStoredActiveBulkJobId();
+    clearActiveBulkJobId();
     setLoadedWorkbenchMetadata(undefined);
     setAgents([]);
     setAgentPage(undefined);
@@ -1159,11 +1170,12 @@ function App() {
           limit: agentDisplayPageSize,
           offset: agentPageIndex * agentDisplayPageSize,
         }, { signal: controller.signal }),
-        getInventoryRefreshJobs({ signal: controller.signal }).catch(() => ({
-          value: [],
-          lastAttemptAt: null,
-          lastSuccessAt: null,
-        })),
+        getInventoryRefreshJobs({ signal: controller.signal }).catch(requestError => {
+          if (requestId === agentListRequestId.current && !controller.signal.aborted) {
+            setError(`Unable to load Power Platform agent refresh history: ${errorMessage(requestError)}`);
+          }
+          return undefined;
+        }),
       ]);
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
       const lastPage = Math.max(Math.ceil(unifiedResponse.count / agentDisplayPageSize) - 1, 0);
@@ -1177,10 +1189,14 @@ function App() {
       setSelectedUnifiedAgent(current =>
         current ? unifiedResponse.value.find(record => record.id === current.id
           || current.packages.some(item => record.packages.some(candidate => candidate.id === item.id))) ?? current : current);
-      const latestPowerPlatformAgentJob = inventoryRefreshJobs.value.find((job) =>
+      const latestPowerPlatformAgentJob = inventoryRefreshJobs?.value.find((job) =>
         job.requestedTypes.includes("microsoft.copilotstudio/agents"),
       );
-      if (latestPowerPlatformAgentJob) setPowerPlatformAgentRefreshJob(latestPowerPlatformAgentJob);
+      if (latestPowerPlatformAgentJob) {
+        // History must not replace a refresh, resume or poll result received while the read was in flight.
+        setPowerPlatformAgentRefreshJob(current =>
+          current === powerPlatformAgentRefreshJob ? latestPowerPlatformAgentJob : current);
+      }
       setSavedAgentPageOwner({ principalKey, requestId });
       setAgentSnapshotId(response.snapshot?.id);
       setLastAgentListRefreshAt(response.snapshot ? new Date(response.snapshot.observedAt) : undefined);
@@ -1504,6 +1520,8 @@ function App() {
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
     const owner = principalKey;
+    if (loadingAgentDetailId) setRequestedAgentDetailId(undefined);
+    setLoadingAgentDetailId(undefined);
     setBusyAgentId(agent.id);
     setError(undefined);
     setBulkResult(undefined);
@@ -1513,6 +1531,7 @@ function App() {
       const preview = await previewPackageMutation({ action, ids: [agent.id], mutationScope: "single" });
       if (!ownsAgentFlowRequest(requestId, owner)) return;
       setBulkConfirmation({ action, ids: [agent.id], mutationScope: "single", preview });
+      return true;
     } catch (requestError) {
       if (ownsAgentFlowRequest(requestId, owner)) setError(errorMessage(requestError));
     } finally {
@@ -1540,9 +1559,11 @@ function App() {
     setError(undefined);
     const action = update.target === "availability" ? "update-availability" : "update-installation";
     const requestId = agentDetailRequestId.current;
+    const owner = principalKey;
     const preview = await previewPackageMutation({ action, ids, mutationScope, accessUpdate: update });
-    if (agentDetailRequestId.current !== requestId) return;
+    if (!ownsAgentFlowRequest(requestId, owner)) return false;
     setBulkConfirmation({ action, ids, mutationScope, preview, accessUpdate: update });
+    return true;
   }
 
   function requestExportCsv() {
@@ -1564,6 +1585,7 @@ function App() {
     setExportProgressMode("fast");
     setExportProgress(0);
     setExportProgressTotal(exportableAgentCount);
+    const owner = principalKey;
 
     try {
       const blob = await downloadPackageInventoryCsv({
@@ -1580,14 +1602,17 @@ function App() {
           sortDirection: agentSortDirection,
         },
       });
+      if (!ownsSession(owner)) return;
       setExportProgress(exportableAgentCount);
       downloadBlob("package-inventory.csv", blob);
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (ownsSession(owner)) setError(errorMessage(requestError));
     } finally {
-      setExportingCsv(false);
-      setExportProgress(0);
-      setExportProgressTotal(0);
+      if (ownsSession(owner)) {
+        setExportingCsv(false);
+        setExportProgress(0);
+        setExportProgressTotal(0);
+      }
     }
   }
 
@@ -1600,6 +1625,7 @@ function App() {
     setExportChoiceOpen(false);
     setError(undefined);
     setExportingPowerPlatformCsv(true);
+    const owner = principalKey;
     try {
       const blob = await downloadInventoryCsv({
         snapshotId,
@@ -1607,11 +1633,14 @@ function App() {
         search: deferredQuery.trim() || undefined,
         environmentId: agentEnvironmentFilter.trim() || undefined,
       });
+      if (!ownsSession(owner)) return;
       downloadBlob(`power-platform-agent-inventory-${snapshotId}.csv`, blob);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Unable to export Power Platform agent inventory.");
+      if (ownsSession(owner)) {
+        setError(caught instanceof Error ? caught.message : "Unable to export Power Platform agent inventory.");
+      }
     } finally {
-      setExportingPowerPlatformCsv(false);
+      if (ownsSession(owner)) setExportingPowerPlatformCsv(false);
     }
   }
 
@@ -1684,17 +1713,25 @@ function App() {
       return;
     }
 
+    const requestId = ++agentDetailRequestId.current;
+    agentDetailAbortController.current?.abort();
+    const owner = principalKey;
+    if (loadingAgentDetailId) setRequestedAgentDetailId(undefined);
+    setLoadingAgentDetailId(undefined);
     setError(undefined);
     try {
       const preview = await previewPackageMutation({ action: label, ids: scope, mutationScope: "bulk" });
+      if (!ownsAgentFlowRequest(requestId, owner)) return;
       setBulkConfirmation({ action: label, ids: scope, mutationScope: "bulk", preview });
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (ownsAgentFlowRequest(requestId, owner)) setError(errorMessage(requestError));
     }
   }
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
     const { action: label, ids, mutationScope, preview, accessUpdate } = confirmation;
+    const requestId = ++bulkJobPollRequestId.current;
+    const owner = principalKey;
 
     setBulkConfirmation(undefined);
 
@@ -1740,13 +1777,15 @@ function App() {
           : await unblockAgents(ids, preview.confirmationHash);
       }
 
-      saveStoredActiveBulkJobId(job.id);
+      if (!ownsBulkJobRequest(requestId, owner)) return;
       await followBulkJob(job.id, job);
     } catch (requestError) {
-      setError(errorMessage(requestError));
-      setBusyBulkAction(undefined);
-      setBulkProgress(undefined);
-      clearStoredActiveBulkJobId();
+      if (ownsBulkJobRequest(requestId, owner)) {
+        setError(errorMessage(requestError));
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+        clearActiveBulkJobId();
+      }
     }
   }
 
@@ -1790,27 +1829,31 @@ function App() {
   async function followBulkJob(jobId: string, initialJob?: BulkActionJob, persist = true) {
     const requestId = bulkJobPollRequestId.current + 1;
     bulkJobPollRequestId.current = requestId;
+    const owner = principalKey;
     let keepStored = true;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
 
     try {
       let job = initialJob ?? (await getBulkActionJob(jobId));
-      if (bulkJobPollRequestId.current !== requestId) return;
+      if (!ownsBulkJobRequest(requestId, owner)) return;
       setTrackedJob(job);
 
       setBusyBulkAction(job.action);
       setBulkProgress(toBulkProgress(job));
-      if (persist) saveStoredActiveBulkJobId(job.id);
+      if (persist) {
+        const storageError = saveStoredActiveBulkJobId(job.id);
+        if (storageError) setBulkJobStorageError(storageError);
+      }
 
       while (isJobPolling(job.status) && Date.now() < deadline) {
         await wait(bulkJobPollIntervalMs);
 
-        if (bulkJobPollRequestId.current !== requestId) {
+        if (!ownsBulkJobRequest(requestId, owner)) {
           return;
         }
         job = await getBulkActionJob(jobId);
 
-        if (bulkJobPollRequestId.current !== requestId) {
+        if (!ownsBulkJobRequest(requestId, owner)) {
           return;
         }
 
@@ -1831,15 +1874,15 @@ function App() {
       }
       setError(jobStatusMessage(job.status));
     } catch (requestError) {
-      if (bulkJobPollRequestId.current === requestId) {
+      if (ownsBulkJobRequest(requestId, owner)) {
         if (persist) setError(errorMessage(requestError));
         else setLinkedJobError(`The exact package control job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
       }
     } finally {
-      if (bulkJobPollRequestId.current === requestId) {
+      if (ownsBulkJobRequest(requestId, owner)) {
         setBusyBulkAction(undefined);
         setBulkProgress(undefined);
-        if (persist && !keepStored) clearStoredActiveBulkJobId();
+        if (persist && !keepStored) clearActiveBulkJobId();
       }
     }
   }
@@ -1908,29 +1951,64 @@ function App() {
 
   async function handleResumeJob() {
     if (!trackedJob || !window.confirm("Resume only unsent items with your current authorization? Inconclusive writes will not be replayed.")) return;
-    try { const job = await resumeBulkActionJob(trackedJob.id); await followBulkJob(job.id, job); }
-    catch (requestError) { setError(errorMessage(requestError)); }
+    const requestId = ++bulkJobPollRequestId.current;
+    const owner = principalKey;
+    try {
+      const job = await resumeBulkActionJob(trackedJob.id);
+      if (ownsBulkJobRequest(requestId, owner)) await followBulkJob(job.id, job);
+    } catch (requestError) {
+      if (ownsBulkJobRequest(requestId, owner)) {
+        setError(errorMessage(requestError));
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+      }
+    }
   }
 
   async function handleCancelJob() {
     if (!trackedJob) return;
-    try { setTrackedJob(await cancelBulkActionJob(trackedJob.id)); }
-    catch (requestError) { setError(errorMessage(requestError)); }
+    const requestId = ++bulkJobPollRequestId.current;
+    const owner = principalKey;
+    try {
+      const job = await cancelBulkActionJob(trackedJob.id);
+      if (ownsBulkJobRequest(requestId, owner)) {
+        await followBulkJob(job.id, job, !requestedPackageControlJobId);
+      }
+    } catch (requestError) {
+      if (ownsBulkJobRequest(requestId, owner)) {
+        setError(errorMessage(requestError));
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+      }
+    }
   }
 
   async function handleReconcileJob() {
     if (!trackedJob) return;
+    const requestId = ++bulkJobPollRequestId.current;
+    const owner = principalKey;
     setError(undefined);
     try {
       const reconciled = await reconcileBulkActionJob(trackedJob.id);
+      if (!ownsBulkJobRequest(requestId, owner)) return;
       setTrackedJob(reconciled);
       if (reconciled.result) setBulkResult(reconciled.result);
       if (reconciled.reconciliation.failed) {
         setError(`${reconciled.reconciliation.failed} provider read${reconciled.reconciliation.failed === 1 ? "" : "s"} could not be reconciled.`);
       }
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (ownsBulkJobRequest(requestId, owner)) setError(errorMessage(requestError));
+    } finally {
+      if (ownsBulkJobRequest(requestId, owner)) {
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+      }
     }
+  }
+
+  function clearActiveBulkJobId() {
+    const storageError = clearStoredActiveBulkJobId();
+    if (storageError) setBulkJobStorageError(storageError);
   }
 
   function handleClearAgentFilters() {
@@ -2114,18 +2192,26 @@ function App() {
 
   function ownsAgentFlowRequest(requestId: number, owner: string) {
     return agentDetailRequestId.current === requestId
-      && sessionOwnerRef.current === owner
+      && ownsSession(owner)
       && activeViewRef.current === "agents";
+  }
+
+  function ownsSession(owner: string) {
+    return sessionOwnerRef.current === owner && !sessionRevalidationInFlight.current;
+  }
+
+  function ownsBulkJobRequest(requestId: number, owner: string) {
+    return bulkJobPollRequestId.current === requestId && ownsSession(owner);
   }
 
   function ownsPackageRefreshRequest(requestId: number, owner: string) {
     return packageRefreshRequestId.current === requestId
-      && sessionOwnerRef.current === owner;
+      && ownsSession(owner);
   }
 
   function ownsInventoryRefreshRequest(requestId: number, owner: string) {
     return inventoryRefreshRequestId.current === requestId
-      && sessionOwnerRef.current === owner
+      && ownsSession(owner)
       && activeViewRef.current === "sync";
   }
 
@@ -2162,6 +2248,7 @@ function App() {
           </p>
           {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
           {error ? <div className="error-banner">{error}</div> : null}
+          {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
           {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
           <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
             Sign in with Entra ID
@@ -2273,6 +2360,7 @@ function App() {
       </header>
 
       {error ? <div className="error-banner">{error}</div> : null}
+      {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
       {hasRole(user, "AgentControl.Viewer") ? (
         <DataSyncPanel
           ref={dataSyncPanelRef}
@@ -2708,9 +2796,10 @@ function App() {
           externalAccessEditorOpen={singleAccessAgentDetail?.id === agentDetail.id}
           onUpdateAccess={handleUpdateAgentAccess}
           onSetBlocked={async (blocked) => {
-            await handleAgentAction(agentDetail, blocked);
-            setAgentDetail(undefined);
-            setRequestedAgentDetailId(undefined);
+            if (await handleAgentAction(agentDetail, blocked)) {
+              setAgentDetail(undefined);
+              setRequestedAgentDetailId(undefined);
+            }
           }}
         />
       ) : null}
@@ -2722,10 +2811,14 @@ function App() {
           initialTarget={singleAccessTarget}
           initialStatus={singleAccessTarget === "availability" ? singleAccessAgentDetail.availableTo : singleAccessAgentDetail.deployedTo}
           initialPrincipals={singleAccessTarget === "availability" ? singleAccessAgentDetail.allowedUsersAndGroups : singleAccessAgentDetail.acquireUsersAndGroups}
-          onCancel={() => setSingleAccessAgentDetail(undefined)}
-          onSubmit={async (update) => {
-            await requestAccessConfirmation([singleAccessAgentDetail.id], update, "single");
+          onCancel={() => {
+            agentDetailRequestId.current += 1;
             setSingleAccessAgentDetail(undefined);
+          }}
+          onSubmit={async (update) => {
+            if (await requestAccessConfirmation([singleAccessAgentDetail.id], update, "single")) {
+              setSingleAccessAgentDetail(undefined);
+            }
           }}
         />
       ) : null}
@@ -2734,7 +2827,10 @@ function App() {
         <AccessAssignmentModal
           context="bulk"
           agentCount={bulkAccessAgentIds.length}
-          onCancel={() => setBulkAccessAgentIds(undefined)}
+          onCancel={() => {
+            agentDetailRequestId.current += 1;
+            setBulkAccessAgentIds(undefined);
+          }}
           onSubmit={runBulkAccessUpdate}
         />
       ) : null}
@@ -2796,27 +2892,35 @@ function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-function loadStoredActiveBulkJobId() {
+function loadStoredActiveBulkJobId(): { jobId?: string; error?: string } {
   if (typeof window === "undefined") {
-    return undefined;
+    return {};
   }
 
   try {
-    return window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined;
+    return { jobId: window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined };
   } catch {
-    return undefined;
+    return { error: "Unable to read the saved package job from browser storage. Open Jobs to recover retained work." };
   }
 }
 
 function saveStoredActiveBulkJobId(jobId: string) {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(activeBulkJobStorageKey, jobId);
+    try {
+      window.localStorage.setItem(activeBulkJobStorageKey, jobId);
+    } catch {
+      return "Unable to save the active package job in browser storage. Tracking continues in this tab; use Jobs after reload.";
+    }
   }
 }
 
 function clearStoredActiveBulkJobId() {
   if (typeof window !== "undefined") {
-    window.localStorage.removeItem(activeBulkJobStorageKey);
+    try {
+      window.localStorage.removeItem(activeBulkJobStorageKey);
+    } catch {
+      return "Unable to clear the saved package job from browser storage. A later reload may retry the saved job ID with current authorization.";
+    }
   }
 }
 

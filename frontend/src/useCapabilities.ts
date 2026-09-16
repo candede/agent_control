@@ -3,28 +3,29 @@ import { ApiError, checkCapabilities, getCapabilities, type CapabilityView, type
 import { hasRole } from "./authorization";
 
 const expiryRetryDelayMs = 30_000;
+const maximumTimerDelayMs = 2_147_483_647;
 
 function principalKey(user: SessionUser | undefined) {
   if (!user || !hasRole(user, "AgentControl.Viewer")) return undefined;
   return `${user.tenantId ?? ""}\0${user.homeAccountId}\0${[...user.roles].sort().join(",")}`;
 }
 
-function evidenceExpirySignature(views: CapabilityView[]) {
+function evidenceExpiries(views: CapabilityView[]) {
   return views
-    .filter(view => view.definition.mode === "delegated" && view.definition.probe.adapterRegistered)
+    .filter(view => view.definition.mode !== "local")
     .map(view => Date.parse(view.decision.expiresAt ?? ""))
     .filter(Number.isFinite)
-    .sort((left, right) => left - right)
-    .join(",");
+    .sort((left, right) => left - right);
 }
 
 function expiredEvidenceSignature(views: CapabilityView[], now = Date.now()) {
-  const signature = evidenceExpirySignature(views);
-  if (!signature) return undefined;
-  return signature.split(",").some(value => Number(value) <= now) ? signature : undefined;
+  const delegatedViews = views.filter(view => view.definition.mode === "delegated" && view.definition.probe.adapterRegistered);
+  return evidenceExpiries(delegatedViews).filter(expiry => expiry <= now).join(",") || undefined;
 }
 
 export function useCapabilities(user: SessionUser | undefined) {
+  const key = principalKey(user);
+  const [stateKey, setStateKey] = useState(key);
   const [views, setViews] = useState<CapabilityView[]>([]);
   const [owner, setOwner] = useState<string>();
   const [loading, setLoading] = useState(false);
@@ -34,41 +35,70 @@ export function useCapabilities(user: SessionUser | undefined) {
   const generation = useRef(0);
   const request = useRef<{ generation: number; controller: AbortController; promise: Promise<void> } | undefined>(undefined);
   const activeController = useRef<AbortController | undefined>(undefined);
+  const initialCheckRequired = useRef(false);
   const attemptedExpiry = useRef<string | undefined>(undefined);
   const expiryRetryCounts = useRef(new Map<string, number>());
-  const expiryRetryTimer = useRef<number | undefined>(undefined);
-  const key = principalKey(user);
+  const expiryRetryTimer = useRef<{ id: number; signature: string; ready: boolean } | undefined>(undefined);
+
+  if (stateKey !== key) {
+    setStateKey(key);
+    setViews([]);
+    setOwner(undefined);
+    setLoading(false);
+    setPending(false);
+    setError(undefined);
+  }
 
   const runCheck = useCallback((current: number, controller: AbortController, expirySignature?: string, retryFailed = false) => {
     const existing = request.current;
     if (existing?.generation === current) return existing.promise;
+    const retry = expiryRetryTimer.current;
+    if (retry?.ready) {
+      expiryRetryCounts.current.set(retry.signature, 1);
+      expiryRetryTimer.current = undefined;
+    }
     activeController.current = controller;
     setPending(true);
+    const scheduleExpiryRetry = (signature: string | undefined) => {
+      if (expiryRetryTimer.current?.signature === signature) return;
+      if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
+      expiryRetryTimer.current = undefined;
+      if (!signature || (expiryRetryCounts.current.get(signature) ?? 0) >= 1) return;
+      expiryRetryTimer.current = {
+        signature,
+        ready: false,
+        id: window.setTimeout(() => {
+          if (generation.current !== current || expiryRetryTimer.current?.signature !== signature) return;
+          expiryRetryTimer.current.ready = true;
+          attemptedExpiry.current = undefined;
+          setNow(Date.now());
+        }, expiryRetryDelayMs),
+      };
+    };
     const promise = checkCapabilities({ signal: controller.signal, retryFailed })
       .then(result => {
         if (generation.current !== current) return;
         setViews(result.value);
         setOwner(key);
         setError(undefined);
-        setNow(Date.now());
-        expiryRetryCounts.current.clear();
-        if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current);
-        expiryRetryTimer.current = undefined;
+        const currentTime = Date.now();
+        setNow(currentTime);
+        const expiredSignature = expiredEvidenceSignature(result.value, currentTime);
+        scheduleExpiryRetry(expiredSignature);
+        if (expiredSignature) {
+          // A successful response can reuse evidence the browser already considers expired.
+          attemptedExpiry.current = expiryRetryTimer.current?.ready ? undefined : expiredSignature;
+        } else {
+          attemptedExpiry.current = undefined;
+          expiryRetryCounts.current.clear();
+        }
       })
       .catch(cause => {
         if (generation.current !== current || controller.signal.aborted) return;
         const detail = cause instanceof ApiError && cause.code === "invalid_origin" ? ` ${cause.message}` : "";
         setError(`Automatic permission check failed.${detail} Existing decisions and saved-data permissions are unchanged. Use Check status to retry.`);
         setNow(Date.now());
-        const retryCount = expirySignature ? expiryRetryCounts.current.get(expirySignature) ?? 0 : 1;
-        if (expirySignature && retryCount < 1) {
-          expiryRetryCounts.current.set(expirySignature, retryCount + 1);
-          expiryRetryTimer.current = window.setTimeout(() => {
-            if (generation.current !== current) return;
-            attemptedExpiry.current = undefined;
-            setNow(Date.now());
-          }, expiryRetryDelayMs);
-        }
+        scheduleExpiryRetry(expirySignature);
         if (cause instanceof Error && cause.name === "AbortError") return;
       })
       .finally(() => {
@@ -83,9 +113,10 @@ export function useCapabilities(user: SessionUser | undefined) {
     const current = ++generation.current;
     activeController.current?.abort();
     request.current = undefined;
+    initialCheckRequired.current = false;
     attemptedExpiry.current = undefined;
     expiryRetryCounts.current.clear();
-    if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current);
+    if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
     expiryRetryTimer.current = undefined;
     const controller = new AbortController();
     activeController.current = controller;
@@ -96,15 +127,14 @@ export function useCapabilities(user: SessionUser | undefined) {
       };
     }
     void getCapabilities({ signal: controller.signal })
-      .then(async result => {
+      .then(result => {
         if (generation.current !== current) return;
+        initialCheckRequired.current = true;
         setViews(result.value);
         setOwner(key);
         setError(undefined);
         setLoading(false);
-        const expiredSignature = expiredEvidenceSignature(result.value);
-        attemptedExpiry.current = expiredSignature;
-        await runCheck(current, controller, expiredSignature);
+        setNow(Date.now());
       })
       .catch(() => {
         if (generation.current !== current || controller.signal.aborted) return;
@@ -112,31 +142,39 @@ export function useCapabilities(user: SessionUser | undefined) {
         setOwner(key);
         setError("Capability status could not be loaded. Saved-data permissions are unchanged.");
         setLoading(false);
+        setPending(false);
       });
     return () => {
       controller.abort();
-      if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current);
+      activeController.current?.abort();
+      if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
+      expiryRetryTimer.current = undefined;
       generation.current += 1;
     };
-  }, [key, runCheck]);
+  }, [key]);
 
   useEffect(() => {
-    if (!key || owner !== key || loading || pending) return;
-    const expiries = evidenceExpirySignature(views).split(",").filter(Boolean).map(Number);
-    if (!expiries.length) return;
-    const signature = expiries.join(",");
-    const earliest = expiries[0];
+    if (!key || owner !== key) return;
+    const expiries = evidenceExpiries(views);
+    if (!expiries.length && !initialCheckRequired.current) return;
     let timer: number | undefined;
     const checkExpired = () => {
       const currentTime = Date.now();
       setNow(currentTime);
-      if (currentTime <= earliest || document.visibilityState !== "visible" || attemptedExpiry.current === signature) return;
+      const signature = expiredEvidenceSignature(views, currentTime);
+      if (loading || pending || document.visibilityState !== "visible") return;
+      if (!initialCheckRequired.current && (!signature || attemptedExpiry.current === signature)) return;
+      initialCheckRequired.current = false;
       attemptedExpiry.current = signature;
       const controller = new AbortController();
       void runCheck(generation.current, controller, signature);
     };
-    if (earliest > Date.now()) timer = window.setTimeout(checkExpired, earliest - Date.now() + 1);
-    else checkExpired();
+    const currentTime = Date.now();
+    const nextExpiry = expiries.find(expiry => expiry > currentTime);
+    if (nextExpiry !== undefined) timer = window.setTimeout(checkExpired, Math.min(nextExpiry - currentTime + 1, maximumTimerDelayMs));
+    const expiredSignature = expiredEvidenceSignature(views, currentTime);
+    if (!loading && !pending && document.visibilityState === "visible" && (initialCheckRequired.current
+      || expiredSignature && attemptedExpiry.current !== expiredSignature)) checkExpired();
     document.addEventListener("visibilitychange", checkExpired);
     window.addEventListener("focus", checkExpired);
     return () => {
@@ -151,13 +189,15 @@ export function useCapabilities(user: SessionUser | undefined) {
     const current = ++generation.current;
     activeController.current?.abort();
     request.current = undefined;
+    initialCheckRequired.current = false;
     attemptedExpiry.current = undefined;
     expiryRetryCounts.current.clear();
-    if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current);
+    if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
     expiryRetryTimer.current = undefined;
     const controller = new AbortController();
     activeController.current = controller;
     setLoading(true);
+    setPending(false);
     try {
       const result = await getCapabilities({ signal: controller.signal });
       if (current !== generation.current) return;
@@ -171,6 +211,7 @@ export function useCapabilities(user: SessionUser | undefined) {
       await runCheck(current, controller, expiredSignature, true);
     } catch {
       if (current === generation.current && !controller.signal.aborted) {
+        setOwner(key);
         setError("Capability status could not be loaded. Existing decisions and saved-data permissions are unchanged.");
       }
     } finally { if (current === generation.current) setLoading(false); }

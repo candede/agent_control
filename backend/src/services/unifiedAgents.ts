@@ -10,7 +10,12 @@ import {
   type InventoryDataScope,
   type UnifiedPowerPlatformSourceResult,
 } from "../db/powerPlatformInventory.js";
-import type { CopilotPackage, CopilotPackageDetail } from "../types/copilotPackage.js";
+import {
+  normalizePackageAuthoringTool,
+  normalizePackageStatus,
+  type CopilotPackage,
+  type CopilotPackageDetail,
+} from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import type {
   UnifiedAgentInventoryPage,
@@ -88,7 +93,12 @@ export class UnifiedAgentsService {
     const powerPlatformStatus = powerPlatformSourceStatus(powerPlatformLoad, powerPlatformObservation);
     if (powerPlatformStatus.error) sourceErrors.push(powerPlatformStatus.error);
     const usablePowerPlatform = powerPlatformStatus.state === "unavailable" ? [] : powerPlatformSource.resources;
-    const usablePackages = graphStatus.state === "unavailable" ? [] : packageSource.packages;
+    const usablePackages = graphStatus.state === "unavailable" ? [] : packageSource.packages.map(value => {
+      const observation = packageSource.observations[value.id];
+      return !value.identityDetailsCollected && (observation?.scopeKind === "exact" || observation?.identityDetails)
+        ? { ...value, identityDetailsCollected: true as const }
+        : value;
+    });
     const links = this.dependencies.resolveLinks(scope.tenantId, usablePackages, usablePowerPlatform);
     const records = buildRecords(
       usablePackages,
@@ -108,10 +118,10 @@ export class UnifiedAgentsService {
         label: powerPlatformSource.environmentNames[key] ?? record.environmentId,
       });
     }
-    const platforms = new Map(packageFacets(usablePackages).platforms.map(option => [normalizeFacet(option.value), option]));
+    const platforms = new Map(packageFacets(usablePackages).platforms.map(option => [normalizePackageAuthoringTool(option.value), option]));
     for (const resource of usablePowerPlatform) {
       const label = resource.authoringTool?.trim();
-      if (label && !platforms.has(normalizeFacet(label))) platforms.set(normalizeFacet(label), { value: label, label });
+      if (label && !platforms.has(normalizePackageAuthoringTool(label))) platforms.set(normalizePackageAuthoringTool(label), { value: label, label });
     }
     const byLabel = (left: { value: string; label: string }, right: { value: string; label: string }) =>
       left.label.localeCompare(right.label) || left.value.localeCompare(right.value);
@@ -124,9 +134,7 @@ export class UnifiedAgentsService {
     const sorted = [...filtered].sort(recordComparator(query));
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 250);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
-    const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected
-      || packageSource.observations[value.id]?.scopeKind === "exact"
-      || packageSource.observations[value.id]?.identityDetails).length;
+    const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected).length;
 
     return {
       value: sorted.slice(offset, offset + limit),
@@ -301,10 +309,15 @@ function powerPlatformSourceStatus(
     );
   }
   if (observation.coverage !== "covered" || observation.environmentScope !== null) {
-    const message = observation.environmentScope
-      ? "The saved Power Platform inventory covers only one environment; observed agents are returned as partial availability."
-      : "The saved Power Platform inventory does not prove complete Copilot Studio agent coverage; observed agents are returned as partial availability.";
-    const error: UnifiedAgentSourceError = { source: "power_platform", code: "coverage_unknown", message };
+    const reasons: string[] = [];
+    if (observation.environmentScope !== null) reasons.push(
+      "The saved Power Platform inventory covers only one environment; observed agents are returned as partial availability.",
+    );
+    if (observation.coverage !== "covered") reasons.push(observation.roleScope === "unknown"
+        ? "Power Platform collection completed, but this snapshot has no recognized Microsoft Entra inventory role evidence (wids). The returned agents are available; tenant-wide Copilot Studio coverage is unknown. Ask an administrator to verify directory-role claims and your active provider role, sign in again, then refresh Power Platform inventory. Refreshing with the same missing role evidence will remain partial."
+        : "The saved Power Platform inventory does not prove complete Copilot Studio agent coverage; observed agents are returned as partial availability.",
+    );
+    const error: UnifiedAgentSourceError = { source: "power_platform", code: "coverage_unknown", message: reasons.join(" ") };
     return { state: "partial", observation, error };
   }
   return { state: "available", observation, error: null };
@@ -350,8 +363,8 @@ function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) 
   )) return false;
   if (query.availableTo && !record.packages.some(value => matchesAvailability(value.availableTo, query.availableTo!))) return false;
   if (query.host && !record.packages.some(value => matchesHost(value.supportedHosts, query.host!))) return false;
-  if (query.platform && !record.packages.some(value => packagePlatform(value) === normalizeFacet(query.platform!))
-    && normalizeFacet(record.powerPlatformResource?.authoringTool ?? "") !== normalizeFacet(query.platform)) return false;
+  if (query.platform && !record.packages.some(value => packagePlatform(value) === normalizePackageAuthoringTool(query.platform!))
+    && normalizePackageAuthoringTool(record.powerPlatformResource?.authoringTool ?? "") !== normalizePackageAuthoringTool(query.platform)) return false;
   if (query.createdWithinDays !== undefined) {
     const threshold = Date.now() - query.createdWithinDays * 24 * 60 * 60_000;
     const createdDates = [...record.packages.map(value => value.createdDateTime), record.powerPlatformResource?.createdAt];
@@ -374,16 +387,35 @@ function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) 
 
 function recordComparator(query: UnifiedAgentInventoryQuery) {
   const direction = query.sortDirection === "desc" ? -1 : 1;
-  const value = (record: UnifiedAgentRecord) => {
-    if (query.sortBy === "environment") return record.environmentId ?? "";
-    if (query.sortBy === "source") return record.presence;
-    if (query.sortBy === "lastModifiedAt") {
-      return [
+  if (query.sortBy === "lastModifiedAt") {
+    const timestamps = new Map<UnifiedAgentRecord, number>();
+    const modifiedAt = (record: UnifiedAgentRecord) => {
+      const cached = timestamps.get(record);
+      if (cached !== undefined) return cached;
+      const latest = [
         record.powerPlatformResource?.lastPublishedAt,
         record.powerPlatformResource?.createdAt,
         ...record.packages.map(item => item.lastModifiedDateTime),
-      ].filter((item): item is string => Boolean(item)).sort().at(-1) ?? "";
-    }
+      ].reduce<number>((latest, value) => {
+        if (!value) return latest;
+        const timestamp = Date.parse(value);
+        if (!Number.isFinite(timestamp)) {
+          throw new AppError(500, "saved_source_invalid", "Saved agent inventory contains an invalid modification timestamp.");
+        }
+        return Math.max(latest, timestamp);
+      }, Number.NEGATIVE_INFINITY);
+      timestamps.set(record, latest);
+      return latest;
+    };
+    return (left: UnifiedAgentRecord, right: UnifiedAgentRecord) => {
+      const leftTime = modifiedAt(left);
+      const rightTime = modifiedAt(right);
+      return ((leftTime < rightTime ? -1 : leftTime > rightTime ? 1 : 0) || ordinal(left.id, right.id)) * direction;
+    };
+  }
+  const value = (record: UnifiedAgentRecord) => {
+    if (query.sortBy === "environment") return record.environmentId ?? "";
+    if (query.sortBy === "source") return record.presence;
     return record.displayName;
   };
   return (left: UnifiedAgentRecord, right: UnifiedAgentRecord) =>
@@ -419,7 +451,8 @@ function matchesAvailability(value: string | undefined, filter: string) {
   const expected = filter.startsWith("available:") ? filter.slice("available:".length) : filter;
   if (expected === "__unknown__") return value === undefined;
   if (expected === "__some_or_all__") {
-    return ["all", "some", "allowedforall", "allowedforsome"].includes(normalizeFacet(value ?? ""));
+    const status = normalizePackageStatus(value);
+    return status === "all" || status === "some";
   }
   return value === expected;
 }
@@ -434,11 +467,7 @@ function packagePlatform(value: CopilotPackage) {
     ?? value.platform
     ?? value.shortDescription?.trim().match(/^built\s+using\s+(.+?)\.?$/i)?.[1]?.trim()
     ?? "";
-  return normalizeFacet(raw);
-}
-
-function normalizeFacet(value: string) {
-  return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+  return normalizePackageAuthoringTool(raw);
 }
 
 function emptyPackageSource(): UnifiedPackageSourceResult {

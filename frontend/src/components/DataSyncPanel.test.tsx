@@ -280,6 +280,7 @@ describe("DataSyncPanel", () => {
     const page = within(screen.getByRole("region", { name: "Data sync" }));
     expect(page.getAllByText("Sync complete")).toHaveLength(1);
     expect(page.getByText("4 of 4 sources complete")).toBeVisible();
+    expect(page.getByText(/Sync completion confirms collection, not complete tenant-wide inventory coverage/)).toBeVisible();
     expect(page.queryByRole("progressbar")).not.toBeInTheDocument();
     expect(page.queryByText("Keep your saved data up to date")).not.toBeInTheDocument();
     expect(page.queryByRole("button", { name: "Check progress" })).not.toBeInTheDocument();
@@ -953,6 +954,225 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledOnce();
     expect(api.cancel).not.toHaveBeenCalled();
   });
+
+  it.each(["refresh", "principal"] as const)(
+    "keeps a replacement polling budget when a superseded request settles after %s",
+    async replacement => {
+      vi.useFakeTimers();
+      const sources = [source("users", "running")];
+      const running = syncState({ run: run("running", sources), sources });
+      let resolveOld!: (value: DataSyncState) => void;
+      let resolveCurrent!: (value: DataSyncState) => void;
+      api.getState
+        .mockResolvedValueOnce(running)
+        .mockReturnValueOnce(new Promise(resolve => { resolveOld = resolve; }))
+        .mockReturnValueOnce(new Promise(resolve => { resolveCurrent = resolve; }))
+        .mockResolvedValue(running);
+      const panelRef = createRef<DataSyncPanelHandle>();
+      const view = renderPanel({ ref: panelRef });
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      const oldSignal = api.getState.mock.calls[1][0].signal as AbortSignal;
+
+      await act(async () => {
+        if (replacement === "refresh") await panelRef.current?.refresh();
+        else view.rerenderPanel({ principalKey: "tenant:other:viewer" });
+      });
+      expect(oldSignal.aborted).toBe(true);
+      await act(async () => resolveOld(running));
+      await act(async () => resolveCurrent(running));
+
+      expect(screen.queryByRole("button", { name: "Resume updates" })).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(api.getState).toHaveBeenCalledTimes(4);
+      expect(screen.getByText("Syncing users")).toBeVisible();
+    },
+  );
+
+  it("keeps only the replacement poll when a source notification refreshes status synchronously", async () => {
+    vi.useFakeTimers();
+    const initialSources = [source("users", "running"), source("usage_reports", "awaiting_upload")];
+    const changedSources = [source("users", "running"), source("usage_reports", "succeeded")];
+    const running = syncState({ run: run("running", changedSources), sources: changedSources });
+    let resolveRefresh!: (value: DataSyncState) => void;
+    api.getState
+      .mockResolvedValueOnce(syncState({ run: run("running", initialSources), sources: initialSources }))
+      .mockResolvedValueOnce(running)
+      .mockReturnValueOnce(new Promise(resolve => { resolveRefresh = resolve; }))
+      .mockResolvedValue(running);
+    const panelRef = createRef<DataSyncPanelHandle>();
+    const onChanged = vi.fn(() => { void panelRef.current?.refresh(); });
+    renderPanel({ ref: panelRef, onSourcesChanged: onChanged });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(api.getState).toHaveBeenCalledTimes(3);
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["usage_reports"]);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    await act(async () => resolveRefresh(running));
+    expect(screen.queryByRole("button", { name: "Resume updates" })).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(api.getState).toHaveBeenCalledTimes(4);
+    expect(onChanged).toHaveBeenCalledOnce();
+  });
+
+  it("preserves exact-run observation history across refreshes but not across run or principal changes", async () => {
+    const panelRef = createRef<DataSyncPanelHandle>();
+    const onChanged = vi.fn();
+    api.getState.mockResolvedValue(syncState());
+    api.getRun.mockResolvedValueOnce(run("waiting", [source("users", "failed", { canRetry: true })], {
+      id: "exact-run",
+    }));
+    const view = renderPanel({ requestedRunId: "exact-run", ref: panelRef, onSourcesChanged: onChanged });
+    await screen.findByText("exact-run", { selector: "code" });
+    api.getRun.mockResolvedValue(run("completed", [source("users", "succeeded", {
+      jobId: "new-users",
+      lastSuccessAt: "2026-09-15T11:00:00.000Z",
+    })], { id: "exact-run" }));
+
+    await act(async () => { await panelRef.current?.refresh(); });
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+    await act(async () => { await panelRef.current?.refresh(); });
+    expect(onChanged).toHaveBeenCalledOnce();
+
+    api.getRun.mockResolvedValue(run("completed", [source("users", "succeeded", {
+      jobId: "historical-users",
+      lastSuccessAt: "2026-09-14T11:00:00.000Z",
+    })], { id: "historical-run" }));
+    await act(async () => { view.rerenderPanel({ requestedRunId: "historical-run" }); });
+    expect(onChanged).toHaveBeenCalledOnce();
+    api.getRun.mockResolvedValue(run("completed", [source("users", "succeeded", {
+      jobId: "other-principal-users",
+    })], { id: "historical-run" }));
+    await act(async () => { view.rerenderPanel({ principalKey: "tenant:other:viewer" }); });
+    expect(onChanged).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates current saved sources while a different historical run is displayed", async () => {
+    vi.useFakeTimers();
+    const runningSources = [source("users", "running")];
+    const completedSources = [source("users", "succeeded", { count: 5 })];
+    api.getState
+      .mockResolvedValueOnce(syncState({ run: run("running", runningSources), sources: runningSources }))
+      .mockResolvedValue(syncState({
+        run: run("completed", completedSources), sources: completedSources,
+        onboardingRequired: false, usageImportRequired: false,
+      }));
+    api.getRun.mockResolvedValue(run("completed", [source("users", "succeeded", { count: 2 })], {
+      id: "historical-run",
+    }));
+    const onChanged = vi.fn();
+    renderPanel({ requestedRunId: "historical-run", onSourcesChanged: onChanged });
+    await act(async () => { await Promise.resolve(); });
+    expect(onChanged).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+    expect(screen.getByText("historical-run", { selector: "code" })).toBeInTheDocument();
+    expect(screen.queryByText("sync-run-1", { selector: "code" })).not.toBeInTheDocument();
+  });
+
+  it.each(["accepted", "lost"] as const)(
+    "notifies a fast exact-run retry completion after an %s response without replaying the retry",
+    async response => {
+      const failed = run("partial", [source("users", "failed", { canRetry: true })], { id: "exact-run" });
+      const completed = run("completed", [source("users", "succeeded", {
+        count: 0, jobId: "retry-users", lastSuccessAt: "2026-09-15T11:00:00.000Z",
+      })], { id: "exact-run" });
+      api.getState.mockResolvedValue(syncState());
+      api.getRun.mockResolvedValueOnce(failed);
+      if (response === "accepted") {
+        api.retry.mockResolvedValue(completed);
+        api.getRun.mockRejectedValue(new Error("Status read failed after retry."));
+      } else {
+        api.retry.mockRejectedValue(new Error("Retry response lost."));
+        api.getRun.mockResolvedValue(completed);
+      }
+      const onChanged = vi.fn();
+      renderPanel({ requestedRunId: "exact-run", onSourcesChanged: onChanged });
+      await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+
+      expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        response === "accepted" ? "Status read failed after retry." : "Retry response lost.",
+      );
+      expect(api.retry).toHaveBeenCalledExactlyOnceWith("exact-run", ["users"], expect.anything());
+      expect(api.start).not.toHaveBeenCalled();
+    },
+  );
+
+  it("detects cleared saved sources after a lost clean-start response from historical details", async () => {
+    const sources = sourceIds.map(id => source(id, "succeeded", {
+      count: 4, lastSuccessAt: "2026-09-15T10:00:00.000Z",
+    }));
+    const cleared = sources.map(item => item.source === "usage_reports" ? item : source(item.source, "queued"));
+    api.getState
+      .mockResolvedValueOnce(syncState({ onboardingRequired: false, usageImportRequired: false, sources }))
+      .mockResolvedValue(syncState({ run: run("running", cleared), sources: cleared, usageImportRequired: false }));
+    api.getRun.mockResolvedValue(run("completed", sources, { id: "historical-run" }));
+    api.start.mockRejectedValue(new Error("Response lost."));
+    const onChanged = vi.fn();
+    const onRequestedRunChange = vi.fn();
+    const view = renderPanel({
+      requestedRunId: "historical-run", onSourcesChanged: onChanged, onRequestedRunChange,
+    });
+    onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => {
+      view.rerenderPanel({ requestedRunId });
+    });
+    await userEvent.click(await screen.findByText("View sync details"));
+    await userEvent.click(screen.getByRole("button", { name: "Clear saved data and resync" }));
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(screen.getByRole("button", { name: "Clear and start full resync" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Response lost.");
+    expect(onRequestedRunChange).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users", "graph_packages", "power_platform"]);
+    expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "full", clearSavedData: true }, expect.anything());
+  });
+
+  it.each(["accepted", "lost"] as const)(
+    "recovers status after the %s start response even when the selected run changes",
+    async response => {
+      vi.useFakeTimers();
+      const runningSources = [source("users", "running")];
+      const completedSources = [source("users", "succeeded", { count: 5 })];
+      let resolveStart!: (value: DataSyncRun) => void;
+      let rejectStart!: (reason: Error) => void;
+      api.start.mockReturnValue(new Promise((resolve, reject) => {
+        resolveStart = resolve;
+        rejectStart = reject;
+      }));
+      api.getState
+        .mockResolvedValueOnce(syncState())
+        .mockResolvedValueOnce(syncState({ run: run("running", runningSources), sources: runningSources }))
+        .mockResolvedValue(syncState({
+          run: run("completed", completedSources), sources: completedSources,
+          onboardingRequired: false, usageImportRequired: false,
+        }));
+      api.getRun.mockResolvedValue(run("completed", [source("users", "succeeded", { count: 2 })], {
+        id: "historical-run",
+      }));
+      const onChanged = vi.fn();
+      const view = renderPanel({ onSourcesChanged: onChanged });
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { screen.getByRole("button", { name: "Start initial sync" }).click(); });
+      await act(async () => { view.rerenderPanel({ requestedRunId: "historical-run" }); });
+      await act(async () => {
+        if (response === "accepted") resolveStart(run("running", runningSources));
+        else rejectStart(new Error("The start response was lost."));
+      });
+
+      expect(api.getState).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("historical-run", { selector: "code" })).toBeInTheDocument();
+      expect(screen.queryByText("sync-run-1", { selector: "code" })).not.toBeInTheDocument();
+      if (response === "lost") expect(screen.getByRole("alert")).toHaveTextContent("The start response was lost.");
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(api.getState).toHaveBeenCalledTimes(3);
+      expect(onChanged).toHaveBeenCalledWith(["users"]);
+      expect(api.start).toHaveBeenCalledOnce();
+      await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+      expect(screen.getByText("sync-run-1", { selector: "code" })).toBeInTheDocument();
+    },
+  );
 
   it("aborts an in-flight start on unmount without replaying it or invalidating the next session", async () => {
     let resolveStart!: (value: DataSyncRun) => void;
