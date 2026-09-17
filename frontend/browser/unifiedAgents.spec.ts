@@ -2,6 +2,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 import type { InventorySourceAwareDetail, PowerPlatformResource, UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 
 const environmentId = "22222222-2222-4222-8222-222222222222";
 const botId = "33333333-3333-4333-8333-333333333333";
@@ -10,6 +11,7 @@ const observation: NonNullable<UnifiedAgentRecord["observations"]["powerPlatform
   snapshotId: "44444444-4444-4444-8444-444444444444",
   observedAt: layoutTime, expiresAt: "2026-10-12T09:58:00.000Z", current: true,
   roleScope: "full", environmentScope: null, coverage: "covered", coveredCount: 2, observedCount: 2, totalRecords: 2,
+  pageCount: 1, verification: createInventoryVerification(2, ["microsoft.copilotstudio/agents"], layoutTime),
 };
 const resource: PowerPlatformResource = {
   tenantId: "layout-tenant", nativeId: botId, environmentId,
@@ -52,6 +54,7 @@ const summary = { total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1, ambig
 const catalog: UnifiedAgentInventoryPage = {
   ...unifiedAgents, value: [merged, unifiedAgents.value[2], draft], count: 3,
   summary, filteredSummary: summary, identityCollection: { checkedPackages: 3, pendingPackages: 0 },
+  verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, {}, layoutTime),
   facets: { ...unifiedAgents.facets, environments: [{ value: environmentId, label: "Finance production" }] },
   sources: { ...unifiedAgents.sources, powerPlatform: { state: "available", observation, error: null } },
   partial: false, errors: [],

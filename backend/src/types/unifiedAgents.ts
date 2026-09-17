@@ -1,7 +1,8 @@
 import type { CopilotPackage } from "./copilotPackage.js";
-import type { PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
+import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
 import type {
   InventoryCoverageStatus,
+  InventorySnapshotVerification,
   PowerPlatformResource,
 } from "./powerPlatformInventory.js";
 
@@ -13,16 +14,25 @@ export type UnifiedAgentSort = "displayName" | "environment" | "source" | "lastM
 export type UnifiedAgentSortDirection = "asc" | "desc";
 
 export type UnifiedAgentTarget =
+  | { source: "canonical"; agentId: string }
   | { source: "graph_packages"; packageId: string }
   | { source: "power_platform"; nativeId: string; environmentId: string | null };
 
 export function unifiedAgentRecordId(target: UnifiedAgentTarget) {
-  return target.source === "graph_packages"
+  return target.source === "canonical" ? `agent:${target.agentId.toLowerCase()}`
+    : target.source === "graph_packages"
     ? `graph_packages:${encodeURIComponent(target.packageId)}`
     : `power_platform:${encodeURIComponent(target.environmentId ?? "")}:${encodeURIComponent(target.nativeId)}`;
 }
 
 export function parseUnifiedAgentRecordId(value: string): UnifiedAgentTarget | undefined {
+  if (value.startsWith("agent:")) {
+    const agentId = value.slice("agent:".length);
+    if (agentId.length !== 36 || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(agentId)) {
+      throw new RangeError("The unified agent link contains an invalid canonical identity.");
+    }
+    return { source: "canonical", agentId: agentId.toLowerCase() };
+  }
   const decode = (part: string, allowEmpty = false) => {
     const decoded = decodeURIComponent(part);
     if ((!decoded && !allowEmpty) || decoded.length > 512 || /[\r\n\0]/.test(decoded)) {
@@ -70,6 +80,8 @@ export type UnifiedAgentPowerPlatformObservation = UnifiedAgentSourceObservation
   coveredCount: number | null;
   observedCount: number;
   totalRecords: number;
+  pageCount: number;
+  verification: InventorySnapshotVerification;
 };
 
 export type UnifiedAgentSourceError = {
@@ -78,6 +90,7 @@ export type UnifiedAgentSourceError = {
     | "snapshot_unavailable"
     | "source_result_limit"
     | "coverage_unknown"
+    | "environment_scope_limited"
     | "not_authorized_scope";
   message: string;
 };
@@ -114,6 +127,8 @@ export type UnifiedAgentRecord = {
       evidence: UnifiedAgentLinkEvidence[];
     }>;
     reason: string | null;
+    warnings?: PackageAgentIdentityWarning[];
+    invalidMetadata?: true;
   };
   observations: {
     graphPackages: UnifiedAgentPackageObservation | null;
@@ -131,14 +146,33 @@ export type UnifiedAgentInventorySummary = {
   conflicting: number;
 };
 
+export type UnifiedAgentInventoryVerification = {
+  status: "verified" | "needs_attention";
+  scope: "authorized_saved_sources";
+  checkedAt: string;
+  graphPackageCount: number;
+  powerPlatformAgentCount: number;
+  representedSourceCount: number;
+  uniqueSourceCount: number;
+  logicalAgentCount: number;
+  checks: {
+    sourceScopes: boolean;
+    packageMetadata: boolean;
+    identityLinks: boolean;
+    sourceMemberships: true;
+  };
+};
+
 export type UnifiedAgentInventoryPage = {
+  revision?: string;
   value: UnifiedAgentRecord[];
   count: number;
   offset: number;
   limit: number;
   summary: UnifiedAgentInventorySummary;
   filteredSummary: UnifiedAgentInventorySummary;
-  identityCollection?: { checkedPackages: number; pendingPackages: number };
+  verification: UnifiedAgentInventoryVerification;
+  identityCollection?: { checkedPackages: number; pendingPackages: number; invalidPackages?: number };
   facets: {
     environments: Array<{ value: string; label: string }>;
     platforms: Array<{ value: string; label: string }>;

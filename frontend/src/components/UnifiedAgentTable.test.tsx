@@ -5,8 +5,10 @@ import { capabilityDefinitions } from "../../../backend/src/services/capabilityR
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import type { CapabilityView, SessionUser, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
+import { quarantineTargetKey } from "../quarantineTarget";
 import { UnifiedAgentTable } from "./UnifiedAgentTable";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
+import { createInventoryVerification } from "../test/inventoryVerification";
 
 const packageBase = {
   displayName: "Builder package",
@@ -81,6 +83,8 @@ const record: UnifiedAgentRecord = {
     powerPlatform: {
       id: "inventory-snapshot",
       snapshotId: "inventory-snapshot",
+      pageCount: 1,
+      verification: createInventoryVerification(1),
       observedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       current: true,
@@ -93,6 +97,8 @@ const record: UnifiedAgentRecord = {
     },
   },
 };
+
+const selectedResourceKey = quarantineTargetKey(record.powerPlatformResource!);
 
 const user: SessionUser = {
   homeAccountId: "admin-1", displayName: "Admin", username: "admin@example.invalid", roles: ["AgentControl.Admin"],
@@ -165,9 +171,9 @@ describe("UnifiedAgentTable", () => {
     expect(checkbox).toBePartiallyChecked();
     update({ selectedPackageIds: new Set(["package-1", "package-2"]) });
     expect(checkbox).toBePartiallyChecked();
-    update({ selectedPowerPlatformKeys: new Set([record.id]) });
+    update({ selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
     expect(checkbox).toBePartiallyChecked();
-    update({ selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([record.id]) });
+    update({ selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
     expect(checkbox).toBeChecked();
     expect(checkbox).not.toBePartiallyChecked();
     expect(screen.getByText("1 agent selected on this page")).toBeInTheDocument();
@@ -182,7 +188,7 @@ describe("UnifiedAgentTable", () => {
     { packageSelectionAllowed: false, quarantineSelectionAllowed: false, checked: false },
   ])("counts only selectable targets with flags $packageSelectionAllowed/$quarantineSelectionAllowed", flags => {
     const { props } = renderTable({
-      ...flags, selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([record.id]),
+      ...flags, selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]),
     });
     const checkbox = screen.getByRole("checkbox");
     expect(checkbox).toHaveProperty("checked", flags.checked);
@@ -193,7 +199,7 @@ describe("UnifiedAgentTable", () => {
   });
 
   it("ignores previously selected targets when their selection permission is removed", () => {
-    const { update } = renderTable({ selectedPackageIds: new Set(["package-1"]), selectedPowerPlatformKeys: new Set([record.id]) });
+    const { update } = renderTable({ selectedPackageIds: new Set(["package-1"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
     expect(screen.getByRole("checkbox")).toBePartiallyChecked();
     update({ packageSelectionAllowed: false });
     expect(screen.getByRole("checkbox")).toBeChecked();
@@ -204,7 +210,7 @@ describe("UnifiedAgentTable", () => {
   it("disables selection and writes while busy, without disabling details", () => {
     const single = { ...record, packages: [record.packages[0]] };
     const { props } = renderTable({
-      records: [single], selectionDisabled: true, selectedPackageIds: new Set(["package-1"]), selectedPowerPlatformKeys: new Set([record.id]),
+      records: [single], selectionDisabled: true, selectedPackageIds: new Set(["package-1"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]),
     });
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(screen.getByRole("checkbox")).toBeDisabled();
@@ -221,6 +227,19 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("button", { name: /View details/ })).toBeEnabled();
   });
 
+  it("waits for bookmarked native selection without blocking saved details or package controls", () => {
+    const single = { ...record, packages: [record.packages[0]] };
+    const { props, update } = renderTable({ records: [single], quarantineSelectionRestoring: true });
+    expect(screen.getByRole("checkbox")).toBeDisabled();
+    expect(screen.getByRole("checkbox")).toHaveAttribute("title", expect.stringContaining("Restoring saved quarantine selections"));
+    expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Manage access for Builder agent" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(props.onToggleSelection).not.toHaveBeenCalled();
+    update({ records: [{ ...single, powerPlatformResource: null }] });
+    expect(screen.getByRole("checkbox")).toBeEnabled();
+  });
+
   it.each(["missing-snapshot", "stale-snapshot", "missing-bot", "invalid-environment", "duplicate-bot"] as const)(
     "excludes an ineligible quarantine target (%s), while retaining exact package selection", scenario => {
       const resource = { ...record.powerPlatformResource! };
@@ -231,7 +250,7 @@ describe("UnifiedAgentTable", () => {
       if (scenario === "invalid-environment") resource.environmentId = "not-an-environment-id";
       if (scenario === "duplicate-bot") resource.identifiers = [...resource.identifiers, { kind: "cds_bot_id", value: "33333333-3333-4333-8333-333333333333" }];
       const invalid = { ...record, powerPlatformResource: resource, observations: { ...record.observations, powerPlatform: snapshot } };
-      const { update } = renderTable({ records: [invalid], selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([record.id]) });
+      const { update } = renderTable({ records: [invalid], selectedPackageIds: new Set(["package-1", "package-2"]), selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
       expect(screen.getByRole("checkbox")).toBeChecked();
       expect(screen.getByRole("checkbox")).toBeEnabled();
       update({ records: [{ ...invalid, packages: [] }] });
@@ -251,7 +270,7 @@ describe("UnifiedAgentTable", () => {
       },
     };
     const { props } = renderTable({
-      records: [{ ...record, packages: [] }, second], selectedPowerPlatformKeys: new Set([record.id]),
+      records: [{ ...record, packages: [] }, second], selectedPowerPlatformKeys: new Set([selectedResourceKey]),
     });
     expect(screen.getAllByRole("row")).toHaveLength(3);
     const checkboxes = within(screen.getByRole("region", { name: "Unified agents" })).getAllByRole("checkbox", { name: "Select Builder agent" });
@@ -285,6 +304,58 @@ describe("UnifiedAgentTable", () => {
     expect(screen.queryByText(/schema|native|source metadata/i)).not.toBeInTheDocument();
   });
 
+  it("keeps exact native selection across canonical row IDs without selecting newly linked packages", () => {
+    const initial = { ...record, id: "agent:33333333-3333-4333-8333-333333333333", packages: [] };
+    const merged = { ...record, id: "agent:44444444-4444-4444-8444-444444444444" };
+    const { update, props } = renderTable({ records: [initial], selectedPowerPlatformKeys: new Set([selectedResourceKey]) });
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    update({ records: [merged] });
+    expect(screen.getByRole("checkbox")).toBePartiallyChecked();
+    fireEvent.click(screen.getByRole("checkbox"));
+    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(merged);
+    update({ records: [merged], selectedPackageIds: new Set(merged.packages.map(item => item.id)) });
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByText("1 exact quarantine target selected")).toBeVisible();
+  });
+
+  it("retains every linked manifest package without promoting a Builder native ID to a quarantine target", () => {
+    const manifestId = "44444444-4444-4444-8444-444444444444";
+    const builder: UnifiedAgentRecord = {
+      ...record,
+      packages: record.packages.map(item => ({ ...item, manifestId })),
+      powerPlatformResource: {
+        ...record.powerPlatformResource!,
+        nativeId: manifestId,
+        details: { schemaName: manifestId },
+        identifiers: [{ kind: "environment_id", value: record.environmentId! }],
+      },
+    };
+    renderTable({ records: [builder], selectedPackageIds: new Set(builder.packages.map(item => item.id)) });
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByText("2 published versions selected")).toBeVisible();
+    expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+  });
+
+  it.each([null, record.environmentId])("renders one graph-only group with all package selections and optional environment %s", environmentId => {
+    const group: UnifiedAgentRecord = {
+      ...record, id: "agent:33333333-3333-4333-8333-333333333333",
+      presence: "graph_packages", environmentId, powerPlatformResource: null,
+      identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "No verified Power Platform counterpart." },
+    };
+    const { props } = renderTable({
+      records: [group], selectedPackageIds: new Set(group.packages.map(item => item.id)),
+      environmentNames: { [record.environmentId!]: "Package-declared environment" },
+    });
+    expect(screen.getAllByRole("row")).toHaveLength(2);
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByText("2 published versions selected")).toBeVisible();
+    expect(within(screen.getAllByRole("row")[1]).getAllByRole("cell")[2]).toHaveTextContent(environmentId ? "Package-declared environment" : "Unknown");
+    expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Manage Builder agent" }));
+    expect(props.onManage).toHaveBeenCalledExactlyOnceWith(group);
+  });
+
   it("uses lowercase environment lookup keys with an honest ID fallback", () => {
     const { update } = renderTable({ records: [{ ...record, environmentId: "ENVIRONMENT-A" }], environmentNames: { "environment-a": "Friendly environment" } });
     expect(screen.getByText("Friendly environment")).toBeInTheDocument();
@@ -293,7 +364,7 @@ describe("UnifiedAgentTable", () => {
   });
 
   it("does not infer availability, blocking, quarantine or authoring from a published resource", () => {
-    renderTable({ records: [{ ...record, packages: [], powerPlatformResource: { ...record.powerPlatformResource!, authoringTool: null } }] });
+    renderTable({ records: [{ ...record, packages: [], powerPlatformResource: { ...record.powerPlatformResource!, authoringTool: null, details: { createdIn: "FutureProvider.vNext_build-X" } } }] });
     const cells = within(screen.getAllByRole("row")[1]).getAllByRole("cell");
     expect(cells[3]).toHaveTextContent(/^Unknown$/);
     expect(cells[4]).toHaveTextContent(/^Unknown$/);

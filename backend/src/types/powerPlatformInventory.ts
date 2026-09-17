@@ -16,7 +16,7 @@ export const powerPlatformResourceTypes = [
 
 export type PowerPlatformResourceType = typeof powerPlatformResourceTypes[number];
 export type InventoryRoleScope = "full" | "ai" | "unknown";
-export type InventoryCoverageStatus = "covered" | "not_authorized_scope" | "unknown";
+export type InventoryCoverageStatus = "covered" | "not_requested" | "not_authorized_scope" | "unknown";
 export type InventoryJobStatus = "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
 export type InventoryFieldMaturity = "ga" | "preview";
 export type InventoryIdentifierKind =
@@ -68,6 +68,7 @@ export type PowerPlatformResourceDetails = {
   quarantinedAt?: string;
   isManaged?: boolean;
   schemaName?: string;
+  createdIn?: string;
   appModuleId?: string;
   logicalName?: string;
   subType?: string;
@@ -121,6 +122,8 @@ export type PowerPlatformResource = {
 
 export type ResourceQueryResult = {
   resources: PowerPlatformResource[];
+  queriedTypes: PowerPlatformResourceType[];
+  environmentScope: string | null;
   totalRecords: number;
   pages: number;
   unknownFieldCount: number;
@@ -130,6 +133,16 @@ export type InventoryTypeCoverage = {
   type: PowerPlatformResourceType;
   status: InventoryCoverageStatus;
   count: number | null;
+};
+
+export type InventorySnapshotVerification = {
+  status: "verified";
+  scope: "authorized_query";
+  basis: "provider_total_and_saved_rows";
+  checkedAt: string;
+  storedCount: number;
+  uniqueIdentityCount: number;
+  queriedTypes: PowerPlatformResourceType[];
 };
 
 export type InventorySnapshot = {
@@ -144,6 +157,7 @@ export type InventorySnapshot = {
   unknownFieldCount: number;
   observedAt: string;
   expiresAt: string;
+  verification: InventorySnapshotVerification;
 };
 
 export type InventoryResourcePage = {

@@ -273,7 +273,7 @@ async function seedSnapshots(scope: DataSyncScope) {
   }
   const job = await submitProvider(scope, "inventory");
   await inventory.markRunning(scope, job.id);
-  await inventory.publish(scope, job.id, { resources: [resource(scope)], totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+  await inventory.publish(scope, job.id, { resources: [resource(scope)], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
   for (const source of ["users", "graph_packages", "power_platform", "usage_reports"] as const) {
     await repository.recordSuccessMarker(scope, source, source === "usage_reports" ? 3 : 1, now());
   }
@@ -288,7 +288,7 @@ function submitProvider(scope: DataSyncScope, provider: "packages" | "inventory"
 function publishProvider(scope: DataSyncScope, provider: "packages" | "inventory", jobId: string) {
   return provider === "packages"
     ? packages.publish(scope, jobId, { packages: [], totalRecords: 0, pages: 1 })
-    : inventory.publish(scope, jobId, { resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 });
+    : inventory.publish(scope, jobId, { resources: [], queriedTypes: [...powerPlatformResourceTypes], environmentScope: null, totalRecords: 0, pages: 1, unknownFieldCount: 0 });
 }
 
 function resource(scope: DataSyncScope): PowerPlatformResource {

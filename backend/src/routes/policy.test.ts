@@ -12,7 +12,7 @@ describe("route policy declarations", () => {
       "GET /auth/login", "POST /auth/consent", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
-      "GET /agent-inventory", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
+      "GET /agent-inventory", "POST /agent-inventory/export.csv", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
       "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry", "POST /data-sync/runs/:id/cancel",
       "POST /agents/refresh-jobs", "POST /agents/:id/refresh-jobs", "GET /agents/refresh-jobs", "GET /agents/refresh-jobs/:id", "POST /agents/refresh-jobs/:id/resume", "POST /agents/refresh-jobs/:id/cancel", "GET /agents/snapshots", "GET /agents/export.csv", "POST /agents/export.csv",

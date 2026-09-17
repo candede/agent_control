@@ -10,6 +10,7 @@ import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
+import { createInventoryVerification } from "../test/inventoryVerification";
 
 mockNativeDialogs();
 
@@ -73,7 +74,7 @@ function observedRecord(): UnifiedAgentRecord {
         id: "snapshot-1", snapshotId: "snapshot-1", current: true,
         observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
         roleScope: "full", environmentScope: null, coverage: "covered", coveredCount: 1,
-        observedCount: 1, totalRecords: 1,
+        observedCount: 1, totalRecords: 1, pageCount: 1, verification: createInventoryVerification(1),
       },
     },
   };
@@ -95,6 +96,31 @@ function corroboratedRecord(withBotIdentifier: boolean): UnifiedAgentRecord {
     identity: {
       state: "matched", evidence, packageEvidence: [{ packageId: "package-1", evidence }],
       reason: "Corroborated environment, schema and native resource identity from source metadata.",
+    },
+  };
+}
+
+function sharedCustomEngineRecord(withBotIdentifier = true): UnifiedAgentRecord {
+  const observed = corroboratedRecord(withBotIdentifier);
+  const packages = [
+    { ...record.packages[0], id: "opaque/legacy%target", displayName: "Legacy custom engine" },
+    { ...record.packages[0], id: "opaque:anchor/target", displayName: "Native-backed custom engine", isBlocked: true },
+  ];
+  const shared: UnifiedAgentRecord["identity"]["evidence"][number] = {
+    kind: "shared_custom_engine_bot_id", basis: "source_declared_metadata", elementIds: [""],
+    packagePath: "Bots.definition.botId + CustomEngineCopilots.definition.id",
+    resourcePath: "related package native identity evidence",
+    relatedPackageIds: [packages[1].id],
+  };
+  return {
+    ...observed, id: "agent:33333333-3333-4333-8333-333333333333", packages,
+    identity: {
+      state: "matched", reason: "The shared bot application identity is uniquely anchored by related package native proof.",
+      evidence: [shared, ...observed.identity.evidence],
+      packageEvidence: [
+        { packageId: packages[0].id, evidence: [shared] },
+        { packageId: packages[1].id, evidence: observed.identity.evidence },
+      ],
     },
   };
 }
@@ -226,6 +252,40 @@ describe("UnifiedAgentDetailModal", () => {
     expect(technical).toHaveTextContent(corroborated.identity.evidence[0].resourcePath);
   });
 
+  it("retains source-specific identity warnings without turning a valid native link into a conflict", async () => {
+    const observed = observedRecord();
+    const message = "Graph and Power Platform supplied different source-specific agent identity IDs; the exact native environment and bot agree.";
+    const { update } = renderDetail({
+      record: { ...observed, identity: { ...observed.identity, warnings: [{ code: "source_specific_agent_identity", message }] } },
+    });
+    await userEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByRole("heading", { name: "Source identity warnings" })).toBeVisible();
+    expect(screen.getByText(message)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Linked by source metadata" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Conflicting link evidence" })).not.toBeInTheDocument();
+    update({ record: observed });
+    expect(screen.queryByText(message)).not.toBeInTheDocument();
+  });
+
+  it.each(["matched", "unmatched"] as const)("shows actionable invalid metadata without disabling exact package controls for a %s record", async state => {
+    const observed = observedRecord();
+    const { update } = renderDetail({
+      record: { ...observed, identity: { ...observed.identity, state, invalidMetadata: true } },
+      activeTab: "controls",
+    });
+    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    const diagnostic = screen.getByText("Invalid saved matching metadata.");
+    expect(diagnostic).toBeVisible();
+    expect(diagnostic.parentElement).toHaveTextContent("Select this agent on Agents");
+    expect(diagnostic.parentElement).toHaveTextContent("Refresh matching details");
+    expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Manage installation for Package one (package-1)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Block Package one (package-1)" })).toBeEnabled();
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
+    update({ record: observed });
+    expect(screen.queryByText("Invalid saved matching metadata.")).not.toBeInTheDocument();
+  });
+
   it.each([false, true])("requires an explicit backend-supplied CDS bot identifier despite corroborated evidence (supplied=%s)", async supplied => {
     renderDetail({ record: corroboratedRecord(supplied), activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
@@ -238,10 +298,107 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
+  it("shows related opaque package proof in both shared custom-engine evidence sections", async () => {
+    const grouped = sharedCustomEngineRecord();
+    const { update } = renderDetail({ record: grouped });
+    await userEvent.click(screen.getByText("Technical details"));
+    const proofs = screen.getAllByRole("list", { name: "Related exact packages" });
+    expect(proofs).toHaveLength(2);
+    for (const proof of proofs) {
+      expect(within(proof).getAllByRole("listitem").map(item => item.textContent)).toEqual([grouped.packages[1].id]);
+    }
+    expect(screen.getAllByText("Shared custom engine bot id")).toHaveLength(2);
+    expect(screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).toBeVisible();
+    expect(screen.getByText(/not a Microsoft-guaranteed native foreign key/)).toBeVisible();
+    expect(screen.getByText(/does not grant or renew native controls/)).toBeVisible();
+    update({ record: observedRecord() });
+    expect(screen.queryByRole("list", { name: "Related exact packages" })).not.toBeInTheDocument();
+  });
+
+  it("keeps definition-backed identity evidence when every outer element label is empty", async () => {
+    const grouped = sharedCustomEngineRecord();
+    for (const evidence of grouped.identity.evidence) evidence.elementIds = ["", ""];
+    renderDetail({ record: grouped });
+    await userEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByRole("heading", { name: "Linked by source metadata" })).toBeVisible();
+    expect(screen.getAllByText(/element labels Not supplied/)).toHaveLength(4);
+    expect(screen.getAllByText("Bots.definition.botId + CustomEngineCopilots.definition.id")).toHaveLength(2);
+    expect(screen.getAllByRole("list", { name: "Related exact packages" })).toHaveLength(2);
+    expect(screen.queryByText("Invalid saved matching metadata.")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retains separate custom-engine package controls and requires explicit CDS proof (%s)", async supplied => {
+    const grouped = sharedCustomEngineRecord(supplied);
+    const botApplicationId = "55555555-5555-4555-8555-555555555555";
+    if (!supplied) grouped.powerPlatformResource!.nativeId = botApplicationId;
+    const { props } = renderDetail({ record: grouped, activeTab: "controls" });
+    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    for (const item of grouped.packages) {
+      await userEvent.click(screen.getByRole("button", { name: `Package details for ${item.displayName} (${item.id})` }));
+      expect(props.onInspectPackage).toHaveBeenLastCalledWith(item);
+      await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
+      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
+      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
+      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
+      expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
+    }
+    if (supplied) {
+      vi.mocked(api.previewQuarantine).mockRejectedValue(new Error("Synthetic preview stopped before any submission."));
+      await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+      await waitFor(() => expect(api.previewQuarantine).toHaveBeenCalledExactlyOnceWith({
+        action: "quarantine", snapshotId: grouped.observations.powerPlatform!.snapshotId,
+        resourceNativeIds: [grouped.powerPlatformResource!.nativeId],
+      }));
+      expect(grouped.powerPlatformResource!.nativeId).not.toBe(botApplicationId);
+    } else {
+      expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
+      expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+      expect(api.previewQuarantine).not.toHaveBeenCalled();
+    }
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["manifest_schema_native_id", "Manifest schema native id", "manifestId", "nativeId + details.schemaName"],
+    ["environment_entra_app_id", "Environment entra app id", "SourceIds.EnvironmentId + BotDefinitions.msAppId", "environmentId + identifiers.entra_app_id"],
+  ] as const)("renders %s as source-declared evidence without deriving a CDS quarantine target", async (kind, heading, packagePath, resourcePath) => {
+    const observed = observedRecord();
+    const evidence: UnifiedAgentRecord["identity"]["evidence"] = [{
+      kind, basis: "source_declared_metadata", elementIds: ["metadata-1"], packagePath, resourcePath,
+    }];
+    renderDetail({
+      record: {
+        ...observed,
+        packages: observed.packages.map(item => ({ ...item, manifestId: botId })),
+        powerPlatformResource: {
+          ...observed.powerPlatformResource!, nativeId: botId, details: { schemaName: botId },
+          identifiers: [{ kind: "environment_id", value: environmentId }],
+        },
+        identity: { state: "matched", evidence, packageEvidence: [{ packageId: "package-1", evidence }], reason: null },
+      },
+    });
+    await userEvent.click(screen.getByText("Technical details"));
+    for (const label of screen.getAllByText(heading)) expect(label).toBeVisible();
+    expect(screen.getAllByText(/Source declared metadata/)).toHaveLength(2);
+    expect(screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).toBeVisible();
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
+    expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
+  });
+
   it("retains Power Platform ownership, configuration and connector details in Agents", () => {
     const resource = {
       ...record.powerPlatformResource,
+      authoringTool: null,
       details: {
+        createdIn: "FutureProvider.vNext_build-X",
         ownerId: "native-owner",
         schemaName: "native-schema",
         model: "configured-model",
@@ -262,6 +419,8 @@ describe("UnifiedAgentDetailModal", () => {
     for (const value of ["native-owner", "native-schema", "configured-model", "configured-authentication", "configured-orchestration", "native-connector", "Read records"]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
+    expect(screen.getByText("Provider origin (raw)").nextElementSibling).toHaveTextContent("FutureProvider.vNext_build-X");
+    expect(screen.getByText("Authoring tool").nextElementSibling).toHaveTextContent("Not supplied");
     expect(screen.getByText(/Capability details are partial/)).toBeInTheDocument();
   });
 
@@ -275,7 +434,7 @@ describe("UnifiedAgentDetailModal", () => {
           id: "snapshot-1", snapshotId: "snapshot-1", current: true,
           observedAt: "2026-09-15T00:00:00Z", expiresAt: "2026-10-15T00:00:00Z",
           roleScope: "full", environmentScope: null, coverage: "covered", coveredCount: 1,
-          observedCount: 1, totalRecords: 1,
+          observedCount: 1, totalRecords: 1, pageCount: 1, verification: createInventoryVerification(1),
         },
       },
     };
@@ -328,6 +487,56 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByText(/Quarantine is unavailable/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each([null, environmentId])("retains every control in a graph-only package group with environment %s", async knownEnvironment => {
+    const group: UnifiedAgentRecord = {
+      ...record, id: "agent:33333333-3333-4333-8333-333333333333",
+      presence: "graph_packages", environmentId: knownEnvironment, powerPlatformResource: null,
+      packages: [record.packages[0], { ...record.packages[0], id: "package-2", displayName: "Package two", isBlocked: true }],
+      identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "No verified Power Platform counterpart." },
+    };
+    const { props } = renderDetail({ record: group, activeTab: "controls" });
+    for (const item of group.packages) {
+      await userEvent.click(screen.getByRole("button", { name: `Package details for ${item.displayName} (${item.id})` }));
+      expect(props.onInspectPackage).toHaveBeenLastCalledWith(item);
+      await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
+      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
+      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
+      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
+      expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
+    }
+    expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
+  });
+
+  it("keeps each merged Builder package control without treating its manifest as a CDS bot", async () => {
+    const observed = observedRecord();
+    const manifestId = "44444444-4444-4444-8444-444444444444";
+    observed.packages = [
+      { ...record.packages[0], manifestId },
+      { ...record.packages[0], id: "package-2", displayName: "Package two", manifestId, isBlocked: true },
+    ];
+    observed.powerPlatformResource = {
+      ...observed.powerPlatformResource!,
+      nativeId: manifestId,
+      details: { schemaName: manifestId },
+      identifiers: [{ kind: "environment_id", value: environmentId }],
+    };
+    const { props } = renderDetail({ record: observed, activeTab: "controls" });
+    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
+    for (const item of observed.packages) {
+      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
+      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
+      expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
+    }
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
   it("offers quarantine for a resource-only agent without inventing package availability", async () => {

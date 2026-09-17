@@ -11,16 +11,20 @@ import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput }
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery } from "../../../backend/src/types/unifiedAgents";
+import type { InventoryExportAction } from "../../../backend/src/types/audit";
+export type { InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
-export type { InventoryRefreshJob, InventoryResourcePage, InventorySnapshot, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
+export type { InventoryCoverageStatus, InventoryRefreshJob, InventoryResourcePage, InventorySnapshot, InventorySnapshotVerification, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export type { InventoryRefreshJobList, InventorySnapshotList } from "../../../backend/src/types/powerPlatformInventory";
 export type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
+  UnifiedAgentInventoryVerification,
   UnifiedAgentLinkState,
   UnifiedAgentPresence,
   UnifiedAgentRecord,
+  UnifiedAgentPowerPlatformObservation,
   UnifiedAgentSourceFilter,
 } from "../../../backend/src/types/unifiedAgents";
 export type { OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
@@ -368,7 +372,6 @@ export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAc
 export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
 export type HuntingReadAction = "view-hunting" | "export-hunting";
 export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting";
-export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
 export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | "export-administrative-audit";
 
@@ -549,6 +552,27 @@ export function getUnifiedAgents(
     `/api/agent-inventory${params.size ? `?${params}` : ""}`,
     { signal: options.signal },
   );
+}
+
+export type UnifiedAgentExportQuery = Omit<UnifiedAgentInventoryQuery, "recordId" | "limit" | "offset">;
+export type UnifiedAgentExportInput = { revision: string } & (
+  | { query?: UnifiedAgentExportQuery; recordIds?: never }
+  | { recordIds: string[]; query?: Pick<UnifiedAgentExportQuery, "sortBy" | "sortDirection"> }
+);
+
+export async function downloadUnifiedAgentInventoryCsv(input: UnifiedAgentExportInput) {
+  const response = await fetch("/api/agent-inventory/export.csv", {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      Accept: "text/csv",
+      "Content-Type": "application/json",
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+    },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await toApiError(response);
+  return response.blob();
 }
 
 export async function downloadPackageInventoryCsv(input: { ids?: string[]; snapshotId: string; filters?: Omit<PackageListQuery, "snapshotId" | "limit" | "offset"> }) {

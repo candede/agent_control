@@ -1,4 +1,7 @@
 import { AppError } from "../errors.js";
+import type pg from "pg";
+import { UnifiedAgentRegistry } from "../db/unifiedAgentRegistry.js";
+import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
 import {
   PackageInventoryRepository,
   packageFacets,
@@ -21,6 +24,7 @@ import type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
   UnifiedAgentInventorySummary,
+  UnifiedAgentInventoryVerification,
   UnifiedAgentPackageObservation,
   UnifiedAgentPackageRecordObservation,
   UnifiedAgentPowerPlatformObservation,
@@ -32,9 +36,11 @@ import {
   resolvePackageAgentLinks,
   withVerifiedControlIdentities,
   type PackageAgentLinkEvidence,
+  type PackageAgentIdentityWarning,
   type PackageAgentLinkResolution,
 } from "./packageAgentIdentity.js";
-import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { powerPlatformAgentKey } from "./inventoryIdentity.js";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { getAuditLog } from "./auditLog.js";
 
 export type UnifiedAgentDependencies = {
@@ -42,6 +48,8 @@ export type UnifiedAgentDependencies = {
   powerPlatform: Pick<PowerPlatformInventoryRepository, "readUnifiedSource">;
   resolveLinks: typeof resolvePackageAgentLinks;
   operationPackageIds: (scope: PackageDataScope, ids: readonly string[], prefix: string) => Promise<string[]>;
+  registry?: Pick<UnifiedAgentRegistry, "withSnapshot" | "reconcile">;
+  readRevision: typeof readUnifiedInventoryRevision;
 };
 
 const defaultDependencies: UnifiedAgentDependencies = {
@@ -49,6 +57,8 @@ const defaultDependencies: UnifiedAgentDependencies = {
   powerPlatform: new PowerPlatformInventoryRepository(),
   resolveLinks: resolvePackageAgentLinks,
   operationPackageIds: (scope, ids, prefix) => getAuditLog(scope).matchingOperationPackageIds(ids, prefix),
+  registry: new UnifiedAgentRegistry(),
+  readRevision: readUnifiedInventoryRevision,
 };
 
 type SourceLoad<T> =
@@ -59,12 +69,45 @@ export class UnifiedAgentsService {
   constructor(private readonly dependencies: UnifiedAgentDependencies = defaultDependencies) {}
 
   async list(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery = {}): Promise<UnifiedAgentInventoryPage> {
+    return this.readPage(scope, query, 250);
+  }
+
+  async forExport(scope: PackageDataScope & InventoryDataScope, revision: string, query: UnifiedAgentInventoryQuery = {}, recordIds?: readonly string[]) {
+    const result = await this.readPage(scope, { ...query, limit: 5_000, offset: 0 }, 5_000, recordIds);
+    if (result.revision !== revision) throw inventoryChanged();
+    if (result.sources.graphPackages.state === "unavailable" && result.sources.powerPlatform.state === "unavailable") {
+      throw new AppError(409, "snapshot_unavailable", "No authorized saved agent inventory is available to export. Refresh Agents first.");
+    }
+    if (result.count > 5_000 || result.value.length !== result.count) {
+      throw new AppError(413, "export_row_limit", "The unified selection exceeds the 5,000 agent export limit.");
+    }
+    return result;
+  }
+
+  async assertRevision(scope: PackageDataScope & InventoryDataScope, revision: string) {
+    if (await this.dependencies.readRevision(scope) !== revision) throw inventoryChanged();
+  }
+
+  private async readPage(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number, recordIds?: readonly string[]) {
+    return this.dependencies.registry
+      ? this.dependencies.registry.withSnapshot(scope, database => this.listSnapshot(scope, query, maximumLimit, recordIds, database))
+      : this.listSnapshot(scope, query, maximumLimit, recordIds);
+  }
+
+  private async listSnapshot(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number,
+    recordIds?: readonly string[], database?: pg.PoolClient): Promise<UnifiedAgentInventoryPage> {
+    const revision = await this.dependencies.readRevision(scope, database);
     const [packageSettled, powerPlatformSettled] = await Promise.allSettled([
-      this.dependencies.packages.readUnifiedSource(scope),
-      this.dependencies.powerPlatform.readUnifiedSource(scope),
+      database ? this.dependencies.packages.readUnifiedSource(scope, database) : this.dependencies.packages.readUnifiedSource(scope),
+      database ? this.dependencies.powerPlatform.readUnifiedSource(scope, database) : this.dependencies.powerPlatform.readUnifiedSource(scope),
     ]);
     const packageLoad = sourceLoad("graph_packages", packageSettled);
     const powerPlatformLoad = sourceLoad("power_platform", powerPlatformSettled);
+    if (this.dependencies.registry) {
+      const incomplete = [packageLoad, powerPlatformLoad].find(load => load.state === "unavailable");
+      if (incomplete?.state === "unavailable") throw new AppError(409, incomplete.error.code,
+        `${incomplete.error.message} Canonical memberships were not changed because the saved sources could not be read completely.`);
+    }
     const packageSource = packageLoad.state === "loaded" ? packageLoad.value : emptyPackageSource();
     const powerPlatformSource = powerPlatformLoad.state === "loaded" ? powerPlatformLoad.value : emptyPowerPlatformSource();
     const packageObservation = packageSource.snapshot ? packageObservationFrom(packageSource) : null;
@@ -100,7 +143,7 @@ export class UnifiedAgentsService {
         : value;
     });
     const links = this.dependencies.resolveLinks(scope.tenantId, usablePackages, usablePowerPlatform);
-    const records = buildRecords(
+    const grouped = buildRecords(
       usablePackages,
       withVerifiedControlIdentities(usablePowerPlatform, links, packageSource.observations),
       links,
@@ -108,6 +151,10 @@ export class UnifiedAgentsService {
       powerPlatformObservation,
       packageSnapshots,
     );
+    const records = database && this.dependencies.registry
+      ? await this.dependencies.registry.reconcile(database, scope, grouped) : grouped;
+    if (await this.dependencies.readRevision(scope, database) !== revision) throw inventoryChanged();
+    const selected = recordIds ? exactSelection(records, recordIds) : undefined;
     const summary = summarize(records);
     const environments = new Map<string, { value: string; label: string }>();
     for (const record of records) {
@@ -128,22 +175,44 @@ export class UnifiedAgentsService {
     const referenceIds = query.operationIdPrefix
       ? new Set(await this.dependencies.operationPackageIds(scope, usablePackages.map(value => value.id), query.operationIdPrefix))
       : undefined;
-    const filtered = records.filter(record => matches(record, query)
+    const filtered = records.filter(record => (!selected || selected.has(record)) && matches(record, query)
       && (!referenceIds || record.packages.some(value => referenceIds.has(value.id))));
     const filteredSummary = summarize(filtered);
     const sorted = [...filtered].sort(recordComparator(query));
-    const limit = Math.min(Math.max(query.limit ?? 50, 1), 250);
+    const limit = Math.min(Math.max(query.limit ?? 50, 1), maximumLimit);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected).length;
+    const invalidPackages = links.filter(link => link.status !== "matched" && link.invalidMetadata).length;
+    const sourceCounts = verifySourceMemberships(records, usablePackages, usablePowerPlatform);
+    const checks: UnifiedAgentInventoryVerification["checks"] = {
+      sourceScopes: sourceErrors.length === 0,
+      packageMetadata: checkedPackages === usablePackages.length && invalidPackages === 0,
+      identityLinks: summary.ambiguous === 0 && summary.conflicting === 0,
+      sourceMemberships: true,
+    };
 
     return {
+      revision,
       value: sorted.slice(offset, offset + limit),
       count: filtered.length,
       offset,
       limit,
       summary,
       filteredSummary,
-      identityCollection: { checkedPackages, pendingPackages: usablePackages.length - checkedPackages },
+      verification: {
+        status: Object.values(checks).every(Boolean) ? "verified" : "needs_attention",
+        scope: "authorized_saved_sources",
+        checkedAt: new Date().toISOString(),
+        graphPackageCount: usablePackages.length,
+        powerPlatformAgentCount: usablePowerPlatform.length,
+        ...sourceCounts,
+        logicalAgentCount: records.length,
+        checks,
+      },
+      identityCollection: {
+        checkedPackages, pendingPackages: usablePackages.length - checkedPackages,
+        ...(invalidPackages ? { invalidPackages } : {}),
+      },
       facets: {
         environments: [...environments.values()].sort(byLabel),
         platforms: [...platforms.values()].sort(byLabel),
@@ -156,6 +225,27 @@ export class UnifiedAgentsService {
 }
 
 export const unifiedAgents = new UnifiedAgentsService();
+
+function verifySourceMemberships(records: readonly UnifiedAgentRecord[], packages: readonly CopilotPackage[], resources: readonly PowerPlatformResource[]) {
+  const packageKey = (id: string) => JSON.stringify(["graph_packages", id]);
+  const nativeKey = (resource: PowerPlatformResource) => JSON.stringify(["power_platform", powerPlatformAgentKey(resource.environmentId, resource.nativeId)]);
+  const expected = new Set([...packages.map(value => packageKey(value.id)), ...resources.map(nativeKey)]);
+  const represented = new Set<string>();
+  const failed = () => new AppError(409, "inventory_verification_failed",
+    "Unified inventory failed verification: every collected source identity must appear in exactly one agent. No incomplete reconciliation was published.");
+  if (expected.size !== packages.length + resources.length || new Set(records.map(record => record.id)).size !== records.length) throw failed();
+  for (const record of records) {
+    const keys = record.packages.map(value => packageKey(value.id));
+    if (record.powerPlatformResource) keys.push(nativeKey(record.powerPlatformResource));
+    if (!keys.length) throw failed();
+    for (const key of keys) {
+      if (!expected.has(key) || represented.has(key)) throw failed();
+      represented.add(key);
+    }
+  }
+  if (represented.size !== expected.size) throw failed();
+  return { representedSourceCount: represented.size, uniqueSourceCount: expected.size };
+}
 
 function buildRecords(
   packages: readonly CopilotPackageDetail[],
@@ -173,9 +263,10 @@ function buildRecords(
     packages: CopilotPackage[];
     evidence: PackageAgentLinkEvidence[];
     packageEvidence: Array<{ packageId: string; evidence: PackageAgentLinkEvidence[] }>;
+    warnings: PackageAgentIdentityWarning[];
   }>();
   for (const resource of resources) {
-    const key = resourceKey(resource.environmentId, resource.nativeId);
+    const key = powerPlatformAgentKey(resource.environmentId, resource.nativeId);
     if (resourceRows.has(key)) {
       throw new AppError(500, "saved_source_invalid", "Saved Power Platform agent inventory contains a duplicate exact environment and native identity.");
     }
@@ -184,29 +275,45 @@ function buildRecords(
       packages: [],
       evidence: [],
       packageEvidence: [],
+      warnings: [],
     });
   }
   const packageById = new Map(packages.map(value => [value.id, value]));
-  const graphOnly: UnifiedAgentRecord[] = [];
+  if (packageById.size !== packages.length) throw new AppError(500, "saved_source_invalid", "Saved Graph inventory contains duplicate package identities.");
+  const graphOnly = new Map<string, UnifiedAgentRecord>();
+  const seenResolutions = new Set<string>();
   for (const resolution of resolutions) {
     const detail = packageById.get(resolution.packageId);
-    if (!detail) throw new AppError(500, "link_resolution_invalid", "The package identity resolver returned an unknown package.");
+    if (!detail || seenResolutions.has(resolution.packageId)) throw new AppError(500, "link_resolution_invalid", "The package identity resolver returned an unknown or duplicate package.");
+    seenResolutions.add(resolution.packageId);
     if (resolution.status === "matched") {
-      const row = resourceRows.get(resourceKey(resolution.resource.environmentId, resolution.resource.nativeId));
+      const row = resourceRows.get(powerPlatformAgentKey(resolution.resource.environmentId, resolution.resource.nativeId));
       if (!row) throw new AppError(500, "link_resolution_invalid", "The package identity resolver returned an unknown Power Platform resource.");
       row.packages.push(packageSummary(detail));
       row.evidence.push(...resolution.evidence);
       row.packageEvidence.push({ packageId: detail.id, evidence: resolution.evidence });
+      row.warnings.push(...resolution.warnings ?? []);
       continue;
     }
-    graphOnly.push({
+    const groupKey = resolution.status === "unmatched" && resolution.grouping
+      ? resolution.grouping.key : JSON.stringify(["package", detail.id]);
+    const existing = graphOnly.get(groupKey);
+    if (existing) {
+      existing.packages.push(packageSummary(detail));
+      Object.assign(existing.observations.packageSnapshots, pickPackageSnapshots([detail.id], packageSnapshots));
+      continue;
+    }
+    graphOnly.set(groupKey, {
       id: unifiedAgentRecordId({ source: "graph_packages", packageId: detail.id }),
-      displayName: detail.displayName,
+      displayName: detail.displayName.trim() || detail.id,
       presence: "graph_packages",
-      environmentId: null,
+      environmentId: resolution.grouping?.environmentId ?? null,
       packages: [packageSummary(detail)],
       powerPlatformResource: null,
-      identity: { state: resolution.status, evidence: [], packageEvidence: [], reason: resolution.reason },
+      identity: {
+        state: resolution.status, evidence: [], packageEvidence: [], reason: resolution.reason,
+        ...(resolution.invalidMetadata ? { invalidMetadata: true } : {}),
+      },
       observations: {
         graphPackages: packageObservation,
         packageSnapshots: pickPackageSnapshots([detail.id], packageSnapshots),
@@ -214,12 +321,17 @@ function buildRecords(
       },
     });
   }
-  const powerRows = [...resourceRows.values()].map(({ resource, packages: linkedPackages, evidence, packageEvidence }) => {
+  for (const record of graphOnly.values()) {
+    record.packages.sort((left, right) => ordinal(left.id, right.id));
+    record.id = unifiedAgentRecordId({ source: "graph_packages", packageId: record.packages[0].id });
+    record.displayName = record.packages[0].displayName.trim() || record.packages[0].id;
+  }
+  const powerRows = [...resourceRows.values()].map(({ resource, packages: linkedPackages, evidence, packageEvidence, warnings }) => {
     const packagesSorted = linkedPackages.sort((left, right) => ordinal(left.id, right.id));
     const matched = packagesSorted.length > 0;
     return {
       id: unifiedAgentRecordId({ source: "power_platform", nativeId: resource.nativeId, environmentId: resource.environmentId }),
-      displayName: resource.displayName ?? packagesSorted[0]?.displayName ?? resource.nativeId,
+      displayName: resource.displayName?.trim() || packagesSorted[0]?.displayName.trim() || resource.nativeId,
       presence: matched ? "both" : "power_platform",
       environmentId: resource.environmentId,
       packages: packagesSorted,
@@ -230,6 +342,7 @@ function buildRecords(
             evidence: uniqueEvidence(evidence),
             packageEvidence: packageEvidence.sort((left, right) => ordinal(left.packageId, right.packageId)),
             reason: null,
+            ...(warnings.length ? { warnings: [...new Map(warnings.map(warning => [warning.code, warning])).values()] } : {}),
           }
         : {
             state: "unmatched",
@@ -244,7 +357,7 @@ function buildRecords(
       },
     } satisfies UnifiedAgentRecord;
   });
-  return [...powerRows, ...graphOnly];
+  return [...powerRows, ...graphOnly.values()];
 }
 
 function packageSummary(value: CopilotPackageDetail): CopilotPackage {
@@ -289,6 +402,8 @@ function powerPlatformObservationFrom(source: UnifiedPowerPlatformSourceResult):
     coveredCount: coverage?.count ?? null,
     observedCount: source.snapshot!.observedCount,
     totalRecords: source.snapshot!.totalRecords,
+    pageCount: source.snapshot!.pageCount,
+    verification: source.snapshot!.verification,
   };
 }
 
@@ -308,16 +423,19 @@ function powerPlatformSourceStatus(
       observation,
     );
   }
-  if (observation.coverage !== "covered" || observation.environmentScope !== null) {
+  if (observation.coverage !== "covered" || observation.verification?.status !== "verified" || observation.environmentScope !== null) {
     const reasons: string[] = [];
     if (observation.environmentScope !== null) reasons.push(
-      "The saved Power Platform inventory covers only one environment; observed agents are returned as partial availability.",
+      "The Power Platform query was restricted to one environment. Other environments were not included in this saved inventory.",
     );
-    if (observation.coverage !== "covered") reasons.push(observation.roleScope === "unknown"
-        ? "Power Platform collection completed, but this snapshot has no recognized Microsoft Entra inventory role evidence (wids). The returned agents are available; tenant-wide Copilot Studio coverage is unknown. Ask an administrator to verify directory-role claims and your active provider role, sign in again, then refresh Power Platform inventory. Refreshing with the same missing role evidence will remain partial."
-        : "The saved Power Platform inventory does not prove complete Copilot Studio agent coverage; observed agents are returned as partial availability.",
+    if (observation.coverage !== "covered" || observation.verification?.status !== "verified") reasons.push(
+      "The selected saved query does not contain verified Copilot Studio agent collection evidence. Refresh Power Platform inventory before treating this source as complete.",
     );
-    const error: UnifiedAgentSourceError = { source: "power_platform", code: "coverage_unknown", message: reasons.join(" ") };
+    const error: UnifiedAgentSourceError = {
+      source: "power_platform",
+      code: observation.environmentScope !== null ? "environment_scope_limited" : "coverage_unknown",
+      message: reasons.join(" "),
+    };
     return { state: "partial", observation, error };
   }
   return { state: "available", observation, error: null };
@@ -347,9 +465,7 @@ function unavailableStatus(
 }
 
 function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) {
-  if (query.recordId && record.id !== query.recordId && !record.packages.some(value =>
-    unifiedAgentRecordId({ source: "graph_packages", packageId: value.id }) === query.recordId,
-  )) return false;
+  if (query.recordId && !matchesRecordId(record, query.recordId)) return false;
   if (query.source && query.source !== "all") {
     if (query.source === "both" && record.presence !== "both") return false;
     if (query.source === "graph_packages" && !record.packages.length) return false;
@@ -383,6 +499,39 @@ function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) 
     ...(record.powerPlatformResource?.identifiers.map(identifier => identifier.value) ?? []),
   ];
   return values.some(value => value?.toLocaleLowerCase("en-US").includes(search));
+}
+
+function matchesRecordId(record: UnifiedAgentRecord, recordId: string) {
+  if (record.id === recordId) return true;
+  const target = parseUnifiedAgentRecordId(recordId);
+  if (target?.source === "graph_packages") return record.packages.some(value => value.id === target.packageId);
+  if (target?.source === "power_platform" && record.powerPlatformResource) {
+    return powerPlatformAgentKey(target.environmentId, target.nativeId)
+      === powerPlatformAgentKey(record.powerPlatformResource.environmentId, record.powerPlatformResource.nativeId);
+  }
+  return false;
+}
+
+function exactSelection(records: readonly UnifiedAgentRecord[], references: readonly string[]) {
+  if (!references.length || references.length > 5_000) throw new AppError(400, "invalid_export_selection", "Select 1-5,000 exact agent references.");
+  const canonical = new Map(records.map(record => [record.id, record]));
+  const packages = new Map(records.flatMap(record => record.packages.map(value => [value.id, record] as const)));
+  const resources = new Map(records.flatMap(record => record.powerPlatformResource ? [[
+    powerPlatformAgentKey(record.powerPlatformResource.environmentId, record.powerPlatformResource.nativeId), record,
+  ] as const] : []));
+  const selected = new Set<UnifiedAgentRecord>();
+  for (const reference of references) {
+    const target = parseUnifiedAgentRecordId(reference);
+    const record = canonical.get(reference) ?? (target?.source === "graph_packages" ? packages.get(target.packageId)
+      : target?.source === "power_platform" ? resources.get(powerPlatformAgentKey(target.environmentId, target.nativeId)) : undefined);
+    if (!record) throw new AppError(409, "export_selection_changed", "A selected agent is no longer in the authorized saved inventory. Refresh Agents and select it again.");
+    selected.add(record);
+  }
+  return selected;
+}
+
+function inventoryChanged() {
+  return new AppError(409, "inventory_changed", "Saved inventory changed. Refresh Agents and try the export again.");
 }
 
 function recordComparator(query: UnifiedAgentInventoryQuery) {
@@ -436,15 +585,12 @@ function summarize(records: readonly UnifiedAgentRecord[]): UnifiedAgentInventor
 function uniqueEvidence(values: readonly PackageAgentLinkEvidence[]) {
   const seen = new Set<string>();
   return values.filter(value => {
-    const key = `${value.kind}\0${value.basis}\0${value.packagePath}\0${value.resourcePath}\0${[...value.elementIds].sort(ordinal).join("\0")}`;
+    const key = JSON.stringify([value.kind, value.basis, value.packagePath, value.resourcePath,
+      [...value.elementIds].sort(ordinal), [...value.relatedPackageIds ?? []].sort(ordinal)]);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
-}
-
-function resourceKey(environmentId: string | null, nativeId: string) {
-  return `${environmentId ?? ""}\0${nativeId}`;
 }
 
 function matchesAvailability(value: string | undefined, filter: string) {

@@ -6,11 +6,11 @@ import { beginAccountSessionValidation, commitAccountSessionValidation } from ".
 import { AppError } from "../errors.js";
 import type { DefenderHuntingJob, DefenderHuntingQualificationBinding, DefenderHuntingTokenMode } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { getAuditLog } from "./auditLog.js";
 import { GraphHuntingClient, validateDefenderHuntingFilters } from "./graphHunting.js";
-import { inventoryRoleScope, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
 import { operationalLog } from "./telemetry.js";
 
 type CapabilityId = "defender.hunting.delegated" | "defender.hunting.application";
@@ -327,10 +327,9 @@ export class DefenderHuntingService {
       qualifications.push({ resultScope: applicationScope, authority: await this.dependencies.qualificationContext("defender.hunting.application", user) });
     }
     catch (error) { if (!(error instanceof AppError && error.code === "not_configured")) throw error; }
-    const roleScope = inventoryRoleScope(user);
     return { tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId, resultScopes, qualifications,
-      ...(hasAppRole(user.roles, "AgentControl.Viewer") && roleScope !== "unknown" ? { inventoryIdentityScope: {
-        principalId: user.homeAccountId, roleScope, resourceTypes: [...resourceTypesForInventoryScope(roleScope)],
+      ...(hasAppRole(user.roles, "AgentControl.Viewer") ? { inventoryIdentityScope: {
+        principalId: user.homeAccountId, resourceTypes: [...powerPlatformResourceTypes],
       } } : {}) };
   }
 }

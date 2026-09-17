@@ -3,7 +3,7 @@ import { Info, Lock, LockOpen, ShieldCheck } from "lucide-react";
 import { formatAgentAuthoringTool } from "../../../backend/src/types/copilotPackage";
 import type { UnifiedAgentRecord } from "../api/client";
 import { formatAccessScope } from "../accessScope";
-import { quarantineTargetReason } from "../quarantineTarget";
+import { quarantineTargetKey, quarantineTargetReason } from "../quarantineTarget";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import "./unifiedAgent.css";
 
@@ -15,6 +15,7 @@ type Props = {
   packageSelectionAllowed: boolean;
   packageOperationsAllowed: boolean;
   quarantineSelectionAllowed: boolean;
+  quarantineSelectionRestoring?: boolean;
   selectionDisabled: boolean;
   environmentNames?: Record<string, string>;
   onToggleSelection: (record: UnifiedAgentRecord) => void;
@@ -32,6 +33,7 @@ export function UnifiedAgentTable({
   packageSelectionAllowed,
   packageOperationsAllowed,
   quarantineSelectionAllowed,
+  quarantineSelectionRestoring = false,
   selectionDisabled,
   environmentNames = {},
   onToggleSelection,
@@ -50,7 +52,8 @@ export function UnifiedAgentTable({
     const quarantineSelectable = quarantineSelectionAllowed && !quarantineReason;
     const selectableCount = packageIds.length + Number(quarantineSelectable);
     const selectedCount = packageIds.filter(id => selectedPackageIds.has(id)).length
-      + Number(quarantineSelectable && selectedPowerPlatformKeys.has(record.id));
+      + Number(quarantineSelectable && record.powerPlatformResource !== null
+        && selectedPowerPlatformKeys.has(quarantineTargetKey(record.powerPlatformResource)));
     return { record, selectableCount, selectedCount, quarantineReason };
   });
   const selectedAgents = rows.filter(row => row.selectedCount > 0).length;
@@ -75,18 +78,21 @@ export function UnifiedAgentTable({
         <tbody>{rows.map(({ record, selectableCount, selectedCount, quarantineReason }) => {
           const packageBusy = record.packages.some(item => item.id === busyPackageId);
           const resource = record.powerPlatformResource;
+          const restoringSelection = quarantineSelectionRestoring && quarantineSelectionAllowed && !quarantineReason;
           const canManage = (packageOperationsAllowed && record.packages.length > 0)
             || (quarantineSelectionAllowed && resource?.type === "microsoft.copilotstudio/agents");
           return <tr key={record.id}>
             <td className="select-cell">
               <SelectionCheckbox
                 label={`Select ${record.displayName}`}
-                title={selectableCount === 0
+                title={restoringSelection
+                  ? "Restoring saved quarantine selections. Clear the saved selection to cancel."
+                  : selectableCount === 0
                   ? (quarantineSelectionAllowed && resource ? quarantineReason : undefined) ?? "No selectable controls are available for this agent."
                   : "Select this agent's available targets"}
                 checked={selectableCount > 0 && selectedCount === selectableCount}
                 indeterminate={selectedCount > 0 && selectedCount < selectableCount}
-                disabled={selectionDisabled || selectableCount === 0}
+                disabled={selectionDisabled || restoringSelection || selectableCount === 0}
                 onChange={() => onToggleSelection(record)}
               />
             </td>

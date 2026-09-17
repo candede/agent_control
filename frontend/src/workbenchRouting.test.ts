@@ -186,6 +186,23 @@ describe("workbench routing", () => {
     expect(parseAgentRoute("detail=power_platform%3Aenv-1%3A%250A").detailId).toBeUndefined();
   });
 
+  it("round trips canonical details and legacy canonical selections alongside exact source targets", () => {
+    const canonical = "agent:11111111-1111-4111-8111-111111111111";
+    const native = "power_platform:environment-a:native%2Fagent";
+    const route = parseAgentRoute(new URLSearchParams({
+      detail: canonical, detailTab: "controls", inventorySnapshot: "snapshot-a",
+    }).toString());
+    route.selectedIds = ["package-a", "package-b"];
+    route.selectedPowerPlatformIds = [canonical, native];
+    expect(parseAgentRoute(agentRouteSearch(route).toString())).toMatchObject({
+      detailId: canonical, detailTab: "controls", inventorySnapshotId: "snapshot-a",
+      selectedIds: ["package-a", "package-b"], selectedPowerPlatformIds: [canonical, native],
+    });
+    expect(parseAgentRoute("detail=agent%3Ainvalid&selectedResource=agent%3Ainvalid")).toMatchObject({
+      detailId: undefined, selectedPowerPlatformIds: [],
+    });
+  });
+
   it("keeps quarantine job-only links independently of a saved selection", () => {
     const migrated = migratePowerPlatformAgentRoute("quarantineJob=job-1");
     expect(parseAgentRoute(migrated!.toString())).toMatchObject({
@@ -233,6 +250,12 @@ describe("workbench routing", () => {
 
     const officialUsage = parseOfficialUsageRoute("staging=stage-old&snapshot=11111111-1111-4111-8111-111111111111&window=90");
     expect(parseOfficialUsageRoute(officialUsageRouteSearch(officialUsage).toString())).toEqual(officialUsage);
+  });
+
+  it("round trips the unified agent inventory export audit action", () => {
+    const route = parseAuditRoute("action=export-agent-inventory&status=succeeded");
+    expect(route.action).toBe("export-agent-inventory");
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
   });
 
   it("defaults retained usage snapshots to the full historical activity window", () => {

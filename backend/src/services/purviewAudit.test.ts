@@ -5,7 +5,7 @@ import type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, P
 import { createProviderQueryBody } from "./graphAuditSearch.js";
 import { PurviewAuditService } from "./purviewAudit.js";
 
-const user: AuthenticatedUser = { homeAccountId: "reader-a", tenantId: "tenant-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"], providerRoles: [], providerRoleScope: "unknown" };
+const user: AuthenticatedUser = { homeAccountId: "reader-a", tenantId: "tenant-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"], providerRoleIds: [] };
 const filters: PurviewAuditFilters = { presetId: "copilot_interactions", operations: ["CopilotInteraction"], startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(), endDateTime: new Date().toISOString(), userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [] };
 
 function job(overrides: Partial<PurviewAuditJob> = {}): PurviewAuditJob {
@@ -52,6 +52,17 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Purview audit worker", () => {
+  it("binds saved inventory associations to the current Viewer even without directory-role claims", async () => {
+    const fixture = setup();
+    await fixture.service.list(user);
+    expect(fixture.repository.listJobs.mock.calls[0][0]).toMatchObject({
+      inventoryIdentityScope: { principalId: user.homeAccountId, resourceTypes: expect.arrayContaining(["microsoft.copilotstudio/agents"]) },
+    });
+    await expect(fixture.service.list({ ...user, roles: [] })).rejects.toMatchObject({ status: 403 });
+    expect(fixture.repository.listJobs).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
   it("returns a durable job promptly and completes create, poll, records and publication in the background", async () => {
     const fixture = setup();
     await expect(fixture.service.start(user, job().id, "delegated")).resolves.toMatchObject({ id: job().id });

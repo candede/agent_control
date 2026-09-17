@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { packageInventoryIdentity, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "./inventoryIdentity.js";
+import { normalizeNativeIdentity, packageInventoryIdentity, powerPlatformAgentKey, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "./inventoryIdentity.js";
 
 function identity(overrides: Partial<InventoryIdentityRecord> = {}): InventoryIdentityRecord {
   return {
@@ -78,5 +78,23 @@ describe("exact inventory identity resolution", () => {
     const second = resolveExactInventoryIdentity({ ...structuredClone(source), identifiers: [...source.identifiers].reverse() }, structuredClone(candidates).reverse());
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
     expect(first).toMatchObject({ status: "ambiguous", reason: "multiple_exact_candidates", candidates: [{ nativeId: "a-first" }, { nativeId: "z-last" }] });
+  });
+
+  it("normalizes UUID and environment casing without folding opaque source IDs or identifier kinds", () => {
+    const id = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    expect(normalizeNativeIdentity(id)).toBe(id.toLowerCase());
+    expect(normalizeNativeIdentity("Opaque-A")).toBe("Opaque-A");
+    expect(normalizeNativeIdentity(`${id}\n`)).toBe(`${id}\n`);
+    expect(normalizeNativeIdentity(`${id}\u2028`)).toBe(`${id}\u2028`);
+    expect(powerPlatformAgentKey("Default-ENV", id)).toBe(powerPlatformAgentKey("default-env", id.toLowerCase()));
+    expect(powerPlatformAgentKey("env", "Opaque-A")).not.toBe(powerPlatformAgentKey("env", "opaque-a"));
+    const source = identity({ tenantId: id, environmentId: `Default-${id}`, identifiers: [{ kind: "cds_bot_id", value: id }] });
+    const candidate = identity({
+      tenantId: id.toLowerCase(), environmentId: `default-${id.toLowerCase()}`,
+      identifiers: [{ kind: "cds_bot_id", value: id.toLowerCase() }],
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate])).toMatchObject({ status: "resolved", matchedKind: "cds_bot_id" });
+    expect(resolveExactInventoryIdentity(source, [{ ...candidate, identifiers: [{ kind: "manifest_id", value: id.toLowerCase() }] }]).status)
+      .toBe("unresolved");
   });
 });

@@ -7,6 +7,7 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import App from "./App";
 import {
   getAgents,
+  powerPlatformResourceTypes,
   type BulkActionJob,
   type CopilotPackage,
   type InventoryRefreshJob,
@@ -21,6 +22,7 @@ import {
 import { storePackageSelection } from "./packageSelectionSession";
 import { mockNativeDialogs } from "./test/dialog";
 import { copilotUsageFixture } from "./test/copilotUsageFixture";
+import { createInventoryVerification, createUnifiedVerification } from "./test/inventoryVerification";
 
 mockNativeDialogs();
 
@@ -64,7 +66,10 @@ const packagePage: PackagePage = {
   facets: { publishers: [], availability: [], hosts: [], platforms: [] },
 };
 
+const unifiedRevision = "a".repeat(64);
 const unifiedPage: UnifiedAgentInventoryPage = {
+  revision: unifiedRevision,
+  verification: createUnifiedVerification({ graphPackageCount: 1, powerPlatformAgentCount: 0, logicalAgentCount: 1 }, { sourceScopes: false }),
   value: [{
     id: "graph_packages:package-private",
     displayName: agent.displayName,
@@ -138,6 +143,8 @@ function powerPlatformSnapshot(): NonNullable<UnifiedAgentRecord["observations"]
     coveredCount: 2,
     observedCount: 2,
     totalRecords: 2,
+    pageCount: 1,
+    verification: createInventoryVerification(2),
   };
 }
 
@@ -180,10 +187,18 @@ function powerPlatformRecord(nativeId: string, displayName: string): UnifiedAgen
 }
 
 function unifiedRecordsPage(records: UnifiedAgentRecord[], count = records.length): UnifiedAgentInventoryPage {
+  const packageCount = new Set(records.flatMap(record => record.packages.map(item => item.id))).size;
+  const nativeCount = new Set(records.flatMap(record => record.powerPlatformResource ? [`${record.powerPlatformResource.environmentId}:${record.powerPlatformResource.nativeId}`] : [])).size;
+  const additionalRows = Math.max(0, count - records.length);
   return {
     ...unifiedPage,
     value: records,
     count,
+    verification: createUnifiedVerification({
+      graphPackageCount: packageCount + (packageCount > 0 ? additionalRows : 0),
+      powerPlatformAgentCount: nativeCount + (packageCount === 0 ? additionalRows : 0),
+      logicalAgentCount: count,
+    }),
     summary: { total: count, linked: 0, graphOnly: records.filter(item => item.presence === "graph_packages").length, powerPlatformOnly: records.filter(item => item.presence === "power_platform").length, ambiguous: 0, conflicting: 0 },
     filteredSummary: { total: count, linked: 0, graphOnly: records.filter(item => item.presence === "graph_packages").length, powerPlatformOnly: records.filter(item => item.presence === "power_platform").length, ambiguous: 0, conflicting: 0 },
     sources: {
@@ -192,6 +207,27 @@ function unifiedRecordsPage(records: UnifiedAgentRecord[], count = records.lengt
     },
     partial: false,
     errors: [],
+  };
+}
+
+function verifiedSavedAgentPage(): UnifiedAgentInventoryPage {
+  const collectedAt = "2026-09-17T05:30:00.000Z";
+  const summary = { total: 1561, linked: 690, graphOnly: 314, powerPlatformOnly: 557, ambiguous: 0, conflicting: 0 };
+  const graph = unifiedPage.sources.graphPackages.observation;
+  if (!graph || !("scopeKind" in graph)) throw new Error("Expected a saved Graph observation");
+  return {
+    ...unifiedPage, count: 1, summary, filteredSummary: { ...summary, total: 1 },
+    identityCollection: { checkedPackages: 1010, pendingPackages: 0 },
+    verification: createUnifiedVerification({ graphPackageCount: 1010, powerPlatformAgentCount: 1247, logicalAgentCount: 1561 }),
+    sources: {
+      graphPackages: { state: "available", error: null, observation: { ...graph, observedAt: collectedAt, observedCount: 1010, totalRecords: 1010 } },
+      powerPlatform: { state: "available", error: null, observation: {
+        ...powerPlatformSnapshot(), roleScope: "unknown", observedAt: collectedAt,
+        observedCount: 4178, totalRecords: 4178, coveredCount: 1247, pageCount: 42,
+        verification: createInventoryVerification(4178, [...powerPlatformResourceTypes]),
+      } },
+    },
+    partial: false, errors: [],
   };
 }
 
@@ -346,6 +382,35 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
   });
 
+  it("routes invalid metadata diagnostics to explicit recovery without treating checked packages as matches or retrying automatically", async () => {
+    const invalid: UnifiedAgentRecord = {
+      ...unifiedPage.value[0], id: "agent:33333333-3333-4333-8333-333333333333",
+      identity: { ...unifiedPage.value[0].identity, invalidMetadata: true },
+    };
+    const transport = initialCatalogTransport({
+      unifiedResponse: {
+        ...unifiedRecordsPage([invalid]),
+        identityCollection: { checkedPackages: 1, pendingPackages: 0, invalidPackages: 1 },
+      },
+    });
+    transport.page = packagePage;
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /1 package with invalid matching metadata.*View sync details/ }));
+    expect(window.location.pathname).toBe("/sync");
+    expect(screen.getByText(/1 package has invalid saved matching metadata/)).toBeVisible();
+    expect(screen.getByText("1 package identities checked; 0 still need collection.")).toBeVisible();
+    expect(screen.getByText("Source-metadata links").nextElementSibling).toHaveTextContent(/^0$/);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    await userEvent.click(screen.getByRole("button", { name: "Select packages on Agents" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Refresh matching details" }));
+    await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
+    expect(JSON.parse(String(refreshRequests(transport.fetchMock)[0][1]?.body))).toEqual({ ids: [agent.id], mode: "delegated" });
+  });
+
   it("selects both exact target kinds with one checkbox on a merged agent", async () => {
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", agent.displayName);
     const merged: UnifiedAgentRecord = {
@@ -371,6 +436,249 @@ describe("App session revalidation", () => {
     expect(await screen.findByRole("tab", { name: "Manage" })).toHaveAttribute("aria-selected", "true");
   });
 
+  it.each([null, "11111111-1111-4111-8111-111111111111"])("refreshes every exact package in a canonical graph-only group with environment %s", async environmentId => {
+    const group: UnifiedAgentRecord = {
+      ...unifiedPage.value[0], id: "agent:33333333-3333-4333-8333-333333333333", environmentId,
+      displayName: "Grouped Graph agent",
+      packages: [agent, { ...agent, id: "package-alternate", displayName: "Alternate representation", isBlocked: true }],
+    };
+    const transport = initialCatalogTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([group]),
+    });
+    transport.page = {
+      ...packagePage, value: group.packages, count: 2,
+      summary: { total: 2, allowed: 1, blocked: 1 }, filteredSummary: { total: 2, allowed: 1, blocked: 1 },
+      snapshot: { ...packagePage.snapshot!, observedCount: 2, totalRecords: 2 },
+    };
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select Grouped Graph agent" }));
+    expect(screen.getByRole("heading", { name: "Agents 1" })).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: "Select Grouped Graph agent" })).toBeChecked();
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id, "package-alternate"]);
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([]);
+    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Refresh matching details" }));
+    await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
+    expect(JSON.parse(String(refreshRequests(transport.fetchMock)[0][1]?.body))).toEqual({
+      ids: [agent.id, "package-alternate"], mode: "delegated",
+    });
+  });
+
+  it.each([1, 2])("opens a saved merged agent with %s packages without a package detail dependency", async packageCount => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Saved merged agent");
+    const merged: UnifiedAgentRecord = {
+      ...native,
+      id: "agent:33333333-3333-4333-8333-333333333333",
+      presence: "both",
+      packages: [agent, { ...agent, id: "package-alternate" }].slice(0, packageCount),
+    };
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([merged]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => merged.packages.some(item => input === `/api/agents/${item.id}`)
+      ? Response.json({ code: "provider_error", detail: "Package detail is unavailable" }, { status: 503 })
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "View details for Saved merged agent" }));
+    const dialog = await screen.findByRole("dialog", { name: "Saved merged agent" });
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
+    for (const item of merged.packages) {
+      expect(within(dialog).getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` })).toBeInTheDocument();
+      expect(within(dialog).getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` })).toBeInTheDocument();
+    }
+    expect(within(dialog).getByRole("heading", { name: "Copilot Studio quarantine" })).toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.some(([path]) => merged.packages.some(item => path === `/api/agents/${item.id}`))).toBe(false);
+  });
+
+  it("keeps unified saved rows when the auxiliary package catalog is unavailable", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Independent native agent");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([native]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agents"
+      ? Response.json({ code: "inventory_unavailable", detail: "Saved package catalog unavailable" }, { status: 503 })
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("Independent native agent")).toBeInTheDocument();
+    expect(screen.getByText(/Saved package summaries are unavailable: Saved package catalog unavailable/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "View details for Independent native agent" }));
+    expect(await screen.findByRole("dialog", { name: "Independent native agent" })).toBeInTheDocument();
+  });
+
+  it("preserves one exact quarantine target when reconciliation changes the canonical row ID", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Reconciled agent");
+    const initial = { ...native, id: "agent:33333333-3333-4333-8333-333333333333" };
+    const merged: UnifiedAgentRecord = {
+      ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both",
+      packages: [agent, { ...agent, id: "package-alternate" }],
+    };
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let reconciled = false;
+    transport.fetchMock.mockImplementation(async (input, init) => input.startsWith("/api/agent-inventory")
+      ? Response.json(unifiedRecordsPage([reconciled ? merged : initial]))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select Reconciled agent" }));
+    expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+    reconciled = true;
+    await userEvent.selectOptions(screen.getByDisplayValue("Name (A-Z)"), "displayName:desc");
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Reconciled agent" })).toBePartiallyChecked());
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Reconciled agent" }));
+    expect(screen.getByRole("checkbox", { name: "Select Reconciled agent" })).toBeChecked();
+    expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([native.id]);
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id, "package-alternate"]);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Reconciled agent" }));
+    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+  });
+
+  it("does not renew retained quarantine proof when newly linked packages are selected", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Snapshot-bound merged agent");
+    const merged: UnifiedAgentRecord = {
+      ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both", packages: [agent],
+      observations: {
+        ...native.observations,
+        powerPlatform: { ...native.observations.powerPlatform!, id: "new-snapshot", snapshotId: "new-snapshot" },
+      },
+    };
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let reconciled = false;
+    transport.fetchMock.mockImplementation(async (input, init) => input.startsWith("/api/agent-inventory")
+      ? Response.json(unifiedRecordsPage([reconciled ? merged : native]))
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select Snapshot-bound merged agent" }));
+    reconciled = true;
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Snapshot-bound merged agent" })).toBePartiallyChecked());
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Snapshot-bound merged agent" }));
+    expect(screen.getByRole("checkbox", { name: "Select Snapshot-bound merged agent" })).toBeChecked();
+    expect(new URLSearchParams(window.location.search).get("inventorySnapshot")).toBe(native.observations.powerPlatform!.snapshotId);
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
+    expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+  });
+
+  it("reconciles an open native-only detail through its canonical alias when package identities arrive", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Reconciled detail");
+    const initial = { ...native, id: "agent:33333333-3333-4333-8333-333333333333" };
+    const merged: UnifiedAgentRecord = {
+      ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both",
+      packages: [agent, { ...agent, id: "package-alternate" }],
+    };
+    const transport = initialCatalogTransport();
+    transport.page = packagePage;
+    const base = transport.fetchMock.getMockImplementation()!;
+    const refresh = deferredResponse();
+    let reconciled = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input.startsWith("/api/agent-inventory")) {
+        const exact = new URL(input, "http://localhost").searchParams.get("recordId");
+        return Response.json({
+          ...unifiedRecordsPage(reconciled ? [merged] : exact ? [initial] : [unifiedPage.value[0], initial]),
+          identityCollection: { checkedPackages: reconciled ? 1 : 0, pendingPackages: reconciled ? 0 : 1 },
+        });
+      }
+      if (input === "/api/agents/refresh-jobs" && init?.method === "POST") return refresh.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
+    await userEvent.click(screen.getByRole("button", { name: "View details for Reconciled detail" }));
+    await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Availability" }));
+    expect(screen.getByText(/No package target is available for these controls/)).toBeInTheDocument();
+    reconciled = true;
+    await act(async () => refresh.resolve(Response.json(completedRefreshJob())));
+
+    const dialog = screen.getByRole("dialog", { name: "Reconciled detail" });
+    await waitFor(() => expect(within(dialog).getAllByRole("button", { name: /Package details for/ })).toHaveLength(2));
+    expect(new URLSearchParams(window.location.search).get("detail")).toBe(merged.id);
+    expect(transport.fetchMock.mock.calls.some(([path]) => new URL(path, "http://localhost").searchParams.get("recordId") === initial.id)).toBe(true);
+  });
+
+  it("restores off-page canonical and source quarantine aliases as one exact native selection", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Off-page target");
+    const canonicalAlias = "agent:33333333-3333-4333-8333-333333333333";
+    const merged: UnifiedAgentRecord = {
+      ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both", packages: [agent],
+    };
+    window.history.replaceState({}, "", `/agents?inventorySnapshot=pp-snapshot&selectedResource=${encodeURIComponent(canonicalAlias)}&selectedResource=${encodeURIComponent(native.id)}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const exact = new URL(input, "http://localhost").searchParams.get("recordId");
+      return exact === canonicalAlias || exact === native.id
+        ? Response.json(unifiedRecordsPage([merged]))
+        : base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([native.id]);
+    expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([]);
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) => path.startsWith("/api/quarantine/") && init?.method === "POST")).toHaveLength(0);
+  });
+
+  it("cancels a pending canonical quarantine restore without a late response reselecting its native target", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Pending native target");
+    const alias = "agent:33333333-3333-4333-8333-333333333333";
+    window.history.replaceState({}, "", `/agents?inventorySnapshot=pp-snapshot&selectedResource=${encodeURIComponent(alias)}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([native]),
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const lookup = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").searchParams.get("recordId") === alias
+      ? lookup.promise
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    const controls = await screen.findByRole("region", { name: "Copilot Studio quarantine controls" });
+    expect(await screen.findByRole("checkbox", { name: "Select Pending native target" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Manage Pending native target" })).toBeEnabled();
+    expect(within(controls).getByText(/Restoring 1 bookmarked quarantine selection/)).toBeVisible();
+    await userEvent.click(within(controls).getByRole("button", { name: "Clear" }));
+    await act(async () => lookup.resolve(Response.json(unifiedRecordsPage([native]))));
+    expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Select Pending native target" })).toBeEnabled();
+    expect(screen.getByRole("checkbox", { name: "Select Pending native target" })).not.toBeChecked();
+    expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([]);
+  });
+
+  it("does not renew a bookmarked quarantine selection with a different inventory snapshot", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Snapshot-bound target");
+    window.history.replaceState({}, "", `/agents?inventorySnapshot=previous-snapshot&selectedResource=${encodeURIComponent(native.id)}`);
+    const transport = appTransport({
+      initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([native]),
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText(/Could not restore.*quarantine.*saved inventory changed/i)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Select Snapshot-bound target" })).not.toBeChecked();
+    expect(screen.queryByText("1 of 25 exact Copilot Studio agents selected")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([path, init]) => path.startsWith("/api/quarantine/") && init?.method === "POST")).toHaveLength(0);
+  });
+
   it("keeps basic filters compact and hides advanced controls without removing them", async () => {
     vi.stubGlobal("fetch", appTransport({ revalidatedRoles: viewer.roles }).fetchMock);
     render(<App />);
@@ -386,8 +694,8 @@ describe("App session revalidation", () => {
     }
     expect(filters.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
     expect(screen.getByLabelText("Publisher")).not.toBeVisible();
-    expect(filters.queryByRole("button", { name: "Export package inventory CSV" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Export package inventory CSV" })).toBeInTheDocument();
+    expect(filters.queryByRole("button", { name: "Export agent inventory CSV" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeInTheDocument();
     await userEvent.click(filters.getByRole("checkbox", { name: "Advanced filters" }));
     expect(filters.getByRole("region", { name: "Advanced agent filters" })).toBeVisible();
     for (const label of ["Environment", "Search environments", "Publisher"]) {
@@ -494,7 +802,7 @@ describe("App session revalidation", () => {
     })).toBe(true));
   });
 
-  it("keeps Agents focused on the catalog and moves coverage and collection controls to Sync", async () => {
+  it("shows saved verification limitations on Agents while keeping provider collection controls on Sync", async () => {
     const transport = appTransport({
       initialRoles: ["AgentControl.Admin"],
       revalidatedRoles: ["AgentControl.Admin"],
@@ -515,14 +823,14 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("region", { name: "Source matching details" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Power Platform agent source" })).not.toBeInTheDocument();
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
-    expect(screen.queryByText("Copilot Studio agent coverage is incomplete.")).not.toBeInTheDocument();
+    expect(screen.getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Refresh agents" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
     expect(screen.getByRole("button", { name: "Block selected packages" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: /Partial inventory/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Saved source limitations.*View sync details/ }));
     expect(window.location.pathname).toBe("/sync");
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
-    expect(screen.getByText("Copilot Studio agent coverage is incomplete.")).toBeVisible();
+    expect(screen.getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
     expect(screen.getByText("Source-metadata links")).toBeVisible();
     expect(screen.getByText(/1 published target selected/)).toBeVisible();
     expect(screen.getByRole("heading", { name: "Sync history" })).toBeVisible();
@@ -531,6 +839,149 @@ describe("App session revalidation", () => {
     await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
     expect(window.location.pathname).toBe("/agents");
     expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
+  });
+
+  it.each(["agents", "sync"])("verifies saved inventory from %s with GET reads only and separate collection/check times", async view => {
+    window.history.replaceState({}, "", `/${view}?q=Sensitive`);
+    const page = verifiedSavedAgentPage();
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let verificationRequested = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return verificationRequested ? pending.promise : Response.json(page);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved inventory verified");
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    expect(receipt.getByText("Resources stored / provider total").nextElementSibling).toHaveTextContent("4,178 / 4,178");
+    expect(receipt.getByText("Provider pages collected").nextElementSibling).toHaveTextContent("42");
+    expect(receipt.getByText("Optional directory-role hint").nextElementSibling).toHaveTextContent("Not supplied");
+    const collectedTime = receipt.getByText("Graph source collected at").nextElementSibling?.textContent;
+    const before = transport.fetchMock.mock.calls.length;
+    verificationRequested = true;
+    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
+    expect(receipt.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
+    const checkedAt = "2026-09-17T06:15:00.000Z";
+    await act(async () => pending.resolve(Response.json({
+      ...page, revision: "b".repeat(64), verification: { ...page.verification, checkedAt },
+    })));
+    await receipt.findByText("Saved inventory verified");
+    expect(receipt.getByText("Saved data verified at").nextElementSibling?.querySelector("time")).toHaveAttribute("datetime", checkedAt);
+    expect(receipt.getByText("Graph source collected at").nextElementSibling).toHaveTextContent(collectedTime!);
+    const requests = transport.fetchMock.mock.calls.slice(before);
+    expect(requests.filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(1);
+    expect(requests.some(([, init]) => init?.method && init.method !== "GET")).toBe(false);
+    expect(new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost").searchParams.has("snapshotId")).toBe(false);
+    expect(receipt.queryByText(/partial inventory|coverage unknown/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the full verified receipt under search, environment filtering and a later result page", async () => {
+    window.history.replaceState({}, "", "/agents?q=Sensitive&environment=env-a&page=2");
+    const page = { ...verifiedSavedAgentPage(), count: 51, offset: 50, value: [{ ...unifiedPage.value[0], environmentId: "env-a" }] };
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+      ? Response.json(page) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved inventory verified");
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    expect(receipt.getByText("Logical agents").nextElementSibling).toHaveTextContent(/^1,561$/);
+    expect(receipt.getByText("Targets represented / unique source targets").nextElementSibling).toHaveTextContent("2,257 / 2,257");
+    expect(receipt.getByText("Environment request scope").nextElementSibling).toHaveTextContent("All environments requested");
+    expect(transport.fetchMock.mock.calls.some(([input]) => {
+      const url = new URL(input, "http://localhost");
+      return url.pathname === "/api/agent-inventory" && url.searchParams.get("search") === "Sensitive"
+        && url.searchParams.get("environmentId") === "env-a" && url.searchParams.get("offset") === "50";
+    })).toBe(true);
+  });
+
+  it.each([false, true])("keeps pending metadata visible without launching automatic provider backfill after Verify saved inventory (page correction: %s)", async correctPage => {
+    if (correctPage) window.history.replaceState({}, "", "/agents?q=Sensitive&page=2");
+    const page = verifiedSavedAgentPage();
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let verificationRequested = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/capabilities") {
+        const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
+        return Response.json({ value: [{ definition, decision: {
+          capabilityId: definition.id, status: "available", authorized: true, fresh: true, verification: "provider",
+          checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          previewQualification: "not_required", remediation: [],
+        } }] });
+      }
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(verificationRequested ? {
+        ...page, revision: "b".repeat(64), identityCollection: { checkedPackages: 1008, pendingPackages: 2 },
+        verification: createUnifiedVerification(page.verification, { packageMetadata: false }),
+      } : correctPage ? { ...page, count: 51, offset: 50 } : page);
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved inventory verified");
+    const before = transport.fetchMock.mock.calls.length;
+    verificationRequested = true;
+    await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+    await screen.findByText("Saved inventory needs attention");
+    expect(screen.getByText("Package identity metadata still needs collection or repair.")).toBeVisible();
+    expect(transport.fetchMock.mock.calls.slice(before).filter(([, init]) => init?.method === "POST")).toEqual([]);
+  });
+
+  it("replaces a previous green receipt with explicit verification failure and permits a saved-only retry", async () => {
+    const page = verifiedSavedAgentPage();
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let fail = false;
+    transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+      ? fail ? Response.json({ detail: "Saved normalized identities do not match provider total." }, { status: 409 }) : Response.json(page)
+      : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved inventory verified");
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    const before = transport.fetchMock.mock.calls.length;
+    fail = true;
+    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
+    await waitFor(() => expect(receipt.getByRole("alert")).toHaveTextContent("Saved normalized identities do not match provider total."));
+    expect(receipt.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(receipt.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    fail = false;
+    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
+    await receipt.findByText("Saved inventory verified");
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(transport.fetchMock.mock.calls.slice(before).some(([, init]) => init?.method && init.method !== "GET")).toBe(false);
+  });
+
+  it("does not let a late saved verification restore protected receipts after session revalidation", async () => {
+    const page = verifiedSavedAgentPage();
+    const transport = appTransport({ revalidatedRoles: [], unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let deferNextRead = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        if (deferNextRead) { deferNextRead = false; return pending.promise; }
+        return Response.json(page);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Saved inventory verified");
+    deferNextRead = true;
+    await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+    await revalidateTransportSession(transport);
+    await act(async () => pending.resolve(Response.json(page)));
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
   });
 
   it("opens Sync for a users-only collection without putting progress back on Users", async () => {
@@ -620,12 +1071,13 @@ describe("App session revalidation", () => {
   });
 
   it.each(["navigation", "role revocation"] as const)(
-    "does not open a delayed unified detail after %s leaves the owning session route",
+    "does not open a delayed package detail after %s leaves the owning session route",
     async scenario => {
-      const transport = appTransport({
+      const transport = initialCatalogTransport({
         revalidatedRoles: scenario === "role revocation" ? [] : viewer.roles,
         deferRevalidation: scenario === "role revocation",
       });
+      transport.page = packagePage;
       const base = transport.fetchMock.getMockImplementation()!;
       let releaseDetail!: (response: Response) => void;
       const delayedDetail = new Promise<Response>(resolve => { releaseDetail = resolve; });
@@ -637,14 +1089,17 @@ describe("App session revalidation", () => {
       render(<App />);
 
       await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
+      const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+      await userEvent.click(within(dialog).getByRole("tab", { name: "Availability" }));
+      await userEvent.click(within(dialog).getByRole("button", { name: /Package details for/ }));
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/agents/package-private")).toBe(true));
       if (scenario === "navigation") {
         await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
       } else {
-        transport.failProtectedReadsWith = 401;
+        transport.session.failProtectedReadsWith = 401;
         await act(async () => { await expect(getAgents()).rejects.toMatchObject({ status: 401 }); });
-        await waitFor(() => expect(transport.meCalls()).toBe(2));
-        await act(async () => transport.releaseRevalidation());
+        await waitFor(() => expect(transport.session.meCalls()).toBe(2));
+        await act(async () => transport.session.releaseRevalidation());
       }
       await act(async () => releaseDetail(Response.json(agent)));
 
@@ -773,6 +1228,9 @@ describe("App session revalidation", () => {
     expect(agentListRequests(transport.fetchMock).some(([path]) =>
       String(path).includes("operationIdPrefix=a5331a93"),
     )).toBe(true);
+    expect(transport.fetchMock.mock.calls.some(([path]) =>
+      path.startsWith("/api/agent-inventory?operationIdPrefix=a5331a93"),
+    )).toBe(true);
     expect(transport.fetchMock.mock.calls.some(([path]) => {
       const url = new URL(String(path), "http://localhost");
       return url.pathname === "/api/agent-inventory"
@@ -803,7 +1261,7 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("button", { name: "Block Sensitive cached agent" })).toBeInTheDocument();
   });
 
-  it("uses authorized bulk references for both package lists and exports", async () => {
+  it("uses authorized bulk references for package lists and unified agent exports", async () => {
     window.history.replaceState({}, "", "/agents?q=ref+a5331a93");
     const transport = appTransport({
       initialRoles: ["AgentControl.Viewer"],
@@ -820,19 +1278,352 @@ describe("App session revalidation", () => {
       String(path).includes("operationIdPrefix=a5331a93"),
     )).toBe(true);
 
-    const exportButton = screen.getByRole("button", { name: "Export package inventory CSV" });
+    const exportButton = screen.getByRole("button", { name: "Export agent inventory CSV" });
     await waitFor(() => expect(exportButton).toBeEnabled());
     await userEvent.click(exportButton);
-    await userEvent.click(await screen.findByRole("button", { name: /Download package inventory/ }));
+    await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
     await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith(
-      "/api/agents/export.csv",
+      "/api/agent-inventory/export.csv",
       expect.objectContaining({ method: "POST" }),
     ));
-    const exportCall = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agents/export.csv")!;
+    const exportCall = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")!;
     expect(JSON.parse(String(exportCall[1]?.body))).toMatchObject({
-      filters: { operationIdPrefix: "a5331a93" },
-      snapshotId: "snapshot-private",
+      query: { operationIdPrefix: "a5331a93" },
+      revision: unifiedRevision,
     });
+  });
+
+  it("exports all matching logical rows with the exact unified filters and sorting, not the visible page", async () => {
+    const params = new URLSearchParams({
+      q: "Matched & saved", status: "blocked", publisher: "Publisher & Co", availability: "available:some",
+      host: "Teams", platform: "Copilot Studio", environment: "env-a", createdWithinDays: "30",
+      sort: "lastModifiedAt", direction: "desc", page: "3",
+    });
+    window.history.replaceState({}, "", `/agents?${params}`);
+    const records = Array.from({ length: 25 }, (_, index): UnifiedAgentRecord => ({
+      ...unifiedPage.value[0],
+      id: `agent:00000000-0000-4000-8000-${String(index + 100).padStart(12, "0")}`,
+      displayName: `Matched & saved ${index}`,
+      environmentId: "env-a",
+      packages: [{ ...agent, id: `package-${index}`, isBlocked: true, publisher: "Publisher & Co", authoringTool: "Copilot Studio" }],
+    }));
+    const page = { ...unifiedRecordsPage(records, 125), offset: 100 };
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const csv = "agentId,packageIds,inventoryPartial\r\nserver-agent,\"one;two\",false\r\n";
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const path = new URL(input, "http://localhost").pathname;
+      if (path === "/api/agent-inventory") return Response.json(page);
+      if (path === "/api/agent-inventory/export.csv") return new Response(csv, { headers: { "Content-Type": "text/csv" } });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText("Matched & saved 0");
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(transport.fetchMock.mock.calls.some(([input]) =>
+      input.startsWith("/api/agent-inventory?") && new URL(input, "http://localhost").searchParams.get("offset") === "100",
+    )).toBe(true);
+    await userEvent.click(button);
+    const matching = screen.getByRole("button", { name: /Download matching agents/ });
+    expect(matching).toHaveTextContent("125 filtered agents across all pages");
+    expect(screen.getByText(/8 MB and 15 seconds/)).toBeVisible();
+    await userEvent.click(matching);
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    const body = JSON.parse(String(transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")![1]?.body));
+    expect(body).toEqual({
+      revision: unifiedRevision,
+      query: {
+        search: "Matched & saved", blocked: true, publisher: "Publisher & Co", availableTo: "available:some",
+        host: "Teams", platform: "Copilot Studio", environmentId: "env-a", createdWithinDays: 30,
+        sortBy: "lastModifiedAt", sortDirection: "desc",
+      },
+    });
+    const listUrl = new URL(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?")).at(-1)![0], "http://localhost");
+    listUrl.searchParams.delete("limit");
+    listUrl.searchParams.delete("offset");
+    expect(Object.fromEntries(listUrl.searchParams)).toEqual(Object.fromEntries(
+      Object.entries(body.query).map(([key, value]) => [key, String(value)]),
+    ));
+    expect(await download.createObjectURL.mock.calls[0][0].text()).toBe(csv);
+    expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/agents/export.csv" || input.startsWith("/api/inventory/export.csv"))).toBe(false);
+  });
+
+  it("exports a merged selection once using observed canonical membership and exact off-page source references", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Grouped export agent");
+    const canonicalId = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const row: UnifiedAgentRecord = {
+      ...native,
+      id: canonicalId,
+      presence: "both",
+      packages: [{ ...agent, id: "opaque/package%one" }, { ...agent, id: "opaque:package-two", isBlocked: true }],
+      identity: { state: "matched", evidence: [], packageEvidence: [], reason: "Exact saved native source association." },
+    };
+    const offPageId = "offpage/opaque%ref";
+    window.history.replaceState({}, "", `/agents?${new URLSearchParams({
+      q: "Grouped", environment: row.environmentId!, status: "blocked", sort: "lastModifiedAt", direction: "desc", selected: offPageId,
+    })}`);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage([row]) });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    const checkbox = await screen.findByRole("checkbox", { name: "Select Grouped export agent" });
+    await userEvent.click(checkbox);
+    expect(checkbox).toBeChecked();
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    const initialPosts = transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").map(([input]) => input);
+    await userEvent.click(button);
+    const selected = screen.getByRole("button", { name: /Download selected agents/ });
+    expect(selected).toHaveTextContent("4 selected package/native references");
+    expect(selected).toHaveTextContent("Current filters do not narrow this selection");
+    await userEvent.click(selected);
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    const body = JSON.parse(String(transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")![1]?.body));
+    expect(body).toEqual({
+      revision: unifiedRevision,
+      recordIds: ["graph_packages:offpage%2Fopaque%25ref", canonicalId],
+      query: { sortBy: "lastModifiedAt", sortDirection: "desc" },
+    });
+    expect(checkbox).toBeChecked();
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").map(([input]) => input)).toEqual([...initialPosts, "/api/agent-inventory/export.csv"]);
+  });
+
+  it("allows a Viewer to export Power Platform-only logical rows without Graph permissions or package summaries", async () => {
+    const row = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Native export agent");
+    const page = unifiedRecordsPage([row]);
+    const transport = appTransport({ initialRoles: viewer.roles, revalidatedRoles: viewer.roles, unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      new URL(input, "http://localhost").pathname === "/api/agents"
+        ? Response.json({ detail: "Package summaries unavailable." }, { status: 503 }) : base(input, init),
+    );
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText("Native export agent");
+    await screen.findByText(/Saved package summaries are unavailable/);
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    await userEvent.click(button);
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    expect(transport.fetchMock).toHaveBeenCalledWith("/api/agent-inventory/export.csv", expect.objectContaining({
+      headers: expect.objectContaining({ "X-CSRF-Token": "csrf-1" }),
+      body: JSON.stringify({ revision: unifiedRevision, query: { sortBy: "displayName", sortDirection: "asc" } }),
+    }));
+    expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/agents/export.csv" || input.startsWith("/api/inventory/export.csv"))).toBe(false);
+  });
+
+  it.each([undefined, "a".repeat(63), "A".repeat(64)])("requires a valid saved revision before enabling unified export (%s)", async revision => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: { ...unifiedPage, revision } });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload saved agent inventory" })).toBeEnabled();
+    expect(screen.getByText(/saved agent inventory revision is unavailable/)).toBeVisible();
+    expect(transport.fetchMock.mock.calls.some(([input]) => input.endsWith("/export.csv"))).toBe(false);
+  });
+
+  it.each([5_000, 5_001])("enforces the exact matching-row cap at %i without disabling a smaller explicit selection", async count => {
+    window.history.replaceState({}, "", "/agents?selected=package-private");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+        ? Response.json(unifiedRecordsPage(unifiedPage.value, count)) : base(input, init),
+    );
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    await userEvent.click(button);
+    const matching = screen.getByRole("button", { name: /Download matching agents/ });
+    const selected = screen.getByRole("button", { name: /Download selected agents/ });
+    expect(selected).toBeEnabled();
+    if (count === 5_000) {
+      expect(matching).toBeEnabled();
+      await userEvent.click(matching);
+    } else {
+      expect(matching).toBeDisabled();
+      expect(matching).toHaveTextContent("More than 5,000 agents match. Narrow the filters");
+      await userEvent.click(matching);
+      expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/agent-inventory/export.csv")).toBe(false);
+      await userEvent.click(selected);
+    }
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    const body = JSON.parse(String(transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")![1]?.body));
+    if (count === 5_000) expect(body.recordIds).toBeUndefined();
+    else expect(body.recordIds).toEqual(["graph_packages:package-private"]);
+  });
+
+  it.each(["revision", "missing-reference"] as const)("requires explicit saved-data reload after %s invalidation and never silently retries a source export", async invalidation => {
+    if (invalidation === "missing-reference") window.history.replaceState({}, "", "/agents?selected=removed-package");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let revision = unifiedRevision;
+    let exports = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const path = new URL(input, "http://localhost").pathname;
+      if (path === "/api/agent-inventory") return Response.json({ ...unifiedPage, revision });
+      if (path === "/api/agent-inventory/export.csv") {
+        exports += 1;
+        if (exports === 1) {
+          revision = "b".repeat(64);
+          return Response.json({ code: "agent_inventory_changed", detail: `${invalidation} invalidated the export.` }, { status: 409 });
+        }
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    const initialPosts = transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").map(([input]) => input);
+    await userEvent.click(button);
+    await userEvent.click(screen.getByRole("button", { name: invalidation === "revision" ? /Download matching agents/ : /Download selected agents/ }));
+    const reload = await screen.findByRole("button", { name: "Reload saved agent inventory" });
+    expect(reload.closest("[role=alert]")).toHaveTextContent(/reload.*review.*try again/i);
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(exports).toBe(1);
+    expect(download.filenames).toEqual([]);
+    const savedReadCount = agentListRequests(transport.fetchMock).length;
+    await userEvent.click(reload);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    expect(agentListRequests(transport.fetchMock).length).toBeGreaterThan(savedReadCount);
+    expect(exports).toBe(1);
+    expect(screen.queryByRole("button", { name: "Reload saved agent inventory" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    if (invalidation === "missing-reference") {
+      await userEvent.click(within(screen.getByRole("dialog", { name: "Export agent inventory" })).getByRole("button", { name: "Clear selection" }));
+      expect(screen.getByRole("button", { name: /Download selected agents/ })).toBeDisabled();
+      expect(new URLSearchParams(window.location.search).has("selected")).toBe(false);
+    }
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    const requests = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/export.csv");
+    expect(requests).toHaveLength(2);
+    expect(JSON.parse(String(requests[1][1]?.body))).toEqual({
+      revision: "b".repeat(64), query: { sortBy: "displayName", sortDirection: "asc" },
+    });
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").map(([input]) => input)).toEqual([
+      ...initialPosts, "/api/agent-inventory/export.csv", "/api/agent-inventory/export.csv",
+    ]);
+  });
+
+  it("waits for current filters and exports their newly loaded saved revision", async () => {
+    const row = { ...unifiedPage.value[0], displayName: "X agent" };
+    const page = unifiedRecordsPage([row]);
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("search") === "X") return pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText("X agent");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search" }), "X");
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/agent-inventory?search=X"))).toBe(true));
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    await act(async () => pending.resolve(Response.json({ ...page, revision: "c".repeat(64) })));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    expect(transport.fetchMock).toHaveBeenCalledWith("/api/agent-inventory/export.csv", expect.objectContaining({
+      body: JSON.stringify({ revision: "c".repeat(64), query: { search: "X", sortBy: "displayName", sortDirection: "asc" } }),
+    }));
+  });
+
+  it.each([false, true])("does not export retained rows after the current unified filters fail to load (late CSV failure: %s)", async lateCsvFailure => {
+    const original = { ...unifiedPage.value[0], displayName: "Original agent" };
+    const filtered = { ...original, displayName: "X agent" };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([original]) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pendingCsv = deferredResponse();
+    let exports = 0;
+    let failFilteredRead = true;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory/export.csv" && lateCsvFailure && ++exports === 1) return pendingCsv.promise;
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("search") === "X") {
+        return failFilteredRead
+          ? Response.json({ detail: "Filtered saved inventory unavailable." }, { status: 503 })
+          : Response.json({ ...unifiedRecordsPage([filtered]), revision: "c".repeat(64) });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText("Original agent");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    if (lateCsvFailure) {
+      await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+      await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    }
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search" }), "X");
+    await screen.findByText(/^Filtered saved inventory unavailable\./);
+    if (lateCsvFailure) {
+      await act(async () => pendingCsv.resolve(Response.json({ detail: "Deferred CSV failed." }, { status: 500 })));
+      await screen.findByText("Deferred CSV failed.");
+    }
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/export.csv")).toHaveLength(lateCsvFailure ? 1 : 0);
+    failFilteredRead = false;
+    await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+    await screen.findByText("X agent");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    expect(transport.fetchMock).toHaveBeenCalledWith("/api/agent-inventory/export.csv", expect.objectContaining({
+      body: JSON.stringify({ revision: "c".repeat(64), query: { search: "X", sortBy: "displayName", sortDirection: "asc" } }),
+    }));
+  });
+
+  it("keeps matching export available during native selection restoration and can cancel that restoration from export", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Off-page native selection");
+    const alias = "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    window.history.replaceState({}, "", `/agents?${new URLSearchParams({ selectedResource: alias, inventorySnapshot: "pp-snapshot" })}`);
+    const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"], unifiedResponse: unifiedRecordsPage(unifiedPage.value) });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("recordId") === alias) return pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").searchParams.get("recordId") === alias)).toBe(true));
+    const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(button).toBeEnabled());
+    await userEvent.click(button);
+    expect(screen.getByRole("button", { name: /Download selected agents/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Download matching agents/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+    await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Export agent inventory" })).getByRole("button", { name: "Clear selection" }));
+    await act(async () => pending.resolve(Response.json(unifiedRecordsPage([{ ...native, id: alias }]))));
+    expect(screen.getByRole("button", { name: /Download selected agents/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Download selected agents/ })).toHaveTextContent("0 selected package/native references");
+    expect(new URLSearchParams(window.location.search).has("selectedResource")).toBe(false);
   });
 
   it("exports Power Platform agents from the exact retained source snapshot", async () => {
@@ -849,6 +1640,8 @@ describe("App session revalidation", () => {
       coveredCount: 1,
       observedCount: 1,
       totalRecords: 1,
+      pageCount: 1,
+      verification: createInventoryVerification(1),
     };
     const transport = appTransport({
       revalidatedRoles: viewer.roles,
@@ -1311,7 +2104,7 @@ describe("App session revalidation", () => {
     transport.page = { ...packagePage, value: [], count: 0 };
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await waitFor(() => expect(screen.getByText(/Last synced/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Graph collected/)).toBeInTheDocument());
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
   });
@@ -1348,7 +2141,7 @@ describe("App session revalidation", () => {
     transport.catalogResponse = async () => Response.json({ code: "provider_error", detail: "Saved catalog unavailable" }, { status: 500 });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByText("Saved catalog unavailable")).toBeInTheDocument();
+    expect(await screen.findByText(/Saved catalog unavailable/)).toBeInTheDocument();
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
@@ -1471,7 +2264,7 @@ describe("App session revalidation", () => {
     expect(within(editor).getByRole("radio", { name: target === "availability" ? /No users/ : /Specific users or groups/ })).toBeChecked();
     if (target === "installation") expect(await within(editor).findByText("Installed user", { exact: true })).toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/package-private/refresh-jobs")).toHaveLength(1);
-    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/package-private")).toHaveLength(2);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/package-private")).toHaveLength(1);
     await userEvent.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "Manage agent access" })).not.toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Sensitive cached agent" })).toBeInTheDocument();
@@ -1533,8 +2326,10 @@ describe("App session revalidation", () => {
     render(<App />);
 
     const selectA = await screen.findByRole("checkbox", { name: "Select Agent A" });
-    expect(selectA).toBeEnabled();
-    await waitFor(() => expect(selectA).toBeChecked());
+    await waitFor(() => {
+      expect(selectA).toBeChecked();
+      expect(selectA).toBeEnabled();
+    });
     await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     await userEvent.click(screen.getByRole("checkbox", { name: "Select Agent A" }));
@@ -1591,7 +2386,7 @@ describe("App session revalidation", () => {
     }
     expect(await screen.findByRole("alert")).toHaveTextContent("Exact provider read denied");
     expect(screen.queryByRole("dialog", { name: "Manage agent access" })).not.toBeInTheDocument();
-    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/package-private")).toHaveLength(entry === "table" ? 0 : 1);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/agents/package-private")).toHaveLength(0);
   });
 
   it("preserves current capability checks before preparing access", async () => {
@@ -1906,8 +2701,8 @@ describe("App session revalidation", () => {
   );
 
   it.each([
-    ["package", "success"],
-    ["package", "failure"],
+    ["unified", "success"],
+    ["unified", "failure"],
     ["Power Platform", "success"],
     ["Power Platform", "failure"],
   ] as const)("discards a delayed %s export %s after session revalidation", async (source, outcome) => {
@@ -1917,8 +2712,8 @@ describe("App session revalidation", () => {
     });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
-    const isExport = (path: string) => source === "package"
-      ? path === "/api/agents/export.csv" : path.startsWith("/api/inventory/export.csv?");
+    const isExport = (path: string) => source === "unified"
+      ? path === "/api/agent-inventory/export.csv" : path.startsWith("/api/inventory/export.csv?");
     transport.fetchMock.mockImplementation(async (input, init) =>
       isExport(input) ? pending.promise : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -1927,9 +2722,9 @@ describe("App session revalidation", () => {
     Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
     render(<App />);
     await screen.findByText(agent.displayName);
-    if (source === "package") {
-      await userEvent.click(screen.getByRole("button", { name: "Export package inventory CSV" }));
-      await userEvent.click(await screen.findByRole("button", { name: /Download package inventory/ }));
+    if (source === "unified") {
+      await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+      await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
     } else {
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
       const button = await screen.findByRole("button", { name: "Export PP agent inventory CSV" });
@@ -2008,7 +2803,7 @@ describe("App session revalidation", () => {
     },
   );
 
-  it.each(["package", "Power Platform"] as const)(
+  it.each(["unified", "Power Platform"] as const)(
     "finishes an in-flight %s export across tabs without starting a duplicate",
     async source => {
       const transport = appTransport({
@@ -2017,8 +2812,8 @@ describe("App session revalidation", () => {
       });
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
-      const isExport = (path: string) => source === "package"
-        ? path === "/api/agents/export.csv" : path.startsWith("/api/inventory/export.csv?");
+      const isExport = (path: string) => source === "unified"
+        ? path === "/api/agent-inventory/export.csv" : path.startsWith("/api/inventory/export.csv?");
       transport.fetchMock.mockImplementation(async (input, init) =>
         isExport(input) ? pending.promise : base(input, init));
       vi.stubGlobal("fetch", transport.fetchMock);
@@ -2027,17 +2822,17 @@ describe("App session revalidation", () => {
       Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
       render(<App />);
       await screen.findByText(agent.displayName);
-      if (source === "package") {
-        await userEvent.click(screen.getByRole("button", { name: "Export package inventory CSV" }));
-        await userEvent.click(await screen.findByRole("button", { name: /Download package inventory/ }));
+      if (source === "unified") {
+        await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
+        await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
       } else {
         await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
         await userEvent.click(await screen.findByRole("button", { name: "Export PP agent inventory CSV" }));
       }
       await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => isExport(path))).toHaveLength(1));
       await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
-      await userEvent.click(screen.getByRole("button", { name: source === "package" ? "Agents" : /^Sync/ }));
-      expect(screen.getByRole("button", { name: source === "package" ? /^Exporting/ : "Exporting PP agents..." })).toBeDisabled();
+      await userEvent.click(screen.getByRole("button", { name: source === "unified" ? "Agents" : /^Sync/ }));
+      expect(screen.getByRole("button", { name: source === "unified" ? /^Exporting/ : "Exporting PP agents..." })).toBeDisabled();
       await act(async () => pending.resolve(new Response("ID,Name\r\n")));
       expect(download).toHaveBeenCalledTimes(1);
       expect(transport.fetchMock.mock.calls.filter(([path]) => isExport(path))).toHaveLength(1);
@@ -2115,6 +2910,9 @@ describe("App session revalidation", () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
     await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    const dialog = await screen.findByRole("dialog", { name: agent.displayName });
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(dialog).getByRole("button", { name: /Package details for/ }));
     expect(screen.getByText("Loading agent details...")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));
     await screen.findByRole("dialog", { name: /block package/i });
@@ -2123,6 +2921,17 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
   });
 });
+
+function mockCsvDownload() {
+  const filenames: string[] = [];
+  const createObjectURL = vi.fn<(blob: Blob) => string>(() => "blob:unified-agent-export");
+  Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+  Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+    filenames.push(this.download);
+  });
+  return { filenames, createObjectURL };
+}
 
 function deferredResponse() {
   let resolve!: (response: Response) => void;
@@ -2274,6 +3083,7 @@ function appTransport({
     });
     if (input.startsWith("/api/official-usage/aggregate")) return Response.json({});
     if (input.startsWith("/api/official-usage/users")) return Response.json({});
+    if (input === "/api/agent-inventory/export.csv") return new Response("Agent ID,Package IDs,inventoryPartial\r\n", { headers: { "Content-Type": "text/csv" } });
     if (input.startsWith("/api/agent-inventory")) {
       return Response.json(filterUnifiedResponse(unifiedResponse, input));
     }

@@ -280,7 +280,7 @@ describe("DataSyncPanel", () => {
     const page = within(screen.getByRole("region", { name: "Data sync" }));
     expect(page.getAllByText("Sync complete")).toHaveLength(1);
     expect(page.getByText("4 of 4 sources complete")).toBeVisible();
-    expect(page.getByText(/Sync completion confirms collection, not complete tenant-wide inventory coverage/)).toBeVisible();
+    expect(page.getByText(/Verify saved inventory below to inspect stored\/provider counts, requested scope and exact source accounting without a new provider read/)).toBeVisible();
     expect(page.queryByRole("progressbar")).not.toBeInTheDocument();
     expect(page.queryByText("Keep your saved data up to date")).not.toBeInTheDocument();
     expect(page.queryByRole("button", { name: "Check progress" })).not.toBeInTheDocument();
@@ -1091,10 +1091,12 @@ describe("DataSyncPanel", () => {
       renderPanel({ requestedRunId: "exact-run", onSourcesChanged: onChanged });
       await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
 
-      expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        response === "accepted" ? "Status read failed after retry." : "Retry response lost.",
-      );
+      await waitFor(() => {
+        expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          response === "accepted" ? "Status read failed after retry." : "Retry response lost.",
+        );
+      });
       expect(api.retry).toHaveBeenCalledExactlyOnceWith("exact-run", ["users"], expect.anything());
       expect(api.start).not.toHaveBeenCalled();
     },

@@ -73,6 +73,14 @@ export async function grantRuntime(database: pg.Pool) {
       GRANT SELECT,INSERT ON data_sync_source_jobs TO agentcontrol_app;
     `);
   }
+  if ((await database.query("SELECT to_regclass('public.unified_agents') AS table_name")).rows[0].table_name) {
+    await database.query(`
+      GRANT SELECT,INSERT,DELETE ON unified_agents,unified_agent_sources TO agentcontrol_app;
+      GRANT UPDATE(updated_at) ON unified_agents TO agentcontrol_app;
+      GRANT UPDATE(agent_id,environment_id,native_id,package_snapshot_id,power_platform_snapshot_id,matching_evidence,updated_at)
+        ON unified_agent_sources TO agentcontrol_app;
+    `);
+  }
   if ((await database.query("SELECT to_regclass('public.purview_audit_jobs') AS table_name")).rows[0].table_name) {
     await database.query(`
       GRANT SELECT, INSERT, UPDATE ON purview_audit_qualifications TO agentcontrol_app;
@@ -169,6 +177,12 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
     await remove("packageSnapshots", "package_inventory_snapshots", "expires_at<clock_timestamp()");
     await remove("packageJobs", "package_refresh_jobs", "expires_at<clock_timestamp() AND status<>'running'");
     await remove("packageQualifications", "package_mutation_qualifications", "expires_at<clock_timestamp()");
+    if ((await client.query("SELECT to_regclass('public.unified_agents') AS name")).rows[0].name) {
+      await remove("unifiedAgentOrphans", "unified_agents",
+        `NOT EXISTS (SELECT 1 FROM unified_agent_sources source
+          WHERE source.tenant_id=unified_agents.tenant_id AND source.principal_id=unified_agents.principal_id
+            AND source.agent_id=unified_agents.id)`);
+    }
     await update("purviewExpiredWork", "purview_audit_jobs",
       "status IN ('running','reconciling_create') AND deadline_at<=clock_timestamp()",
       "status='inconclusive',error_code='audit_job_expired',message='The local Audit Search deadline expired; remote work may continue.',remote_work_may_continue=attempted_at IS NOT NULL,finished_at=clock_timestamp(),execution_owner=NULL,updated_at=clock_timestamp()");

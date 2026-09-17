@@ -36,6 +36,22 @@ beforeEach(() => {
 });
 
 describe("AuditLogView routing", () => {
+  it("retains the unified inventory export filter and labels its audit event", async () => {
+    window.history.replaceState({}, "", "/audit?action=export-agent-inventory&status=succeeded");
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
+      id: "export-event", operationId: "export-operation", action: "export-agent-inventory", scope: "bulk",
+      agentId: "agent-inventory", actor: { homeAccountId: "fixture", username: "fixture@example.invalid", displayName: "Fixture", roles: ["AgentControl.Viewer"] },
+      startedAt: "2026-09-17T00:00:00.000Z", status: "succeeded", requestPath: "/api/agent-inventory/export.csv",
+    }] });
+    render(<AuditLogView agents={[]} />);
+    await waitFor(() => expect(getAuditEvents).toHaveBeenCalledWith(expect.objectContaining({
+      action: "export-agent-inventory", status: "succeeded",
+    })));
+    expect(screen.getByRole("combobox", { name: "Action" })).toHaveValue("export-agent-inventory");
+    expect(screen.getAllByText("Export agent inventory").length).toBeGreaterThan(1);
+    expect(new URLSearchParams(window.location.search).get("action")).toBe("export-agent-inventory");
+  });
+
   it("exports exact displayed event IDs through the authorized server rather than serializing cached rows", async () => {
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [{
       id: "event-1", operationId: "operation-1", action: "block", targetBlockedState: true, scope: "single",

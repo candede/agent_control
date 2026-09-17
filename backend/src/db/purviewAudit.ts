@@ -1,8 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
-import { resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
-import { resourceTypesForInventoryScope } from "../services/inventoryRoleScope.js";
+import { resolveExactInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type {
   PurviewAuditFilters,
@@ -18,7 +17,8 @@ import type {
   PurviewProviderQueryStatus,
 } from "../types/purviewAudit.js";
 import { purviewAuditPresets } from "../types/purviewAudit.js";
-import type { InventoryRoleScope, PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
+import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
 import { pool, transaction } from "./pool.js";
 
 export type PurviewAuditScope = {
@@ -31,7 +31,7 @@ export type PurviewAuditScope = {
 export type PurviewAuditReadScope = {
   tenantId: string;
   resultScopes: PurviewAuditResultScope[];
-  inventoryIdentityScope?: { principalId: string; roleScope: Exclude<InventoryRoleScope, "unknown">; resourceTypes: PowerPlatformResourceType[] };
+  inventoryIdentityScope?: InventoryIdentityReadScope;
 };
 
 export type PurviewAuditExecution = {
@@ -138,13 +138,6 @@ type RecordRow = {
   content_available: false;
   unknown_field_count: number;
   association: PurviewAuditRecord["association"] | null;
-};
-
-type InventoryIdentityRow = {
-  native_id: string;
-  resource_type: string;
-  environment_id: string;
-  identifiers: Array<{ kind: string; value: string }>;
 };
 
 export class PurviewAuditRepository {
@@ -476,14 +469,9 @@ export class PurviewAuditRepository {
     if (resultScope.kind !== "principal" || !identityScope || identityScope.principalId !== resultScope.scopeId) {
       return records.map(() => ({ status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const }));
     }
-    const candidates = await database.query<InventoryIdentityRow>(`SELECT DISTINCT resource.native_id COLLATE "C" AS native_id,resource.resource_type COLLATE "C" AS resource_type,
-        resource.environment_id COLLATE "C" AS environment_id,resource.identifiers
-      FROM power_platform_inventory_resources resource JOIN power_platform_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
-      WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.role_scope=$3 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-        AND resource.resource_type=ANY($4::text[])
-      ORDER BY resource_type,environment_id,native_id,resource.identifiers`, [readScope.tenantId, identityScope.principalId, identityScope.roleScope, identityScope.resourceTypes]);
-    const identities: InventoryIdentityRecord[] = candidates.rows.map(candidate => ({ nativeId: candidate.native_id, tenantId: readScope.tenantId, environmentId: candidate.environment_id,
-      sourceSystem: "power_platform", resourceType: candidate.resource_type, identifiers: candidate.identifiers as InventoryIdentityRecord["identifiers"] }));
+    const identities = await new PowerPlatformInventoryRepository(this.database).readIdentityCandidates(
+      { tenantId: readScope.tenantId, principalId: identityScope.principalId }, identityScope.resourceTypes, database,
+    );
     return records.map(record => {
       if (record.auditLogRecordType !== "powerPlatformAdministratorActivity" || record.service !== "PowerPlatform"
         || !purviewAuditPresets.copilot_studio_admin.operationFilters.includes(record.operation)) {
@@ -597,7 +585,7 @@ function validateReadScope(scope: PurviewAuditReadScope) {
   }
   if (scope.inventoryIdentityScope) {
     const identity = scope.inventoryIdentityScope;
-    const allowed = new Set(resourceTypesForInventoryScope(identity.roleScope));
+    const allowed = new Set(powerPlatformResourceTypes);
     if (!identity.principalId || !scope.resultScopes.some(resultScope => resultScope.kind === "principal" && resultScope.scopeId === identity.principalId)
       || !identity.resourceTypes.length || identity.resourceTypes.some(resourceType => !allowed.has(resourceType))) {
       throw new AppError(403, "scope_mismatch", "Audit Search inventory association requires an exact current Viewer identity scope.");

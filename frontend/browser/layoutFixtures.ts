@@ -4,6 +4,7 @@ import { workbenchActions, workbenchViews } from "../../backend/src/services/wor
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
 import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
   InventoryResourcePage, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView,
@@ -70,6 +71,8 @@ const graphObservation = {
 };
 const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
 export const unifiedAgents: UnifiedAgentInventoryPage = {
+  revision: "a".repeat(64),
+  verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 0, logicalAgentCount: 3 }, { sourceScopes: false }, layoutTime),
   value: packages.value.map(item => ({
     id: `graph_packages:${item.id}`, displayName: item.displayName,
     presence: "graph_packages", environmentId: null, packages: [item], powerPlatformResource: null,
@@ -111,6 +114,7 @@ const inventory: InventoryResourcePage = {
       { type: "microsoft.powerapps/apps", status: "not_authorized_scope", count: null },
     ],
     observedCount: 2, totalRecords: 2, pageCount: 1, unknownFieldCount: 0, observedAt, expiresAt,
+    verification: createInventoryVerification(2, ["microsoft.copilotstudio/agents"], layoutTime),
   },
 };
 

@@ -640,7 +640,7 @@ function SyncProgress({ run }: { run: DataSyncRun }) {
       </div>
       {!complete && run.sources.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={run.sources.length} /> : null}
       <p>{complete
-        ? "Your saved data is ready to browse. Sync completion confirms collection, not complete tenant-wide inventory coverage."
+        ? "Requested source collection completed. Verify saved inventory below to inspect stored/provider counts, requested scope and exact source accounting without a new provider read."
         : active && (running.length > 0 || queued)
           ? "Sources can run in parallel. Counts appear as results are saved; this is source progress, not an estimated time."
           : "Review the source statuses below. Completed sources remain available; retry only the sources that need it."}</p>

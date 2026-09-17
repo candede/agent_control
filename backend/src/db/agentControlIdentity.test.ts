@@ -26,7 +26,9 @@ describe("corroborated agent control identity", () => {
         idempotencyKey: "native-only-inventory", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
       });
       await inventory.markRunning(scope, inventoryJob.id);
-      const saved = await inventory.publish(scope, inventoryJob.id, { resources: [resource], totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+      const saved = await inventory.publish(scope, inventoryJob.id, {
+        resources: [resource], queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
+      });
       await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
         .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
       const packaged = allowlistedPackage({

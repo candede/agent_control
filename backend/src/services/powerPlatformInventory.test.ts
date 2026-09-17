@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import type { ResourceQueryResult } from "../types/powerPlatformInventory.js";
 import { inventoryProviderRoleIds } from "./inventoryRoleScope.js";
 import { PowerPlatformInventoryService } from "./powerPlatformInventory.js";
 import { withTelemetryContext } from "./telemetry.js";
@@ -27,9 +28,13 @@ function fixture(overrides: Record<string, unknown> = {}) {
   };
   const dependencies = {
     revalidateUser: vi.fn(async () => user), requireAvailable: vi.fn(async () => undefined), delegatedToken: vi.fn(async () => "opaque-token"),
-    query: vi.fn(async () => ({ resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 })),
+    query: vi.fn(async () => emptyQueryResult()),
   };
   return { job, repository, dependencies, service: new PowerPlatformInventoryService(repository as never, dependencies as never) };
+}
+
+function emptyQueryResult(): ResourceQueryResult {
+  return { resources: [], queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 0, pages: 1, unknownFieldCount: 0 };
 }
 
 describe("Power Platform inventory refresh service", () => {
@@ -49,6 +54,37 @@ describe("Power Platform inventory refresh service", () => {
     expect(repository.markRunning).toHaveBeenCalledBefore(dependencies.query);
   });
 
+  it("does not fail an agent-only query when optional role claims disappear or change to another supported inventory role", async () => {
+    for (const providerRoleIds of [[], [inventoryProviderRoleIds.aiReader]]) {
+      const { service, job, repository, dependencies } = fixture();
+      dependencies.revalidateUser.mockResolvedValue({ ...user, providerRoleIds });
+      await service.start(user, job.id);
+      await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+      expect(repository.markFailed).not.toHaveBeenCalled();
+      expect(dependencies.requireAvailable).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("rejects a real type-scope change before querying and fails a changed publication scope instead of requesting irrelevant reauthorization", async () => {
+    const changedUser = { ...user, providerRoleIds: [inventoryProviderRoleIds.aiReader] };
+    const beforeStart = fixture();
+    beforeStart.job.requestedTypes = ["microsoft.copilotstudio/agents", "microsoft.powerapps/canvasapps"];
+    beforeStart.dependencies.revalidateUser.mockResolvedValue(changedUser);
+    await expect(beforeStart.service.start(user, beforeStart.job.id)).rejects.toMatchObject({ code: "inventory_scope_changed" });
+    expect(beforeStart.dependencies.query).not.toHaveBeenCalled();
+    const duringQuery = fixture();
+    duringQuery.job.requestedTypes = [...beforeStart.job.requestedTypes];
+    duringQuery.dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(changedUser);
+    await duringQuery.service.start(user, duringQuery.job.id);
+    await vi.waitFor(() => expect(duringQuery.repository.markFailed).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, duringQuery.job.id,
+      "inventory_scope_changed", expect.stringContaining("Submit a new refresh"),
+    ));
+    expect(duringQuery.repository.publish).not.toHaveBeenCalled();
+    expect(duringQuery.repository.markWaitingAuthorization).not.toHaveBeenCalled();
+  });
+
   it("leaves authorization failures waiting without issuing a provider query", async () => {
     const { service, repository, dependencies } = fixture();
     dependencies.delegatedToken.mockRejectedValue(new AppError(401, "interaction_required", "authorization required"));
@@ -60,11 +96,22 @@ describe("Power Platform inventory refresh service", () => {
     }));
   });
 
+  it("reports a publication scope mismatch as a data failure, not a consent request", async () => {
+    const { service, job, repository } = fixture();
+    repository.publish.mockRejectedValue(new AppError(409, "scope_mismatch", "The completed inventory query did not match the authorized resource types and environment."));
+    await service.start(user, job.id);
+    await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "scope_mismatch",
+      expect.stringContaining("completed inventory query"),
+    ));
+    expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+  });
+
   it("correlates accepted requests with background progress and publication", async () => {
     const { service, job, repository, dependencies } = fixture();
     dependencies.query.mockImplementation(async (_token, _types, options) => {
       await options.onProgress({ pages: 1, observedCount: 0, totalRecords: 0 });
-      return { resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 };
+      return emptyQueryResult();
     });
     await withTelemetryContext({ requestId: "request-a", route: "/inventory/refresh-jobs" }, () => service.start(user, job.id));
     await vi.waitFor(() => expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
@@ -100,7 +147,7 @@ describe("Power Platform inventory refresh service", () => {
     const { service, job, dependencies, repository } = fixture();
     dependencies.query.mockImplementation((_token, _types, options) => new Promise((resolve, reject) => {
       options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
-      setTimeout(() => resolve({ resources: [], totalRecords: 0, pages: 1, unknownFieldCount: 0 }), 61_500);
+      setTimeout(() => resolve(emptyQueryResult()), 61_500);
     }));
     await service.start(user, job.id);
     await vi.advanceTimersByTimeAsync(61_500);

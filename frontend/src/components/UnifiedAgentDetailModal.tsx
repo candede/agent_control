@@ -145,6 +145,10 @@ export function UnifiedAgentDetailModal({
           dialog.current?.querySelector<HTMLButtonElement>(`#unified-agent-tab-${next}`)?.focus();
         }}>{tabLabels[tab]}</button>)}
       </div>
+      {record.identity.invalidMetadata ? <div className="notice" role="status">
+        <strong>Invalid saved matching metadata.</strong>{" "}
+        Select this agent on Agents, then open Sync and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
+      </div> : null}
       <section id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
         {selectedTab === "identities" ? <>
           <h3>Overview</h3>
@@ -186,8 +190,12 @@ function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
     <h3>{record.identity.state === "matched" ? "Linked by source metadata" : record.identity.state === "unmatched" ? "No verified link" : `${label(record.identity.state)} link evidence`}</h3>
     <p className="association-status">{record.identity.reason ?? (record.identity.state === "matched"
       ? "The sources share explicit source-declared provider metadata."
-      : "A source counterpart has not been proven.")}{record.identity.state === "matched" ? " This is not presented as a publicly documented Microsoft canonical identifier equivalence." : ""}</p>
-    {record.identity.state === "unmatched" && record.packages.length ? <p>Package detail identity metadata is not present in every broad catalog observation. Select exact packages and use <strong>Refresh matching details</strong> before concluding that no Power Platform counterpart exists.</p> : null}
+      : "A source counterpart has not been proven.")}{record.identity.state === "matched" ? " This is correlation within the current authorized saved inventory, not a Microsoft-guaranteed native foreign key. This is not presented as a publicly documented Microsoft canonical identifier equivalence. Association does not grant or renew native controls." : ""}</p>
+    {record.identity.warnings?.length ? <>
+      <h4>Source identity warnings</h4>
+      <ul>{record.identity.warnings.map((warning, index) => <li key={`${warning.code}:${index}`}>{warning.message}</li>)}</ul>
+    </> : null}
+    {record.identity.state === "unmatched" && !record.identity.invalidMetadata && record.packages.length ? <p>Package detail identity metadata is not present in every broad catalog observation. Select exact packages and use <strong>Refresh matching details</strong> before concluding that no Power Platform counterpart exists.</p> : null}
     <div className="inventory-detail-grid">
       <Detail label="Unified record ID" value={record.id} />
       <Detail label="Source presence" value={record.presence} />
@@ -197,8 +205,8 @@ function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
       <Detail label="Power Platform resource" value={record.powerPlatformResource?.nativeId} />
       <Detail label="Link state" value={record.identity.state} />
     </div>
-    {record.identity.evidence.length ? <dl className="inventory-identifiers">{record.identity.evidence.map((evidence, index) => <div key={`${evidence.kind}:${evidence.packagePath}:${evidence.resourcePath}:${index}`}><dt>{label(evidence.kind)}</dt><dd><strong>{label(evidence.basis)}</strong> · elements {evidence.elementIds.join(", ") || "Not supplied"}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code></dd></div>)}</dl> : null}
-    {record.identity.packageEvidence.length ? <><h4>Evidence by exact package</h4><dl className="inventory-identifiers">{record.identity.packageEvidence.map(item => <div key={item.packageId}><dt>{item.packageId}</dt><dd>{item.evidence.length ? <ul>{item.evidence.map((evidence, index) => <li key={`${evidence.kind}:${index}`}><strong>{label(evidence.kind)}</strong> · {label(evidence.basis)} · elements {evidence.elementIds.join(", ") || "Not supplied"}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code></li>)}</ul> : "No source-declared identity evidence retained for this exact package."}</dd></div>)}</dl></> : null}
+    {record.identity.evidence.length ? <dl className="inventory-identifiers">{record.identity.evidence.map((evidence, index) => <div key={`${evidence.kind}:${evidence.packagePath}:${evidence.resourcePath}:${index}`}><dt>{label(evidence.kind)}</dt><dd><strong>{label(evidence.basis)}</strong> · element labels {formatElementLabels(evidence.elementIds)}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code><RelatedPackageEvidence packageIds={evidence.relatedPackageIds} /></dd></div>)}</dl> : null}
+    {record.identity.packageEvidence.length ? <><h4>Evidence by exact package</h4><dl className="inventory-identifiers">{record.identity.packageEvidence.map(item => <div key={item.packageId}><dt>{item.packageId}</dt><dd>{item.evidence.length ? <ul>{item.evidence.map((evidence, index) => <li key={`${evidence.kind}:${index}`}><strong>{label(evidence.kind)}</strong> · {label(evidence.basis)} · element labels {formatElementLabels(evidence.elementIds)}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code><RelatedPackageEvidence packageIds={evidence.relatedPackageIds} /></li>)}</ul> : "No source-declared identity evidence retained for this exact package."}</dd></div>)}</dl></> : null}
     <h4>Saved observations</h4>
     <div className="inventory-detail-grid">
       <Detail label="Graph snapshot" value={record.observations.graphPackages?.snapshotId} />
@@ -206,6 +214,18 @@ function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
       <Detail label="Power Platform snapshot" value={record.observations.powerPlatform?.snapshotId} />
       <Detail label="Power Platform observed" value={formatDate(record.observations.powerPlatform?.observedAt)} />
     </div>
+  </>;
+}
+
+function formatElementLabels(labels: string[]) {
+  return labels.filter(value => value.trim().length > 0).join(", ") || "Not supplied";
+}
+
+function RelatedPackageEvidence({ packageIds }: { packageIds?: string[] }) {
+  if (!packageIds?.length) return null;
+  return <>
+    <br /><span>Related exact packages</span>
+    <ul aria-label="Related exact packages">{packageIds.map((id, index) => <li key={`${id}:${index}`}><code>{id}</code></li>)}</ul>
   </>;
 }
 

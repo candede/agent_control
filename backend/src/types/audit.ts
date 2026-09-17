@@ -12,7 +12,7 @@ export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "su
 
 export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
 
-export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory";
+export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory" | "export-agent-inventory";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
 export type AdministrativeExportAction = "export-administrative-audit";
 

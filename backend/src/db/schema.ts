@@ -3,6 +3,8 @@ import type pg from "pg";
 import { officialUsageHistoryMigrationSql } from "./officialUsageHistorySchema.js";
 import { dataSyncMigrationSql } from "./dataSyncSchema.js";
 import { dataSyncCleanupMigrationSql } from "./dataSyncCleanupSchema.js";
+import { unifiedAgentRegistryMigrationSql } from "./unifiedAgentRegistrySchema.js";
+import { inventoryVerificationMigrationSql } from "./inventoryVerificationSchema.js";
 
 export const migrations = [
   { version: 1, sql: `
@@ -1685,6 +1687,8 @@ END $$;
   { version: 29, sql: officialUsageHistoryMigrationSql },
   { version: 30, sql: dataSyncMigrationSql },
   { version: 31, sql: dataSyncCleanupMigrationSql },
+  { version: 32, sql: unifiedAgentRegistryMigrationSql },
+  { version: 33, sql: inventoryVerificationMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {

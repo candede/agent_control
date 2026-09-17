@@ -6,7 +6,7 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole } from "../types/capability.js";
 import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import { capabilities } from "./capabilities.js";
-import { inventoryRoleScope, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
+import { inventoryQueryTypes, inventoryRoleScope } from "./inventoryRoleScope.js";
 import { PowerPlatformResourceQueryClient, powerPlatformInventoryQueryDeadlineMs } from "./powerPlatformResourceQuery.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
@@ -69,7 +69,7 @@ export class PowerPlatformInventoryService {
         stage = "authorization";
         requireSamePrincipal(scope, freshUser);
         requireReader(freshUser);
-        if (current.roleScope !== inventoryRoleScope(freshUser)) throw new AppError(409, "inventory_scope_changed", "Provider role scope changed; submit a new inventory refresh.");
+        requireSameQueryScope(current, freshUser);
         await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser);
         stage = "delegated_token";
         token = await this.dependencies.delegatedToken(scope.principalId, "powerPlatform.inventory.read");
@@ -137,8 +137,7 @@ export class PowerPlatformInventoryService {
     const startedAt = performance.now();
     let stage = "query";
     try {
-      const allowedTypes = new Set(resourceTypesForInventoryScope(current.roleScope));
-      const queryTypes = current.requestedTypes.filter(type => allowedTypes.has(type));
+      const queryTypes = inventoryQueryTypes(current.roleScope, current.requestedTypes);
       const result = await this.dependencies.query(token, queryTypes, {
         signal,
         expectedTenantId: scope.tenantId,
@@ -157,7 +156,7 @@ export class PowerPlatformInventoryService {
         signal.throwIfAborted();
         requireSamePrincipal(scope, freshUser);
         requireReader(freshUser);
-        if (current.roleScope !== inventoryRoleScope(freshUser)) throw new AppError(401, "authorization_expired", "Provider role scope changed during inventory refresh.");
+        requireSameQueryScope(current, freshUser);
         await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser);
         signal.throwIfAborted();
         stage = "publication";
@@ -165,7 +164,8 @@ export class PowerPlatformInventoryService {
       });
       operationalLog("info", "inventory_refresh_succeeded", {
         jobId: id, status: "succeeded", pages: result.pages, observedCount: result.resources.length,
-        totalRecords: result.totalRecords, durationMs: Math.round(performance.now() - startedAt),
+        totalRecords: result.totalRecords, queriedTypeCount: result.queriedTypes.length,
+        environmentScoped: result.environmentScope !== null, durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
       const failure = isTimeoutError(error) ? new AppError(504, "provider_timeout",
@@ -192,6 +192,14 @@ export class PowerPlatformInventoryService {
 
 export const powerPlatformInventory = new PowerPlatformInventoryService();
 
+function requireSameQueryScope(job: InventoryRefreshJob, user: AuthenticatedUser) {
+  const submitted = inventoryQueryTypes(job.roleScope, job.requestedTypes);
+  const current = inventoryQueryTypes(inventoryRoleScope(user), job.requestedTypes);
+  if (submitted.length !== current.length || submitted.some((type, index) => current[index] !== type)) {
+    throw new AppError(409, "inventory_scope_changed", "The inventory resource-type scope changed. Submit a new refresh for the current scope.");
+  }
+}
+
 function dataScope(user: AuthenticatedUser): InventoryDataScope {
   if (!user.tenantId) throw AppError.unauthorized("The current session does not have a tenant scope.");
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
@@ -210,6 +218,6 @@ function isAuthorizationFailure(error: unknown) {
 }
 
 function safeFailureMessage(error: unknown) {
-  if (error instanceof AppError && ["provider_error", "provider_timeout", "provider_schema", "provider_result_limit", "incomplete_inventory_coverage", "scope_mismatch"].includes(error.code)) return error.message.slice(0, 1024);
+  if (error instanceof AppError && ["provider_error", "provider_timeout", "provider_schema", "provider_result_limit", "incomplete_inventory_coverage", "scope_mismatch", "inventory_scope_changed"].includes(error.code)) return error.message.slice(0, 1024);
   return "Power Platform inventory refresh failed before complete publication.";
 }

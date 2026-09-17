@@ -47,7 +47,7 @@ if (process.argv[2] === "seed") {
     const unsent=await repository.submit(scope,input(["only-unsent"]));
     const inventoryCompleted=await inventory.submit(scope,{idempotencyKey:"restart-completed",roleScope:"full",requestedTypes:["microsoft.powerplatform/environments"]});
     assert.equal(await inventory.markRunning(scope,inventoryCompleted.id),true);
-    await inventory.publish(scope,inventoryCompleted.id,{resources:[],totalRecords:0,pages:1,unknownFieldCount:0});
+    await inventory.publish(scope,inventoryCompleted.id,{resources:[],queriedTypes:["microsoft.powerplatform/environments"],environmentScope:null,totalRecords:0,pages:1,unknownFieldCount:0});
     const quarantineInventory=await inventory.submit(scope,{idempotencyKey:"restart-quarantine-inventory",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
     assert.equal(await inventory.markRunning(scope,quarantineInventory.id),true);
     await inventory.publish(scope,quarantineInventory.id,{resources:quarantineTargetIds.map(target=>({tenantId:scope.tenantId,nativeId:target.nativeId,
@@ -55,7 +55,7 @@ if (process.argv[2] === "seed") {
       lastPublishedAt:null,sourceSystem:"power_platform" as const,authoringTool:"Copilot Studio",creatorType:"unknown" as const,agentKind:"copilot_studio_agent",
       lifecycle:"published" as const,identityConfidence:"exact_native" as const,identifiers:[{kind:"power_platform_resource_id" as const,value:target.nativeId},
         {kind:"environment_id" as const,value:scope.tenantId},{kind:"cds_bot_id" as const,value:target.botId}],provenance:{},
-      details:{isQuarantined:false},unknownFieldCount:0})),totalRecords:quarantineTargetIds.length,pages:1,unknownFieldCount:0});
+      details:{isQuarantined:false},unknownFieldCount:0})),queriedTypes:["microsoft.copilotstudio/agents"],environmentScope:null,totalRecords:quarantineTargetIds.length,pages:1,unknownFieldCount:0});
     const quarantineSnapshotId=(await inventory.getJob(scope,quarantineInventory.id))!.snapshotId!;
     const resolvedQuarantineTargets=await inventory.resolveQuarantineTargets(scope,quarantineSnapshotId,quarantineTargetIds.map(target=>target.nativeId));
     const frozenQuarantineTargets=resolvedQuarantineTargets.map((target):FrozenQuarantineTarget=>({...target,directStatus:{environmentId:target.environmentId,

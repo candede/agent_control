@@ -2,14 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
-import { resourceTypesForInventoryScope } from "../services/inventoryRoleScope.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { defenderHuntingTemplates, type DefenderHuntingFilters, type DefenderHuntingHistory, type DefenderHuntingJob,
   type DefenderHuntingAuthorityBinding, type DefenderHuntingQualificationBinding, type DefenderHuntingQualificationEvidence,
   type DefenderHuntingQueryResult, type DefenderHuntingResultScope, type DefenderHuntingRetainedScope,
   type DefenderHuntingRetainedScopeBinding,
   type DefenderAgentInventoryRow, type DefenderHuntingRow, type DefenderHuntingRowPage, type DefenderHuntingSnapshot, type DefenderHuntingTokenMode } from "../types/defenderHunting.js";
-import type { InventoryRoleScope, PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
+import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
 import { pool, transaction } from "./pool.js";
 
 export type DefenderHuntingScope = {
@@ -24,7 +23,7 @@ export type DefenderHuntingReadScope = {
   authorizationPrincipalId: string;
   resultScopes: DefenderHuntingResultScope[];
   qualifications?: Array<{ resultScope: DefenderHuntingResultScope; authority: DefenderHuntingAuthorityBinding }>;
-  inventoryIdentityScope?: { principalId: string; roleScope: Exclude<InventoryRoleScope, "unknown">; resourceTypes: PowerPlatformResourceType[] };
+  inventoryIdentityScope?: InventoryIdentityReadScope;
 };
 
 export type DefenderHuntingExecution = { owner: string; version: number };
@@ -52,8 +51,6 @@ type SnapshotRow = {
   unobserved_start: Date | null; unobserved_end: Date | null; observation_time: Date; result_complete: boolean; no_data: boolean;
   partial_reason: DefenderHuntingSnapshot["partialReason"]; provider_row_count: number; stored_row_count: number; byte_count: number; expires_at: Date;
 };
-
-type IdentityRow = { native_id: string; resource_type: string; environment_id: string; identifiers: Array<{ kind: string; value: string }> };
 
 type QualificationEvidenceRow = {
   capability_id: DefenderHuntingAuthorityBinding["capabilityId"]; template_id: DefenderHuntingQualificationEvidence["templateId"];
@@ -440,16 +437,10 @@ export class DefenderHuntingRepository {
   private async resolveAssociations(scope: DefenderHuntingReadScope, rows: DefenderHuntingRow[]) {
     const identityScope = scope.inventoryIdentityScope;
     if (!identityScope) return rows.map(() => ({ status: "unresolved" as const, reason: "no_documented_cross_source_relation" as const }));
-    const allowed = new Set(resourceTypesForInventoryScope(identityScope.roleScope));
-    if (!identityScope.resourceTypes.length || identityScope.resourceTypes.some(value => !allowed.has(value))) throw new AppError(403, "scope_mismatch", "Hunting inventory association requires an exact current Viewer identity scope.");
-    const candidates = await this.database.query<IdentityRow>(`SELECT DISTINCT resource.native_id COLLATE "C" AS native_id,resource.resource_type COLLATE "C" AS resource_type,
-        resource.environment_id COLLATE "C" AS environment_id,resource.identifiers
-      FROM power_platform_inventory_resources resource JOIN power_platform_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
-      WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.role_scope=$3 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-        AND resource.resource_type=ANY($4::text[]) ORDER BY resource_type,environment_id,native_id,resource.identifiers`,
-    [scope.tenantId, identityScope.principalId, identityScope.roleScope, identityScope.resourceTypes]);
-    const identities: InventoryIdentityRecord[] = candidates.rows.map(value => ({ nativeId: value.native_id, tenantId: scope.tenantId, environmentId: value.environment_id,
-      sourceSystem: "power_platform", resourceType: value.resource_type, identifiers: value.identifiers as InventoryIdentityRecord["identifiers"] }));
+    if (identityScope.principalId !== scope.authorizationPrincipalId) throw new AppError(403, "scope_mismatch", "Hunting inventory association requires the current reader's private identity scope.");
+    const identities = await new PowerPlatformInventoryRepository(this.database).readIdentityCandidates(
+      { tenantId: scope.tenantId, principalId: identityScope.principalId }, identityScope.resourceTypes,
+    );
     return rows.map(row => {
       const identifiers: InventoryIdentityRecord["identifiers"] = row.sourceTable === "AgentsInfo"
         ? [...(row.entraAgentObjectId ? [{ kind: "entra_agent_id" as const, value: row.entraAgentObjectId }] : []),

@@ -1,13 +1,23 @@
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
-import { operationalLog } from "./telemetry.js";
+import { normalizeNativeIdentity, powerPlatformAgentKey } from "./inventoryIdentity.js";
+import {
+  isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName,
+  readPackageAgentMetadata, readPackageCustomEngineBotIdentity, supplied, type PackageAgentMetadata,
+} from "./packageAgentMetadata.js";
 
 export type PackageAgentLinkEvidence = {
-  kind: "entra_agent_id" | "environment_cds_bot_id" | "environment_schema_native_id";
+  kind: "entra_agent_id" | "environment_entra_app_id" | "environment_cds_bot_id" | "environment_schema_native_id" | "manifest_schema_native_id" | "shared_custom_engine_bot_id";
   basis: "source_declared_metadata";
   elementIds: string[];
   packagePath: string;
   resourcePath: string;
+  relatedPackageIds?: string[];
+};
+
+export type PackageAgentIdentityWarning = {
+  code: "source_specific_agent_identity";
+  message: string;
 };
 
 export type PackageAgentLinkResolution =
@@ -16,25 +26,18 @@ export type PackageAgentLinkResolution =
       status: "matched";
       resource: { nativeId: string; environmentId: string };
       evidence: PackageAgentLinkEvidence[];
+      warnings?: PackageAgentIdentityWarning[];
       controlBotId?: string;
     }
-  | { packageId: string; status: "unmatched" | "ambiguous" | "conflicting"; reason: string };
+  | {
+      packageId: string;
+      status: "unmatched" | "ambiguous" | "conflicting";
+      reason: string;
+      invalidMetadata?: true;
+      grouping?: { key: string; environmentId: string | null };
+    };
 
-type PackageAgentIdentity = {
-  environmentId: string;
-  cdsBotId?: string;
-  entraAgentId?: string;
-  schemaName?: string;
-};
-
-type IdentityObservation =
-  | { status: "available"; identity: PackageAgentIdentity; elementIds: string[] }
-  | { status: "unmatched" | "conflicting"; reason: string };
-
-const guidPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
-const environmentPattern = /^(?:Default-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const metadataPath = "elementDetails.AgentMetadatas.definition";
-const schemaNamePattern = /^[a-z_][a-z0-9_]{0,511}$/i;
 
 export function resolvePackageAgentLinks(
   tenantId: string,
@@ -42,163 +45,253 @@ export function resolvePackageAgentLinks(
   resources: readonly PowerPlatformResource[],
 ): PackageAgentLinkResolution[] {
   const candidates = resources.filter(resource =>
-    resource.tenantId === tenantId && resource.type === "microsoft.copilotstudio/agents",
+    normalizeNativeIdentity(resource.tenantId) === normalizeNativeIdentity(tenantId)
+      && resource.type === "microsoft.copilotstudio/agents",
   );
   const index = new Map<string, Set<PowerPlatformResource>>();
+  const add = (key: string, resource: PowerPlatformResource) => {
+    const values = index.get(key) ?? new Set<PowerPlatformResource>();
+    values.add(resource);
+    index.set(key, values);
+  };
   for (const resource of candidates) {
-    if (!resource.environmentId) continue;
-    for (const kind of ["entra_agent_id", "cds_bot_id"] as const) {
-      for (const id of identifierValues(resource, kind)) {
-        const key = identityKey(resource.environmentId, kind, id);
-        const values = index.get(key) ?? new Set<PowerPlatformResource>();
-        values.add(resource);
-        index.set(key, values);
-      }
+    const environmentId = normalizedEnvironmentId(resource.environmentId);
+    if (!environmentId) continue;
+    for (const kind of ["entra_agent_id", "entra_app_id", "cds_bot_id"] as const) {
+      for (const id of identifierValues(resource, kind)) add(identityKey(environmentId, kind, id), resource);
     }
-    const schemaName = normalizedId(resource.details.schemaName, schemaNamePattern);
-    const nativeId = normalizedId(resource.nativeId, guidPattern);
+    const schemaName = normalizedSchemaName(resource.details.schemaName);
+    const nativeId = normalizedGuid(resource.nativeId);
     if (schemaName && nativeId) {
-      const key = identityKey(resource.environmentId, "schema_native", `${schemaName}\0${nativeId}`);
-      const values = index.get(key) ?? new Set<PowerPlatformResource>();
-      values.add(resource);
-      index.set(key, values);
+      add(identityKey(environmentId, "schema_native", `${schemaName}\0${nativeId}`), resource);
+      if (schemaName === nativeId) add(identityKey("", "declarative_manifest", nativeId), resource);
     }
   }
-  const identities = new Map<string, PackageAgentIdentity>();
+  const identities = new Map<string, PackageAgentMetadata>();
   const resolutions: PackageAgentLinkResolution[] = packages.map(value => {
-    const observation = packageAgentIdentity(value);
-    if (observation.status !== "available") return { packageId: value.id, ...observation };
-    const { identity } = observation;
-    identities.set(value.id, identity);
-    const matches: Array<{ resource: PowerPlatformResource; evidence: PackageAgentLinkEvidence[] }> = [];
-    let conflicting = false;
-    const possibleCandidates = new Set([
-      ...index.get(identityKey(identity.environmentId, "entra_agent_id", identity.entraAgentId ?? "")) ?? [],
-      ...index.get(identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId ?? "")) ?? [],
-      ...index.get(identityKey(identity.environmentId, "schema_native", `${identity.schemaName ?? ""}\0${identity.cdsBotId ?? ""}`)) ?? [],
-    ]);
+    const observation = readPackageAgentMetadata(value);
+    if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
+      return { packageId: value.id, ...observation };
+    }
+    const identity = observation.status === "available" ? observation.identity : undefined;
+    if (identity) identities.set(value.id, identity);
+    const elementIds = observation.status === "available" ? observation.elementIds : [];
+    const declarativeElements = value.elementDetails?.filter(group => isPackageElementType(group.elementType, "DeclarativeCopilots"))
+      .flatMap(group => group.elements) ?? [];
+    const isDeclarative = declarativeElements.length > 0 || value.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots"));
+    const manifestId = isDeclarative ? normalizedGuid(value.manifestId) : undefined;
+    if (manifestId && !identity?.cdsBotId && identity?.manifestId && manifestId !== identity.manifestId) {
+      return { packageId: value.id, status: "conflicting", reason: "The package manifest identity disagrees with its source metadata; no link was created." };
+    }
+    if (manifestId && declarativeElements.length > 1) {
+      return { packageId: value.id, status: "ambiguous", reason: "The package contains multiple declarative agents; a manifest alone cannot select one native agent." };
+    }
+    const grouping = identity?.environmentId && identity.cdsBotId
+      ? { key: identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId), environmentId: identity.environmentId }
+      : manifestId && !identity?.cdsBotId
+        ? { key: identityKey("", "declarative_manifest", manifestId), environmentId: identity?.environmentId ?? null }
+        : undefined;
+    const possibleCandidates = new Set<PowerPlatformResource>();
+    const addCandidates = (key: string) => {
+      for (const candidate of index.get(key) ?? []) possibleCandidates.add(candidate);
+    };
+    if (identity?.environmentId) {
+      if (identity.cdsBotId) {
+        addCandidates(identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId));
+        if (identity.schemaName) addCandidates(identityKey(identity.environmentId, "schema_native", `${identity.schemaName}\0${identity.cdsBotId}`));
+      }
+      if (identity.entraApplicationId) addCandidates(identityKey(identity.environmentId, "entra_app_id", identity.entraApplicationId));
+      for (const id of identity.graphAgentIds) addCandidates(identityKey(identity.environmentId, "entra_agent_id", id));
+    }
+    if (manifestId && !identity?.cdsBotId) addCandidates(identityKey("", "declarative_manifest", manifestId));
+    const matches: Array<{
+      resource: PowerPlatformResource; evidence: PackageAgentLinkEvidence[]; warnings: PackageAgentIdentityWarning[];
+      primary: boolean;
+    }> = [];
+    let primaryConflict = false;
+    let secondaryConflict = false;
     for (const resource of possibleCandidates) {
-      if (!resource.environmentId || !sameId(resource.environmentId, identity.environmentId)) continue;
-      const entraIds = identifierValues(resource, "entra_agent_id");
+      const environmentId = normalizedEnvironmentId(resource.environmentId);
+      if (!environmentId || identity?.environmentId && environmentId !== identity.environmentId) continue;
+      const agentIds = identifierValues(resource, "entra_agent_id");
+      const appIds = identifierValues(resource, "entra_app_id");
       const botIds = identifierValues(resource, "cds_bot_id");
-      const entraMatch = Boolean(identity.entraAgentId && entraIds.includes(identity.entraAgentId));
-      const botMatch = Boolean(identity.cdsBotId && botIds.includes(identity.cdsBotId));
-      const resourceSchemaName = normalizedId(resource.details.schemaName, schemaNamePattern);
-      const corroboratedNativeMatch = Boolean(identity.schemaName && identity.cdsBotId
-        && resourceSchemaName === identity.schemaName && normalizedId(resource.nativeId, guidPattern) === identity.cdsBotId);
-      if (!entraMatch && !botMatch && !corroboratedNativeMatch) continue;
+      const botMatch = Boolean(identity?.cdsBotId && botIds.includes(identity.cdsBotId));
+      const agentMatch = Boolean(identity?.graphAgentIds.some(id => agentIds.includes(id)));
+      const appMatch = Boolean(identity?.entraApplicationId && appIds.includes(identity.entraApplicationId));
+      const resourceSchemaName = normalizedSchemaName(resource.details.schemaName);
+      const nativeMatch = Boolean(identity?.schemaName && identity.cdsBotId
+        && resourceSchemaName === identity.schemaName && normalizedGuid(resource.nativeId) === identity.cdsBotId);
+      const manifestMatch = Boolean(manifestId && !identity?.cdsBotId
+        && normalizedGuid(resource.nativeId) === manifestId && resourceSchemaName === manifestId);
+      if (!botMatch && !nativeMatch && !manifestMatch && !agentMatch && !appMatch) continue;
       const invalidIdentifier = resource.identifiers.some(identifier =>
-        (identifier.kind === "entra_agent_id" || identifier.kind === "cds_bot_id")
-          && !normalizedId(identifier.value, guidPattern)
-        || identifier.kind === "environment_id" && !sameId(identifier.value, identity.environmentId),
+        (identifier.kind === "entra_agent_id" || identifier.kind === "entra_app_id" || identifier.kind === "cds_bot_id")
+          && !normalizedGuid(identifier.value)
+        || identifier.kind === "environment_id" && normalizedEnvironmentId(identifier.value) !== environmentId
+        || identifier.kind === "power_platform_resource_id"
+          && normalizeNativeIdentity(identifier.value) !== normalizeNativeIdentity(resource.nativeId),
       );
-      if (invalidIdentifier || entraIds.length > 1 || botIds.length > 1
+      if (invalidIdentifier || botIds.length > 1
         || supplied(resource.details.schemaName) && !resourceSchemaName
-        || identity.entraAgentId && entraIds.length && !entraMatch
-        || identity.cdsBotId && botIds.length && !botMatch
-        || identity.schemaName && resourceSchemaName && identity.schemaName !== resourceSchemaName) {
-        conflicting = true;
+        || identity?.cdsBotId && botIds.length > 0 && !botMatch
+        || identity?.schemaName && resourceSchemaName && identity.schemaName !== resourceSchemaName
+        || manifestMatch && botIds.length > 0) {
+        if (botMatch || nativeMatch || manifestMatch) primaryConflict = true;
+        else secondaryConflict = true;
         continue;
       }
       const evidence: PackageAgentLinkEvidence[] = [];
-      if (entraMatch) evidence.push({
-        kind: "entra_agent_id",
-        basis: "source_declared_metadata",
-        elementIds: observation.elementIds,
+      if (agentMatch) evidence.push({
+        kind: "entra_agent_id", basis: "source_declared_metadata", elementIds,
         packagePath: `${metadataPath}.AgentIdentityId + SourceIds.EnvironmentId`,
         resourcePath: "identifiers.entra_agent_id + environmentId",
       });
+      if (appMatch) evidence.push({
+        kind: "environment_entra_app_id", basis: "source_declared_metadata", elementIds,
+        packagePath: `${metadataPath}.SourceIds.EnvironmentId + SourceIds.EntraApplicationId`,
+        resourcePath: "environmentId + identifiers.entra_app_id",
+      });
       if (botMatch) evidence.push({
-        kind: "environment_cds_bot_id",
-        basis: "source_declared_metadata",
-        elementIds: observation.elementIds,
+        kind: "environment_cds_bot_id", basis: "source_declared_metadata", elementIds,
         packagePath: `${metadataPath}.SourceIds.EnvironmentId + SourceIds.CdsBotId`,
         resourcePath: "environmentId + identifiers.cds_bot_id",
       });
-      if (corroboratedNativeMatch) evidence.push({
-        kind: "environment_schema_native_id",
-        basis: "source_declared_metadata",
-        elementIds: observation.elementIds,
+      if (nativeMatch) evidence.push({
+        kind: "environment_schema_native_id", basis: "source_declared_metadata", elementIds,
         packagePath: `${metadataPath}.SourceIds.EnvironmentId + SourceIds.SchemaName + SourceIds.CdsBotId`,
         resourcePath: "environmentId + details.schemaName + nativeId",
       });
-      matches.push({ resource, evidence });
+      if (manifestMatch) evidence.push({
+        kind: "manifest_schema_native_id", basis: "source_declared_metadata",
+        elementIds: declarativeElements.map(element => element.id).filter(Boolean).sort(),
+        packagePath: "manifestId + elementTypes.DeclarativeCopilots",
+        resourcePath: "nativeId + details.schemaName (declarative manifest identity, not a CDS bot ID)",
+      });
+      const warnings: PackageAgentIdentityWarning[] = identity?.graphAgentIds.length && agentIds.length && !agentMatch
+        ? [{
+            code: "source_specific_agent_identity",
+            message: "The package and Power Platform report different source-specific agent identity IDs. Their exact native agent identity agrees; both source identities are retained separately.",
+          }]
+        : [];
+      matches.push({ resource, evidence, warnings, primary: botMatch || nativeMatch || manifestMatch });
     }
-    if (conflicting) return { packageId: value.id, status: "conflicting", reason: "Provider metadata contains conflicting native agent identities; no link was created." };
-    if (matches.length > 1) return { packageId: value.id, status: "ambiguous", reason: "The same explicit identity matches multiple Power Platform resources; no link was created." };
-    if (matches.length === 1) return {
-      packageId: value.id,
-      status: "matched",
-      resource: { nativeId: matches[0].resource.nativeId, environmentId: matches[0].resource.environmentId! },
-      evidence: matches[0].evidence,
-      ...(matches[0].evidence.some(evidence => evidence.kind === "environment_schema_native_id")
-        ? { controlBotId: identity.cdsBotId } : {}),
+    const primary = matches.filter(match => match.primary);
+    const selected = primary.length ? primary : matches;
+    if (primaryConflict || !primary.length && secondaryConflict) return { packageId: value.id, status: "conflicting", reason: "Provider metadata contains conflicting native agent identities; no link was created." };
+    if (selected.length > 1) return { packageId: value.id, status: "ambiguous", reason: "The same explicit identity matches multiple Power Platform resources; no link was created." };
+    if (selected.length === 1) {
+      const match = selected[0];
+      return {
+        packageId: value.id, status: "matched",
+        resource: { nativeId: match.resource.nativeId, environmentId: match.resource.environmentId! },
+        evidence: match.evidence,
+        ...(match.warnings.length ? { warnings: match.warnings } : {}),
+        ...(match.evidence.some(evidence => evidence.kind === "environment_schema_native_id")
+          && identity?.schemaName && !normalizedGuid(identity.schemaName) ? { controlBotId: identity.cdsBotId } : {}),
+      };
+    }
+    return {
+      packageId: value.id, status: "unmatched",
+      reason: observation.status === "unmatched" && !manifestId ? observation.reason
+        : "No saved Power Platform agent matches the package's source-native or declarative manifest identity.",
+      ...(grouping ? { grouping } : {}),
     };
-    return { packageId: value.id, status: "unmatched", reason: "No Power Platform agent matches the package's explicit environment and typed agent identifiers." };
   });
-  const groupedIdentities = new Map<string, { bots: Set<string>; agents: Set<string>; schemas: Set<string> }>();
+  const grouped = new Map<string, { bots: Set<string>; schemas: Set<string> }>();
+  const groupKey = (resolution: PackageAgentLinkResolution) => resolution.status === "matched"
+    ? powerPlatformAgentKey(resolution.resource.environmentId, resolution.resource.nativeId)
+    : resolution.status === "unmatched" ? resolution.grouping?.key : undefined;
   for (const resolution of resolutions) {
-    if (resolution.status !== "matched") continue;
-    const key = identityKey(resolution.resource.environmentId, "native", resolution.resource.nativeId);
-    const group = groupedIdentities.get(key) ?? { bots: new Set<string>(), agents: new Set<string>(), schemas: new Set<string>() };
-    const identity = identities.get(resolution.packageId)!;
+    const key = groupKey(resolution);
+    const identity = identities.get(resolution.packageId);
+    if (!key || !identity) continue;
+    const group = grouped.get(key) ?? { bots: new Set<string>(), schemas: new Set<string>() };
     if (identity.cdsBotId) group.bots.add(identity.cdsBotId);
-    if (identity.entraAgentId) group.agents.add(identity.entraAgentId);
     if (identity.schemaName) group.schemas.add(identity.schemaName);
-    groupedIdentities.set(key, group);
+    grouped.set(key, group);
   }
-  return resolutions.map(resolution => {
-    if (resolution.status !== "matched") return resolution;
-    const group = groupedIdentities.get(identityKey(resolution.resource.environmentId, "native", resolution.resource.nativeId))!;
-    return group.bots.size > 1 || group.agents.size > 1 || group.schemas.size > 1
+  const validated: PackageAgentLinkResolution[] = resolutions.map(resolution => {
+    const key = groupKey(resolution);
+    const group = key ? grouped.get(key) : undefined;
+    return group && (group.bots.size > 1 || group.schemas.size > 1)
       ? { packageId: resolution.packageId, status: "conflicting", reason: "Package representations disagree about this agent's native identities or schema name; no link was created." }
       : resolution;
   });
+  return linkCustomEngineRepresentations(packages, identities, validated);
 }
 
-function packageAgentIdentity(value: CopilotPackageDetail): IdentityObservation {
-  const groups = value.elementDetails?.filter(group => group.elementType === "AgentMetadatas");
-  if (!groups?.length) return {
-    status: "unmatched",
-    reason: value.identityDetailsCollected
-      ? "Package details were collected, but Microsoft Graph did not supply agent identity metadata. No cross-source link can be proven from the saved details."
-      : "Agent identity metadata has not been supplied. Refresh package details to check for a source-declared link.",
-  };
-  const identities = new Map<string, PackageAgentIdentity>();
-  const elementIds = new Set<string>();
-  let elementCount = 0;
-  for (const group of groups) {
-    for (const element of group.elements) {
-      elementCount += 1;
-      if (elementCount > 16) return malformedIdentity("metadata_limit");
-      elementIds.add(element.id);
-      let metadata: unknown;
-      try {
-        metadata = JSON.parse(element.definition);
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-        return malformedIdentity("invalid_json");
+function linkCustomEngineRepresentations(
+  packages: readonly CopilotPackageDetail[],
+  identities: ReadonlyMap<string, PackageAgentMetadata>,
+  resolutions: readonly PackageAgentLinkResolution[],
+): PackageAgentLinkResolution[] {
+  const groups = new Map<string, Array<{ packageId: string; elementIds: string[] }>>();
+  for (const value of packages) {
+    const bot = readPackageCustomEngineBotIdentity(value);
+    if (!bot) continue;
+    const group = groups.get(bot.botApplicationId) ?? [];
+    group.push({ packageId: value.id, elementIds: bot.elementIds });
+    groups.set(bot.botApplicationId, group);
+  }
+  const result = new Map(resolutions.map(resolution => [resolution.packageId, resolution]));
+  for (const [botApplicationId, members] of groups) {
+    if (members.length < 2) continue;
+    if (members.some(member => {
+      const resolution = result.get(member.packageId)!;
+      return resolution.status === "conflicting" || resolution.status === "ambiguous"
+        || resolution.status === "unmatched" && resolution.invalidMetadata;
+    })) continue;
+    const anchors = members.flatMap(member => {
+      const resolution = result.get(member.packageId)!;
+      return resolution.status === "matched" && resolution.evidence.some(evidence =>
+        evidence.kind === "environment_cds_bot_id" || evidence.kind === "environment_schema_native_id",
+      ) ? [resolution] : [];
+    });
+    const targets = new Set(anchors.map(anchor => powerPlatformAgentKey(anchor.resource.environmentId, anchor.resource.nativeId)));
+    const nativeIdentities = members.flatMap(member => identities.get(member.packageId) ?? []);
+    const environments = new Set(nativeIdentities.flatMap(identity => identity.environmentId ?? []));
+    const bots = new Set(nativeIdentities.flatMap(identity => identity.cdsBotId ?? []));
+    const schemas = new Set(nativeIdentities.flatMap(identity => identity.schemaName ?? []));
+    if (targets.size > 1 || environments.size > 1 || bots.size > 1 || schemas.size > 1) {
+      for (const member of members) {
+        const resolution = result.get(member.packageId)!;
+        if (resolution.status === "unmatched" && !resolution.invalidMetadata && !identities.get(member.packageId)?.cdsBotId) {
+          result.set(member.packageId, {
+            packageId: member.packageId, status: "ambiguous",
+            reason: "This custom-engine bot application is associated with multiple native agents; no package association was chosen.",
+          });
+        }
       }
-      if (!isRecord(metadata) || !isRecord(metadata.SourceIds)) return malformedIdentity("missing_source_ids");
-      const source = metadata.SourceIds;
-      const environmentId = normalizedId(source.EnvironmentId, environmentPattern);
-      const cdsBotId = normalizedId(source.CdsBotId, guidPattern);
-      const entraAgentId = normalizedId(metadata.AgentIdentityId, guidPattern);
-      const schemaName = normalizedId(source.SchemaName, schemaNamePattern);
-      if (!environmentId || !cdsBotId && !entraAgentId
-        || supplied(source.CdsBotId) && !cdsBotId
-        || supplied(metadata.AgentIdentityId) && !entraAgentId
-        || supplied(source.SchemaName) && !schemaName) return malformedIdentity("invalid_typed_identity");
-      const identity = {
-        environmentId, ...(cdsBotId ? { cdsBotId } : {}), ...(entraAgentId ? { entraAgentId } : {}),
-        ...(schemaName ? { schemaName } : {}),
-      };
-      identities.set(JSON.stringify(identity), identity);
+      continue;
+    }
+    const relatedPackageIds = anchors.map(anchor => anchor.packageId).sort();
+    for (const member of members) {
+      const resolution = result.get(member.packageId)!;
+      if (resolution.status !== "unmatched" || resolution.invalidMetadata) continue;
+      if (anchors.length) {
+        result.set(member.packageId, {
+          packageId: member.packageId, status: "matched", resource: anchors[0].resource,
+          evidence: [{
+            kind: "shared_custom_engine_bot_id", basis: "source_declared_metadata", elementIds: member.elementIds,
+            packagePath: "elementDetails.Bots.definition.botId + CustomEngineCopilots.definition.id (type=bot)",
+            resourcePath: "related packages' exact environment and native agent identity (not a CDS bot ID alias)",
+            relatedPackageIds,
+          }],
+        });
+      } else if (!members.some(member => result.get(member.packageId)!.status !== "unmatched")) {
+        const sourceGroup = members.flatMap(member => {
+          const candidate = result.get(member.packageId)!;
+          return candidate.status === "unmatched" && identities.get(member.packageId)?.cdsBotId && candidate.grouping ? [candidate.grouping] : [];
+        })[0];
+        result.set(member.packageId, {
+          ...resolution,
+          grouping: sourceGroup ?? { key: identityKey("", "custom_engine_bot_application", botApplicationId), environmentId: [...environments][0] ?? null },
+        });
+      }
     }
   }
-  if (!identities.size) return malformedIdentity("empty_metadata");
-  if (identities.size > 1) return { status: "conflicting", reason: "The package contains multiple different agent identity records; no link was created." };
-  return { status: "available", identity: [...identities.values()][0], elementIds: [...elementIds].sort() };
+  return resolutions.map(resolution => result.get(resolution.packageId)!);
 }
 
 export function withVerifiedControlIdentities(
@@ -222,11 +315,10 @@ export function withVerifiedControlIdentities(
     const observedAt = Date.parse(identityObservation.observedAt);
     if (!Number.isFinite(observedAt) || observedAt > now || observedAt < now - maximumAgeMs
       || !(Date.parse(identityObservation.expiresAt) > now) || !(Date.parse(observation.expiresAt) > now)) continue;
-    verified.set(identityKey(link.resource.environmentId, "native", link.resource.nativeId.toLowerCase()), link.controlBotId);
+    verified.set(powerPlatformAgentKey(link.resource.environmentId, link.resource.nativeId), link.controlBotId);
   }
   return resources.map(resource => {
-    const botId = resource.environmentId
-      ? verified.get(identityKey(resource.environmentId, "native", resource.nativeId.toLowerCase())) : undefined;
+    const botId = resource.environmentId ? verified.get(powerPlatformAgentKey(resource.environmentId, resource.nativeId)) : undefined;
     if (!botId || resource.identifiers.some(identifier => identifier.kind === "cds_bot_id")) return resource;
     return {
       ...resource,
@@ -243,32 +335,11 @@ export function withVerifiedControlIdentities(
   });
 }
 
-function malformedIdentity(reason: string): IdentityObservation {
-  operationalLog("warn", "agent_identity_unresolved", { provider: "graph_packages", reason });
-  return { status: "unmatched", reason: "Package agent identity metadata is incomplete or invalid; no link was created." };
-}
-
-function identifierValues(resource: PowerPlatformResource, kind: "entra_agent_id" | "cds_bot_id") {
+function identifierValues(resource: PowerPlatformResource, kind: "entra_agent_id" | "entra_app_id" | "cds_bot_id") {
   return [...new Set(resource.identifiers.filter(identifier => identifier.kind === kind)
-    .map(identifier => normalizedId(identifier.value, guidPattern)).filter((value): value is string => value !== undefined))];
-}
-
-function normalizedId(value: unknown, pattern: RegExp) {
-  return typeof value === "string" && pattern.test(value) ? value.toLowerCase() : undefined;
-}
-
-function sameId(left: string, right: string) {
-  return left.toLowerCase() === right.toLowerCase();
+    .map(identifier => normalizedGuid(identifier.value)).filter((value): value is string => value !== undefined))];
 }
 
 function identityKey(environmentId: string, kind: string, id: string) {
-  return `${environmentId.toLowerCase()}\0${kind}\0${id}`;
-}
-
-function supplied(value: unknown) {
-  return value !== undefined && value !== null && value !== "";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  return JSON.stringify([environmentId.toLowerCase(), kind, id]);
 }

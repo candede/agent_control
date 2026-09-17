@@ -308,7 +308,7 @@ export function migratePowerPlatformAgentRoute(search: string) {
 const localAuditActions = new Set([
   "block", "unblock", "update-availability", "update-installation",
   "view-audit-search", "export-audit-search", "view-hunting", "export-hunting",
-  "export-package-inventory", "export-power-platform-inventory",
+  "export-package-inventory", "export-power-platform-inventory", "export-agent-inventory",
 ]);
 const localAuditStatuses = new Set([
   "requested", "started", "succeeded", "failed", "skipped", "inconclusive", "cancelled",

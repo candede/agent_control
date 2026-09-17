@@ -44,9 +44,9 @@ async function seedInventory(value: QuarantineScope, descriptors = [{ resourceNa
     VALUES(gen_random_uuid(),$1,$2,$3,repeat('c',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`,
   [value.tenantId, value.principalId, `inventory-${randomUUID()}`]);
   const snapshot = await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_inventory_snapshots
-    (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,coverage,observed_count,total_records,page_count,unknown_field_count)
+    (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count)
     VALUES(gen_random_uuid(),$1,$2,$3,repeat('d',64),'full','["microsoft.copilotstudio/agents"]',$4,$5,$5,1,0) RETURNING id`,
-  [job.rows[0].id, value.tenantId, value.principalId, JSON.stringify(Array.from({ length: 11 }, () => ({ type: "fixture", status: "unknown", count: null }))), descriptors.length]);
+  [job.rows[0].id, value.tenantId, value.principalId, JSON.stringify(["microsoft.copilotstudio/agents"]), descriptors.length]);
   for (const descriptor of descriptors) await fixture.operator.query(`INSERT INTO power_platform_inventory_resources
     (snapshot_id,tenant_id,principal_id,native_id,resource_type,environment_id,display_name,source_system,creator_type,agent_kind,lifecycle,identity_confidence,identifiers,provenance,details,unknown_field_count)
     VALUES($1,$2,$3,$6,'microsoft.copilotstudio/agents',$4,'Canary agent','power_platform','unknown','copilot_studio_agent','published','exact_native',$5,'{}','{}',0)`,

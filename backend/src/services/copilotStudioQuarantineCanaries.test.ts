@@ -40,7 +40,7 @@ async function seedOperatorInventory(operator: AuthenticatedUser) {
     sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published",
     identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: target.resourceNativeId },
       { kind: "environment_id", value: target.environmentId }, { kind: "cds_bot_id", value: target.botId }], provenance: {}, details: {}, unknownFieldCount: 0 }],
-    totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
   return (await inventory.getJob(scope, job.id))!.snapshotId!;
 }
 

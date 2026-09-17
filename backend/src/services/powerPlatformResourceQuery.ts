@@ -12,7 +12,7 @@ import {
   type PowerPlatformResourceType,
   type ResourceQueryResult,
 } from "../types/powerPlatformInventory.js";
-import { sortIdentifiers } from "./inventoryIdentity.js";
+import { normalizeNativeIdentity, powerPlatformAgentKey, sortIdentifiers } from "./inventoryIdentity.js";
 import { boundedProviderJson } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
 
@@ -133,7 +133,7 @@ export class PowerPlatformResourceQueryClient {
         if (parsed.totalRecords !== totalRecords) throw new InventorySchemaError("Power Platform inventory changed totalRecords during paging.", { reason: "changed_total", field: "totalRecords" });
         if (resources.length + parsed.resources.length > maximumRows) throw new AppError(502, "provider_result_limit", "Power Platform inventory exceeded the bounded row limit.");
         for (const [index, resource] of parsed.resources.entries()) {
-          const identity = `${resource.tenantId}\0${resource.type}\0${resource.environmentId ?? ""}\0${resource.nativeId}`;
+          const identity = `${normalizeNativeIdentity(resource.tenantId)}\0${resource.type}\0${powerPlatformAgentKey(resource.environmentId, resource.nativeId)}`;
           const firstSeenPage = identities.get(identity);
           if (firstSeenPage !== undefined) throw new InventorySchemaError("Power Platform inventory returned a duplicate resource identity.", {
             reason: "duplicate_identity", resourceType: resource.type, resourceIndex: index + 1, firstSeenPage,
@@ -164,7 +164,7 @@ export class PowerPlatformResourceQueryClient {
         ...logContext, pages, observedCount: resources.length, totalRecords,
         omittedFieldCount: unknownFieldCount, durationMs: Math.round(performance.now() - startedAt),
       });
-      return { resources, totalRecords: totalRecords ?? 0, pages, unknownFieldCount };
+      return { resources, queriedTypes: requestedTypes, environmentScope: environmentId ?? null, totalRecords, pages, unknownFieldCount };
     } catch (error) {
       const failure = isTimeoutError(error) ? new AppError(504, "provider_timeout", deadlineSignal.aborted
         ? `Power Platform inventory exceeded the ${powerPlatformInventoryQueryDeadlineMs / 1_000}-second enumeration limit. No incomplete snapshot was saved. Retry the refresh or select a narrower scope.`
@@ -369,8 +369,10 @@ function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResource
   });
   const requested = new Set(requestedTypes);
   for (const [index, resource] of resources.entries()) {
-    if (!requested.has(resource.type) || expectedEnvironmentId && resource.environmentId !== expectedEnvironmentId || expectedTenantId && resource.tenantId !== expectedTenantId) {
-      const field = !requested.has(resource.type) ? "type" : expectedEnvironmentId && resource.environmentId !== expectedEnvironmentId ? "environmentId" : "tenantId";
+    const environmentMismatch = expectedEnvironmentId && resource.environmentId?.toLowerCase() !== expectedEnvironmentId.toLowerCase();
+    if (!requested.has(resource.type) || environmentMismatch
+      || expectedTenantId && normalizeNativeIdentity(resource.tenantId) !== normalizeNativeIdentity(expectedTenantId)) {
+      const field = !requested.has(resource.type) ? "type" : environmentMismatch ? "environmentId" : "tenantId";
       throw new InventorySchemaError("Power Platform inventory returned data outside the requested tenant, environment, or resource type scope.", {
         reason: "scope_mismatch", field, resourceType: resource.type, resourceIndex: index + 1,
       });
@@ -403,7 +405,9 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     });
   }
   // Catalog availability is scoped by the delegated query, not by connector ownership.
-  const tenantId = catalogWithoutTenant ? expectedTenantId : value.tenantId;
+  const sourceTenantId = catalogWithoutTenant ? expectedTenantId : value.tenantId;
+  const tenantId = typeof sourceTenantId === "string" && expectedTenantId
+    && normalizeNativeIdentity(sourceTenantId) === normalizeNativeIdentity(expectedTenantId) ? expectedTenantId : sourceTenantId;
   if (typeof tenantId !== "string") throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", {
     reason: "invalid_identity_type", field: "tenantId", actualType: valueType(tenantId), resourceType: type,
   });
@@ -522,7 +526,7 @@ function projectDetails(context: ProjectionContext, type: PowerPlatformResourceT
   assign(details, "isQuarantined", optionalBoolean(context, "isQuarantined", "properties.isQuarantined", maturity(context, "isQuarantined")));
   assign(details, "quarantinedAt", optionalDate(context, "quarantinedAt", "properties.quarantinedAt", "preview"));
   assign(details, "isManaged", optionalBoolean(context, "isManaged", "properties.isManaged", maturity(context, "isManaged")));
-  for (const key of ["schemaName", "appModuleId", "logicalName", "subType", "workflowEntityId", "trigger", "triggerOperation", "environmentType", "environmentGroup", "environmentGroupId", "connectorId", "publisher", "tier", "releaseTag", "orchestration", "model", "authentication"] as const) {
+  for (const key of ["schemaName", "createdIn", "appModuleId", "logicalName", "subType", "workflowEntityId", "trigger", "triggerOperation", "environmentType", "environmentGroup", "environmentGroupId", "connectorId", "publisher", "tier", "releaseTag", "orchestration", "model", "authentication"] as const) {
     assign(details, key, optionalString(context, key, `properties.${key}`, maturity(context, key), 512));
   }
   assign(details, "description", optionalString(context, "description", "properties.description", maturity(context, "description"), 16_384));
@@ -643,14 +647,22 @@ function optionalStringArray(context: ProjectionContext, property: string, path:
 }
 
 function deriveAuthoringTool(type: PowerPlatformResourceType, createdIn: string | null) {
-  if (type === "microsoft.copilotstudio/agents") return createdIn === "Copilot Studio" || createdIn === "Microsoft 365 Copilot Agent Builder" ? createdIn : null;
+  if (type === "microsoft.copilotstudio/agents") {
+    const normalized = createdIn?.toLowerCase().replace(/[^a-z0-9]/g, "");
+    return normalized === "copilotstudio" ? "Copilot Studio"
+      : normalized === "microsoft365copilotagentbuilder" ? "Microsoft 365 Copilot Agent Builder" : null;
+  }
   if (type.startsWith("microsoft.powerapps/")) return "Power Apps";
   if (type === "microsoft.powerautomate/cloudflows" || type === "microsoft.powerautomate/agentflows") return "Power Automate";
   return null;
 }
 
 function deriveAgentKind(type: PowerPlatformResourceType, createdIn: string | null, subType?: string) {
-  if (type === "microsoft.copilotstudio/agents") return createdIn === "Microsoft 365 Copilot Agent Builder" ? "agent_builder_agent" : createdIn === "Copilot Studio" ? "copilot_studio_agent" : "agent";
+  if (type === "microsoft.copilotstudio/agents") {
+    const authoringTool = deriveAuthoringTool(type, createdIn);
+    return authoringTool === "Microsoft 365 Copilot Agent Builder" ? "agent_builder_agent"
+      : authoringTool === "Copilot Studio" ? "copilot_studio_agent" : "agent";
+  }
   if (type === "microsoft.powerautomate/agentflows") return "agent_flow";
   if (type === "microsoft.powerautomate/m365agentflows") return "workflow_agent_flow";
   if (type === "microsoft.powerapps/codeapps") return subType === "vibeApp" ? "vibe_app" : "code_app";

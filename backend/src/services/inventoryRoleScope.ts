@@ -44,6 +44,11 @@ export function resourceTypesForInventoryScope(scope: InventoryRoleScope) {
   return scope === "ai" ? powerPlatformResourceTypes.filter(type => aiResourceTypes.has(type)) : [...powerPlatformResourceTypes];
 }
 
+export function inventoryQueryTypes(scope: InventoryRoleScope, requestedTypes: readonly PowerPlatformResourceType[]) {
+  const allowed = new Set(resourceTypesForInventoryScope(scope));
+  return requestedTypes.filter(type => allowed.has(type));
+}
+
 function ordinal(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0;
 }

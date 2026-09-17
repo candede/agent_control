@@ -28,6 +28,7 @@ const auditActions = new Set<LocalAuditAction>([
   "revoke-hunting-scope",
   "export-package-inventory",
   "export-power-platform-inventory",
+  "export-agent-inventory",
   "export-official-usage-aggregate",
   "export-official-usage-users",
   "export-administrative-audit",

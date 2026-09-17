@@ -2,6 +2,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
+import { createUnifiedVerification } from "../src/test/inventoryVerification";
 
 const sourceIds: DataSyncSourceId[] = ["users", "graph_packages", "power_platform", "usage_reports"];
 const initial: DataSyncState = {
@@ -20,6 +21,8 @@ async function mockSync(page: Page, firstState: DataSyncState, retainedRuns: Dat
   const starts: StartDataSyncInput[] = [];
   const reads: string[] = [];
   await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
+    revision: "a".repeat(64),
+    verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
     value: [], count: 0, offset: 0, limit: 50,
     summary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
     filteredSummary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },

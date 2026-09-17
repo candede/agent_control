@@ -21,8 +21,8 @@ test("basic filters occupy exactly two rows on desktop and tablet, with usable m
   await expect(filters.getByRole("combobox", { name: "Source", exact: true })).toHaveCount(0);
   await expect(filters.getByRole("combobox", { name: "Source link", exact: true })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Advanced agent filters" })).toHaveCount(0);
-  await expect(filters.getByRole("button", { name: "Export package inventory CSV" })).toHaveCount(0);
-  await expect(page.locator(".agent-catalog-heading").getByRole("button", { name: "Export package inventory CSV" })).toBeVisible();
+  await expect(filters.getByRole("button", { name: "Export agent inventory CSV" })).toHaveCount(0);
+  await expect(page.locator(".agent-catalog-heading").getByRole("button", { name: "Export agent inventory CSV" })).toBeVisible();
   for (const width of info.project.name === "desktop" ? [768, 1024, 1480, 1920] : [360]) {
     await page.setViewportSize({ width, height: 1000 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

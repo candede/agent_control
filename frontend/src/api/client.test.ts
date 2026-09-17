@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createUnifiedVerification } from "../test/inventoryVerification";
 
 import {
   blockAgent,
@@ -7,7 +8,10 @@ import {
   getBulkActionJob,
   getDefenderHuntingJob,
   getAgents,
+  getAgentDetails,
+  getCurrentUser,
   getUnifiedAgents,
+  downloadUnifiedAgentInventoryCsv,
   getPackageRefreshJob,
   getOfficialUsageAggregate,
   getOfficialUsageHistory,
@@ -281,7 +285,10 @@ describe("access API client", () => {
   });
 
   it("requests unified saved rows and explicitly refreshes selected matching details", async () => {
-    const fetchMock = mockJsonResponse({ value: [] });
+    const fetchMock = mockJsonResponse({
+      value: [],
+      verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
+    });
     await getUnifiedAgents({
       search: "Builder & one",
       source: "both",
@@ -311,6 +318,86 @@ describe("access API client", () => {
         body: JSON.stringify({ ids: ["package-1", "package-2"], mode: "delegated" }),
       }),
     );
+  });
+
+  it("resolves canonical and exact source aliases through the unified endpoint without rewriting package targets", async () => {
+    const record = {
+      id: "agent:11111111-1111-4111-8111-111111111111",
+      packages: [{ id: "package/a" }, { id: "package:b" }],
+      powerPlatformResource: { nativeId: "native/a", environmentId: "environment-a" },
+      identity: {
+        state: "matched",
+        evidence: [
+          { kind: "manifest_schema_native_id", basis: "source_declared_metadata", elementIds: [], packagePath: "manifestId", resourcePath: "nativeId + details.schemaName" },
+          { kind: "shared_custom_engine_bot_id", basis: "source_declared_metadata", elementIds: ["bot-one"], packagePath: "Bots.definition.botId", resourcePath: "related package native identity evidence", relatedPackageIds: ["package:b"] },
+        ],
+        packageEvidence: [], reason: null, invalidMetadata: true,
+        warnings: [{ code: "source_specific_agent_identity", message: "Source-specific identity IDs differ without a native resource conflict." }],
+      },
+    };
+    const inventory = {
+      value: [record], count: 1, identityCollection: { checkedPackages: 2, pendingPackages: 0, invalidPackages: 1 },
+      verification: createUnifiedVerification({ graphPackageCount: 2, powerPlatformAgentCount: 1, logicalAgentCount: 1 }, { packageMetadata: false }),
+    };
+    const fetchMock = mockJsonResponse(inventory);
+    const controller = new AbortController();
+    for (const recordId of [record.id, "graph_packages:package%2Fa", "power_platform:environment-a:native%2Fa"]) {
+      const response = await getUnifiedAgents({ recordId }, { signal: controller.signal });
+      expect(response).toEqual(inventory);
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        `/api/agent-inventory?${new URLSearchParams({ recordId })}`,
+        expect.objectContaining({ signal: controller.signal, credentials: "include" }),
+      );
+    }
+  });
+
+  it("downloads revision-bound unified CSV with cookies and the current CSRF token", async () => {
+    const csv = "agentId,packageIds,inventoryPartial\r\nagent-one,\"package-one;package-two\",true\r\n";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ user: { roles: ["AgentControl.Viewer"] }, csrfToken: "csv-csrf" }))
+      .mockResolvedValueOnce(new Response(csv, { headers: { "Content-Type": "text/csv" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await getCurrentUser();
+    const input = { revision: "a".repeat(64), query: { environmentId: "env/one", search: "Agent & one", sortBy: "lastModifiedAt" as const, sortDirection: "desc" as const } };
+    const blob = await downloadUnifiedAgentInventoryCsv(input);
+    expect(await blob.text()).toBe(csv);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/export.csv", {
+      method: "POST", credentials: "include",
+      headers: { Accept: "text/csv", "Content-Type": "application/json", "X-CSRF-Token": "csv-csrf" },
+      body: JSON.stringify(input),
+    });
+  });
+
+  it("preserves exact selected references and reports invalidation without a source-export fallback", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      code: "agent_inventory_changed", detail: "Saved source revision or selected references changed.",
+    }, { status: 409 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const input = {
+      revision: "b".repeat(64),
+      recordIds: ["agent:11111111-1111-4111-8111-111111111111", "graph_packages:opaque%2Fid"],
+      query: { sortBy: "displayName" as const, sortDirection: "asc" as const },
+    };
+    await expect(downloadUnifiedAgentInventoryCsv(input)).rejects.toMatchObject({ status: 409, code: "agent_inventory_changed" });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/agent-inventory/export.csv", expect.objectContaining({
+      method: "POST", body: JSON.stringify(input),
+    }));
+  });
+
+  it("preserves separate opaque package targets in detail reads, exact refreshes and mutation previews", async () => {
+    const fetchMock = mockJsonResponse({});
+    for (const id of ["opaque/legacy%target", "opaque:anchor/target"]) {
+      await getAgentDetails(id);
+      expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}`, expect.objectContaining({ credentials: "include" }));
+      await startExactPackageRefresh(id);
+      expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}/refresh-jobs`, expect.objectContaining({
+        method: "POST", body: JSON.stringify({ mode: "delegated" }),
+      }));
+      await previewPackageMutation({ action: "block", ids: [id], mutationScope: "single" });
+      expect(fetchMock).toHaveBeenLastCalledWith("/api/agents/mutation-preview", expect.objectContaining({
+        method: "POST", body: JSON.stringify({ action: "block", ids: [id], mutationScope: "single" }),
+      }));
+    }
   });
 
   it("uses distinct encoded GET routes for exact saved job sources", async () => {

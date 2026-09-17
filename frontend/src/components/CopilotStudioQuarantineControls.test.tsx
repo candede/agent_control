@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { useState, type ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
@@ -34,8 +34,8 @@ function onDemandDecision(): CapabilityView {
   };
 }
 
-function renderControls(view: CapabilityView, currentUser = user) {
-  const content = <CopilotStudioQuarantineControls snapshot={snapshot} targets={[target]} variant="detail" canManage />;
+function renderControls(view: CapabilityView, currentUser = user, props: Partial<ComponentProps<typeof CopilotStudioQuarantineControls>> = {}) {
+  const content = <CopilotStudioQuarantineControls snapshot={snapshot} targets={[target]} variant="detail" canManage {...props} />;
   const wrap = (next: CapabilityView, actor: SessionUser) => <CapabilityContext value={{
     views: [next], user: actor, now: Date.now(), loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
   }}><WorkbenchActionProvider value={workbenchActions}>{content}</WorkbenchActionProvider></CapabilityContext>;
@@ -94,6 +94,19 @@ describe("on-demand quarantine changes", () => {
     expect(submitQuarantine).toHaveBeenCalledWith({
       action: "quarantine", snapshotId: snapshot.id, resourceNativeIds: [target.nativeId], confirmationHash: result.confirmationHash,
     }, expect.stringMatching(/^[0-9a-f-]{36}$/));
+  });
+
+  it.each([0, 1])("does not preview %s resolved targets while bookmarks are pending and permits cancellation", async count => {
+    const onClear = vi.fn();
+    renderControls(onDemandDecision(), user, { variant: "bulk", targets: count ? [target] : [], pendingTargetCount: 2, onClear });
+    expect(screen.getByText(/Restoring 2 bookmarked quarantine selections/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Quarantine selected" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Restore selected" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(onClear).toHaveBeenCalledOnce();
+    expect(previewQuarantine).not.toHaveBeenCalled();
+    expect(submitQuarantine).not.toHaveBeenCalled();
   });
 
   it.each(["viewer", "stale", "missing-permission", "forged-read"] as const)("does not bypass %s gating", async scenario => {

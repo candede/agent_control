@@ -5,10 +5,10 @@ import { beginAccountSessionValidation, commitAccountSessionValidation } from ".
 import { AppError } from "../errors.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import type { PurviewAuditJob, PurviewAuditTokenMode, PurviewProviderQuery } from "../types/purviewAudit.js";
 import { capabilities } from "./capabilities.js";
 import { GraphAuditSearchClient, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
-import { inventoryRoleScope, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
 import { operationalLog } from "./telemetry.js";
 
 type CapabilityId = "purview.audit.search.delegated" | "purview.audit.search.application";
@@ -391,10 +391,9 @@ export class PurviewAuditService {
     } catch (error) {
       if (!(error instanceof AppError && error.code === "not_configured")) throw error;
     }
-    const roleScope = inventoryRoleScope(user);
     return { tenantId: user.tenantId, resultScopes,
-      ...(hasAppRole(user.roles, "AgentControl.Viewer") && roleScope !== "unknown" ? { inventoryIdentityScope: {
-        principalId: user.homeAccountId, roleScope, resourceTypes: [...resourceTypesForInventoryScope(roleScope)],
+      ...(hasAppRole(user.roles, "AgentControl.Viewer") ? { inventoryIdentityScope: {
+        principalId: user.homeAccountId, resourceTypes: [...powerPlatformResourceTypes],
       } } : {}) };
   }
 }

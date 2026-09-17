@@ -23,6 +23,7 @@ type Props = {
   targets: QuarantineSelectableTarget[];
   variant: "detail" | "bulk";
   canManage: boolean;
+  pendingTargetCount?: number;
   onClear?: () => void;
   initialJobId?: string;
   onJobChange?: (job: QuarantineJob) => void;
@@ -40,7 +41,7 @@ type FrozenPreview = {
 const quarantineJobPollIntervalMs = 1_000;
 const maximumAutomaticJobPolls = 60;
 
-export function CopilotStudioQuarantineControls({ snapshot, targets, variant, canManage, onClear, initialJobId, onJobChange }: Props) {
+export function CopilotStudioQuarantineControls({ snapshot, targets, variant, canManage, pendingTargetCount = 0, onClear, initialJobId, onJobChange }: Props) {
   const [boundStatus, setBoundStatus] = useState<{ selectionKey: string; status: QuarantineStatusView }>();
   const [frozenPreview, setFrozenPreview] = useState<FrozenPreview>();
   const [confirmed, setConfirmed] = useState(false);
@@ -49,14 +50,14 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
   const [boundError, setBoundError] = useState<{ message: string; selectionKey?: string }>();
   const [eligibilityNow, setEligibilityNow] = useState(Date.now);
   const mounted = useRef(true);
-  const selectionKey = `${snapshot?.id ?? ""}\u001f${targets.map(target => `${target.type}:${target.environmentId ?? ""}:${target.nativeId}`).sort().join("\u001e")}`;
+  const selectionKey = `${snapshot?.id ?? ""}\u001f${pendingTargetCount}\u001f${targets.map(target => `${target.type}:${target.environmentId ?? ""}:${target.nativeId}`).sort().join("\u001e")}`;
   const previousSelectionKey = useRef(selectionKey);
   const selectionRevision = useRef(0);
   const status = boundStatus?.selectionKey === selectionKey ? boundStatus.status : undefined;
   const preview = frozenPreview?.selectionKey === selectionKey ? frozenPreview.preview : undefined;
   const busy = busyKey === selectionKey || busyKey === "job";
   const error = boundError && (!boundError.selectionKey || boundError.selectionKey === selectionKey) ? boundError.message : undefined;
-  const eligible = Boolean(snapshot) && targets.length > 0 && targets.length <= 25 && targets.every(target => quarantineTargetReason(target, snapshot, eligibilityNow) === undefined);
+  const eligible = pendingTargetCount === 0 && Boolean(snapshot) && targets.length > 0 && targets.length <= 25 && targets.every(target => quarantineTargetReason(target, snapshot, eligibilityNow) === undefined);
 
   useEffect(() => {
     if (previousSelectionKey.current === selectionKey) return;
@@ -214,8 +215,9 @@ export function CopilotStudioQuarantineControls({ snapshot, targets, variant, ca
 
   return <section className="quarantine-bulk" aria-label="Copilot Studio quarantine controls">
     <div><strong>{targets.length} of 25 exact Copilot Studio agents selected</strong><span>Selection uses native IDs from one saved inventory snapshot.</span></div>
+    {pendingTargetCount > 0 ? <p role="status">Restoring {pendingTargetCount} bookmarked quarantine selection{pendingTargetCount === 1 ? "" : "s"} from exact saved identities. Clear to cancel.</p> : null}
     <div className="quarantine-actions">
-      <button type="button" className="secondary" disabled={!targets.length} onClick={onClear}><X aria-hidden="true" /> Clear</button>
+      <button type="button" className="secondary" disabled={!targets.length && !pendingTargetCount} onClick={onClear}><X aria-hidden="true" /> Clear</button>
       <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="danger" disabled={!eligible || busy || !canManage} onClick={() => void beginPreview("quarantine")}><Ban aria-hidden="true" /> Quarantine selected</button></WorkbenchActionGate>
       <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="secondary" disabled={!eligible || busy || !canManage} onClick={() => void beginPreview("unquarantine")}><CheckCircle2 aria-hidden="true" /> Restore selected</button></WorkbenchActionGate>
     </div>

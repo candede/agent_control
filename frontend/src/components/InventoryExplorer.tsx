@@ -9,6 +9,8 @@ import { WorkbenchActionGate } from "../workbenchActionContext";
 import { quarantineTargetReason } from "../quarantineTarget";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { parsePowerPlatformRoute, powerPlatformRouteSearch, workbenchUrl } from "../workbenchRouting";
+import { inventoryCoverageValue, inventoryRequestScope } from "../inventoryVerification";
+import { SavedPowerPlatformVerification } from "./SavedInventoryVerification";
 
 const pageSize = 50;
 const noQuarantineTargets = new Map<string, PowerPlatformResource>();
@@ -36,6 +38,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   const [exporting, setExporting] = useState(false);
   const [submittingRefresh, setSubmittingRefresh] = useState(false);
   const [error, setError] = useState<string>();
+  const [inventoryReadError, setInventoryReadError] = useState<string>();
   const [jobError, setJobError] = useState<string>();
   const [job, setJob] = useState<InventoryRefreshJob>();
   const [detail, setDetail] = useState<PowerPlatformResource>();
@@ -138,8 +141,14 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
       const lastPage = Math.max(Math.ceil(result.count / pageSize) - 1, 0);
       if (pageIndex > lastPage) setPageIndex(lastPage);
       setPage(result);
+      setInventoryReadError(undefined);
       if (!snapshotId && result.snapshot) setSnapshotId(result.snapshot.id);
-    }).catch(requestError => { if (!controller.signal.aborted && owner === listGeneration.current) setError(errorMessage(requestError)); })
+    }).catch(requestError => {
+      if (!controller.signal.aborted && owner === listGeneration.current) {
+        setError(errorMessage(requestError));
+        setInventoryReadError(errorMessage(requestError));
+      }
+    })
       .finally(() => { if (!controller.signal.aborted && owner === listGeneration.current) setLoading(false); });
     return () => { controller.abort(); };
   }, [pageIndex, query, reload, snapshotId]);
@@ -231,8 +240,9 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   }, [pollingJobId, updateRefreshJob]);
 
   const totalPages = Math.max(Math.ceil((page?.count ?? 0) / pageSize), 1);
-  const covered = page?.typeCounts.filter(item => item.status === "covered").length ?? 0;
-  const restricted = page?.typeCounts.filter(item => item.status === "not_authorized_scope").length ?? 0;
+  const currentVerification = !loading && !inventoryReadError && page?.snapshot?.verification;
+  const covered = currentVerification ? page.typeCounts.filter(item => item.status === "covered").length : loading ? "Checking..." : "Not established";
+  const restricted = currentVerification ? page.typeCounts.filter(item => item.status === "not_authorized_scope").length : loading ? "Checking..." : "Not established";
 
   async function handleRefresh() {
     setError(undefined);
@@ -301,6 +311,9 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     <div className="inventory-heading">
       <div><p className="eyebrow">Saved delegated inventory</p><h2>Inventory Explorer</h2></div>
       <div className="inventory-actions">
+        <button type="button" className="secondary" disabled={loading} onClick={() => { setLoading(true); setReload(value => value + 1); }}>
+          <RotateCw size={15} aria-hidden="true" />{loading ? "Verifying saved inventory..." : "Verify saved inventory"}
+        </button>
         <button type="button" className="secondary icon-button" title="Export filtered inventory CSV" aria-label="Export filtered inventory CSV" disabled={exporting || !page?.snapshot} onClick={() => void handleExport()}><Download aria-hidden="true" /></button>
         <WorkbenchActionGate actionId="power-platform.refresh">
           <button type="button" className="primary-link inventory-refresh" disabled={submittingRefresh || job?.status === "running"} onClick={() => void handleRefresh()}><RefreshCw aria-hidden="true" /> Refresh selected scope</button>
@@ -313,18 +326,19 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     {job ? <RefreshStatus job={job} onResume={handleResume} /> : null}
 
     <section className="summary-grid inventory-summary" aria-label="Inventory summary">
-      <Metric label="Resources" value={page?.snapshot ? page.count : "Unknown"} />
-      <Metric label="Covered types" value={covered} />
-      <Metric label="Role-restricted types" value={restricted} />
+      <Metric label="Matching resources" value={page?.snapshot ? loading ? "Checking..." : inventoryReadError ? "Not verified" : page.count : "Unknown"} />
+      <Metric label="Verified type queries" value={covered} />
+      <Metric label="Scope-excluded types" value={restricted} />
       <Metric label="Observed" value={page?.snapshot ? formatRelativeDate(page.snapshot.observedAt) : "No snapshot"} />
       <Metric label="Last attempt" value={formatDateTime(jobHistory.lastAttemptAt, "None")} />
       <Metric label="Last success" value={formatDateTime(jobHistory.lastSuccessAt, "None")} />
     </section>
 
-    {page?.snapshot ? <div className="inventory-source-note"><strong>{displayTime - Date.parse(page.snapshot.observedAt) > 20 * 60_000 ? "Stale saved source observation" : "Saved source observation"}</strong><span>{formatDateTime(page.snapshot.observedAt, "Unknown")} · {scopeText(page.snapshot)} · {title(page.snapshot.roleScope)} role coverage · Unknown fields omitted: {page.snapshot.unknownFieldCount}.</span><span>Power Platform changes typically appear within 20 minutes. Draft inventory reflects published configuration fields where documented. Authorized saved data remains available during provider outages.</span></div> : null}
+    <SavedPowerPlatformVerification snapshot={page?.snapshot} loading={loading} error={inventoryReadError} />
+    {page?.snapshot ? <div className="inventory-source-note"><strong>Saved source observation</strong><span>{formatDateTime(page.snapshot.observedAt, "Unknown")} · {scopeText(page.snapshot)} · Unknown fields omitted: {page.snapshot.unknownFieldCount}.</span><span>Draft inventory reflects published configuration fields where documented. Saved observations retain their original collection time.</span>{loading || inventoryReadError ? <span>Displaying previous saved results. They have not been verified for the current read.</span> : null}</div> : null}
 
-    {page?.snapshot ? <div className="coverage-strip" aria-label="Resource type coverage" tabIndex={0}>
-      {page.typeCounts.map(item => <span key={item.type} className={`coverage-item ${item.status}`} title={item.type}>{shortType(item.type)} <strong>{coverageValue(item.status, item.count)}</strong></span>)}
+    {page?.snapshot?.verification && !loading && !inventoryReadError ? <div className="coverage-strip" aria-label="Resource type coverage" tabIndex={0}>
+      {page.typeCounts.map(item => <span key={item.type} className={`coverage-item ${item.status}`} title={item.type}>{shortType(item.type)} <strong>{inventoryCoverageValue(item.status, item.count)}</strong></span>)}
     </div> : null}
 
     <section className="controls inventory-controls" aria-label="Inventory filters">
@@ -340,7 +354,7 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
 
     {canManageQuarantine && routeSelectedIds.size === quarantineTargets.size ? <CopilotStudioQuarantineControls snapshot={page?.snapshot ?? null} targets={[...quarantineTargets.values()]} variant="bulk" canManage={canManageQuarantine} onClear={clearQuarantineTargets} initialJobId={routeQuarantineJobId} /> : null}
 
-    {loading && !page ? <div className="screen-state">Loading saved inventory...</div> : !page?.snapshot ? <div className="empty-state"><h2>No saved inventory</h2><p>Run an explicit refresh after Power Platform inventory access is available.</p></div> : page.value.length === 0 ? <div className="empty-state"><h2>No matching resources</h2><p>The saved snapshot has no resources for these filters. Role-restricted types are not counted as zero.</p></div> : <>
+    {loading && !page ? <div className="screen-state">Loading saved inventory...</div> : !page?.snapshot ? <div className="empty-state"><h2>No saved inventory</h2><p>Run an explicit refresh after Power Platform inventory access is available.</p></div> : page.value.length === 0 ? <div className="empty-state"><h2>{loading || inventoryReadError ? "Matching results not yet verified" : "No matching resources"}</h2><p>{loading || inventoryReadError ? "A current matching count is not established." : "The saved snapshot has no resources for these filters. Unrequested, scope-excluded and unverified types are not proven zero."}</p></div> : <>
       <div className="inventory-pagination"><span>{page.count ? `${pageIndex * pageSize + 1}-${Math.min((pageIndex + 1) * pageSize, page.count)} of ${page.count}` : "0 resources"}</span><div><button type="button" className="icon-button" aria-label="Previous inventory page" disabled={pageIndex === 0 || loading} onClick={() => setPageIndex(value => value - 1)}><ChevronLeft aria-hidden="true" /></button><span>Page {pageIndex + 1} of {totalPages}</span><button type="button" className="icon-button" aria-label="Next inventory page" disabled={pageIndex >= totalPages - 1 || loading} onClick={() => setPageIndex(value => value + 1)}><ChevronRight aria-hidden="true" /></button></div></div>
       <div className="table-shell inventory-table"><table><thead><tr>{canManageQuarantine ? <th className="inventory-select"><span className="sr-only">Select quarantine targets</span></th> : null}<th>Name</th><th>Type</th><th>Environment</th><th>Built with</th><th>Lifecycle</th><th>Published</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{page.value.map(resource => { const reason=quarantineTargetReason(resource,page.snapshot,displayTime); const selected=quarantineTargets.has(resource.nativeId); return <tr key={`${resource.type}:${resource.environmentId}:${resource.nativeId}`}>{canManageQuarantine ? <td className="inventory-select">{resource.type === "microsoft.copilotstudio/agents" ? <input type="checkbox" aria-label={`Select ${resource.displayName ?? resource.nativeId} for quarantine control`} title={reason} checked={selected} disabled={Boolean(reason) || (!selected && quarantineTargets.size >= 25)} onChange={() => toggleQuarantineTarget(resource)} /> : <span aria-hidden="true">-</span>}</td> : null}<td><strong>{resource.displayName ?? "Not supplied"}</strong><small>{resource.nativeId}</small></td><td>{shortType(resource.type)}</td><td>{resource.environmentId ?? "Not supplied"}</td><td>{resource.authoringTool ?? "Not supplied"}</td><td>{title(resource.lifecycle)}</td><td>{formatDate(resource.lastPublishedAt)}</td><td><button type="button" className="icon-button" title="View inventory details" aria-label={`View details for ${resource.displayName ?? resource.nativeId}`} onClick={event => { detailTrigger.current=event.currentTarget; setDetail(resource); }}><Eye aria-hidden="true" /></button></td></tr>; })}</tbody></table></div>
     </>}
@@ -435,6 +449,7 @@ export function PowerPlatformResourceData({ resource }: { resource: PowerPlatfor
     <div className="inventory-detail-grid embedded">
       <Detail label="Creator type" value={title(resource.creatorType)} />
       <Detail label="Authoring tool" value={resource.authoringTool} maturity={resource.provenance.authoringTool?.maturity} />
+      <Detail label="Provider origin (raw)" value={resource.details.createdIn} maturity={resource.provenance.createdIn?.maturity} />
       <Detail label="Agent kind" value={title(resource.agentKind)} />
       <Detail label="Lifecycle" value={title(resource.lifecycle)} />
       {detailFields(resource.type).map(field => <Detail key={field.key} label={field.label} value={fieldValue(resource, field.key)} maturity={resource.provenance[field.key]?.maturity} />)}
@@ -460,14 +475,13 @@ function formatRelativeDate(value: string) { const hours = Math.max(0, Math.floo
 function title(value: string) { return value.replace(/^microsoft\./, "").replace(/[_.-]+/g, " ").replace(/\b\w/g, letter => letter.toUpperCase()); }
 function shortType(value: PowerPlatformResourceType) { return title(value.split("/").at(-1) ?? value); }
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : "Inventory request failed."; }
-function coverageValue(status: string, count: number | null) { return status === "not_authorized_scope" ? "Not authorized" : status === "unknown" ? count === null ? "Unknown" : `Observed ${count}; coverage unknown` : String(count ?? 0); }
 function associationText(association: PowerPlatformResource["association"]) {
   if (!association) return "Not supplied.";
   if (association.status === "resolved") return `Resolved by exact ${title(association.matchedKind)}: ${association.candidate.nativeId} (${association.candidate.resourceType}, ${association.candidate.environmentId ?? "environment not supplied"}).`;
   if (association.status === "ambiguous") return `Ambiguous: ${association.candidateCount ?? association.candidates.length} exact candidates remain separate.`;
   return association.reason === "blueprint_is_parent_not_equivalence" ? "Unresolved: a shared blueprint is parentage, not equivalence." : "Unresolved: no documented exact identifier matches another record in this saved scope.";
 }
-function scopeText(snapshot: InventorySnapshot) { const types=snapshot.requestedTypes.length===11?"All supported types":snapshot.requestedTypes.map(shortType).join(", ");return `${snapshot.environmentScope??"All environments"} · ${types}`; }
+function scopeText(snapshot: InventorySnapshot) { const types=snapshot.requestedTypes.length===powerPlatformResourceTypes.length?"All supported types requested":snapshot.requestedTypes.map(shortType).join(", ");return `${inventoryRequestScope(snapshot.environmentScope)} · ${types}`; }
 type DetailKey = keyof PowerPlatformResource["details"] | "createdAt" | "createdBy" | "lastPublishedAt" | "location";
 const commonOwnedFields: {key:DetailKey;label:string}[]=[{key:"location",label:"Location"},{key:"createdAt",label:"Created"},{key:"createdBy",label:"Created by"},{key:"ownerId",label:"Owner"},{key:"lastModifiedAt",label:"Last modified"},{key:"lastModifiedBy",label:"Last modified by"}];
 function detailFields(type: PowerPlatformResourceType): {key:DetailKey;label:string}[] {

@@ -5,7 +5,7 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { DefenderHuntingService } from "./defenderHunting.js";
 
 const user: AuthenticatedUser = { homeAccountId: "security-a", tenantId: "tenant-a", username: "security@example.invalid", displayName: "Security Reader",
-  roles: ["AgentControl.Viewer"], providerRoles: [], providerRoleScope: "unknown" };
+  roles: ["AgentControl.Viewer"], providerRoleIds: [] };
 const filters: DefenderHuntingFilters = { templateId: "agents_inventory", startDateTime: new Date(Date.now() - 30 * 60_000).toISOString(),
   endDateTime: new Date().toISOString(), agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [] };
 const qualification = { capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: user.homeAccountId };
@@ -51,6 +51,18 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Defender hunting worker", () => {
+  it("binds saved inventory associations to the current Viewer even without directory-role claims", async () => {
+    const fixture = setup();
+    await fixture.service.list(user);
+    expect(fixture.repository.listJobs.mock.calls[0][0]).toMatchObject({
+      authorizationPrincipalId: user.homeAccountId,
+      inventoryIdentityScope: { principalId: user.homeAccountId, resourceTypes: expect.arrayContaining(["microsoft.copilotstudio/agents"]) },
+    });
+    await expect(fixture.service.list({ ...user, roles: [] })).rejects.toMatchObject({ status: 403 });
+    expect(fixture.repository.listJobs).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
   it("returns the durable running job promptly and completes the one fixed query in the background", async () => {
     let release!: (value: AuthenticatedUser) => void;
     const pendingUser = new Promise<AuthenticatedUser>(resolve => { release = resolve; });

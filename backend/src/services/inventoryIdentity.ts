@@ -29,6 +29,15 @@ const equivalentKinds = new Set<InventoryIdentifierKind>([
 ]);
 const environmentScopedKinds = new Set<InventoryIdentifierKind>(["power_platform_resource_id", "cds_bot_id"]);
 
+export function normalizeNativeIdentity(value: string): string {
+  return value.length === 36 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase() : value;
+}
+
+export function powerPlatformAgentKey(environmentId: string | null, nativeId: string): string {
+  return JSON.stringify([environmentId?.toLowerCase() ?? "", normalizeNativeIdentity(nativeId)]);
+}
+
 export function packageInventoryIdentity(tenantId: string, value: CopilotPackage): InventoryIdentityRecord {
   return {
     nativeId: value.id,
@@ -65,13 +74,15 @@ export function resolveExactInventoryIdentity(source: InventoryIdentityRecord, c
   const documentedCrossSourceKinds = new Set(options.documentedCrossSourceKinds ?? []);
   const orderedCandidates = [...candidates].sort((left, right) => ordinal(identityKey(left), identityKey(right)));
   const matches = orderedCandidates.flatMap(candidate => {
-    if (candidate.tenantId !== source.tenantId) return [];
+    if (normalizeNativeIdentity(candidate.tenantId) !== normalizeNativeIdentity(source.tenantId)) return [];
     for (const sourceIdentifier of sourceIdentifiers) {
       if (!equivalentKinds.has(sourceIdentifier.kind)) continue;
       if (candidate.sourceSystem !== source.sourceSystem && !documentedCrossSourceKinds.has(sourceIdentifier.kind)) continue;
-      const candidateIdentifier = sortIdentifiers(candidate.identifiers).find(identifier => identifier.kind === sourceIdentifier.kind && identifier.value === sourceIdentifier.value);
+      const candidateIdentifier = sortIdentifiers(candidate.identifiers).find(identifier => identifier.kind === sourceIdentifier.kind
+        && normalizeNativeIdentity(identifier.value) === normalizeNativeIdentity(sourceIdentifier.value));
       if (!candidateIdentifier) continue;
-      if (environmentScopedKinds.has(sourceIdentifier.kind) && (!source.environmentId || !candidate.environmentId || source.environmentId !== candidate.environmentId)) continue;
+      if (environmentScopedKinds.has(sourceIdentifier.kind) && (!source.environmentId || !candidate.environmentId
+        || source.environmentId.toLowerCase() !== candidate.environmentId.toLowerCase())) continue;
       if (sourceIdentifier.kind === "power_platform_resource_id" && source.resourceType !== candidate.resourceType) continue;
       return [{ candidate, kind: sourceIdentifier.kind }];
     }
@@ -98,7 +109,8 @@ function ordinal(left: string, right: string) {
 }
 
 function identityKey(value: InventoryIdentityRecord) {
-  return `${value.tenantId}\0${value.sourceSystem}\0${value.resourceType}\0${value.environmentId ?? ""}\0${value.nativeId}`;
+  return JSON.stringify([normalizeNativeIdentity(value.tenantId), value.sourceSystem, value.resourceType,
+    value.environmentId?.toLowerCase() ?? "", normalizeNativeIdentity(value.nativeId)]);
 }
 
 function identityScope(value: InventoryIdentityRecord): InventoryIdentityScope {

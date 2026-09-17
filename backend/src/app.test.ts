@@ -27,7 +27,7 @@ import { defenderHunting } from "./services/defenderHunting.js";
 import { purviewAudit } from "./services/purviewAudit.js";
 import { launchBulkJob, runBulkJob } from "./services/bulkJobs.js";
 import type { AppRole } from "./types/capability.js";
-import type { PowerPlatformResource } from "./types/powerPlatformInventory.js";
+import type { PowerPlatformResource, PowerPlatformResourceType } from "./types/powerPlatformInventory.js";
 import { clearAdmissionForTest } from "./middleware/admission.js";
 
 vi.hoisted(() => {
@@ -63,7 +63,10 @@ vi.mock("./services/capabilities.js", () => ({ capabilities: {
   quarantineApprovalAuthorityContext: vi.fn(async () => ({ contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 })),
 } }));
 vi.mock("./services/powerPlatformResourceQuery.js", async original => ({ ...await original<typeof import("./services/powerPlatformResourceQuery.js")>(), PowerPlatformResourceQueryClient: class {
-  async query() { inventoryProviderFixture.queries += 1; return {resources:[],totalRecords:0,pages:1,unknownFieldCount:0}; }
+  async query(_token: string, queriedTypes: PowerPlatformResourceType[], options: { environmentId?: string } = {}) {
+    inventoryProviderFixture.queries += 1;
+    return {resources:[],queriedTypes,environmentScope:options.environmentId ?? null,totalRecords:0,pages:1,unknownFieldCount:0};
+  }
 } }));
 vi.mock("./services/bulkJobs.js", async original => ({ ...await original<typeof import("./services/bulkJobs.js")>(), launchBulkJob: vi.fn() }));
 vi.mock("./services/copilotStudioQuarantineJobs.js", async original => ({ ...await original<typeof import("./services/copilotStudioQuarantineJobs.js")>(), launchCopilotStudioQuarantineJob: vi.fn() }));
@@ -144,14 +147,15 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
 async function publishQuarantineInventory(principalId: string) {
   const repository = new PowerPlatformInventoryRepository(fixture.runtime);
   const scope = { tenantId: config.tenantId!, principalId };
-  const job = await repository.submit(scope, { idempotencyKey: `quarantine-inventory-${principalId}-${randomUUID()}`, roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
+  const job = await repository.submit(scope, { idempotencyKey: `quarantine-inventory-${principalId}-${randomUUID()}`, roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"] });
   await repository.markRunning(scope, job.id);
   await repository.publish(scope, job.id, { resources: [{ tenantId: config.tenantId!, nativeId: "native-agent", type: "microsoft.copilotstudio/agents",
     location: null, displayName: "Exact agent", environmentId: "11111111-1111-4111-8111-111111111111", createdAt: null, createdBy: null,
     lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
     lifecycle: "published", identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "native-agent" },
       { kind: "environment_id", value: "11111111-1111-4111-8111-111111111111" }, { kind: "cds_bot_id", value: "22222222-2222-4222-8222-222222222222" }],
-    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z" }, unknownFieldCount: 0 }], totalRecords: 1, pages: 1, unknownFieldCount: 0 });
+    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z" }, unknownFieldCount: 0 }],
+    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
   return (await repository.getJob(scope, job.id))!.snapshotId!;
 }
 async function mutationPreview(action: "block" | "unblock", ids: string[], mutationScope: "single" | "bulk") {
@@ -891,6 +895,134 @@ describe.sequential("packaged API/session contracts", () => {
     expect(stale.status).toBe(409);
     await expect(stale.json()).resolves.toMatchObject({ code: "snapshot_invalidated" });
   });
+  it("exports the authorized unified inventory with revision, environment filtering, source aliases and row-free audit", async () => {
+    const principalId = "unified-export-reader";
+    const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    await publishPackageSnapshot(principalId);
+    await publishQuarantineInventory(principalId);
+    const graphReads = vi.mocked(GraphPackagesClient.prototype.getPackageDetails).mock.calls.length;
+    const platformReads = inventoryProviderFixture.queries;
+    const saved = await request("/api/agent-inventory?limit=1", { headers: { Cookie: readerCookie } });
+    expect(saved.status).toBe(200);
+    const page = await saved.json() as { count: number; revision: string; value: Array<{ id: string }> };
+    expect(page.count).toBe(2);
+    expect(page).toMatchObject({
+      partial: false,
+      sources: { powerPlatform: { state: "available", observation: { roleScope: "unknown", verification: { status: "verified", storedCount: 1 } } } },
+      verification: {
+        status: "needs_attention", scope: "authorized_saved_sources", graphPackageCount: 1, powerPlatformAgentCount: 1,
+        representedSourceCount: 2, uniqueSourceCount: 2, logicalAgentCount: 2,
+        checks: { sourceScopes: true, packageMetadata: false, sourceMemberships: true },
+      },
+    });
+    expect(page.value).toHaveLength(1);
+    expect(page.revision).toMatch(/^[a-f0-9]{64}$/);
+    const exportRequest = (body: unknown, selectedCookie = readerCookie) => request("/api/agent-inventory/export.csv", {
+      method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const all = await exportRequest({ revision: page.revision });
+    expect(all.status).toBe(200);
+    expect(all.headers.get("content-disposition")).toBe("attachment; filename=agents.csv");
+    expect(all.headers.get("cache-control")).toContain("no-store");
+    const allRows = parseCsv(await all.text(), { bom: true, columns: true });
+    expect(allRows).toHaveLength(2);
+    expect(allRows.every((row: Record<string, string>) => row.inventoryVerificationStatus === "needs_attention"
+      && row.inventorySourceCount === "2" && row.inventoryUniqueSourceCount === "2")).toBe(true);
+    expect(JSON.stringify(allRows)).not.toContain("sensitive-user");
+    const filtered = await exportRequest({ revision: page.revision, query: { environmentId: "11111111-1111-4111-8111-111111111111" } });
+    expect(filtered.status).toBe(200);
+    expect(parseCsv(await filtered.text(), { bom: true, columns: true })).toEqual([
+      expect.objectContaining({ nativeResourceId: "native-agent", packageIds: "[]" }),
+    ]);
+    const selected = await exportRequest({ revision: page.revision, recordIds: ["graph_packages:package-1", "graph_packages:package-1"] });
+    expect(selected.status).toBe(200);
+    expect(parseCsv(await selected.text(), { bom: true, columns: true })).toEqual([
+      expect.objectContaining({ packageIds: '["package-1"]', inventoryRevision: page.revision }),
+    ]);
+    const missing = await exportRequest({ revision: page.revision, recordIds: ["graph_packages:absent"] });
+    expect(missing.status).toBe(409);
+    expect(await missing.json()).toMatchObject({ code: "export_selection_changed" });
+    const foreignCookie = await roleCookie("unified-export-foreign", ["AgentControl.Viewer"]);
+    expect((await exportRequest({ revision: page.revision }, foreignCookie)).status).toBe(409);
+    const audit = await request("/api/audit/events?action=export-agent-inventory", { headers: { Cookie: readerCookie } });
+    expect(audit.status).toBe(200);
+    const events = await audit.json() as { value: Array<{ status: string; metadata: Record<string, unknown> }> };
+    expect(events.value.filter(event => event.status === "succeeded")).toHaveLength(3);
+    expect(JSON.stringify(events)).not.toContain("sensitive-user");
+    expect(events.value.some(event => event.metadata.resultingCount === 2)).toBe(true);
+    expect(vi.mocked(GraphPackagesClient.prototype.getPackageDetails).mock.calls.length).toBe(graphReads);
+    expect(inventoryProviderFixture.queries).toBe(platformReads);
+    expect((await request("/api/agent-inventory/export.csv", {
+      method: "POST", headers: { Cookie: readerCookie, "x-csrf-token": "wrong", "Content-Type": "application/json" },
+      body: JSON.stringify({ revision: page.revision }),
+    })).status).toBe(403);
+    const unassigned = await roleCookie("unified-export-unassigned", []);
+    expect((await exportRequest({ revision: page.revision }, unassigned)).status).toBe(403);
+    expect((await exportRequest({ revision: page.revision }, "")).status).toBe(401);
+  });
+
+  it.each(["role", "session", "expiry", "deletion", "exact-overlay", "environment", "filter-source"] as const)(
+    "fences unified CSV publication when %s changes after selection", async change => {
+      const principalId = `unified-export-race-${change}`;
+      const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+      const snapshotId = await publishPackageSnapshot(principalId);
+      const scope = { tenantId: config.tenantId!, principalId };
+      if (change === "filter-source") await new AuditLog(scope, fixture.runtime).startEvent({
+        operationId: "abcd1234-source", scope: "bulk", action: "block", targetBlockedState: true, agentId: "package-1",
+        actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
+        requestPath: "/fixture",
+      });
+      const saved = await request("/api/agent-inventory", { headers: { Cookie: readerCookie } });
+      expect(saved.status).toBe(200);
+      const { revision } = await saved.json() as { revision: string };
+      const complete = AuditLog.prototype.completeEvent;
+      const completing = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
+        const completed = await complete.call(this, id, update);
+        if (completed.action === "export-agent-inventory" && completed.status === "succeeded") {
+          if (change === "role") await fixture.operator.query(
+            "UPDATE sessions SET sess=jsonb_set(sess::jsonb,'{user,roles}','[]'::jsonb) WHERE principal_id=$1", [principalId]);
+          else if (change === "session") await fixture.operator.query("DELETE FROM sessions WHERE principal_id=$1", [principalId]);
+          else if (change === "expiry") await fixture.operator.query(
+            "UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [snapshotId]);
+          else if (change === "deletion") await fixture.operator.query("DELETE FROM package_inventory_snapshots WHERE id=$1", [snapshotId]);
+          else if (change === "exact-overlay") await publishPackageSnapshot(principalId, ["package-1"]);
+          else if (change === "filter-source") await fixture.operator.query("DELETE FROM audit_events WHERE principal_id=$1 AND action='block'", [principalId]);
+          else {
+            const repository = new PowerPlatformInventoryRepository(fixture.runtime);
+            const job = await repository.submit(scope, {
+              idempotencyKey: `environment-${randomUUID()}`, roleScope: "full", requestedTypes: ["microsoft.powerplatform/environments"],
+            });
+            await repository.markRunning(scope, job.id);
+            await repository.publish(scope, job.id, {
+              resources: [{
+                tenantId: scope.tenantId, nativeId: "11111111-1111-4111-8111-111111111111", type: "microsoft.powerplatform/environments",
+                environmentId: null, displayName: "Renamed environment", location: null, createdAt: null, createdBy: null,
+                lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "not_agent",
+                lifecycle: "unknown", identityConfidence: "exact_native",
+                identifiers: [{ kind: "power_platform_resource_id", value: "11111111-1111-4111-8111-111111111111" }],
+                provenance: {}, details: {}, unknownFieldCount: 0,
+              }], totalRecords: 1, pages: 1, unknownFieldCount: 0,
+            });
+          }
+        }
+        return completed;
+      });
+      try {
+        const exported = await request("/api/agent-inventory/export.csv", {
+          method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
+          body: JSON.stringify({ revision, ...(change === "filter-source" ? { query: { operationIdPrefix: "abcd1234" } } : {}) }),
+        });
+        expect(exported.status).toBe(change === "role" || change === "session" ? 401 : 409);
+        expect(exported.headers.get("content-type")).toContain("application/problem+json");
+        expect(await exported.text()).not.toContain("package-1");
+        expect(await new AuditLog(scope, fixture.runtime).listEvents({ action: "export-agent-inventory" })).toEqual([
+          expect.objectContaining({ status: "failed", metadata: expect.objectContaining({ source: "unified_agents", revision }) }),
+        ]);
+      } finally {
+        completing.mockRestore();
+      }
+    });
+
   it.each(["role", "session", "expiry", "deletion", "application-scope", "filter-source"] as const)(
     "denies export when %s changes during final audit without releasing rows", async change => {
       const principalId = `export-race-${change}`;
@@ -1052,7 +1184,7 @@ describe.sequential("packaged API/session contracts", () => {
       createdAt:null,createdBy:null,lastPublishedAt:null,sourceSystem:"power_platform",authoringTool:null,creatorType:"unknown",agentKind:"agent",lifecycle:"draft",
       identityConfidence:"exact_native",identifiers:[{kind:"power_platform_resource_id",value:"@native"}],provenance:{},details:{},unknownFieldCount:0,
     };
-    await repository.publish(inventoryScope,job.id,{resources:[malicious],totalRecords:1,pages:1,unknownFieldCount:0});
+    await repository.publish(inventoryScope,job.id,{resources:[malicious],queriedTypes:["microsoft.copilotstudio/agents"],environmentScope:null,totalRecords:1,pages:1,unknownFieldCount:0});
     const snapshotId=(await repository.getJob(inventoryScope,job.id))!.snapshotId!;
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(new AppError(502,"provider_error","provider unavailable"));
     try {

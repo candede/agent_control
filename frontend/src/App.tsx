@@ -18,7 +18,7 @@ import {
   blockAgent,
   blockAgents,
   downloadInventoryCsv,
-  downloadPackageInventoryCsv,
+  downloadUnifiedAgentInventoryCsv,
   getAgentDetails,
   getAgents,
   getUnifiedAgents,
@@ -66,8 +66,9 @@ import {
   type SessionUser,
   type UnifiedAgentInventoryPage,
   type UnifiedAgentRecord,
+  type UnifiedAgentExportQuery,
 } from "./api/client";
-import { downloadBlob } from "./agentExport";
+import { downloadBlob, isSavedAgentRevision, maximumUnifiedAgentExportRows, selectedAgentExportReferences, type UnifiedAgentExportScope } from "./agentExport";
 import "./App.css";
 import { isJobPolling, jobStatusMessage } from "./jobStatus";
 import { parseBulkRefSearch } from "./bulkRefSearch";
@@ -77,7 +78,8 @@ import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
 import { providerActionAllowed } from "./capabilityState";
-import { quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
+import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
+import { findUnifiedAgentRecord } from "./unifiedAgentIdentity";
 import { CapabilityGate } from "./components/CapabilityGate";
 import { CapabilityContext } from "./capabilityContext";
 import { CapabilityHealth, PermissionCenter } from "./components/PermissionCenter";
@@ -96,6 +98,7 @@ import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal"
 import { OfficialUsageHistoryPanel } from "./components/OfficialUsageHistoryPanel";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
+import { SavedAgentInventoryVerification } from "./components/SavedInventoryVerification";
 import { EnvironmentFilter } from "./components/EnvironmentFilter";
 import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
@@ -205,6 +208,7 @@ function App() {
   const [agents, setAgents] = useState<CopilotPackage[]>([]);
   const [agentPage, setAgentPage] = useState<PackagePage>();
   const [unifiedAgentPage, setUnifiedAgentPage] = useState<UnifiedAgentInventoryPage>();
+  const [unifiedAgentReadError, setUnifiedAgentReadError] = useState<string>();
   const [selectedUnifiedAgent, setSelectedUnifiedAgent] = useState<UnifiedAgentRecord>();
   const [selectedPowerPlatformTargets, setSelectedPowerPlatformTargets] = useState<Map<string, PowerPlatformResource>>(new Map());
   const [selectedPowerPlatformSnapshot, setSelectedPowerPlatformSnapshot] = useState<QuarantineSelectionSnapshot | null>(null);
@@ -212,7 +216,7 @@ function App() {
   const [agentEnvironmentFilter, setAgentEnvironmentFilter] = useState(initialAgentRoute.environmentId);
   const [requestedQuarantineJobId, setRequestedQuarantineJobId] = useState(initialAgentRoute.quarantineJobId);
   const [requestedInventorySnapshotId, setRequestedInventorySnapshotId] = useState(initialAgentRoute.inventorySnapshotId);
-  const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number }>();
+  const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number; verificationOnly: boolean }>();
   const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
   const [loadingAgents, setLoadingAgents] = useState(false);
@@ -259,14 +263,11 @@ function App() {
   const [agentDetailError, setAgentDetailError] = useState<string>();
   const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
   const [exportingCsv, setExportingCsv] = useState(false);
+  const [agentExportError, setAgentExportError] = useState<{ message: string; reloadRequired: boolean }>();
   const [exportingPowerPlatformCsv, setExportingPowerPlatformCsv] = useState(false);
   const [refreshingPowerPlatformAgents, setRefreshingPowerPlatformAgents] = useState(false);
   const [powerPlatformAgentRefreshJob, setPowerPlatformAgentRefreshJob] = useState<InventoryRefreshJob>();
   const [agentReloadRevision, setAgentReloadRevision] = useState(0);
-  const [exportProgress, setExportProgress] = useState(0);
-  const [exportProgressTotal, setExportProgressTotal] = useState(0);
-  const [exportProgressMode, setExportProgressMode] =
-    useState<ExportMode>("full");
   const [officialUsageAggregate, setOfficialUsageAggregate] =
     useState<OfficialUsageAggregateView>();
   const [officialUsageAggregateSetId, setOfficialUsageAggregateSetId] =
@@ -306,9 +307,11 @@ function App() {
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
   const agentDetailAbortController = useRef<AbortController | undefined>(undefined);
+  const unifiedAgentDetailPage = useRef<UnifiedAgentInventoryPage | undefined>(undefined);
   const agentListRequestId = useRef(0);
   const agentListAbortController = useRef<AbortController | undefined>(undefined);
   const forceCurrentAgentReload = useRef(false);
+  const verificationOnlyAgentReload = useRef(false);
   const bulkJobPollRequestId = useRef(0);
   const packageRefreshRequestId = useRef(0);
   const identityBackfills = useRef(new Set<string>());
@@ -375,6 +378,7 @@ function App() {
     agentDetailAbortController.current?.abort();
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
+    verificationOnlyAgentReload.current = false;
     bulkJobPollRequestId.current += 1;
     packageRefreshRequestId.current += 1;
     inventoryRefreshRequestId.current += 1;
@@ -387,6 +391,7 @@ function App() {
       setAgents([]);
       setAgentPage(undefined);
       setUnifiedAgentPage(undefined);
+      setUnifiedAgentReadError(undefined);
       setSelectedUnifiedAgent(undefined);
       setSelectedPowerPlatformTargets(new Map());
       setSelectedPowerPlatformSnapshot(null);
@@ -586,21 +591,16 @@ function App() {
   }, [activeView, officialUsageReportSetId, reportActivityWindowDays, requestedOfficialUsageStagingId]);
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId || selectedUnifiedAgent?.id === requestedAgentDetailId || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
-    const exact = unifiedAgentPage?.value.find(record =>
-      record.id === requestedAgentDetailId ||
-      record.packages.some(item => item.id === requestedAgentDetailId));
-    const legacyPowerPlatform = !exact && agentEnvironmentFilter
-      ? unifiedAgentPage?.value.filter(record =>
-          record.powerPlatformResource?.nativeId === requestedAgentDetailId
-          && record.environmentId === agentEnvironmentFilter) ?? []
-      : [];
-    const unified = exact ?? (legacyPowerPlatform.length === 1 ? legacyPowerPlatform[0] : undefined);
+    if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
+      || (selectedUnifiedAgent?.id === requestedAgentDetailId && unifiedAgentDetailPage.current === unifiedAgentPage)
+      || agentDetail?.id === requestedAgentDetailId || loadingAgentDetailId === requestedAgentDetailId) return;
+    const unified = findUnifiedAgentRecord(unifiedAgentPage?.value ?? [], requestedAgentDetailId, agentEnvironmentFilter);
     if (unified) {
       const requestId = ++agentDetailRequestId.current;
       let active = true;
       void Promise.resolve().then(() => {
         if (!active || requestId !== agentDetailRequestId.current) return;
+        unifiedAgentDetailPage.current = unifiedAgentPage;
         setSelectedUnifiedAgent(unified);
         setRequestedAgentDetailId(unified.id);
         setAgentDetail(undefined);
@@ -616,24 +616,30 @@ function App() {
         ?? { source: "graph_packages" as const, packageId: requestedAgentDetailId };
       const resolved = await getUnifiedAgents({ recordId: unifiedAgentRecordId(target) }, { signal: controller.signal });
       if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
-      if (resolved.count > 1) throw new Error("The agent link is ambiguous; select an exact source-qualified agent.");
+      if (resolved.count > 1 || resolved.value.length > 1) throw new Error("The agent link is ambiguous; select an exact source-qualified agent.");
       if (resolved.value.length === 1) {
+        unifiedAgentDetailPage.current = unifiedAgentPage;
         setSelectedUnifiedAgent(resolved.value[0]);
         setRequestedAgentDetailId(resolved.value[0].id);
         setAgentDetail(undefined);
         return;
       }
-      if (target.source !== "graph_packages") throw new Error("The exact Power Platform agent is not available in the current saved inventory. Refresh Power Platform agents and retry.");
+      if (target.source !== "graph_packages") throw new Error("The exact agent is not available in the current saved inventory. Refresh saved agent inventory and retry.");
       const detail = await getAgentDetails(target.packageId, { signal: controller.signal });
-      if (!controller.signal.aborted && requestId === agentDetailRequestId.current) setAgentDetail(detail);
+      if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
+        setSelectedUnifiedAgent(undefined);
+        setAgentDetail(detail);
+        setRequestedAgentDetailId(detail.id);
+      }
     }).catch(requestError => {
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
+        setSelectedUnifiedAgent(undefined);
         setRequestedAgentDetailId(undefined);
         setAgentDetailError(errorMessage(requestError));
       }
     });
     return () => controller.abort();
-  }, [activeView, agentDetail?.id, agentEnvironmentFilter, loadingAgentDetailId, requestedAgentDetailId, selectedUnifiedAgent?.id, unifiedAgentPage?.value, user]);
+  }, [activeView, agentDetail?.id, agentEnvironmentFilter, loadingAgentDetailId, requestedAgentDetailId, selectedUnifiedAgent?.id, unifiedAgentPage, user]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && activeView !== "sync") || !requestedPackageRefreshJobId) {
@@ -817,36 +823,68 @@ function App() {
   }, [inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageReportSetId, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
 
   useEffect(() => {
-    if (!unifiedAgentPage || pendingPowerPlatformIds.size === 0) return;
-    const resolved = new Map<string, PowerPlatformResource>();
-    const unresolved = new Set(pendingPowerPlatformIds);
-    let snapshot: UnifiedAgentRecord["observations"]["powerPlatform"] = null;
-    for (const key of pendingPowerPlatformIds) {
-      const exact = unifiedAgentPage.value.find(record => record.id === key && record.powerPlatformResource);
-      const legacy = !exact && agentEnvironmentFilter
-        ? unifiedAgentPage.value.filter(record =>
-            record.powerPlatformResource?.nativeId === key
-            && record.powerPlatformResource.environmentId === agentEnvironmentFilter)
-        : [];
-      const record = exact ?? (legacy.length === 1 ? legacy[0] : undefined);
-      if (!record?.powerPlatformResource || !record.observations.powerPlatform) continue;
-      resolved.set(record.id, record.powerPlatformResource);
-      unresolved.delete(key);
-      snapshot = record.observations.powerPlatform;
-    }
-    if (resolved.size && snapshot) {
-      let active = true;
-      const selectedSnapshot = snapshot;
-      void Promise.resolve().then(() => {
-        if (!active) return;
-        setRequestedInventorySnapshotId(selectedSnapshot.snapshotId);
-        setSelectedPowerPlatformSnapshot(selectedSnapshot);
-        setSelectedPowerPlatformTargets(current => new Map([...current, ...resolved]));
-        setPendingPowerPlatformIds(unresolved);
-      });
-      return () => { active = false; };
-    }
-  }, [agentEnvironmentFilter, pendingPowerPlatformIds, unifiedAgentPage]);
+    if (!unifiedAgentPage || pendingPowerPlatformIds.size === 0 || !hasRole(user, "AgentControl.Admin") || activeView !== "agents") return;
+    const controller = new AbortController();
+    void Promise.all([...pendingPowerPlatformIds].map(async key => {
+      try {
+        const known = findUnifiedAgentRecord(unifiedAgentPage.value, key, agentEnvironmentFilter);
+        if (known) return { record: known };
+        const target = parseUnifiedAgentRecordId(key) ?? (agentEnvironmentFilter
+          ? { source: "power_platform" as const, nativeId: key, environmentId: agentEnvironmentFilter }
+          : undefined);
+        if (!target) throw new Error("An exact environment and native resource identity is required.");
+        const page = await getUnifiedAgents({ recordId: unifiedAgentRecordId(target) }, { signal: controller.signal });
+        if (page.count > 1 || page.value.length > 1) throw new Error("The bookmarked agent identity is ambiguous.");
+        if (page.value.length !== 1) throw new Error("The exact agent is unavailable in the current saved inventory.");
+        return { record: page.value[0] };
+      } catch (requestError) {
+        return { error: errorMessage(requestError) };
+      }
+    })).then(results => {
+      if (controller.signal.aborted) return;
+      const resolved = new Map(selectedPowerPlatformTargets);
+      let snapshot = selectedPowerPlatformSnapshot;
+      const failures: string[] = [];
+      for (const result of results) {
+        if (result.error !== undefined) {
+          failures.push(result.error);
+          continue;
+        }
+        const resource = result.record?.powerPlatformResource;
+        const observation = result.record?.observations.powerPlatform;
+        const reason = quarantineTargetReason(resource ?? undefined, observation ?? null);
+        if (!resource || !observation || reason) {
+          failures.push(reason ?? "An exact saved quarantine target is required.");
+          continue;
+        }
+        if ((requestedInventorySnapshotId && requestedInventorySnapshotId !== observation.snapshotId)
+          || (snapshot && snapshot.id !== observation.snapshotId)) {
+          failures.push("The saved inventory changed. Select the exact targets again from one current snapshot.");
+          continue;
+        }
+        const key = quarantineTargetKey(resource);
+        if (!resolved.has(key) && resolved.size >= 25) {
+          failures.push("Quarantine supports up to 25 exact targets in one selection.");
+          continue;
+        }
+        resolved.set(key, resource);
+        snapshot = observation;
+      }
+      setPendingPowerPlatformIds(new Set());
+      if (resolved.size && snapshot) {
+        setRequestedInventorySnapshotId(snapshot.id);
+        setSelectedPowerPlatformSnapshot(snapshot);
+        setSelectedPowerPlatformTargets(resolved);
+      }
+      if (failures.length) {
+        setSelectionRouteNotice({
+          tone: "error",
+          text: `Could not restore ${failures.length} bookmarked quarantine target${failures.length === 1 ? "" : "s"}: ${[...new Set(failures)].join(" ")}`,
+        });
+      }
+    });
+    return () => controller.abort();
+  }, [activeView, agentEnvironmentFilter, pendingPowerPlatformIds, requestedInventorySnapshotId, selectedPowerPlatformSnapshot, selectedPowerPlatformTargets, unifiedAgentPage, user]);
 
   useEffect(
     () => {
@@ -894,6 +932,9 @@ function App() {
   const canCollectIdentities = canReadSensitiveUsage
     && providerActionAllowed(capabilityState.views.find(view => view.definition.id === "graph.package.read.delegated"));
   const identitySnapshotId = savedAgentPageOwner?.principalKey === principalKey
+    && !savedAgentPageOwner.verificationOnly
+    && !loadingAgents
+    && !unifiedAgentReadError
     && unifiedAgentPage?.identityCollection?.pendingPackages
     && unifiedAgentPage.sources.powerPlatform.state !== "unavailable"
     ? unifiedAgentPage.sources.graphPackages.observation?.snapshotId : undefined;
@@ -1019,6 +1060,16 @@ function App() {
   }
 
   const displayedUnifiedAgents = unifiedAgentPage?.value ?? [];
+  const invalidMatchingPackageCount = unifiedAgentPage?.identityCollection?.invalidPackages ?? 0;
+  const pendingMatchingPackageCount = unifiedAgentPage?.identityCollection?.pendingPackages ?? 0;
+  const agentInventoryIssueSummary = [
+    unifiedAgentPage?.verification?.status === "needs_attention" ? "Saved inventory needs attention" : "",
+    unifiedAgentPage?.partial ? "Saved source limitations" : "",
+    pendingMatchingPackageCount > 0 ? `${pendingMatchingPackageCount.toLocaleString()} packages awaiting identity metadata` : "",
+    invalidMatchingPackageCount > 0
+      ? `${invalidMatchingPackageCount.toLocaleString()} package${invalidMatchingPackageCount === 1 ? "" : "s"} with invalid matching metadata`
+      : "",
+  ].filter(Boolean).join(" · ");
   const advancedFilterCount = countAdvancedAgentFilters({
     environmentId: agentEnvironmentFilter,
     publisher: publisherFilter,
@@ -1032,16 +1083,11 @@ function App() {
     hostFilter !== "all" ||
     effectivePlatformFilter !== "all" ||
     parseOptionalPositiveInteger(createdWithinDays) !== undefined;
-  const hasActivePackageFilters =
-    deferredQuery.trim().length > 0 ||
-    statusFilter !== "all" ||
-    publisherFilter !== "all" ||
-    availableToFilter !== "all" ||
-    hostFilter !== "all" ||
-    effectivePlatformFilter !== "all" ||
-    parseOptionalPositiveInteger(createdWithinDays) !== undefined;
-
-  const exportableAgentCount = agentPage?.count ?? unifiedAgentPage?.summary.graphOnly ?? 0;
+  const exportableAgentCount = unifiedAgentPage?.count ?? 0;
+  const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size;
+  const exportSelectionRestoring = pendingPowerPlatformIds.size > 0 || pendingStoredAgentSelectionCount !== undefined;
+  const agentExportRevision = isSavedAgentRevision(unifiedAgentPage?.revision) ? unifiedAgentPage.revision : undefined;
+  const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (unifiedAgentPage && !agentExportRevision));
   const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
     record => record.observations.powerPlatform,
   )?.observations.powerPlatform ?? null;
@@ -1055,6 +1101,7 @@ function App() {
     agentDetailAbortController.current?.abort();
     agentListRequestId.current += 1;
     agentListAbortController.current?.abort();
+    verificationOnlyAgentReload.current = false;
     bulkJobPollRequestId.current += 1;
     packageRefreshRequestId.current += 1;
     inventoryRefreshRequestId.current += 1;
@@ -1098,8 +1145,8 @@ function App() {
     setRefreshingAgents(false);
     setRecentlyChangedAgentIds(new Set());
     setExportingCsv(false);
-    setExportProgress(0);
-    setExportProgressTotal(0);
+    setAgentExportError(undefined);
+    setUnifiedAgentReadError(undefined);
     setBulkProgress(undefined);
     setBulkResult(undefined);
     setTrackedJob(undefined);
@@ -1132,7 +1179,24 @@ function App() {
     }
   }
 
+  function currentUnifiedAgentQuery(): UnifiedAgentExportQuery {
+    return {
+      ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
+      ...(agentEnvironmentFilter.trim() ? { environmentId: agentEnvironmentFilter.trim() } : {}),
+      ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
+      ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
+      ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
+      ...(hostFilter === "all" ? {} : { host: hostFilter }),
+      ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
+      ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+      sortBy: agentSortBy === "lastModifiedAt" ? "lastModifiedAt" : "displayName",
+      sortDirection: agentSortDirection,
+    };
+  }
+
   async function loadAgents(forceCurrentSnapshot = false) {
+    const verificationOnly = verificationOnlyAgentReload.current;
+    verificationOnlyAgentReload.current = false;
     const requestId = ++agentListRequestId.current;
     agentListAbortController.current?.abort();
     const controller = new AbortController();
@@ -1155,18 +1219,14 @@ function App() {
           sortDirection: agentSortDirection,
           limit: agentDisplayPageSize,
           offset: 0,
-        }, { signal: controller.signal }),
+        }, { signal: controller.signal }).catch(requestError => {
+          if (requestId === agentListRequestId.current && !controller.signal.aborted) {
+            setError(`Saved package summaries are unavailable: ${errorMessage(requestError)}`);
+          }
+          return undefined;
+        }),
         getUnifiedAgents({
-          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-          ...(agentEnvironmentFilter.trim() ? { environmentId: agentEnvironmentFilter.trim() } : {}),
-          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
-          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
-          ...(hostFilter === "all" ? {} : { host: hostFilter }),
-          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
-          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-          sortBy: agentSortBy === "lastModifiedAt" ? "lastModifiedAt" : "displayName",
-          sortDirection: agentSortDirection,
+          ...currentUnifiedAgentQuery(),
           limit: agentDisplayPageSize,
           offset: agentPageIndex * agentDisplayPageSize,
         }, { signal: controller.signal }),
@@ -1180,15 +1240,15 @@ function App() {
       if (requestId !== agentListRequestId.current || controller.signal.aborted) return;
       const lastPage = Math.max(Math.ceil(unifiedResponse.count / agentDisplayPageSize) - 1, 0);
       if (agentPageIndex > lastPage) {
+        if (verificationOnly) verificationOnlyAgentReload.current = true;
         setAgentPageIndex(lastPage);
         return;
       }
-      setAgents(response.value);
+      setAgents(response?.value ?? []);
       setAgentPage(response);
       setUnifiedAgentPage(unifiedResponse);
-      setSelectedUnifiedAgent(current =>
-        current ? unifiedResponse.value.find(record => record.id === current.id
-          || current.packages.some(item => record.packages.some(candidate => candidate.id === item.id))) ?? current : current);
+      setUnifiedAgentReadError(undefined);
+      setAgentExportError(current => current === agentExportError ? undefined : current);
       const latestPowerPlatformAgentJob = inventoryRefreshJobs?.value.find((job) =>
         job.requestedTypes.includes("microsoft.copilotstudio/agents"),
       );
@@ -1197,14 +1257,15 @@ function App() {
         setPowerPlatformAgentRefreshJob(current =>
           current === powerPlatformAgentRefreshJob ? latestPowerPlatformAgentJob : current);
       }
-      setSavedAgentPageOwner({ principalKey, requestId });
-      setAgentSnapshotId(response.snapshot?.id);
-      setLastAgentListRefreshAt(response.snapshot ? new Date(response.snapshot.observedAt) : undefined);
-      setPackageSnapshotExpiresAt(response.snapshot ? new Date(response.snapshot.expiresAt) : undefined);
+      setSavedAgentPageOwner({ principalKey, requestId, verificationOnly });
+      setAgentSnapshotId(response?.snapshot?.id);
+      setLastAgentListRefreshAt(response?.snapshot ? new Date(response.snapshot.observedAt) : undefined);
+      setPackageSnapshotExpiresAt(response?.snapshot ? new Date(response.snapshot.expiresAt) : undefined);
       agentDetailsCache.current.clear();
     } catch (requestError) {
       if (requestId === agentListRequestId.current && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
         setError(errorMessage(requestError));
+        setUnifiedAgentReadError(errorMessage(requestError));
       }
     } finally {
       if (requestId === agentListRequestId.current) setLoadingAgents(false);
@@ -1426,41 +1487,16 @@ function App() {
     }
   }
 
-  async function handleViewUnifiedAgentDetails(record: UnifiedAgentRecord) {
+  function handleViewUnifiedAgentDetails(record: UnifiedAgentRecord) {
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
-    const controller = new AbortController();
-    agentDetailAbortController.current = controller;
-    const owner = principalKey;
+    if (!ownsAgentFlowRequest(requestId, principalKey)) return;
+    unifiedAgentDetailPage.current = unifiedAgentPage;
+    setLoadingAgentDetailId(undefined);
     setAgentDetailError(undefined);
-    if (record.packages.length !== 1) {
-      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
-        setLoadingAgentDetailId(undefined);
-        setRequestedAgentDetailId(record.id);
-        setSelectedUnifiedAgent(record);
-      }
-      return;
-    }
-    const item = record.packages[0];
-    setLoadingAgentDetailId(item.id);
-    try {
-      const detail = withPackageSummaryFallback(
-        await getAgentDetails(item.id, { signal: controller.signal }),
-        item,
-      );
-      if (!ownsAgentDetailRequest(requestId, owner, controller.signal)) return;
-      agentDetailsCache.current.set(item.id, detail);
-      setRequestedAgentDetailId(record.id);
-      setSelectedUnifiedAgent(record);
-    } catch (requestError) {
-      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
-        setAgentDetailError(errorMessage(requestError));
-      }
-    } finally {
-      if (ownsAgentDetailRequest(requestId, owner, controller.signal)) {
-        setLoadingAgentDetailId(undefined);
-      }
-    }
+    setAgentDetail(undefined);
+    setRequestedAgentDetailId(record.id);
+    setSelectedUnifiedAgent(record);
   }
 
   async function refreshAccessDetails(id: string, requestId: number, deadline = Date.now() + foregroundJobPollBudgetMs) {
@@ -1567,52 +1603,59 @@ function App() {
   }
 
   function requestExportCsv() {
-    if (exportableAgentCount === 0 || exportingCsv) {
+    if (exportingCsv || loadingAgents) return;
+    if (!agentExportRevision || agentExportNeedsReload) {
+      setAgentExportError({ message: "Reload the saved agent inventory before exporting; a valid saved revision is required.", reloadRequired: true });
       return;
     }
-
     setExportChoiceOpen(true);
   }
 
-  async function handleExportCsv() {
-    if (exportableAgentCount === 0 || exportingCsv || !agentSnapshotId) {
+  async function handleExportCsv(scope: UnifiedAgentExportScope) {
+    if (exportingCsv) return;
+    const owner = principalKey;
+    if (!ownsSession(owner) || !hasRole(user, "AgentControl.Viewer")) return;
+    if (!agentExportRevision || agentExportNeedsReload) {
+      setAgentExportError({ message: "Reload the saved agent inventory before exporting; a valid saved revision is required.", reloadRequired: true });
+      return;
+    }
+    if (loadingAgents || deferredQuery !== query) {
+      setAgentExportError({ message: "Wait for the current saved agent filters to finish loading, then try again.", reloadRequired: false });
+      return;
+    }
+    if (scope === "matching" && (exportableAgentCount === 0 || exportableAgentCount > maximumUnifiedAgentExportRows)) {
+      setAgentExportError({ message: `Choose filters matching 1-${maximumUnifiedAgentExportRows.toLocaleString()} agents before exporting.`, reloadRequired: false });
+      return;
+    }
+    if (scope === "selected" && (selectedExportTargetCount === 0 || exportSelectionRestoring)) {
+      setAgentExportError({ message: "Select agents and wait for saved selections to finish restoring before exporting the selection.", reloadRequired: false });
       return;
     }
 
     setExportChoiceOpen(false);
-    setError(undefined);
+    setAgentExportError(undefined);
     setExportingCsv(true);
-    setExportProgressMode("fast");
-    setExportProgress(0);
-    setExportProgressTotal(exportableAgentCount);
-    const owner = principalKey;
-
     try {
-      const blob = await downloadPackageInventoryCsv({
-        snapshotId: agentSnapshotId,
-        filters: {
-          ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
-          ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
-          ...(publisherFilter === "all" ? {} : { publisher: publisherFilter }),
-          ...(availableToFilter === "all" ? {} : { availableTo: availableToFilter }),
-          ...(hostFilter === "all" ? {} : { host: hostFilter }),
-          ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
-          ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-          sortBy: agentSortBy,
-          sortDirection: agentSortDirection,
-        },
-      });
+      const query = currentUnifiedAgentQuery();
+      const blob = await downloadUnifiedAgentInventoryCsv(scope === "selected" ? {
+        revision: agentExportRevision,
+        recordIds: selectedAgentExportReferences(unifiedAgentPage?.value ?? [], selectedAgentIds, selectedPowerPlatformTargets.keys()),
+        query: { sortBy: query.sortBy, sortDirection: query.sortDirection },
+      } : { revision: agentExportRevision, query });
       if (!ownsSession(owner)) return;
-      setExportProgress(exportableAgentCount);
-      downloadBlob("package-inventory.csv", blob);
+      downloadBlob("agents.csv", blob);
     } catch (requestError) {
-      if (ownsSession(owner)) setError(errorMessage(requestError));
-    } finally {
       if (ownsSession(owner)) {
-        setExportingCsv(false);
-        setExportProgress(0);
-        setExportProgressTotal(0);
+        const invalidated = requestError instanceof ApiError && requestError.status === 409;
+        setAgentExportError({
+          message: invalidated
+            ? `The saved agent inventory changed or a selected reference is no longer available. Reload the saved inventory, review your selection, and try again. ${errorMessage(requestError)}`
+            : errorMessage(requestError),
+          reloadRequired: invalidated,
+        });
       }
+    } finally {
+      if (ownsSession(owner)) setExportingCsv(false);
     }
   }
 
@@ -2151,11 +2194,13 @@ function App() {
     setSelectionRouteNotice(undefined);
     const resource = record.powerPlatformResource;
     const observation = record.observations.powerPlatform;
+    const nativeKey = resource ? quarantineTargetKey(resource) : undefined;
     const canSelectQuarantine = Boolean(canOperate && resource && !quarantineTargetReason(resource, observation));
+    const quarantineSelected = nativeKey !== undefined && selectedPowerPlatformTargets.has(nativeKey);
     const ids = record.packages.map(item => item.id);
     const allSelected = ids.every(id => selectedAgentIds.has(id))
-      && (!canSelectQuarantine || selectedPowerPlatformTargets.has(record.id));
-    if (!allSelected && canSelectQuarantine && !selectedPowerPlatformTargets.has(record.id)) {
+      && (!canSelectQuarantine || quarantineSelected);
+    if (!allSelected && canSelectQuarantine && nativeKey && !quarantineSelected) {
       if (selectedPowerPlatformTargets.size >= 25) {
         setSelectionRouteNotice({ tone: "error", text: "Quarantine supports up to 25 selected agents. Clear an agent from the selection before adding another." });
         return;
@@ -2173,15 +2218,22 @@ function App() {
       }
       return next;
     });
-    if (canSelectQuarantine && resource && observation) {
-      setRequestedInventorySnapshotId(observation.snapshotId);
-      setSelectedPowerPlatformSnapshot(observation);
-      setSelectedPowerPlatformTargets(current => {
-        const next = new Map(current);
-        if (allSelected) next.delete(record.id);
-        else next.set(record.id, resource);
-        return next;
-      });
+    if (canSelectQuarantine && resource && observation && nativeKey) {
+      if (allSelected) {
+        setSelectedPowerPlatformTargets(current => {
+          const next = new Map(current);
+          next.delete(nativeKey);
+          return next;
+        });
+        if (selectedPowerPlatformTargets.size === 1) {
+          setSelectedPowerPlatformSnapshot(null);
+          setRequestedInventorySnapshotId(undefined);
+        }
+      } else if (!quarantineSelected) {
+        setRequestedInventorySnapshotId(observation.snapshotId);
+        setSelectedPowerPlatformSnapshot(observation);
+        setSelectedPowerPlatformTargets(current => new Map(current).set(nativeKey, resource));
+      }
     }
   }
 
@@ -2218,6 +2270,12 @@ function App() {
   function requestCurrentAgentReload() {
     forceCurrentAgentReload.current = true;
     setAgentReloadRevision(revision => revision + 1);
+  }
+
+  function verifySavedAgentInventory() {
+    verificationOnlyAgentReload.current = true;
+    setLoadingAgents(true);
+    requestCurrentAgentReload();
   }
 
   if (loadingSession) {
@@ -2380,6 +2438,9 @@ function App() {
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
           <AgentSyncTools
             inventory={unifiedAgentPage}
+            verifyingInventory={loadingAgents || deferredQuery !== query}
+            inventoryError={unifiedAgentReadError}
+            onVerifyInventory={hasRole(user, "AgentControl.Viewer") ? verifySavedAgentInventory : undefined}
             selectedPackageCount={selectedAgentIds.size}
             refreshingPackages={refreshingAgents}
             refreshingPowerPlatform={refreshingPowerPlatformAgents}
@@ -2436,37 +2497,37 @@ function App() {
               <span className="last-refresh" aria-live="polite">
                 {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
                   : lastAgentListRefreshAt
-                  ? `Last synced ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
+                  ? `Graph collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
                     : "No saved package observation. Open Data sync on the Sync tab to collect workspace data."}
               </span>
             </div>
             <div className="agent-catalog-actions">
-              {unifiedAgentPage?.partial ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentPage.errors.map(item => item.message).join(" ")}>Partial inventory · View sync details</button> : null}
-              <WorkbenchActionGate actionId="packages.export" compact><button
+              {!loadingAgents && !unifiedAgentReadError && agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentPage?.errors.map(item => item.message).join(" ") || agentInventoryIssueSummary}>{agentInventoryIssueSummary} · View sync details</button> : null}
+              <button
                 type="button"
                 className="secondary icon-button control-icon-button"
-                aria-label={exportingCsv ? `Exporting ${exportProgress} of ${exportableAgentCount} package records` : "Export package inventory CSV"}
-                title={exportingCsv ? `Exporting ${exportProgress}/${exportableAgentCount}` : "Export exact package inventory CSV"}
-                disabled={loadingAgents || exportingCsv || exportableAgentCount === 0}
+                aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
+                title={!agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
+                disabled={!canReadSensitiveUsage || loadingAgents || deferredQuery !== query || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
                 onClick={requestExportCsv}
               >
                 <ExportIcon />
-              </button></WorkbenchActionGate>
+              </button>
             </div>
           </div>
 
-          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult || exportingCsv) ? <BulkActions
+          <SavedAgentInventoryVerification inventory={unifiedAgentPage} loading={loadingAgents || deferredQuery !== query}
+            error={unifiedAgentReadError} onVerify={verifySavedAgentInventory} />
+          {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
+            <span>{agentExportError?.message ?? (unifiedAgentReadError
+              ? "The current saved agent inventory could not be loaded. Reload the saved inventory before exporting."
+              : "A saved agent inventory revision is unavailable. Reload the saved inventory before exporting.")}</span>
+            {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={requestCurrentAgentReload}>Reload saved agent inventory</button> : null}
+          </div> : null}
+          {exportingCsv ? <div className="report-status" role="status">Preparing agent inventory CSV. The server exports each resolved agent once.</div> : null}
+          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult) ? <BulkActions
             disabled={
               loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
-            }
-            activityProgress={
-              exportingCsv ? (
-                <ExportProgressMeter
-                  completed={exportProgress}
-                  mode={exportProgressMode}
-                  total={exportProgressTotal || exportableAgentCount}
-                />
-              ) : undefined
             }
             busyAction={busyBulkAction}
             progress={bulkProgress}
@@ -2617,10 +2678,8 @@ function App() {
             targets={[...selectedPowerPlatformTargets.values()]}
             variant="bulk"
             canManage={canOperate}
-            onClear={() => {
-              setSelectedPowerPlatformTargets(new Map());
-              setSelectedPowerPlatformSnapshot(null);
-            }}
+            pendingTargetCount={pendingPowerPlatformIds.size}
+            onClear={resetPowerPlatformSelection}
             initialJobId={requestedQuarantineJobId}
             onJobChange={job => setRequestedQuarantineJobId(job.id)}
           /> : null}
@@ -2642,6 +2701,7 @@ function App() {
                 packageSelectionAllowed
                 packageOperationsAllowed={canOperate}
                 quarantineSelectionAllowed={canOperate}
+                quarantineSelectionRestoring={pendingPowerPlatformIds.size > 0}
                 selectionDisabled={Boolean(busyBulkAction) || refreshingAgents}
                 environmentNames={agentEnvironmentNames}
                 onToggleSelection={toggleUnifiedAgentSelection}
@@ -2846,9 +2906,18 @@ function App() {
       {exportChoiceOpen ? (
         <ExportChoiceModal
           agentCount={exportableAgentCount}
-          isFiltered={hasActivePackageFilters}
+          isFiltered={hasActiveAgentFilters}
+          selectedTargetCount={selectedExportTargetCount}
+          selectionRestoring={exportSelectionRestoring}
+          disabled={loadingAgents || deferredQuery !== query || !agentExportRevision || agentExportNeedsReload}
           onCancel={() => setExportChoiceOpen(false)}
-          onExport={() => void handleExportCsv()}
+          onClearSelection={() => {
+            setSelectedAgentIds(new Set());
+            setPendingStoredAgentSelectionCount(undefined);
+            resetPowerPlatformSelection();
+            setSelectionRouteNotice(undefined);
+          }}
+          onExport={scope => void handleExportCsv(scope)}
         />
       ) : null}
 
@@ -2858,8 +2927,6 @@ function App() {
     </CapabilityContext>
   );
 }
-
-type ExportMode = "fast" | "full";
 
 export type BulkConfirmation = {
   action: AuditAction;
@@ -2956,40 +3023,6 @@ function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
     {loading ? <p role="status">Loading exact package…</p> : null}
     {error ? <p role="alert">{error}</p> : null}
   </section>;
-}
-
-function ExportProgressMeter({
-  completed,
-  mode,
-  total,
-}: {
-  completed: number;
-  mode: ExportMode;
-  total: number;
-}) {
-  const completedPercent =
-    total === 0 ? 100 : Math.round((completed / total) * 100);
-  const modeLabel = mode === "fast" ? "fast export" : "full export";
-
-  return (
-    <div
-      className="bulk-progress export-progress"
-      role="status"
-      aria-live="polite"
-    >
-      <div className="bulk-progress-header">
-        <strong>
-          Preparing {modeLabel}: {completed} of {total} agents
-        </strong>
-        <span>{completedPercent}%</span>
-      </div>
-      <progress value={completed} max={total || 1} />
-      <div className="bulk-progress-meta">
-        <span>{completed} finished</span>
-        <span>{Math.max(total - completed, 0)} remaining</span>
-      </div>
-    </div>
-  );
 }
 
 function AgentPageControls({
@@ -3211,13 +3244,21 @@ export function BulkConfirmModal({
 function ExportChoiceModal({
   agentCount,
   isFiltered,
+  selectedTargetCount,
+  selectionRestoring,
+  disabled,
   onCancel,
+  onClearSelection,
   onExport,
 }: {
   agentCount: number;
   isFiltered: boolean;
+  selectedTargetCount: number;
+  selectionRestoring: boolean;
+  disabled: boolean;
   onCancel: () => void;
-  onExport: () => void;
+  onClearSelection: () => void;
+  onExport: (scope: UnifiedAgentExportScope) => void;
 }) {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -3242,27 +3283,39 @@ function ExportChoiceModal({
       >
         <div>
           <p className="eyebrow">Export agents</p>
-          <h2 id="export-choice-title">Export authorized CSV</h2>
+          <h2 id="export-choice-title">Export agent inventory</h2>
         </div>
         <p>
-          Export {agentCount.toLocaleString()}{" "}
-          {isFiltered ? "filtered" : "loaded"} package records from the current saved
-          package snapshot. The server rechecks your current role and scope.
+          Download one CSV row per resolved agent, retaining all package IDs and states,
+          Power Platform configuration, and partial-inventory status. The server checks
+          your current authorization and saved inventory revision.
+          CSV generation is also bounded to 8 MB and 15 seconds; narrow filters or
+          reduce the selection if a limit is reached.
         </p>
         <div className="export-choice-grid">
-          <WorkbenchActionGate actionId="packages.export">
           <button
             type="button"
             className="secondary export-choice-card"
-            onClick={onExport}
+            disabled={disabled || agentCount === 0 || agentCount > maximumUnifiedAgentExportRows}
+            onClick={() => onExport("matching")}
           >
-            <strong>Download package inventory</strong>
-            <span>Exports only the exact filtered package IDs from the selected saved snapshot.</span>
-            <small>Formula-safe CSV with source, observation, and expiry fields.</small>
+            <strong>Download matching agents</strong>
+            <span>Export all {agentCount.toLocaleString()} {isFiltered ? "filtered" : "saved"} agents across all pages, using the current filters and sorting.</span>
+            <small>{agentCount > maximumUnifiedAgentExportRows ? "More than 5,000 agents match. Narrow the filters before exporting." : "Up to 5,000 agent rows; not limited to the displayed page."}</small>
           </button>
-          </WorkbenchActionGate>
+          <button
+            type="button"
+            className="secondary export-choice-card"
+            disabled={disabled || selectionRestoring || selectedTargetCount === 0}
+            onClick={() => onExport("selected")}
+          >
+            <strong>Download selected agents</strong>
+            <span>{selectedTargetCount.toLocaleString()} selected package/native references. The server resolves aliases and exports each agent once, with all its packages.</span>
+            <small>{selectionRestoring ? "Wait for saved selections to finish restoring." : "Current filters do not narrow this selection; current sorting is preserved. Up to 5,000 resolved agent rows."}</small>
+          </button>
         </div>
         <div className="confirm-actions">
+          {selectedTargetCount > 0 || selectionRestoring ? <button type="button" className="secondary" onClick={onClearSelection}>Clear selection</button> : null}
           <button type="button" className="secondary" onClick={onCancel}>
             Cancel
           </button>

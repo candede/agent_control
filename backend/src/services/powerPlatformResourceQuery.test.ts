@@ -70,6 +70,61 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(JSON.stringify(result)).not.toContain("unsupported-connector");
   });
 
+  it("retains raw authoring origin and GUID schema names without treating a declarative manifest as a bot", async () => {
+    const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
+      ...resource, name: nativeId, properties: {
+        environmentId: `Default-${resource.tenantId}`, schemaName: nativeId,
+        createdIn: "microsoft365CopilotAgentBuilder",
+      },
+    }] }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      nativeId, authoringTool: "Microsoft 365 Copilot Agent Builder", agentKind: "agent_builder_agent",
+      details: { schemaName: nativeId, createdIn: "microsoft365CopilotAgentBuilder" },
+    });
+    expect(result.resources[0].identifiers).not.toContainEqual(expect.objectContaining({ kind: "cds_bot_id" }));
+    expect(result.resources[0].provenance.createdIn.path).toBe("properties.createdIn");
+  });
+
+  it("keeps unknown authoring origins available for diagnostics instead of discarding their values", async () => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
+      ...resource, properties: { createdIn: "Future authoring service" },
+    }] }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      authoringTool: null, agentKind: "agent", details: { createdIn: "Future authoring service" },
+    });
+  });
+
+  it("rejects GUID casing aliases across pages but preserves distinct opaque native IDs", async () => {
+    const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const first = { ...resource, name: nativeId, properties: { environmentId: `Default-${resource.tenantId}` } };
+    const second = { ...first, name: nativeId.toUpperCase(), properties: { environmentId: `default-${resource.tenantId}` } };
+    const duplicate = vi.fn()
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 1, skipToken: "next", data: [first] }))
+      .mockResolvedValueOnce(Response.json({ totalRecords: 2, count: 1, resultTruncated: 0, data: [second] }));
+    await expect(new PowerPlatformResourceQueryClient(duplicate).query("opaque-token"))
+      .rejects.toMatchObject({ code: "provider_schema", diagnostics: { reason: "duplicate_identity" } });
+    const distinct = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 2, count: 2, resultTruncated: 0,
+      data: [{ ...first, name: "Opaque-A" }, { ...second, name: "opaque-a" }],
+    }));
+    expect((await new PowerPlatformResourceQueryClient(distinct).query("opaque-token")).resources).toHaveLength(2);
+  });
+
+  it("accepts case-equivalent GUID tenant and environment scope without broadening authorization", async () => {
+    const tenantId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const environmentId = `Default-${tenantId}`;
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
+      ...resource, tenantId: tenantId.toUpperCase(), properties: { environmentId: environmentId.toLowerCase() },
+    }] }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"], {
+      expectedTenantId: tenantId, environmentId,
+    });
+    expect(result.resources[0]).toMatchObject({ tenantId, environmentId: environmentId.toLowerCase() });
+  });
+
   it("uses documented POST paging and enumerates a complete result", async () => {
     const progress: unknown[] = [];
     const fetcher = vi.fn()

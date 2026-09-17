@@ -108,9 +108,9 @@ describe.sequential("Purview audit repository", () => {
       (id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
       VALUES(gen_random_uuid(),$1,$2,'audit-association',repeat('a',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`, [scope.tenantId, scope.resultScope.scopeId])).rows[0].id;
     const snapshot = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_inventory_snapshots
-      (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,coverage,observed_count,total_records,page_count,unknown_field_count)
+      (id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count)
       VALUES(gen_random_uuid(),$1,$2,$3,repeat('a',64),'full','["microsoft.copilotstudio/agents"]',$4,1,1,1,0) RETURNING id`,
-      [inventoryJob, scope.tenantId, scope.resultScope.scopeId, JSON.stringify(Array.from({ length: 11 }, () => ({ type: "fixture", status: "unknown", count: null })))])).rows[0].id;
+      [inventoryJob, scope.tenantId, scope.resultScope.scopeId, JSON.stringify(["microsoft.copilotstudio/agents"])])).rows[0].id;
     await fixture.operator.query(`INSERT INTO power_platform_inventory_resources
       (snapshot_id,tenant_id,principal_id,native_id,resource_type,environment_id,source_system,creator_type,agent_kind,lifecycle,identity_confidence,identifiers,provenance,details,unknown_field_count)
       VALUES($1,$2,$3,'inventory-agent','microsoft.copilotstudio/agents','environment-a','power_platform','unknown','copilot_studio_agent','unknown','exact_native',$4,'{}','{}',0)`,
@@ -123,7 +123,7 @@ describe.sequential("Purview audit repository", () => {
       record({ wrapperId: "copilot-agent", nativeEventId: "55555555-5555-4555-8555-555555555555", botId: null, agentId: "agent-a" }),
     ]));
     const values = (await repository.listRecords({ tenantId: scope.tenantId, resultScopes: [scope.resultScope],
-      inventoryIdentityScope: { principalId: scope.authorizationPrincipalId, roleScope: "full", resourceTypes: ["microsoft.copilotstudio/agents"] } } as never, job.id)).value;
+      inventoryIdentityScope: { principalId: scope.authorizationPrincipalId, resourceTypes: ["microsoft.copilotstudio/agents"] } } as never, job.id)).value;
     expect(values.find(value => value.wrapperId === "exact")?.association).toEqual({ status: "resolved", sourceSystem: "power_platform", nativeId: "inventory-agent", resourceType: "microsoft.copilotstudio/agents", environmentId: "environment-a", matchedKind: "cds_bot_id" });
     expect(values.find(value => value.wrapperId === "missing-env")?.association).toEqual({ status: "unresolved", reason: "missing_environment" });
     expect(values.find(value => value.wrapperId === "copilot-agent")?.association).toEqual({ status: "unresolved", reason: "no_documented_cross_source_relation" });

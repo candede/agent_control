@@ -1,9 +1,14 @@
 import type { InventorySnapshot, PowerPlatformResource } from "./api/client";
+import { unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
 
 export type QuarantineSelectionSnapshot = Pick<InventorySnapshot, "id" | "observedAt" | "expiresAt">;
 export type QuarantineSelectableTarget = Pick<PowerPlatformResource, "nativeId" | "type" | "displayName" | "environmentId" | "identifiers" | "details"> & {
   quarantineEligibility?: { eligible: boolean; reason?: string };
 };
+
+export function quarantineTargetKey(resource: Pick<QuarantineSelectableTarget, "nativeId" | "environmentId">) {
+  return unifiedAgentRecordId({ source: "power_platform", nativeId: resource.nativeId, environmentId: resource.environmentId });
+}
 
 export function quarantineTargetReason(resource: QuarantineSelectableTarget | undefined, snapshot: QuarantineSelectionSnapshot | null, now = Date.now()) {
   if (!resource || resource.type !== "microsoft.copilotstudio/agents") return "Only exact Copilot Studio agent inventory records support quarantine.";

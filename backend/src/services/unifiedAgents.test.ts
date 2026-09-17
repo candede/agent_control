@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { parse as parseCsv } from "csv-parse/sync";
 import { AppError } from "../errors.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { InventorySnapshot, PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { UnifiedAgentsService, type UnifiedAgentDependencies } from "./unifiedAgents.js";
+import { buildUnifiedAgentCsv } from "./unifiedAgentExport.js";
 
 const tenantId = "tenant-unified";
 const environmentA = "11111111-1111-4111-8111-111111111111";
@@ -77,6 +79,10 @@ function powerPlatformSnapshot(coverage: "covered" | "unknown" = "covered"): Inv
     unknownFieldCount: 0,
     observedAt: "2026-09-15T00:00:00.000Z",
     expiresAt: "2026-09-22T00:00:00.000Z",
+    verification: {
+      status: "verified", scope: "authorized_query", basis: "provider_total_and_saved_rows",
+      checkedAt: "2026-09-15T00:00:00.000Z", storedCount: 2, uniqueIdentityCount: 2, queriedTypes: ["microsoft.copilotstudio/agents"],
+    },
   };
 }
 
@@ -120,10 +126,90 @@ function dependencies(options: {
     },
     resolveLinks: resolvePackageAgentLinks,
     operationPackageIds: vi.fn(async () => []),
+    readRevision: vi.fn(async () => "a".repeat(64)),
   };
 }
 
 describe("UnifiedAgentsService", () => {
+  it("exports every matching logical row rather than just the visible page", async () => {
+    const packages = Array.from({ length: 301 }, (_, index) => packageValue(`package-${index}`, `Package ${index}`));
+    const service = new UnifiedAgentsService(dependencies({ packages, powerPlatformSnapshot: null }));
+    const scope = { tenantId, principalId: "viewer" };
+    expect((await service.list(scope, { limit: 10 })).value).toHaveLength(10);
+    const exported = await service.forExport(scope, "a".repeat(64));
+    expect(exported.value).toHaveLength(301);
+    expect(exported.count).toBe(301);
+    expect(exported.revision).toBe("a".repeat(64));
+  });
+
+  it("exports grouped capabilities with the unified environment filter and formula-safe labels", async () => {
+    const packages = [packageValue("linked-a", "Package", true), packageValue("linked-b-blocked", "Package", true), packageValue("unrelated", "Other")];
+    const service = new UnifiedAgentsService(dependencies({
+      packages, resources: [{ ...resource(environmentA), displayName: "=formula" }, resource(environmentB)],
+      environmentNames: { [environmentA]: "Production environment" },
+    }));
+    const inventory = await service.forExport({ tenantId, principalId: "viewer" }, "a".repeat(64), { environmentId: environmentA });
+    expect(inventory.count).toBe(1);
+    const csv = buildUnifiedAgentCsv(inventory, Date.now() + 15_000);
+    expect(csv.rowCount).toBe(1);
+    const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
+    expect(rows[0]).toMatchObject({
+      displayName: "'=formula", environmentId: environmentA, environmentName: "Production environment", nativeResourceId: "shared-native",
+    });
+    expect(JSON.parse(rows[0].packageIds)).toEqual(["linked-a", "linked-b-blocked"]);
+    expect(JSON.parse(rows[0].packageStates)).toMatchObject([
+      { packageId: "linked-a", isBlocked: false }, { packageId: "linked-b-blocked", isBlocked: true },
+    ]);
+    expect(csv.buffer.toString("utf8")).not.toContain("secret-principal");
+    expect(csv.buffer.toString("utf8")).not.toContain("Provider metadata");
+  });
+
+  it("deduplicates exact aliases into one export row and rejects absent selections or changed revisions", async () => {
+    const deps = dependencies({
+      packages: [packageValue("linked-a", "Package", true), packageValue("linked-b", "Package", true)],
+      resources: [resource(environmentA)],
+    });
+    const service = new UnifiedAgentsService(deps);
+    const scope = { tenantId, principalId: "viewer" };
+    const selected = await service.forExport(scope, "a".repeat(64), {}, [
+      "graph_packages:linked-a", "graph_packages:linked-b",
+      unifiedAgentRecordId({ source: "power_platform", environmentId: environmentA.toUpperCase(), nativeId: "shared-native" }),
+    ]);
+    expect(selected.count).toBe(1);
+    expect(selected.value[0].packages).toHaveLength(2);
+    await expect(service.forExport(scope, "a".repeat(64), {}, ["graph_packages:absent"])).rejects.toMatchObject({ code: "export_selection_changed" });
+    await expect(service.forExport(scope, "b".repeat(64))).rejects.toMatchObject({ code: "inventory_changed" });
+    await service.assertRevision(scope, "a".repeat(64));
+    deps.readRevision = vi.fn(async () => "b".repeat(64));
+    await expect(service.assertRevision(scope, "a".repeat(64))).rejects.toMatchObject({ code: "inventory_changed" });
+  });
+
+  it("rejects row and byte limit overflow instead of exporting a successful partial inventory", async () => {
+    const resources = Array.from({ length: 2_001 }, (_, index) => ({
+      ...resource(environmentA, `native-${index}`),
+      identifiers: [{ kind: "power_platform_resource_id" as const, value: `native-${index}` }],
+    }));
+    const service = new UnifiedAgentsService(dependencies({
+      packages: Array.from({ length: 3_000 }, (_, index) => packageValue(`package-${index}`, "Package")), resources,
+    }));
+    await expect(service.forExport({ tenantId, principalId: "viewer" }, "a".repeat(64))).rejects.toMatchObject({ code: "export_row_limit" });
+    const large = await new UnifiedAgentsService(dependencies({
+      packages: [{ ...packageValue("large", "Large"), publisher: "x".repeat(8_000_001) }],
+    })).list({ tenantId, principalId: "viewer" });
+    expect(() => buildUnifiedAgentCsv(large, Date.now() + 15_000)).toThrowError(expect.objectContaining({ code: "export_byte_limit" }));
+  });
+
+  it("never stamps expiring observations with the revision of a later source set", async () => {
+    const deps = dependencies({ packages: [packageValue("old-observation", "Old observation")] });
+    deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockResolvedValue("b".repeat(64));
+    await expect(new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "inventory_changed" });
+  });
+
+  it("does not export absent inventory as a successful empty collection", async () => {
+    const service = new UnifiedAgentsService(dependencies({ packageSnapshot: false, powerPlatformSnapshot: null }));
+    await expect(service.forExport({ tenantId, principalId: "viewer" }, "a".repeat(64))).rejects.toMatchObject({ code: "snapshot_unavailable" });
+  });
+
   it("merges production-shaped source records before counts and paging while keeping identical names separate", async () => {
     const published = {
       ...packageValue("package-a", "Clinical Treatment Plan"),
@@ -456,18 +542,21 @@ describe("UnifiedAgentsService", () => {
     }));
     const partial = await incompletePowerPlatform.list({ tenantId, principalId: "viewer" });
     expect(partial.sources.powerPlatform).toMatchObject({ state: "partial", error: { code: "coverage_unknown" } });
-    expect(partial.errors[0].message).toContain("no recognized Microsoft Entra inventory role evidence (wids)");
-    expect(partial.errors[0].message).toContain("sign in again, then refresh Power Platform inventory");
+    expect(partial.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
+    expect(partial.errors[0].message).not.toContain("wids");
     expect(partial.count).toBe(2);
   });
 
-  it.each(["full", "ai"] as const)("accepts proven agent coverage for %s roles without requiring every resource type", async roleScope => {
+  it.each(["full", "ai", "unknown"] as const)("accepts verified agent query evidence for %s role hints without requiring every resource type", async roleScope => {
     const result = await new UnifiedAgentsService(dependencies({
       resources: [resource(environmentA)],
       powerPlatformSnapshot: { ...powerPlatformSnapshot(), roleScope },
     })).list({ tenantId, principalId: "viewer" });
     expect(result.partial).toBe(false);
     expect(result.sources.powerPlatform).toMatchObject({ state: "available", error: null });
+    expect(result.verification).toMatchObject({
+      status: "verified", representedSourceCount: 1, uniqueSourceCount: 1, logicalAgentCount: 1,
+    });
     expect(result.count).toBe(1);
   });
 
@@ -477,19 +566,21 @@ describe("UnifiedAgentsService", () => {
       powerPlatformSnapshot: { ...powerPlatformSnapshot(), environmentScope: environmentA },
     })).list({ tenantId, principalId: "viewer" });
     expect(result.partial).toBe(true);
-    expect(result.errors[0].message).toContain("covers only one environment");
+    expect(result.errors[0].code).toBe("environment_scope_limited");
+    expect(result.errors[0].message).toContain("restricted to one environment");
     expect(result.errors[0].message).not.toContain("wids");
     expect(result.count).toBe(1);
   });
 
-  it("reports both environment restriction and missing role evidence for the same snapshot", async () => {
+  it("reports environment restriction and missing query evidence independently of role hints", async () => {
     const result = await new UnifiedAgentsService(dependencies({
       resources: [resource(environmentA)],
       powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), environmentScope: environmentA },
     })).list({ tenantId, principalId: "viewer" });
     expect(result.partial).toBe(true);
-    expect(result.errors[0].message).toContain("covers only one environment");
-    expect(result.errors[0].message).toContain("no recognized Microsoft Entra inventory role evidence (wids)");
+    expect(result.errors[0].message).toContain("restricted to one environment");
+    expect(result.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
+    expect(result.verification.status).toBe("needs_attention");
   });
 
   it("does not misdiagnose unknown type coverage as missing role evidence when the role is known", async () => {
@@ -498,8 +589,36 @@ describe("UnifiedAgentsService", () => {
       powerPlatformSnapshot: { ...powerPlatformSnapshot("unknown"), roleScope: "full" },
     })).list({ tenantId, principalId: "viewer" });
     expect(result.partial).toBe(true);
-    expect(result.errors[0].message).toContain("does not prove complete Copilot Studio agent coverage");
+    expect(result.errors[0].message).toContain("does not contain verified Copilot Studio agent collection evidence");
     expect(result.errors[0].message).not.toContain("wids");
+  });
+
+  it("verifies every source target before filtering and flags pending identity metadata separately", async () => {
+    const packages = [packageValue("linked-a", "Package", true), packageValue("linked-b", "Package", true), packageValue("other", "Other")];
+    const result = await new UnifiedAgentsService(dependencies({
+      packages, resources: [resource(environmentA), resource(environmentB)],
+    })).list({ tenantId, principalId: "viewer" }, { environmentId: environmentA, limit: 1 });
+    expect(result).toMatchObject({
+      count: 1, partial: false,
+      verification: {
+        status: "needs_attention", graphPackageCount: 3, powerPlatformAgentCount: 2,
+        representedSourceCount: 5, uniqueSourceCount: 5, logicalAgentCount: 3,
+        checks: { sourceScopes: true, sourceMemberships: true, packageMetadata: false, identityLinks: true },
+      },
+    });
+    const csv = parseCsv(buildUnifiedAgentCsv(result, Date.now() + 15_000).buffer, { bom: true, columns: true });
+    expect(csv[0]).toMatchObject({
+      inventoryVerificationStatus: "needs_attention", inventorySourceCount: "5",
+      inventoryUniqueSourceCount: "5", inventoryLogicalAgentCount: "3",
+    });
+  });
+
+  it("rejects repeated source identities instead of reporting a successful reconciliation", async () => {
+    const repeated = packageValue("repeated", "Agent");
+    await expect(new UnifiedAgentsService(dependencies({ packages: [repeated, repeated] }))
+      .list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "saved_source_invalid" });
+    await expect(new UnifiedAgentsService(dependencies({ resources: [resource(environmentA, botA), resource(environmentA.toUpperCase(), botA.toUpperCase())] }))
+      .list({ tenantId, principalId: "viewer" })).rejects.toMatchObject({ code: "saved_source_invalid" });
   });
 
   it("converts only bounded source-limit errors and propagates unexpected repository failures", async () => {

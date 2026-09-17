@@ -311,21 +311,21 @@ export class PackageInventoryRepository {
     };
   }
 
-  async readUnifiedSource(scope: PackageDataScope): Promise<UnifiedPackageSourceResult> {
+  async readUnifiedSource(scope: PackageDataScope, database: Pick<pg.Pool, "query"> = this.database): Promise<UnifiedPackageSourceResult> {
     validateScope(scope);
-    const snapshotResult = await this.database.query<SnapshotRow>(`SELECT * FROM package_inventory_snapshots
+    const snapshotResult = await database.query<SnapshotRow>(`SELECT * FROM package_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND scope_kind='broad'
         AND is_current AND expires_at>clock_timestamp()
       ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
     const snapshot = snapshotResult.rows[0];
     if (!snapshot) return { packages: [], observations: {}, snapshot: null };
-    const base = await this.database.query<ResourceRow>(`SELECT package_data FROM package_inventory_resources
+    const base = await database.query<ResourceRow & { native_id: string }>(`SELECT native_id,package_data FROM package_inventory_resources
       WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
       ORDER BY native_id COLLATE "C" LIMIT 5001`, [snapshot.id, scope.tenantId, scope.principalId]);
     if (base.rows.length > 5000) {
       throw new AppError(409, "source_result_limit", "Saved Graph package inventory exceeds the 5,000-row unified inventory limit.");
     }
-    const overlays = await this.database.query<{
+    const overlays = await database.query<{
       native_id: string;
       package_data: CopilotPackageDetail | null;
       snapshot_id: string;
@@ -349,7 +349,7 @@ export class PackageInventoryRepository {
     if (overlays.rows.length > 5000) {
       throw new AppError(409, "source_result_limit", "Saved exact Graph package observations exceed the 5,000-row unified inventory limit.");
     }
-    const details = await this.database.query<{
+    const details = await database.query<{
       native_id: string;
       package_data: CopilotPackageDetail;
       snapshot_id: string;
@@ -372,6 +372,28 @@ export class PackageInventoryRepository {
       ORDER BY native_id COLLATE "C" LIMIT 5001`, [scope.tenantId, scope.principalId]);
     if (details.rows.length > 5000) {
       throw new AppError(409, "source_result_limit", "Saved detailed Graph package observations exceed the 5,000-row unified inventory limit.");
+    }
+    if (base.rows.length !== snapshot.observed_count
+      || [...base.rows, ...overlays.rows, ...details.rows].some(row => row.package_data && row.package_data.id !== row.native_id)) {
+      throw packageVerificationFailed();
+    }
+    const snapshotIds = [...new Set([snapshot.id, ...overlays.rows.map(row => row.snapshot_id), ...details.rows.map(row => row.snapshot_id)])];
+    const verified = await database.query<{
+      id: string; observed_count: number; total_records: number; page_count: number; stored_count: number;
+    }>(`WITH counts AS (
+      SELECT snapshot_id,count(*)::int AS stored_count FROM package_inventory_resources
+      WHERE tenant_id=$1 AND principal_id=$2 AND snapshot_id=ANY($3::uuid[]) GROUP BY snapshot_id
+    )
+    SELECT saved.id,saved.observed_count,saved.total_records,saved.page_count,COALESCE(counts.stored_count,0) AS stored_count
+    FROM package_inventory_snapshots saved LEFT JOIN counts ON counts.snapshot_id=saved.id
+    WHERE saved.tenant_id=$1 AND saved.principal_id=$2 AND saved.token_mode='delegated'
+      AND saved.is_current AND saved.expires_at>clock_timestamp() AND saved.id=ANY($3::uuid[])`,
+    [scope.tenantId, scope.principalId, snapshotIds]);
+    if (verified.rows.length !== snapshotIds.length || verified.rows.some(row =>
+      row.stored_count !== row.observed_count || row.observed_count !== row.total_records
+      || !Number.isSafeInteger(row.total_records) || row.total_records < 0 || row.total_records > 5000
+      || !Number.isSafeInteger(row.page_count) || row.page_count < 1 || row.page_count > 100)) {
+      throw packageVerificationFailed();
     }
     const packages = new Map(base.rows.map(row => [row.package_data.id, row.package_data]));
     const observations: UnifiedPackageSourceResult["observations"] = Object.fromEntries(base.rows.map(row => [row.package_data.id, {
@@ -498,6 +520,11 @@ export class PackageInventoryRepository {
       ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId, snapshotId ?? null]);
     return rows[0];
   }
+}
+
+function packageVerificationFailed() {
+  return new AppError(409, "inventory_verification_failed",
+    "Saved Graph package inventory failed verification of collected totals or source identities. Refresh package inventory before using these snapshots.");
 }
 
 function validatePublication(job: JobRow, result: PackageScanResult) {

@@ -285,6 +285,7 @@ function LocalAuditLogView({
             <option value="export-audit-search">Export provider audit</option>
             <option value="view-hunting">View Defender hunting</option>
             <option value="export-hunting">Export Defender hunting</option>
+            <option value="export-agent-inventory">Export agent inventory</option>
             <option value="export-package-inventory">Export package inventory</option>
             <option value="export-power-platform-inventory">Export Power Platform inventory</option>
           </select>
@@ -689,6 +690,8 @@ function formatAuditAction(action: LocalAuditAction) {
       return "View Defender hunting";
     case "export-hunting":
       return "Export Defender hunting";
+    case "export-agent-inventory":
+      return "Export agent inventory";
     case "export-package-inventory":
       return "Export package inventory";
     case "export-power-platform-inventory":
