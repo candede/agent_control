@@ -169,12 +169,12 @@ The delivered adapter targets global `api.powerplatform.com` only. Sovereign-clo
 
 ### Verified Power Platform inventory
 
-A successful sync and a verified saved inventory are distinct measurable results. Sync completes only after validated provider enumeration and atomic publication. **Verify saved inventory** rereads the saved sources, checks actual stored rows and normalized identities against provider totals and captured request scope, and verifies that each collected source target appears exactly once in the unified view. The receipt covers the entire unfiltered inventory, not just the visible page. It also reports pending/invalid matching metadata and ambiguous/conflicting identities.
+A successful sync and a verified saved inventory are distinct measurable results. Sync completes only after validated provider enumeration and atomic publication. Saved inventory checks run automatically whenever saved inventory is loaded; no manual verification or administrator approval is required after sync. The optional **Verify saved inventory** action in **Sync > Advanced results** repeats those saved reads, checking actual stored rows and normalized identities against provider totals and captured request scope, and verifying that each collected source target appears exactly once in the unified view. The receipt covers the entire unfiltered inventory, not just the visible page. It also reports pending/invalid matching metadata and ambiguous/conflicting identities.
 
-To verify the result:
+For optional troubleshooting, open **Sync > Advanced results** (collapsed by default):
 
 1. Confirm the relevant sync run and its source jobs succeeded. Power Platform resource totals include all queried resource types, not just agents.
-2. Use **Verify saved inventory**. Check the stored/provider resource counts, page count, unique source memberships, and matching checks. A source accounting or saved-row mismatch fails explicitly; refresh the affected source rather than manually editing counts or role IDs.
+2. Inspect the automatic receipt, or use **Verify saved inventory** to repeat the saved checks. Check the stored/provider resource counts, page count, unique source memberships, and matching checks. A source accounting or saved-row mismatch fails explicitly; refresh the affected source rather than manually editing counts or role IDs.
 3. Review the actual queried types and environment scope. An environment-filtered snapshot remains limited; unqueried or role-filtered types are not presented as verified zeros. The absence of an environment filter means all environments were requested for the authenticated API query.
 4. Review source observation times separately from the verification time. Rechecking saved data is not a live provider refresh. Refresh the source when newer Microsoft data is needed; another clean resync is not necessary merely to verify an existing complete snapshot.
 

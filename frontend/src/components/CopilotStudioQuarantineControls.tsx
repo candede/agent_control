@@ -237,18 +237,28 @@ function StatusComparison({ status, resource, snapshot }: { status?: QuarantineS
 
 function QuarantineConfirmation({ preview, action, confirmed, busy, canSubmit, onConfirmed, onClose, onSubmit }: { preview: QuarantinePreview; action: QuarantineAction; confirmed: boolean; busy: boolean; canSubmit: boolean; onConfirmed: (value: boolean) => void; onClose: () => void; onSubmit: () => Promise<void> }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const dialogMounted = useRef(false);
   useEffect(() => {
     const element = dialog.current;
+    dialogMounted.current = true;
     if (typeof element?.showModal === "function") element.showModal();
     else element?.setAttribute("open", "");
-    return () => { if (element?.open && typeof element.close === "function") element.close(); };
+    return () => {
+      dialogMounted.current = false;
+      if (element?.open && typeof element.close === "function") element.close();
+    };
   }, []);
   function closeDialog() {
     if (typeof dialog.current?.close === "function") dialog.current.close();
     else { dialog.current?.removeAttribute("open"); onClose(); }
   }
-  return <dialog ref={dialog} className="quarantine-confirmation" aria-labelledby="quarantine-confirmation-title" onClose={onClose} onKeyDown={event => {
+  return <dialog ref={dialog} className="quarantine-confirmation" aria-labelledby="quarantine-confirmation-title" onClose={event => {
+    event.stopPropagation();
+    if (event.target === event.currentTarget && dialogMounted.current && !event.currentTarget.open) onClose();
+  }} onCancel={event => event.stopPropagation()} onKeyDown={event => {
+    if (event.key === "Escape") { event.stopPropagation(); return; }
     if (event.key !== "Tab") return;
+    event.stopPropagation();
     const controls = event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),a[href],[tabindex="0"]');
     const first = controls[0];
     const last = controls[controls.length - 1];

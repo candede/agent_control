@@ -98,7 +98,6 @@ import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal"
 import { OfficialUsageHistoryPanel } from "./components/OfficialUsageHistoryPanel";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
-import { SavedAgentInventoryVerification } from "./components/SavedInventoryVerification";
 import { EnvironmentFilter } from "./components/EnvironmentFilter";
 import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
@@ -430,14 +429,12 @@ function App() {
       agentDetailRequestId.current += 1;
       agentDetailAbortController.current?.abort();
       packageRefreshRequestId.current += 1;
-      inventoryRefreshRequestId.current += 1;
       setLoadingAgentDetailId(undefined);
       setBusyAgentId(undefined);
       setSingleAccessAgentDetail(undefined);
       setBulkAccessAgentIds(undefined);
       setBulkConfirmation(undefined);
       setRefreshingAgents(false);
-      setRefreshingPowerPlatformAgents(false);
       const view = parseWorkbenchView(window.location.pathname);
       if (view !== "agents") {
         setAgentDetail(undefined);
@@ -722,7 +719,7 @@ function App() {
       return;
     }
     const controller = new AbortController();
-    const requestId = ++inventoryRefreshRequestId.current;
+    const requestId = inventoryRefreshRequestId.current;
     const owner = principalKey;
     const jobId = powerPlatformAgentRefreshJob.id;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
@@ -765,7 +762,6 @@ function App() {
     return () => {
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);
-      if (requestId === inventoryRefreshRequestId.current) inventoryRefreshRequestId.current += 1;
     };
   }, [activeView, powerPlatformAgentRefreshJob?.id, powerPlatformAgentRefreshJob?.status, principalKey, refreshingPowerPlatformAgents]);
 
@@ -955,7 +951,6 @@ function App() {
   function navigateToView(view: WorkbenchViewId) {
     agentDetailRequestId.current += 1;
     agentDetailAbortController.current?.abort();
-    inventoryRefreshRequestId.current += 1;
     setLoadingAgentDetailId(undefined);
     setBusyAgentId(undefined);
     savedViewSearches.current.set(activeView, window.location.search);
@@ -966,7 +961,6 @@ function App() {
     setBulkAccessAgentIds(undefined);
     setBulkConfirmation(undefined);
     setExportChoiceOpen(false);
-    setRefreshingPowerPlatformAgents(false);
     setActiveView(view);
     const savedSearch = savedViewSearches.current.get(view) ?? "";
     const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
@@ -2263,8 +2257,7 @@ function App() {
 
   function ownsInventoryRefreshRequest(requestId: number, owner: string) {
     return inventoryRefreshRequestId.current === requestId
-      && ownsSession(owner)
-      && activeViewRef.current === "sync";
+      && ownsSession(owner);
   }
 
   function requestCurrentAgentReload() {
@@ -2502,7 +2495,7 @@ function App() {
               </span>
             </div>
             <div className="agent-catalog-actions">
-              {!loadingAgents && !unifiedAgentReadError && agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentPage?.errors.map(item => item.message).join(" ") || agentInventoryIssueSummary}>{agentInventoryIssueSummary} · View sync details</button> : null}
+              {!loadingAgents && (unifiedAgentReadError || agentInventoryIssueSummary) ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentReadError || unifiedAgentPage?.errors.map(item => item.message).join(" ") || agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
               <button
                 type="button"
                 className="secondary icon-button control-icon-button"
@@ -2516,8 +2509,6 @@ function App() {
             </div>
           </div>
 
-          <SavedAgentInventoryVerification inventory={unifiedAgentPage} loading={loadingAgents || deferredQuery !== query}
-            error={unifiedAgentReadError} onVerify={verifySavedAgentInventory} />
           {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
             <span>{agentExportError?.message ?? (unifiedAgentReadError
               ? "The current saved agent inventory could not be loaded. Reload the saved inventory before exporting."

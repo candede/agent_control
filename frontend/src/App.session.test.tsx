@@ -397,8 +397,12 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /1 package with invalid matching metadata.*View sync details/ }));
+    const issue = await screen.findByRole("button", { name: /Inventory needs attention.*Open Sync/ });
+    expect(issue).toHaveAttribute("title", expect.stringContaining("1 package with invalid matching metadata"));
+    await userEvent.click(issue);
     expect(window.location.pathname).toBe("/sync");
+    expect(screen.getByText("Advanced results").closest("details")).not.toHaveAttribute("open");
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText(/1 package has invalid saved matching metadata/)).toBeVisible();
     expect(screen.getByText("1 package identities checked; 0 still need collection.")).toBeVisible();
     expect(screen.getByText("Source-metadata links").nextElementSibling).toHaveTextContent(/^0$/);
@@ -406,6 +410,7 @@ describe("App session revalidation", () => {
     await userEvent.click(screen.getByRole("button", { name: "Select packages on Agents" }));
     await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await userEvent.click(screen.getByRole("button", { name: "Refresh matching details" }));
     await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
     expect(JSON.parse(String(refreshRequests(transport.fetchMock)[0][1]?.body))).toEqual({ ids: [agent.id], mode: "delegated" });
@@ -460,6 +465,7 @@ describe("App session revalidation", () => {
     expect(new URLSearchParams(window.location.search).getAll("selectedResource")).toEqual([]);
     expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await userEvent.click(screen.getByRole("button", { name: "Refresh matching details" }));
     await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
     expect(JSON.parse(String(refreshRequests(transport.fetchMock)[0][1]?.body))).toEqual({
@@ -802,7 +808,23 @@ describe("App session revalidation", () => {
     })).toBe(true));
   });
 
-  it("shows saved verification limitations on Agents while keeping provider collection controls on Sync", async () => {
+  it("keeps the verified Agents page focused on filters, agent rows and management without a diagnostic panel", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.getByRole("region", { name: "Filters" })).toBeVisible();
+    expect(screen.getByRole("searchbox", { name: "Search" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify saved inventory" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Inventory needs attention/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByText("Graph package targets")).not.toBeInTheDocument();
+    expect(screen.queryByText("Optional directory-role hint")).not.toBeInTheDocument();
+  });
+
+  it("shows only a concise issue notice on Agents and keeps troubleshooting collapsed on Sync", async () => {
     const transport = appTransport({
       initialRoles: ["AgentControl.Admin"],
       revalidatedRoles: ["AgentControl.Admin"],
@@ -823,13 +845,21 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("region", { name: "Source matching details" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Power Platform agent source" })).not.toBeInTheDocument();
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
-    expect(screen.getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Copilot Studio agent coverage is incomplete\./)).not.toBeInTheDocument();
+    const issue = screen.getByRole("button", { name: /Inventory needs attention.*Open Sync/ });
+    expect(issue).toBeVisible();
+    expect(issue).toHaveAttribute("title", "Copilot Studio agent coverage is incomplete.");
     expect(screen.queryByRole("button", { name: "Refresh agents" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
     expect(screen.getByRole("button", { name: "Block selected packages" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: /Saved source limitations.*View sync details/ }));
+    await userEvent.click(issue);
     expect(window.location.pathname).toBe("/sync");
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
+    expect(screen.getByText("Advanced results").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("region", { name: "Saved agent inventory verification" })).not.toBeVisible();
+    expect(screen.getByText("Inventory needs attention. Open Advanced results for details.")).toBeVisible();
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
     expect(screen.getByText("Source-metadata links")).toBeVisible();
     expect(screen.getByText(/1 published target selected/)).toBeVisible();
@@ -841,7 +871,7 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
   });
 
-  it.each(["agents", "sync"])("verifies saved inventory from %s with GET reads only and separate collection/check times", async view => {
+  it.each(["agents", "sync"])("offers saved-only verification in Sync advanced results when starting from %s", async view => {
     window.history.replaceState({}, "", `/${view}?q=Sensitive`);
     const page = verifiedSavedAgentPage();
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
@@ -856,7 +886,16 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
+    if (view === "agents") {
+      await screen.findByText(agent.displayName);
+      expect(screen.queryByRole("button", { name: "Verify saved inventory" })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    }
     await screen.findByText("Saved inventory verified");
+    expect(screen.getByText("Saved inventory verified")).not.toBeVisible();
+    const beforeExpansion = transport.fetchMock.mock.calls.length;
+    await userEvent.click(screen.getByText("Advanced results"));
+    expect(transport.fetchMock.mock.calls.slice(beforeExpansion).some(([, init]) => init?.method && init.method !== "GET")).toBe(false);
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     expect(receipt.getByText("Resources stored / provider total").nextElementSibling).toHaveTextContent("4,178 / 4,178");
     expect(receipt.getByText("Provider pages collected").nextElementSibling).toHaveTextContent("42");
@@ -890,6 +929,9 @@ describe("App session revalidation", () => {
       ? Response.json(page) : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await screen.findByText("Saved inventory verified");
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     expect(receipt.getByText("Logical agents").nextElementSibling).toHaveTextContent(/^1,561$/);
@@ -903,7 +945,7 @@ describe("App session revalidation", () => {
   });
 
   it.each([false, true])("keeps pending metadata visible without launching automatic provider backfill after Verify saved inventory (page correction: %s)", async correctPage => {
-    if (correctPage) window.history.replaceState({}, "", "/agents?q=Sensitive&page=2");
+    window.history.replaceState({}, "", correctPage ? "/sync?q=Sensitive&page=2" : "/sync?q=Sensitive");
     const page = verifiedSavedAgentPage();
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -925,6 +967,7 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
+    await userEvent.click(await screen.findByText("Advanced results"));
     await screen.findByText("Saved inventory verified");
     const before = transport.fetchMock.mock.calls.length;
     verificationRequested = true;
@@ -932,9 +975,13 @@ describe("App session revalidation", () => {
     await screen.findByText("Saved inventory needs attention");
     expect(screen.getByText("Package identity metadata still needs collection or repair.")).toBeVisible();
     expect(transport.fetchMock.mock.calls.slice(before).filter(([, init]) => init?.method === "POST")).toEqual([]);
+    expect(transport.fetchMock.mock.calls.slice(before)
+      .filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")
+      .map(([input]) => new URL(input, "http://localhost").searchParams.get("offset"))).toEqual(correctPage ? ["50", "0"] : ["0"]);
   });
 
   it("replaces a previous green receipt with explicit verification failure and permits a saved-only retry", async () => {
+    window.history.replaceState({}, "", "/sync?q=Sensitive");
     const page = verifiedSavedAgentPage();
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -944,6 +991,7 @@ describe("App session revalidation", () => {
       : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
+    await userEvent.click(await screen.findByText("Advanced results"));
     await screen.findByText("Saved inventory verified");
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     const before = transport.fetchMock.mock.calls.length;
@@ -952,15 +1000,24 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(receipt.getByRole("alert")).toHaveTextContent("Saved normalized identities do not match provider total."));
     expect(receipt.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(receipt.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    const issue = await screen.findByRole("button", { name: /Inventory needs attention.*Open Sync/ });
+    expect(issue).toHaveAttribute("title", expect.stringContaining("Saved normalized identities do not match provider total."));
     expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+    await userEvent.click(issue);
+    await userEvent.click(screen.getByText("Advanced results"));
+    const retryReceipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    await waitFor(() => expect(retryReceipt.getByRole("alert")).toHaveTextContent("Saved normalized identities do not match provider total."));
     fail = false;
-    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
-    await receipt.findByText("Saved inventory verified");
-    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await userEvent.click(retryReceipt.getByRole("button", { name: "Verify saved inventory" }));
+    await retryReceipt.findByText("Saved inventory verified");
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled());
     expect(transport.fetchMock.mock.calls.slice(before).some(([, init]) => init?.method && init.method !== "GET")).toBe(false);
   });
 
   it("does not let a late saved verification restore protected receipts after session revalidation", async () => {
+    window.history.replaceState({}, "", "/sync?q=Sensitive");
     const page = verifiedSavedAgentPage();
     const transport = appTransport({ revalidatedRoles: [], unifiedResponse: page });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -975,6 +1032,7 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
+    await userEvent.click(await screen.findByText("Advanced results"));
     await screen.findByText("Saved inventory verified");
     deferNextRead = true;
     await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
@@ -1057,12 +1115,12 @@ describe("App session revalidation", () => {
     expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
   });
 
-  it("keeps a restored unified agent detail open after the saved inventory resolves", async () => {
+  it.each([false, true])("keeps a restored unified agent detail open after the saved inventory resolves (Strict Mode: %s)", async reactStrictMode => {
     const detailId = unifiedPage.value[0].id;
     window.history.replaceState({}, "", `/agents?detail=${encodeURIComponent(detailId)}`);
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
-    render(<App />);
+    render(<App />, { reactStrictMode });
     const dialog = await screen.findByRole("dialog", { name: agent.displayName });
     expect(within(dialog).getByText("Agent details")).toBeInTheDocument();
     await act(async () => { await Promise.resolve(); });
@@ -1667,6 +1725,7 @@ describe("App session revalidation", () => {
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await screen.findByRole("button", { name: "Export PP agent inventory CSV" });
     await waitFor(() => expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Export PP agent inventory CSV" }));
@@ -1732,6 +1791,7 @@ describe("App session revalidation", () => {
 
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await screen.findByRole("button", { name: "Refresh PP agent inventory" });
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh PP agent inventory" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Refresh PP agent inventory" }));
@@ -1743,8 +1803,210 @@ describe("App session revalidation", () => {
         types: ["microsoft.copilotstudio/agents"],
       }),
     )).toBe(true));
-    expect(await screen.findByText(/Latest agent refresh: succeeded/)).toBeInTheDocument();
+    expect(await screen.findByText(/Latest agent refresh: succeeded/)).toBeVisible();
     expect(screen.getByRole("heading", { name: "Sync history" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["refresh", "tab"],
+    ["resume", "tab"],
+    ["refresh", "history"],
+    ["resume", "history"],
+  ] as const)(
+    "retains a pending Power Platform %s across %s navigation and accepts completion away from Sync",
+    async (action, navigation) => {
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let currentJob = inventoryRefreshJob(action === "resume" ? "waiting_authorization" : "succeeded", "previous-job");
+      const requestPath = action === "refresh"
+        ? "/api/inventory/refresh-jobs"
+        : `/api/inventory/refresh-jobs/${currentJob.id}/resume`;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === requestPath && init?.method === "POST") return pending.promise;
+        if (input === "/api/inventory/refresh-jobs") {
+          return Response.json({ value: [currentJob], lastAttemptAt: null, lastSuccessAt: null });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+
+      async function navigate(view: "agents" | "sync") {
+        if (navigation === "tab") {
+          await userEvent.click(screen.getByRole("button", { name: view === "agents" ? "Agents" : /^Sync/ }));
+        } else {
+          act(() => {
+            window.history.pushState({}, "", `/${view}`);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+          });
+        }
+        if (view === "sync") await userEvent.click(await screen.findByText("Advanced results"));
+      }
+
+      await navigate("sync");
+      const start = screen.getByRole("button", { name: action === "resume" ? "Resume PP agent refresh" : "Refresh PP agent inventory" });
+      await waitFor(() => expect(start).toBeEnabled());
+      await userEvent.click(start);
+      expect(transport.fetchMock).toHaveBeenCalledWith(requestPath, expect.objectContaining({ method: "POST" }));
+
+      await navigate("agents");
+      await navigate("sync");
+      const refresh = screen.getByRole("button", { name: "Refreshing PP agents..." });
+      expect(refresh).toBeDisabled();
+      await userEvent.click(refresh);
+      if (action === "resume") {
+        const resume = screen.getByRole("button", { name: "Resume PP agent refresh" });
+        expect(resume).toBeDisabled();
+        await userEvent.click(resume);
+      }
+      expect(transport.fetchMock.mock.calls.filter(([path, init]) => path === requestPath && init?.method === "POST")).toHaveLength(1);
+
+      await navigate("agents");
+      const savedReads = () => transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/agent-inventory?")).length;
+      const readsBeforeCompletion = savedReads();
+      currentJob = {
+        ...inventoryRefreshJob("succeeded", action === "refresh" ? "new-job" : currentJob.id),
+        message: "Completed after navigation.",
+      };
+      await act(async () => pending.resolve(Response.json(currentJob)));
+      await waitFor(() => expect(savedReads()).toBeGreaterThan(readsBeforeCompletion));
+
+      await navigate("sync");
+      expect(screen.getByText(/Latest agent refresh: succeeded - Completed after navigation/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Refresh PP agent inventory" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Resume PP agent refresh" })).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([path, init]) => path === requestPath && init?.method === "POST")).toHaveLength(1);
+    },
+  );
+
+  it.each(["refresh", "resume"] as const)(
+    "reports a delayed Power Platform %s failure after leaving Sync and allows an explicit retry",
+    async action => {
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const previousJob = inventoryRefreshJob(action === "resume" ? "waiting_authorization" : "succeeded", "previous-job");
+      const requestPath = action === "refresh"
+        ? "/api/inventory/refresh-jobs"
+        : `/api/inventory/refresh-jobs/${previousJob.id}/resume`;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === requestPath && init?.method === "POST") return pending.promise;
+        if (input === "/api/inventory/refresh-jobs") {
+          return Response.json({ value: [previousJob], lastAttemptAt: null, lastSuccessAt: null });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
+      const actionName = action === "resume" ? "Resume PP agent refresh" : "Refresh PP agent inventory";
+      await waitFor(() => expect(screen.getByRole("button", { name: actionName })).toBeEnabled());
+      await userEvent.click(screen.getByRole("button", { name: actionName }));
+      await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+
+      await act(async () => pending.resolve(Response.json(
+        { code: "inventory_refresh_failed", detail: "Delayed Power Platform refresh failed." },
+        { status: 500 },
+      )));
+      expect(await screen.findByText("Delayed Power Platform refresh failed.")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
+      expect(screen.getByRole("button", { name: actionName })).toBeEnabled();
+      expect(transport.fetchMock.mock.calls.filter(([path, init]) => path === requestPath && init?.method === "POST")).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["refresh", "session revalidation", "success"],
+    ["refresh", "session revalidation", "failure"],
+    ["resume", "session revalidation", "success"],
+    ["resume", "session revalidation", "failure"],
+    ["refresh", "unmount", "success"],
+    ["refresh", "unmount", "failure"],
+    ["resume", "unmount", "success"],
+    ["resume", "unmount", "failure"],
+  ] as const)(
+    "discards a delayed Power Platform %s after %s (%s)",
+    async (action, lifecycle, outcome) => {
+      const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const previousJob = inventoryRefreshJob(action === "resume" ? "waiting_authorization" : "succeeded", "previous-job");
+      const requestPath = action === "refresh"
+        ? "/api/inventory/refresh-jobs"
+        : `/api/inventory/refresh-jobs/${previousJob.id}/resume`;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === requestPath && init?.method === "POST") return pending.promise;
+        if (input === "/api/inventory/refresh-jobs") {
+          return Response.json({ value: [previousJob], lastAttemptAt: null, lastSuccessAt: null });
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      const app = render(<App />);
+      await screen.findByText(agent.displayName);
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
+      const actionName = action === "resume" ? "Resume PP agent refresh" : "Refresh PP agent inventory";
+      await waitFor(() => expect(screen.getByRole("button", { name: actionName })).toBeEnabled());
+      await userEvent.click(screen.getByRole("button", { name: actionName }));
+
+      if (lifecycle === "session revalidation") {
+        await revalidateTransportSession(transport);
+        await screen.findByText(new RegExp(`Latest agent refresh: ${previousJob.status.replaceAll("_", " ")}`));
+      } else {
+        app.unmount();
+      }
+      const savedReads = () => transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/agent-inventory?")).length;
+      const readsBeforeResult = savedReads();
+      await act(async () => pending.resolve(outcome === "success"
+        ? Response.json({ ...inventoryRefreshJob("succeeded", previousJob.id), message: "Late refresh result." })
+        : Response.json({ code: "inventory_refresh_failed", detail: "Late refresh failure." }, { status: 500 })));
+      expect(savedReads()).toBe(readsBeforeResult);
+      expect(screen.queryByText(/Late refresh result|Late refresh failure/)).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([path, init]) => path === requestPath && init?.method === "POST")).toHaveLength(1);
+    },
+  );
+
+  it("ignores an aborted Power Platform poll after returning to Sync and receiving newer status", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const currentJob = inventoryRefreshJob("waiting_authorization", "running-job");
+    let polls = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === `/api/inventory/refresh-jobs/${currentJob.id}`) {
+        polls += 1;
+        return polls === 1 ? pending.promise : Response.json(currentJob);
+      }
+      if (input === "/api/inventory/refresh-jobs") {
+        return Response.json({ value: [inventoryRefreshJob("running", currentJob.id)], lastAttemptAt: null, lastSuccessAt: null });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await waitFor(() => expect(polls).toBe(1), { timeout: 3_000 });
+    const pollRequest = transport.fetchMock.mock.calls.find(([path]) => path === `/api/inventory/refresh-jobs/${currentJob.id}`);
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(pollRequest?.[1]?.signal?.aborted).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
+    expect(await screen.findByText(/Latest agent refresh: waiting authorization/, {}, { timeout: 3_000 })).toBeVisible();
+    expect(polls).toBe(2);
+
+    const savedReads = () => transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/agent-inventory?")).length;
+    const readsBeforeResult = savedReads();
+    await act(async () => pending.resolve(Response.json(inventoryRefreshJob("succeeded", currentJob.id))));
+    expect(screen.getByText(/Latest agent refresh: waiting authorization/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Resume PP agent refresh" })).toBeEnabled();
+    expect(savedReads()).toBe(readsBeforeResult);
   });
 
   it.each([
@@ -1786,6 +2048,7 @@ describe("App session revalidation", () => {
       await userEvent.paste("Sensitive");
       await waitFor(() => expect(delayedHistoryRequested).toBe(true));
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
       if (action !== "poll") {
         await userEvent.click(screen.getByRole("button", {
           name: action === "resume" ? "Resume PP agent refresh" : "Refresh PP agent inventory",
@@ -1829,6 +2092,7 @@ describe("App session revalidation", () => {
     expect(await screen.findByText(agent.displayName)).toBeVisible();
     expect(await screen.findByText(/Unable to load Power Platform agent refresh history: Synthetic inventory history failure/)).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByRole("heading", { name: "Agent inventory sources" })).toBeVisible();
     expect(screen.getByText("Total").nextElementSibling).toHaveTextContent("1");
   });
@@ -1924,6 +2188,7 @@ describe("App session revalidation", () => {
       await userEvent.type(search, "Fresh");
       expect(await screen.findByText(freshAgent.displayName)).toBeInTheDocument();
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
       await userEvent.click(screen.getByRole("button", {
         name: refreshKind === "matching details" ? "Refresh matching details" : "Refresh PP agent inventory",
       }));
@@ -1982,7 +2247,8 @@ describe("App session revalidation", () => {
     await userEvent.type(search, "Fresh");
     expect(await screen.findByText(freshAgent.displayName)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
-    expect(await screen.findByText(/Latest agent refresh: succeeded/, {}, { timeout: 4_000 })).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Advanced results"));
+    expect(await screen.findByText(/Latest agent refresh: succeeded/, {}, { timeout: 4_000 })).toBeVisible();
     expect(exactPolls).toBe(2);
     const inventoryRequests = transport.fetchMock.mock.calls
       .map(([path]) => new URL(String(path), "http://localhost"))
@@ -2118,6 +2384,7 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs?"))).toBe(false);
     await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(await screen.findByRole("button", { name: "Refresh agents" })).toBeEnabled();
   });
 
@@ -2157,6 +2424,7 @@ describe("App session revalidation", () => {
     } else {
       await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
       expect(screen.getByRole("button", { name: "Refresh agents" })).toBeDisabled();
     }
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
@@ -2177,6 +2445,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await screen.findByRole("button", { name: "Refresh agents" });
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh agents" })).toBeEnabled());
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
@@ -2188,6 +2457,7 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
     transport.failRefresh = false;
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await userEvent.click(screen.getByText("Advanced results"));
     await userEvent.click(screen.getByRole("button", { name: "Refresh agents" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh agents" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
@@ -2727,6 +2997,7 @@ describe("App session revalidation", () => {
       await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
     } else {
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByText("Advanced results"));
       const button = await screen.findByRole("button", { name: "Export PP agent inventory CSV" });
       await waitFor(() => expect(button).toBeEnabled());
       await userEvent.click(button);
@@ -2827,11 +3098,13 @@ describe("App session revalidation", () => {
         await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
       } else {
         await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+        await userEvent.click(screen.getByText("Advanced results"));
         await userEvent.click(await screen.findByRole("button", { name: "Export PP agent inventory CSV" }));
       }
       await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => isExport(path))).toHaveLength(1));
       await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
       await userEvent.click(screen.getByRole("button", { name: source === "unified" ? "Agents" : /^Sync/ }));
+      if (source !== "unified") await userEvent.click(screen.getByText("Advanced results"));
       expect(screen.getByRole("button", { name: source === "unified" ? /^Exporting/ : "Exporting PP agents..." })).toBeDisabled();
       await act(async () => pending.resolve(new Response("ID,Name\r\n")));
       expect(download).toHaveBeenCalledTimes(1);

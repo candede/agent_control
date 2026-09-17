@@ -96,9 +96,11 @@ async function expectAccessibleSyncPage(page: Page) {
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
-  expect(await page.locator(".sync-inventory-counts").evaluate(element => getComputedStyle(element).display)).toBe("grid");
-  if (page.viewportSize()!.width >= 1000) {
-    expect(await page.locator(".sync-inventory-counts").evaluate(element => getComputedStyle(element).gridTemplateColumns.split(/\s+/).length)).toBe(4);
+  const sourceCounts = page.locator(".sync-inventory-counts");
+  if (await sourceCounts.isVisible()) {
+    expect(await sourceCounts.evaluate(element => getComputedStyle(element).display)).toBe("grid");
+    expect(await sourceCounts.evaluate(element => getComputedStyle(element).gridTemplateColumns.split(/\s+/).length))
+      .toBe(page.viewportSize()!.width >= 1000 ? 4 : 2);
   }
   const bounds = await panel.boundingBox();
   expect(bounds).not.toBeNull();
@@ -128,6 +130,9 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(page.getByRole("button", { name: /^Data sync/ })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Source matching details" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Power Platform agent source" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Saved agent inventory verification" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Verify saved inventory" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Filters" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Exact package bulk actions" })).toHaveCount(0);
   await expect(page.locator(".bulk-panel, .selection-summary, .data-sync-toggle")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
@@ -136,7 +141,8 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(page).toHaveURL(/\/sync$/);
   await expect(syncButton).toHaveAttribute("aria-current", "page");
   await expect(panel.getByRole("button", { name: "Start initial sync", exact: true })).toBeEnabled();
-  await expect(page.getByRole("heading", { name: "Agent inventory sources" })).toBeVisible();
+  await expect(page.getByText("Advanced results", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Agent inventory sources" })).toBeHidden();
   await expect(page.getByRole("heading", { name: "Sync history" })).toBeVisible();
   await page.screenshot({ path: info.outputPath("sync-setup.png") });
   await panel.getByRole("button", { name: "Start initial sync", exact: true }).click();
@@ -201,6 +207,8 @@ test("a completed saved run opens without setup and progress clutter", async ({ 
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
   await expect(primarySync(page)).not.toContainText("Setup needed");
   await expect(panel.getByText("Sync complete", { exact: true })).toBeVisible();
+  await expect(panel.getByText(/Saved inventory checks run automatically. Optional diagnostics are in Advanced results/)).toBeVisible();
+  await expect(panel.getByText(/Verify saved inventory below/)).toHaveCount(0);
   await expect(panel.getByRole("progressbar")).toHaveCount(0);
   await expect(panel.getByText("Keep your saved data up to date")).toHaveCount(0);
   await expect(panel.getByText("Refresh saved data", { exact: true })).toHaveCount(1);
@@ -242,15 +250,24 @@ test("clean resync is separate from refresh and requires an informed confirmatio
   expect(fixture.unexpected).toEqual([]);
 });
 
-test("direct Sync navigation includes inventory tools and history restricted to sync sources", async ({ page }) => {
+test("direct Sync navigation keeps diagnostics optional and history restricted to sync sources", async ({ page }) => {
   const fixture = await mockSync(page, initial);
   await page.goto("/sync");
   await expect(primarySync(page)).toHaveAttribute("aria-current", "page");
   await expect(primarySync(page)).toContainText("Setup needed");
   await expect(page.getByRole("heading", { name: "Data sync", level: 2 })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start initial sync", exact: true })).toBeEnabled();
-  const inventory = page.getByRole("region", { name: "Agent inventory sources" });
+  const inventory = page.getByRole("region", { name: "Advanced results" });
   await expect(inventory).toBeVisible();
+  const disclosure = inventory.getByText("Advanced results", { exact: true });
+  await expect(inventory.locator("details")).not.toHaveAttribute("open");
+  await expect(inventory.getByRole("region", { name: "Source matching details" })).toBeHidden();
+  await expect(inventory.getByRole("region", { name: "Saved agent inventory verification" })).toBeHidden();
+  await disclosure.focus();
+  await page.keyboard.press("Enter");
+  await expect(inventory.locator("details")).toHaveAttribute("open");
+  await expect(inventory.getByRole("region", { name: "Saved agent inventory verification" })).toBeVisible();
+  await expect(inventory.getByText(/No manual verification or administrator approval is required after sync/)).toBeVisible();
   await expect(inventory.getByRole("region", { name: "Source matching details" })).toBeVisible();
   await expect(inventory.getByRole("region", { name: "Power Platform agent source" })).toBeVisible();
   await expect(inventory.getByRole("button", { name: "Refresh matching details" })).toBeDisabled();

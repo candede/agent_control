@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within, type RenderOptions } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -137,7 +137,12 @@ function capabilities(): CapabilityView[] {
   }));
 }
 
-function renderDetail(overrides: Partial<ComponentProps<typeof UnifiedAgentDetailModal>> = {}, views = capabilities(), actions = workbenchActions) {
+function renderDetail(
+  overrides: Partial<ComponentProps<typeof UnifiedAgentDetailModal>> = {},
+  views = capabilities(),
+  actions = workbenchActions,
+  options: Pick<RenderOptions, "reactStrictMode" | "wrapper"> = {},
+) {
   const props = {
     record, roles: user.roles, onTabChange: vi.fn(), onClose: vi.fn(), onInspectPackage: vi.fn(),
     onManagePackageAccess: vi.fn(), onSetPackageBlocked: vi.fn(), ...overrides,
@@ -146,15 +151,16 @@ function renderDetail(overrides: Partial<ComponentProps<typeof UnifiedAgentDetai
     views: nextViews, user: { ...user, roles: next.roles ?? props.roles }, now: Date.now(),
     loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
   }}><WorkbenchActionProvider value={actions}><UnifiedAgentDetailModal {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
-  const result = render(content());
+  const result = render(content(), options);
   return { ...result, props, update: (next: Partial<typeof props>, nextViews = views) => result.rerender(content(next, nextViews)) };
 }
 
-beforeEach(() => {
-  const snapshot = observedRecord().observations.powerPlatform!;
-  const related: InventorySourceAwareDetail = {
-    source: "power_platform", nativeId: record.powerPlatformResource.nativeId,
-    resourceType: record.powerPlatformResource.type, environmentId, snapshotId: snapshot.id,
+function sourceAwareDetail(observed = observedRecord()): InventorySourceAwareDetail {
+  const resource = observed.powerPlatformResource!;
+  const snapshot = observed.observations.powerPlatform!;
+  return {
+    source: "power_platform", nativeId: resource.nativeId,
+    resourceType: resource.type, environmentId: resource.environmentId, snapshotId: snapshot.id,
     observedAt: snapshot.observedAt, expiresAt: snapshot.expiresAt, identifiers: [],
     package: { status: "unmatched", reason: "No package association queried." },
     reports: { status: "unavailable", reason: "Usage reports are unavailable." },
@@ -162,12 +168,74 @@ beforeEach(() => {
     security: { status: "available", count: 0, value: [] },
     controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
   };
-  vi.spyOn(api, "getInventorySourceAwareDetail").mockResolvedValue(related);
+}
+
+function quarantinePreview(observed = observedRecord()): QuarantinePreview {
+  const resource = observed.powerPlatformResource!;
+  const snapshot = observed.observations.powerPlatform!;
+  return {
+    confirmationHash: "c".repeat(64),
+    statuses: [{
+      target: { resourceNativeId: resource.nativeId, displayName: observed.displayName, environmentId, botId },
+      direct: { isBotQuarantined: false, providerUpdatedAt: snapshot.observedAt, observedAt: snapshot.observedAt, correlationId: "status-1", source: "provider" },
+      inventory: { isQuarantined: null, quarantinedAt: null, observedAt: snapshot.observedAt, snapshotId: snapshot.id },
+      disagreesWithInventory: false,
+    }],
+    summary: {
+      risk: true, operation: "quarantine", provider: "Power Platform Copilot Studio", endpoint: "api-version=1 botQuarantine",
+      permission: "Delegated CopilotStudio.AdminActions.Invoke", targetCount: 1, targetSelectionHash: "d".repeat(64),
+      actor: { id: user.homeAccountId, displayName: user.displayName, username: user.username }, packageControlIndependent: true,
+      makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false,
+      targets: [{
+        resourceNativeId: resource.nativeId, displayName: observed.displayName, environmentId, botId,
+        currentState: false, requestedState: true, currentProviderUpdatedAt: snapshot.observedAt,
+        inventoryState: null, inventoryObservedAt: snapshot.observedAt,
+      }],
+      additionalTargetCount: 0,
+    },
+  };
+}
+
+function queueNativeCloseEvents() {
+  vi.spyOn(HTMLDialogElement.prototype, "close").mockImplementation(function (this: HTMLDialogElement) {
+    this.removeAttribute("open");
+    queueMicrotask(() => this.dispatchEvent(new Event("close")));
+  });
+}
+
+beforeEach(() => {
+  vi.spyOn(api, "getInventorySourceAwareDetail").mockResolvedValue(sourceAwareDetail());
   vi.spyOn(api, "previewQuarantine");
   vi.spyOn(api, "submitQuarantine");
 });
 
 describe("UnifiedAgentDetailModal", () => {
+  it.each(["synchronous", "queued"] as const)("keeps details open through Strict Mode replay with %s close events", async timing => {
+    if (timing === "queued") queueNativeCloseEvents();
+    const { props } = renderDetail({}, capabilities(), workbenchActions, { reactStrictMode: true });
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("dialog", { name: record.displayName })).toHaveAttribute("open");
+    expect(props.onClose).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Close unified agent details" }));
+    expect(props.onClose).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["padding", 120, 100, false],
+    ["scrollbar", 699, 200, false],
+    ["border", 100, 80, false],
+    ["left backdrop", 99, 100, true],
+    ["right backdrop", 701, 100, true],
+    ["top backdrop", 200, 79, true],
+    ["bottom backdrop", 200, 581, true],
+  ] as const)("distinguishes a %s click from the dialog content", (_area, clientX, clientY, shouldClose) => {
+    const { props } = renderDetail();
+    const dialog = screen.getByRole("dialog", { name: record.displayName });
+    vi.spyOn(dialog, "getBoundingClientRect").mockReturnValue(new DOMRect(100, 80, 600, 500));
+    fireEvent.mouseDown(dialog, { clientX, clientY });
+    expect(props.onClose).toHaveBeenCalledTimes(shouldClose ? 1 : 0);
+  });
+
   it("defaults to Overview with admin facts and collapsed technical evidence", async () => {
     const { props } = renderDetail({ roles: ["AgentControl.Viewer"], environmentNames: { "environment-1": "Production" } });
 
@@ -277,6 +345,7 @@ describe("UnifiedAgentDetailModal", () => {
     const diagnostic = screen.getByText("Invalid saved matching metadata.");
     expect(diagnostic).toBeVisible();
     expect(diagnostic.parentElement).toHaveTextContent("Select this agent on Agents");
+    expect(diagnostic.parentElement).toHaveTextContent("Sync > Advanced results");
     expect(diagnostic.parentElement).toHaveTextContent("Refresh matching details");
     expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Manage installation for Package one (package-1)" })).toBeEnabled();
@@ -452,6 +521,74 @@ describe("UnifiedAgentDetailModal", () => {
     expect(lookup).toHaveBeenCalledOnce();
   });
 
+  it.each(["success", "error"] as const)("ignores a late source lookup %s after changing exact targets", async outcome => {
+    const first = observedRecord();
+    const next: UnifiedAgentRecord = {
+      ...first, id: "unified-2",
+      powerPlatformResource: { ...first.powerPlatformResource!, nativeId: "agent-2" },
+    };
+    let finish!: () => void;
+    const pending = new Promise<InventorySourceAwareDetail>((resolve, reject) => {
+      finish = () => {
+        if (outcome === "error") reject(new Error("Previous target lookup failed"));
+        else resolve({
+          ...sourceAwareDetail(first),
+          reports: { status: "unavailable", reason: "Previous target reports" },
+        });
+      };
+    });
+    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
+      .mockReturnValueOnce(pending)
+      .mockResolvedValueOnce({
+        ...sourceAwareDetail(next),
+        reports: { status: "unavailable", reason: "Current target reports" },
+      });
+    const { update, unmount } = renderDetail({ record: first, activeTab: "reports" });
+    expect(lookup).toHaveBeenNthCalledWith(1, {
+      snapshotId: first.observations.powerPlatform!.snapshotId,
+      nativeId: first.powerPlatformResource!.nativeId,
+      type: first.powerPlatformResource!.type,
+      environmentId: first.powerPlatformResource!.environmentId,
+    }, { signal: expect.any(AbortSignal) });
+    update({ record: next });
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(await screen.findByText("Unavailable: Current target reports")).toBeVisible();
+    await act(async () => { finish(); });
+    expect(screen.getByText("Unavailable: Current target reports")).toBeVisible();
+    expect(screen.queryByText(/Previous target/)).not.toBeInTheDocument();
+    unmount();
+    expect(lookup.mock.calls[1][1]?.signal?.aborted).toBe(true);
+  });
+
+  it.each([0, 1, 20, 21])("distinguishes %s total activity associations from the bounded displayed rows", async count => {
+    const observed = observedRecord();
+    const shown = Math.min(count, 20);
+    const related = sourceAwareDetail(observed);
+    related.audit = {
+      status: "available", count,
+      value: Array.from({ length: shown }, (_, index) => ({
+        jobId: "audit-job", wrapperId: `wrapper-${index}`, nativeEventId: null,
+        observedAt: related.observedAt, operation: `Audit operation ${index}`,
+        resultStatus: null, correlationId: null, matchedKind: "cds_bot_id",
+      })),
+    };
+    related.security = {
+      status: "available", count,
+      value: Array.from({ length: shown }, (_, index) => ({
+        jobId: "security-job", snapshotId: "security-snapshot", nativeRecordId: `Security record ${index}`,
+        observedAt: related.observedAt, platform: null, lifecycleStatus: null, publishedStatus: null,
+        matchedKind: "entra_agent_id",
+      })),
+    };
+    vi.mocked(api.getInventorySourceAwareDetail).mockResolvedValue(related);
+    renderDetail({ record: observed, activeTab: "audit-security" });
+    const summary = count === 0 ? "Authorized and queried; no exact associated records."
+      : `${count} exact associated record${count === 1 ? "" : "s"}; showing ${shown}.`;
+    expect(await screen.findAllByText(summary)).toHaveLength(2);
+    expect(screen.queryAllByText(/^Audit operation \d+$/)).toHaveLength(shown);
+    expect(screen.queryAllByText(/^Security record \d+$/)).toHaveLength(shown);
+  });
+
   it("offers common Manage controls for every package and quarantine with exact target callbacks", async () => {
     const observed = observedRecord();
     observed.packages = [
@@ -605,27 +742,7 @@ describe("UnifiedAgentDetailModal", () => {
   it("retains explicit frozen-target confirmation and capability rechecks for quarantine", async () => {
     const observed = observedRecord();
     const snapshot = observed.observations.powerPlatform!;
-    const preview: QuarantinePreview = {
-      confirmationHash: "c".repeat(64),
-      statuses: [{
-        target: { resourceNativeId: record.powerPlatformResource.nativeId, displayName: record.displayName, environmentId, botId },
-        direct: { isBotQuarantined: false, providerUpdatedAt: snapshot.observedAt, observedAt: snapshot.observedAt, correlationId: "status-1", source: "provider" },
-        inventory: { isQuarantined: null, quarantinedAt: null, observedAt: snapshot.observedAt, snapshotId: snapshot.id },
-        disagreesWithInventory: false,
-      }],
-      summary: {
-        risk: true, operation: "quarantine", provider: "Power Platform Copilot Studio", endpoint: "api-version=1 botQuarantine",
-        permission: "Delegated CopilotStudio.AdminActions.Invoke", targetCount: 1, targetSelectionHash: "d".repeat(64),
-        actor: { id: user.homeAccountId, displayName: user.displayName, username: user.username }, packageControlIndependent: true,
-        makerBehavior: "Makers may still see and test this bot while connected channels cannot use it.", providerAtomicity: false,
-        targets: [{
-          resourceNativeId: record.powerPlatformResource.nativeId, displayName: record.displayName, environmentId, botId,
-          currentState: false, requestedState: true, currentProviderUpdatedAt: snapshot.observedAt,
-          inventoryState: null, inventoryObservedAt: snapshot.observedAt,
-        }],
-        additionalTargetCount: 0,
-      },
-    };
+    const preview = quarantinePreview(observed);
     vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
     vi.mocked(api.submitQuarantine).mockResolvedValue({
       id: "job-1", action: "quarantine", status: "succeeded", confirmationHash: preview.confirmationHash, confirmation: preview.summary,
@@ -655,6 +772,70 @@ describe("UnifiedAgentDetailModal", () => {
     }, expect.stringMatching(/^[0-9a-f-]{36}$/));
     expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
     expect(props.onManagePackageAccess).not.toHaveBeenCalled();
+    expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it.each(["close button", "cancel button", "Escape"] as const)("dismisses only the quarantine confirmation using its %s", async action => {
+    const observed = observedRecord();
+    const ancestorClose = vi.fn();
+    const ancestorCancel = vi.fn();
+    const ancestorKeyDown = vi.fn();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(quarantinePreview(observed));
+    const { props } = renderDetail({ record: observed, activeTab: "controls", externalAccessEditorOpen: true }, capabilities(), workbenchActions, {
+      wrapper: ({ children }) => <dialog open aria-label="Ancestor dialog" onClose={ancestorClose} onCancel={ancestorCancel} onKeyDown={ancestorKeyDown}>{children}</dialog>,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole<HTMLDialogElement>("dialog", { name: "Quarantine 1 agent" });
+    if (action === "Escape") {
+      fireEvent.keyDown(confirmation, { key: "Escape" });
+      expect(ancestorKeyDown).not.toHaveBeenCalled();
+      const cancel = new Event("cancel", { cancelable: true });
+      fireEvent(confirmation, cancel);
+      expect(cancel.defaultPrevented).toBe(false);
+      expect(ancestorCancel).not.toHaveBeenCalled();
+      act(() => confirmation.close());
+    } else {
+      await userEvent.click(within(confirmation).getByRole("button", {
+        name: action === "close button" ? "Close quarantine confirmation" : "Cancel",
+      }));
+    }
+    expect(confirmation).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: record.displayName })).toHaveAttribute("open");
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(ancestorClose).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
+  });
+
+  it("keeps quarantine keyboard focus inside confirmation without invoking ancestor focus traps", async () => {
+    const observed = observedRecord();
+    const ancestorKeyDown = vi.fn();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(quarantinePreview(observed));
+    renderDetail({ record: observed, activeTab: "controls" }, capabilities(), workbenchActions, {
+      wrapper: ({ children }) => <div onKeyDown={ancestorKeyDown}>{children}</div>,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    const first = within(confirmation).getByRole("button", { name: "Close quarantine confirmation" });
+    const last = within(confirmation).getByRole("button", { name: "Confirm quarantine" });
+    first.focus();
+    fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    expect(last).toHaveFocus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(first).toHaveFocus();
+    expect(ancestorKeyDown).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
+  });
+
+  it.each(["synchronous", "queued"] as const)("keeps quarantine confirmation open through Strict Mode replay with %s close events", async timing => {
+    if (timing === "queued") queueNativeCloseEvents();
+    const observed = observedRecord();
+    vi.mocked(api.previewQuarantine).mockResolvedValue(quarantinePreview(observed));
+    const { props } = renderDetail({ record: observed, activeTab: "controls" }, capabilities(), workbenchActions, { reactStrictMode: true });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    expect(screen.getByRole("dialog", { name: "Quarantine 1 agent" })).toHaveAttribute("open");
+    expect(props.onClose).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
   it("does not close the parent dialog on Escape while the access editor is open", () => {

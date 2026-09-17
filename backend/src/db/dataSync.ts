@@ -153,9 +153,10 @@ export class DataSyncRepository {
 
   async getLatestRun(scope: DataSyncScope): Promise<DataSyncRun | undefined> {
     validateScope(scope);
+    // Retrying a retained run updates its activity, not its original start time.
     const result = await this.database.query<{ id: string }>(`SELECT id FROM data_sync_runs
       WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
-      ORDER BY started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+      ORDER BY updated_at DESC,started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
     return result.rows[0] ? this.getRun(scope, result.rows[0].id) : undefined;
   }
 

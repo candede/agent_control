@@ -52,9 +52,50 @@ function inventory(agentCount: number | null = 1247): UnifiedAgentInventoryPage 
 }
 
 describe("AgentSyncTools", () => {
+  it("keeps diagnostics and source-specific actions collapsed until requested, without starting work", async () => {
+    const actions = props({ inventory: inventory() });
+    render(<AgentSyncTools {...actions} />);
+    const disclosure = screen.getByText("Advanced results");
+    expect(disclosure.closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("Saved inventory verified")).not.toBeVisible();
+    expect(screen.getByText("Source-metadata links")).not.toBeVisible();
+    expect(screen.getByRole("button", { name: "Verify saved inventory" })).not.toBeVisible();
+    await userEvent.click(disclosure);
+    expect(disclosure.closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(screen.getByText(/No manual verification or administrator approval is required after sync/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();
+    await userEvent.click(disclosure);
+    expect(screen.getByText("Saved inventory verified")).not.toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh agents" })).not.toBeVisible();
+    expect(actions.onVerifyInventory).not.toHaveBeenCalled();
+    expect(actions.onRefreshPackages).not.toHaveBeenCalled();
+    expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
+    expect(actions.onRefreshPowerPlatform).not.toHaveBeenCalled();
+    expect(actions.onResumePowerPlatform).not.toHaveBeenCalled();
+    expect(actions.onExportPowerPlatform).not.toHaveBeenCalled();
+    expect(actions.onOpenAgents).not.toHaveBeenCalled();
+  });
+
+  it.each(["needs_attention", "read_error"] as const)("keeps a concise %s notice visible when diagnostics are collapsed", state => {
+    const saved = inventory();
+    if (state === "needs_attention") saved.verification = createUnifiedVerification(saved.verification, { sourceScopes: false });
+    render(<AgentSyncTools {...props({
+      inventory: saved,
+      inventoryError: state === "read_error" ? "Saved total and normalized identities disagree." : undefined,
+    })} />);
+    const notice = screen.getByText("Inventory needs attention. Open Advanced results for details.");
+    expect(notice).toBeVisible();
+    expect(notice).toHaveAttribute("role", state === "read_error" ? "alert" : "status");
+    expect(screen.getByText("Advanced results").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("region", { name: "Saved agent inventory verification" })).not.toBeVisible();
+    expect(screen.getByRole("button", { name: "Verify saved inventory" })).not.toBeVisible();
+  });
+
   it.each([0, 1, 100, 101])("requires 1-100 exact targets for matching refresh, with %s selected", async count => {
     const actions = props({ selectedPackageCount: count });
     render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     const refresh = screen.getByRole("button", { name: "Refresh matching details" });
     if (count > 0 && count <= 100) {
       expect(refresh).toBeEnabled();
@@ -68,14 +109,16 @@ describe("AgentSyncTools", () => {
     expect(actions.onOpenAgents).toHaveBeenCalledOnce();
   });
 
-  it("disables competing Graph refreshes while a refresh is in progress", () => {
+  it("disables competing Graph refreshes while a refresh is in progress", async () => {
     render(<AgentSyncTools {...props({ selectedPackageCount: 1, refreshingPackages: true })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByRole("button", { name: "Refreshing agents" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
   });
 
-  it("verifies measured collection and 1x source accounting without a partial warning for absent wids", () => {
+  it("verifies measured collection and 1x source accounting without a partial warning for absent wids", async () => {
     render(<AgentSyncTools {...props({ inventory: inventory() })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("Saved inventory verified")).toBeVisible();
     expect(screen.queryByText(/partial unified inventory|partial inventory|coverage unknown|saved inventory needs attention/i)).not.toBeInTheDocument();
     expect(screen.getByText("Resources stored / provider total").nextElementSibling).toHaveTextContent("4,178 / 4,178");
@@ -95,7 +138,7 @@ describe("AgentSyncTools", () => {
     expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeEnabled();
   });
 
-  it("retains a real environment restriction and identity issues instead of explaining them away as hints", () => {
+  it("retains a real environment restriction and identity issues instead of explaining them away as hints", async () => {
     const saved = inventory();
     const observation = saved.sources.powerPlatform.observation;
     if (!observation || !("roleScope" in observation)) throw new Error("Expected Power Platform observation");
@@ -107,6 +150,7 @@ describe("AgentSyncTools", () => {
     saved.identityCollection = { checkedPackages: 1008, pendingPackages: 2, invalidPackages: 1 };
     saved.verification = createUnifiedVerification(saved.verification, { sourceScopes: false, packageMetadata: false, identityLinks: false });
     render(<AgentSyncTools {...props({ inventory: saved })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("Saved inventory needs attention")).toBeVisible();
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(screen.getByText(/The saved request is restricted to environment finance-only/)).toBeVisible();
@@ -120,6 +164,7 @@ describe("AgentSyncTools", () => {
     const saved = { ...inventory(), count: 1, offset: 50, limit: 1 };
     const actions = props({ inventory: saved });
     render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     expect(receipt.getByText("Logical agents").nextElementSibling).toHaveTextContent("1,561");
     expect(receipt.getByText(/all unfiltered saved records, not the current page or display filters/)).toBeVisible();
@@ -130,9 +175,10 @@ describe("AgentSyncTools", () => {
     expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
   });
 
-  it("does not present a previous green receipt as the latest pending or failed verification", () => {
+  it("does not present a previous green receipt as the latest pending or failed verification", async () => {
     const actions = props({ inventory: inventory() });
     const view = render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("Saved inventory verified")).toBeVisible();
     view.rerender(<AgentSyncTools {...actions} verifyingInventory />);
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
@@ -144,7 +190,7 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
     expect(screen.queryByText(/package identities checked;/)).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Saved total and normalized identities disagree.");
+    expect(within(screen.getByRole("region", { name: "Saved agent inventory verification" })).getByRole("alert")).toHaveTextContent("Saved total and normalized identities disagree.");
     expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();
   });
 
@@ -154,6 +200,7 @@ describe("AgentSyncTools", () => {
     saved.verification = createUnifiedVerification(saved.verification, { packageMetadata: false });
     const actions = props({ inventory: saved, selectedPackageCount: 2 });
     render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("1,010 package identities checked; 0 still need collection.")).toBeVisible();
     expect(screen.getByText("Source-metadata links").nextElementSibling).toHaveTextContent(/^690$/);
     const diagnostic = screen.getByText(/1 package has invalid saved matching metadata/);
@@ -168,19 +215,21 @@ describe("AgentSyncTools", () => {
     expect(actions.onRefreshMatchingDetails).toHaveBeenCalledOnce();
   });
 
-  it.each([undefined, 0])("does not invent invalid metadata diagnostics for an omitted or zero count (%s)", invalidPackages => {
+  it.each([undefined, 0])("does not invent invalid metadata diagnostics for an omitted or zero count (%s)", async invalidPackages => {
     const saved = inventory();
     saved.identityCollection = { checkedPackages: 1010, pendingPackages: 0, ...(invalidPackages === undefined ? {} : { invalidPackages }) };
     render(<AgentSyncTools {...props({ inventory: saved })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.queryByText(/invalid saved matching metadata/)).not.toBeInTheDocument();
   });
 
-  it.each([[null, "Not established"], [0, "0"]] as const)("does not turn unknown agent count %s into a proven zero", (count, text) => {
+  it.each([[null, "Not established"], [0, "0"]] as const)("does not turn unknown agent count %s into a proven zero", async (count, text) => {
     render(<AgentSyncTools {...props({ inventory: inventory(count) })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("Power Platform agents observed").nextElementSibling).toHaveTextContent(text);
   });
 
-  it("does not describe an agent-only snapshot as collection of all resource types", () => {
+  it("does not describe an agent-only snapshot as collection of all resource types", async () => {
     const saved = inventory();
     const observation = saved.sources.powerPlatform.observation;
     if (!observation || !("roleScope" in observation)) throw new Error("Expected a saved observation");
@@ -188,6 +237,7 @@ describe("AgentSyncTools", () => {
     observation.totalRecords = 1247;
     observation.verification = createInventoryVerification(1247);
     render(<AgentSyncTools {...props({ inventory: saved })} />);
+    await userEvent.click(screen.getByText("Advanced results"));
     expect(screen.getByText("Resources stored / provider total").nextElementSibling).toHaveTextContent("1,247 / 1,247");
     expect(screen.getByText("Actual resource types queried").nextElementSibling).toHaveTextContent(/^1$/);
     expect(screen.queryByText("All resource types collected")).not.toBeInTheDocument();

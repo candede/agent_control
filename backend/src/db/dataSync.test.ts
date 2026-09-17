@@ -122,6 +122,27 @@ describe.sequential("Data sync repository", () => {
       canRetry: true,
     });
   });
+
+  it("keeps a historical retry current through completion without reordering retained history", async () => {
+    const retryScope = { ...scope, principalId: "historical-retry-viewer" };
+    const older = await repository.submit(retryScope, { mode: "incremental", sources: ["users"] });
+    await repository.updateSource(retryScope, older.run.id, "users", {
+      status: "failed", message: "Retry required.", canRetry: true,
+    });
+    const newer = await repository.submit(retryScope, { mode: "incremental", sources: ["users"] });
+    await repository.updateSource(retryScope, newer.run.id, "users", {
+      status: "succeeded", count: 0, message: "Saved zero users.", canRetry: false,
+    });
+    expect((await repository.getLatestRun(retryScope))?.id).toBe(newer.run.id);
+
+    await repository.retry(retryScope, older.run.id, ["users"]);
+    expect(await repository.getLatestRun(retryScope)).toMatchObject({ id: older.run.id, status: "running" });
+    await repository.updateSource(retryScope, older.run.id, "users", {
+      status: "succeeded", count: 0, message: "Retry completed with zero users.", canRetry: false,
+    });
+    expect(await repository.getLatestRun(retryScope)).toMatchObject({ id: older.run.id, status: "completed" });
+    expect((await repository.listRuns(retryScope)).map(run => run.id)).toEqual([newer.run.id, older.run.id]);
+  });
 });
 
 function directoryUser(userPrincipalName: string): CopilotDirectoryUser {

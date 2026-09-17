@@ -21,6 +21,7 @@ export function SavedAgentInventoryVerification({
         <RefreshCw size={15} aria-hidden="true" />{loading ? "Verifying saved inventory..." : "Verify saved inventory"}
       </button>
     </div>
+    <p>Saved inventory is checked automatically. No manual verification or administrator approval is required after sync.</p>
     {loading ? <p role="status">Checking saved inventory. Any previous receipt is not the result of this check.</p>
       : error ? <p className="verification-attention" role="alert">Saved inventory verification failed. The previous receipt has not been reverified. {error}</p>
         : !receipt || !inventory ? <p role="status">Saved inventory verification is not available. Read the saved inventory to obtain a receipt.</p>
@@ -37,16 +38,22 @@ export function SavedAgentInventoryVerification({
             </dl>
             <ul className="verification-checks">
               <li>{receipt.checks.sourceScopes ? "Saved source query scopes verified." : "A saved source is missing or its collection scope is limited."}</li>
-              <li>{receipt.checks.packageMetadata ? "Package identity metadata checked and valid." : "Package identity metadata still needs collection or repair."}</li>
-              <li>{receipt.checks.identityLinks ? "No ambiguous or conflicting identity links." : "Ambiguous or conflicting identity links require review."}</li>
-              <li>{receipt.checks.sourceMemberships ? "Each available source target is represented exactly once." : "Source membership accounting is not verified."}</li>
+              <li>{inventory.sources.graphPackages.state === "unavailable"
+                ? "Package identity metadata is not established: the saved Graph source is unavailable."
+                : receipt.checks.packageMetadata ? "Package identity metadata checked and valid." : "Package identity metadata still needs collection or repair."}</li>
+              <li>{noSources
+                ? "Identity-link consistency is not established: no saved agent source is available."
+                : receipt.checks.identityLinks ? "No ambiguous or conflicting identity links." : "Ambiguous or conflicting identity links require review."}</li>
+              <li>{noSources
+                ? "Source membership accounting is not established: no saved agent source is available."
+                : receipt.checks.sourceMemberships ? "Each available source target is represented exactly once." : "Source membership accounting is not verified."}</li>
             </ul>
             {inventory.partial || inventory.errors.length > 0 ? <p className="verification-attention">
               <strong>Saved source limitations.</strong> {inventory.errors.map(item => item.message).join(" ")}
             </p> : null}
             <p>These counts cover all unfiltered saved records, not the current page or display filters. Logical grouping follows exact source evidence; this does not prove every source-only row is a different physical agent.</p>
             <dl className="verification-dates">
-              <Fact label="Saved data verified at"><time dateTime={receipt.checkedAt}>{savedInventoryTime(receipt.checkedAt)}</time></Fact>
+              <Fact label={receipt.status === "verified" ? "Saved data verified at" : "Saved data checked at"}><time dateTime={receipt.checkedAt}>{savedInventoryTime(receipt.checkedAt)}</time></Fact>
               <Fact label="Graph source collected at">{inventory.sources.graphPackages.observation
                 ? <time dateTime={inventory.sources.graphPackages.observation.observedAt}>{savedInventoryTime(inventory.sources.graphPackages.observation.observedAt)}</time>
                 : "Not available"}</Fact>

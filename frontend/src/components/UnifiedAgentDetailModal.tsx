@@ -56,6 +56,7 @@ export function UnifiedAgentDetailModal({
   externalAccessEditorOpen = false,
 }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const dialogMounted = useRef(false);
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
   const [relatedState, setRelatedState] = useState<RelatedState>();
   const selectedTab = tabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
@@ -77,9 +78,11 @@ export function UnifiedAgentDetailModal({
 
   useEffect(() => {
     const element = dialog.current;
+    dialogMounted.current = true;
     if (typeof element?.showModal === "function") element.showModal();
     else element?.setAttribute("open", "");
     return () => {
+      dialogMounted.current = false;
       if (element?.open && typeof element.close === "function") element.close();
     };
   }, []);
@@ -123,10 +126,17 @@ export function UnifiedAgentDetailModal({
       ref={dialog}
       className="inventory-detail-modal unified-agent-detail-modal"
       aria-labelledby="unified-agent-detail-title"
-      onClose={onClose}
-      onMouseDown={event => { if (event.target === event.currentTarget) close(); }}
+      onClose={event => {
+        // Native close events can arrive after Strict Mode has reopened the dialog.
+        if (event.target === event.currentTarget && dialogMounted.current && !event.currentTarget.open) onClose();
+      }}
+      onMouseDown={event => {
+        if (event.target !== event.currentTarget) return;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) close();
+      }}
       onCancel={event => {
-        if (externalAccessEditorOpen) event.preventDefault();
+        if (event.target === event.currentTarget && externalAccessEditorOpen) event.preventDefault();
       }}
     >
       <header>
@@ -147,7 +157,7 @@ export function UnifiedAgentDetailModal({
       </div>
       {record.identity.invalidMetadata ? <div className="notice" role="status">
         <strong>Invalid saved matching metadata.</strong>{" "}
-        Select this agent on Agents, then open Sync and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
+        Select this agent on Agents, then open <strong>Sync &gt; Advanced results</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
       </div> : null}
       <section id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
         {selectedTab === "identities" ? <>
@@ -195,7 +205,7 @@ function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
       <h4>Source identity warnings</h4>
       <ul>{record.identity.warnings.map((warning, index) => <li key={`${warning.code}:${index}`}>{warning.message}</li>)}</ul>
     </> : null}
-    {record.identity.state === "unmatched" && !record.identity.invalidMetadata && record.packages.length ? <p>Package detail identity metadata is not present in every broad catalog observation. Select exact packages and use <strong>Refresh matching details</strong> before concluding that no Power Platform counterpart exists.</p> : null}
+    {record.identity.state === "unmatched" && !record.identity.invalidMetadata && record.packages.length ? <p>Package detail identity metadata is not present in every broad catalog observation. Select exact packages and use <strong>Refresh matching details</strong> in <strong>Sync &gt; Advanced results</strong> before concluding that no Power Platform counterpart exists.</p> : null}
     <div className="inventory-detail-grid">
       <Detail label="Unified record ID" value={record.id} />
       <Detail label="Source presence" value={record.presence} />
@@ -296,7 +306,7 @@ function RelatedState({ heading, source, error, unavailable }: {
   if (error) return <><h3>{heading}</h3><p className="error-banner">{error}</p></>;
   if (!source) return <><h3>{heading}</h3><p>Loading authorized exact source associations…</p></>;
   if (source.status !== "available") return <><h3>{heading}</h3><p className="association-status">{label(source.status)}: {source.reason}</p></>;
-  return <><h3>{heading}</h3><p className="association-status">{source.count === 0 ? "Authorized and queried; no exact associated records." : `${source.count} exact associated record${source.count === 1 ? "" : "s"}.`}</p></>;
+  return <><h3>{heading}</h3><p className="association-status">{source.count === 0 ? "Authorized and queried; no exact associated records." : `${source.count} exact associated record${source.count === 1 ? "" : "s"}; showing ${source.value.length}.`}</p></>;
 }
 
 function Detail({ label: heading, value }: { label: string; value: ReactNode }) {

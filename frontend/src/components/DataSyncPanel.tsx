@@ -112,13 +112,13 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const actionController = useRef<AbortController | undefined>(undefined);
   const timer = useRef<number | undefined>(undefined);
   const pollDeadline = useRef(0);
-  const sourceStatuses = useRef<Map<DataSyncSourceId, string> | undefined>(undefined);
+  const sourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const stateRef = useRef<DataSyncState | undefined>(undefined);
   const requestedRunIdRef = useRef(requestedRunId);
   const requestedRunGeneration = useRef(0);
   const requestedRunController = useRef<AbortController | undefined>(undefined);
   const requestedRunTimer = useRef<number | undefined>(undefined);
-  const requestedSourceStatuses = useRef<Map<DataSyncSourceId, string> | undefined>(undefined);
+  const requestedSourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const onSourcesChangedRef = useRef(onSourcesChanged);
   const onRunsChangedRef = useRef(onRunsChanged);
   const wasActive = useRef(active);
@@ -159,14 +159,17 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     statuses: typeof sourceStatuses,
   ) => {
     const priorStatuses = statuses.current;
-    statuses.current = new Map(sources.map(source => [source.source, sourceObservationIdentity(source)]));
+    statuses.current = new Map(sources.map(source => [source.source, source]));
     if (priorStatuses) {
       const changed = sources
         .filter(source => {
           const previous = priorStatuses.get(source.source);
-          return source.status === "succeeded"
-            ? previous !== sourceObservationIdentity(source)
-            : previous?.startsWith("succeeded:") && source.count === null && source.lastSuccessAt === null;
+          if (source.status === "succeeded") {
+            return !previous || sourceObservationIdentity(previous) !== sourceObservationIdentity(source);
+          }
+          // Failed attempts and sources omitted by limited runs can still have saved data.
+          return source.count === null && source.lastSuccessAt === null
+            && (!previous || previous.status === "succeeded" || previous.lastSuccessAt !== null);
         })
         .map(source => source.source);
       if (changed.length) onSourcesChangedRef.current(changed);
@@ -387,6 +390,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const tone = requestedRunId && requestedRunError ? "error" : panelTone(displayedState);
   const updatesPaused = requestedRunId ? requestedPollingPaused : pollingPaused;
   const cannotStart = isProgressing(state?.run) || runActive || Boolean(busy);
+  const retryBlockedByRun = displayedRun?.status === "running"
+    || (isProgressing(state?.run) && state?.run?.id !== displayedRun?.id);
 
   useEffect(() => {
     if (active && !wasActive.current) void refresh();
@@ -477,7 +482,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                       <button
                         type="button"
                         className="secondary"
-                        disabled={Boolean(busy)}
+                        disabled={Boolean(busy) || retryBlockedByRun}
                         onClick={() => void perform(
                           "retry",
                           signal => retryDataSyncRun(displayedRun.id, retrySources, { signal }),
@@ -486,6 +491,9 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                         Retry incomplete ({retrySources.length})
                       </button>
                     </WorkbenchActionGate>
+                  ) : null}
+                  {retrySources.length > 0 && retryBlockedByRun ? (
+                    <p className="data-sync-run-meta" role="status">Finish or cancel the active sync run before retrying these sources.</p>
                   ) : null}
                   {runActive ? (
                     <WorkbenchActionGate actionId="data-sync.cancel">
@@ -640,7 +648,7 @@ function SyncProgress({ run }: { run: DataSyncRun }) {
       </div>
       {!complete && run.sources.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={run.sources.length} /> : null}
       <p>{complete
-        ? "Requested source collection completed. Verify saved inventory below to inspect stored/provider counts, requested scope and exact source accounting without a new provider read."
+        ? "Requested source collection completed. Saved inventory checks run automatically. Optional diagnostics are in Advanced results."
         : active && (running.length > 0 || queued)
           ? "Sources can run in parallel. Counts appear as results are saved; this is source progress, not an estimated time."
           : "Review the source statuses below. Completed sources remain available; retry only the sources that need it."}</p>
