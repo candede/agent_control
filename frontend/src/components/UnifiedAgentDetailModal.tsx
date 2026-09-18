@@ -4,6 +4,7 @@ import {
   getInventorySourceAwareDetail,
   type AppRole,
   type CopilotPackage,
+  type CopilotPackageDetail,
   type InventorySourceAwareDetail,
   type PackageAccessTarget,
   type UnifiedAgentRecord,
@@ -12,6 +13,7 @@ import { hasAppRole } from "../../../backend/src/types/capability";
 import { formatAccessScope } from "../accessScope";
 import { quarantineTargetReason } from "../quarantineTarget";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
+import { AgentDetailModal } from "./AgentDetailModal";
 import { PowerPlatformResourceData } from "./InventoryExplorer";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { AgentAuthoringTools, AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
@@ -20,7 +22,7 @@ const tabs = ["identities", "package", "power-platform", "reports", "audit-secur
 type DetailTab = typeof tabs[number];
 const tabLabels: Record<DetailTab, string> = {
   identities: "Overview",
-  package: "Availability",
+  package: "Packages",
   "power-platform": "Configuration",
   reports: "Usage",
   "audit-security": "Activity",
@@ -38,6 +40,9 @@ type Props = {
   onTabChange: (tab: string) => void;
   onClose: () => void;
   onInspectPackage: (item: CopilotPackage) => void;
+  packageDetail?: CopilotPackageDetail;
+  packageDetailLoading?: boolean;
+  packageDetailError?: string;
   onManagePackageAccess: (item: CopilotPackage, target?: PackageAccessTarget) => void;
   onSetPackageBlocked: (item: CopilotPackage, blocked: boolean) => void;
   externalAccessEditorOpen?: boolean;
@@ -51,6 +56,9 @@ export function UnifiedAgentDetailModal({
   onTabChange,
   onClose,
   onInspectPackage,
+  packageDetail,
+  packageDetailLoading = false,
+  packageDetailError,
   onManagePackageAccess,
   onSetPackageBlocked,
   externalAccessEditorOpen = false,
@@ -159,6 +167,7 @@ export function UnifiedAgentDetailModal({
         <strong>Invalid saved matching metadata.</strong>{" "}
         Select this agent on Agents, then open <strong>Sync &gt; Advanced results</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
       </div> : null}
+      {packageDetailError ? <p className="error-banner unified-agent-detail-error" role="alert">{packageDetailError}</p> : null}
       <section id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
         {selectedTab === "identities" ? <>
           <h3>Overview</h3>
@@ -173,22 +182,37 @@ export function UnifiedAgentDetailModal({
             <IdentityPanel record={record} />
           </details>
         </> : null}
-        {selectedTab === "package" ? <PackagesPanel record={record} canManage={canManage} onInspect={onInspectPackage} onManageAccess={onManagePackageAccess} onSetBlocked={onSetPackageBlocked} /> : null}
+        {selectedTab === "package" ? <PackagesPanel
+          record={record}
+          selectedPackageId={packageDetail?.id}
+          onInspect={onInspectPackage}
+        >
+          {packageDetailLoading ? <div className="package-detail-state" role="status">Loading exact package details...</div> : null}
+          {packageDetail ? <AgentDetailModal agent={packageDetail} embedded roles={roles} /> : null}
+        </PackagesPanel> : null}
         {selectedTab === "power-platform" ? <PowerPlatformPanel record={record} /> : null}
         {selectedTab === "reports" ? <RelatedState heading="Official reports" source={related?.reports} error={relatedError} unavailable={relatedUnavailable} /> : null}
         {selectedTab === "audit-security" ? <AuditSecurityPanel related={related} error={relatedError} unavailable={relatedUnavailable} /> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage agent</h3>
-          <p>Manage who can access and install this agent, block its packages, or quarantine its connected channels. Each control applies only to its displayed target; package blocking and quarantine are independent.</p>
+          <p className="tab-description">Manage package access and installation, blocking, and connected Copilot Studio channels. Every action identifies its exact target before applying a change.</p>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
-          <PackagesPanel record={record} canManage={canManage} onInspect={onInspectPackage} onManageAccess={onManagePackageAccess} onSetBlocked={onSetPackageBlocked} compact />
-          <h4>Quarantine and restore</h4>
-          {resource && !quarantineReason ? <CopilotStudioQuarantineControls
-            snapshot={record.observations.powerPlatform}
-            targets={[resource]}
-            variant="detail"
-            canManage={canManage}
-          /> : <p className="association-status">Quarantine is unavailable: {quarantineReason ?? "No exact Power Platform quarantine target is associated with this record."}</p>}
+          <div className="agent-management-sections">
+            <article className="agent-management-card">
+              <PackagesPanel record={record} canManage={canManage} onInspect={onInspectPackage} onManageAccess={onManagePackageAccess} onSetBlocked={onSetPackageBlocked} controls />
+            </article>
+            <article className="agent-management-card">
+              <div className="management-card-heading">
+                <div><h4>Quarantine and restore</h4><p>Control the linked Copilot Studio channel independently from package access and blocking.</p></div>
+              </div>
+              {resource && !quarantineReason ? <CopilotStudioQuarantineControls
+                snapshot={record.observations.powerPlatform}
+                targets={[resource]}
+                variant="detail"
+                canManage={canManage}
+              /> : <p className="association-status">Quarantine is unavailable: {quarantineReason ?? "No exact Power Platform quarantine target is associated with this record."}</p>}
+            </article>
+          </div>
         </> : null}
       </section>
     </dialog>
@@ -239,18 +263,22 @@ function RelatedPackageEvidence({ packageIds }: { packageIds?: string[] }) {
   </>;
 }
 
-function PackagesPanel({ record, canManage, onInspect, onManageAccess, onSetBlocked, compact = false }: {
+function PackagesPanel({ record, canManage = false, selectedPackageId, onInspect, onManageAccess, onSetBlocked, controls = false, children }: {
   record: UnifiedAgentRecord;
-  canManage: boolean;
+  canManage?: boolean;
+  selectedPackageId?: string;
   onInspect: (item: CopilotPackage) => void;
-  onManageAccess: (item: CopilotPackage, target?: PackageAccessTarget) => void;
-  onSetBlocked: (item: CopilotPackage, blocked: boolean) => void;
-  compact?: boolean;
+  onManageAccess?: (item: CopilotPackage, target?: PackageAccessTarget) => void;
+  onSetBlocked?: (item: CopilotPackage, blocked: boolean) => void;
+  controls?: boolean;
+  children?: ReactNode;
 }) {
   return <>
-    {!compact ? <h3>Availability and installation</h3> : <h4>Access, installation and blocking</h4>}
+    {controls ? <div className="management-card-heading"><div><h4>Package controls</h4><p>Manage access, installation, and blocking for each published package.</p></div></div> : <><h3>Packages and availability</h3><p className="tab-description">Select a package to review its complete metadata, connected services, audience, installation scope, and blocking status.</p></>}
     <p>{record.packages.length
-      ? "Review access and installation for each package. Changes require confirmation of the exact package target and do not change quarantine."
+      ? controls
+        ? "Changes require confirmation of the exact package target and do not change quarantine."
+        : "Package management actions are available from the Manage tab."
       : "Availability and installation have not been observed. No package target is available for these controls."}</p>
     {record.packages.length ? <ul className="detail-list expanded-detail-list">{record.packages.map(item => <li key={item.id}>
       <span>
@@ -263,12 +291,13 @@ function PackagesPanel({ record, canManage, onInspect, onManageAccess, onSetBloc
         </small>
       </span>
       <span className="row-actions">
-        <WorkbenchActionGate actionId="packages.inspect" compact><button type="button" className="secondary" aria-label={`Package details for ${item.displayName} (${item.id})`} onClick={() => onInspect(item)}>Package details</button></WorkbenchActionGate>
-        {canManage ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage access for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "availability")}>Manage access</button></WorkbenchActionGate> : null}
-        {canManage ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage installation for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "installation")}>Manage installation</button></WorkbenchActionGate> : null}
-        {canManage && typeof item.isBlocked === "boolean" ? <WorkbenchActionGate actionId={item.isBlocked ? "packages.unblock" : "packages.block"} compact><button type="button" className={item.isBlocked ? "secondary" : "danger"} aria-label={`${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})`} onClick={() => onSetBlocked(item, !item.isBlocked)}>{item.isBlocked ? "Unblock" : "Block"}</button></WorkbenchActionGate> : null}
+        {!controls ? <WorkbenchActionGate actionId="packages.inspect" compact><button type="button" className={selectedPackageId === item.id ? "primary-link" : "secondary"} aria-pressed={selectedPackageId === item.id} aria-label={`Package details for ${item.displayName} (${item.id})`} onClick={() => onInspect(item)}>{selectedPackageId === item.id ? "Viewing details" : "View package details"}</button></WorkbenchActionGate> : null}
+        {controls && canManage && onManageAccess ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage access for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "availability")}>Manage access</button></WorkbenchActionGate> : null}
+        {controls && canManage && onManageAccess ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage installation for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "installation")}>Manage installation</button></WorkbenchActionGate> : null}
+        {controls && canManage && onSetBlocked && typeof item.isBlocked === "boolean" ? <WorkbenchActionGate actionId={item.isBlocked ? "packages.unblock" : "packages.block"} compact><button type="button" className={item.isBlocked ? "secondary" : "danger"} aria-label={`${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})`} onClick={() => onSetBlocked(item, !item.isBlocked)}>{item.isBlocked ? "Unblock" : "Block"}</button></WorkbenchActionGate> : null}
       </span>
     </li>)}</ul> : null}
+    {!controls ? children : null}
   </>;
 }
 

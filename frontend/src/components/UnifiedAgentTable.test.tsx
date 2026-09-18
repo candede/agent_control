@@ -118,7 +118,7 @@ function renderTable(overrides: Partial<ComponentProps<typeof UnifiedAgentTable>
   const props = {
     records: [record], selectedPackageIds: new Set<string>(), selectedPowerPlatformKeys: new Set<string>(),
     packageSelectionAllowed: true, packageOperationsAllowed: true, quarantineSelectionAllowed: true, selectionDisabled: false,
-    onToggleSelection: vi.fn(), onViewDetails: vi.fn(), onManage: vi.fn(), onManageAccess: vi.fn(), onSetBlocked: vi.fn(),
+    onToggleSelection: vi.fn(), onViewDetails: vi.fn(), onManageAccess: vi.fn(), onSetBlocked: vi.fn(),
     ...overrides,
   };
   const content = (next: Partial<typeof props> = {}) => <CapabilityContext value={{
@@ -141,7 +141,7 @@ describe("UnifiedAgentTable", () => {
     expect(screen.queryByText("Copilot Studio / CopilotStudio")).not.toBeInTheDocument();
   });
 
-  it("renders one logical agent with friendly columns, one checkbox, and common Manage", () => {
+  it("renders one logical agent with friendly columns, one checkbox, and one detail entry point", () => {
     const { props } = renderTable({ environmentNames: { [record.environmentId!]: "Production" } });
     expect(screen.getByRole("region", { name: "Unified agents" })).toContainElement(screen.getByRole("table"));
     expect(screen.getAllByRole("row")).toHaveLength(2);
@@ -155,10 +155,9 @@ describe("UnifiedAgentTable", () => {
     expect(screen.queryByText(/0 .*selected/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Builder agent" }));
     expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(record);
-    fireEvent.click(screen.getByRole("button", { name: "Manage Builder agent" }));
-    expect(props.onManage).toHaveBeenCalledExactlyOnceWith(record);
     fireEvent.click(screen.getByRole("button", { name: "View details for Builder agent" }));
     expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(record);
+    expect(screen.queryByRole("button", { name: "Manage Builder agent" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Manage access|^Block / })).not.toBeInTheDocument();
   });
 
@@ -214,14 +213,13 @@ describe("UnifiedAgentTable", () => {
     });
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(screen.getByRole("checkbox")).toBeDisabled();
-    for (const name of ["Manage Builder agent", "Manage access for Builder agent", "Block Builder agent"]) {
+    for (const name of ["Manage access for Builder agent", "Block Builder agent"]) {
       const button = screen.getByRole("button", { name });
       expect(button).toBeDisabled();
       fireEvent.click(button);
     }
     fireEvent.click(screen.getByRole("checkbox"));
     expect(props.onToggleSelection).not.toHaveBeenCalled();
-    expect(props.onManage).not.toHaveBeenCalled();
     expect(props.onManageAccess).not.toHaveBeenCalled();
     expect(props.onSetBlocked).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: /View details/ })).toBeEnabled();
@@ -232,7 +230,7 @@ describe("UnifiedAgentTable", () => {
     const { props, update } = renderTable({ records: [single], quarantineSelectionRestoring: true });
     expect(screen.getByRole("checkbox")).toBeDisabled();
     expect(screen.getByRole("checkbox")).toHaveAttribute("title", expect.stringContaining("Restoring saved quarantine selections"));
-    expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View details for Builder agent" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Manage access for Builder agent" })).toBeEnabled();
     fireEvent.click(screen.getByRole("checkbox"));
     expect(props.onToggleSelection).not.toHaveBeenCalled();
@@ -256,7 +254,7 @@ describe("UnifiedAgentTable", () => {
       update({ records: [{ ...invalid, packages: [] }] });
       expect(screen.getByRole("checkbox")).toBeDisabled();
       expect(screen.getByRole("checkbox")).not.toBeChecked();
-      expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "View details for Builder agent" })).toBeEnabled();
     },
   );
 
@@ -278,8 +276,8 @@ describe("UnifiedAgentTable", () => {
     expect(checkboxes[1]).not.toBeChecked();
     fireEvent.click(checkboxes[1]);
     expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(second);
-    fireEvent.click(screen.getAllByRole("button", { name: "Manage Builder agent" })[1]);
-    expect(props.onManage).toHaveBeenCalledExactlyOnceWith(second);
+    fireEvent.click(screen.getAllByRole("button", { name: "View details for Builder agent" })[1]);
+    expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(second);
   });
 
   it.each([false, true])("uses only backend-supplied quarantine identifiers, not schema/native evidence (supplied=%s)", supplied => {
@@ -334,7 +332,7 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(screen.getByText("2 published versions selected")).toBeVisible();
     expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View details for Builder agent" })).toBeEnabled();
   });
 
   it.each([null, record.environmentId])("renders one graph-only group with all package selections and optional environment %s", environmentId => {
@@ -352,8 +350,8 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByText("2 published versions selected")).toBeVisible();
     expect(within(screen.getAllByRole("row")[1]).getAllByRole("cell")[2]).toHaveTextContent(environmentId ? "Package-declared environment" : "Unknown");
     expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Manage Builder agent" }));
-    expect(props.onManage).toHaveBeenCalledExactlyOnceWith(group);
+    fireEvent.click(screen.getByRole("button", { name: "View details for Builder agent" }));
+    expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(group);
   });
 
   it("uses lowercase environment lookup keys with an honest ID fallback", () => {
@@ -418,7 +416,7 @@ describe("UnifiedAgentTable", () => {
     }
     expect(props.onManageAccess).not.toHaveBeenCalled();
     expect(props.onSetBlocked).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Manage Builder agent" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View details for Builder agent" })).toBeEnabled();
   });
 
   it("retains viewer selection and details without exposing administrative entry points", () => {

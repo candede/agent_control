@@ -437,7 +437,8 @@ describe("App session revalidation", () => {
     expect(checkbox).not.toBeChecked();
     expect(screen.queryByRole("region", { name: "Exact package bulk actions" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Copilot Studio quarantine controls" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: `Manage ${agent.displayName}` }));
+    await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Manage" }));
     expect(await screen.findByRole("tab", { name: "Manage" })).toHaveAttribute("aria-selected", "true");
   });
 
@@ -606,7 +607,7 @@ describe("App session revalidation", () => {
 
     await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: "View details for Reconciled detail" }));
-    await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Packages" }));
     expect(screen.getByText(/No package target is available for these controls/)).toBeInTheDocument();
     reconciled = true;
     await act(async () => refresh.resolve(Response.json(completedRefreshJob())));
@@ -660,7 +661,7 @@ describe("App session revalidation", () => {
 
     const controls = await screen.findByRole("region", { name: "Copilot Studio quarantine controls" });
     expect(await screen.findByRole("checkbox", { name: "Select Pending native target" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Manage Pending native target" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "View details for Pending native target" })).toBeEnabled();
     expect(within(controls).getByText(/Restoring 1 bookmarked quarantine selection/)).toBeVisible();
     await userEvent.click(within(controls).getByRole("button", { name: "Clear" }));
     await act(async () => lookup.resolve(Response.json(unifiedRecordsPage([native]))));
@@ -1148,7 +1149,7 @@ describe("App session revalidation", () => {
 
       await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
       const dialog = await screen.findByRole("dialog", { name: agent.displayName });
-      await userEvent.click(within(dialog).getByRole("tab", { name: "Availability" }));
+      await userEvent.click(within(dialog).getByRole("tab", { name: "Packages" }));
       await userEvent.click(within(dialog).getByRole("button", { name: /Package details for/ }));
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/agents/package-private")).toBe(true));
       if (scenario === "navigation") {
@@ -2526,7 +2527,7 @@ describe("App session revalidation", () => {
     await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
     const saved = await screen.findByRole("dialog", { name: "Sensitive cached agent" });
     expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/agents/package-private/refresh-jobs")).toBe(false);
-    await userEvent.click(within(saved).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(saved).getByRole("tab", { name: "Manage" }));
     await userEvent.click(within(saved).getByRole("button", { name: target === "availability" ? /Manage access for/ : /Manage installation for/ }));
     const editor = await screen.findByRole("dialog", { name: "Manage agent access" });
     expect(screen.queryByRole("dialog", { name: "Sensitive cached agent" })).not.toBeInTheDocument();
@@ -2546,7 +2547,7 @@ describe("App session revalidation", () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
     const detail = await screen.findByRole("dialog", { name: "Sensitive cached agent" });
-    await userEvent.click(within(detail).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
     await userEvent.click(within(detail).getByRole("button", { name: "Block Sensitive cached agent (package-private)" }));
 
     const confirmation = await screen.findByRole("dialog", { name: /block package/i });
@@ -2563,7 +2564,7 @@ describe("App session revalidation", () => {
     render(<App />);
     await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
     const detail = await screen.findByRole("dialog", { name: "Sensitive cached agent" });
-    await userEvent.click(within(detail).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(detail).getByRole("tab", { name: "Manage" }));
     await userEvent.click(within(detail).getByRole("button", { name: /Manage access for/ }));
     const editor = await screen.findByRole("dialog", { name: "Manage agent access" });
     await userEvent.click(within(editor).getByRole("button", { name: "Apply" }));
@@ -2651,7 +2652,7 @@ describe("App session revalidation", () => {
     } else {
       await userEvent.click(await screen.findByRole("button", { name: "View details for Sensitive cached agent" }));
       const saved = await screen.findByRole("dialog", { name: "Sensitive cached agent" });
-      await userEvent.click(within(saved).getByRole("tab", { name: "Availability" }));
+      await userEvent.click(within(saved).getByRole("tab", { name: "Manage" }));
       await userEvent.click(within(saved).getByRole("button", { name: /Manage installation for/ }));
     }
     expect(await screen.findByRole("alert")).toHaveTextContent("Exact provider read denied");
@@ -3184,7 +3185,7 @@ describe("App session revalidation", () => {
     await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
     await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
     const dialog = await screen.findByRole("dialog", { name: agent.displayName });
-    await userEvent.click(within(dialog).getByRole("tab", { name: "Availability" }));
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Packages" }));
     await userEvent.click(within(dialog).getByRole("button", { name: /Package details for/ }));
     expect(screen.getByText("Loading agent details...")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Block selected packages" }));

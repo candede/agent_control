@@ -20,7 +20,6 @@ type Props = {
   environmentNames?: Record<string, string>;
   onToggleSelection: (record: UnifiedAgentRecord) => void;
   onViewDetails: (record: UnifiedAgentRecord) => void;
-  onManage: (record: UnifiedAgentRecord) => void;
   onManageAccess: (record: UnifiedAgentRecord) => void;
   onSetBlocked: (record: UnifiedAgentRecord, blocked: boolean) => void;
 };
@@ -38,7 +37,6 @@ export function UnifiedAgentTable({
   environmentNames = {},
   onToggleSelection,
   onViewDetails,
-  onManage,
   onManageAccess,
   onSetBlocked,
 }: Props) {
@@ -79,8 +77,6 @@ export function UnifiedAgentTable({
           const packageBusy = record.packages.some(item => item.id === busyPackageId);
           const resource = record.powerPlatformResource;
           const restoringSelection = quarantineSelectionRestoring && quarantineSelectionAllowed && !quarantineReason;
-          const canManage = (packageOperationsAllowed && record.packages.length > 0)
-            || (quarantineSelectionAllowed && resource?.type === "microsoft.copilotstudio/agents");
           return <tr key={record.id}>
             <td className="select-cell">
               <SelectionCheckbox
@@ -103,7 +99,6 @@ export function UnifiedAgentTable({
             <td><AgentStatus record={record} /></td>
             <td><div className="row-actions">
               <button className="icon-button" type="button" aria-label={`View details for ${record.displayName}`} title="View agent details" onClick={() => onViewDetails(record)}><Info aria-hidden="true" /></button>
-              {canManage ? <button className="secondary" type="button" aria-label={`Manage ${record.displayName}`} disabled={selectionDisabled} onClick={() => onManage(record)}>Manage</button> : null}
               {packageOperationsAllowed && record.packages.length === 1 ? <WorkbenchActionGate actionId="packages.access" compact><button className="icon-button" type="button" aria-label={`Manage access for ${record.displayName}`} title="Manage access" disabled={selectionDisabled} onClick={() => onManageAccess(record)}><ShieldCheck aria-hidden="true" /></button></WorkbenchActionGate> : null}
               {packageOperationsAllowed && record.packages.length === 1 && typeof record.packages[0].isBlocked === "boolean" ? <WorkbenchActionGate actionId={record.packages[0].isBlocked ? "packages.unblock" : "packages.block"} compact><button className={`icon-button${record.packages[0].isBlocked ? "" : " danger"}`} type="button" aria-label={`${record.packages[0].isBlocked ? "Unblock" : "Block"} ${record.displayName}`} title={`${record.packages[0].isBlocked ? "Unblock" : "Block"} agent`} disabled={selectionDisabled || packageBusy} onClick={() => onSetBlocked(record, !record.packages[0].isBlocked)}>{record.packages[0].isBlocked ? <LockOpen aria-hidden="true" /> : <Lock aria-hidden="true" />}</button></WorkbenchActionGate> : null}
             </div></td>

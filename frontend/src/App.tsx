@@ -83,7 +83,6 @@ import { findUnifiedAgentRecord } from "./unifiedAgentIdentity";
 import { CapabilityGate } from "./components/CapabilityGate";
 import { CapabilityContext } from "./capabilityContext";
 import { CapabilityHealth, PermissionCenter } from "./components/PermissionCenter";
-import { AgentDetailModal } from "./components/AgentDetailModal";
 import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
 import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
@@ -530,7 +529,7 @@ function App() {
       sortBy: agentSortBy,
       sortDirection: agentSortDirection,
       page: agentPageIndex,
-      detailId: agentDetail?.id ?? requestedAgentDetailId,
+      detailId: selectedUnifiedAgent?.id ?? agentDetail?.id ?? requestedAgentDetailId,
       detailTab: agentDetailTab,
       selectedIds: [...selectedAgentIds],
       refreshMode: requestedPackageRefreshMode,
@@ -558,7 +557,7 @@ function App() {
           : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentPageIndex, agentSortBy, agentSortDirection, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
 
   useEffect(() => {
     if (activeView !== "sync") return;
@@ -624,9 +623,29 @@ function App() {
       if (target.source !== "graph_packages") throw new Error("The exact agent is not available in the current saved inventory. Refresh saved agent inventory and retry.");
       const detail = await getAgentDetails(target.packageId, { signal: controller.signal });
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
-        setSelectedUnifiedAgent(undefined);
+        const fallbackRecord: UnifiedAgentRecord = {
+          id: unifiedAgentRecordId({ source: "graph_packages", packageId: detail.id }),
+          displayName: detail.displayName,
+          presence: "graph_packages",
+          environmentId: null,
+          packages: [detail],
+          powerPlatformResource: null,
+          identity: {
+            state: "unmatched",
+            evidence: [],
+            packageEvidence: [{ packageId: detail.id, evidence: [] }],
+            reason: "No Power Platform counterpart is available in the current saved unified inventory.",
+          },
+          observations: {
+            graphPackages: null,
+            packageSnapshots: {},
+            powerPlatform: null,
+          },
+        };
+        unifiedAgentDetailPage.current = unifiedAgentPage;
+        setSelectedUnifiedAgent(fallbackRecord);
         setAgentDetail(detail);
-        setRequestedAgentDetailId(detail.id);
+        setRequestedAgentDetailId(fallbackRecord.id);
       }
     }).catch(requestError => {
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
@@ -1456,7 +1475,6 @@ function App() {
 
     setAgentDetailError(undefined);
     setAgentDetail(undefined);
-    setRequestedAgentDetailId(agent.id);
     setLoadingAgentDetailId(agent.id);
 
     try {
@@ -1567,14 +1585,6 @@ function App() {
     } finally {
       if (ownsAgentFlowRequest(requestId, owner)) setBusyAgentId(undefined);
     }
-  }
-
-  async function handleUpdateAgentAccess(update: PackageAccessUpdate) {
-    if (!agentDetail) {
-      throw new Error("Agent details are no longer open.");
-    }
-
-    await requestAccessConfirmation([agentDetail.id], update, "single");
   }
 
   async function requestAccessConfirmation(
@@ -2700,10 +2710,6 @@ function App() {
                   setAgentDetailTab("identities");
                   void handleViewUnifiedAgentDetails(record);
                 }}
-                onManage={record => {
-                  setAgentDetailTab("controls");
-                  void handleViewUnifiedAgentDetails(record);
-                }}
                 onManageAccess={record => {
                   const item = record.packages[0];
                   if (item) void handleManageAgentAccess(item);
@@ -2807,7 +2813,7 @@ function App() {
         </div>
       ) : null}
 
-      {agentDetailError && !agentDetail ? (
+      {agentDetailError && !agentDetail && !selectedUnifiedAgent ? (
         <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
@@ -2820,37 +2826,21 @@ function App() {
           roles={user?.roles ?? []}
           externalAccessEditorOpen={Boolean(singleAccessAgentDetail)}
           onClose={() => {
+            agentDetailRequestId.current += 1;
+            setLoadingAgentDetailId(undefined);
+            setAgentDetail(undefined);
             setSelectedUnifiedAgent(undefined);
             setRequestedAgentDetailId(undefined);
           }}
           onInspectPackage={item => {
-            setSelectedUnifiedAgent(undefined);
             void handleViewAgentDetails(item);
           }}
+          packageDetail={selectedUnifiedAgent.packages.some(item => item.id === agentDetail?.id) ? agentDetail : undefined}
+          packageDetailLoading={Boolean(loadingAgentDetailId)}
+          packageDetailError={agentDetailError}
           onManagePackageAccess={(item, target) => void handleManageAgentAccess(item, target)}
           onSetPackageBlocked={(item, blocked) => {
             void handleAgentAction(item, blocked);
-          }}
-        />
-      ) : null}
-
-      {agentDetail ? (
-        <AgentDetailModal
-          agent={agentDetail}
-          activeTab={agentDetailTab}
-          onTabChange={setAgentDetailTab}
-          roles={user?.roles ?? []}
-          onClose={() => { agentDetailRequestId.current += 1; setLoadingAgentDetailId(undefined); setAgentDetail(undefined); setRequestedAgentDetailId(undefined); }}
-          onEditAccess={target => void handleManageAgentAccess(agentDetail, target)}
-          preparingAccess={Boolean(loadingAgentDetailId)}
-          accessError={agentDetailError}
-          externalAccessEditorOpen={singleAccessAgentDetail?.id === agentDetail.id}
-          onUpdateAccess={handleUpdateAgentAccess}
-          onSetBlocked={async (blocked) => {
-            if (await handleAgentAction(agentDetail, blocked)) {
-              setAgentDetail(undefined);
-              setRequestedAgentDetailId(undefined);
-            }
           }}
         />
       ) : null}

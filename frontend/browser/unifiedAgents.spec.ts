@@ -77,6 +77,16 @@ test("one agent row selects all published versions and configuration controls wi
     controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
   };
   await page.route(`**/api/inventory/resources/${botId}/related*`, route => route.fulfill({ json: related }));
+  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[0].id)}`, route => route.fulfill({ json: {
+    ...merged.packages[0],
+    longDescription: "Package-level configuration and connected service metadata.",
+    allowedUsersAndGroups: [{ resourceType: "group", resourceId: "service-desk-users" }],
+    acquireUsersAndGroups: [],
+    elementDetails: [{
+      elementType: "AgentMetadatas",
+      elements: [{ id: "metadata", definition: JSON.stringify({ connectorId: "Service desk connector" }) }],
+    }],
+  } }));
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.locator("tbody tr")).toHaveCount(3);
@@ -97,9 +107,12 @@ test("one agent row selects all published versions and configuration controls wi
   await expect(page.getByRole("region", { name: "Exact package bulk actions" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Copilot Studio quarantine controls" })).toHaveCount(0);
 
-  await table.getByRole("button", { name: "Manage Service desk assistant", exact: true }).click();
+  await table.getByRole("button", { name: "View details for Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog");
+  const initialBounds = await dialog.boundingBox();
+  await dialog.getByRole("tab", { name: "Manage", exact: true }).click();
   await expect(dialog.getByRole("tab", { name: "Manage", exact: true })).toHaveAttribute("aria-selected", "true");
+  expect(await dialog.boundingBox()).toEqual(initialBounds);
   if (info.project.name === "mobile") {
     const geometry = await dialog.getByRole("tablist").evaluate(element => ({
       height: element.getBoundingClientRect().height,
@@ -113,6 +126,7 @@ test("one agent row selects all published versions and configuration controls wi
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("unified-agent-manage.png"), fullPage: true });
   await dialog.getByRole("tab", { name: "Overview", exact: true }).click();
+  expect(await dialog.boundingBox()).toEqual(initialBounds);
   const status = dialog.locator(".agent-summary-status");
   expect(await status.evaluate(element => getComputedStyle(element).display)).toBe("grid");
   expect(await status.locator(":scope > span").evaluateAll(elements => elements.every(element => getComputedStyle(element).display === "block"))).toBe(true);
@@ -120,5 +134,13 @@ test("one agent row selects all published versions and configuration controls wi
   await expect(technical).not.toHaveAttribute("open", "");
   await expect(dialog.getByRole("tablist", { name: "Agent details" })).toBeVisible();
   await page.screenshot({ path: info.outputPath("unified-agent-overview.png"), fullPage: true });
+  await dialog.getByRole("tab", { name: "Packages", exact: true }).click();
+  expect(await dialog.boundingBox()).toEqual(initialBounds);
+  await dialog.getByRole("button", { name: `Package details for ${merged.packages[0].displayName} (${merged.packages[0].id})`, exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "Connected services", exact: true })).toBeVisible();
+  await expect(dialog.getByText("Service desk connector", { exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog")).toHaveCount(1);
+  expect(await dialog.boundingBox()).toEqual(initialBounds);
+  await page.screenshot({ path: info.outputPath("unified-agent-packages.png"), fullPage: true });
   expect(unexpected).toEqual([]);
 });

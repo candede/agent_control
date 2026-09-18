@@ -16,11 +16,12 @@ type DetailTab = typeof detailTabs[number];
 
 type AgentDetailModalProps = {
   agent: CopilotPackageDetail;
+  embedded?: boolean;
   activeTab?: string;
   onTabChange?: (tab: string) => void;
   roles?: AppRole[];
-  onClose: () => void;
-  onUpdateAccess: (update: PackageAccessUpdate) => Promise<void>;
+  onClose?: () => void;
+  onUpdateAccess?: (update: PackageAccessUpdate) => Promise<void>;
   onEditAccess?: (target: PackageAccessTarget) => void;
   preparingAccess?: boolean;
   accessError?: string;
@@ -42,11 +43,12 @@ type ConnectedService = {
 
 export function AgentDetailModal({
   agent,
+  embedded = false,
   activeTab,
   onTabChange,
   roles = [],
-  onClose,
-  onUpdateAccess,
+  onClose = () => undefined,
+  onUpdateAccess = async () => undefined,
   onEditAccess,
   preparingAccess = false,
   accessError,
@@ -56,7 +58,7 @@ export function AgentDetailModal({
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
   const [editingAccessTarget, setEditingAccessTarget] =
     useState<PackageAccessTarget>();
-  const requestedTab = activeTab ?? internalTab;
+  const requestedTab = embedded ? "package" : activeTab ?? internalTab;
   const selectedTab: DetailTab = detailTabs.includes(requestedTab as DetailTab) ? requestedTab as DetailTab : "identities";
   const selectTab = (tab: DetailTab) => {
     setInternalTab(tab);
@@ -82,14 +84,17 @@ export function AgentDetailModal({
   const returnFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
+    if (embedded) return;
     returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     return () => { window.requestAnimationFrame(() => returnFocusRef.current?.focus()); };
-  }, []);
+  }, [embedded]);
   useEffect(() => {
+    if (embedded) return;
     dialogRef.current?.querySelector<HTMLElement>(`#agent-tab-${selectedTab}`)?.focus();
-  }, [selectedTab]);
+  }, [embedded, selectedTab]);
 
   useEffect(() => {
+    if (embedded) return;
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape" && !editingAccessTarget && !externalAccessEditorOpen) {
         onClose();
@@ -99,19 +104,20 @@ export function AgentDetailModal({
     window.addEventListener("keydown", handleKeyDown);
 
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [editingAccessTarget, externalAccessEditorOpen, onClose]);
+  }, [editingAccessTarget, embedded, externalAccessEditorOpen, onClose]);
 
   return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+    <div className={embedded ? "embedded-package-detail-host" : "modal-backdrop"} role={embedded ? undefined : "presentation"} onClick={embedded ? undefined : onClose}>
       <section
         ref={dialogRef}
-        className="detail-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-detail-title"
-        tabIndex={-1}
-        onClick={(event) => event.stopPropagation()}
+        className={embedded ? "embedded-package-detail" : "detail-modal"}
+        role={embedded ? undefined : "dialog"}
+        aria-modal={embedded ? undefined : true}
+        aria-labelledby={embedded ? undefined : "agent-detail-title"}
+        tabIndex={embedded ? undefined : -1}
+        onClick={embedded ? undefined : (event) => event.stopPropagation()}
         onKeyDown={(event) => {
+          if (embedded) return;
           if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && (event.target as HTMLElement).getAttribute("role") === "tab") {
             event.preventDefault();
             const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
@@ -129,7 +135,7 @@ export function AgentDetailModal({
           else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
         }}
       >
-        <header className="detail-header">
+        {!embedded ? <><header className="detail-header">
           <div className="detail-title-block">
             <p className="eyebrow">Agent details</p>
             <h2 id="agent-detail-title">{agent.displayName}</h2>
@@ -154,9 +160,17 @@ export function AgentDetailModal({
           {detailTabs.map(tab => <button key={tab} id={`agent-tab-${tab}`} type="button" role="tab"
             aria-selected={selectedTab === tab} aria-controls={`agent-${tab}-panel`} tabIndex={selectedTab === tab ? 0 : -1}
             onClick={() => selectTab(tab)}>{detailTabLabel(tab)}</button>)}
-        </div>
+        </div></> : null}
 
-        {selectedTab === "package" ? <div id="agent-package-panel" role="tabpanel" aria-labelledby="agent-tab-package" tabIndex={0}>
+        {selectedTab === "package" ? <div id={embedded ? undefined : "agent-package-panel"} role={embedded ? undefined : "tabpanel"} aria-labelledby={embedded ? undefined : "agent-tab-package"} tabIndex={embedded ? undefined : 0}>
+        {embedded ? sanitizedDescriptionHtml ? (
+          <div
+            className="detail-description rich-description"
+            dangerouslySetInnerHTML={{ __html: sanitizedDescriptionHtml }}
+          />
+        ) : (
+          <p className="detail-description">{description}</p>
+        ) : null}
         <div className="detail-stat-grid">
           <SummaryStat
             label="Package block"
@@ -275,13 +289,13 @@ export function AgentDetailModal({
               <AccessList
                 label="Available to"
                 values={agent.allowedUsersAndGroups}
-                onEdit={() => editAccess("availability")}
+                onEdit={embedded ? undefined : () => editAccess("availability")}
                 busy={preparingAccess}
               />
               <AccessList
                 label="Installed for"
                 values={agent.acquireUsersAndGroups}
-                onEdit={() => editAccess("installation")}
+                onEdit={embedded ? undefined : () => editAccess("installation")}
                 busy={preparingAccess}
               />
             </div>
@@ -353,9 +367,9 @@ export function AgentDetailModal({
             {hasAppRole(roles, "AgentControl.Admin") && onSetBlocked ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"}><button type="button" className="secondary" onClick={() => void onSetBlocked(!agent.isBlocked)}>{agent.isBlocked ? "Unblock exact package" : "Block exact package"}</button></WorkbenchActionGate> : null}
             {hasAppRole(roles, "AgentControl.Admin") ? <WorkbenchActionGate actionId="packages.access"><button type="button" className="secondary" disabled={preparingAccess} onClick={() => editAccess("availability")}>Manage package availability</button></WorkbenchActionGate> : <p>Admin is required for package mutations.</p>}
           </section>}
-        {preparingAccess ? <p role="status">Loading current access from Microsoft Graph...</p> : null}
-        {accessError ? <p className="error-banner" role="alert">{accessError}</p> : null}
-        {editingAccessTarget ? (
+        {!embedded && preparingAccess ? <p role="status">Loading current access from Microsoft Graph...</p> : null}
+        {!embedded && accessError ? <p className="error-banner" role="alert">{accessError}</p> : null}
+        {!embedded && editingAccessTarget ? (
           <AccessAssignmentModal
             context="single"
             agentCount={1}
@@ -604,18 +618,18 @@ function AccessList({
 }: {
   label: string;
   values?: CopilotPackageDetail["allowedUsersAndGroups"];
-  onEdit: () => void;
+  onEdit?: () => void;
   busy?: boolean;
 }) {
   return (
     <div className="access-list">
       <div className="access-list-header">
         <span>{label}</span>
-        <WorkbenchActionGate actionId="packages.access">
+        {onEdit ? <WorkbenchActionGate actionId="packages.access">
         <button type="button" className="secondary" aria-label={`Edit ${label === "Available to" ? "availability" : "installation"}`} disabled={busy} onClick={onEdit}>
           {busy ? "Loading..." : "Edit"}
         </button>
-        </WorkbenchActionGate>
+        </WorkbenchActionGate> : null}
       </div>
       {values?.length ? (
         <ul>

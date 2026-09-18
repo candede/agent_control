@@ -1419,9 +1419,11 @@ button.export-choice-card.secondary {
 
 .detail-modal {
   width: min(1120px, 100%);
-  max-height: min(860px, calc(100svh - 48px));
-  overflow: auto;
+  height: min(820px, calc(100svh - 48px));
+  max-height: none;
+  overflow: hidden;
   display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 20px;
   padding: 0;
   border: 1px solid var(--border);
@@ -1430,6 +1432,12 @@ button.export-choice-card.secondary {
     linear-gradient(180deg, rgba(236, 245, 241, 0.94), transparent 260px),
     var(--surface);
   box-shadow: 0 22px 70px rgba(16, 33, 31, 0.24);
+}
+
+.detail-modal > [role="tabpanel"] {
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 28px;
 }
 
 .detail-header {

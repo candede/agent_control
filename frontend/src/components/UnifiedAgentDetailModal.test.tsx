@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import * as api from "../api/client";
-import type { CapabilityView, InventorySourceAwareDetail, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
+import type { CapabilityView, CopilotPackageDetail, InventorySourceAwareDetail, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
@@ -241,7 +241,7 @@ describe("UnifiedAgentDetailModal", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
     const tablist = within(dialog).getByRole("tablist", { name: "Agent details" });
-    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Availability", "Configuration", "Usage", "Activity", "Manage"]);
+    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Packages", "Configuration", "Usage", "Activity", "Manage"]);
     expect(within(dialog).getByRole("tabpanel", { name: "Overview" })).toBeVisible();
     expect(within(dialog).getByText("Production")).toBeVisible();
     expect(within(dialog).getByText("Agent Builder")).toBeVisible();
@@ -256,7 +256,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(technical).toHaveTextContent("package-1");
     expect(technical).toHaveTextContent("element-1");
     expect(technical).toHaveTextContent("elementDetails.AgentMetadatas.definition.AgentIdentityId");
-    fireEvent.click(within(dialog).getByRole("tab", { name: "Availability" }));
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Packages" }));
     expect(props.onTabChange).toHaveBeenLastCalledWith("package");
     expect(within(dialog).getByText("Package one")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("tab", { name: "Configuration" }));
@@ -265,18 +265,48 @@ describe("UnifiedAgentDetailModal", () => {
     fireEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
     expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
     expect(within(dialog).getByRole("heading", { name: "Manage agent" })).toBeVisible();
-    expect(within(dialog).getByText(/package blocking and quarantine are independent/)).toBeVisible();
+    expect(within(dialog).getByText(/Every action identifies its exact target/)).toBeVisible();
     expect(within(dialog).getByText(/AgentControl.Admin role is required/)).toBeVisible();
   });
 
   it.each([
-    ["identities", "Overview"], ["package", "Availability"], ["power-platform", "Configuration"],
+    ["identities", "Overview"], ["package", "Packages"], ["power-platform", "Configuration"],
     ["reports", "Usage"], ["audit-security", "Activity"], ["controls", "Manage"],
   ])("preserves the legacy %s route and panel IDs under the %s label", (activeTab, name) => {
     renderDetail({ activeTab });
     expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name })).toHaveAttribute("id", `unified-agent-tab-${activeTab}`);
     expect(screen.getByRole("tabpanel", { name })).toHaveAttribute("id", `unified-agent-panel-${activeTab}`);
+  });
+
+  it("keeps Availability informational and reserves package mutations for Manage", () => {
+    renderDetail({ activeTab: "package" });
+    expect(screen.getByRole("button", { name: "Package details for Package one (package-1)" })).toBeEnabled();
+    expect(screen.getByText("Package management actions are available from the Manage tab.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block / })).not.toBeInTheDocument();
+  });
+
+  it("embeds exact package metadata in the agent workspace without opening another dialog", async () => {
+    const packageDetail: CopilotPackageDetail = {
+      ...record.packages[0],
+      version: "3.2.1",
+      allowedUsersAndGroups: [{ resourceType: "group", resourceId: "group-1" }],
+      elementDetails: [{
+        elementType: "AgentMetadatas",
+        elements: [{ id: "metadata-1", definition: JSON.stringify({ connectorId: "Finance connector" }) }],
+      }],
+    };
+    const { props, update } = renderDetail({ activeTab: "package" });
+
+    await userEvent.click(screen.getByRole("button", { name: "Package details for Package one (package-1)" }));
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    update({ activeTab: "package", packageDetail });
+
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.getByRole("heading", { name: "Package details" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Connected services" })).toBeVisible();
+    expect(screen.getByText("Finance connector")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Package details for Package one (package-1)" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("falls back to Overview for an unknown route and supports keyboard tab navigation", () => {
@@ -406,8 +436,6 @@ describe("UnifiedAgentDetailModal", () => {
     const { props } = renderDetail({ record: grouped, activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
     for (const item of grouped.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Package details for ${item.displayName} (${item.id})` }));
-      expect(props.onInspectPackage).toHaveBeenLastCalledWith(item);
       await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
       expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
       await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
@@ -597,7 +625,7 @@ describe("UnifiedAgentDetailModal", () => {
     ];
     const { props } = renderDetail({ record: observed, activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
-    expect(screen.getByRole("heading", { name: "Access, installation and blocking" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Package controls" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Quarantine and restore" })).toBeVisible();
     expect(screen.getByText(/Available to: All users.*Installed for: Specific users or groups/)).toBeVisible();
     expect(screen.getByText(/Available to: Unknown.*Installed for: Unknown/)).toBeVisible();
@@ -608,8 +636,6 @@ describe("UnifiedAgentDetailModal", () => {
       expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
       await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
       expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
-      await userEvent.click(screen.getByRole("button", { name: `Package details for ${item.displayName} (${item.id})` }));
-      expect(props.onInspectPackage).toHaveBeenLastCalledWith(item);
     }
     expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Restore from quarantine" })).toBeEnabled();
@@ -635,8 +661,6 @@ describe("UnifiedAgentDetailModal", () => {
     };
     const { props } = renderDetail({ record: group, activeTab: "controls" });
     for (const item of group.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Package details for ${item.displayName} (${item.id})` }));
-      expect(props.onInspectPackage).toHaveBeenLastCalledWith(item);
       await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
       expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
       await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
@@ -689,7 +713,6 @@ describe("UnifiedAgentDetailModal", () => {
     renderDetail({ record: observedRecord(), activeTab: "controls", roles: ["AgentControl.Viewer"] });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
     expect(screen.getByText(/AgentControl.Admin role is required/)).toBeVisible();
-    expect(screen.getByRole("button", { name: /Package details/ })).toBeEnabled();
     expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block |^Quarantine$|Restore from quarantine/ })).not.toBeInTheDocument();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
   });
