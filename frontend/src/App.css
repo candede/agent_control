@@ -542,7 +542,7 @@ button.view-button.active {
 }
 
 .filter-section-primary {
-  grid-template-columns: minmax(0, 2fr) repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 2fr) repeat(4, minmax(0, 1fr));
 }
 
 .filter-section-advanced {
@@ -4679,6 +4679,10 @@ button.audit-result-button:focus-visible {
 }
 
 @media (max-width: 920px) {
+  .filter-section-primary {
+    grid-template-columns: minmax(0, 0.75fr) repeat(4, minmax(0, 1fr));
+  }
+
   .user-controls,
   .inventory-controls,
   .hunting-filters > div,

@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { createJobConfirmation, JobRepository, type JobInput, type JobIntentInput } from "./jobs.js";
+import { allowlistedPackage } from "../services/packageObservation.js";
+import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: JobRepository;
@@ -71,10 +73,34 @@ describe("Durable scoped jobs", () => {
     const lease = claims.find(Boolean)!; const work = (await jobs.beginItem(lease))!;
     await jobs.markSent(lease, work.item.id, work.item.prestate_hash);
     await fixture.operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
-    await expect(jobs.finishItem(lease, work.item.id, "succeeded")).rejects.toMatchObject({ code: "lease_lost" });
+    const revision = await readUnifiedInventoryRevision(scope, fixture.runtime);
+    await expect(jobs.finishItem(lease, work.item.id, "succeeded", {
+      poststate: { kind: "block", isBlocked: true }, readbackCount: 1, inventoryGeneration: null,
+      readback: allowlistedPackage({ id: work.item.target_id, displayName: "Expired result", isBlocked: true }),
+    })).rejects.toMatchObject({ code: "lease_lost" });
+    expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).toBe(revision);
     await jobs.recover(scope.tenantId);
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1, canResume: false });
     expect(await jobs.claim(job.id, scope, randomUUID(), true)).toBeUndefined();
+  });
+
+  it("rejects readbacks for another exact target or a different verified state atomically", async () => {
+    const job = await jobs.submit(scope, input(["verified-target"]));
+    const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
+    const work = (await jobs.beginItem(lease))!;
+    const revision = await readUnifiedInventoryRevision(scope, fixture.runtime);
+    for (const detail of [
+      { id: "another-target", displayName: "Other target", isBlocked: true },
+      { id: "verified-target", displayName: "Wrong state", isBlocked: false },
+    ]) {
+      await expect(jobs.finishItem(lease, work.item.id, "succeeded", {
+        poststate: { kind: "block", isBlocked: true }, readbackCount: 1, readback: allowlistedPackage(detail), inventoryGeneration: null,
+      })).rejects.toMatchObject({ code: "mutation_readback_mismatch" });
+      expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).toBe(revision);
+      expect((await fixture.runtime.query("SELECT status FROM job_items WHERE id=$1", [work.item.id])).rows[0].status).toBe("running");
+    }
+    await jobs.finishItem(lease, work.item.id, "cancelled");
+    await jobs.release(lease);
   });
   it("recovers unsent work to authorization wait and never replays success", async () => {
     const job = await jobs.submit(scope, input(["first", "second"]));

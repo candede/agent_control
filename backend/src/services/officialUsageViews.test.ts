@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PublishedOfficialUsage } from "../types/officialUsage.js";
-import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
+import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
 
 const set = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -80,6 +80,20 @@ function published(): PublishedOfficialUsage {
       },
     },
   };
+}
+
+function drilldownPublished() {
+  const source = published();
+  source.reports.userAgents!.rows.push(
+    { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "zero-user", responsesSentToUsers: 0, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
+    { agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: "bridge-only", responsesSentToUsers: 2, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
+    { agentId: "usage-A", agentName: "Agent A", creatorType: "Declarative", username: "upper-only", responsesSentToUsers: 11, lastActivityDateUtc: "2026-07-06T00:00:00.000Z" },
+  );
+  source.reports.users!.rows.push(
+    { username: "zero-user", displayName: "Zero User", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+    { username: "users-only", displayName: "No bridge rows", numberOfAgentsUsed: 8, agentResponsesReceived: 900 },
+  );
+  return source;
 }
 
 describe("official usage views", () => {
@@ -262,6 +276,52 @@ describe("official usage views", () => {
     expect(withoutBridge.summary.usage.topAgentsByActiveUsers).toEqual([]);
   });
 
+  it("counts distinct positive-response identities without treating reported zero rows as active users", () => {
+    const source = drilldownPublished();
+    source.reports.users!.rows.push({
+      username: "users-only-zero", displayName: "No responses", numberOfAgentsUsed: 0, agentResponsesReceived: 0,
+    });
+    const result = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
+
+    expect(result.summary.usage).toMatchObject({
+      totalActiveUsers: 5,
+      activeUserReconciliation: { sourceValues: { users: 3, userAgents: 4 }, status: "mismatch", difference: 1 },
+    });
+    expect(result.summary.activityWindow.activeUsers).toBe(4);
+    expect(result.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
+      activeUsersTotal: 3, activeUsersIdentityCount: 3, activeUsersTotalBasis: "userAgents_distinct_identity",
+    });
+    expect(result.summary.usage.topAgentsByActiveUsers.find(agent => agent.id === "usage-a")?.activeUsers).toBe(3);
+    expect(buildOfficialUsageUserView(source, { staleAfterDays: 35 }).users.value.map(user => user.username))
+      .toEqual(expect.arrayContaining(["zero-user", "users-only-zero"]));
+  });
+
+  it("does not infer an active-user zero for an agent absent from an otherwise present companion report", () => {
+    const source = published();
+    source.reports.userAgents!.rows = source.reports.userAgents!.rows.filter(row => row.agentId !== "usage-a");
+    const result = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
+
+    expect(result.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
+      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
+    });
+    expect(result.summary.usage.topAgentsByActiveUsers.map(agent => agent.id)).not.toContain("usage-a");
+  });
+
+  it.each(["activeUsersLicensed", "activeUsersUnlicensed"] as const)(
+    "fails explicitly instead of publishing an inexact %s occurrence total", metric => {
+      const source = published();
+      source.reports.agents!.rows[0][metric] = Number.MAX_SAFE_INTEGER;
+      source.reports.agents!.rows[1][metric] = 0;
+      const safe = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
+      expect(metric === "activeUsersLicensed"
+        ? safe.summary.usage.reportedLicensedActiveUserOccurrences
+        : safe.summary.usage.reportedUnlicensedActiveUserOccurrences).toBe(Number.MAX_SAFE_INTEGER);
+
+      source.reports.agents!.rows[1][metric] = 1;
+      expect(() => buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 }))
+        .toThrowError(expect.objectContaining({ code: "official_usage_total_limit" }));
+    });
+
   it("preserves a disjoint 50k plus 50k identity union for export paging", () => {
     const source = published();
     source.reports.agents!.rows = Array.from({ length: 50_000 }, (_, index) => ({
@@ -300,5 +360,228 @@ describe("official usage views", () => {
     expect(aggregate.summary.usage.totalActiveUsers).toBe(100_000);
     expect(aggregate.agents.count).toBe(100_000);
     expect(aggregate.agents.value).toHaveLength(100_000);
+  });
+});
+
+describe("official usage agent detail", () => {
+  it("keeps distinct report identities, nonadditive categories and mismatching source totals without inventing user dates", () => {
+    const source = drilldownPublished();
+    const original = structuredClone(source);
+    const options = { staleAfterDays: 35, now: new Date("2026-07-10T00:00:00.000Z") };
+    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", options)!;
+    const aggregate = buildOfficialUsageAggregateView(source, [], options);
+
+    expect(detail.agent).toEqual(aggregate.agents.value.find(agent => agent.agentId === "usage-a"));
+    expect(detail.agent).toMatchObject({
+      activeUsersLicensed: 2,
+      activeUsersUnlicensed: 1,
+      activeUsersTotal: 3,
+      activeUsersIdentityCount: 3,
+      responsesSentToUsers: 9,
+      responseComparison: { status: "mismatch", sourceValues: { agents: 9, userAgents: 11 }, difference: 2 },
+      identityStatus: "unresolved",
+    });
+    expect(detail.summary).toEqual({
+      reportedUsers: 4, responseProducingUsers: 3, zeroResponseUsers: 1, userBreakdownResponses: 11,
+    });
+    expect(detail.users.value).toEqual([
+      { username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 5 },
+      { username: "casesensitiveuser", displayName: "Pseudonym B", responsesSentToUsers: 4 },
+      { username: "bridge-only", displayName: "bridge-only", responsesSentToUsers: 2 },
+      { username: "zero-user", displayName: "Zero User", responsesSentToUsers: 0 },
+    ]);
+    for (const user of detail.users.value) {
+      expect(Object.keys(user).sort()).toEqual(["displayName", "responsesSentToUsers", "username"]);
+    }
+    for (const key of ["authority", "availability", "staleAfterDays", "periodAgeDays", "acceptedAgeDays", "activeSet", "lineages", "missingKinds"] as const) {
+      expect(detail[key]).toEqual(aggregate[key]);
+    }
+    expect(source).toEqual(original);
+  });
+
+  it.each([
+    ["responses", "asc", ["bridge-only", "casesensitiveuser"]],
+    ["responses", "desc", ["casesensitiveuser", "bridge-only"]],
+    ["displayName", "asc", ["casesensitiveuser", "zero-user"]],
+    ["displayName", "desc", ["zero-user", "casesensitiveuser"]],
+  ] as const)("sorts the entire user breakdown by %s %s before paging", (sortBy, sortDirection, usernames) => {
+    const result = buildOfficialUsageAgentDetailView(drilldownPublished(), "usage-a", {
+      staleAfterDays: 35, sortBy, sortDirection, limit: 2, offset: 1,
+    })!;
+
+    expect(result.users).toMatchObject({ count: 4, limit: 2, offset: 1 });
+    expect(result.users.value.map(user => user.username)).toEqual(usernames);
+    expect(result.filters).toEqual({ sortBy, sortDirection });
+    expect(result.summary).toEqual({
+      reportedUsers: 4, responseProducingUsers: 3, zeroResponseUsers: 1, userBreakdownResponses: 11,
+    });
+  });
+
+  it("searches report display names and usernames without changing whole-agent metrics", () => {
+    const source = drilldownPublished();
+    const result = buildOfficialUsageAgentDetailView(source, "usage-a", {
+      staleAfterDays: 35, search: " PSEUDONYM ", sortDirection: "asc", limit: 1, offset: 1,
+    })!;
+    expect(result.filters.search).toBe("PSEUDONYM");
+    expect(result.users).toEqual({
+      value: [{ username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 5 }],
+      count: 2, limit: 1, offset: 1,
+    });
+    const byUsername = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, search: "BRIDGE-ONLY" })!;
+    expect(byUsername.users.value).toEqual([{ username: "bridge-only", displayName: "bridge-only", responsesSentToUsers: 2 }]);
+    const empty = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, search: "absent" })!;
+    expect(empty.users).toMatchObject({ value: [], count: 0 });
+    expect(empty.summary).toEqual(result.summary);
+    expect(byUsername.summary).toEqual(result.summary);
+    expect(empty.agent.responsesSentToUsers).toBe(9);
+  });
+
+  it("breaks sorting ties by the exact username in either direction", () => {
+    const source = published();
+    source.reports.userAgents!.rows[0].responsesSentToUsers = 4;
+    source.reports.users!.rows.forEach(row => { row.displayName = "Same label"; });
+    for (const sortBy of ["responses", "displayName"] as const) {
+      for (const sortDirection of ["asc", "desc"] as const) {
+        const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, sortBy, sortDirection })!;
+        expect(detail.users.value.map(user => user.username)).toEqual(["CaseSensitiveUser", "casesensitiveuser"]);
+      }
+    }
+  });
+
+  it("distinguishes missing active-user evidence, empty breakdowns and explicit zero-response rows", () => {
+    const source = drilldownPublished();
+    const zeroOnly = source.reports.userAgents!.rows.find(row => row.username === "zero-user")!;
+    source.reports.userAgents!.rows = [zeroOnly];
+    const zero = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(zero.summary).toEqual({ reportedUsers: 1, responseProducingUsers: 0, zeroResponseUsers: 1, userBreakdownResponses: 0 });
+    expect(zero.users.value).toEqual([{ username: "zero-user", displayName: "Zero User", responsesSentToUsers: 0 }]);
+    expect(zero.agent.responseComparison.sourceValues).toEqual({ agents: 9, userAgents: 0 });
+    expect(zero.agent).toMatchObject({
+      activeUsersTotal: 0, activeUsersIdentityCount: 0, activeUsersTotalBasis: "userAgents_distinct_identity",
+    });
+
+    source.reports.userAgents!.rows = [];
+    const empty = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(empty.summary).toEqual({ reportedUsers: 0, responseProducingUsers: null, zeroResponseUsers: 0, userBreakdownResponses: 0 });
+    expect(empty.users).toMatchObject({ value: [], count: 0 });
+    expect(empty.agent).toMatchObject({
+      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
+    });
+
+    source.reports.userAgents = undefined;
+    const missing = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(missing.summary).toEqual({ reportedUsers: null, responseProducingUsers: null, zeroResponseUsers: null, userBreakdownResponses: null });
+    expect(missing.users).toMatchObject({ value: [], count: 0 });
+    expect(missing.missingKinds).toEqual(["userAgents"]);
+    expect(missing.agent).toMatchObject({
+      activeUsersTotal: null, activeUsersIdentityCount: null, activeUsersTotalBasis: "unknown",
+      responseComparison: { status: "not_comparable", sourceValues: { agents: 9, userAgents: null } },
+    });
+  });
+
+  it("keeps response-producing users unknown when companion rows only describe other agents", () => {
+    const source = drilldownPublished();
+    source.reports.userAgents!.rows = source.reports.userAgents!.rows.filter(row => row.agentId !== "usage-a");
+    expect(source.reports.userAgents!.rows.length).toBeGreaterThan(0);
+
+    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(detail.summary).toEqual({
+      reportedUsers: 0, responseProducingUsers: null, zeroResponseUsers: 0, userBreakdownResponses: 0,
+    });
+    expect(detail.agent.activeUsersIdentityCount).toBeNull();
+    expect(detail.users).toMatchObject({ value: [], count: 0 });
+    expect(detail.missingKinds).not.toContain("userAgents");
+  });
+
+  it("uses exact report IDs, never agent names or inferred inventory identities", () => {
+    const source = drilldownPublished();
+    const upper = buildOfficialUsageAgentDetailView(source, "usage-A", { staleAfterDays: 35 })!;
+    expect(upper.agent).toMatchObject({
+      agentId: "usage-A", agentName: "Agent A", sourceReport: "userAgents", sourceReports: ["userAgents"],
+      activeUsersLicensed: null, activeUsersUnlicensed: null, activeUsersTotal: 1, identityStatus: "unresolved",
+    });
+    expect(upper.users.value).toEqual([{ username: "upper-only", displayName: "upper-only", responsesSentToUsers: 11 }]);
+    for (const id of ["USAGE-A", "Agent A", "package-usage-a", " usage-a ", "unknown"]) {
+      expect(buildOfficialUsageAgentDetailView(source, id, { staleAfterDays: 35 })).toBeUndefined();
+    }
+    expect(buildOfficialUsageAgentDetailView({ ...source, reports: {} }, "usage-a", { staleAfterDays: 35 })).toBeUndefined();
+  });
+
+  it("falls back to exact report usernames when the Users companion is absent", () => {
+    const source = published();
+    source.reports.users = undefined;
+    const detail = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(detail.missingKinds).toEqual(["users"]);
+    expect(detail.users.value).toEqual([
+      { username: "CaseSensitiveUser", displayName: "CaseSensitiveUser", responsesSentToUsers: 5 },
+      { username: "casesensitiveuser", displayName: "casesensitiveuser", responsesSentToUsers: 4 },
+    ]);
+  });
+
+  it("bounds user pages independently of whole-agent metrics", () => {
+    const source = published();
+    source.reports.userAgents!.rows = Array.from({ length: 550 }, (_, index) => ({
+      agentId: "usage-a", agentName: "Agent A", creatorType: "Declarative", username: `user-${index}`, responsesSentToUsers: 1,
+    }));
+    const defaults = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35 })!;
+    expect(defaults.users).toMatchObject({ count: 550, limit: 100, offset: 0 });
+    expect(defaults.users.value).toHaveLength(100);
+    const bounded = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, limit: 100_000 })!;
+    expect(bounded.users).toMatchObject({ count: 550, limit: 500, offset: 0 });
+    expect(bounded.users.value).toHaveLength(500);
+    expect(bounded.summary).toEqual({ reportedUsers: 550, responseProducingUsers: 550, zeroResponseUsers: 0, userBreakdownResponses: 550 });
+    const beyond = buildOfficialUsageAgentDetailView(source, "usage-a", { staleAfterDays: 35, limit: 0, offset: 1_000_000 })!;
+    expect(beyond.users).toEqual({ value: [], count: 550, limit: 1, offset: 100_000 });
+    expect(beyond.summary).toEqual(bounded.summary);
+  });
+});
+
+describe("official usage users agent filter", () => {
+  it("selects exact bridge identities, including zero rows, while retaining each full Users total and all rows", () => {
+    const source = drilldownPublished();
+    const baseline = buildOfficialUsageUserView(source, { staleAfterDays: 35 });
+    const filtered = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-a" });
+
+    expect(baseline.filters).not.toHaveProperty("agentId");
+    expect(filtered.filters.agentId).toBe("usage-a");
+    expect(filtered.users.count).toBe(4);
+    expect(filtered.users.value.map(user => user.username)).toEqual(["CaseSensitiveUser", "casesensitiveuser", "bridge-only", "zero-user"]);
+    for (const user of filtered.users.value) {
+      expect(user).toEqual(baseline.users.value.find(candidate => candidate.username === user.username));
+    }
+    expect(filtered.users.value[0]).toMatchObject({
+      reportedResponsesReceived: 9, bridgeResponsesSentToUsers: 11, reportedAgentsUsed: 2, agentsAccessedTotal: 3,
+    });
+    expect(filtered.users.value[0].rows.map(row => row.agentId)).toEqual(["usage-a", "usage-b", "usage-report-only"]);
+    expect(filtered.counts).toEqual({ ...baseline.counts, filteredUsers: 4 });
+    expect(filtered.cohorts).toEqual(baseline.cohorts);
+    expect(filtered.topUsersByResponses[0]).toMatchObject({ username: "CaseSensitiveUser", responses: 9, responsesSource: "users" });
+    expect(filtered.users.value.at(-1)).toMatchObject({
+      username: "zero-user", reportedResponsesReceived: 0, rows: [expect.objectContaining({ agentId: "usage-a", responsesSentToUsers: 0 })],
+    });
+  });
+
+  it("applies the agent filter, search and sorting before counts and pagination", () => {
+    const result = buildOfficialUsageUserView(drilldownPublished(), {
+      staleAfterDays: 35, agentId: "usage-a", search: "PSEUDONYM", userSortBy: "responses", sortDirection: "asc", limit: 1, offset: 1,
+    });
+    expect(result.users).toMatchObject({
+      value: [expect.objectContaining({ username: "CaseSensitiveUser", reportedResponsesReceived: 9 })],
+      count: 2, limit: 1, offset: 1,
+    });
+    expect(result.counts).toMatchObject({ users: 6, filteredUsers: 2, totalResponsesReceived: 913 });
+  });
+
+  it("keeps case-distinct report IDs separate and never infers missing access rows", () => {
+    const source = drilldownPublished();
+    const upper = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-A" });
+    expect(upper.users.value.map(user => user.username)).toEqual(["upper-only"]);
+    for (const agentId of ["USAGE-A", "Agent A", "unknown"]) {
+      expect(buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId }).users).toMatchObject({ value: [], count: 0 });
+    }
+    source.reports.userAgents = undefined;
+    const missing = buildOfficialUsageUserView(source, { staleAfterDays: 35, agentId: "usage-a" });
+    expect(missing.users).toMatchObject({ value: [], count: 0 });
+    expect(missing.counts).toMatchObject({ users: 4, filteredUsers: 0, totalResponsesReceived: 913 });
   });
 });

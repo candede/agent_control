@@ -15,8 +15,9 @@ export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAc
 export type InventoryExportAction = "export-package-inventory" | "export-power-platform-inventory" | "export-agent-inventory";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
 export type AdministrativeExportAction = "export-administrative-audit";
+export type AgentUsageAuditAction = "associate-agent-usage" | "remove-agent-usage-association";
 
-export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction;
+export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction | AgentUsageAuditAction;
 
 export type AuditScope = "single" | "bulk";
 
@@ -55,7 +56,7 @@ type AuditEventAction =
       targetBlockedState: boolean;
     }
   | {
-      action: AccessAuditAction | ReassignAuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction;
+      action: AccessAuditAction | ReassignAuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AdministrativeExportAction | AgentUsageAuditAction;
       targetBlockedState?: never;
     };
 

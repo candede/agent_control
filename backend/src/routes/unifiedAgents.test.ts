@@ -3,6 +3,14 @@ import { unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAg
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 
 describe("unified agent inventory query", () => {
+  it("accepts organizational and usage views and new column sorting for list and export", () => {
+    expect(unifiedAgentInventoryQuery({ view: "organization", sortBy: "deployment" })).toMatchObject({ view: "organization", sortBy: "deployment" });
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view: "used", sortBy: "responses", sortDirection: "desc" } }).query)
+      .toMatchObject({ view: "used", sortBy: "responses", sortDirection: "desc" });
+    expect(() => unifiedAgentInventoryQuery({ view: "active-guessed" })).toThrow();
+    expect(() => unifiedAgentInventoryQuery({ sortBy: "actions" })).toThrow();
+  });
+
   it("parses typed filters, sorting and pagination", () => {
     expect(unifiedAgentInventoryQuery({
       search: " agent ",

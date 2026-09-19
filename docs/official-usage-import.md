@@ -12,7 +12,7 @@ This runbook imports the Microsoft 365 admin-center Copilot Agents usage exports
 
 Microsoft says interaction usage can become visible within one hour. That is source latency, not proof that an exported or imported set is current. You do not need to record or enter dates to import the files.
 
-Microsoft source: [Copilot Agents usage report](https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide), rechecked 2026-09-09; source page updated 2026-08-18.
+Microsoft source: [Copilot Agents usage report](https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide), rechecked 2026-09-19; source page updated 2026-09-09.
 
 ## Supported schemas
 
@@ -30,8 +30,10 @@ The source refresh time remains unknown. The app does not guess it from the file
 
 Microsoft documents the following interpretation constraints:
 
-- **Active users (licensed)** and **Active users (unlicensed)** are independent source categories. A license change can place one person in both categories during the selected period, so even one agent's distinct total can be less than their sum. Agent Control never adds them. Per-agent distinct active users come from exact Users & agents identities; without that bridge the value is `Unknown`.
+- **Active users (licensed)** and **Active users (unlicensed)** are independent source categories. A license change can place one person in both categories during the selected period, so even one agent's distinct total can be less than their sum. Agent Control never adds them. Microsoft defines an active user as one who asks an agent a question and receives a response. Per-agent distinct active users come from exact, positive-response Users & agents identities; without companion rows for that agent the value is `Unknown`. Explicit zero-response rows remain reported relationships, but contribute zero active users. Tenant active-user totals deduplicate positive-response identities from Users and Users & agents without adding the two source counts.
+- The drilldown's **Users with responses** metric follows the same per-agent evidence rule. It remains `Unknown` when the companion report is empty or contains only other agents, even though its reported relationship count is zero.
 - Response values from Agents, Users & agents, and Users remain separate source totals. The headline response total uses Agents only and excludes bridge-only agents instead of creating a hybrid total.
+- Computed report totals must fit the exact safe-integer range. If a total exceeds that range, the report returns an explicit `official_usage_total_limit` conflict rather than publishing a rounded number.
 - In Users & agents, **Last activity date (UTC)** is when that agent was last used by anyone. It is preserved with that exact meaning and is not used as the named user's recency. User recency comes from the Users export and is `Unknown` when no Users row exists.
 - Usernames can be anonymized according to Microsoft 365 report settings. They remain case-sensitive dataset-scoped identifiers and are never guessed back to people.
 
@@ -74,7 +76,47 @@ A snapshot dashboard includes all its rows, including undated and zero-response 
 
 Response totals and agent counts from the Users export are shown separately from the user-agent relationship totals when they disagree. A source discrepancy is a data-quality signal, not a reason to discard rows or overwrite one report with another. Identifiers seen in only one report remain available with their missing-source status.
 
+### Explore adoption from Agents and Users
+
+- **Agents > Explore usage & users** searches reported agents and opens an exact report's response and user breakdown on the tenant-level Agents page. A report identity does not establish an inventory association or grant access-control targets.
+- Inventory agent modals are strictly agent-scoped. Their Overview and **Usage & users** tabs never substitute tenant totals or unrelated report comparisons. Inventory usage requires an explicit Admin-reviewed association to an exact report identity in the active set (see below); without one, metrics remain unknown rather than matching a name or ID or claiming zero activity.
+- **Users > User-agent matrix** shows response counts for each reported user-agent relationship, including concealed or unlinked identities. Select an agent column to focus that exact report ID. User paging and agent-column paging are explicit; columns describe the displayed user page, not all agents in the tenant.
+- An explicit zero is reported evidence. **Not reported** is an absent relationship and says nothing about access or activity. **All-agent responses** is the independent Users-report total, not a sum of the visible matrix columns.
+- Drilldown links carry the report snapshot so changing the tenant's selected report cannot silently change their meaning. **Use current reports** is an explicit switch. Current license details require an existing unique directory identity link for the same report set and versions, not a name or username heuristic. Historical or unmatched rows retain unknown license status.
+- Saved report reads are bounded and do not call inventory providers: `GET /api/official-usage/agents/:agentId` accepts `setId`, user `search`, `sortBy`, `sortDirection`, `limit`, and `offset`. `GET /api/official-usage/users` accepts an optional exact, case-sensitive `agentId` filter before paging. User-level totals remain all-agent totals even under that filter. Viewer and Admin use the existing report-read authorization.
+- Report detail, users, aggregate, history, and CSV queries reject unsupported, repeated, or structured parameters before reading saved data. A report selection is one exact `setId`, never the first value of an ambiguous query.
+
 Filtered agent and user CSV downloads preserve these source distinctions. The user download has one row per reported user-agent relationship, or one row with empty agent fields when the user has no relationship rows. User-level totals repeat on relationship rows; do not sum those repeated totals as though they were per-agent counts.
+
+### Review inventory usage associations
+
+Microsoft describes the reported Agent ID as an app identifier generated by Microsoft, but does not document equivalence to a Graph package ID, Entra application ID, manifest ID, or Power Platform native ID. Equal strings and names are **not** identity evidence. Report-only browsing remains independent of inventory; no import creates associations automatically.
+
+An Admin can explicitly browse candidates for an authorized saved agent and confirm a reporting-only association:
+
+| Route | Contract |
+| --- | --- |
+| `GET /api/agent-inventory/:recordId/usage-candidates` | Admin only; explicit candidate browsing, optional `search` (256 characters), `offset` (0–100,000), `limit` (1–250, default 50). Returns only Agents-export rows, an `associated` flag, and active report context. No user rows or provider calls. |
+| `POST /api/agent-inventory/:recordId/usage-associations` | Admin and CSRF; exact `reportSetId`, case-sensitive `reportAgentId`, source-qualified `target`, `expectedInventoryRevision`, `expectedUsageRevision`, and literal `confirmed: true`. |
+| `DELETE /api/agent-inventory/:recordId/usage-associations` | Admin and CSRF; the same confirmed revision/set/report identity fields, without `target`. Only an association resolving to this currently authorized agent can be removed. |
+
+Graph targets are `{ source: "graph_packages", packageId }`; Power Platform targets are `{ source: "power_platform", nativeId, environmentId }`, with an explicit `null` for an absent environment. A canonical UUID is a navigation reference, **not** an association target. Unknown fields and malformed identifiers, revisions, confirmation values, or paging are rejected. Successful mutations return `{ context }` only after commit; refresh the inventory before another review.
+
+Associations are shared within a tenant but bind to **one immutable report set and one exact native source**, never to the reviewer's private canonical UUID. Another viewer sees metrics only when that same native source is present in their current authorized saved inventory. Package IDs and opaque native IDs are case-sensitive; Power Platform GUIDs and environments follow the existing inventory identity normalization. Each report ID has one target per tenant/set; reassignment requires explicit removal first. Multiple distinct report identities may attach to one logical inventory agent. A new active report set does not inherit old associations, even when its IDs, names, or underlying row content match.
+
+Linked responses sum each associated Agents-export identity once, within the active set only. The latest Agents-export activity date is preserved. Active users are the union of exact, case-sensitive **positive-response** Users & agents identities, deduplicated across associated report identities. Licensed and unlicensed categories are never added. If any associated identity lacks companion evidence, its combined active-user metric is unknown; an explicit zero-response companion row yields zero. Unavailable reports and unlinked records use null metrics, not zero. Source lineage, stale status, unknown freshness, and `activity_range` provenance remain visible; no overlapping-period or all-time total is invented.
+
+Associations never create, authorize, or alter native management targets, provider capability evidence, directory identities, or saved inventory. Candidates and writes read only saved data.
+
+#### Atomicity, revision fences, and cleanup
+
+Association operations take transaction-scoped locks in the same order as inventory reconciliation: `package-refresh:<tenant>:<principal>`, `power-platform:<tenant>:<principal>`, then `official-usage:<tenant>`. They validate current source membership, the exact active report set, usage revision, and combined inventory revision in that transaction. Report row locks additionally fence operator retention. The mutation and successful administrative audit receipt commit together; audit failure rolls the mutation back. Rejected attempts retain a failed audit receipt when the database remains available.
+
+Usage revisions hash the active selection revision, report-set/lineage/content identities, freshness state, and tenant association revision. Association insert/delete advances a monotonic revision, including remove/re-add cycles. Combined inventory revisions include the private source revision and usage revision, so report replacement, deletion, expiry, and association edits invalidate old reviewed/export selections. Unexpected database failures fail explicitly rather than yielding an empty successful projection.
+
+Inventory integration calls `agentUsage.project(scope, records, client)` once after canonical reconciliation and before filtering or paging. Export revalidation reads the base inventory revision and `agentUsage.revision(scope, client)` on the same locked inventory transaction, then compares `combineAgentInventoryRevision(base, usage)`. Separate unlocked base/report reads are not an atomic publication fence. Existing standalone official-report reads retain their accepted-history compatibility; the transaction-compatible read used by inventory associations explicitly enforces report-set, version, and artifact expiry.
+
+Deleting a report set removes its associations immediately in the same transaction; physical set deletion also cascades. Bounded operator retention removes associations for expired/deleted sets. Accepted history has no default time expiry; associations on unselected but retained sets stay scoped to those sets and can reappear only if that exact set is selected again. Principal inventory cleanup does not delete another viewer's tenant report associations, but absent sources never receive metrics. Tenant association revision counters contain no report/user payload and remain to prevent revision reuse.
 
 For IT license reviews:
 
@@ -83,7 +125,7 @@ For IT license reviews:
 3. Inspect discrepancies before acting and retain the source totals in exported review data.
 4. Confirm the person's current Microsoft 365 Copilot license assignment, broader Copilot activity, role, and business need using your approved administration workflow before reclaiming or reallocating a license.
 
-**These exports cannot identify every unused Microsoft 365 Copilot license.** They do not include a tenant license roster, per-person license assignment, or all Copilot use in Word, Excel, Teams, Outlook, and other apps. A user absent from the files cannot be classified as having zero usage. Even a reported user with zero agent responses may use Copilot elsewhere. License status is therefore unavailable at user level; low agent usage is a candidate for review, not an automatic unassignment recommendation. Licensed and unlicensed agent-level categories cannot be joined back to individual users.
+**These exports cannot identify every unused Microsoft 365 Copilot license.** They do not include a tenant license roster, per-person license assignment, or all Copilot use in Word, Excel, Teams, Outlook, and other apps. A user absent from the files cannot be classified as having zero usage. Even a reported user with zero agent responses may use Copilot elsewhere. The exports alone cannot establish a user's license status; the Users view adds separately saved directory context only through a verified user link. Low agent usage is a candidate for review, not an automatic unassignment recommendation. Licensed and unlicensed agent-level categories cannot be joined back to individual users.
 
 ## Export compatibility check
 
@@ -93,7 +135,7 @@ The supplied snapshot contains 244 agents, 517 user-agent relationships, and 300
 
 ## Limits and retention
 
-Existing installations must apply schema migrations through 31 using the normal [deployment workflow](deployment-setup.md) before starting the updated runtime. Migration 29 backfills deduplicated report payloads and semantic content identities while preserving existing lineage; migration 30 adds private source-sync and saved user data; migration 31 adds explicitly admitted, principal-scoped clean resync while preserving accepted usage reports. Earlier migrations and their checksums are unchanged. Use the migration operator, not the restricted runtime database role. No in-app full resync applies migrations or wipes the database.
+Existing installations must apply schema migrations through 34 using the normal [deployment workflow](deployment-setup.md) before starting the updated runtime. Migration 29 backfills deduplicated report payloads and semantic content identities while preserving existing lineage; migration 30 adds private source-sync and saved user data; migration 31 adds explicitly admitted, principal-scoped clean resync while preserving accepted usage reports; migrations 32–33 add the canonical registry and saved-inventory verification; migration 34 adds reviewed reporting-only agent usage associations and audit actions. Earlier migrations and their checksums are unchanged. Use the migration operator, not the restricted runtime database role. Runtime grants permit association insert/delete, not reassignment updates or revision-counter writes; readiness verifies that boundary. No in-app full resync applies migrations or wipes the database.
 
 | Boundary | Limit |
 | --- | --- |

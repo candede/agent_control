@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import { resolvePackageAgentLinks } from "../services/packageAgentIdentity.js";
 import { UnifiedAgentsService } from "../services/unifiedAgents.js";
+import { AgentUsageService } from "../services/agentUsage.js";
 import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
@@ -12,6 +13,7 @@ import { PackageInventoryRepository } from "./packageInventory.js";
 import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 import { UnifiedAgentRegistry } from "./unifiedAgentRegistry.js";
 import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
+import { deleteUsageSet, publishUsageReports, saveUsageInventory, usageAudit } from "./agentUsageTestSupport.js";
 
 const scope = { tenantId: "unified-integration-tenant", principalId: "unified-reader" };
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -75,6 +77,70 @@ async function publishResources(repository: PowerPlatformInventoryRepository, ke
 }
 
 describe("persisted unified agent inventory", () => {
+  it("projects reviewed usage into private inventories and fences filtered exports across associations and report changes", async () => {
+    const fixture = await testDatabase();
+    try {
+      const packages = new PackageInventoryRepository(fixture.runtime);
+      const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+      const usage = new AgentUsageService(fixture.runtime);
+      const service = new UnifiedAgentsService({
+        packages, powerPlatform, usage, registry: new UnifiedAgentRegistry(fixture.runtime),
+        resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
+      });
+      await publishPackages(packages, "usage-inventory", ["used", "zero", "unlinked"].map((id, index) => ({
+        ...builderPackage(id), type: "external", manifestId: [manifestId, botId, unrelatedId][index],
+      })));
+      await publishResources(powerPlatform, "usage-native-inventory", []);
+      const reports = await publishUsageReports(fixture.runtime, scope);
+      const before = await service.list(scope);
+      expect(before.value.every(record => record.usage?.status === "unlinked")).toBe(true);
+      expect((await service.list(scope, { view: "organization" })).count).toBe(0);
+      const used = before.value.find(record => record.packages[0].id === "used")!;
+      await usage.attach(scope, used.id, {
+        reportSetId: reports.setId, reportAgentId: "Report-A", target: { source: "graph_packages", packageId: "used" },
+        expectedInventoryRevision: before.revision!, expectedUsageRevision: before.usageContext!.revision, confirmed: true,
+      }, usageAudit(scope));
+      const after = await service.list(scope);
+      const zero = after.value.find(record => record.packages[0].id === "zero")!;
+      await usage.attach(scope, zero.id, {
+        reportSetId: reports.setId, reportAgentId: "Report-Zero", target: { source: "graph_packages", packageId: "zero" },
+        expectedInventoryRevision: after.revision!, expectedUsageRevision: after.usageContext!.revision, confirmed: true,
+      }, usageAudit(scope));
+      const sorted = await service.list(scope, { sortBy: "responses", sortDirection: "desc" });
+      expect(sorted.value.map(record => record.usage?.responses)).toEqual([10, 0, null]);
+      expect(sorted.value.map(record => record.usage?.activeUsers)).toEqual([2, 0, null]);
+      const zeroPage = await service.list(scope, { sortBy: "responses", sortDirection: "desc", offset: 1, limit: 1 });
+      expect(zeroPage.value[0].id).toBe(zero.id);
+      const filtered = await service.list(scope, { view: "used", limit: 1 });
+      expect(filtered).toMatchObject({ count: 1, summary: { total: 3 }, filteredSummary: { total: 1 } });
+      expect(filtered.value[0].id).toBe(used.id);
+      expect((await service.list(scope, { view: "organization" })).value.map(record => record.id)).toEqual([used.id]);
+      await expect(service.assertRevision(scope, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+      const exported = await service.forExport(scope, sorted.revision!, { view: "used" });
+      expect(buildUnifiedAgentCsv(exported, Date.now() + 15_000).rowCount).toBe(1);
+      await service.assertRevision(scope, sorted.revision!);
+
+      const otherReader = { ...scope, principalId: "other-usage-reader" };
+      expect((await service.list(otherReader, { view: "used" })).count).toBe(0);
+      await saveUsageInventory(fixture.runtime, otherReader, [{ packages: ["used"] }]);
+      const authorized = await service.list(otherReader, { view: "used" });
+      expect(authorized.value[0].usage).toMatchObject({ status: "linked", responses: 10, activeUsers: 2 });
+      expect(authorized.value[0].id).not.toBe(used.id);
+      expect((await service.list({ tenantId: "unrelated-tenant", principalId: scope.principalId }, { view: "used" })).count).toBe(0);
+
+      const replacement = await publishUsageReports(fixture.runtime, scope, 11);
+      expect((await service.list(scope, { view: "used" })).count).toBe(0);
+      await expect(service.forExport(scope, sorted.revision!, { view: "used" })).rejects.toMatchObject({ code: "inventory_changed" });
+      const replaced = await service.list(scope);
+      await deleteUsageSet(fixture.runtime, scope, replacement.setId);
+      expect((await service.list(scope)).usageContext).toMatchObject({ reportSet: null, availability: "not_selected" });
+      await expect(service.assertRevision(scope, replaced.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("does not erase canonical ownership when a saved source exceeds the reader bound", async () => {
     const fixture = await testDatabase();
     try {
@@ -83,6 +149,7 @@ describe("persisted unified agent inventory", () => {
       const registry = new UnifiedAgentRegistry(fixture.runtime);
       const dependencies = {
         packages, powerPlatform, registry, resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        usage: new AgentUsageService(fixture.runtime),
         readRevision: (owner: typeof scope, database: Pick<typeof fixture.runtime, "query"> = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
       };
       await publishPackages(packages, "bounded-packages", [builderPackage("builder"), studioPackage()]);
@@ -122,6 +189,7 @@ describe("persisted unified agent inventory", () => {
       const service = new UnifiedAgentsService({
         packages, powerPlatform, registry: new UnifiedAgentRegistry(fixture.runtime),
         resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        usage: new AgentUsageService(fixture.runtime),
         readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
       });
       const ids = Array.from({ length: 5_000 }, (_, index) => `10000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`);
@@ -156,6 +224,7 @@ describe("persisted unified agent inventory", () => {
       const registry = new UnifiedAgentRegistry(fixture.runtime);
       const service = new UnifiedAgentsService({
         packages, powerPlatform, registry, resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        usage: new AgentUsageService(fixture.runtime),
         readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
       });
       const values = [builderPackage("builder-b-blocked"), builderPackage("builder-a"), studioPackage(), {
@@ -226,6 +295,7 @@ describe("persisted unified agent inventory", () => {
       const service = new UnifiedAgentsService({
         packages, powerPlatform, registry: new UnifiedAgentRegistry(fixture.runtime),
         resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        usage: new AgentUsageService(fixture.runtime),
         readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
       });
       const value = studioPackage();

@@ -129,6 +129,87 @@ function renderTable(overrides: Partial<ComponentProps<typeof UnifiedAgentTable>
 }
 
 describe("UnifiedAgentTable", () => {
+  it("shows and hides columns, preserves mandatory identity, and resets defaults", () => {
+    renderTable({ records: [{ ...record, packages: record.packages.map(item => ({ ...item, supportedHosts: ["Teams", "Copilot"] })) }] });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    const picker = screen.getByRole("dialog", { name: "Choose agent columns" });
+    expect(within(picker).getByRole("checkbox", { name: "Agent Always shown" })).toBeDisabled();
+    fireEvent.click(within(picker).getByRole("checkbox", { name: "Hosts" }));
+    expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeInTheDocument();
+    expect(screen.getByText("Copilot / Teams")).toBeInTheDocument();
+    fireEvent.click(within(picker).getByRole("checkbox", { name: "Environment" }));
+    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    fireEvent.click(within(picker).getByRole("button", { name: "Reset defaults" }));
+    expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Environment" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Choose agent columns" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Columns" })).toHaveFocus();
+  });
+
+  it("requests server sorting without reordering the supplied page and updates accessible sort state", () => {
+    const onSortChange = vi.fn();
+    const { update } = renderTable({ onSortChange, sortBy: "displayName", sortDirection: "asc", records: [
+      { ...record, id: "agent-z", displayName: "Zulu" },
+      { ...record, id: "agent-a", displayName: "Alpha" },
+    ] });
+    expect(screen.getAllByRole("button", { name: /^(Zulu|Alpha)$/ }).map(element => element.textContent)).toEqual(["Zulu", "Alpha"]);
+    fireEvent.click(screen.getByRole("button", { name: "Sort by Agent" }));
+    expect(onSortChange).toHaveBeenCalledWith("displayName", "desc");
+    update({ sortDirection: "desc" });
+    expect(screen.getByRole("columnheader", { name: "Agent" })).toHaveAttribute("aria-sort", "descending");
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Sort by Responses" }));
+    expect(onSortChange).toHaveBeenLastCalledWith("responses", "desc");
+  });
+
+  it("preserves mounted controls and uses current callbacks after a parent render", () => {
+    const { update, props } = renderTable();
+    const checkbox = screen.getByRole("checkbox", { name: `Select ${record.displayName}` });
+    const detail = screen.getByRole("button", { name: record.displayName });
+    detail.focus();
+    const onToggleSelection = vi.fn();
+    const onViewDetails = vi.fn();
+    update({ onToggleSelection, onViewDetails, selectedPackageIds: new Set([record.packages[0].id]) });
+    expect(screen.getByRole("checkbox", { name: `Select ${record.displayName}` })).toBe(checkbox);
+    expect(screen.getByRole("button", { name: record.displayName })).toBe(detail);
+    expect(detail).toHaveFocus();
+    fireEvent.click(checkbox);
+    fireEvent.click(detail);
+    expect(onToggleSelection).toHaveBeenCalledWith(record);
+    expect(onViewDetails).toHaveBeenCalledWith(record);
+    expect(props.onToggleSelection).not.toHaveBeenCalled();
+    expect(props.onViewDetails).not.toHaveBeenCalled();
+  });
+
+  it("keeps zero responses distinct from unlinked usage and makes columns available for an empty view", () => {
+    const { update } = renderTable({ records: [{
+      ...record,
+      usage: { status: "linked", reportSetId: "report-1", responses: 0, activeUsers: 0, lastActivityDateUtc: null, associations: [] },
+    }] });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("cell", { name: "0" })).toBeInTheDocument();
+    update({ records: [record] });
+    expect(screen.getByRole("cell", { name: "Unavailable" })).toBeInTheDocument();
+    update({ records: [] });
+    expect(screen.getByRole("heading", { name: "No matching agents" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Columns" })).toBeEnabled();
+  });
+
+  it("surfaces malformed optional timestamps without crashing the table or inventing dates", () => {
+    renderTable({ records: [{ ...record, packages: [{ ...record.packages[0], lastModifiedDateTime: "not a date" }] }] });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Modified" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByText("Invalid saved value")).toHaveAttribute("role", "status");
+    expect(screen.getByText("Invalid saved value")).toHaveAttribute("title", "Saved agent inventory contains an invalid timestamp.");
+    expect(screen.getByRole("button", { name: record.displayName })).toBeEnabled();
+  });
+
   it("does not repeat the authoring tool because its sources use different spelling", () => {
     renderTable({
       records: [{

@@ -12,9 +12,9 @@ test("basic filters occupy exactly two rows on desktop and tablet, with usable m
   await page.goto("/agents");
   await expect(page.getByRole("region", { name: "Unified agents" })).toBeVisible();
   const filters = page.getByRole("region", { name: "Filters", exact: true });
-  await expect(filters.getByRole("combobox")).toHaveCount(5);
+  await expect(filters.getByRole("combobox")).toHaveCount(6);
   await expect(page.getByRole("checkbox", { name: "Advanced filters" })).not.toBeChecked();
-  for (const name of ["Built with", "Available to", "Host", "Package status"]) {
+  for (const name of ["Show agents", "Built with", "Available to", "Host", "Package status"]) {
     await expect(filters.getByRole("combobox", { name, exact: true })).toBeVisible();
   }
   await expect(filters.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();

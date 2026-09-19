@@ -1,4 +1,4 @@
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../../backend/src/types/unifiedAgents";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
 
 export const workbenchViewIds = [
   "agents",
@@ -15,6 +15,7 @@ export const workbenchViewIds = [
 export type WorkbenchViewId = (typeof workbenchViewIds)[number];
 
 export type AgentRouteState = {
+  agentView: UnifiedAgentView;
   search: string;
   status: "all" | "allowed" | "blocked";
   publisher: string;
@@ -22,7 +23,7 @@ export type AgentRouteState = {
   host: string;
   platform: string;
   createdWithinDays: string;
-  sortBy: "displayName" | "publisher" | "lastModifiedAt";
+  sortBy: UnifiedAgentSort;
   sortDirection: "asc" | "desc";
   page: number;
   detailId?: string;
@@ -85,6 +86,14 @@ export type OfficialUsageRouteState = {
   stagingId?: string;
   reportSetId?: string;
   activityWindowDays: number;
+};
+
+export type UsersRouteState = {
+  view: "licenses" | "matrix";
+  search: string;
+  agentId?: string;
+  reportSetId?: string;
+  page: number;
 };
 
 export type DataSyncRouteState = {
@@ -157,6 +166,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     ? unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: rawDetailId })
     : rawDetailId;
   return {
+    agentView: unifiedAgentViews.find(value => value === params.get("show")) ?? "all",
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
     publisher: bounded(params.get("publisher"), 256) ?? "all",
@@ -164,7 +174,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     host: bounded(params.get("host"), 256) ?? "all",
     platform: bounded(params.get("platform"), 256) ?? "all",
     createdWithinDays: boundedIntegerText(params.get("createdWithinDays"), 3650),
-    sortBy: sortBy === "publisher" || sortBy === "lastModifiedAt" ? sortBy : "displayName",
+    sortBy: unifiedAgentSortKeys.find(value => value === sortBy) ?? "displayName",
     sortDirection: params.get("direction") === "desc" ? "desc" : "asc",
     page: boundedPage(params.get("page")),
     detailId,
@@ -186,6 +196,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
 
 export function agentRouteSearch(state: AgentRouteState) {
   const params = new URLSearchParams();
+  if (state.agentView !== "all") params.set("show", state.agentView);
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.status !== "all") params.set("status", state.status);
   if (state.publisher !== "all") params.set("publisher", state.publisher);
@@ -278,6 +289,7 @@ export function migratePowerPlatformAgentRoute(search: string) {
     return environmentId ? unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId }) : nativeId;
   });
   return agentRouteSearch({
+    agentView: "all",
     search: route.search,
     status: "all",
     publisher: "all",
@@ -309,6 +321,7 @@ const localAuditActions = new Set([
   "block", "unblock", "update-availability", "update-installation",
   "view-audit-search", "export-audit-search", "view-hunting", "export-hunting",
   "export-package-inventory", "export-power-platform-inventory", "export-agent-inventory",
+  "associate-agent-usage", "remove-agent-usage-association",
 ]);
 const localAuditStatuses = new Set([
   "requested", "started", "succeeded", "failed", "skipped", "inconclusive", "cancelled",
@@ -397,6 +410,28 @@ export function officialUsageRouteSearch(state: OfficialUsageRouteState) {
   if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);
   const defaultWindowDays = state.reportSetId ? 365 : 30;
   if (state.activityWindowDays !== defaultWindowDays) params.set("window", String(Math.min(365, Math.max(1, state.activityWindowDays))));
+  return params;
+}
+
+export function parseUsersRoute(search: string): UsersRouteState {
+  const params = new URLSearchParams(search);
+  return {
+    view: params.get("view") === "matrix" ? "matrix" : "licenses",
+    search: bounded(params.get("q"), 256) ?? "",
+    agentId: bounded(params.get("agent"), 512),
+    reportSetId: bounded(params.get("snapshot"), 512),
+    page: boundedPage(params.get("page")),
+  };
+}
+
+export function usersRouteSearch(state: UsersRouteState) {
+  const params = new URLSearchParams();
+  if (state.view !== "matrix") return params;
+  params.set("view", "matrix");
+  if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
+  if (state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
+  if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);
+  if (state.page > 0) params.set("page", String(Math.min(2_001, state.page + 1)));
   return params;
 }
 

@@ -559,10 +559,20 @@ export class OfficialUsageRepository {
     validateTenant(tenantId);
     if (setId) validateUuid(setId, "report set ID");
     return transaction(this.database, async client => {
-    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      return this.getPublishedInTransaction(tenantId, client, setId);
+    });
+  }
+
+  async getPublishedInTransaction(tenantId: string, client: pg.PoolClient, setId?: string,
+    options: { respectExpiry?: boolean } = {}): Promise<PublishedOfficialUsage> {
+    validateTenant(tenantId);
+    if (setId) validateUuid(setId, "report set ID");
     const state = await client.query<StateRow>("SELECT active_set_id,revision FROM official_usage_state WHERE tenant_id=$1", [tenantId]);
     const retained = await client.query<{ complete: boolean; count: number }>(`SELECT complete,count(*)::int AS count FROM official_usage_sets
-      WHERE tenant_id=$1 AND deleted_at IS NULL GROUP BY complete`, [tenantId]);
+      WHERE tenant_id=$1 AND deleted_at IS NULL
+        AND (NOT $2::boolean OR expires_at IS NULL OR expires_at>clock_timestamp()) GROUP BY complete`,
+    [tenantId, options.respectExpiry ?? false]);
     const history = await client.query(`SELECT 1 FROM official_usage_sets WHERE tenant_id=$1
       UNION ALL SELECT 1 FROM official_usage_audit
       WHERE tenant_id=$1 AND action='accepted' AND outcome='succeeded' LIMIT 1`, [tenantId]);
@@ -574,18 +584,19 @@ export class OfficialUsageRepository {
     const reportSet = (await client.query<SetRow>(`SELECT report_set.*,coalesce(array_agg(membership.kind ORDER BY membership.kind),'{}') AS kinds
       FROM official_usage_sets report_set JOIN official_usage_set_versions membership ON membership.set_id=report_set.id AND membership.tenant_id=report_set.tenant_id
       WHERE report_set.id=$1 AND report_set.tenant_id=$2 AND report_set.complete AND report_set.deleted_at IS NULL
+        AND (NOT $3::boolean OR report_set.expires_at IS NULL OR report_set.expires_at>clock_timestamp())
         AND (SELECT count(*) FROM official_usage_set_versions candidate
           WHERE candidate.set_id=report_set.id AND candidate.tenant_id=report_set.tenant_id)=3
         AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions candidate
           JOIN official_usage_versions candidate_version ON candidate_version.id=candidate.version_id
             AND candidate_version.tenant_id=candidate.tenant_id AND candidate_version.kind=candidate.kind
           WHERE candidate.set_id=report_set.id AND candidate.tenant_id=report_set.tenant_id
-            AND (candidate_version.deleted_at IS NOT NULL OR candidate_version.row_count<>(
+            AND (candidate_version.deleted_at IS NOT NULL OR ($3::boolean AND candidate_version.expires_at<=clock_timestamp()) OR candidate_version.row_count<>(
               SELECT count(*) FROM official_usage_version_rows candidate_row
               WHERE candidate_row.version_id=candidate_version.id
                 AND candidate_row.tenant_id=candidate_version.tenant_id
                 AND candidate_row.kind=candidate_version.kind)))
-      GROUP BY report_set.id`, [selectedSetId, tenantId])).rows[0];
+      GROUP BY report_set.id`, [selectedSetId, tenantId, options.respectExpiry ?? false])).rows[0];
     if (!reportSet) {
       if (setId) throw new AppError(404, "official_usage_set_not_found", "The retained official usage report set was not found.");
       return { activeRevision: Number(state.rows[0]?.revision ?? 1), activeSet: null, reports: {}, retainedCompleteSets: retainedCounts.true ?? 0, retainedIncompleteSets: retainedCounts.false ?? 0, hasImportHistory: Boolean(history.rowCount), activeSelectionIncomplete: true };
@@ -602,10 +613,12 @@ export class OfficialUsageRepository {
       LEFT JOIN official_usage_version_rows row ON row.version_id=version.id AND row.tenant_id=version.tenant_id AND row.kind=version.kind
       LEFT JOIN official_usage_row_facts fact ON fact.tenant_id=row.tenant_id AND fact.kind=row.kind AND fact.payload_hash=row.payload_hash
       WHERE membership.set_id=$1 AND membership.tenant_id=$2 AND version.deleted_at IS NULL
+        AND (NOT $3::boolean OR version.expires_at IS NULL OR version.expires_at>clock_timestamp())
+        AND (NOT $3::boolean OR artifact.expires_at IS NULL OR artifact.expires_at>clock_timestamp())
         AND artifact.id IS NOT NULL
       GROUP BY version.id,artifact.file_hash,artifact.parser_version,artifact.schema_version
       HAVING count(row.ordinal)=version.row_count
-      ORDER BY version.kind`, [selectedSetId, tenantId]);
+      ORDER BY version.kind`, [selectedSetId, tenantId, options.respectExpiry ?? false]);
     if (versions.rows.length !== 3 || new Set(versions.rows.map(version => version.kind)).size !== 3) {
       return { activeRevision: Number(state.rows[0]?.revision ?? 1), activeSet: null, reports: {}, retainedCompleteSets: retainedCounts.true ?? 0, retainedIncompleteSets: retainedCounts.false ?? 0, hasImportHistory: Boolean(history.rowCount), activeSelectionIncomplete: true };
     }
@@ -658,7 +671,6 @@ export class OfficialUsageRepository {
       hasImportHistory: Boolean(history.rowCount),
       activeSelectionIncomplete: false,
     };
-    });
   }
 
   async previewSetOperation(scope: OfficialUsageScope, operation: "select" | "delete", setId: string) {

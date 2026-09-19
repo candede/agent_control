@@ -27,7 +27,6 @@ type ReportingViewProps = {
   activityWindowDays: number;
   data?: OfficialUsageAggregateView;
   inactiveDays: number;
-  reportSetId?: string;
   onActivityWindowDaysChange: (activityWindowDays: number) => void;
   onAgentPageChange?: (offset: number) => void;
   onAgentQueryChange?: (query: {
@@ -59,7 +58,6 @@ export function ReportingView({
   activityWindowDays,
   data,
   inactiveDays,
-  reportSetId,
   onActivityWindowDaysChange,
   onAgentPageChange = () => undefined,
   onAgentQueryChange = () => undefined,
@@ -75,7 +73,10 @@ export function ReportingView({
   const [agentSortDirection, setAgentSortDirection] = useState<"asc" | "desc">("desc");
   const [exporting, setExporting] = useState<"aggregate" | "users">();
   const [exportError, setExportError] = useState<string>();
+  const exportController = useRef<AbortController | null>(null);
   const notifyAgentQueryChange = useEffectEvent(onAgentQueryChange);
+
+  useEffect(() => () => exportController.current?.abort(), []);
 
   useEffect(() => {
     notifyAgentQueryChange({
@@ -89,14 +90,30 @@ export function ReportingView({
   }, [agentCreatorType, agentEndDate, agentSearch, agentSortBy, agentSortDirection, agentStartDate]);
 
   async function handleExport(kind: "aggregate" | "users", filters: object) {
+    exportController.current?.abort();
+    const controller = new AbortController();
+    exportController.current = controller;
     setExportError(undefined);
+    setExporting(kind);
     try {
-      await exportUsage(kind, {
+      const setId = (kind === "aggregate" ? data : userData)?.activeSet?.id;
+      if (!setId) throw new Error("Load an accepted report set before exporting official usage.");
+      const blob = await exportUsage(kind, {
         ...filters,
-        ...(reportSetId ? { setId: reportSetId } : {}),
-      }, setExporting);
+        setId,
+      }, controller.signal);
+      if (!controller.signal.aborted) {
+        downloadBlob(kind === "aggregate" ? "official-agent-usage.csv" : "official-user-usage.csv", blob);
+      }
     } catch (error) {
-      setExportError(error instanceof Error ? error.message : "The official usage export failed.");
+      if (!controller.signal.aborted) {
+        setExportError(error instanceof Error ? error.message : "The official usage export failed.");
+      }
+    } finally {
+      if (exportController.current === controller) {
+        exportController.current = null;
+        if (!controller.signal.aborted) setExporting(undefined);
+      }
     }
   }
 
@@ -125,7 +142,7 @@ export function ReportingView({
         </section>
         <div className="report-kpi-strip">
           <SmallStat label="Response total basis" value={summary.usage.totalResponsesBasis === "agents_report" ? "Agents report only" : "Unknown"} />
-          <SmallStat label="Active-user basis" value={summary.usage.totalActiveUsersBasis === "users_and_users_agents_distinct_identity" ? "Distinct Users + Users & agents identities" : "Unknown"} />
+          <SmallStat label="Active-user basis" value={summary.usage.totalActiveUsersBasis === "users_and_users_agents_distinct_identity" ? "Distinct positive-response Users + Users & agents identities" : "Unknown"} />
           <SmallStat label="Response reconciliation" value={formatComparison(summary.usage.responseReconciliation)} />
           <SmallStat label="Active-user reconciliation" value={formatComparison(summary.usage.activeUserReconciliation)} />
           <SmallStat label="Catalog agents not identity-linked to usage" value={summary.catalog.noImportedUsageAgents} />
@@ -149,7 +166,7 @@ export function ReportingView({
           muted={!summary.usage.hasAgentUsage}
         />
         <Metric
-          label="Distinct users (dataset union)"
+          label="Active users (positive responses)"
           value={summary.usage.totalActiveUsers}
           muted={!summary.usage.hasAgentUsage}
         />
@@ -664,21 +681,16 @@ function UsagePagination({ page, label, onPageChange }: {
   </div>;
 }
 
-async function exportUsage(
+function exportUsage(
   kind: "aggregate" | "users",
   filters: object,
-  setExporting: (value: "aggregate" | "users" | undefined) => void,
+  signal: AbortSignal,
 ) {
-  setExporting(kind);
-  try {
-    const query: Record<string, string | number | boolean> = {};
-    for (const [key, value] of Object.entries(filters)) {
-      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") query[key] = value;
-    }
-    downloadBlob(kind === "aggregate" ? "official-agent-usage.csv" : "official-user-usage.csv", await downloadOfficialUsageCsv(kind, query));
-  } finally {
-    setExporting(undefined);
+  const query: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") query[key] = value;
   }
+  return downloadOfficialUsageCsv(kind, query, signal);
 }
 
 function formatNullable(value: number | null) {
@@ -764,4 +776,4 @@ function clampNumber(
 
   return Math.min(max, Math.max(min, Math.round(parsed)));
 }
-import { useEffect, useEffectEvent, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";

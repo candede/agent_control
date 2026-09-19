@@ -11,7 +11,7 @@ type Database = Pick<pg.Pool, "query">;
 export function auditMetadata(value: Record<string, unknown> | undefined) {
   if (!value) return undefined;
   const result: Record<string, string | number | boolean> = {};
-  for (const key of ["target", "mode", "scope", "template", "rowCount", "requestCount", "previousCount", "resultingCount", "resultingBytes", "source", "snapshotId", "revision", "selection", "partial", "jobId", "reportSetId", "reportingStart", "reportingEnd", "leaseVersion", "correlationId", "confirmationHash", "targetSelectionHash", "prestateHash", "poststateHash", "readbackCount", "reconciliationStatus", "verification"]) {
+  for (const key of ["target", "mode", "scope", "template", "rowCount", "requestCount", "previousCount", "resultingCount", "resultingBytes", "source", "snapshotId", "revision", "selection", "partial", "jobId", "reportSetId", "reportingStart", "reportingEnd", "leaseVersion", "correlationId", "confirmationHash", "targetSelectionHash", "prestateHash", "poststateHash", "readbackCount", "reconciliationStatus", "verification", "reportAgentHash", "inventoryRevision", "changed"]) {
     const entry = value[key];
     if (typeof entry === "string" && entry.length <= 128 || typeof entry === "number" && Number.isFinite(entry) || typeof entry === "boolean") {
       result[key] = entry as string | number | boolean;

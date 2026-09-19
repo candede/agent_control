@@ -5,9 +5,10 @@ import { AppError } from "../errors.js";
 import { AuditLog, type DataScope } from "../services/auditLog.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type { AuditAction, AuditActor, AuditScope } from "../types/audit.js";
-import type { PackageAccessUpdate } from "../types/copilotPackage.js";
+import type { CopilotPackageDetail, PackageAccessUpdate } from "../types/copilotPackage.js";
 import type { CapabilityId } from "../types/capability.js";
-import { canonicalAccessEntities, expectedPackageMutationState, packageMutationStateHash, type PackageMutationState } from "../services/packageMutationState.js";
+import { canonicalAccessEntities, capturePackageMutationState, expectedPackageMutationState, packageMutationStateHash, type PackageMutationState } from "../services/packageMutationState.js";
+import { lockPackageInventoryScope, publishPackageReadback, readPackageInventoryGeneration } from "./packageInventory.js";
 
 export type JobStatus = "queued" | "running" | "waiting_authorization" | "succeeded" | "failed" | "cancelled" | "partial";
 export type ItemOutcome = "succeeded" | "failed" | "cancelled" | "inconclusive" | "skipped";
@@ -41,7 +42,9 @@ export type JobRow = {
 export type ReconciliationStatus = "not_required" | "required" | "verified_applied" | "verified_not_applied" | "conflict";
 export type JobItem = { id: string; job_id: string; target_id: string; display_name: string; ordinal: number; status: "queued" | "running" | ItemOutcome; sent_at: Date | null; message: string | null; error_code: string | null; prestate_hash: string; prestate: PackageMutationState; poststate_hash: string | null; poststate: PackageMutationState | null; correlation_id: string | null; reconciliation_status: ReconciliationStatus; reconciled_at: Date | null };
 export type Lease = { jobId: string; owner: string; version: number; scope: DataScope };
-export type FinishItemEvidence = { message?: string; errorCode?: string; poststate?: PackageMutationState; readbackCount?: number };
+export type FinishItemEvidence = {
+  message?: string; errorCode?: string; poststate?: PackageMutationState; readbackCount?: number;
+} & ({ readback: CopilotPackageDetail; inventoryGeneration: string | null } | { readback?: never; inventoryGeneration?: never });
 
 export function createJobConfirmation(input: JobIntentInput) {
   const prepared = prepareIntent(input);
@@ -197,7 +200,7 @@ export class JobRepository {
         ...(job.action === "block" || job.action === "unblock" ? { action: job.action, targetBlockedState: job.action === "block" } : { action: job.action }),
         agentId: item.target_id, agentDisplayName: item.display_name,
         actor: { tenantId: job.tenant_id, homeAccountId: job.principal_id, username: job.actor_username, displayName: job.actor_name }, requestPath: job.request_path, metadata: { leaseVersion: lease.version, correlationId, prestateHash: item.prestate_hash } });
-      return { item: running.rows[0], job };
+      return { item: running.rows[0], job, inventoryGeneration: await readPackageInventoryGeneration(lease.scope, client) };
     });
   }
 
@@ -217,14 +220,24 @@ export class JobRepository {
 
   async finishItem(lease: Lease, itemId: string, outcome: ItemOutcome, evidence: FinishItemEvidence = {}) {
     await transaction(this.database, async client => {
-      await this.fence(client, lease);
+      if (evidence.readback) await lockPackageInventoryScope(lease.scope, client);
+      const job = await this.fence(client, lease);
       const poststateHash = evidence.poststate ? packageMutationStateHash(evidence.poststate) : null;
-      const result = await client.query(`UPDATE job_items SET status=$3,message=$4,error_code=$5,poststate=$6,poststate_hash=$7,
+      const result = await client.query<{ target_id: string }>(`UPDATE job_items SET status=$3,message=$4,error_code=$5,poststate=$6,poststate_hash=$7,
         reconciliation_status=CASE WHEN $3='inconclusive' THEN 'required' ELSE 'not_required' END,updated_at=clock_timestamp()
-        WHERE id=$1 AND job_id=$2 AND status='running' RETURNING id`, [itemId, lease.jobId, outcome, evidence.message?.slice(0,1024) ?? null, evidence.errorCode?.slice(0,128) ?? null, evidence.poststate ?? null, poststateHash]);
+        WHERE id=$1 AND job_id=$2 AND status='running' RETURNING target_id`, [itemId, lease.jobId, outcome, evidence.message?.slice(0,1024) ?? null, evidence.errorCode?.slice(0,128) ?? null, evidence.poststate ?? null, poststateHash]);
       if (!result.rowCount) throw new AppError(409, "terminal_item", "Terminal items cannot be overwritten.");
+      let snapshotId: string | undefined;
+      if (evidence.readback) {
+        if (!["succeeded", "skipped"].includes(outcome)
+          || evidence.readback.id !== result.rows[0].target_id
+          || packageMutationStateHash(capturePackageMutationState(evidence.readback, job.action)) !== poststateHash) {
+          throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact target and verified mutation state.");
+        }
+        snapshotId = await publishPackageReadback(lease.scope, evidence.readback, client, evidence.inventoryGeneration);
+      }
       await client.query("UPDATE job_attempts SET finished_at=clock_timestamp(),outcome=$3,readback_count=$4 WHERE item_id=$1 AND lease_version=$2", [itemId, lease.version, outcome, Math.min(Math.max(evidence.readbackCount ?? 0, 0), 20)]);
-      await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: outcome, message: evidence.message, errorCode: evidence.errorCode, metadata: { poststateHash: poststateHash ?? "", readbackCount: evidence.readbackCount ?? 0, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required", verification: outcome === "succeeded" ? "provider_readback" : "not_verified" } });
+      await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: outcome, message: evidence.message, errorCode: evidence.errorCode, metadata: { poststateHash: poststateHash ?? "", readbackCount: evidence.readbackCount ?? 0, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required", verification: outcome === "succeeded" || snapshotId ? "provider_readback" : "not_verified", ...(snapshotId ? { snapshotId } : {}) } });
     });
   }
 
@@ -262,20 +275,33 @@ export class JobRepository {
     }
   }
 
-  async recordReconciliation(scope: DataScope, itemId: string, status: Exclude<ReconciliationStatus, "not_required" | "required">, observed: PackageMutationState, message: string) {
+  async inventoryGeneration(scope: DataScope) {
+    return readPackageInventoryGeneration(scope, this.database);
+  }
+
+  async recordReconciliation(scope: DataScope, itemId: string, status: Exclude<ReconciliationStatus, "not_required" | "required">, observed: PackageMutationState, message: string, observation?: { details: CopilotPackageDetail; inventoryGeneration: string | null }) {
     await transaction(this.database, async client => {
-      const item = await client.query<JobItem & { job_id: string; lease_version: number }>(`SELECT item.*,attempt.lease_version FROM job_items item
+      if (observation) await lockPackageInventoryScope(scope, client);
+      const item = await client.query<JobItem & { job_id: string; lease_version: number; action: AuditAction }>(`SELECT item.*,attempt.lease_version,job.action FROM job_items item
         JOIN jobs job ON job.id=item.job_id
         JOIN LATERAL (SELECT lease_version FROM job_attempts WHERE item_id=item.id ORDER BY lease_version DESC LIMIT 1) attempt ON true
         WHERE item.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.cancel_requested=false AND item.status='inconclusive' AND item.reconciliation_status='required' FOR UPDATE`, [itemId, scope.tenantId, scope.principalId]);
       if (!item.rows[0]) throw new AppError(409, "reconciliation_state", "The package item no longer requires reconciliation.");
       const poststateHash = packageMutationStateHash(observed);
+      let snapshotId: string | undefined;
+      if (observation) {
+        if (observation.details.id !== item.rows[0].target_id
+          || packageMutationStateHash(capturePackageMutationState(observation.details, item.rows[0].action)) !== poststateHash) {
+          throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact reconciled target and observed state.");
+        }
+        snapshotId = await publishPackageReadback(scope, observation.details, client, observation.inventoryGeneration);
+      }
       await client.query(`UPDATE job_items SET status=CASE WHEN $2='verified_applied' THEN 'succeeded' ELSE status END,
         poststate=$3,poststate_hash=$4,reconciliation_status=$2,reconciled_at=clock_timestamp(),message=$5,updated_at=clock_timestamp() WHERE id=$1`, [itemId, status, observed, poststateHash, message.slice(0,1024)]);
       await new AuditLog(scope, client).completeEvent(`${itemId}:${item.rows[0].lease_version}`, {
         status: status === "verified_applied" ? "succeeded" : "inconclusive",
         message,
-        metadata: { poststateHash, reconciliationStatus: status, verification: "provider_reconciliation" },
+        metadata: { poststateHash, reconciliationStatus: status, verification: "provider_reconciliation", ...(snapshotId ? { snapshotId } : {}) },
       });
       await this.aggregate(client, item.rows[0].job_id);
     });

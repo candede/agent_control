@@ -7,7 +7,7 @@ import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
-  InventoryResourcePage, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView,
+  InventoryResourcePage, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageUserView,
   PackagePage, PurviewAuditCatalog, PurviewAuditJob, PurviewAuditRecordPage, SessionUser,
   WorkbenchJobsResponse, UnifiedAgentInventoryPage,
 } from "../src/api/client";
@@ -120,7 +120,7 @@ const inventory: InventoryResourcePage = {
 
 const activeSet: NonNullable<OfficialUsageAggregateView["activeSet"]> = {
   id: "55555555-5555-4555-8555-555555555555", bundleId: "66666666-6666-4666-8666-666666666666",
-  reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30" }, supersedesSetId: null,
+  reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", provenance: "operator_asserted" }, supersedesSetId: null,
   complete: true, kinds: ["agents", "userAgents", "users"], acceptedAt: observedAt,
   deletedAt: null, createdAt: observedAt, expiresAt,
 };
@@ -213,6 +213,26 @@ const users: OfficialUsageUserView = {
   },
 };
 const usageAdmin: OfficialUsageAdminState = { activeSetId: activeSet.id, activeRevision: 1, staging: [], sets: [activeSet] };
+const usageHistory: OfficialUsageHistoryView = {
+  summary: {
+    importCount: 1, uniqueObservationCount: 3, observationRowCount: 6, uniquePayloadCount: 6, repeatedRowsReused: 0,
+    earliestObservedAt: observedAt, latestObservedAt: observedAt,
+    activityDateRange: { earliestDateUtc: "2026-08-01", latestDateUtc: "2026-08-30", provenance: "last_activity_dates", provesReportingCoverage: false },
+    reportingWindows: { knownCount: 1, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
+    warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
+  },
+  bundles: {
+    value: [{
+      ...activeSet, isActive: true, observationCount: 3, rowCount: 6, uniquePayloadCount: 6, repeatedRowsReused: 0,
+      reportingWindowKnown: true, activityRangeIsCoverage: false,
+      observations: lineage.lineages.map(item => ({
+        versionId: item.versionId, kind: item.kind, contentHash: item.fileHash,
+        rowCount: item.rowCount, uniquePayloadCount: item.rowCount, repeatedRowsReused: 0, lineage: item,
+      })),
+    }],
+    count: 1, limit: 10, offset: 0,
+  },
+};
 const auditEvents: AuditEvent[] = packageNames.slice(0, 2).map((agentDisplayName, index) => ({
   id: `layout-audit-${index}`, operationId: `layout-operation-${index}`, scope: "single",
   agentId: packages.value[index].id, agentDisplayName, actor, startedAt: observedAt, completedAt: observedAt,
@@ -334,11 +354,12 @@ export async function mockLayoutApi(page: Page) {
     return route.abort();
   });
   const responses: Record<string, unknown> = {
-    "/api/auth/status": { authConfigured: true, callback: "http://127.0.0.1:4173/api/auth/callback" },
+    "/api/auth/status": { authConfigured: true, callback: new URL("/api/auth/callback", process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3001").href },
     "/api/me": { user: actor, csrfToken: "layout-csrf", roleAssignmentRequired: false },
     "/api/workbench/metadata": { views: workbenchViews, actions: workbenchActions },
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
     "/api/agents": packages,
+    ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}`, item])),
     "/api/agent-inventory": unifiedAgents,
     "/api/data-sync/state": {
       onboardingRequired: false, usageImportRequired: false, run: null,
@@ -352,6 +373,7 @@ export async function mockLayoutApi(page: Page) {
     "/api/inventory/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/quarantine/jobs": { value: [] },
     "/api/official-usage/admin": usageAdmin, "/api/official-usage/aggregate": aggregate, "/api/official-usage/users": users,
+    "/api/official-usage/history": usageHistory,
     "/api/copilot-usage/users": copilotUsageFixture,
     "/api/audit/events": { value: auditEvents, count: auditEvents.length },
     "/api/audit-search/catalog": purviewCatalog, "/api/audit-search/jobs": { value: [purviewJob], count: 1, limit: 20, offset: 0 },

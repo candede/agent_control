@@ -11,6 +11,7 @@ import { migrations, verifySchema } from "./db/schema.js";
 import { AppError, errorHandler } from "./errors.js";
 import { apiAdmission } from "./middleware/admission.js";
 import { agentsRouter } from "./routes/agents.js";
+import { createAgentUsageRouter } from "./routes/agentUsage.js";
 import { auditRouter } from "./routes/audit.js";
 import { authRouter } from "./routes/auth.js";
 import { capabilitiesRouter } from "./routes/capabilities.js";
@@ -96,7 +97,7 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
       limits: { databasePool: 4, requestBodyBytes: 524_288, exportDeadlineSeconds: 15 },
     });
   });
-  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(), unifiedAgentsRouter, inventoryRouter, copilotStudioQuarantineRouter, createCopilotUsageRouter(database), createOfficialUsageRouter(database), purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);
+  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(), unifiedAgentsRouter, createAgentUsageRouter(database), inventoryRouter, copilotStudioQuarantineRouter, createCopilotUsageRouter(database), createOfficialUsageRouter(database), purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);
   app.use("/api", (_request, _response, next) => next(new AppError(404, "not_found", "API route not found.")));
   app.use("/assets", express.static(`${staticDirectory}/assets`, { immutable: true, maxAge: "1y", fallthrough: false, dotfiles: "deny" }));
   app.use(express.static(staticDirectory, { index: false, maxAge: 0, dotfiles: "deny", setHeaders: response => response.setHeader("Cache-Control", "no-store") }));

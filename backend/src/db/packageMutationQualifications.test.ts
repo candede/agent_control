@@ -21,7 +21,7 @@ const poststate = { kind: "block" as const, isBlocked: true };
 beforeAll(async () => {
   fixture = await testDatabase(false);
   await bootstrap(fixture.operator, fixturePassword);
-  await migrate(fixture.operator, migrations.slice(0, 11));
+  await migrate(fixture.operator);
   await grantRuntime(fixture.operator);
   qualifications = new PackageMutationQualificationRepository(fixture.runtime);
   jobs = new JobRepository(fixture.runtime);
@@ -29,6 +29,26 @@ beforeAll(async () => {
 afterAll(async () => { await fixture?.close(); });
 
 describe("Package mutation qualifications", () => {
+  it("preserves legacy canary approvals through the complete runtime upgrade", async () => {
+    const legacy = await testDatabase(false);
+    try {
+      await bootstrap(legacy.operator, fixturePassword);
+      await migrate(legacy.operator, migrations.slice(0, 11));
+      await grantRuntime(legacy.operator);
+      const repository = new PackageMutationQualificationRepository(legacy.runtime);
+      const approval = await repository.createApproved(administrator, qualificationInput());
+      await migrate(legacy.operator);
+      await grantRuntime(legacy.operator);
+      await verifySchema(legacy.runtime);
+      expect((await repository.list(administrator)).value).toContainEqual(expect.objectContaining({
+        id: approval.id, targetId: approval.targetId, status: "approved", action: "block",
+        prestate: approval.prestate, poststate: approval.poststate, approvedByPrincipalId: administrator.homeAccountId,
+      }));
+    } finally {
+      await legacy.close();
+    }
+  });
+
   it("requires separate approvals and durable verification of both exact directions", async () => {
     await expect(qualifications.createApproved({ ...administrator, roles: [] }, qualificationInput())).rejects.toMatchObject({ code: "missing_internal_role" });
     const approvals = await createApprovals("package-1");
@@ -116,6 +136,7 @@ describe("Package mutation qualifications", () => {
     const completed = await executeClaimedCycle(await qualifications.claimCycle(operator, approvals.original.id, approvals.restoration.id, identity(), identity()));
     const jobIds = [completed.original.jobId, completed.restoration.jobId];
     await migrate(fixture.operator);
+    await grantRuntime(fixture.operator);
     await verifySchema(fixture.runtime);
     await transaction(fixture.operator, async client => {
       await client.query("ALTER TABLE jobs DISABLE TRIGGER USER");

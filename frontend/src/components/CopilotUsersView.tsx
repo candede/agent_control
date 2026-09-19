@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { RefreshCw, X } from "lucide-react";
 import {
   ApiError,
@@ -8,10 +8,13 @@ import {
   type CopilotUsageUser,
   type CopilotUsageUsersResponse,
 } from "../api/client";
+import type { UsersRouteState } from "../workbenchRouting";
+import { UserAgentMatrix } from "./UserAgentMatrix";
 import "./copilotUsers.css";
 
 type Cohort = "all" | "attention" | "most" | "least" | "unknown";
 type Sort = "responses-desc" | "responses-asc" | "name" | "activity";
+type ReadState = { key: string; status: "ready" } | { key: string; status: "failed"; error: string };
 const pageSize = 50;
 const appFields = [
   ["Copilot Chat", "copilotChatLastActivityDate"],
@@ -27,46 +30,63 @@ const appFields = [
 export function CopilotUsersView({
   dataRevision = 0,
   onSyncUsers,
+  route,
+  onRouteChange,
 }: {
   dataRevision?: number;
   onSyncUsers?: () => Promise<void>;
+  route?: UsersRouteState;
+  onRouteChange?: (route: UsersRouteState, replace?: boolean) => void;
 }) {
   const [data, setData] = useState<CopilotUsageUsersResponse>();
-  const [error, setError] = useState<string>();
-  const [loading, setLoading] = useState(true);
+  const [read, setRead] = useState<ReadState>();
+  const [syncError, setSyncError] = useState<{ key: string; message: string }>();
   const [syncing, setSyncing] = useState(false);
+  const [reload, setReload] = useState(0);
+  const [internalRoute, setInternalRoute] = useState<UsersRouteState>({ view: "licenses", search: "", page: 0 });
+  const [selectedUser, setSelectedUser] = useState<{ id: string; threshold: number; readKey: string }>();
+  const matrixViewButton = useRef<HTMLButtonElement>(null);
+  const readKey = JSON.stringify([dataRevision, reload]);
+  const scopedRead = read?.key === readKey ? read : undefined;
+  const loading = !scopedRead;
+  const currentData = scopedRead?.status === "ready" ? data : undefined;
+  const error = scopedRead?.status === "failed" ? scopedRead.error : syncError?.key === readKey ? syncError.message : undefined;
+  const currentRoute = route ?? internalRoute;
+  const selected = selectedUser?.readKey === readKey
+    ? data?.users.find(user => user.directory.objectId === selectedUser.id)
+    : undefined;
+
+  function changeRoute(next: UsersRouteState, replace = false) {
+    setInternalRoute(next);
+    onRouteChange?.(next, replace);
+  }
 
   useEffect(() => {
     const controller = new AbortController();
-    void Promise.resolve().then(() => {
-      if (controller.signal.aborted) return undefined;
-      setLoading(true);
-      setError(undefined);
-      return getCopilotUsageUsers({ signal: controller.signal });
-    }).then(result => {
-      if (!result) return;
-      if (!controller.signal.aborted) setData(result);
+    void getCopilotUsageUsers({ signal: controller.signal }).then(result => {
+      if (!controller.signal.aborted) {
+        setData(result);
+        setRead({ key: readKey, status: "ready" });
+      }
     }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
         if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
           setData(undefined);
         }
-        setError(failure instanceof Error ? failure.message : "License usage could not be loaded.");
+        setRead({ key: readKey, status: "failed", error: failure instanceof Error ? failure.message : "License usage could not be loaded." });
       }
-    }).finally(() => {
-      if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [dataRevision]);
+  }, [readKey]);
 
   async function syncUsers() {
     if (!onSyncUsers) return;
     setSyncing(true);
-    setError(undefined);
+    setSyncError(undefined);
     try {
       await onSyncUsers();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "The users sync could not be started.");
+      setSyncError({ key: readKey, message: failure instanceof Error ? failure.message : "The users sync could not be started." });
     } finally {
       setSyncing(false);
     }
@@ -76,30 +96,49 @@ export function CopilotUsersView({
     <section className="copilot-users" aria-label="Copilot license usage" aria-busy={loading}>
       <header className="copilot-users-header">
         <div>
-          <h2>Copilot license usage</h2>
-          <p>Current Microsoft 365 Copilot assignments, including qualifying bundles. Microsoft 365 or Office 365 base licenses and free Copilot Chat alone are not counted.</p>
+          <h2>Users & adoption</h2>
+          <p>{currentRoute.view === "licenses"
+            ? "Current Microsoft 365 Copilot assignments, including qualifying bundles. Microsoft 365 or Office 365 base licenses and free Copilot Chat alone are not counted."
+            : "Understand who is using agents and explore adoption alongside current Copilot license assignments."}</p>
         </div>
-        <button type="button" className="secondary" disabled={!onSyncUsers || syncing} onClick={() => void syncUsers()}>
-          <RefreshCw size={16} className={syncing ? "spin" : undefined} aria-hidden="true" />{syncing ? "Starting sync..." : "Sync users"}
-        </button>
+        <div className="copilot-users-header-actions">
+          <div className="copilot-users-tabs" role="group" aria-label="User views">
+            <button type="button" className="secondary" aria-pressed={currentRoute.view === "licenses"} onClick={() => changeRoute({ view: "licenses", search: "", page: 0 })}>License adoption</button>
+            <button ref={matrixViewButton} type="button" className="secondary" aria-pressed={currentRoute.view === "matrix"} onClick={() => changeRoute({ ...currentRoute, view: "matrix" })}>User-agent matrix</button>
+          </div>
+          <button type="button" className="secondary" disabled={!onSyncUsers || syncing} onClick={() => void syncUsers()}>
+            <RefreshCw size={16} className={syncing ? "spin" : undefined} aria-hidden="true" />{syncing ? "Starting sync..." : "Sync users"}
+          </button>
+        </div>
       </header>
-      {error ? <div className="error-banner" role="alert">{error} <a href="/permissions">Check permissions</a>, then retry.</div> : null}
-      {loading ? <p role="status">Loading saved license assignments and usage snapshots...</p> : null}
-      {data ? <CopilotUsersDashboard data={data} /> : null}
+      {error ? <div className="error-banner" role="alert">{error} <a href="/permissions">Check permissions</a>.
+        {" "}<button type="button" className="secondary" onClick={() => setReload(value => value + 1)}>Retry saved users</button></div> : null}
+      {loading && currentRoute.view === "licenses" ? <p role="status">Loading saved license assignments and usage snapshots...</p> : null}
+      {data && !currentData ? <p className="copilot-users-notice" role="status">Showing the last saved user snapshot. Current license assignments and adoption recommendations are unverified until saved users reload.</p> : null}
+      {currentRoute.view === "matrix" ? <UserAgentMatrix route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} directoryData={currentData}
+        onInspectUser={user => setSelectedUser({ id: user.directory.objectId, threshold: 5, readKey })} />
+        : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, readKey })} /> : null}
+      {selected && selectedUser && data ? <CopilotUserDetail user={selected} data={data} current={Boolean(currentData)} threshold={selectedUser.threshold} returnFocusTo={matrixViewButton} onClose={() => setSelectedUser(undefined)}
+        onViewAgent={(agentId, reportSetId) => {
+          setSelectedUser(undefined);
+          changeRoute({ view: "matrix", agentId, reportSetId, search: "", page: 0 });
+        }} /> : null}
     </section>
   );
 }
 
-function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
+function CopilotUsersDashboard({ data, current, onInspectUser }: {
+  data: CopilotUsageUsersResponse; current: boolean; onInspectUser: (user: CopilotUsageUser, threshold: number) => void;
+}) {
   const [search, setSearch] = useState("");
   const [cohort, setCohort] = useState<Cohort>("all");
   const [sort, setSort] = useState<Sort>("responses-desc");
   const [threshold, setThreshold] = useState(5);
   const [page, setPage] = useState(0);
-  const [selectedId, setSelectedId] = useState<string>();
   const directoryKnown = data.sources.directory.state === "available";
-  const agentUsageFresh = data.sources.importedAgentUsage.state === "available";
-  const attention = data.users.filter(user => needsAttention(user, threshold, agentUsageFresh)).length;
+  const agentUsageFresh = current && data.sources.importedAgentUsage.state === "available";
+  const appActivityFresh = current && data.sources.appActivity.state === "available";
+  const attention = data.users.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh)).length;
   const measured = data.users.filter(user => responses(user) !== null).length;
   const unknown = data.users.length - measured;
   const filtered = useMemo(() => {
@@ -109,7 +148,7 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
         user.directory.displayName, user.directory.userPrincipalName, user.directory.objectId, user.directory.department,
         ...(user.importedUsage?.rows.flatMap(row => [row.displayAgentName, row.creatorType]) ?? []),
       ].some(value => value?.toLowerCase().includes(query))) return false;
-      if (cohort === "attention") return needsAttention(user, threshold, agentUsageFresh);
+      if (cohort === "attention") return needsAttention(user, threshold, agentUsageFresh, appActivityFresh);
       if (cohort === "unknown") return responses(user) === null;
       if (cohort === "most" || cohort === "least") return responses(user) !== null;
       return true;
@@ -122,11 +161,10 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
       if (right === null && left !== null) return -1;
       return (sort === "responses-asc" ? 1 : -1) * ((left ?? 0) - (right ?? 0)) || name(a).localeCompare(name(b));
     });
-  }, [agentUsageFresh, cohort, data.users, search, sort, threshold]);
+  }, [agentUsageFresh, appActivityFresh, cohort, data.users, search, sort, threshold]);
   const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
   const visible = filtered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
-  const selected = data.users.find(user => user.directory.objectId === selectedId);
 
   function selectCohort(next: Cohort) {
     setCohort(next);
@@ -136,7 +174,7 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
 
   return <>
     {data.snapshot ? (
-      <div className="copilot-users-snapshot" role="status">
+      <div className={`copilot-users-snapshot${data.snapshot.state === "available" ? " compact" : ""}`} role="status">
         <strong>
           {data.snapshot.state === "not_synced"
             ? "Saved user data has never been collected."
@@ -144,15 +182,13 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
         </strong>
         <span>
           Last successful sync: {data.snapshot.lastSuccessAt ? formatDateTime(data.snapshot.lastSuccessAt) : "never"}.
-          Directory observed: {data.snapshot.directoryObservedAt ? formatDateTime(data.snapshot.directoryObservedAt) : "never"}.
-          App activity observed: {data.snapshot.appActivityObservedAt ? formatDateTime(data.snapshot.appActivityObservedAt) : "never"}.
         </span>
       </div>
     ) : null}
     <div className="copilot-user-metrics" aria-label="Licensed user summary">
       <Metric label="Licensed users" value={directoryKnown ? data.users.length : null} hint="Microsoft 365 Copilot, not all Microsoft 365 licenses" />
       <Metric label="Using agents" value={directoryKnown && agentUsageFresh ? data.users.filter(user => (responses(user) ?? 0) > 0).length : null} hint="At least one reported agent response" />
-      <Metric label="Needs attention" value={directoryKnown ? attention : null} hint="Adoption or assignment follow-up" />
+      <Metric label="Needs attention" value={directoryKnown && current ? attention : null} hint="Adoption or assignment follow-up" />
       <Metric label="Agent usage unknown" value={directoryKnown ? unknown : null} hint="Not evidence of an unused license" />
     </div>
 
@@ -191,9 +227,9 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
       <table className="copilot-users-table">
         <thead><tr><th scope="col">User</th><th scope="col">License</th><th scope="col">Agent responses</th><th scope="col">Agents used</th><th scope="col">Last reported activity</th><th scope="col">Follow-up</th></tr></thead>
         <tbody>{visible.map(user => {
-          const followUp = recommendation(user, threshold, agentUsageFresh);
+          const followUp = current ? recommendation(user, threshold, agentUsageFresh, appActivityFresh) : { label: "Reload saved users", tone: "unknown" };
           return <tr key={user.directory.objectId}>
-            <td><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => setSelectedId(user.directory.objectId)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</td>
+            <td><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => onInspectUser(user, threshold)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</td>
             <td><span className={`copilot-user-badge ${licenseIssue(user) ? "attention" : ""}`}>{licenseLabel(user)}</span></td>
             <td data-numeric>{formatCount(responses(user))}{!agentUsageFresh && responses(user) !== null ? <small>Historical report</small> : null}</td>
             <td data-numeric>{formatCount(user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : null)}</td>
@@ -216,6 +252,8 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
 
     <details className="copilot-users-provenance">
       <summary>Data sources and coverage</summary>
+      {data.snapshot ? <p>Directory observed: {data.snapshot.directoryObservedAt ? formatDateTime(data.snapshot.directoryObservedAt) : "never"}.
+        {" "}App activity observed: {data.snapshot.appActivityObservedAt ? formatDateTime(data.snapshot.appActivityObservedAt) : "never"}.</p> : null}
       <dl>{([
         ["License assignments", data.sources.directory],
         ["Agent activity", data.sources.importedAgentUsage],
@@ -236,7 +274,6 @@ function CopilotUsersDashboard({ data }: { data: CopilotUsageUsersResponse }) {
       </div>
       {data.unresolvedImportedIdentities.length > pageSize ? <p>First {pageSize} shown. <a href="/official-usage">View all imported identities and agent details</a>.</p> : null}
     </details> : null}
-    {selected ? <CopilotUserDetail user={selected} data={data} threshold={threshold} onClose={() => setSelectedId(undefined)} /> : null}
   </>;
 }
 
@@ -244,16 +281,21 @@ function formatDateTime(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-function CopilotUserDetail({ user, data, threshold, onClose }: { user: CopilotUsageUser; data: CopilotUsageUsersResponse; threshold: number; onClose: () => void }) {
+function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onClose, onViewAgent }: {
+  user: CopilotUsageUser; data: CopilotUsageUsersResponse; current: boolean; threshold: number; onClose: () => void;
+  returnFocusTo: RefObject<HTMLButtonElement | null>;
+  onViewAgent: (agentId: string, reportSetId?: string) => void;
+}) {
   const dialog = useRef<HTMLDialogElement>(null);
   const close = useRef<HTMLButtonElement>(null);
   const imported = user.importedUsage;
-  const fresh = data.sources.importedAgentUsage.state === "available";
-  const followUp = recommendation(user, threshold, fresh);
+  const fresh = current && data.sources.importedAgentUsage.state === "available";
+  const followUp = current ? recommendation(user, threshold, fresh, data.sources.appActivity.state === "available") : { label: "Reload saved users", tone: "unknown" };
   const auditUrl = `/audit?${new URLSearchParams({ source: "purview", user: user.directory.userPrincipalName })}`;
   useEffect(() => {
     const element = dialog.current;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const fallbackFocus = returnFocusTo.current;
     const previousOverflow = document.body.style.overflow;
     element?.showModal();
     close.current?.focus();
@@ -261,16 +303,16 @@ function CopilotUserDetail({ user, data, threshold, onClose }: { user: CopilotUs
     return () => {
       element?.close();
       document.body.style.overflow = previousOverflow;
-      previousFocus?.focus();
+      (previousFocus?.isConnected ? previousFocus : fallbackFocus)?.focus();
     };
-  }, []);
+  }, [returnFocusTo]);
   return <dialog ref={dialog} className="copilot-user-dialog" aria-labelledby="copilot-user-name" onCancel={event => { event.preventDefault(); onClose(); }}>
     <header>
       <div><h2 id="copilot-user-name">{name(user)}</h2><p>{user.directory.userPrincipalName}{user.directory.department ? ` | ${user.directory.department}` : ""}</p><span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span></div>
       <button ref={close} type="button" className="secondary icon-button" aria-label="Close user details" onClick={onClose}><X size={20} aria-hidden="true" /></button>
     </header>
     <div className="copilot-user-metrics">
-      <Metric label="License" value={licenseLabel(user)} hint="Current Entra assignment" />
+      <Metric label="License" value={licenseLabel(user)} hint={current && data.sources.directory.state === "available" ? "Current Entra assignment" : "Last saved Entra assignment"} />
       <Metric label="Agent responses" value={responses(user)} hint={fresh ? "Imported Users report total" : "Historical or missing report"} />
       <Metric label="Agents used" value={imported && !imported.missingUserReport ? imported.reportedAgentsUsed : null} hint="Imported Users report total" />
     </div>
@@ -294,7 +336,7 @@ function CopilotUserDetail({ user, data, threshold, onClose }: { user: CopilotUs
       {imported?.hasReportMismatch ? <p className="copilot-users-notice">The Users total and Users &amp; agents breakdown differ. They are shown separately, not added together.</p> : null}
       {imported?.rows.length ? <div className="copilot-users-table-shell" role="region" aria-label="User agent breakdown" tabIndex={0}>
         <table className="copilot-users-table"><thead><tr><th scope="col">Agent</th><th scope="col">Creator</th><th scope="col">Responses to this user</th></tr></thead>
-          <tbody>{[...imported.rows].sort((a, b) => b.responsesSentToUsers - a.responsesSentToUsers).map(row => <tr key={row.agentId}><td>{row.displayAgentName}<small>{row.agentId}</small></td><td>{row.creatorType || "Unknown"}</td><td>{row.responsesSentToUsers.toLocaleString()}</td></tr>)}</tbody>
+          <tbody>{[...imported.rows].sort((a, b) => b.responsesSentToUsers - a.responsesSentToUsers).map(row => <tr key={row.agentId}><td><button type="button" className="matrix-agent-button" onClick={() => onViewAgent(row.agentId, imported.datasetScope.reportSetId ?? undefined)}>{row.displayAgentName}</button><small>{row.agentId}</small></td><td>{row.creatorType || "Unknown"}</td><td>{row.responsesSentToUsers.toLocaleString()}</td></tr>)}</tbody>
         </table>
       </div> : <p>No matched agent breakdown. This does not establish zero activity.</p>}
       <p><small>Period totals, not a daily event log. Agent-wide last-use dates are not attributed to this user.</small></p>
@@ -334,17 +376,17 @@ function licenseLabel(user: CopilotUsageUser) {
   return "Assigned";
 }
 
-function needsAttention(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean) {
+function needsAttention(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean) {
   const count = responses(user);
-  return licenseIssue(user) || user.attention.includes("app_activity_inactive") || (agentUsageFresh && count !== null && count <= threshold);
+  return licenseIssue(user) || (appActivityFresh && user.attention.includes("app_activity_inactive")) || (agentUsageFresh && count !== null && count <= threshold);
 }
 
-function recommendation(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean) {
+function recommendation(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean) {
   const count = responses(user);
   if (licenseIssue(user)) return { label: "Review assignment", tone: "attention" };
   if (agentUsageFresh && count === 0) return { label: "Explore agents", tone: "attention" };
   if (agentUsageFresh && count !== null && count <= threshold) return { label: "Offer adoption help", tone: "attention" };
-  if (user.attention.includes("app_activity_inactive")) return { label: "Review app activity", tone: "attention" };
+  if (appActivityFresh && user.attention.includes("app_activity_inactive")) return { label: "Review app activity", tone: "attention" };
   if (!agentUsageFresh && count !== null) return { label: "Refresh agent report", tone: "unknown" };
   if (count === null) return { label: "Usage unknown", tone: "unknown" };
   return { label: "Using agents", tone: "" };

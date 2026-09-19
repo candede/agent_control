@@ -5,10 +5,12 @@ import { parseOfficialUsageReport } from "../../backend/src/services/officialUsa
 import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../../backend/src/services/officialUsageViews";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import type { AcceptedOfficialUsageReports, ParsedOfficialUsageReport, PublishedOfficialUsage } from "../../backend/src/types/officialUsage";
-import type { OfficialUsageAdminState, OfficialUsageStagingPreview } from "../src/api/client";
+import type { OfficialUsageAdminState, OfficialUsageHistoryView, OfficialUsageStagingPreview } from "../src/api/client";
+import { mockLayoutApi } from "./layoutFixtures";
 
 const instant = "2026-09-12T14:45:00.000Z";
 const setId = "11111111-1111-4111-8111-111111111111";
+const unexpectedApiRequests = new WeakMap<Page, string[]>();
 const csvFiles = [
   {
     name: "DeclarativeAgents_Agents_30_2026-09-12T14-41-53.csv",
@@ -48,6 +50,8 @@ function accepted<T extends ParsedOfficialUsageReport>(report: T, index: number)
 }
 
 async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; active?: boolean } = {}) {
+  await page.clock.setFixedTime(new Date(instant));
+  unexpectedApiRequests.set(page, await mockLayoutApi(page));
   let bundleId = "22222222-2222-4222-8222-222222222222";
   let isAccepted = options.active ?? false;
   const stages: OfficialUsageStagingPreview[] = [];
@@ -161,11 +165,40 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
         limit: Number(url.searchParams.get("limit") ?? 100), offset: Number(url.searchParams.get("offset") ?? 0),
       }));
     }
+    if (path === "/api/official-usage/history") {
+      const observations = Object.values(published().reports).map(report => ({
+        versionId: report.lineage.versionId, kind: report.kind, contentHash: report.lineage.fileHash,
+        rowCount: report.rows.length, uniquePayloadCount: report.rows.length, repeatedRowsReused: 0, lineage: report.lineage,
+      }));
+      const rowCount = observations.reduce((sum, report) => sum + report.rowCount, 0);
+      const history: OfficialUsageHistoryView = {
+        summary: {
+          importCount: isAccepted ? 1 : 0, uniqueObservationCount: observations.length,
+          observationRowCount: rowCount, uniquePayloadCount: rowCount, repeatedRowsReused: 0,
+          earliestObservedAt: isAccepted ? instant : null, latestObservedAt: isAccepted ? instant : null,
+          activityDateRange: {
+            earliestDateUtc: isAccepted ? "2026-08-14" : null, latestDateUtc: isAccepted ? "2026-09-12" : null,
+            provenance: "last_activity_dates", provesReportingCoverage: false,
+          },
+          reportingWindows: { knownCount: 0, unknownCount: isAccepted ? 1 : 0, overlappingKnownWindowCount: 0, additive: false },
+          warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
+        },
+        bundles: {
+          value: isAccepted ? [{
+            ...activeSet, bundleId, kinds: [...activeSet.kinds], isActive: true,
+            observationCount: observations.length, rowCount, uniquePayloadCount: rowCount, repeatedRowsReused: 0,
+            reportingWindowKnown: false, activityRangeIsCoverage: false, observations,
+          }] : [],
+          count: isAccepted ? 1 : 0, limit: 10, offset: 0,
+        },
+      };
+      return respond(history);
+    }
     if (path === "/api/agents") return respond({
       value: [], count: 0, summary: { total: 0, allowed: 0, blocked: 0 }, filteredSummary: { total: 0, allowed: 0, blocked: 0 },
       facets: { publishers: [], availability: [], hosts: [], platforms: [] }, snapshot: null,
     });
-    return respond({ value: [] });
+    return route.fallback();
   });
   return { uploadBodies, userRequests, apiRequests };
 }
@@ -176,6 +209,8 @@ test.beforeEach(async ({ context }) => {
 
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
+  const unexpected = unexpectedApiRequests.get(page);
+  if (unexpected) expect(unexpected).toEqual([]);
 });
 
 test("keeps import management off the report page and opens an accessible dialog on demand", async ({ page }, info) => {
@@ -244,7 +279,7 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Validated report previews" })).toBeVisible();
   await page.getByRole("button", { name: "Accept reviewed bundle" }).click();
-  await expect(page.getByText(/three-file set is active/)).toBeVisible();
+  await expect(page.getByText(/three-file snapshot was added to cumulative history and is current/)).toBeVisible();
   await page.getByRole("button", { name: "Back to reports" }).click();
   await expect(modal).toBeHidden();
   await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("2,061");

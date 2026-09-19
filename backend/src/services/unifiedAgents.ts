@@ -42,6 +42,8 @@ import {
 import { powerPlatformAgentKey } from "./inventoryIdentity.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { getAuditLog } from "./auditLog.js";
+import { agentColumnValue, matchesAgentView, packageAuthoringTool, type AgentColumnValue } from "../types/agentPresentation.js";
+import { agentUsage, combineAgentInventoryRevision } from "./agentUsage.js";
 
 export type UnifiedAgentDependencies = {
   packages: Pick<PackageInventoryRepository, "readUnifiedSource">;
@@ -50,6 +52,7 @@ export type UnifiedAgentDependencies = {
   operationPackageIds: (scope: PackageDataScope, ids: readonly string[], prefix: string) => Promise<string[]>;
   registry?: Pick<UnifiedAgentRegistry, "withSnapshot" | "reconcile">;
   readRevision: typeof readUnifiedInventoryRevision;
+  usage: Pick<typeof agentUsage, "project" | "revision">;
 };
 
 const defaultDependencies: UnifiedAgentDependencies = {
@@ -59,6 +62,7 @@ const defaultDependencies: UnifiedAgentDependencies = {
   operationPackageIds: (scope, ids, prefix) => getAuditLog(scope).matchingOperationPackageIds(ids, prefix),
   registry: new UnifiedAgentRegistry(),
   readRevision: readUnifiedInventoryRevision,
+  usage: agentUsage,
 };
 
 type SourceLoad<T> =
@@ -85,7 +89,15 @@ export class UnifiedAgentsService {
   }
 
   async assertRevision(scope: PackageDataScope & InventoryDataScope, revision: string) {
-    if (await this.dependencies.readRevision(scope) !== revision) throw inventoryChanged();
+    const check = async (database?: pg.PoolClient) => {
+      const baseRevision = await this.dependencies.readRevision(scope, database);
+      const usageRevision = await this.dependencies.usage.revision(scope, database);
+      if (combineAgentInventoryRevision(baseRevision, usageRevision) !== revision
+        || await this.dependencies.readRevision(scope, database) !== baseRevision) throw inventoryChanged();
+    };
+    return this.dependencies.registry
+      ? this.dependencies.registry.withSnapshot(scope, check)
+      : check();
   }
 
   private async readPage(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number, recordIds?: readonly string[]) {
@@ -96,7 +108,7 @@ export class UnifiedAgentsService {
 
   private async listSnapshot(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number,
     recordIds?: readonly string[], database?: pg.PoolClient): Promise<UnifiedAgentInventoryPage> {
-    const revision = await this.dependencies.readRevision(scope, database);
+    const baseRevision = await this.dependencies.readRevision(scope, database);
     const [packageSettled, powerPlatformSettled] = await Promise.allSettled([
       database ? this.dependencies.packages.readUnifiedSource(scope, database) : this.dependencies.packages.readUnifiedSource(scope),
       database ? this.dependencies.powerPlatform.readUnifiedSource(scope, database) : this.dependencies.powerPlatform.readUnifiedSource(scope),
@@ -151,9 +163,16 @@ export class UnifiedAgentsService {
       powerPlatformObservation,
       packageSnapshots,
     );
-    const records = database && this.dependencies.registry
+    const canonicalRecords = database && this.dependencies.registry
       ? await this.dependencies.registry.reconcile(database, scope, grouped) : grouped;
-    if (await this.dependencies.readRevision(scope, database) !== revision) throw inventoryChanged();
+    const sourceCounts = verifySourceMemberships(canonicalRecords, usablePackages, usablePowerPlatform);
+    const usage = await this.dependencies.usage.project(scope, canonicalRecords, database);
+    const records = canonicalRecords.map(record => {
+      const summary = usage.summaries.get(record.id);
+      if (!summary) throw new AppError(500, "agent_usage_projection_incomplete", "Saved usage did not account for every authorized inventory agent.");
+      return { ...record, usage: summary };
+    });
+    const revision = combineAgentInventoryRevision(baseRevision, usage.context.revision);
     const selected = recordIds ? exactSelection(records, recordIds) : undefined;
     const summary = summarize(records);
     const environments = new Map<string, { value: string; label: string }>();
@@ -178,21 +197,22 @@ export class UnifiedAgentsService {
     const filtered = records.filter(record => (!selected || selected.has(record)) && matches(record, query)
       && (!referenceIds || record.packages.some(value => referenceIds.has(value.id))));
     const filteredSummary = summarize(filtered);
-    const sorted = [...filtered].sort(recordComparator(query));
+    const sorted = [...filtered].sort(recordComparator(query, powerPlatformSource.environmentNames));
     const limit = Math.min(Math.max(query.limit ?? 50, 1), maximumLimit);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected).length;
     const invalidPackages = links.filter(link => link.status !== "matched" && link.invalidMetadata).length;
-    const sourceCounts = verifySourceMemberships(records, usablePackages, usablePowerPlatform);
     const checks: UnifiedAgentInventoryVerification["checks"] = {
       sourceScopes: sourceErrors.length === 0,
       packageMetadata: checkedPackages === usablePackages.length && invalidPackages === 0,
       identityLinks: summary.ambiguous === 0 && summary.conflicting === 0,
       sourceMemberships: true,
     };
+    if (await this.dependencies.readRevision(scope, database) !== baseRevision) throw inventoryChanged();
 
     return {
       revision,
+      usageContext: usage.context,
       value: sorted.slice(offset, offset + limit),
       count: filtered.length,
       offset,
@@ -465,6 +485,7 @@ function unavailableStatus(
 }
 
 function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) {
+  if (!matchesAgentView(record, query.view)) return false;
   if (query.recordId && !matchesRecordId(record, query.recordId)) return false;
   if (query.source && query.source !== "all") {
     if (query.source === "both" && record.presence !== "both") return false;
@@ -534,41 +555,35 @@ function inventoryChanged() {
   return new AppError(409, "inventory_changed", "Saved inventory changed. Refresh Agents and try the export again.");
 }
 
-function recordComparator(query: UnifiedAgentInventoryQuery) {
+function recordComparator(query: UnifiedAgentInventoryQuery, environmentNames: Record<string, string>) {
   const direction = query.sortDirection === "desc" ? -1 : 1;
-  if (query.sortBy === "lastModifiedAt") {
-    const timestamps = new Map<UnifiedAgentRecord, number>();
-    const modifiedAt = (record: UnifiedAgentRecord) => {
-      const cached = timestamps.get(record);
-      if (cached !== undefined) return cached;
-      const latest = [
-        record.powerPlatformResource?.lastPublishedAt,
-        record.powerPlatformResource?.createdAt,
-        ...record.packages.map(item => item.lastModifiedDateTime),
-      ].reduce<number>((latest, value) => {
-        if (!value) return latest;
-        const timestamp = Date.parse(value);
-        if (!Number.isFinite(timestamp)) {
-          throw new AppError(500, "saved_source_invalid", "Saved agent inventory contains an invalid modification timestamp.");
-        }
-        return Math.max(latest, timestamp);
-      }, Number.NEGATIVE_INFINITY);
-      timestamps.set(record, latest);
-      return latest;
-    };
-    return (left: UnifiedAgentRecord, right: UnifiedAgentRecord) => {
-      const leftTime = modifiedAt(left);
-      const rightTime = modifiedAt(right);
-      return ((leftTime < rightTime ? -1 : leftTime > rightTime ? 1 : 0) || ordinal(left.id, right.id)) * direction;
-    };
-  }
+  const sortBy = query.sortBy ?? "displayName";
+  const values = new Map<UnifiedAgentRecord, AgentColumnValue>();
   const value = (record: UnifiedAgentRecord) => {
-    if (query.sortBy === "environment") return record.environmentId ?? "";
-    if (query.sortBy === "source") return record.presence;
-    return record.displayName;
+    if (values.has(record)) return values.get(record)!;
+    let result: AgentColumnValue;
+    try {
+      result = agentColumnValue(record, sortBy, environmentNames);
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      throw new AppError(500, "saved_source_invalid", error.message);
+    }
+    values.set(record, result);
+    return result;
   };
-  return (left: UnifiedAgentRecord, right: UnifiedAgentRecord) =>
-    (value(left).localeCompare(value(right), "en-US", { sensitivity: "base" }) || ordinal(left.id, right.id)) * direction;
+  return (left: UnifiedAgentRecord, right: UnifiedAgentRecord) => {
+    const leftValue = value(left);
+    const rightValue = value(right);
+    if (leftValue === null || rightValue === null) {
+      if (leftValue === rightValue) return ordinal(left.id, right.id) * direction;
+      const missingOrder = leftValue === null ? 1 : -1;
+      return sortBy === "lastModifiedAt" ? -missingOrder * direction : missingOrder;
+    }
+    const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : String(leftValue).localeCompare(String(rightValue), "en-US", { sensitivity: "base", numeric: sortBy === "versions" });
+    return (comparison || ordinal(left.id, right.id)) * direction;
+  };
 }
 
 function summarize(records: readonly UnifiedAgentRecord[]): UnifiedAgentInventorySummary {
@@ -609,11 +624,7 @@ function matchesHost(values: readonly string[] | undefined, filter: string) {
 }
 
 function packagePlatform(value: CopilotPackage) {
-  const raw = value.authoringTool
-    ?? value.platform
-    ?? value.shortDescription?.trim().match(/^built\s+using\s+(.+?)\.?$/i)?.[1]?.trim()
-    ?? "";
-  return normalizePackageAuthoringTool(raw);
+  return normalizePackageAuthoringTool(packageAuthoringTool(value) ?? "");
 }
 
 function emptyPackageSource(): UnifiedPackageSourceResult {

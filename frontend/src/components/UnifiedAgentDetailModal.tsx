@@ -1,30 +1,32 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
 import {
   getInventorySourceAwareDetail,
   type AppRole,
+  type AgentUsageContext,
+  type BulkActionResult,
   type CopilotPackage,
   type CopilotPackageDetail,
   type InventorySourceAwareDetail,
-  type PackageAccessTarget,
+  type PackageAccessUpdate,
   type UnifiedAgentRecord,
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
-import { formatAccessScope } from "../accessScope";
 import { quarantineTargetReason } from "../quarantineTarget";
+import { CapabilityContext } from "../capabilityContext";
+import { providerActionAllowed } from "../capabilityState";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
-import { AgentDetailModal } from "./AgentDetailModal";
-import { PowerPlatformResourceData } from "./InventoryExplorer";
-import { WorkbenchActionGate } from "../workbenchActionContext";
-import { AgentAuthoringTools, AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
+import { AgentOverview } from "./AgentOverview";
+import { AgentAccessManagement } from "./AgentAccessManagement";
+import { AgentUsagePanel } from "./AgentUsagePanel";
+import { WorkbenchActionGate, useWorkbenchAction } from "../workbenchActionContext";
+import "./agentInsights.css";
 
-const tabs = ["identities", "package", "power-platform", "reports", "audit-security", "controls"] as const;
+const tabs = ["identities", "reports", "controls", "audit-security"] as const;
 type DetailTab = typeof tabs[number];
 const tabLabels: Record<DetailTab, string> = {
   identities: "Overview",
-  package: "Packages",
-  "power-platform": "Configuration",
-  reports: "Usage",
+  reports: "Usage & users",
   "audit-security": "Activity",
   controls: "Manage",
 };
@@ -40,12 +42,22 @@ type Props = {
   onTabChange: (tab: string) => void;
   onClose: () => void;
   onInspectPackage: (item: CopilotPackage) => void;
+  selectedPackageId?: string;
   packageDetail?: CopilotPackageDetail;
   packageDetailLoading?: boolean;
   packageDetailError?: string;
-  onManagePackageAccess: (item: CopilotPackage, target?: PackageAccessTarget) => void;
+  packageActionsBusy?: boolean;
+  onUpdatePackageAccess: (item: CopilotPackage, update: PackageAccessUpdate) => Promise<void>;
   onSetPackageBlocked: (item: CopilotPackage, blocked: boolean) => void;
-  externalAccessEditorOpen?: boolean;
+  packageAccessRevisions?: ReadonlyMap<string, number>;
+  packageConfirmation?: ReactNode;
+  onCancelPackageConfirmation?: () => void;
+  packageControlError?: { packageId: string; message: string };
+  packageResults?: BulkActionResult["results"];
+  dataRevision?: number;
+  usageContext?: AgentUsageContext;
+  inventoryRevision?: string;
+  onUsageChanged?: () => void;
 };
 
 export function UnifiedAgentDetailModal({
@@ -56,33 +68,111 @@ export function UnifiedAgentDetailModal({
   onTabChange,
   onClose,
   onInspectPackage,
+  selectedPackageId,
   packageDetail,
   packageDetailLoading = false,
   packageDetailError,
-  onManagePackageAccess,
+  packageActionsBusy = false,
+  onUpdatePackageAccess,
   onSetPackageBlocked,
-  externalAccessEditorOpen = false,
+  packageAccessRevisions,
+  packageConfirmation,
+  onCancelPackageConfirmation,
+  packageControlError,
+  packageResults,
+  dataRevision = 0,
+  usageContext,
+  inventoryRevision,
+  onUsageChanged,
 }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const dialogMounted = useRef(false);
+  const panel = useRef<HTMLElement>(null);
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
   const [relatedState, setRelatedState] = useState<RelatedState>();
-  const selectedTab = tabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
+  const [relatedRetry, setRelatedRetry] = useState(0);
+  const [packageSelection, setPackageSelection] = useState(() => ({
+    recordId: record.id,
+    packageId: selectedPackageId ?? record.packages.find(item => item.id === packageDetail?.id)?.id ?? record.packages[0]?.id,
+    parentPackageId: selectedPackageId,
+  }));
+  if (packageSelection.recordId !== record.id) {
+    setPackageSelection({
+      recordId: record.id,
+      packageId: (selectedPackageId !== packageSelection.parentPackageId
+        ? selectedPackageId : record.packages.find(item => item.id === selectedPackageId)?.id)
+        ?? record.packages.find(item => item.id === packageDetail?.id)?.id ?? record.packages[0]?.id,
+      parentPackageId: selectedPackageId,
+    });
+  } else if (packageSelection.parentPackageId !== selectedPackageId) {
+    setPackageSelection({ ...packageSelection, packageId: selectedPackageId ?? packageSelection.packageId, parentPackageId: selectedPackageId });
+  } else if (packageSelection.packageId === undefined && record.packages.length) {
+    setPackageSelection({ ...packageSelection, packageId: record.packages[0].id });
+  }
+  const requestedPackage = useRef<string | undefined>(undefined);
+  const packageSelectId = useId();
+  const inspectAction = useWorkbenchAction("packages.inspect");
+  const accessAction = useWorkbenchAction("packages.access");
+  const capabilities = useContext(CapabilityContext);
+  const canInspectPackage = Boolean(inspectAction && inspectAction.roles.some(role => hasAppRole(roles, role))
+    && (!inspectAction.capabilityId || capabilities && providerActionAllowed(
+      capabilities.views.find(view => view.definition.id === inspectAction.capabilityId),
+      inspectAction.preview === "required",
+      capabilities.now,
+    )));
+  const canEditAccess = Boolean(accessAction && accessAction.roles.some(role => hasAppRole(roles, role))
+    && (!accessAction.capabilityId || capabilities && providerActionAllowed(
+      capabilities.views.find(view => view.definition.id === accessAction.capabilityId),
+      true, capabilities.now,
+    )));
+  const preferredPackageId = packageSelection.recordId === record.id ? packageSelection.packageId : undefined;
+  const selectedPackage = record.packages.find(item => item.id === preferredPackageId);
+  const missingPackageSelection = preferredPackageId !== undefined && !selectedPackage;
+  const selectedDetail = packageDetail?.id === selectedPackage?.id ? packageDetail : undefined;
+  const hasPackageConfirmation = Boolean(packageConfirmation);
+  const packageResult = packageResults?.find(result => result.id === selectedPackage?.id);
+  const controlError = packageControlError && packageControlError.packageId === selectedPackage?.id ? packageControlError.message : undefined;
+  const packageKey = JSON.stringify([
+    record.id, selectedPackage?.id,
+    selectedPackage ? record.observations.packageSnapshots[selectedPackage.id]?.snapshotId : undefined,
+    record.observations.graphPackages?.snapshotId,
+  ]);
+  const requestedTab = activeTab === "package" || activeTab === "power-platform" ? "identities" : activeTab;
+  const selectedTab = tabs.find(tab => tab === (requestedTab ?? internalTab)) ?? "identities";
+  const usesPackageDetails = selectedTab === "identities" || selectedTab === "controls";
   const resource = record.powerPlatformResource;
   const snapshot = record.observations.powerPlatform;
   const relatedKey = resource && snapshot
-    ? JSON.stringify([snapshot.snapshotId, resource.type, resource.environmentId, resource.nativeId])
+    ? JSON.stringify([snapshot.snapshotId, resource.type, resource.environmentId, resource.nativeId, relatedRetry, dataRevision])
     : undefined;
   const scopedRelated = relatedState?.key === relatedKey ? relatedState : undefined;
   const related = scopedRelated?.status === "available" ? scopedRelated.value : undefined;
   const relatedError = scopedRelated?.status === "error" ? scopedRelated.message : "";
   const relatedUnavailable = !resource
-    ? "No Power Platform resource is linked; these exact source associations were not queried."
+    ? "No saved activity is linked to this agent's inventory record."
     : !snapshot
-      ? "No saved Power Platform snapshot is available; these exact source associations were not queried."
+      ? "Saved activity cannot be loaded for this agent until its inventory observation is refreshed."
       : undefined;
   const quarantineReason = quarantineTargetReason(resource ?? undefined, record.observations.powerPlatform);
   const canManage = hasAppRole(roles, "AgentControl.Admin");
+  const inspectSelectedPackage = useEffectEvent(() => {
+    if (selectedPackage) onInspectPackage(selectedPackage);
+  });
+
+  useEffect(() => {
+    if (packageActionsBusy || hasPackageConfirmation) {
+      requestedPackage.current = undefined;
+      return;
+    }
+    if (!usesPackageDetails || !canInspectPackage || !selectedPackage || selectedDetail
+      || requestedPackage.current === packageKey) return;
+    requestedPackage.current = packageKey;
+    inspectSelectedPackage();
+  }, [usesPackageDetails, canInspectPackage, selectedPackage, selectedDetail, packageKey, packageActionsBusy, hasPackageConfirmation]);
+
+  useEffect(() => {
+    if (panel.current) panel.current.scrollTop = 0;
+  }, [selectedTab, record.id, hasPackageConfirmation]);
 
   useEffect(() => {
     const element = dialog.current;
@@ -144,15 +234,18 @@ export function UnifiedAgentDetailModal({
         if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) close();
       }}
       onCancel={event => {
-        if (event.target === event.currentTarget && externalAccessEditorOpen) event.preventDefault();
+        if (event.target === event.currentTarget && hasPackageConfirmation) {
+          event.preventDefault();
+          onCancelPackageConfirmation?.();
+        }
       }}
     >
       <header>
-        <div><p className="eyebrow">Agent details</p><h2 id="unified-agent-detail-title">{record.displayName}</h2></div>
+        <div><p className="eyebrow">Agent management</p><h2 id="unified-agent-detail-title">{record.displayName}</h2></div>
         <button type="button" className="icon-button" aria-label="Close unified agent details" onClick={close}><X aria-hidden="true" /></button>
       </header>
       <div className="detail-tabs" role="tablist" aria-label="Agent details">
-        {tabs.map(tab => <button key={tab} id={`unified-agent-tab-${tab}`} type="button" role="tab" aria-selected={selectedTab === tab} aria-controls={`unified-agent-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)} onKeyDown={event => {
+        {tabs.map(tab => <button key={tab} id={`unified-agent-tab-${tab}`} type="button" role="tab" disabled={hasPackageConfirmation} aria-selected={selectedTab === tab} aria-controls={`unified-agent-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)} onKeyDown={event => {
           const index = tabs.indexOf(tab);
           const next = event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length]
             : event.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length]
@@ -168,50 +261,74 @@ export function UnifiedAgentDetailModal({
         Select this agent on Agents, then open <strong>Sync &gt; Advanced results</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
       </div> : null}
       {packageDetailError ? <p className="error-banner unified-agent-detail-error" role="alert">{packageDetailError}</p> : null}
-      <section id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
-        {selectedTab === "identities" ? <>
-          <h3>Overview</h3>
-          <div className="inventory-detail-grid">
-            <Detail label="Environment" value={record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : "Unknown"} />
-            <Detail label="Built with" value={<AgentAuthoringTools record={record} />} />
-            <Detail label="Availability" value={<AgentAvailability record={record} />} />
-            <Detail label="Status" value={<AgentStatus record={record} />} />
-          </div>
-          <details className="agent-technical-details">
-            <summary>Technical details</summary>
-            <IdentityPanel record={record} />
-          </details>
+      <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
+        {usesPackageDetails && (selectedPackage || missingPackageSelection) ? <>
+          {record.packages.length > 1 || missingPackageSelection ? <div className="agent-version-selector">
+            <label htmlFor={packageSelectId}>Published version details</label>
+            <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || hasPackageConfirmation}
+              onChange={event => setPackageSelection(current => ({ ...current, recordId: record.id, packageId: event.target.value }))}>
+              {missingPackageSelection ? <option value="" disabled>Selected version unavailable</option> : null}
+              {record.packages.map(item => <option key={item.id} value={item.id}>{item.displayName}{item.version ? ` - Version ${item.version}` : ""} ({item.id})</option>)}
+            </select>
+          </div> : null}
+          {missingPackageSelection ? <p className="error-banner" role="alert">
+            The selected published version <code>{preferredPackageId}</code> is no longer in this saved agent inventory.
+            Choose an available version explicitly or <a href="/sync">refresh agent inventory</a>.
+          </p> : null}
+          {selectedPackage && !selectedDetail && !hasPackageConfirmation ? packageDetailError ? <WorkbenchActionGate actionId="packages.inspect" compact>
+            <button type="button" className="secondary" disabled={packageActionsBusy || packageDetailLoading} onClick={() => onInspectPackage(selectedPackage)}>Retry saved details</button>
+          </WorkbenchActionGate> : canInspectPackage ? <p className="agent-metadata-status" role="status">{packageActionsBusy
+            ? "Saved details will be loaded when the current management action finishes."
+            : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional saved details require the package read action to be available. The saved inventory information remains visible.</p> : null}
         </> : null}
-        {selectedTab === "package" ? <PackagesPanel
-          record={record}
-          selectedPackageId={packageDetail?.id}
-          onInspect={onInspectPackage}
-        >
-          {packageDetailLoading ? <div className="package-detail-state" role="status">Loading exact package details...</div> : null}
-          {packageDetail ? <AgentDetailModal agent={packageDetail} embedded roles={roles} /> : null}
-        </PackagesPanel> : null}
-        {selectedTab === "power-platform" ? <PowerPlatformPanel record={record} /> : null}
-        {selectedTab === "reports" ? <RelatedState heading="Official reports" source={related?.reports} error={relatedError} unavailable={relatedUnavailable} /> : null}
-        {selectedTab === "audit-security" ? <AuditSecurityPanel related={related} error={relatedError} unavailable={relatedUnavailable} /> : null}
+        {selectedTab === "identities" ? <AgentOverview key={`${record.id}:${selectedPackage?.id ?? "native"}:${selectedDetail?.observation?.observedAt ?? "saved"}`}
+          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} environmentNames={environmentNames} /> : null}
+        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.revision, inventoryRevision])}
+          record={record} context={usageContext} inventoryRevision={inventoryRevision} canManage={canManage}
+          disabled={packageActionsBusy} onChanged={onUsageChanged} /> : null}
+        {selectedTab === "identities" ? <details className="agent-technical-details" open={activeTab === "power-platform" || undefined}>
+          <summary>Technical details</summary>
+          {resource ? <PowerPlatformPanel record={record} /> : null}
+          <IdentityPanel record={record} />
+        </details> : null}
+        {selectedTab === "audit-security" ? <AuditSecurityPanel agentName={record.displayName} related={related} error={relatedError} unavailable={relatedUnavailable} onRetry={() => setRelatedRetry(value => value + 1)} /> : null}
         {selectedTab === "controls" ? <>
-          <h3>Manage agent</h3>
-          <p className="tab-description">Manage package access and installation, blocking, and connected Copilot Studio channels. Every action identifies its exact target before applying a change.</p>
+          <h3>Manage</h3>
+          <p className="tab-description">Apply checks current settings before exact-target confirmation.</p>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
+          {canManage && !canEditAccess ? <p className="agent-insight-note">Access settings are read-only until access-management permissions are available.</p> : null}
+          {controlError ? <p className="error-banner" role="alert">{controlError}</p> : null}
+          {packageResult ? <p className={packageResult.status === "succeeded" ? "notice" : "error-banner"} role={packageResult.status === "succeeded" ? "status" : "alert"}>
+            {packageResult.message ?? (packageResult.status === "succeeded" ? "The change completed for this published version." : "The change was not applied to this published version.")}
+          </p> : null}
+          {packageConfirmation}
+        </> : null}
+        {selectedPackage && capabilities ? <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
+          <AgentAccessManagement key={`${record.id}:${selectedPackage.id}`} revision={packageAccessRevisions?.get(selectedPackage.id) ?? 0}
+            agent={selectedPackage} detail={selectedDetail} canManage={canManage} canEditAccess={canEditAccess}
+            showName={selectedPackage.displayName !== record.displayName}
+            active={selectedTab === "controls" && !hasPackageConfirmation}
+            busy={packageActionsBusy || hasPackageConfirmation} loading={packageDetailLoading}
+            onUpdate={onUpdatePackageAccess} onSetBlocked={onSetPackageBlocked} />
+        </div> : null}
+        {selectedTab === "controls" && !hasPackageConfirmation ? <>
+          {!record.packages.length ? <p>Availability and installation have not been observed. No published version is available for these controls.</p> : null}
+          {!record.packages.length && quarantineReason ? <p className="agent-insight-note">No supported management target is present in the saved inventory. <a href="/sync">Refresh agent inventory</a> and <a href="/permissions">review permissions</a> before choosing a control.</p> : null}
           <div className="agent-management-sections">
-            <article className="agent-management-card">
-              <PackagesPanel record={record} canManage={canManage} onInspect={onInspectPackage} onManageAccess={onManagePackageAccess} onSetBlocked={onSetPackageBlocked} controls />
-            </article>
-            <article className="agent-management-card">
+            {resource && !quarantineReason ? <article className="agent-management-card">
               <div className="management-card-heading">
-                <div><h4>Quarantine and restore</h4><p>Control the linked Copilot Studio channel independently from package access and blocking.</p></div>
+                <div><h4>Quarantine and restore</h4><p>Restrict connected channels independently from availability and blocking of published versions.</p></div>
               </div>
-              {resource && !quarantineReason ? <CopilotStudioQuarantineControls
+              <CopilotStudioQuarantineControls
+                key={JSON.stringify([resource.type, resource.environmentId, resource.nativeId])}
                 snapshot={record.observations.powerPlatform}
                 targets={[resource]}
                 variant="detail"
                 canManage={canManage}
-              /> : <p className="association-status">Quarantine is unavailable: {quarantineReason ?? "No exact Power Platform quarantine target is associated with this record."}</p>}
-            </article>
+              />
+            </article> : resource ? <details className="agent-insight-provenance"><summary>Additional control availability</summary>
+              <p>Quarantine is unavailable: {quarantineReason}</p><a href="/sync">Review inventory coverage</a>
+            </details> : null}
           </div>
         </> : null}
       </section>
@@ -229,7 +346,6 @@ function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
       <h4>Source identity warnings</h4>
       <ul>{record.identity.warnings.map((warning, index) => <li key={`${warning.code}:${index}`}>{warning.message}</li>)}</ul>
     </> : null}
-    {record.identity.state === "unmatched" && !record.identity.invalidMetadata && record.packages.length ? <p>Package detail identity metadata is not present in every broad catalog observation. Select exact packages and use <strong>Refresh matching details</strong> in <strong>Sync &gt; Advanced results</strong> before concluding that no Power Platform counterpart exists.</p> : null}
     <div className="inventory-detail-grid">
       <Detail label="Unified record ID" value={record.id} />
       <Detail label="Source presence" value={record.presence} />
@@ -263,44 +379,6 @@ function RelatedPackageEvidence({ packageIds }: { packageIds?: string[] }) {
   </>;
 }
 
-function PackagesPanel({ record, canManage = false, selectedPackageId, onInspect, onManageAccess, onSetBlocked, controls = false, children }: {
-  record: UnifiedAgentRecord;
-  canManage?: boolean;
-  selectedPackageId?: string;
-  onInspect: (item: CopilotPackage) => void;
-  onManageAccess?: (item: CopilotPackage, target?: PackageAccessTarget) => void;
-  onSetBlocked?: (item: CopilotPackage, blocked: boolean) => void;
-  controls?: boolean;
-  children?: ReactNode;
-}) {
-  return <>
-    {controls ? <div className="management-card-heading"><div><h4>Package controls</h4><p>Manage access, installation, and blocking for each published package.</p></div></div> : <><h3>Packages and availability</h3><p className="tab-description">Select a package to review its complete metadata, connected services, audience, installation scope, and blocking status.</p></>}
-    <p>{record.packages.length
-      ? controls
-        ? "Changes require confirmation of the exact package target and do not change quarantine."
-        : "Package management actions are available from the Manage tab."
-      : "Availability and installation have not been observed. No package target is available for these controls."}</p>
-    {record.packages.length ? <ul className="detail-list expanded-detail-list">{record.packages.map(item => <li key={item.id}>
-      <span>
-        <strong>{item.displayName}</strong>
-        <code>{item.id}</code>
-        <small>
-          {item.publisher ?? "Publisher not supplied"} · {item.isBlocked === true ? "Blocked" : item.isBlocked === false ? "Not blocked" : "Block status unknown"}
-          {" · "}Available to: {formatAccessScope(item.availableTo, [])}
-          {" · "}Installed for: {formatAccessScope(item.deployedTo, [])}
-        </small>
-      </span>
-      <span className="row-actions">
-        {!controls ? <WorkbenchActionGate actionId="packages.inspect" compact><button type="button" className={selectedPackageId === item.id ? "primary-link" : "secondary"} aria-pressed={selectedPackageId === item.id} aria-label={`Package details for ${item.displayName} (${item.id})`} onClick={() => onInspect(item)}>{selectedPackageId === item.id ? "Viewing details" : "View package details"}</button></WorkbenchActionGate> : null}
-        {controls && canManage && onManageAccess ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage access for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "availability")}>Manage access</button></WorkbenchActionGate> : null}
-        {controls && canManage && onManageAccess ? <WorkbenchActionGate actionId="packages.access" compact><button type="button" className="secondary" aria-label={`Manage installation for ${item.displayName} (${item.id})`} onClick={() => onManageAccess(item, "installation")}>Manage installation</button></WorkbenchActionGate> : null}
-        {controls && canManage && onSetBlocked && typeof item.isBlocked === "boolean" ? <WorkbenchActionGate actionId={item.isBlocked ? "packages.unblock" : "packages.block"} compact><button type="button" className={item.isBlocked ? "secondary" : "danger"} aria-label={`${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})`} onClick={() => onSetBlocked(item, !item.isBlocked)}>{item.isBlocked ? "Unblock" : "Block"}</button></WorkbenchActionGate> : null}
-      </span>
-    </li>)}</ul> : null}
-    {!controls ? children : null}
-  </>;
-}
-
 function PowerPlatformPanel({ record }: { record: UnifiedAgentRecord }) {
   const resource = record.powerPlatformResource;
   if (!resource) return <><h3>Configuration</h3><p>No configuration has been observed for this agent.</p></>;
@@ -311,31 +389,42 @@ function PowerPlatformPanel({ record }: { record: UnifiedAgentRecord }) {
       <Detail label="Environment" value={resource.environmentId} />
       <Detail label="CDS bot ID" value={resource.identifiers.find(item => item.kind === "cds_bot_id")?.value} />
       <Detail label="Entra agent ID" value={resource.identifiers.find(item => item.kind === "entra_agent_id")?.value} />
+      <Detail label="Schema name" value={resource.details.schemaName} />
+      <Detail label="Authoring tool (raw)" value={resource.details.createdIn} />
+      <Detail label="Authoring tool" value={resource.authoringTool} />
     </div>
-    <PowerPlatformResourceData resource={resource} />
+    <p>{resource.unknownFieldCount} unknown or malformed fields were omitted from the saved observation.</p>
   </>;
 }
 
-function AuditSecurityPanel({ related, error, unavailable }: { related?: InventorySourceAwareDetail; error: string; unavailable?: string }) {
+function AuditSecurityPanel({ agentName, related, error, unavailable, onRetry }: { agentName: string; related?: InventorySourceAwareDetail; error: string; unavailable?: string; onRetry: () => void }) {
   return <>
-    <RelatedState heading="Purview audit" source={related?.audit} error={error} unavailable={unavailable} />
-    {related?.audit.status === "available" && related.audit.value.length ? <dl className="inventory-identifiers">{related.audit.value.map(item => <div key={`${item.jobId}:${item.wrapperId}`}><dt>{item.operation}</dt><dd>Exact {label(item.matchedKind)} · {formatDate(item.observedAt)} · event {item.nativeEventId ?? item.wrapperId}</dd></div>)}</dl> : null}
-    <RelatedState heading="Defender security" source={related?.security} error={error} unavailable={unavailable} />
-    {related?.security.status === "available" && related.security.value.length ? <dl className="inventory-identifiers">{related.security.value.map(item => <div key={`${item.snapshotId}:${item.nativeRecordId}`}><dt>{item.nativeRecordId}</dt><dd>Exact {label(item.matchedKind)} · {formatDate(item.observedAt)} · {item.lifecycleStatus ?? "Lifecycle not supplied"}</dd></div>)}</dl> : null}
+    <h3>Activity for {agentName}</h3>
+    <p className="tab-description">Only saved audit events and security observations associated with this agent are shown. Missing evidence is not proof of inactivity or safety.</p>
+    {unavailable ? <p className="agent-insight-note">{unavailable}</p> : error ? <div className="error-banner" role="alert">{error} <button type="button" className="secondary" onClick={onRetry}>Retry activity</button></div> : <>
+      <article className="agent-management-card">
+        <RelatedState heading="Audit activity" source={related?.audit} />
+        {related?.audit.status === "available" && related.audit.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Agent audit events" tabIndex={0}>
+          <table className="agent-insight-table"><thead><tr><th scope="col">Operation</th><th scope="col">Observed</th><th scope="col">Result</th><th scope="col">Investigation</th></tr></thead><tbody>
+            {related.audit.value.map(item => <tr key={`${item.jobId}:${item.wrapperId}`}><th scope="row">{item.operation}</th><td>{formatDate(item.observedAt)}</td><td>{item.resultStatus ?? "Not reported"}</td><td><a href={`/audit?${new URLSearchParams({ source: "purview", job: item.jobId })}`}>View audit search</a></td></tr>)}
+          </tbody></table>
+        </div> : null}
+      </article>
+      <article className="agent-management-card">
+        <RelatedState heading="Security observations" source={related?.security} />
+        {related?.security.status === "available" && related.security.value.length ? <dl className="inventory-identifiers">{related.security.value.map(item => <div key={`${item.snapshotId}:${item.nativeRecordId}`}><dt>{item.nativeRecordId}</dt><dd>{formatDate(item.observedAt)} · {item.lifecycleStatus ?? "Lifecycle not supplied"} · <a href={`/security?${new URLSearchParams({ job: item.jobId })}`}>View security investigation</a></dd></div>)}</dl> : null}
+      </article>
+    </>}
   </>;
 }
 
-function RelatedState({ heading, source, error, unavailable }: {
+function RelatedState({ heading, source }: {
   heading: string;
-  source: InventorySourceAwareDetail["reports"] | InventorySourceAwareDetail["audit"] | InventorySourceAwareDetail["security"] | undefined;
-  error: string;
-  unavailable?: string;
+  source: InventorySourceAwareDetail["audit"] | InventorySourceAwareDetail["security"] | undefined;
 }) {
-  if (unavailable) return <><h3>{heading}</h3><p className="association-status">{unavailable}</p></>;
-  if (error) return <><h3>{heading}</h3><p className="error-banner">{error}</p></>;
-  if (!source) return <><h3>{heading}</h3><p>Loading authorized exact source associations…</p></>;
-  if (source.status !== "available") return <><h3>{heading}</h3><p className="association-status">{label(source.status)}: {source.reason}</p></>;
-  return <><h3>{heading}</h3><p className="association-status">{source.count === 0 ? "Authorized and queried; no exact associated records." : `${source.count} exact associated record${source.count === 1 ? "" : "s"}; showing ${source.value.length}.`}</p></>;
+  if (!source) return <><h4>{heading}</h4><p role="status">Loading saved activity associations...</p></>;
+  if (source.status !== "available") return <><h4>{heading}</h4><p>{label(source.status)}: {source.reason}</p></>;
+  return <><h4>{heading}</h4><p>{source.count === 0 ? "Authorized and queried; no exact associated records." : `${source.count} exact associated record${source.count === 1 ? "" : "s"}; showing ${source.value.length}.`}</p></>;
 }
 
 function Detail({ label: heading, value }: { label: string; value: ReactNode }) {

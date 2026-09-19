@@ -3,7 +3,7 @@ import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventoryResourcePage, InventorySnapshot, InventorySnapshotList, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
-import type { OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
@@ -11,7 +11,9 @@ import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput }
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery } from "../../../backend/src/types/unifiedAgents";
-import type { InventoryExportAction } from "../../../backend/src/types/audit";
+import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
+export type { AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
+import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
@@ -27,7 +29,7 @@ export type {
   UnifiedAgentPowerPlatformObservation,
   UnifiedAgentSourceFilter,
 } from "../../../backend/src/types/unifiedAgents";
-export type { OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+export type { OfficialUsageAgent, OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 export type { CopilotAppActivity, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
@@ -373,7 +375,7 @@ export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search
 export type HuntingReadAction = "view-hunting" | "export-hunting";
 export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
-export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | "export-administrative-audit";
+export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AgentUsageAuditAction | "export-administrative-audit";
 
 export type PackageMutationState = Record<string, unknown>;
 
@@ -427,7 +429,7 @@ type AuditEventBase = {
 export type AuditEvent = AuditEventBase &
   (
     | { action: BlockAuditAction; targetBlockedState: boolean }
-    | { action: AccessAuditAction | ReassignAuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction; targetBlockedState?: never }
+    | { action: Exclude<LocalAuditAction, BlockAuditAction>; targetBlockedState?: never }
   );
 
 export type AuditEventsQuery = {
@@ -555,6 +557,31 @@ export function getUnifiedAgents(
 }
 
 export type UnifiedAgentExportQuery = Omit<UnifiedAgentInventoryQuery, "recordId" | "limit" | "offset">;
+
+export function getAgentUsageCandidates(
+  recordId: string,
+  query: { search?: string; offset?: number; limit?: number } = {},
+  options: { signal?: AbortSignal } = {},
+) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  }
+  return request<AgentUsageCandidatePage>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-candidates${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
+
+export function associateAgentUsage(recordId: string, input: AgentUsageAssociationInput) {
+  return request<{ context: AgentUsageContext }>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  });
+}
+
+export function removeAgentUsageAssociation(recordId: string, input: AgentUsageAssociationRemoval) {
+  return request<{ context: AgentUsageContext }>(`/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, {
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+  });
+}
+
 export type UnifiedAgentExportInput = { revision: string } & (
   | { query?: UnifiedAgentExportQuery; recordIds?: never }
   | { recordIds: string[]; query?: Pick<UnifiedAgentExportQuery, "sortBy" | "sortDirection"> }
@@ -830,6 +857,7 @@ export function getOfficialUsageAggregate(
 
 export type OfficialUsageUserQuery = {
   setId?: string;
+  agentId?: string;
   search?: string;
   creatorType?: string;
   activity?: "all" | "recent" | "inactive" | "no-activity";
@@ -849,6 +877,23 @@ export function getOfficialUsageUsers(query: OfficialUsageUserQuery = {}, option
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
   return request<OfficialUsageUserView>(`/api/official-usage/users${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
+
+export function getOfficialUsageAgentDetail(
+  agentId: string,
+  query: {
+    setId?: string;
+    search?: string;
+    sortBy?: "responses" | "displayName";
+    sortDirection?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+  } = {},
+  options: { signal?: AbortSignal } = {},
+) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  return request<OfficialUsageAgentDetailView>(`/api/official-usage/agents/${encodeURIComponent(agentId)}${params.size ? `?${params}` : ""}`, { signal: options.signal });
 }
 
 export function getCopilotUsageUsers(options: { signal?: AbortSignal } = {}) {
@@ -1013,10 +1058,10 @@ export async function downloadDefenderHuntingCsv(id: string) {
   return response.blob();
 }
 
-export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}) {
+export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  const response = await fetch(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { credentials: "include", headers: { Accept: "text/csv" } });
+  const response = await fetch(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { credentials: "include", signal, headers: { Accept: "text/csv" } });
   if (!response.ok) throw await toApiError(response);
   return response.blob();
 }

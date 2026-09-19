@@ -84,7 +84,7 @@ export async function runBulkJob(
       }
       const current = await repository.beginItem(lease);
       if (!current) break;
-      const { item, job } = current;
+      const { item, job, inventoryGeneration } = current;
       const signal = externalSignal
         ? AbortSignal.any([externalSignal, AbortSignal.timeout(itemExecutionDeadlineMs)])
         : AbortSignal.timeout(itemExecutionDeadlineMs);
@@ -118,26 +118,26 @@ export async function runBulkJob(
             if (accessAction !== "update-availability" && accessAction !== "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package access action does not match its payload.");
             const result = await updatePackageAccess(provider, accessToken, item.target_id, job.access_update, before, dispatch, readOptions);
             if (!result.changed) {
-              await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1 }, scope, job.capability, authorize, signal);
+              await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorize, signal);
               return;
             }
             const expected = expectedPackageMutationState(beforeState, accessAction, job.access_update);
             const verified = await verifyPackageMutationConverged(provider, readbackToken, item.target_id, accessAction, expected, readOptions);
-            await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount }, scope, job.capability, authorize, signal);
+            await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorize, signal);
             return;
           }
           const blockAction = job.action;
           if (blockAction === "reassign" || blockAction === "update-availability" || blockAction === "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package action does not match its payload.");
           const expected = expectedPackageMutationState(beforeState, blockAction);
           if (packageMutationStateHash(beforeState) === packageMutationStateHash(expected)) {
-            await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1 }, scope, job.capability, authorize, signal);
+            await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorize, signal);
             return;
           }
           const dispatchToken = await dispatch();
           if (blockAction === "block") await provider.blockPackage(dispatchToken, item.target_id, readOptions);
           else await provider.unblockPackage(dispatchToken, item.target_id, readOptions);
           const verified = await verifyPackageMutationConverged(provider, dispatchToken, item.target_id, blockAction, expected, readOptions);
-          await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount }, scope, job.capability, authorize, signal);
+          await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorize, signal);
         });
       } catch (error) {
         if (error instanceof AppError && error.code === "lease_lost") throw error;
@@ -183,6 +183,7 @@ export async function reconcileBulkJob(
       await repository.withReconciliationLock(scope, item, async () => {
         const action = context.job.action;
         if (action === "reassign") throw new AppError(409, "reassign_verification_unavailable", "Reassign owner cannot be reconciled because Microsoft Graph does not expose owner state.");
+        const inventoryGeneration = await repository.inventoryGeneration(scope);
         const details = await provider.getPackageDetails(token, item.target_id, { correlationId: item.correlation_id ?? randomUUID(), signal });
         if (details.id !== item.target_id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
         const observed = capturePackageMutationState(details, action);
@@ -192,11 +193,11 @@ export async function reconcileBulkJob(
         await commitAccountSessionValidation(validation, async () => {
           signal.throwIfAborted();
           if (packageMutationStatesEqual(observed, expected)) {
-            await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.");
+            await repository.recordReconciliation(scope, item.id, "verified_applied", observed, "Provider reconciliation verified that the confirmed mutation was applied.", { details, inventoryGeneration });
           } else if (packageMutationStatesEqual(observed, item.prestate)) {
-            await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.");
+            await repository.recordReconciliation(scope, item.id, "verified_not_applied", observed, "Provider reconciliation verified that the confirmed mutation was not applied. A new explicit confirmation is required before any retry.", { details, inventoryGeneration });
           } else {
-            await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.");
+            await repository.recordReconciliation(scope, item.id, "conflict", observed, "Provider reconciliation found an intervening external change. Automatic restoration or retry is prohibited.", { details, inventoryGeneration });
           }
         });
       });

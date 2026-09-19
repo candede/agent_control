@@ -5,6 +5,7 @@ import { dataSyncMigrationSql } from "./dataSyncSchema.js";
 import { dataSyncCleanupMigrationSql } from "./dataSyncCleanupSchema.js";
 import { unifiedAgentRegistryMigrationSql } from "./unifiedAgentRegistrySchema.js";
 import { inventoryVerificationMigrationSql } from "./inventoryVerificationSchema.js";
+import { agentUsageMigrationSql } from "./agentUsageSchema.js";
 
 export const migrations = [
   { version: 1, sql: `
@@ -1689,6 +1690,7 @@ END $$;
   { version: 31, sql: dataSyncCleanupMigrationSql },
   { version: 32, sql: unifiedAgentRegistryMigrationSql },
   { version: 33, sql: inventoryVerificationMigrationSql },
+  { version: 34, sql: agentUsageMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {
@@ -1703,4 +1705,28 @@ export async function verifySchema(database: Pick<pg.Pool, "query">) {
     row.version !== migrations[index]?.version || row.checksum !== migrationChecksum(migrations[index].sql))) {
     throw new Error("Database schema is missing, modified or newer than this artifact; operator migration required.");
   }
+  const contract = (await database.query<{ associations: string | null; revision: string | null; triggers: number; cascade: boolean }>(`
+    SELECT to_regclass('public.agent_usage_associations')::text AS associations,
+      to_regclass('public.agent_usage_state')::text AS revision,
+      (SELECT count(*)::int FROM pg_trigger WHERE NOT tgisinternal AND tgenabled IN ('O','A') AND (
+        (tgrelid=to_regclass('public.agent_usage_associations') AND tgname IN ('protect_agent_usage_association','advance_agent_usage_revision'))
+        OR (tgrelid=to_regclass('public.official_usage_sets') AND tgname='delete_agent_usage_report_associations')
+      )) AS triggers,
+      EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('public.agent_usage_associations')
+        AND contype='f' AND confrelid=to_regclass('public.official_usage_sets') AND confdeltype='c') AS cascade`)).rows[0];
+  if (!contract?.associations || !contract.revision || contract.triggers !== 3 || !contract.cascade) {
+    throw new Error("Database usage association schema is missing or incomplete; operator migration required.");
+  }
+  const permissions = (await database.query<{ valid: boolean }>(`
+    SELECT current_user<>'agentcontrol_app' OR (
+      has_table_privilege(current_user,'agent_usage_associations','SELECT')
+      AND has_table_privilege(current_user,'agent_usage_associations','INSERT')
+      AND has_table_privilege(current_user,'agent_usage_associations','DELETE')
+      AND NOT has_any_column_privilege(current_user,'agent_usage_associations','UPDATE')
+      AND NOT has_table_privilege(current_user,'agent_usage_associations','TRUNCATE')
+      AND has_table_privilege(current_user,'agent_usage_state','SELECT')
+      AND NOT has_table_privilege(current_user,'agent_usage_state','INSERT,UPDATE,DELETE,TRUNCATE')
+      AND NOT has_any_column_privilege(current_user,'agent_usage_state','INSERT,UPDATE')
+    ) AS valid`)).rows[0];
+  if (!permissions?.valid) throw new Error("Database usage association runtime grants are invalid; operator recovery required.");
 }

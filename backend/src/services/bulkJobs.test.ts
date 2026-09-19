@@ -6,6 +6,17 @@ import { revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { reconcileBulkJob, runBulkJob } from "./bulkJobs.js";
 import { GraphPackagesClient, type FetchLike } from "./graphPackages.js";
+import { PackageInventoryRepository } from "../db/packageInventory.js";
+import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
+import { UnifiedAgentRegistry } from "../db/unifiedAgentRegistry.js";
+import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
+import { UnifiedAgentsService } from "./unifiedAgents.js";
+import { AgentUsageService } from "./agentUsage.js";
+import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
+import { allowlistedPackage } from "./packageObservation.js";
+import { capturePackageMutationState } from "./packageMutationState.js";
+import { AuditLog } from "./auditLog.js";
+import { DataSyncRepository } from "../db/dataSync.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: JobRepository;
@@ -16,18 +27,161 @@ beforeAll(async () => { fixture = await testDatabase(); jobs = new JobRepository
 afterEach(() => vi.restoreAllMocks());
 afterAll(async () => { await fixture?.close(); });
 
+async function savedReadbackInventory(owner: { tenantId: string; principalId: string }) {
+  const packages = new PackageInventoryRepository(fixture.runtime);
+  const refresh = await packages.submit(owner, {
+    authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(),
+  });
+  await packages.markRunning(owner, refresh.id);
+  await packages.publish(owner, refresh.id, {
+    packages: ["readback-package", "untouched-package"].map(id => allowlistedPackage({
+      id, displayName: id === "readback-package" ? "Reviewed package" : "Untouched package",
+      isBlocked: false, availableTo: "some", deployedTo: "some",
+    })),
+    totalRecords: 2, pages: 1,
+  });
+  const service = new UnifiedAgentsService({
+    packages, powerPlatform: new PowerPlatformInventoryRepository(fixture.runtime),
+    usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
+    resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+    readRevision: (scope, database = fixture.runtime) => readUnifiedInventoryRevision(scope, database),
+  });
+  return { packages, service };
+}
+
 describe("Durable bulk execution", () => {
+  it.each(["block", "availability", "installation", "skipped"] as const)("publishes verified %s readback before exposing its terminal result", async operation => {
+    const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
+    const saved = await savedReadbackInventory(owner);
+    const before = await saved.service.list(owner);
+    let providerState = {
+      id: "readback-package", displayName: "Reviewed package", isBlocked: operation === "skipped",
+      availableTo: "some", deployedTo: "some",
+      allowedUsersAndGroups: [{ resourceType: "user", resourceId: "11111111-1111-4111-8111-111111111111" }],
+      acquireUsersAndGroups: [{ resourceType: "user", resourceId: "22222222-2222-4222-8222-222222222222" }],
+    };
+    const action = operation === "availability" ? "update-availability" : operation === "installation" ? "update-installation" : "block";
+    const accessUpdate: JobIntentInput["accessUpdate"] = operation === "availability" || operation === "installation"
+      ? { target: operation, mode: "replace", scope: "none", principals: [] } : undefined;
+    const intent: JobIntentInput = {
+      action, targets: [{ id: providerState.id, displayName: providerState.displayName, prestate: capturePackageMutationState(allowlistedPackage(providerState), action) }],
+      ...(accessUpdate ? { accessUpdate } : {}),
+      scope: "single", actor: { tenantId: owner.tenantId, homeAccountId: owner.principalId, username: "readback@example.invalid", displayName: "Readback operator" },
+      requestPath: "/api/agents/readback-package",
+    };
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") {
+        providerState = { ...providerState, isBlocked: true };
+        return new Response(null, { status: 204 });
+      }
+      if (request?.method === "PATCH") {
+        const payload: Pick<typeof providerState, "allowedUsersAndGroups" | "acquireUsersAndGroups"> = JSON.parse(String(request.body));
+        providerState = {
+          ...providerState, ...payload,
+          availableTo: payload.allowedUsersAndGroups.length ? "some" : "none",
+          deployedTo: payload.acquireUsersAndGroups.length ? "some" : "none",
+        };
+        return new Response(null, { status: 204 });
+      }
+      return Response.json(providerState);
+    });
+    const job = await jobs.submit(owner, confirmedInput(intent));
+    await runBulkJob(job.id, owner, false, jobs, new GraphPackagesClient(fetcher), async () => "synthetic-token");
+    expect(await jobs.get(job.id, owner)).toMatchObject({
+      status: "succeeded", succeeded: operation === "skipped" ? 0 : 1, skipped: operation === "skipped" ? 1 : 0,
+    });
+    const after = await saved.service.list(owner);
+    expect(after.revision).not.toBe(before.revision);
+    const changed = after.value.flatMap(row => row.packages).find(item => item.id === providerState.id)!;
+    expect((await saved.packages.get(owner, providerState.id))?.package).toMatchObject(allowlistedPackage(providerState));
+    expect(changed).toMatchObject({
+      id: providerState.id, isBlocked: providerState.isBlocked,
+      availableTo: providerState.availableTo, deployedTo: providerState.deployedTo,
+    });
+    expect(after.value.flatMap(row => row.packages).find(item => item.id === "untouched-package")).toMatchObject({
+      isBlocked: false, availableTo: "some", deployedTo: "some",
+    });
+    const filtered = await saved.service.list(owner, operation === "block" || operation === "skipped"
+      ? { blocked: false } : { availableTo: "some" });
+    expect(filtered.count).toBe(operation === "installation" ? 2 : 1);
+    expect(filtered.filteredSummary.total).toBe(filtered.count);
+    await expect(saved.service.forExport(owner, before.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+    const exported = await saved.service.forExport(owner, after.revision!);
+    expect(exported.value.flatMap(row => row.packages).find(item => item.id === providerState.id)).toMatchObject(changed);
+    expect((await saved.service.list({ ...owner, principalId: "another-reader" })).count).toBe(0);
+    expect(fetcher).toHaveBeenCalledTimes(operation === "skipped" ? 1 : 4);
+    expect((await saved.packages.listJobs(owner, owner.principalId)).value).toHaveLength(1);
+    const receipt = await fixture.runtime.query("SELECT metadata FROM audit_events WHERE operation_id=$1 AND status=$2", [job.id, operation === "skipped" ? "skipped" : "succeeded"]);
+    expect(receipt.rows[0].metadata.snapshotId).toMatch(/^[a-f0-9-]{36}$/);
+  });
+
+  it("rolls back readback inventory and revisions when the success audit cannot be stored", async () => {
+    const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
+    const saved = await savedReadbackInventory(owner);
+    const before = await saved.service.list(owner);
+    let blocked = false;
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
+      return Response.json({ id: "readback-package", displayName: "Reviewed package", isBlocked: blocked });
+    });
+    const job = await jobs.submit(owner, confirmedInput({
+      action: "block", targets: [{ id: "readback-package", displayName: "Reviewed package", prestate: { kind: "block", isBlocked: false } }],
+      scope: "single", actor: { tenantId: owner.tenantId, homeAccountId: owner.principalId, username: "readback@example.invalid", displayName: "Readback operator" },
+      requestPath: "/api/agents/readback-package/block",
+    }));
+    vi.spyOn(AuditLog.prototype, "completeEvent").mockRejectedValueOnce(new Error("synthetic audit failure"));
+    await runBulkJob(job.id, owner, false, jobs, new GraphPackagesClient(fetcher), async () => "synthetic-token");
+    expect(await jobs.get(job.id, owner)).toMatchObject({ status: "partial", inconclusive: 1, succeeded: 0 });
+    expect((await saved.service.list(owner)).revision).toBe(before.revision);
+    expect(await saved.packages.get(owner, "readback-package")).toMatchObject({ package: { isBlocked: false } });
+    const snapshots = await fixture.runtime.query("SELECT scope_kind FROM package_inventory_snapshots WHERE tenant_id=$1 AND principal_id=$2", [owner.tenantId, owner.principalId]);
+    expect(snapshots.rows).toEqual([{ scope_kind: "broad" }]);
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
+  });
+
+  it("does not republish an in-flight readback across a confirmed saved-data clear", async () => {
+    const owner = { tenantId: "readback-tenant", principalId: randomUUID() };
+    const saved = await savedReadbackInventory(owner);
+    let blocked = false;
+    let cleared = false;
+    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
+      if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
+      const response = Response.json({ id: "readback-package", displayName: "Reviewed package", isBlocked: blocked });
+      if (blocked && !cleared) {
+        await new DataSyncRepository(fixture.runtime).submit(owner, { mode: "full", clearSavedData: true });
+        cleared = true;
+      }
+      return response;
+    });
+    const job = await jobs.submit(owner, confirmedInput({
+      action: "block", targets: [{ id: "readback-package", displayName: "Reviewed package", prestate: { kind: "block", isBlocked: false } }],
+      scope: "single", actor: { tenantId: owner.tenantId, homeAccountId: owner.principalId, username: "readback@example.invalid", displayName: "Readback operator" },
+      requestPath: "/api/agents/readback-package/block",
+    }));
+    const provider = new GraphPackagesClient(fetcher);
+    await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
+    expect(await jobs.get(job.id, owner)).toMatchObject({
+      status: "partial", inconclusive: 1, results: [{ errorCode: "package_readback_superseded" }],
+    });
+    expect(await saved.packages.get(owner, "readback-package")).toBeUndefined();
+    const reconciled = await reconcileBulkJob(job.id, owner, jobs, provider, async () => "synthetic-token");
+    expect(reconciled).toMatchObject({ status: "succeeded", reconciliation: { attempted: 1, failed: 0 } });
+    expect((await saved.packages.get(owner, "readback-package"))?.package.isBlocked).toBe(true);
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
+  });
+
   it("persists intent before sending and verifies the resulting state", async () => {
     let blocked = false;
     const correlations = new Set<string>();
     const fetcher = vi.fn<FetchLike>(async (_url, request) => {
       correlations.add(new Headers(request?.headers).get("client-request-id") ?? "");
       if (request?.method === "POST") {
-        const sent = await fixture.runtime.query("SELECT 1 FROM job_items WHERE sent_at IS NOT NULL");
+        const sent = await fixture.runtime.query("SELECT 1 FROM job_items WHERE job_id=$1 AND sent_at IS NOT NULL", [job.id]);
         expect(sent.rowCount).toBe(1); blocked = true; return new Response(null, { status: 204 });
       }
       return Response.json({ id: "package-1", displayName: "Fixture", isBlocked: blocked });
     });
+
     const job = await jobs.submit(scope, input());
     await runBulkJob(job.id, scope, false, jobs, new GraphPackagesClient(fetcher), async () => "ephemeral-token");
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "succeeded", succeeded: 1 });
@@ -80,6 +234,7 @@ describe("Durable bulk execution", () => {
       const provider = new GraphPackagesClient(fetcher, { maxAttempts: 1 });
       const job = await jobs.submit(scope, input());
       await runBulkJob(job.id, scope, false, jobs, provider, async () => "ephemeral-token");
+      const previousRevision = await readUnifiedInventoryRevision(scope, fixture.runtime);
       const authorizationCapabilities: string[] = [];
       const reconciled = await reconcileBulkJob(job.id, scope, jobs, provider, async (_scope, capabilityId) => {
         authorizationCapabilities.push(capabilityId);
@@ -94,6 +249,8 @@ describe("Durable bulk execution", () => {
       expect(reconciled).toMatchObject(applied
         ? { status: "succeeded", succeeded: 1, reconciliation: { attempted: 1, failed: 0 } }
         : { status: "partial", inconclusive: 1, results: [{ reconciliationStatus: "verified_not_applied", retryEligible: true }], reconciliation: { attempted: 1, failed: 0 } });
+      expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).not.toBe(previousRevision);
+      expect((await new PackageInventoryRepository(fixture.runtime).get(scope, "package-1"))?.package.isBlocked).toBe(applied);
     }
   });
 

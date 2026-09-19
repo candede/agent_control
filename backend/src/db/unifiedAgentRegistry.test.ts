@@ -60,7 +60,9 @@ describe("canonical agent registry", () => {
       expect((await upgrade.runtime.query("SELECT to_jsonb(resource) AS value,xmin::text AS row_version FROM package_inventory_resources resource")).rows).toEqual(resourcesBefore.rows);
       expect((await upgrade.runtime.query("SELECT to_jsonb(event) AS value,xmin::text AS row_version FROM audit_events event ORDER BY id")).rows).toEqual(auditBefore.rows);
       const constraintsAfter = new Map((await boundaries()).rows.map(row => [row.conname, row.definition]));
-      expect(actionNames(constraintsAfter.get("audit_events_action_check")!)).toEqual([...previousActions, "export-agent-inventory"].sort());
+      expect(actionNames(constraintsAfter.get("audit_events_action_check")!)).toEqual([
+        ...previousActions, "export-agent-inventory", "associate-agent-usage", "remove-agent-usage-association",
+      ].sort());
       for (const name of ["audit_events_action_state", "jobs_action_check"]) {
         expect(constraintsAfter.get(name)).toBe(constraintsBefore.get(name));
       }

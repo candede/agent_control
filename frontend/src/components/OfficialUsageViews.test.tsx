@@ -4,8 +4,11 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { OfficialUsageAggregateView, OfficialUsageUserView } from "../api/client";
 import * as usageApi from "../api/client";
+import { downloadBlob } from "../agentExport";
 import { ReportingView } from "./ReportingView";
 import { UserAccessView } from "./UserAccessView";
+
+vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
 vi.mock("recharts", () => {
   const Container = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
@@ -234,7 +237,6 @@ describe("usage source clarity and export recovery", () => {
       render(<ReportingView
         data={aggregate}
         userData={userView}
-        reportSetId={reportSetId}
         activityWindowDays={30}
         inactiveDays={30}
         onActivityWindowDaysChange={vi.fn()}
@@ -243,7 +245,69 @@ describe("usage source clarity and export recovery", () => {
       expect(download).toHaveBeenCalledWith(
         "aggregate",
         expect.objectContaining({ setId: reportSetId }),
+        expect.objectContaining({ aborted: false }),
       );
+    } finally {
+      download.mockRestore();
+    }
+  });
+
+  it.each(["aggregate", "users"] as const)("pins the current %s CSV to that section's displayed report set", async kind => {
+    const userSetId = "44444444-4444-4444-8444-444444444444";
+    const userSnapshot: OfficialUsageUserView = {
+      ...userView,
+      activeSet: { ...activeSet, kinds: [...activeSet.kinds], id: userSetId },
+      users: {
+        ...userView.users,
+        value: userView.users.value.map(row => ({
+          ...row, datasetScope: { ...row.datasetScope, reportSetId: userSetId },
+        })),
+      },
+    };
+    const blob = new Blob(["csv"]);
+    const download = vi.spyOn(usageApi, "downloadOfficialUsageCsv").mockResolvedValue(blob);
+    try {
+      render(<ReportingView
+        data={aggregate}
+        userData={userSnapshot}
+        activityWindowDays={30}
+        inactiveDays={30}
+        onActivityWindowDaysChange={vi.fn()}
+      />);
+      await userEvent.click(screen.getByRole("button", {
+        name: kind === "aggregate" ? "Export filtered agents CSV" : "Export filtered user details CSV",
+      }));
+      expect(download).toHaveBeenCalledWith(
+        kind,
+        expect.objectContaining({ setId: kind === "aggregate" ? activeSet.id : userSetId }),
+        expect.objectContaining({ aborted: false }),
+      );
+      expect(downloadBlob).toHaveBeenLastCalledWith(
+        kind === "aggregate" ? "official-agent-usage.csv" : "official-user-usage.csv", blob,
+      );
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      download.mockRestore();
+    }
+  });
+
+  it.each(["aggregate", "users"] as const)("does not export %s without that section's report-set identity", async kind => {
+    const download = vi.spyOn(usageApi, "downloadOfficialUsageCsv");
+    try {
+      render(<ReportingView
+        data={kind === "aggregate" ? { ...aggregate, activeSet: null } : aggregate}
+        userData={kind === "users" ? { ...userView, activeSet: null } : userView}
+        activityWindowDays={30}
+        inactiveDays={30}
+        onActivityWindowDaysChange={vi.fn()}
+      />);
+      const button = screen.getByRole("button", {
+        name: kind === "aggregate" ? "Export filtered agents CSV" : "Export filtered user details CSV",
+      });
+      await userEvent.click(button);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Load an accepted report set");
+      expect(download).not.toHaveBeenCalled();
+      expect(button).toBeEnabled();
     } finally {
       download.mockRestore();
     }
@@ -261,6 +325,7 @@ describe("official usage views", () => {
     expect(screen.getByText("Response reconciliation")).not.toBeVisible();
     expect(screen.getByText(/Agent activity only, not a license ledger/)).toBeVisible();
     expect(within(screen.getByRole("region", { name: "Usage summary" })).getByText("Agents in report")).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "Usage summary" })).getByText("Active users (positive responses)")).toBeVisible();
     expect(screen.queryByText("Imported agent rows")).not.toBeInTheDocument();
     await userEvent.click(screen.getByText("Report details", { exact: true }));
     expect(screen.getByText("Microsoft 365 admin center Copilot Agents usage exports")).toBeVisible();

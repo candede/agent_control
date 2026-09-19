@@ -22,6 +22,7 @@ import { AppError } from "./errors.js";
 import { AuditLog } from "./services/auditLog.js";
 import { CopilotStudioQuarantineClient } from "./services/copilotStudioQuarantine.js";
 import { GraphPackagesClient } from "./services/graphPackages.js";
+import { allowlistedPackage } from "./services/packageObservation.js";
 import { capabilities } from "./services/capabilities.js";
 import { defenderHunting } from "./services/defenderHunting.js";
 import { purviewAudit } from "./services/purviewAudit.js";
@@ -719,13 +720,14 @@ describe.sequential("packaged API/session contracts", () => {
 
       cookie = await roleCookie("operator", ["AgentControl.Admin"]);
       authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "operator", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
+      const canaryDetails = (isBlocked: boolean) => allowlistedPackage({ id: "package-canary", displayName: "Canary", isBlocked });
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: false })
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: false })
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: true })
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: true })
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: true })
-        .mockResolvedValueOnce({ id: "package-canary", displayName: "Canary", isBlocked: false });
+        .mockResolvedValueOnce(canaryDetails(false))
+        .mockResolvedValueOnce(canaryDetails(false))
+        .mockResolvedValueOnce(canaryDetails(true))
+        .mockResolvedValueOnce(canaryDetails(true))
+        .mockResolvedValueOnce(canaryDetails(true))
+        .mockResolvedValueOnce(canaryDetails(false));
       const executed = await request(`/api/agents/mutation-canaries/${approval.id}/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, restorationApprovalId: restorationApproval.id }) });
       expect(executed.status).toBe(200);
       const result = await executed.json();
@@ -735,6 +737,9 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs WHERE id=ANY($1::uuid[])", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_items WHERE job_id=ANY($1::uuid[]) AND status='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_attempts WHERE job_id=ANY($1::uuid[]) AND outcome='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
+      const saved = new PackageInventoryRepository(fixture.runtime);
+      expect((await saved.get({ tenantId: config.tenantId!, principalId: "operator" }, "package-canary"))?.package.isBlocked).toBe(false);
+      expect(await saved.get({ tenantId: config.tenantId!, principalId: "another-operator" }, "package-canary")).toBeUndefined();
       expect((await request(`/api/agents/mutation-canaries/${approval.id}/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, restorationApprovalId: restorationApproval.id }) })).status).toBe(409);
       expect(GraphPackagesClient.prototype.blockPackage).toHaveBeenCalledTimes(1);
       expect(GraphPackagesClient.prototype.unblockPackage).toHaveBeenCalledTimes(1);
@@ -754,11 +759,12 @@ describe.sequential("packaged API/session contracts", () => {
       const restoration = await (await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) })).json();
       cookie = await roleCookie("conflict-operator", ["AgentControl.Admin"]);
       authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Admin"] };
+      const canaryDetails = (isBlocked: boolean) => allowlistedPackage({ id: approvalBody.targetId, displayName: "Canary", isBlocked });
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
-        .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: false })
-        .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: false })
-        .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: true })
-        .mockResolvedValueOnce({ id: approvalBody.targetId, displayName: "Canary", isBlocked: false });
+        .mockResolvedValueOnce(canaryDetails(false))
+        .mockResolvedValueOnce(canaryDetails(false))
+        .mockResolvedValueOnce(canaryDetails(true))
+        .mockResolvedValueOnce(canaryDetails(false));
       const response = await request(`/api/agents/mutation-canaries/${original.id}/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, restorationApprovalId: restoration.id }) });
       expect(response.status).toBe(409);
       expect(await response.json()).toMatchObject({ code: "canary_cycle_incomplete" });

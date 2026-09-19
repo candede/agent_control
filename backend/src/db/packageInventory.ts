@@ -108,6 +108,34 @@ type ResourceRow = {
   package_data: CopilotPackageDetail;
 };
 
+type SnapshotQuery = Pick<JobRow, "token_mode" | "query_hash" | "scope_kind" | "requested_ids">;
+
+export async function lockPackageInventoryScope(scope: PackageDataScope, client: pg.PoolClient) {
+  validateScope(scope);
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+}
+
+export async function readPackageInventoryGeneration(scope: PackageDataScope, database: Pick<pg.Pool, "query">) {
+  validateScope(scope);
+  const result = await database.query<{ id: string }>(`SELECT id FROM data_sync_runs
+    WHERE tenant_id=$1 AND principal_id=$2 AND clear_saved_data
+    ORDER BY started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+  return result.rows[0]?.id ?? null;
+}
+
+// The caller's transaction also commits the fenced job outcome and its audit receipt.
+export async function publishPackageReadback(scope: PackageDataScope, detail: CopilotPackageDetail, client: pg.PoolClient, inventoryGeneration: string | null) {
+  await lockPackageInventoryScope(scope, client);
+  if (await readPackageInventoryGeneration(scope, client) !== inventoryGeneration) {
+    throw new AppError(409, "package_readback_superseded", "Saved inventory was cleared during package work. Reconcile the exact target before publishing a new observation.");
+  }
+  const requestedIds = normalizeRequestedIds([detail.id]);
+  return writePackageSnapshot(client, scope, {
+    token_mode: "delegated", scope_kind: "exact", requested_ids: requestedIds,
+    query_hash: hash({ tokenMode: "delegated", scopeKind: "exact", requestedIds }),
+  }, null, { packages: [detail], totalRecords: 1, pages: 1 });
+}
+
 export class PackageInventoryRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
@@ -125,7 +153,7 @@ export class PackageInventoryRepository {
     const queryHash = hash({ tokenMode: input.tokenMode, scopeKind, requestedIds });
     const requestHash = hash({ authorizationPrincipalId: input.authorizationPrincipalId, queryHash });
     const id = await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+      await lockPackageInventoryScope(scope, client);
       const existing = await client.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM package_refresh_jobs job
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND idempotency_key=$4`, [scope.tenantId, scope.principalId, input.tokenMode, input.idempotencyKey]);
       if (existing.rows[0]) {
@@ -229,7 +257,7 @@ export class PackageInventoryRepository {
   async publish(scope: PackageDataScope, id: string, result: PackageScanResult) {
     validateScope(scope);
     const snapshotId = await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+      await lockPackageInventoryScope(scope, client);
       const jobResult = await client.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM package_refresh_jobs job
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() FOR UPDATE`, [id, scope.tenantId, scope.principalId]);
       const job = jobResult.rows[0];
@@ -238,34 +266,7 @@ export class PackageInventoryRepository {
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND query_hash=$4 AND status IN ('running','succeeded') AND id<>$5
           AND (created_at,id)>(SELECT created_at,id FROM package_refresh_jobs WHERE id=$5) LIMIT 1`, [scope.tenantId, scope.principalId, job.token_mode, job.query_hash, job.id]);
       if (newer.rowCount) throw new AppError(409, "package_refresh_superseded", "A newer package refresh for this scope superseded publication.");
-      validatePublication(job, result);
-      await client.query("UPDATE package_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND query_hash=$4 AND is_current", [scope.tenantId, scope.principalId, job.token_mode, job.query_hash]);
-      const createdSnapshotId = randomUUID();
-      await client.query(`INSERT INTO package_inventory_snapshots(id,job_id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`, [createdSnapshotId, id, scope.tenantId, scope.principalId, job.token_mode, job.query_hash, job.scope_kind, JSON.stringify(job.requested_ids), result.packages.length, result.totalRecords, result.pages]);
-      if (result.packages.length) {
-        const rows = result.packages.map(value => {
-          const identity = packageInventoryIdentity(scope.tenantId, value);
-          return {
-            native_id: value.id,
-            display_name: value.displayName,
-            is_blocked: value.isBlocked,
-            available_to: value.availableTo ?? null,
-            deployed_to: value.deployedTo ?? null,
-            publisher: value.publisher ?? null,
-            last_modified_at: value.lastModifiedDateTime ?? null,
-            identifiers: identity.identifiers,
-            package_data: value,
-          };
-        });
-        await client.query(`INSERT INTO package_inventory_resources(snapshot_id,tenant_id,principal_id,native_id,display_name,is_blocked,available_to,deployed_to,publisher,last_modified_at,identifiers,package_data)
-          SELECT $1,$2,$3,row.native_id,row.display_name,row.is_blocked,row.available_to,row.deployed_to,row.publisher,row.last_modified_at,row.identifiers,row.package_data
-          FROM jsonb_to_recordset($4::jsonb) AS row(native_id text,display_name text,is_blocked boolean,available_to text,deployed_to text,publisher text,last_modified_at timestamptz,identifiers jsonb,package_data jsonb)`, [createdSnapshotId, scope.tenantId, scope.principalId, JSON.stringify(rows)]);
-        await client.query(`INSERT INTO source_identifiers(id,tenant_id,source,resource_type,environment_id,native_id,identifier_kind,identifier_value)
-          SELECT gen_random_uuid(),$1,'graph_packages','microsoft.graph/copilotpackages','',resource.native_id,identifier.kind,identifier.value
-          FROM package_inventory_resources resource CROSS JOIN LATERAL jsonb_to_recordset(resource.identifiers) AS identifier(kind text,value text)
-          WHERE resource.snapshot_id=$2 ON CONFLICT DO NOTHING`, [scope.tenantId, createdSnapshotId]);
-      }
+      const createdSnapshotId = await writePackageSnapshot(client, scope, job, id, result);
       await client.query(`UPDATE package_refresh_jobs SET status='succeeded',page_count=$4,observed_count=$5,total_records=$6,error_code=NULL,message=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3`, [id, scope.tenantId, scope.principalId, result.pages, result.packages.length, result.totalRecords]);
       return createdSnapshotId;
@@ -527,7 +528,31 @@ function packageVerificationFailed() {
     "Saved Graph package inventory failed verification of collected totals or source identities. Refresh package inventory before using these snapshots.");
 }
 
-function validatePublication(job: JobRow, result: PackageScanResult) {
+async function writePackageSnapshot(client: pg.PoolClient, scope: PackageDataScope, query: SnapshotQuery, jobId: string | null, result: PackageScanResult) {
+  validatePublication(query, result);
+  await client.query("UPDATE package_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND query_hash=$4 AND is_current", [scope.tenantId, scope.principalId, query.token_mode, query.query_hash]);
+  const snapshotId = randomUUID();
+  await client.query(`INSERT INTO package_inventory_snapshots(id,job_id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`, [snapshotId, jobId, scope.tenantId, scope.principalId, query.token_mode, query.query_hash, query.scope_kind, JSON.stringify(query.requested_ids), result.packages.length, result.totalRecords, result.pages]);
+  if (result.packages.length) {
+    const rows = result.packages.map(value => ({
+      native_id: value.id, display_name: value.displayName, is_blocked: value.isBlocked,
+      available_to: value.availableTo ?? null, deployed_to: value.deployedTo ?? null,
+      publisher: value.publisher ?? null, last_modified_at: value.lastModifiedDateTime ?? null,
+      identifiers: packageInventoryIdentity(scope.tenantId, value).identifiers, package_data: value,
+    }));
+    await client.query(`INSERT INTO package_inventory_resources(snapshot_id,tenant_id,principal_id,native_id,display_name,is_blocked,available_to,deployed_to,publisher,last_modified_at,identifiers,package_data)
+      SELECT $1,$2,$3,row.native_id,row.display_name,row.is_blocked,row.available_to,row.deployed_to,row.publisher,row.last_modified_at,row.identifiers,row.package_data
+      FROM jsonb_to_recordset($4::jsonb) AS row(native_id text,display_name text,is_blocked boolean,available_to text,deployed_to text,publisher text,last_modified_at timestamptz,identifiers jsonb,package_data jsonb)`, [snapshotId, scope.tenantId, scope.principalId, JSON.stringify(rows)]);
+    await client.query(`INSERT INTO source_identifiers(id,tenant_id,source,resource_type,environment_id,native_id,identifier_kind,identifier_value)
+      SELECT gen_random_uuid(),$1,'graph_packages','microsoft.graph/copilotpackages','',resource.native_id,identifier.kind,identifier.value
+      FROM package_inventory_resources resource CROSS JOIN LATERAL jsonb_to_recordset(resource.identifiers) AS identifier(kind text,value text)
+      WHERE resource.snapshot_id=$2 ON CONFLICT DO NOTHING`, [scope.tenantId, snapshotId]);
+  }
+  return snapshotId;
+}
+
+function validatePublication(job: Pick<SnapshotQuery, "requested_ids" | "scope_kind">, result: PackageScanResult) {
   if (!Number.isSafeInteger(result.totalRecords) || result.totalRecords !== result.packages.length || !Number.isSafeInteger(result.pages) || result.pages < 1 || result.pages > 100 || result.packages.length > 5000) {
     throw new AppError(409, "incomplete_package_coverage", "Only a completely enumerated package result can be published.");
   }

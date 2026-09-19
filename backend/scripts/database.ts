@@ -120,6 +120,12 @@ export async function grantRuntime(database: pg.Pool) {
       GRANT EXECUTE ON FUNCTION official_usage_bundle_content_hash(jsonb) TO agentcontrol_app;
     `);
   }
+  if ((await database.query("SELECT to_regclass('public.agent_usage_associations') AS table_name")).rows[0].table_name) {
+    await database.query(`
+      GRANT SELECT,INSERT,DELETE ON agent_usage_associations TO agentcontrol_app;
+      GRANT SELECT ON agent_usage_state TO agentcontrol_app;
+    `);
+  }
 }
 
 export type RetentionResult = { dryRun: boolean; batchSize: number; affected: Record<string, number> };
@@ -229,6 +235,13 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
     await remove("officialStaging", "official_usage_staging", "status<>'active' AND created_at<clock_timestamp()-interval '1 day'");
     await remove("officialBundleReceipts", "official_usage_bundle_receipts", "expires_at<clock_timestamp()");
     await remove("officialAudit", "official_usage_audit", "expires_at<clock_timestamp()");
+    if ((await client.query("SELECT to_regclass('public.agent_usage_associations') AS name")).rows[0].name) {
+      await remove("agentUsageAssociations", "agent_usage_associations",
+        `EXISTS (SELECT 1 FROM official_usage_sets report_set
+          WHERE report_set.id=agent_usage_associations.report_set_id
+            AND report_set.tenant_id=agent_usage_associations.tenant_id
+            AND (report_set.deleted_at IS NOT NULL OR report_set.expires_at<=clock_timestamp()))`);
+    }
     await remove("officialMemberships", "official_usage_set_versions",
       "EXISTS (SELECT 1 FROM official_usage_sets report_set WHERE report_set.id=official_usage_set_versions.set_id AND report_set.deleted_at<clock_timestamp()-interval '90 days')");
     await remove("officialVersions", "official_usage_versions",

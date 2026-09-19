@@ -32,8 +32,11 @@ const auditActions = new Set<LocalAuditAction>([
   "export-official-usage-aggregate",
   "export-official-usage-users",
   "export-administrative-audit",
+  "associate-agent-usage",
+  "remove-agent-usage-association",
 ]);
 const auditStatuses = new Set<AuditStatus>([
+  "requested",
   "started",
   "succeeded",
   "failed",

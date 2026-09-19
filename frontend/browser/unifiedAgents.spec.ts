@@ -20,7 +20,11 @@ const resource: PowerPlatformResource = {
   sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown",
   agentKind: "copilot_studio_agent", lifecycle: "published", identityConfidence: "exact_native",
   identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }],
-  provenance: {}, details: { schemaName: "cr123_serviceDesk", isQuarantined: false }, unknownFieldCount: 0,
+  provenance: {}, details: {
+    schemaName: "cr123_serviceDesk", isQuarantined: false, ownerId: "Support operations",
+    model: "Support language model",
+    connectors: [{ connectorId: "Support knowledge connector", operations: [{ operationId: "readKnowledge", displayName: "Read support knowledge", method: "GET" }] }],
+  }, unknownFieldCount: 0,
 };
 const primary = unifiedAgents.value[0];
 const merged: UnifiedAgentRecord = {
@@ -46,6 +50,7 @@ const draft: UnifiedAgentRecord = {
   presence: "power_platform", packages: [], identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: "Not published." },
   powerPlatformResource: {
     ...resource, nativeId: draftId, displayName: "Unpublished helpdesk assistant", lifecycle: "draft", lastPublishedAt: null,
+    details: { schemaName: "cr123_helpdesk_draft", isQuarantined: false, ownerId: "Tenant maker" },
     identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: draftId }],
   },
   observations: { graphPackages: null, packageSnapshots: {}, powerPlatform: observation },
@@ -77,16 +82,36 @@ test("one agent row selects all published versions and configuration controls wi
     controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
   };
   await page.route(`**/api/inventory/resources/${botId}/related*`, route => route.fulfill({ json: related }));
-  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[0].id)}`, route => route.fulfill({ json: {
+  await page.route(`**/api/inventory/resources/${draftId}/related*`, route => route.fulfill({ json: {
+    ...related, nativeId: draftId, identifiers: draft.powerPlatformResource!.identifiers,
+    package: { status: "unmatched", reason: "No published version was observed." },
+    controls: { quarantineTarget: { environmentId, botId: draftId }, packageTarget: null },
+  } }));
+  const detailReads: string[] = [];
+  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[0].id)}`, route => {
+    detailReads.push(`${route.request().method()} ${merged.packages[0].id}`);
+    return route.fulfill({ json: {
     ...merged.packages[0],
-    longDescription: "Package-level configuration and connected service metadata.",
+    longDescription: "<p><strong>Service desk assistant</strong> helps your employees find support and resolve common requests.</p><h3>How this agent helps</h3><p>Resolve common requests without leaving your conversation.</p><ul><li>Find trusted support knowledge.</li><li>Get guidance for common IT issues.</li></ul>",
     allowedUsersAndGroups: [{ resourceType: "group", resourceId: "service-desk-users" }],
     acquireUsersAndGroups: [],
     elementDetails: [{
       elementType: "AgentMetadatas",
       elements: [{ id: "metadata", definition: JSON.stringify({ connectorId: "Service desk connector" }) }],
     }],
-  } }));
+    } });
+  });
+  await page.route(`**/api/agents/${encodeURIComponent(merged.packages[1].id)}`, route => {
+    detailReads.push(`${route.request().method()} ${merged.packages[1].id}`);
+    return route.fulfill({ json: {
+      ...merged.packages[1], longDescription: "Microsoft Teams edition with its own saved configuration.",
+      allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+      elementDetails: [{
+        elementType: "AgentMetadatas",
+        elements: [{ id: "teams-metadata", definition: JSON.stringify({ connectorId: "Teams knowledge connector" }) }],
+      }],
+    } });
+  });
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.locator("tbody tr")).toHaveCount(3);
@@ -110,6 +135,17 @@ test("one agent row selects all published versions and configuration controls wi
   await table.getByRole("button", { name: "View details for Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog");
   const initialBounds = await dialog.boundingBox();
+  await expect(dialog.getByText("Resolve common requests without leaving your conversation.")).toBeVisible();
+  await expect(dialog.getByText("Support operations", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Support language model", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Support knowledge connector", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Service desk connector", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: /Details & services|Viewing details|Review usage|Review access/ })).toHaveCount(0);
+  expect(detailReads).toEqual([`GET ${merged.packages[0].id}`]);
+  expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
+  await dialog.screenshot({ path: info.outputPath("unified-agent-overview.png") });
+  await dialog.getByRole("region", { name: "Connected services", exact: true }).scrollIntoViewIfNeeded();
+  await dialog.screenshot({ path: info.outputPath("unified-agent-services.png") });
   await dialog.getByRole("tab", { name: "Manage", exact: true }).click();
   await expect(dialog.getByRole("tab", { name: "Manage", exact: true })).toHaveAttribute("aria-selected", "true");
   expect(await dialog.boundingBox()).toEqual(initialBounds);
@@ -122,9 +158,18 @@ test("one agent row selects all published versions and configuration controls wi
     expect(geometry.height).toBeLessThanOrEqual(112);
   }
   await expect(dialog.getByRole("button", { name: "Quarantine", exact: true })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: /Manage access for/i }).first()).toBeVisible();
+  await expect(dialog.getByRole("button", { name: /Manage access for|Manage installation for/ })).toHaveCount(0);
+  await expect(dialog.getByRole("heading", { name: "Select who can use this agent" })).toBeVisible();
+  await expect(dialog.getByRole("radio", { name: /Specific users or groups/ })).toBeChecked();
+  await expect(dialog.getByRole("radio", { name: /Specific users or groups/ })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: /^Block Service desk assistant/ })).toBeVisible();
+  await expect(dialog.getByText("service-desk-users", { exact: true })).toBeVisible();
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
-  await page.screenshot({ path: info.outputPath("unified-agent-manage.png"), fullPage: true });
+  await dialog.screenshot({ path: info.outputPath("unified-agent-manage.png") });
+  await dialog.getByRole("button", { name: /^Installed for/ }).click();
+  await expect(dialog.getByRole("heading", { name: "Select who this agent is installed for" })).toBeVisible();
+  await expect(dialog.getByRole("radio", { name: /No users/ })).toBeChecked();
+  await expect(page.getByRole("dialog")).toHaveCount(1);
   await dialog.getByRole("tab", { name: "Overview", exact: true }).click();
   expect(await dialog.boundingBox()).toEqual(initialBounds);
   const status = dialog.locator(".agent-summary-status");
@@ -133,14 +178,25 @@ test("one agent row selects all published versions and configuration controls wi
   const technical = dialog.locator("details").filter({ has: page.locator("summary", { hasText: "Technical details" }) });
   await expect(technical).not.toHaveAttribute("open", "");
   await expect(dialog.getByRole("tablist", { name: "Agent details" })).toBeVisible();
-  await page.screenshot({ path: info.outputPath("unified-agent-overview.png"), fullPage: true });
-  await dialog.getByRole("tab", { name: "Packages", exact: true }).click();
+  await dialog.getByRole("combobox", { name: "Published version details" }).selectOption(merged.packages[1].id);
+  await expect(dialog.getByText("Microsoft Teams edition with its own saved configuration.")).toBeVisible();
+  await expect(dialog.getByText("Teams knowledge connector", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Resolve common requests without leaving your conversation.")).toHaveCount(0);
+  await expect(dialog.getByText("Service desk connector", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Support knowledge connector", { exact: true })).toBeVisible();
   expect(await dialog.boundingBox()).toEqual(initialBounds);
-  await dialog.getByRole("button", { name: `Package details for ${merged.packages[0].displayName} (${merged.packages[0].id})`, exact: true }).click();
   await expect(dialog.getByRole("heading", { name: "Connected services", exact: true })).toBeVisible();
-  await expect(dialog.getByText("Service desk connector", { exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(1);
-  expect(await dialog.boundingBox()).toEqual(initialBounds);
-  await page.screenshot({ path: info.outputPath("unified-agent-packages.png"), fullPage: true });
+  await dialog.screenshot({ path: info.outputPath("unified-agent-selected-version.png") });
+  await page.keyboard.press("Escape");
+  await table.getByRole("button", { name: "View details for Unpublished helpdesk assistant", exact: true }).click();
+  const nativeDialog = page.getByRole("dialog", { name: "Unpublished helpdesk assistant" });
+  await expect(nativeDialog.getByText("No description provided.")).toBeVisible();
+  await expect(nativeDialog.getByText("Tenant maker", { exact: true })).toBeVisible();
+  await expect(nativeDialog.getByText("0 references")).toHaveCount(0);
+  await expect(nativeDialog.getByText("Microsoft Teams edition with its own saved configuration.")).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
+  await nativeDialog.screenshot({ path: info.outputPath("unified-native-agent.png") });
+  expect(detailReads).toEqual([`GET ${merged.packages[0].id}`, `GET ${merged.packages[1].id}`]);
   expect(unexpected).toEqual([]);
 });

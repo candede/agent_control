@@ -4,7 +4,7 @@ import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { unifiedAgents } from "../services/unifiedAgents.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews } from "../types/unifiedAgents.js";
 import { isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
 import { getAuditLog } from "../services/auditLog.js";
@@ -79,7 +79,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
   if (!isRecord(query)) throw new AppError(400, "invalid_export_selection", "Export filters must be an object.");
   const allowed = new Set([
     "recordId", "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher",
-    "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection",
+    "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view",
   ]);
   const normalized: Record<string, unknown> = {};
   for (const [key, field] of Object.entries(query)) {
@@ -110,6 +110,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
 export function unifiedAgentInventoryQuery(query: Record<string, unknown>): UnifiedAgentInventoryQuery {
   const blocked = first(query.blocked);
   return {
+    view: oneOf(first(query.view), "view", unifiedAgentViews),
     recordId: exactRecordId(first(query.recordId)),
     operationIdPrefix: operationReference(first(query.operationIdPrefix)),
     search: optionalText(first(query.search), "search", 256),
@@ -125,7 +126,7 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
     host: optionalText(first(query.host), "host", 256),
     platform: optionalText(first(query.platform), "platform", 256),
     createdWithinDays: optionalPositiveInteger(first(query.createdWithinDays), "createdWithinDays", 3650),
-    sortBy: oneOf(first(query.sortBy), "sortBy", ["displayName", "environment", "source", "lastModifiedAt"] as const) ?? "displayName",
+    sortBy: oneOf(first(query.sortBy), "sortBy", unifiedAgentSortKeys) ?? "displayName",
     sortDirection: oneOf(first(query.sortDirection), "sortDirection", ["asc", "desc"] as const) ?? "asc",
     limit: positiveInteger(first(query.limit), "limit", 50, 250),
     offset: positiveInteger(first(query.offset), "offset", 0, 100_000, true),

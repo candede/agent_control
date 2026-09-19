@@ -1,7 +1,10 @@
+import { AppError } from "../errors.js";
 import type { CopilotPackage } from "../types/copilotPackage.js";
 import type {
   AcceptedOfficialUsageReports,
   OfficialUsageAgent,
+  OfficialUsageAgentDetailView,
+  OfficialUsageAgentUser,
   OfficialUsageAggregateView,
   OfficialUsageAvailability,
   OfficialUsageReportingSummary,
@@ -27,6 +30,7 @@ type ViewOptions = {
   inactiveDays?: number;
   activityWindowDays?: number;
   search?: string;
+  agentId?: string;
   creatorType?: string;
   activity?: "all" | "recent" | "inactive" | "no-activity";
   responsesOnly?: boolean;
@@ -39,6 +43,12 @@ type ViewOptions = {
   sortDirection?: "asc" | "desc";
   limit?: number;
   offset?: number;
+};
+
+type AgentDetailViewOptions = Pick<ViewOptions,
+  "staleAfterDays" | "now" | "search" | "sortDirection" | "limit" | "offset"
+> & {
+  sortBy?: OfficialUsageAgentDetailView["filters"]["sortBy"];
 };
 
 export function buildOfficialUsageAggregateView(
@@ -97,6 +107,68 @@ export function buildOfficialUsageAggregateView(
   };
 }
 
+export function buildOfficialUsageAgentDetailView(
+  published: PublishedOfficialUsage,
+  agentId: string,
+  options: AgentDetailViewOptions,
+): OfficialUsageAgentDetailView | undefined {
+  const agent = buildAgentUsage(published.reports).find(row => row.agentId === agentId);
+  if (!agent) return undefined;
+
+  const viewState = availability(published, options.staleAfterDays, options.now ?? new Date());
+  const displayNames = new Map(published.reports.users?.rows.map(row => [row.username, row.displayName]) ?? []);
+  const byUsername = new Map<string, OfficialUsageAgentUser>();
+  for (const row of published.reports.userAgents?.rows ?? []) {
+    if (row.agentId !== agentId) continue;
+    const user = byUsername.get(row.username);
+    if (user) user.responsesSentToUsers += row.responsesSentToUsers;
+    else byUsername.set(row.username, {
+      username: row.username,
+      displayName: displayNames.get(row.username) || row.username,
+      responsesSentToUsers: row.responsesSentToUsers,
+    });
+  }
+  const users = [...byUsername.values()];
+  const search = options.search?.trim();
+  const query = search?.toLowerCase();
+  const filteredUsers = query
+    ? users.filter(user => [user.username, user.displayName].some(value => value.toLowerCase().includes(query)))
+    : users;
+  const sortBy = options.sortBy ?? "responses";
+  const sortDirection = options.sortDirection ?? "desc";
+  const sortedUsers = [...filteredUsers].sort((left, right) => {
+    const comparison = sortBy === "displayName"
+      ? ordinal(left.displayName, right.displayName)
+      : left.responsesSentToUsers - right.responsesSentToUsers;
+    return (sortDirection === "asc" ? comparison : -comparison) || ordinal(left.username, right.username);
+  });
+  const paging = boundedPaging(options.limit ?? 100, options.offset, 500);
+
+  return {
+    authority,
+    availability: viewState.value,
+    staleAfterDays: options.staleAfterDays,
+    periodAgeDays: viewState.periodAgeDays,
+    acceptedAgeDays: viewState.acceptedAgeDays,
+    activeSet: published.activeSet,
+    lineages: lineages(published.reports),
+    missingKinds: requiredKinds.filter(kind => !published.reports[kind]),
+    agent,
+    summary: {
+      reportedUsers: published.reports.userAgents ? users.length : null,
+      responseProducingUsers: agent.activeUsersIdentityCount,
+      zeroResponseUsers: published.reports.userAgents ? users.filter(user => user.responsesSentToUsers === 0).length : null,
+      userBreakdownResponses: published.reports.userAgents ? sum(users, user => user.responsesSentToUsers) : null,
+    },
+    filters: { ...(search ? { search } : {}), sortBy, sortDirection },
+    users: {
+      value: sortedUsers.slice(paging.offset, paging.offset + paging.limit),
+      count: sortedUsers.length,
+      ...paging,
+    },
+  };
+}
+
 export function buildOfficialUsageUserView(
   published: PublishedOfficialUsage,
   options: ViewOptions,
@@ -123,6 +195,7 @@ export function buildOfficialUsageUserView(
     filters: {
       creatorTypes: [...new Set(summaries.flatMap(summary => summary.creatorTypes))].sort(ordinal),
       ...(options.search?.trim() ? { search: options.search.trim() } : {}),
+      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
       ...(options.creatorType && options.creatorType !== "all" ? { creatorType: options.creatorType } : {}),
       activity: options.activity ?? "all",
       responsesOnly: Boolean(options.responsesOnly),
@@ -197,7 +270,7 @@ function buildAgentUsage(reports: AcceptedOfficialUsageReports): OfficialUsageAg
     const rows = byAgent.get(agentId) ?? [];
     const first = rows[0];
     const bridgeResponses = sum(rows, row => row.responsesSentToUsers);
-    const bridgeUsers = reports.userAgents ? new Set(rows.map(row => row.username)).size : null;
+    const bridgeUsers = rows.length ? responseProducingIdentities(rows, row => row.responsesSentToUsers).size : null;
     if (reportRow) {
       return {
         agentId: reportRow.agentId,
@@ -211,7 +284,7 @@ function buildAgentUsage(reports: AcceptedOfficialUsageReports): OfficialUsageAg
         sourceReport: "agents" as const,
         sourceReports: rows.length ? ["agents", "userAgents"] as const : ["agents"] as const,
         activeUsersIdentityCount: bridgeUsers,
-        activeUsersTotalBasis: reports.userAgents ? "userAgents_distinct_identity" as const : "unknown" as const,
+        activeUsersTotalBasis: bridgeUsers !== null ? "userAgents_distinct_identity" as const : "unknown" as const,
         responseComparison: sourceComparison({ agents: reportRow.responsesSentToUsers, userAgents: rows.length ? bridgeResponses : null }),
         creatorTypeSource: "agents_report" as const,
         identityStatus: "unresolved" as const,
@@ -229,7 +302,7 @@ function buildAgentUsage(reports: AcceptedOfficialUsageReports): OfficialUsageAg
       sourceReport: "userAgents",
       sourceReports: ["userAgents"],
       activeUsersIdentityCount: bridgeUsers,
-      activeUsersTotalBasis: reports.userAgents ? "userAgents_distinct_identity" : "unknown",
+      activeUsersTotalBasis: bridgeUsers !== null ? "userAgents_distinct_identity" : "unknown",
       responseComparison: sourceComparison({ agents: null, userAgents: bridgeResponses }),
       creatorTypeSource: "users_and_agents_report",
       identityStatus: "unresolved",
@@ -251,8 +324,8 @@ function reportingSummary(
   const totalResponses = reports.agents ? sum(reports.agents.rows, row => row.responsesSentToUsers) : null;
   const totalActiveUsers = distinctDatasetUsers(reports);
   const windowAgentIds = new Set(windowRows.map(row => row.agentId));
-  const windowActiveUsers = reports.userAgents ? new Set(
-    reports.userAgents.rows.filter(row => windowAgentIds.has(row.agentId)).map(row => row.username),
+  const windowActiveUsers = reports.userAgents ? responseProducingIdentities(
+    reports.userAgents.rows.filter(row => windowAgentIds.has(row.agentId)), row => row.responsesSentToUsers,
   ).size : null;
   const windowResponses = reports.agents
     ? sum(windowRows.filter(row => row.sourceReport === "agents"), row => row.responsesSentToUsers)
@@ -288,8 +361,8 @@ function reportingSummary(
         users: reports.users ? sum(reports.users.rows, row => row.agentResponsesReceived) : null,
       }),
       activeUserReconciliation: sourceComparison({
-        users: reports.users ? new Set(reports.users.rows.map(row => row.username)).size : null,
-        userAgents: reports.userAgents ? new Set(reports.userAgents.rows.map(row => row.username)).size : null,
+        users: reports.users ? responseProducingIdentities(reports.users.rows, row => row.agentResponsesReceived).size : null,
+        userAgents: reports.userAgents ? responseProducingIdentities(reports.userAgents.rows, row => row.responsesSentToUsers).size : null,
       }),
       creatorTypeDistribution: topDistribution(countBy(usageRows, row => row.creatorType)),
       topAgentsByResponses: topAgents(usageRows.filter(row => row.sourceReport === "agents"), row => row.responsesSentToUsers),
@@ -320,10 +393,14 @@ function reportingSummary(
 function distinctDatasetUsers(reports: AcceptedOfficialUsageReports) {
   if (!reports.users && !reports.userAgents) return null;
   const identities = [
-    ...(reports.users?.rows.map(row => row.username) ?? []),
-    ...(reports.userAgents?.rows.map(row => row.username) ?? []),
+    ...responseProducingIdentities(reports.users?.rows ?? [], row => row.agentResponsesReceived),
+    ...responseProducingIdentities(reports.userAgents?.rows ?? [], row => row.responsesSentToUsers),
   ];
   return new Set(identities).size;
+}
+
+function responseProducingIdentities<T extends { username: string }>(rows: readonly T[], responses: (row: T) => number) {
+  return new Set(rows.filter(row => responses(row) > 0).map(row => row.username));
 }
 
 function buildUserSummaries(reports: AcceptedOfficialUsageReports, reportSetId: string | null, lowResponseThreshold: number): OfficialUsageUserSummary[] {
@@ -391,6 +468,7 @@ function filterUserSummaries(summaries: OfficialUsageUserSummary[], options: Vie
   const query = options.search?.trim().toLowerCase();
   const inactiveDays = boundedDays(options.inactiveDays, 30);
   return summaries.filter(summary => {
+    if (options.agentId !== undefined && !summary.rows.some(row => row.agentId === options.agentId)) return false;
     if (query && !summary.searchableText.includes(query)) return false;
     if (options.creatorType && options.creatorType !== "all" && !summary.creatorTypes.includes(options.creatorType)) return false;
     if (options.responsesOnly && !summary.rows.some(row => row.hasResponses)) return false;
@@ -636,7 +714,13 @@ function formatBuiltWithValue(value: string) {
 }
 
 function sum<T>(items: readonly T[], value: (item: T) => number) {
-  return items.reduce((total, item) => total + value(item), 0);
+  return items.reduce((total, item) => {
+    const next = total + value(item);
+    if (!Number.isSafeInteger(next) || next < 0) {
+      throw new AppError(409, "official_usage_total_limit", "The official usage total exceeds the exact numeric range.");
+    }
+    return next;
+  }, 0);
 }
 
 function ordinal(left: string, right: string) {

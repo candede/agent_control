@@ -22,13 +22,18 @@ import { PowerPlatformResourceQueryClient } from "../src/services/powerPlatformR
 import type { AuthenticatedUser } from "../src/types/session.js";
 
 vi.hoisted(() => {
+  const origin = new URL(process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3001");
+  if (origin.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(origin.hostname)
+    || origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash) {
+    throw new Error("The browser fixture requires a plain HTTP loopback origin.");
+  }
   process.env.NODE_ENV = "test";
   process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-2222-2222-222222222222";
   process.env.CLIENT_SECRET = "synthetic-browser-client-secret";
   process.env.SESSION_SECRET = "synthetic-browser-session-secret-0001";
-  process.env.FRONTEND_ORIGIN = "http://localhost:3001";
-  process.env.REDIRECT_URI = "http://localhost:3001/api/auth/callback";
+  process.env.FRONTEND_ORIGIN = origin.origin;
+  process.env.REDIRECT_URI = `${origin.origin}/api/auth/callback`;
 });
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, string>() }));
 vi.mock("../src/auth/msal.js", async original => {
@@ -36,7 +41,7 @@ vi.mock("../src/auth/msal.js", async original => {
   return {
     ...actual,
     createAuthorizationUrl: async (flow: ReturnType<typeof actual.createAuthFlow>) => {
-      const scenario = new URL(flow.returnTo, "http://localhost:3001").searchParams.get("fixture") ?? "available";
+      const scenario = new URL(flow.returnTo, process.env.FRONTEND_ORIGIN).searchParams.get("fixture") ?? "available";
       identity.scenarios.set(flow.state, scenario);
       return flow.kind === "consent" ? `/api/auth/callback?state=${flow.state}&error=access_denied&error_description=never-render-provider-text`
         : `/api/auth/callback?state=${flow.state}&code=${flow.state}`;
@@ -71,7 +76,7 @@ const qualifiedQuarantineBotId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const unqualifiedQuarantineBotId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const quarantineProviderFixture = { reads: 0, writes: 0, states: new Map<string, boolean>(), updatedAt: new Map<string, string>() };
 beforeAll(async () => {
-  if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser" || process.env.NODE_ENV !== "test") throw new Error("This fixture requires its disposable Docker test entry point.");
+  if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser" || process.env.NODE_ENV !== "test") throw new Error("This fixture requires its isolated browser test entry point.");
   fixture = await testDatabase();
   pool.options.database = fixture.name; pool.options.user = "agentcontrol_app"; pool.options.password = fixturePassword;
   const repository = new CapabilityRepository(fixture.runtime);
@@ -122,8 +127,12 @@ beforeAll(async () => {
     return realFetch(input, init);
   });
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
-  await new Promise<void>(done => { server = application.app.listen(3001, "0.0.0.0", done); });
-  console.log(JSON.stringify({ event: "isolated_browser_fixture", origin: "http://localhost:3001", database: fixture.name, liveProviders: false }));
+  const origin = new URL(process.env.FRONTEND_ORIGIN!);
+  await new Promise<void>((done, reject) => {
+    server = application.app.listen(Number(origin.port || 80), origin.hostname, error => error ? reject(error) : done());
+    server.once("error", reject);
+  });
+  console.log(JSON.stringify({ event: "isolated_browser_fixture", origin: origin.origin, database: fixture.name, liveProviders: false }));
 });
 afterAll(async () => {
   application?.store.close();
@@ -131,9 +140,9 @@ afterAll(async () => {
   await pool.end(); await fixture?.close();
   vi.unstubAllGlobals();
 });
-it("qualifies the packaged Permission Center through Chromium and axe", async () => {
+it("qualifies the packaged Permission Center through Chromium and axe", async ({ signal }) => {
   const exitCode = await new Promise<number | null>((done, reject) => {
-    const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts"], { stdio: "inherit", env: process.env });
+    const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts"], { stdio: "inherit", env: process.env, signal });
     child.once("error", reject); child.once("exit", done);
   });
   expect(exitCode).toBe(0);
@@ -144,7 +153,11 @@ it("qualifies the packaged Permission Center through Chromium and axe", async ()
   application.store.close();
   await new Promise<void>(done => server.close(() => done()));
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
-  await new Promise<void>(done => { server = application.app.listen(3001, "0.0.0.0", done); });
+  const origin = new URL(process.env.FRONTEND_ORIGIN!);
+  await new Promise<void>((done, reject) => {
+    server = application.app.listen(Number(origin.port || 80), origin.hostname, error => error ? reject(error) : done());
+    server.once("error", reject);
+  });
 
   const afterRestart = await officialUsageFingerprint(new OfficialUsageRepository(fixture.runtime), viewOptions);
   expect(afterRestart).toEqual(beforeRestart);
@@ -174,7 +187,7 @@ async function seedQuarantineTargets(capabilityRepository: CapabilityRepository)
     authoringTool: "Copilot Studio", creatorType: "unknown" as const, agentKind: "copilot_studio_agent", lifecycle: "published" as const,
     identityConfidence: "exact_native" as const, identifiers: [{ kind: "power_platform_resource_id" as const, value: target.nativeId }, { kind: "environment_id" as const, value: quarantineEnvironmentId }, { kind: "cds_bot_id" as const, value: target.botId }],
     provenance: {}, details: { isQuarantined: false }, unknownFieldCount: 0,
-  })), totalRecords: targets.length, pages: 1, unknownFieldCount: 0 });
+  })), queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: targets.length, pages: 1, unknownFieldCount: 0 });
   expect(published.snapshotId).toBeTruthy();
   const definition = capabilityDefinitions.find(value => value.id === "powerPlatform.quarantine.manage")!;
   const configuration = await capabilityRepository.configuration(scope.tenantId, definition.id);

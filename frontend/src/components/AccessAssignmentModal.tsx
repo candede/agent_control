@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ShieldCheck, X } from "lucide-react";
 import {
   resolveDirectoryPrincipals,
@@ -30,41 +30,70 @@ type AccessAssignmentModalProps = {
   onSubmit: (update: PackageAccessUpdate) => Promise<void>;
 };
 
-export function AccessAssignmentModal({
+type AccessAssignmentEditorProps = Omit<AccessAssignmentModalProps, "context" | "agentCount"> & {
+  active?: boolean;
+  readOnly?: boolean;
+  onTargetChange: (target: PackageAccessTarget) => void;
+};
+
+export function AccessAssignmentModal(props: AccessAssignmentModalProps) {
+  return <AccessAssignmentForm {...props} />;
+}
+
+export function AccessAssignmentEditor(props: AccessAssignmentEditorProps) {
+  return <AccessAssignmentForm {...props} context="single" agentCount={1} inline />;
+}
+
+function AccessAssignmentForm({
   context,
   agentCount,
   initialTarget = "availability",
-  initialPrincipals = [],
+  initialPrincipals,
   initialStatus,
   busy = false,
   onCancel,
   onSubmit,
-}: AccessAssignmentModalProps) {
+  inline = false,
+  active = true,
+  readOnly = false,
+  onTargetChange,
+}: AccessAssignmentModalProps & {
+  inline?: boolean;
+  active?: boolean;
+  readOnly?: boolean;
+  onTargetChange?: (target: PackageAccessTarget) => void;
+}) {
+  const id = useId();
   const capabilities = useCapabilityContext();
   const directory = capabilities.views.find(view => view.definition.id === "graph.directory.read");
   const directoryAllowed = providerActionAllowed(directory, false, capabilities.now);
   const [initialAccess] = useState(() => ({
     status: initialStatus,
-    principals: initialPrincipals,
-    scope: getInitialAccessScope(initialStatus, initialPrincipals),
+    principals: initialPrincipals ?? [],
+    principalsReported: initialPrincipals !== undefined,
+    scope: getInitialAccessScope(initialStatus, initialPrincipals ?? []),
   }));
   const [target, setTarget] = useState<PackageAccessTarget>(initialTarget);
   const [mode, setMode] = useState<PackageAccessMutationMode>("replace");
   const [scope, setScope] = useState<AccessScopeSelection | undefined>(
     initialAccess.scope,
   );
-  const [selected, setSelected] = useState<DirectoryPrincipal[]>([]);
-  const [principalsInitialized, setPrincipalsInitialized] = useState(false);
+  const [assignments, setAssignments] = useState(() => ({
+    selected: initialAccess.principals.map(fallbackPrincipal),
+    initialized: false,
+  }));
+  const { selected, initialized: principalsInitialized } = assignments;
   const resolving = initialAccess.scope === "specific"
     && initialAccess.principals.length > 0
     && !principalsInitialized;
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const locked = busy || submitting;
+  const locked = busy || submitting || readOnly;
   const [error, setError] = useState<string>();
   const dialogRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
+    if (inline) return;
     const previouslyFocused = document.activeElement;
     dialogRef.current?.focus();
 
@@ -73,9 +102,10 @@ export function AccessAssignmentModal({
         previouslyFocused.focus();
       }
     };
-  }, []);
+  }, [inline]);
 
   useEffect(() => {
+    if (inline) return;
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape" && !busy && !submitting) {
         event.stopImmediatePropagation();
@@ -90,10 +120,10 @@ export function AccessAssignmentModal({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [busy, onCancel, submitting]);
+  }, [busy, inline, onCancel, submitting]);
 
   useEffect(() => {
-    if (!directoryAllowed || !resolving) {
+    if (!active || readOnly || !directoryAllowed || !resolving) {
       return;
     }
 
@@ -102,25 +132,20 @@ export function AccessAssignmentModal({
     void resolveDirectoryPrincipals(initialAccess.principals)
       .then((response) => {
         if (!cancelled) {
-          setSelected(response.value);
+          setAssignments({ selected: response.value, initialized: true });
         }
       })
       .catch((requestError) => {
         if (!cancelled) {
-          setSelected(initialAccess.principals.map(fallbackPrincipal));
+          setAssignments({ selected: initialAccess.principals.map(fallbackPrincipal), initialized: true });
           setError(errorMessage(requestError));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setPrincipalsInitialized(true);
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [initialAccess, resolving, directoryAllowed]);
+  }, [initialAccess, resolving, directoryAllowed, active, readOnly]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);
@@ -131,6 +156,7 @@ export function AccessAssignmentModal({
   }
 
   async function handleApply() {
+    if (locked) return;
     if (!scope) {
       setError("Choose an access scope.");
       return;
@@ -146,7 +172,7 @@ export function AccessAssignmentModal({
       return;
     }
 
-    if (!confirming && mode === "replace") {
+    if (!inline && !confirming && mode === "replace") {
       setConfirming(true);
       return;
     }
@@ -180,32 +206,24 @@ export function AccessAssignmentModal({
     }
   }
 
-  return (
-    <div
-      className="modal-backdrop access-modal-backdrop"
-      role="presentation"
-      onClick={() => {
-        if (!busy && !submitting) {
-          onCancel();
-        }
-      }}
-    >
+  const content = (
       <section
         ref={dialogRef}
-        className="access-assignment-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="access-assignment-title"
-        aria-busy={locked}
-        tabIndex={-1}
+        className={inline ? "access-assignment-editor" : "access-assignment-modal"}
+        role={inline ? "region" : "dialog"}
+        aria-modal={inline ? undefined : true}
+        aria-labelledby={inline ? undefined : `${id}-title`}
+        aria-label={inline ? `${target === "availability" ? "Availability" : "Installation"} settings` : undefined}
+        aria-busy={busy || submitting}
+        tabIndex={inline ? undefined : -1}
         onClick={(event) => event.stopPropagation()}
       >
-        <header className="access-modal-header">
+        {!inline ? <header className="access-modal-header">
           <span className="access-modal-icon">
             <ShieldCheck size={22} aria-hidden="true" />
           </span>
           <div className="access-modal-heading">
-            <h2 id="access-assignment-title">Manage agent access</h2>
+            <h2 id={`${id}-title`}>Manage agent access</h2>
             <p>
               Control who can use or install{" "}
               {agentCount === 1
@@ -224,7 +242,7 @@ export function AccessAssignmentModal({
           >
             <X size={20} aria-hidden="true" />
           </button>
-        </header>
+        </header> : null}
 
         <div className="access-modal-body">
           <nav className="access-setting-nav" aria-label="Access setting">
@@ -232,9 +250,10 @@ export function AccessAssignmentModal({
             <button
               type="button"
               aria-current={target === "availability" ? "page" : undefined}
-              disabled={locked || (context === "single" && target !== "availability")}
+              disabled={busy || submitting || (!onTargetChange && context === "single" && target !== "availability")}
               onClick={() => {
-                setTarget("availability");
+                if (onTargetChange) onTargetChange("availability");
+                else setTarget("availability");
                 setConfirming(false);
               }}
             >
@@ -244,9 +263,10 @@ export function AccessAssignmentModal({
             <button
               type="button"
               aria-current={target === "installation" ? "page" : undefined}
-              disabled={locked || (context === "single" && target !== "installation")}
+              disabled={busy || submitting || (!onTargetChange && context === "single" && target !== "installation")}
               onClick={() => {
-                setTarget("installation");
+                if (onTargetChange) onTargetChange("installation");
+                else setTarget("installation");
                 setConfirming(false);
               }}
             >
@@ -299,7 +319,7 @@ export function AccessAssignmentModal({
                 Access scope
                 {context === "single" ? (
                   <span className="access-current-setting">
-                    Current:{" "}
+                    {inline ? "Saved" : "Current"}:{" "}
                     {formatAccessScope(initialAccess.status, initialAccess.principals)}
                   </span>
                 ) : null}
@@ -308,7 +328,7 @@ export function AccessAssignmentModal({
                 <label className="disabled-option">
                   <input
                     type="radio"
-                    name="access-scope"
+                    name={`${id}-scope`}
                     checked={scope === "all"}
                     disabled
                     readOnly
@@ -325,7 +345,7 @@ export function AccessAssignmentModal({
                 >
                   <input
                     type="radio"
-                    name="access-scope"
+                    name={`${id}-scope`}
                     checked={scope === "none"}
                     disabled={locked || mode === "add"}
                     onChange={() => {
@@ -341,7 +361,7 @@ export function AccessAssignmentModal({
                 <label>
                   <input
                     type="radio"
-                    name="access-scope"
+                    name={`${id}-scope`}
                     checked={scope === "specific"}
                     disabled={locked}
                     onChange={() => {
@@ -362,18 +382,23 @@ export function AccessAssignmentModal({
             {scope === "specific" ? (
               <section
                 className="access-assignment-workspace"
-                aria-labelledby="assignment-workspace-title"
+                aria-labelledby={`${id}-assignments`}
               >
                 <div className="access-workspace-heading">
                   <div>
-                    <h4 id="assignment-workspace-title">Users and groups</h4>
+                    <h4 id={`${id}-assignments`}>Users and groups</h4>
                     <p>
-                      Add directory users or groups, then review the list below.
+                      {readOnly ? "Saved assignments for this setting." : "Add directory users or groups, then review the list below."}
                     </p>
                   </div>
-                  <span>{selected.length} selected</span>
+                  <span>{readOnly
+                    ? initialAccess.principalsReported ? `${selected.length.toLocaleString()} saved` : "Not reported"
+                    : `${selected.length.toLocaleString()} selected`}</span>
                 </div>
-                {!directoryAllowed ? <p role="status">{directory ? capabilityExplanation(directory, capabilities.now) : "Directory capability is unavailable."}</p> : resolving ? (
+                {readOnly || !directoryAllowed ? <>
+                  {!readOnly ? <p role="status">{directory ? capabilityExplanation(directory, capabilities.now) : "Directory capability is unavailable."}</p> : null}
+                  <AssignmentList values={readOnly && !initialAccess.principalsReported ? undefined : selected} saved={readOnly} />
+                </> : resolving ? (
                   <p className="access-resolving" role="status">
                     Resolving current assignments...
                   </p>
@@ -382,13 +407,13 @@ export function AccessAssignmentModal({
                     selected={selected}
                     disabled={locked}
                     onChange={(principals) => {
-                      setSelected(principals);
+                      setAssignments({ selected: principals, initialized: true });
                       setConfirming(false);
                     }}
                   />
                 )}
               </section>
-            ) : scope === "none" ? (
+            ) : scope === "none" && !readOnly ? (
               <div className="access-empty-scope">
                 <strong>No users will have this access.</strong>
                 <p>
@@ -411,18 +436,18 @@ export function AccessAssignmentModal({
                 </p>
               </div>
             ) : null}
-            {error ? <div className="inline-error">{error}</div> : null}
+            {error ? <div className="inline-error" role="alert">{error}</div> : null}
           </div>
         </div>
 
-        <footer className="access-modal-actions">
+        {!readOnly ? <footer className="access-modal-actions">
           <button
             type="button"
             className="secondary"
             disabled={busy || submitting}
             onClick={onCancel}
           >
-            Cancel
+            {inline ? "Discard changes" : "Cancel"}
           </button>
           <WorkbenchActionGate actionId="packages.access">
           <button
@@ -444,10 +469,33 @@ export function AccessAssignmentModal({
                 : "Apply"}
           </button>
                   </WorkbenchActionGate>
-        </footer>
+        </footer> : null}
       </section>
-    </div>
   );
+  return inline ? content : <div
+    className="modal-backdrop access-modal-backdrop"
+    role="presentation"
+    onClick={() => { if (!busy && !submitting) onCancel(); }}
+  >{content}</div>;
+}
+
+function AssignmentList({ values, saved }: { values?: DirectoryPrincipal[]; saved: boolean }) {
+  const [requestedOffset, setRequestedOffset] = useState(0);
+  const count = values?.length ?? 0;
+  const offset = Math.min(requestedOffset, Math.max(0, Math.ceil(count / 8) - 1) * 8);
+  return <div className="agent-control-assignments" role="group" aria-label={saved ? "Saved users and groups" : "Selected users and groups"}>
+    <p>{values === undefined ? "Assignments not reported" : count
+      ? `${count.toLocaleString()} ${saved ? "saved" : "selected"} user or group ${count === 1 ? "assignment" : "assignments"}`
+      : saved ? "No explicit user or group assignments" : "No users or groups selected"}</p>
+    {count ? <ul>{values?.slice(offset, offset + 8).map((entry, index) => <li key={`${entry.resourceType}:${entry.resourceId}:${index}`}>
+      <strong>{entry.displayName}</strong><span>{entry.resourceType}: {entry.resourceId}</span>
+    </li>)}</ul> : null}
+    {count > 8 ? <div className="agent-assignment-pages">
+      <span>{offset + 1}-{Math.min(offset + 8, count)} of {count.toLocaleString()}</span>
+      <button type="button" className="secondary" disabled={offset === 0} onClick={() => setRequestedOffset(offset - 8)}>Previous assignments</button>
+      <button type="button" className="secondary" disabled={offset + 8 >= count} onClick={() => setRequestedOffset(offset + 8)}>Next assignments</button>
+    </div> : null}
+  </div>;
 }
 
 function fallbackPrincipal(entity: PackageAccessEntity): DirectoryPrincipal {

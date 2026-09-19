@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Upload, X } from "lucide-react";
 import { OfficialUsageImportPanel } from "./OfficialUsageImportPanel";
 import "./officialUsage.css";
@@ -6,11 +6,13 @@ import "./officialUsage.css";
 type OfficialUsageImportModalProps = Parameters<typeof OfficialUsageImportPanel>[0] & {
   openRequest?: number;
   showTrigger?: boolean;
+  returnFocusRef?: RefObject<HTMLButtonElement | null>;
 };
 
 export function OfficialUsageImportModal({
   openRequest = 0,
   showTrigger = true,
+  returnFocusRef,
   ...panelProps
 }: OfficialUsageImportModalProps) {
   const [open, setOpen] = useState(Boolean(panelProps.initialStagingId));
@@ -20,11 +22,16 @@ export function OfficialUsageImportModal({
   const closeButton = useRef<HTMLButtonElement>(null);
   const returnButton = useRef<HTMLButtonElement>(null);
   const lastOpenRequest = useRef(openRequest);
+  const returnTarget = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const element = dialog.current;
-    if (open && !element?.open) element?.showModal();
-    else if (!open && element?.open) element.close();
+    if (!element) return;
+    if (open && !element.open) {
+      const focused = document.activeElement;
+      returnTarget.current = focused instanceof HTMLElement && focused !== document.body && !element.contains(focused) ? focused : null;
+      element.showModal();
+    } else if (!open && element.open) element.close();
   }, [open]);
 
   useEffect(() => {
@@ -71,7 +78,9 @@ export function OfficialUsageImportModal({
         onClose={event => {
           if (event.target !== event.currentTarget) return;
           setOpen(false);
-          trigger.current?.focus();
+          const target = returnTarget.current;
+          if (target?.isConnected) target.focus();
+          else (returnFocusRef?.current ?? trigger.current)?.focus();
         }}
       >
         <header className="usage-modal-header">

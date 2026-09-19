@@ -29,6 +29,12 @@ describe("parseAuditEventsQuery", () => {
     });
   });
 
+  it.each([
+    "requested", "started", "succeeded", "failed", "skipped", "inconclusive", "cancelled",
+  ])("accepts the persisted %s audit status", status => {
+    expect(parseAuditEventsQuery({ status })).toMatchObject({ status });
+  });
+
   it("rejects malformed limits", () => {
     expect(() => parseAuditEventsQuery({ limit: "10abc" })).toThrow(AppError);
     expect(() => parseAuditEventsQuery({ limit: "-1" })).toThrow(AppError);

@@ -267,6 +267,37 @@ export type OfficialUsageAggregateView = {
   agents: { value: OfficialUsageAgent[]; count: number; limit: number; offset: number };
 };
 
+export type OfficialUsageAgentUser = {
+  username: string;
+  displayName: string;
+  responsesSentToUsers: number;
+};
+
+export type OfficialUsageAgentDetailView = Pick<OfficialUsageAggregateView,
+  | "authority"
+  | "availability"
+  | "staleAfterDays"
+  | "periodAgeDays"
+  | "acceptedAgeDays"
+  | "activeSet"
+  | "lineages"
+  | "missingKinds"
+> & {
+  agent: OfficialUsageAgent;
+  summary: {
+    reportedUsers: number | null;
+    responseProducingUsers: number | null;
+    zeroResponseUsers: number | null;
+    userBreakdownResponses: number | null;
+  };
+  filters: {
+    search?: string;
+    sortBy: "responses" | "displayName";
+    sortDirection: "asc" | "desc";
+  };
+  users: { value: OfficialUsageAgentUser[]; count: number; limit: number; offset: number };
+};
+
 export type OfficialUsageUserAgentRow = UserAgentUsageRow & {
   displayAgentName: string;
   packageStatus: "report-only";
@@ -310,6 +341,7 @@ export type OfficialUsageUserView = {
   filters: {
     creatorTypes: string[];
     search?: string;
+    agentId?: string;
     creatorType?: string;
     activity: "all" | "recent" | "inactive" | "no-activity";
     responsesOnly: boolean;

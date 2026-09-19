@@ -1,4 +1,5 @@
 import type { CopilotPackage } from "./copilotPackage.js";
+import type { AgentUsageContext, AgentUsageSummary } from "./agentUsage.js";
 import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../services/packageAgentIdentity.js";
 import type {
   InventoryCoverageStatus,
@@ -10,8 +11,17 @@ export type UnifiedAgentSource = "graph_packages" | "power_platform";
 export type UnifiedAgentSourceFilter = "all" | UnifiedAgentSource | "both";
 export type UnifiedAgentPresence = "graph_packages" | "power_platform" | "both";
 export type UnifiedAgentLinkState = "matched" | "unmatched" | "ambiguous" | "conflicting";
-export type UnifiedAgentSort = "displayName" | "environment" | "source" | "lastModifiedAt";
+export const unifiedAgentSortKeys = [
+  "displayName", "environment", "builtWith", "availability", "status", "hosts", "publisher",
+  "origin", "deployment", "owner", "createdBy", "createdAt", "lastModifiedAt", "lastPublishedAt",
+  "agentType", "versions", "publication", "quarantine", "location", "model", "authentication",
+  "channels", "orchestration", "webSearch", "managed", "source", "observedAt", "linkState",
+  "responses", "activeUsers", "lastActivity",
+] as const;
+export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
+export const unifiedAgentViews = ["all", "organization", "used", "unknown"] as const;
+export type UnifiedAgentView = typeof unifiedAgentViews[number];
 
 export type UnifiedAgentTarget =
   | { source: "canonical"; agentId: string }
@@ -119,6 +129,7 @@ export type UnifiedAgentRecord = {
   environmentId: string | null;
   packages: CopilotPackage[];
   powerPlatformResource: PowerPlatformResource | null;
+  usage?: AgentUsageSummary;
   identity: {
     state: UnifiedAgentLinkState;
     evidence: UnifiedAgentLinkEvidence[];
@@ -165,6 +176,7 @@ export type UnifiedAgentInventoryVerification = {
 
 export type UnifiedAgentInventoryPage = {
   revision?: string;
+  usageContext?: AgentUsageContext;
   value: UnifiedAgentRecord[];
   count: number;
   offset: number;
@@ -186,6 +198,7 @@ export type UnifiedAgentInventoryPage = {
 };
 
 export type UnifiedAgentInventoryQuery = {
+  view?: UnifiedAgentView;
   recordId?: string;
   operationIdPrefix?: string;
   search?: string;

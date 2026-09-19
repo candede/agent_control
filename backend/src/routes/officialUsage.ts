@@ -10,7 +10,7 @@ import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { parseOfficialUsageReport, OfficialUsageValidationError } from "../services/officialUsageParser.js";
 import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
-import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
+import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import type { AppRole } from "../types/capability.js";
@@ -197,6 +197,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     access: "authenticated", dataClass: "official_usage_history", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
+    validateViewQuery(request.query, ["limit", "offset"]);
     response.json(await history.getHistory(scope.tenantId, {
       limit: queryInteger(first(request.query.limit), 25, 100, true),
       offset: queryInteger(first(request.query.offset), 0, 100_000, false),
@@ -256,29 +257,31 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     access: "authenticated", dataClass: "official_usage_aggregate", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
+    const options = aggregateOptions(request.query);
     const setId = querySetId(request.query);
     const [published, packages] = await Promise.all([
       repository.getPublished(scope.tenantId, setId),
       packageRepository.list(scope, { limit: 5_000, offset: 0 }),
     ]);
-    response.json(buildOfficialUsageAggregateView(published, packages.value, aggregateOptions(request.query)));
+    response.json(buildOfficialUsageAggregateView(published, packages.value, options));
   });
 
   policyRoute(router, "get", "/official-usage/aggregate.csv", {
     access: "authenticated", dataClass: "official_usage_aggregate_export", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const options = aggregateOptions(request.query);
+    const setId = querySetId(request.query);
     await sendOfficialCsv(request, response, {
       role: "AgentControl.Viewer",
       action: "export-official-usage-aggregate",
       filename: "official-agent-usage.csv",
       load: async () => {
         const scope = requestScope(request);
-        const setId = querySetId(request.query);
         const [published, packages] = await Promise.all([
           repository.getPublished(scope.tenantId, setId),
           packageRepository.list(scope, { limit: 5_000, offset: 0 }),
         ]);
-        const view = buildOfficialUsageAggregateView(published, packages.value, { ...aggregateOptions(request.query), limit: 100_000, offset: 0 });
+        const view = buildOfficialUsageAggregateView(published, packages.value, { ...options, limit: 100_000, offset: 0 });
         const datasetKey = officialDatasetKey(published);
         return {
           columns: ["agentId", "agentName", "creatorType", "creatorTypeSource", "activeUsersLicensed", "activeUsersUnlicensed", "activeUsersTotal", "activeUsersTotalBasis", "activeUsersIdentityCount", "responsesSentToUsers", "responseComparisonStatus", "responseDifference", "responsesAgentsReport", "responsesUsersAndAgentsReport", "lastActivityDateUtc", "sourceReports", "identityStatus", "reportSetId", "reportingStart", "reportingEnd", "agentsVersionId", "agentsPeriodProvenance", "agentsSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness"] as const,
@@ -295,29 +298,43 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     });
   });
 
+  policyRoute(router, "get", "/official-usage/agents/:agentId", {
+    access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    const scope = requestScope(request);
+    const agentId = reportAgentId(request.params.agentId);
+    const options = agentDetailViewOptions(request.query);
+    const published = await repository.getPublished(scope.tenantId, querySetId(request.query));
+    const view = buildOfficialUsageAgentDetailView(published, agentId, options);
+    if (!view) throw new AppError(404, "official_usage_agent_not_found", "The agent ID was not found in the selected official usage report set.");
+    response.json(view);
+  });
+
   policyRoute(router, "get", "/official-usage/users", {
     access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
+    const options = userViewOptions(request.query);
     response.json(buildOfficialUsageUserView(
       await repository.getPublished(scope.tenantId, querySetId(request.query)),
-      userViewOptions(request.query),
+      options,
     ));
   });
 
   policyRoute(router, "get", "/official-usage/users.csv", {
     access: "authenticated", dataClass: "official_usage_user_export", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const options = userViewOptions(request.query);
+    const setId = querySetId(request.query);
     await sendOfficialCsv(request, response, {
       role: "AgentControl.Viewer",
       action: "export-official-usage-users",
       filename: "official-user-usage.csv",
       load: async () => {
         const scope = requestScope(request);
-        const setId = querySetId(request.query);
         const published = await repository.getPublished(scope.tenantId, setId);
         const view = buildOfficialUsageUserView(published, {
-          ...userViewOptions(request.query), limit: 100_000, offset: 0,
+          ...options, limit: 100_000, offset: 0,
         });
         const datasetKey = officialDatasetKey(published);
         return {
@@ -372,6 +389,10 @@ function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?
 }
 
 function aggregateOptions(query: Record<string, unknown>) {
+  validateViewQuery(query, [
+    "setId", "search", "creatorType", "inactiveDays", "activityWindowDays",
+    "startDate", "endDate", "sortBy", "sortDirection", "limit", "offset",
+  ]);
   const sortBy = queryEnum(first(query.sortBy), ["agentName", "responses", "licensedUsers", "unlicensedUsers", "lastActivity"] as const, "agent sort");
   const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
   const [startDate, endDate] = queryDateRange(query);
@@ -391,6 +412,10 @@ function aggregateOptions(query: Record<string, unknown>) {
 }
 
 function userViewOptions(query: Record<string, unknown>) {
+  validateViewQuery(query, [
+    "setId", "search", "agentId", "creatorType", "activity", "responsesOnly", "inactiveDays",
+    "startDate", "endDate", "lowResponseThreshold", "cohort", "sortBy", "sortDirection", "limit", "offset",
+  ]);
   const activity = first(query.activity);
   if (activity !== undefined && !["all", "recent", "inactive", "no-activity"].includes(activity)) {
     throw new AppError(400, "invalid_usage_query", "The official usage activity filter is invalid.");
@@ -406,6 +431,7 @@ function userViewOptions(query: Record<string, unknown>) {
   return {
     staleAfterDays: config.officialUsageStaleDays,
     search: queryText(first(query.search), 256),
+    agentId: query.agentId === undefined ? undefined : reportAgentId(query.agentId, "invalid_usage_query"),
     creatorType: queryText(first(query.creatorType), 128),
     activity: activity as "all" | "recent" | "inactive" | "no-activity" | undefined,
     responsesOnly: responsesOnly === "true",
@@ -419,6 +445,31 @@ function userViewOptions(query: Record<string, unknown>) {
     limit: queryInteger(first(query.limit), 100, 500, true),
     offset: queryInteger(first(query.offset), 0, 100_000, false),
   };
+}
+
+function agentDetailViewOptions(query: Record<string, unknown>) {
+  validateViewQuery(query, ["setId", "search", "sortBy", "sortDirection", "limit", "offset"]);
+  return {
+    staleAfterDays: config.officialUsageStaleDays,
+    search: queryText(first(query.search), 256),
+    sortBy: queryEnum(first(query.sortBy), ["responses", "displayName"] as const, "agent user sort"),
+    sortDirection: queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction"),
+    limit: queryInteger(first(query.limit), 100, 500, true),
+    offset: queryInteger(first(query.offset), 0, 100_000, false),
+  };
+}
+
+function validateViewQuery(query: Record<string, unknown>, allowed: readonly string[]) {
+  if (Object.entries(query).some(([key, value]) => !allowed.includes(key) || typeof value !== "string")) {
+    throw new AppError(400, "invalid_usage_query", "Only supported official usage query parameters supplied once as text are allowed.");
+  }
+}
+
+function reportAgentId(value: unknown, code = "invalid_identifier") {
+  if (typeof value !== "string" || !value.trim() || value.length > 512 || /[\r\n\0]/.test(value)) {
+    throw new AppError(400, code, "The official usage report agent ID is invalid.");
+  }
+  return value;
 }
 
 function operation(value: unknown) {

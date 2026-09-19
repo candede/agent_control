@@ -52,5 +52,11 @@ describe("workbench metadata", () => {
     expect(metadata.actions.find(action => action.id === "data-sync.retry")).toMatchObject({
       nativeTarget: "sync_run", roles: ["AgentControl.Viewer"], recovery: "reauthorize",
     });
+    const usage = metadata.actions.filter(action => action.id.startsWith("agentUsage."));
+    expect(usage.map(action => action.id)).toEqual(["agentUsage.candidates", "agentUsage.associate", "agentUsage.remove"]);
+    for (const action of usage) {
+      expect(action).toMatchObject({ roles: ["AgentControl.Admin"], capabilityId: null, source: "official_usage", recovery: "none" });
+      if (action.method !== "GET") expect(action).toMatchObject({ preview: "required", confirmation: "risk_and_exact_targets" });
+    }
   });
 });

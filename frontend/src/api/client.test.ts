@@ -11,9 +11,15 @@ import {
   getAgentDetails,
   getCurrentUser,
   getUnifiedAgents,
+  getAgentUsageCandidates,
+  getAuditEvents,
+  associateAgentUsage,
+  removeAgentUsageAssociation,
   downloadUnifiedAgentInventoryCsv,
+  downloadOfficialUsageCsv,
   getPackageRefreshJob,
   getOfficialUsageAggregate,
+  getOfficialUsageAgentDetail,
   getOfficialUsageHistory,
   getOfficialUsageUsers,
   getCopilotUsageUsers,
@@ -39,6 +45,7 @@ import {
   updateAgentsAccess,
   type PackageAccessReplacement,
   type PackageAccessUpdate,
+  type AuditEvent,
 } from "./client";
 
 const accessUpdate: PackageAccessReplacement = {
@@ -56,6 +63,56 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it("retains administrative-audit export receipts without a package blocked-state claim", async () => {
+    const event: AuditEvent = {
+      id: "audit-export-receipt", operationId: "export-operation", action: "export-administrative-audit",
+      scope: "bulk", agentId: "audit-export", status: "succeeded",
+      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer", roles: ["AgentControl.Admin"] },
+      startedAt: "2026-09-15T12:00:00.000Z", completedAt: "2026-09-15T12:00:01.000Z",
+      requestPath: "/api/audit/events/export.csv", metadata: { selectedCount: 2 },
+    };
+    mockJsonResponse({ value: [event], count: 1 });
+    const result = await getAuditEvents({ action: "export-administrative-audit" });
+    expect(result.value).toEqual([event]);
+    expect(result.value[0]).not.toHaveProperty("targetBlockedState");
+  });
+
+  it.each(["aggregate", "users"] as const)("passes cancellation through the %s official-usage CSV request", async kind => {
+    const fetchMock = vi.fn(async () => new Response("selected-report-csv", { headers: { "Content-Type": "text/csv" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const setId = "11111111-1111-4111-8111-111111111111";
+    const blob = await downloadOfficialUsageCsv(kind, { setId }, controller.signal);
+    expect(fetchMock).toHaveBeenCalledWith(`/api/official-usage/${kind}.csv?setId=${setId}`, {
+      credentials: "include", signal: controller.signal, headers: { Accept: "text/csv" },
+    });
+    expect(await blob.text()).toBe("selected-report-csv");
+  });
+
+  it("encodes agent usage reads and sends confirmed, CSRF-protected association changes", async () => {
+    const fetchMock = mockJsonResponse({ csrfToken: "association-fixture-csrf" });
+    await getCurrentUser();
+    const controller = new AbortController();
+    const id = "graph_packages:package%2Fone";
+    await getAgentUsageCandidates(id, { search: "Report & agent", limit: 20, offset: 40 }, { signal: controller.signal });
+    const common = {
+      reportSetId: "11111111-1111-4111-8111-111111111111", reportAgentId: "report/Upper:1",
+      expectedInventoryRevision: "a".repeat(64), expectedUsageRevision: "b".repeat(64), confirmed: true as const,
+    };
+    await associateAgentUsage(id, { ...common, target: { source: "graph_packages", packageId: "package/one" } });
+    await removeAgentUsageAssociation(id, common);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      "/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-candidates?search=Report+%26+agent&limit=20&offset=40",
+      expect.objectContaining({ signal: controller.signal }),
+    ]);
+    for (const [index, method] of [[2, "POST"], [3, "DELETE"]] as const) {
+      const [path, options] = fetchMock.mock.calls[index];
+      expect(path).toBe("/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-associations");
+      expect(options).toMatchObject({ method, credentials: "include", headers: { "X-CSRF-Token": "association-fixture-csrf", "Content-Type": "application/json" } });
+      expect(JSON.parse(String(options?.body))).toMatchObject(common);
+    }
+  });
+
   it("uses the durable data-sync state and run contracts", async () => {
     const fetchMock = mockJsonResponse({});
     const controller = new AbortController();
@@ -173,6 +230,23 @@ describe("access API client", () => {
     );
     expect(fetchMock.mock.calls[0][1]?.method ?? "GET").toBe("GET");
     expect(fetchMock.mock.calls[0][1]?.body).toBeUndefined();
+  });
+
+  it("encodes exact report identities and pins bounded drilldowns to their report set", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    const agentId = "Report/Upper%Case:1";
+    const setId = "11111111-1111-4111-8111-111111111111";
+    await getOfficialUsageAgentDetail(agentId, {
+      setId, search: "User + one", sortBy: "displayName", sortDirection: "asc", limit: 20, offset: 40,
+    }, { signal: controller.signal });
+    await getOfficialUsageUsers({ agentId, setId }, { signal: controller.signal });
+    expect(fetchMock.mock.calls[0][0]).toBe(`/api/official-usage/agents/Report%2FUpper%25Case%3A1?setId=${setId}&search=User+%2B+one&sortBy=displayName&sortDirection=asc&limit=20&offset=40`);
+    expect(fetchMock.mock.calls[1][0]).toBe(`/api/official-usage/users?agentId=Report%2FUpper%25Case%3A1&setId=${setId}`);
+    for (const [, options] of fetchMock.mock.calls) {
+      expect(options).toMatchObject({ credentials: "include", signal: controller.signal });
+      expect(options.method).toBeUndefined();
+    }
   });
 
   it("requests failed-check recovery only for an explicit retry", async () => {

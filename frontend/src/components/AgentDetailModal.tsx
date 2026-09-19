@@ -1,5 +1,4 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import DOMPurify from "dompurify";
 import type {
   AppRole,
   CopilotPackageDetail,
@@ -8,6 +7,7 @@ import type {
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
 import { getBuiltWithLabel } from "../agentDisplay";
+import { extractConnectedServices, getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetails";
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 
@@ -34,11 +34,6 @@ type AccessSummary = {
   users: number;
   groups: number;
   other: number;
-};
-
-type ConnectedService = {
-  value: string;
-  source: string;
 };
 
 export function AgentDetailModal({
@@ -311,7 +306,7 @@ export function AgentDetailModal({
           >
             {connectedServices.length ? (
               <ul className="detail-list service-list expanded-detail-list">
-                {connectedServices.map((service) => (
+                {connectedServices.slice(0, 20).map((service) => (
                   <li key={`${service.source}-${service.value}`}>
                     <span>{service.value}</span>
                     <small>{service.source}</small>
@@ -323,6 +318,8 @@ export function AgentDetailModal({
                 No connected service metadata was returned for this package.
               </p>
             )}
+            {connectedServices.length > 20 ? <p>Showing the first 20 of {connectedServices.length} detected service references.</p> : null}
+            <p className="detail-overflow-note">Detected metadata references do not prove a live connection.</p>
           </DetailSection>
 
         </div>
@@ -394,30 +391,6 @@ export function AgentDetailModal({
       </section>
     </div>
   );
-}
-
-function getAgentDescription(agent: CopilotPackageDetail) {
-  return (
-    agent.longDescription ||
-    agent.shortDescription ||
-    "No description provided."
-  );
-}
-
-function getSanitizedDescriptionHtml(description: string) {
-  if (!hasHtmlMarkup(description)) {
-    return undefined;
-  }
-
-  const sanitized = DOMPurify.sanitize(description, {
-    USE_PROFILES: { html: true },
-  }).trim();
-
-  return sanitized || undefined;
-}
-
-function hasHtmlMarkup(value: string) {
-  return /<\/?[a-z][\s\S]*>/i.test(value);
 }
 
 function DetailSection({
@@ -525,89 +498,6 @@ function formatAccessSummary(summary: AccessSummary) {
   }
 
   return `${summary.total} total (${summary.users} users, ${summary.groups} groups, ${summary.other} other)`;
-}
-
-function extractConnectedServices(
-  elementDetails?: CopilotPackageDetail["elementDetails"],
-): ConnectedService[] {
-  const services = new Map<string, ConnectedService>();
-
-  for (const detail of elementDetails ?? []) {
-    for (const element of detail.elements) {
-      const source = `${formatDetailLabel(detail.elementType) ?? detail.elementType} ${element.id}`;
-
-      for (const service of extractServiceCandidates(element.definition)) {
-        const key = `${source}:${service}`;
-        services.set(key, { value: service, source });
-      }
-    }
-  }
-
-  return [...services.values()].slice(0, 20);
-}
-
-function extractServiceCandidates(definition: string) {
-  const candidates = new Set<string>();
-  const urlMatches = definition.matchAll(
-    /https?:\/\/([^\s"'<>/]+)[^\s"'<>]*/gi,
-  );
-
-  for (const match of urlMatches) {
-    candidates.add(match[1]);
-  }
-
-  const parsed = parseJson(definition);
-
-  if (parsed !== undefined) {
-    collectServiceCandidates(parsed, candidates);
-  }
-
-  return [...candidates];
-}
-
-function collectServiceCandidates(value: unknown, candidates: Set<string>) {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectServiceCandidates(item, candidates);
-    }
-    return;
-  }
-
-  if (!value || typeof value !== "object") {
-    return;
-  }
-
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string" && isServiceLikeKey(key)) {
-      const candidate = item.trim();
-
-      if (candidate && candidate.length <= 120) {
-        candidates.add(candidate);
-      }
-    } else {
-      collectServiceCandidates(item, candidates);
-    }
-  }
-}
-
-function isServiceLikeKey(key: string) {
-  return /(api|connector|connection|endpoint|host|name|resource|service|url)/i.test(
-    key,
-  );
-}
-
-function parseJson(value: string) {
-  const trimmed = value.trim();
-
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return undefined;
-  }
 }
 
 function AccessList({

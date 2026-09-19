@@ -1,16 +1,18 @@
 import { act, fireEvent, render, screen, waitFor, within, type RenderOptions } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
+import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import * as api from "../api/client";
-import type { CapabilityView, CopilotPackageDetail, InventorySourceAwareDetail, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
+import type { CapabilityView, CopilotPackage, CopilotPackageDetail, InventorySourceAwareDetail, PackageAccessTarget, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
 import { createInventoryVerification } from "../test/inventoryVerification";
+import { usageAggregateFixture, usageAgentDetailFixture } from "../test/usageInsightsFixture";
 
 mockNativeDialogs();
 
@@ -137,6 +139,17 @@ function capabilities(): CapabilityView[] {
   }));
 }
 
+function capabilitiesWithDirectory(): CapabilityView[] {
+  return [...capabilities(), {
+    definition: capabilityDefinitions.find(definition => definition.id === "graph.directory.read")!,
+    decision: {
+      capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
+      verification: "provider", previewQualification: "not_required", remediation: [],
+      checkedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    },
+  }];
+}
+
 function renderDetail(
   overrides: Partial<ComponentProps<typeof UnifiedAgentDetailModal>> = {},
   views = capabilities(),
@@ -145,7 +158,7 @@ function renderDetail(
 ) {
   const props = {
     record, roles: user.roles, onTabChange: vi.fn(), onClose: vi.fn(), onInspectPackage: vi.fn(),
-    onManagePackageAccess: vi.fn(), onSetPackageBlocked: vi.fn(), ...overrides,
+    onUpdatePackageAccess: vi.fn().mockResolvedValue(undefined), onSetPackageBlocked: vi.fn(), ...overrides,
   };
   const content = (next: Partial<typeof props> = {}, nextViews = views) => <CapabilityContext value={{
     views: nextViews, user: { ...user, roles: next.roles ?? props.roles }, now: Date.now(),
@@ -153,6 +166,14 @@ function renderDetail(
   }}><WorkbenchActionProvider value={actions}><UnifiedAgentDetailModal {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
   const result = render(content(), options);
   return { ...result, props, update: (next: Partial<typeof props>, nextViews = views) => result.rerender(content(next, nextViews)) };
+}
+
+async function submitInlineAccess(item: CopilotPackage, target: PackageAccessTarget) {
+  const versions = screen.queryByRole("combobox", { name: "Published version details" });
+  if (versions) await userEvent.selectOptions(versions, item.id);
+  await userEvent.click(screen.getByRole("button", { name: target === "availability" ? /^Available to/ : /^Installed for/ }));
+  await userEvent.click(screen.getByRole("radio", { name: /No users/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Apply" }));
 }
 
 function sourceAwareDetail(observed = observedRecord()): InventorySourceAwareDetail {
@@ -205,11 +226,31 @@ function queueNativeCloseEvents() {
 
 beforeEach(() => {
   vi.spyOn(api, "getInventorySourceAwareDetail").mockResolvedValue(sourceAwareDetail());
+  vi.spyOn(api, "getOfficialUsageAggregate").mockResolvedValue(usageAggregateFixture());
+  vi.spyOn(api, "getOfficialUsageAgentDetail").mockResolvedValue(usageAgentDetailFixture());
   vi.spyOn(api, "previewQuarantine");
   vi.spyOn(api, "submitQuarantine");
 });
 
 describe("UnifiedAgentDetailModal", () => {
+  it.each(["identities", "reports", "controls", "audit-security"])("keeps %s isolated from tenant totals and unrelated usage reports, including hidden panels", async activeTab => {
+    renderDetail({
+      activeTab,
+      record: { ...record, id: "synthetic-researcher", displayName: "Researcher" },
+    });
+    const dialog = await screen.findByRole("dialog", { name: "Researcher" });
+    expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    expect(within(dialog).queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Tenant adoption snapshot")).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("Find a reported agent")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Concealed report user")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Search tenant interactions")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Open tenant security")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("View management audit")).not.toBeInTheDocument();
+  });
+
   it.each(["synchronous", "queued"] as const)("keeps details open through Strict Mode replay with %s close events", async timing => {
     if (timing === "queued") queueNativeCloseEvents();
     const { props } = renderDetail({}, capabilities(), workbenchActions, { reactStrictMode: true });
@@ -241,10 +282,10 @@ describe("UnifiedAgentDetailModal", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
     const tablist = within(dialog).getByRole("tablist", { name: "Agent details" });
-    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Packages", "Configuration", "Usage", "Activity", "Manage"]);
+    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage & users", "Manage", "Activity"]);
     expect(within(dialog).getByRole("tabpanel", { name: "Overview" })).toBeVisible();
     expect(within(dialog).getByText("Production")).toBeVisible();
-    expect(within(dialog).getByText("Agent Builder")).toBeVisible();
+    expect(within(dialog).getAllByText("Agent Builder").some(element => element.closest("details") === null)).toBe(true);
     expect(within(dialog).getByText("Quarantine status unknown")).toBeVisible();
     expect(within(dialog).getByText("Linked by source metadata")).not.toBeVisible();
     expect(within(dialog).getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).not.toBeVisible();
@@ -256,75 +297,583 @@ describe("UnifiedAgentDetailModal", () => {
     expect(technical).toHaveTextContent("package-1");
     expect(technical).toHaveTextContent("element-1");
     expect(technical).toHaveTextContent("elementDetails.AgentMetadatas.definition.AgentIdentityId");
-    fireEvent.click(within(dialog).getByRole("tab", { name: "Packages" }));
-    expect(props.onTabChange).toHaveBeenLastCalledWith("package");
-    expect(within(dialog).getByText("Package one")).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("tab", { name: "Configuration" }));
-    expect(props.onTabChange).toHaveBeenLastCalledWith("power-platform");
     expect(within(dialog).getByText("agent-identity-1")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
     expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
-    expect(within(dialog).getByRole("heading", { name: "Manage agent" })).toBeVisible();
-    expect(within(dialog).getByText(/Every action identifies its exact target/)).toBeVisible();
+    expect(within(dialog).getByText("Package one")).toBeInTheDocument();
+    expect(within(dialog).getByRole("heading", { name: "Manage" })).toBeVisible();
+    expect(within(dialog).getByText(/Apply checks current settings before exact-target confirmation/)).toBeVisible();
     expect(within(dialog).getByText(/AgentControl.Admin role is required/)).toBeVisible();
   });
 
   it.each([
-    ["identities", "Overview"], ["package", "Packages"], ["power-platform", "Configuration"],
-    ["reports", "Usage"], ["audit-security", "Activity"], ["controls", "Manage"],
-  ])("preserves the legacy %s route and panel IDs under the %s label", (activeTab, name) => {
+    ["identities", "identities", "Overview"], ["package", "identities", "Overview"], ["power-platform", "identities", "Overview"],
+    ["reports", "reports", "Usage & users"], ["audit-security", "audit-security", "Activity"], ["controls", "controls", "Manage"],
+  ])("resolves the legacy %s route to the %s panel under the %s label", (activeTab, panel, name) => {
     renderDetail({ activeTab });
     expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name })).toHaveAttribute("id", `unified-agent-tab-${activeTab}`);
-    expect(screen.getByRole("tabpanel", { name })).toHaveAttribute("id", `unified-agent-panel-${activeTab}`);
+    expect(screen.getByRole("tab", { name })).toHaveAttribute("id", `unified-agent-tab-${panel}`);
+    expect(screen.getByRole("tabpanel", { name })).toHaveAttribute("id", `unified-agent-panel-${panel}`);
   });
 
-  it("keeps Availability informational and reserves package mutations for Manage", () => {
-    renderDetail({ activeTab: "package" });
-    expect(screen.getByRole("button", { name: "Package details for Package one (package-1)" })).toBeEnabled();
-    expect(screen.getByText("Package management actions are available from the Manage tab.")).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block / })).not.toBeInTheDocument();
+  it("opens useful overview information directly for a legacy package detail route", () => {
+    const { props } = renderDetail({ activeTab: "package" });
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    expect(screen.queryByRole("button", { name: /Package details for|Details & services|Viewing details/ })).not.toBeInTheDocument();
   });
 
-  it("embeds exact package metadata in the agent workspace without opening another dialog", async () => {
+  it("automatically combines rich descriptions, service metadata and native configuration on Overview", async () => {
+    const observed = observedRecord();
+    observed.powerPlatformResource = {
+      ...observed.powerPlatformResource!,
+      createdBy: "Tenant maker",
+      details: { ownerId: "Team owner", model: "Tenant model", authentication: "Organization sign-in", connectors: [{ connectorId: "Configured connector" }] },
+    };
     const packageDetail: CopilotPackageDetail = {
       ...record.packages[0],
       version: "3.2.1",
+      publisher: "Example vendor",
+      longDescription: "<p>A <strong>full vendor description</strong> with useful details.</p>",
       allowedUsersAndGroups: [{ resourceType: "group", resourceId: "group-1" }],
       elementDetails: [{
         elementType: "AgentMetadatas",
         elements: [{ id: "metadata-1", definition: JSON.stringify({ connectorId: "Finance connector" }) }],
       }],
     };
-    const { props, update } = renderDetail({ activeTab: "package" });
-
-    await userEvent.click(screen.getByRole("button", { name: "Package details for Package one (package-1)" }));
+    const { props, update } = renderDetail({ record: observed });
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
-    update({ activeTab: "package", packageDetail });
+    update({ packageDetail });
 
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
-    expect(screen.getByRole("heading", { name: "Package details" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Agent information" })).toBeVisible();
+    expect(screen.getByText("full vendor description").tagName).toBe("STRONG");
+    expect(screen.getByText("full vendor description")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Connected services" })).toBeVisible();
     expect(screen.getByText("Finance connector")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Package details for Package one (package-1)" })).toHaveAttribute("aria-pressed", "true");
+    for (const value of ["Example vendor", "Team owner", "Tenant maker", "Tenant model", "Organization sign-in", "Configured connector"]) {
+      expect(screen.getByText(value)).toBeVisible();
+    }
+    expect(screen.getByText("Technical details").closest("details")).not.toHaveAttribute("open");
+    expect(screen.queryByRole("button", { name: /Details & services|Viewing details|Package details for/ })).not.toBeInTheDocument();
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
 
+  it.each(["identities", "reports", "controls", "audit-security"])("does not duplicate the tab navigation with buttons in %s", activeTab => {
+    renderDetail({ activeTab });
+    expect(screen.queryByRole("button", {
+      name: /^(Review usage & users|Review access & controls|Investigate activity|View this agent's activity|Details & services|Viewing details)$/,
+    })).not.toBeInTheDocument();
+  });
+
+  it("requests saved details once in Strict Mode and does not refetch on ordinary tab changes", async () => {
+    const { props, update } = renderDetail({}, undefined, undefined, { reactStrictMode: true });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    update({ packageDetail: { ...record.packages[0], longDescription: "Saved detailed description." } });
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Overview" }));
+    expect(screen.getByText("Saved detailed description.")).toBeVisible();
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+  });
+
+  it("switches exact version details without another dialog and never shows the previous version's metadata", async () => {
+    const first = record.packages[0];
+    const second = { ...first, id: "second-package", displayName: "Second version", version: "2" };
+    const group = { ...record, packages: [first, second] };
+    const { props, update } = renderDetail({
+      record: group,
+      packageDetail: { ...first, longDescription: "First version details" },
+    });
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Published version details" }), second.id);
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(second);
+    expect(screen.queryByText("First version details")).not.toBeInTheDocument();
+    update({ packageDetail: { ...second, longDescription: "Second version details" } });
+    expect(screen.getByText("Second version details")).toBeVisible();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+    expect(screen.getByRole("region", { name: "Manage Second version (second-package)" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Availability settings" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Manage access for|Manage installation for/ })).not.toBeInTheDocument();
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+  });
+
+  it("respects a restored exact version and clears metadata when the agent changes", async () => {
+    const first = record.packages[0];
+    const second = { ...first, id: "second-package", displayName: "Second version" };
+    const { props, update } = renderDetail({
+      record: { ...record, packages: [first, second] },
+      selectedPackageId: second.id,
+      packageDetail: { ...second, longDescription: "Previous agent description" },
+    });
+    expect(screen.getByRole("combobox", { name: "Published version details" })).toHaveValue(second.id);
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    const nextPackage = { ...first, id: "next-package", shortDescription: "Current agent description" };
+    update({ record: { ...record, id: "different-agent", packages: [nextPackage] } });
+    expect(screen.queryByText("Previous agent description")).not.toBeInTheDocument();
+    expect(screen.getByText("Current agent description")).toBeVisible();
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(nextPackage);
+  });
+
+  it("does not silently replace a withdrawn selected version with another management target", async () => {
+    const first = record.packages[0];
+    const second = { ...first, id: "second-package", displayName: "Second version", version: "2" };
+    const { props, update } = renderDetail({
+      record: { ...record, packages: [first, second] }, activeTab: "controls",
+      selectedPackageId: second.id, packageDetail: { ...second, longDescription: "Withdrawn version description" },
+    });
+    update({ record: { ...record, packages: [first] } });
+    expect(screen.getByRole("alert")).toHaveTextContent("The selected published version second-package is no longer");
+    expect(screen.getByRole("combobox", { name: "Published version details" })).toHaveValue("");
+    expect(screen.queryByRole("region", { name: /^Manage / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^(Apply|Block |Unblock )/ })).not.toBeInTheDocument();
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Published version details" }), first.id);
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(first);
+    expect(screen.getByRole("region", { name: "Manage Package one (package-1)" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("rejects an unavailable restored version rather than reading or managing the first package", () => {
+    const { props } = renderDetail({ selectedPackageId: "unavailable-package", activeTab: "controls" });
+    expect(screen.getByRole("alert")).toHaveTextContent("unavailable-package");
+    expect(screen.queryByRole("region", { name: /^Manage / })).not.toBeInTheDocument();
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+  });
+
+  it("keeps a new unavailable restored version closed when the logical agent also changes", () => {
+    const first = record.packages[0];
+    const { props, update } = renderDetail({
+      selectedPackageId: first.id, packageDetail: first, activeTab: "controls",
+    });
+    const nextPackage = { ...first, id: "next-package" };
+    update({
+      record: { ...record, id: "different-agent", packages: [nextPackage] },
+      selectedPackageId: "unavailable-restored-package", packageDetail: undefined,
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("unavailable-restored-package");
+    expect(screen.queryByRole("region", { name: /^Manage / })).not.toBeInTheDocument();
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
+  });
+
+  it("selects a newly observed package for a previously resource-only agent", () => {
+    const { props, update } = renderDetail({ record: { ...record, packages: [] } });
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    update({ record });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+  });
+
+  it("defers automatic reads during management and resumes after saved details are invalidated", () => {
+    const { props, update } = renderDetail({ packageActionsBusy: true });
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    update({ packageActionsBusy: false });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ packageActionsBusy: true, packageDetail: { ...record.packages[0] } });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ packageActionsBusy: false, packageDetail: undefined });
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces detail errors without automatic retry loops and supports an explicit saved-only retry", async () => {
+    const { props, update } = renderDetail();
+    update({ packageDetailError: "Saved detail unavailable" });
+    expect(screen.getByRole("alert")).toHaveTextContent("Saved detail unavailable");
+    update({ record: { ...record }, packageDetailError: "Saved detail unavailable" });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+    update({ packageDetailError: undefined, packageDetail: { ...record.packages[0], longDescription: "Recovered saved detail" } });
+    expect(screen.getByText("Recovered saved detail")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["missing action", "missing role"] as const)("does not automatically inspect packages with %s", scenario => {
+    const { props } = renderDetail({ roles: scenario === "missing role" ? [] : user.roles }, undefined,
+      scenario === "missing action" ? [] : undefined);
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    expect(screen.getByText(/Additional saved details require the package read action/)).toBeVisible();
+  });
+
+  it("shows the full service-reference count and pages only the list", async () => {
+    renderDetail({ packageDetail: {
+      ...record.packages[0],
+      elementDetails: [{
+        elementType: "AgentMetadatas",
+        elements: [{ id: "metadata", definition: JSON.stringify({ connections: Array.from({ length: 35 }, (_, index) => ({ connectorId: `Service ${index}` })) }) }],
+      }],
+    } });
+    expect(screen.getByText("35 references", { exact: true })).toBeVisible();
+    const list = screen.getByRole("list", { name: "Detected service references" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(20);
+    await userEvent.click(screen.getByRole("button", { name: "Next references" }));
+    expect(within(list).getAllByRole("listitem")).toHaveLength(15);
+    expect(within(list).getByText("Service 34")).toBeVisible();
+    expect(screen.getByText("35 references", { exact: true })).toBeVisible();
+  });
+
+  it("preserves useful native metadata for a sparse agent without inventing a vendor description or connections", () => {
+    renderDetail({ record: {
+      ...record, packages: [], presence: "power_platform",
+      powerPlatformResource: { ...record.powerPlatformResource, details: { ownerId: "Tenant owner", isWebSearchEnabledForKnowledge: false } },
+    } });
+    expect(screen.getByText("No description provided.")).toBeVisible();
+    const information = screen.getByRole("region", { name: "Agent information" });
+    expect(within(information).getByText("Tenant owner")).toBeVisible();
+    expect(within(information).getByText("Web search for knowledge").nextElementSibling).toHaveTextContent("No");
+    expect(screen.queryByText("0 references")).not.toBeInTheDocument();
+    expect(screen.queryByText("Publisher", { exact: true })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { deployedTo: undefined, expected: "Partially known" },
+    { deployedTo: "unknownFutureValue", expected: "Partially known" },
+    { deployedTo: "none", expected: "No users" },
+    { deployedTo: "all", expected: "Varies by package" },
+  ])("keeps the installation overview consistent with aggregate scope evidence ($deployedTo)", ({ deployedTo, expected }) => {
+    const first = { ...record.packages[0], deployedTo: "none" };
+    const second = { ...first, id: "second-package", deployedTo };
+    renderDetail({ record: { ...record, packages: [first, second] } });
+    expect(screen.getByText("Installed for", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
+  });
+
+  it("keeps reported connector totals separate from retained details and detected references", () => {
+    renderDetail({
+      record: {
+        ...record, powerPlatformResource: {
+          ...record.powerPlatformResource, details: {
+            distinctPowerPlatformConnectors: 5, distinctPowerPlatformConnectorsOperations: 9,
+            connectors: [{ connectorId: "retained-connector" }], connectorDetailsStatus: "partial", capabilityDetailsTruncated: true,
+            channels: ["Teams", "CustomChannel"], quarantinedAt: "2026-09-18T12:00:00Z",
+          },
+        },
+      },
+      packageDetail: {
+        ...record.packages[0], elementDetails: [{
+          elementType: "AgentMetadatas",
+          elements: [{ id: "metadata", definition: '{"connectorId":"Reference one","serviceName":"Reference two"}' }],
+        }],
+      },
+    });
+    expect(screen.getByText("5 configured / 2 references")).toBeVisible();
+    expect(screen.getByText("retained-connector")).toBeVisible();
+    const information = screen.getByRole("region", { name: "Agent information" });
+    expect(within(information).getByText("Configured connector operations").nextElementSibling).toHaveTextContent("9");
+    expect(within(information).getByText("Channels").nextElementSibling).toHaveTextContent("Teams, Custom Channel");
+    expect(within(information).getByText("Last quarantined").nextElementSibling?.querySelector("time")).toHaveAttribute("dateTime", "2026-09-18T12:00:00Z");
+    expect(screen.getByText(/Capability details are partial/)).not.toHaveTextContent("reached its projection limit");
+  });
+
+  it.each([0, 5])("retains a reported connector count of %s when connector details are missing", count => {
+    renderDetail({ record: {
+      ...record, packages: [], powerPlatformResource: {
+        ...record.powerPlatformResource, details: {
+          distinctPowerPlatformConnectors: count, distinctPowerPlatformConnectorsOperations: 0,
+          connectorDetailsStatus: "not_supplied", channels: [],
+        },
+      },
+    } });
+    expect(screen.getByText(`${count} configured`)).toBeVisible();
+    expect(screen.getByText("Configured connector operations").nextElementSibling).toHaveTextContent("0");
+    expect(screen.getByText("Channels").nextElementSibling).toHaveTextContent("None reported");
+    expect(screen.queryByText("No connected-service metadata was reported for this agent.")).not.toBeInTheDocument();
+    expect(screen.getByText(count ? /Configured connector details are not available/ : "No configured connectors were reported.")).toBeVisible();
+  });
+
+  it("does not present a partial retained connector list as the complete configured count", () => {
+    renderDetail({ record: {
+      ...record, packages: [], powerPlatformResource: {
+        ...record.powerPlatformResource, details: { connectors: [{ connectorId: "retained" }], connectorDetailsStatus: "partial" },
+      },
+    } });
+    expect(screen.getByText("1 listed (partial)")).toBeVisible();
+    expect(screen.queryByText("1 configured")).not.toBeInTheDocument();
+  });
+
+  it("includes exact package observations when showing the latest saved inventory time", () => {
+    const observedAt = "2026-09-19T12:00:00Z";
+    renderDetail({ record: {
+      ...record, observations: {
+        ...record.observations, packageSnapshots: {
+          "package-1": {
+            id: "exact-snapshot", snapshotId: "exact-snapshot", current: true, scopeKind: "exact",
+            observedAt, expiresAt: "2026-09-26T12:00:00Z", identityDetails: null,
+          },
+        },
+      },
+    } });
+    expect(screen.getByText("Inventory observed").nextElementSibling?.querySelector("time")).toHaveAttribute("dateTime", observedAt);
+  });
+
+  it("keeps assignment identities readable in Manage for viewers and pages long lists", async () => {
+    renderDetail({
+      activeTab: "controls", roles: ["AgentControl.Viewer"],
+      packageDetail: {
+        ...record.packages[0], allowedUsersAndGroups: Array.from({ length: 10 }, (_, index) => ({ resourceType: "group", resourceId: `group-${index}` })),
+        acquireUsersAndGroups: [{ resourceType: "user", resourceId: "installed-user" }],
+      },
+    });
+    const availability = screen.getByRole("group", { name: "Saved users and groups" });
+    expect(within(availability).getByText("group-0")).toBeVisible();
+    expect(within(availability).getAllByRole("listitem")).toHaveLength(8);
+    await userEvent.click(within(availability).getByRole("button", { name: "Next assignments" }));
+    expect(within(availability).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(availability).getByText("group-9")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByText("installed-user", { exact: true })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Manage access|Manage installation/ })).not.toBeInTheDocument();
+  });
+
+  it("distinguishes unloaded, unreported and explicitly empty saved assignments", async () => {
+    const item = { ...record.packages[0], availableTo: "some", deployedTo: "some" };
+    const { update } = renderDetail({
+      activeTab: "controls", roles: ["AgentControl.Viewer"], record: { ...record, packages: [item] },
+    });
+    expect(screen.getByText("Loading saved agent details...")).toBeVisible();
+    update({ packageDetail: { ...item, acquireUsersAndGroups: [] } });
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("Assignments not reported");
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("No explicit user or group assignments");
+    update({ packageDetail: { ...item, allowedUsersAndGroups: [], acquireUsersAndGroups: [] } });
+    await userEvent.click(screen.getByRole("button", { name: /^Available to/ }));
+    expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("No explicit user or group assignments");
+  });
+
+  it("uses the selected saved detail's block status consistently when choosing the exact control", async () => {
+    const { props } = renderDetail({
+      activeTab: "controls", packageDetail: { ...record.packages[0], isBlocked: true },
+    });
+    const blocking = screen.getByRole("group", { name: "Blocking for package-1" });
+    expect(within(blocking).getByText("Blocked", { exact: true })).toBeVisible();
+    await userEvent.click(within(blocking).getByRole("button", { name: "Unblock Package one (package-1)" }));
+    expect(props.onSetPackageBlocked).toHaveBeenCalledExactlyOnceWith(record.packages[0], false);
+  });
+
+  it("edits availability and installation directly, preserving their separate drafts across the main tabs", async () => {
+    const { props } = renderDetail({ packageDetail: { ...record.packages[0], availableTo: "all", deployedTo: "none" } });
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    const dialog = screen.getByRole("dialog", { name: record.displayName });
+    expect(within(dialog).queryByRole("button", { name: /Manage access|Manage installation/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /All users/ })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /All users/ })).toBeDisabled();
+    await userEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    await userEvent.click(screen.getByRole("radio", { name: /Specific users or groups/ }));
+    await userEvent.click(screen.getByRole("button", { name: /^Available to/ }));
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    await userEvent.click(screen.getByRole("tab", { name: "Overview" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(props.onUpdatePackageAccess).toHaveBeenCalledExactlyOnceWith(record.packages[0], {
+      target: "availability", mode: "replace", scope: "none", principals: [],
+    });
+    expect(screen.getAllByRole("dialog")).toEqual([dialog]);
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("radio", { name: /Specific users or groups/ })).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+  });
+
+  it("loads successful access changes without returning installation to the availability setting", async () => {
+    const detail = { ...record.packages[0], availableTo: "all", deployedTo: "none" };
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: detail });
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    update({ packageDetail: { ...detail, deployedTo: "some", acquireUsersAndGroups: [{ resourceType: "group", resourceId: "new-group" }] }, packageAccessRevisions: new Map([["package-1", 1]]) });
+    expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
+    expect(screen.getByRole("radio", { name: /Specific users or groups/ })).toBeChecked();
+    expect(screen.getByText("new-group", { exact: true })).toBeVisible();
+  });
+
+  it("resolves installation assignments only after the setting navigation becomes enabled", async () => {
+    const installed = { resourceType: "user", resourceId: "installed-user", displayName: "Installed user", principalKind: "user" as const };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: [installed] });
+    const detail = {
+      ...record.packages[0], availableTo: "none", allowedUsersAndGroups: [],
+      deployedTo: "some", acquireUsersAndGroups: [{ resourceType: installed.resourceType, resourceId: installed.resourceId }],
+    };
+    const { update } = renderDetail({
+      activeTab: "controls", packageDetail: detail, packageActionsBusy: true,
+    }, capabilitiesWithDirectory());
+    expect(screen.queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Installed for/ })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("region", { name: "Availability settings" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Installation settings" })).not.toBeInTheDocument();
+    expect(resolve).not.toHaveBeenCalled();
+    update({ packageActionsBusy: false });
+    expect(screen.getByRole("button", { name: /^Installed for/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
+    expect(await screen.findByText("Installed user", { exact: true })).toBeVisible();
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+  });
+
+  it("restarts pending assignment resolution after a saved-detail reload and ignores the cancelled response", async () => {
+    type Resolution = Awaited<ReturnType<typeof api.resolveDirectoryPrincipals>>;
+    let completeStale!: (response: Resolution) => void;
+    const stale = new Promise<Resolution>(resolve => { completeStale = resolve; });
+    const installed = { resourceType: "user", resourceId: "installed-user", displayName: "Installed user", principalKind: "user" as const };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+      .mockReturnValueOnce(stale)
+      .mockResolvedValue({ value: [installed] });
+    const detail = {
+      ...record.packages[0], availableTo: "none", allowedUsersAndGroups: [],
+      deployedTo: "some", acquireUsersAndGroups: [{ resourceType: installed.resourceType, resourceId: installed.resourceId }],
+    };
+    const { update } = renderDetail({
+      activeTab: "controls", packageDetail: detail, packageAccessRevisions: new Map([[detail.id, 1]]),
+    }, capabilitiesWithDirectory());
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    expect(screen.getByText("Resolving current assignments...")).toBeVisible();
+    update({ packageDetail: undefined, packageDetailLoading: true });
+    expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
+    update({
+      packageDetail: { ...detail, acquireUsersAndGroups: detail.acquireUsersAndGroups.map(principal => ({ ...principal })) },
+      packageDetailLoading: false,
+    });
+    expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
+    expect(await screen.findByText("Installed user", { exact: true })).toBeVisible();
+    expect(resolve).toHaveBeenCalledTimes(2);
+    await act(async () => completeStale({ value: [{ ...installed, displayName: "Stale installed user" }] }));
+    expect(screen.getByText("Installed user", { exact: true })).toBeVisible();
+    expect(screen.queryByText("Stale installed user")).not.toBeInTheDocument();
+  });
+
+  it("retains completed assignment resolution when a saved reload interrupts its promise completion", async () => {
+    type Resolution = Awaited<ReturnType<typeof api.resolveDirectoryPrincipals>>;
+    let complete!: (response: Resolution) => void;
+    const request = new Promise<Resolution>(resolve => { complete = resolve; });
+    const installed = { resourceType: "user", resourceId: "installed-user", displayName: "Installed user", principalKind: "user" as const };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockReturnValue(request);
+    const detail = {
+      ...record.packages[0], availableTo: "none", allowedUsersAndGroups: [],
+      deployedTo: "some", acquireUsersAndGroups: [{ resourceType: installed.resourceType, resourceId: installed.resourceId }],
+    };
+    const { update } = renderDetail({
+      activeTab: "controls", packageDetail: detail, packageAccessRevisions: new Map([[detail.id, 1]]),
+    }, capabilitiesWithDirectory());
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    const interrupt = request.then(() => {
+      flushSync(() => update({ packageDetail: undefined, packageDetailLoading: true }));
+    });
+    await act(async () => {
+      complete({ value: [installed] });
+      await interrupt;
+    });
+    update({ packageDetail: { ...detail }, packageDetailLoading: false });
+    expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
+    expect(screen.getByText("Installed user", { exact: true })).toBeVisible();
+    expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+  });
+
+  it("does not relabel an unsaved assignment draft as saved when directory permission becomes unavailable", async () => {
+    const principals = ["saved-a", "saved-b"].map(resourceId => ({
+      resourceId, resourceType: "group", displayName: resourceId, principalKind: "unknown" as const,
+    }));
+    vi.spyOn(api, "resolveDirectoryPrincipals").mockResolvedValue({ value: principals });
+    const views = capabilitiesWithDirectory();
+    const { props, update } = renderDetail({
+      activeTab: "controls", packageDetail: {
+        ...record.packages[0], availableTo: "some",
+        allowedUsersAndGroups: principals.map(({ resourceId, resourceType }) => ({ resourceId, resourceType })),
+      },
+    }, views);
+    await userEvent.click(await screen.findByRole("button", { name: "Remove saved-a" }));
+    update({}, capabilities());
+    const selected = screen.getByRole("group", { name: "Selected users and groups" });
+    expect(selected).toHaveTextContent("1 selected user or group assignment");
+    expect(within(selected).getByText("saved-b")).toBeVisible();
+    expect(within(selected).queryByText("saved-a")).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Saved users and groups" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+  });
+
+  it("keeps preview errors and retry in the inline editor without creating another dialog", async () => {
+    const submit = vi.fn().mockRejectedValueOnce(new Error("Current access could not be verified")).mockResolvedValue(undefined);
+    renderDetail({ activeTab: "controls", onUpdatePackageAccess: submit });
+    await userEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Current access could not be verified");
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(submit).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each(["graph_packages", "power_platform", "both"] as const)("shows honest agent-specific usage availability for %s without importing unrelated reports", async presence => {
+    const observed = observedRecord();
+    const current: UnifiedAgentRecord = {
+      ...observed, presence, displayName: "Researcher",
+      packages: presence === "power_platform" ? [] : observed.packages,
+      powerPlatformResource: presence === "graph_packages" ? null : observed.powerPlatformResource,
+    };
+    const { props, update } = renderDetail({ record: current, activeTab: "reports" });
+    const usage = await screen.findByRole("region", { name: "Usage and users for Researcher" });
+    expect(within(usage).getByRole("heading", { name: "No verified usage data for this agent" })).toBeVisible();
+    expect(within(usage).getByText(/Its response totals, active users, and last-used date are unavailable/)).toHaveTextContent("Researcher");
+    expect(within(usage).getByText(/Missing usage data does not mean zero usage/)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Users of the reported agent" })).not.toBeInTheDocument();
+    expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    if (presence === "graph_packages") expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
+    expect(within(usage).queryByRole("button")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
+    update({ activeTab: "controls" });
+    expect(screen.getByRole("heading", { name: "Manage" })).toBeVisible();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
   it("falls back to Overview for an unknown route and supports keyboard tab navigation", () => {
     const { props, update } = renderDetail({ activeTab: "legacy-unknown-tab" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
     update({ activeTab: undefined });
     fireEvent.keyDown(screen.getByRole("tab", { name: "Overview" }), { key: "End" });
-    expect(screen.getByRole("tab", { name: "Manage" })).toHaveFocus();
-    expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
-    fireEvent.keyDown(screen.getByRole("tab", { name: "Manage" }), { key: "ArrowRight" });
+    expect(screen.getByRole("tab", { name: "Activity" })).toHaveFocus();
+    expect(props.onTabChange).toHaveBeenLastCalledWith("audit-security");
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Activity" }), { key: "ArrowRight" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveFocus();
     expect(props.onTabChange).toHaveBeenLastCalledWith("identities");
     fireEvent.keyDown(screen.getByRole("tab", { name: "Overview" }), { key: "ArrowLeft" });
-    expect(screen.getByRole("tab", { name: "Manage" })).toHaveFocus();
-    fireEvent.keyDown(screen.getByRole("tab", { name: "Manage" }), { key: "Home" });
+    expect(screen.getByRole("tab", { name: "Activity" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Activity" }), { key: "Home" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveFocus();
   });
 
+  it("keeps unavailable usage scoped to the current agent across record and name changes", async () => {
+    const first: UnifiedAgentRecord = { ...record, displayName: "Researcher", presence: "graph_packages", powerPlatformResource: null };
+    const { update } = renderDetail({ record: first, activeTab: "reports" });
+    expect(await screen.findByRole("region", { name: "Usage and users for Researcher" })).toBeVisible();
+    update({ record: { ...first, id: "different-agent" } });
+    expect(screen.getByRole("heading", { name: "No verified usage data for this agent" })).toBeVisible();
+    update({ record: { ...first, id: "different-agent", displayName: "Different agent" } });
+    expect(screen.getByRole("region", { name: "Usage and users for Different agent" })).toBeVisible();
+    expect(screen.queryByText("Researcher")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
+    expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+  });
+
+  it("resets panel scroll when switching tasks", () => {
+    renderDetail();
+    const overview = screen.getByRole("tabpanel", { name: "Overview" });
+    overview.scrollTop = 500;
+    fireEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.getByRole("tabpanel", { name: "Manage" }).scrollTop).toBe(0);
+  });
   it("accepts the singular shorthand but always emits the existing identities tab ID", () => {
     const { props } = renderDetail({ activeTab: "identity" });
     expect(screen.getByRole("tabpanel", { name: "Overview" })).toHaveAttribute("id", "unified-agent-panel-identities");
@@ -377,12 +926,24 @@ describe("UnifiedAgentDetailModal", () => {
     expect(diagnostic.parentElement).toHaveTextContent("Select this agent on Agents");
     expect(diagnostic.parentElement).toHaveTextContent("Sync > Advanced results");
     expect(diagnostic.parentElement).toHaveTextContent("Refresh matching details");
-    expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Manage installation for Package one (package-1)" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /^Available to/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /^Installed for/ })).toBeEnabled();
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Block Package one (package-1)" })).toBeEnabled();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
     update({ record: observed });
     expect(screen.queryByText("Invalid saved matching metadata.")).not.toBeInTheDocument();
+  });
+
+  it("does not contradict a completed identity collection with instructions to repeat it", async () => {
+    const reason = "Package details were collected, but no source-declared agent identity metadata was supplied.";
+    renderDetail({ record: {
+      ...record, presence: "graph_packages", powerPlatformResource: null,
+      identity: { state: "unmatched", evidence: [], packageEvidence: [], reason },
+    } });
+    await userEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByText(reason)).toBeVisible();
+    expect(screen.queryByText("Refresh matching details")).not.toBeInTheDocument();
   });
 
   it.each([false, true])("requires an explicit backend-supplied CDS bot identifier despite corroborated evidence (supplied=%s)", async supplied => {
@@ -391,7 +952,7 @@ describe("UnifiedAgentDetailModal", () => {
     if (supplied) expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     else {
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
-      expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+      expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
     }
     expect(api.previewQuarantine).not.toHaveBeenCalled();
     expect(api.submitQuarantine).not.toHaveBeenCalled();
@@ -436,10 +997,10 @@ describe("UnifiedAgentDetailModal", () => {
     const { props } = renderDetail({ record: grouped, activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
     for (const item of grouped.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
-      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await submitInlineAccess(item, "availability");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "availability", mode: "replace", scope: "none", principals: [] });
+      await submitInlineAccess(item, "installation");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "installation", mode: "replace", scope: "none", principals: [] });
       await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
       expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
     }
@@ -453,7 +1014,7 @@ describe("UnifiedAgentDetailModal", () => {
       expect(grouped.powerPlatformResource!.nativeId).not.toBe(botApplicationId);
     } else {
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
-      expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+      expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
       expect(api.previewQuarantine).not.toHaveBeenCalled();
     }
     expect(api.submitQuarantine).not.toHaveBeenCalled();
@@ -484,8 +1045,8 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).toBeVisible();
     await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
-    expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
+    expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeEnabled();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
@@ -510,13 +1071,13 @@ describe("UnifiedAgentDetailModal", () => {
         record={{ ...record, powerPlatformResource: resource }}
         activeTab="power-platform" roles={["AgentControl.Viewer"]}
         onTabChange={vi.fn()} onClose={vi.fn()} onInspectPackage={vi.fn()}
-        onManagePackageAccess={vi.fn()} onSetPackageBlocked={vi.fn()}
+        onUpdatePackageAccess={vi.fn().mockResolvedValue(undefined)} onSetPackageBlocked={vi.fn()}
       />
     </WorkbenchActionProvider>);
     for (const value of ["native-owner", "native-schema", "configured-model", "configured-authentication", "configured-orchestration", "native-connector", "Read records"]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
-    expect(screen.getByText("Provider origin (raw)").nextElementSibling).toHaveTextContent("FutureProvider.vNext_build-X");
+    expect(screen.getByText("Authoring tool (raw)").nextElementSibling).toHaveTextContent("FutureProvider.vNext_build-X");
     expect(screen.getByText("Authoring tool").nextElementSibling).toHaveTextContent("Not supplied");
     expect(screen.getByText(/Capability details are partial/)).toBeInTheDocument();
   });
@@ -536,16 +1097,17 @@ describe("UnifiedAgentDetailModal", () => {
       },
     };
     const modal = (value: UnifiedAgentRecord) => <WorkbenchActionProvider value={[]}>
-      <UnifiedAgentDetailModal record={value} activeTab="reports" roles={["AgentControl.Viewer"]}
+      <UnifiedAgentDetailModal record={value} activeTab="audit-security" roles={["AgentControl.Viewer"]}
         onTabChange={vi.fn()} onClose={vi.fn()} onInspectPackage={vi.fn()}
-        onManagePackageAccess={vi.fn()} onSetPackageBlocked={vi.fn()} />
+        onUpdatePackageAccess={vi.fn().mockResolvedValue(undefined)} onSetPackageBlocked={vi.fn()} />
     </WorkbenchActionProvider>;
     const { rerender } = render(modal(observed));
     expect(await screen.findByText("Previous source lookup failed")).toBeInTheDocument();
     rerender(modal({ ...record, id: "package-only", powerPlatformResource: null }));
     expect(screen.queryByText("Previous source lookup failed")).not.toBeInTheDocument();
     expect(screen.queryByText(/Loading authorized exact source associations/)).not.toBeInTheDocument();
-    expect(screen.getByText(/No Power Platform resource is linked/)).toBeInTheDocument();
+    expect(screen.getByText("No saved activity is linked to this agent's inventory record.")).toBeVisible();
+    expect(screen.queryByRole("link", { name: "Search tenant interactions" })).not.toBeInTheDocument();
     expect(lookup).toHaveBeenCalledOnce();
   });
 
@@ -561,7 +1123,7 @@ describe("UnifiedAgentDetailModal", () => {
         if (outcome === "error") reject(new Error("Previous target lookup failed"));
         else resolve({
           ...sourceAwareDetail(first),
-          reports: { status: "unavailable", reason: "Previous target reports" },
+          audit: { status: "unavailable", reason: "Previous target audit" },
         });
       };
     });
@@ -569,9 +1131,9 @@ describe("UnifiedAgentDetailModal", () => {
       .mockReturnValueOnce(pending)
       .mockResolvedValueOnce({
         ...sourceAwareDetail(next),
-        reports: { status: "unavailable", reason: "Current target reports" },
+        audit: { status: "unavailable", reason: "Current target audit" },
       });
-    const { update, unmount } = renderDetail({ record: first, activeTab: "reports" });
+    const { update, unmount } = renderDetail({ record: first, activeTab: "audit-security" });
     expect(lookup).toHaveBeenNthCalledWith(1, {
       snapshotId: first.observations.powerPlatform!.snapshotId,
       nativeId: first.powerPlatformResource!.nativeId,
@@ -580,9 +1142,9 @@ describe("UnifiedAgentDetailModal", () => {
     }, { signal: expect.any(AbortSignal) });
     update({ record: next });
     expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
-    expect(await screen.findByText("Unavailable: Current target reports")).toBeVisible();
+    expect(await screen.findByText("Unavailable: Current target audit")).toBeVisible();
     await act(async () => { finish(); });
-    expect(screen.getByText("Unavailable: Current target reports")).toBeVisible();
+    expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
     expect(screen.queryByText(/Previous target/)).not.toBeInTheDocument();
     unmount();
     expect(lookup.mock.calls[1][1]?.signal?.aborted).toBe(true);
@@ -625,15 +1187,18 @@ describe("UnifiedAgentDetailModal", () => {
     ];
     const { props } = renderDetail({ record: observed, activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
-    expect(screen.getByRole("heading", { name: "Package controls" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Manage" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Quarantine and restore" })).toBeVisible();
-    expect(screen.getByText(/Available to: All users.*Installed for: Specific users or groups/)).toBeVisible();
-    expect(screen.getByText(/Available to: Unknown.*Installed for: Unknown/)).toBeVisible();
+    expect(screen.getByRole("region", { name: "Availability settings" })).toHaveTextContent("Saved: All users");
+    await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(screen.getByRole("region", { name: "Installation settings" })).toHaveTextContent("Saved: Specific users or groups");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Published version details" }), "package-2");
+    expect(screen.getByRole("region", { name: "Availability settings" })).toHaveTextContent("Saved: Unknown");
     for (const item of observed.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
-      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await submitInlineAccess(item, "availability");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "availability", mode: "replace", scope: "none", principals: [] });
+      await submitInlineAccess(item, "installation");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "installation", mode: "replace", scope: "none", principals: [] });
       await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
       expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
     }
@@ -644,10 +1209,10 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
-  it("keeps package-only controls available and explains missing quarantine without inventing a target", () => {
+  it("keeps package-only controls available without advertising an inapplicable quarantine section", () => {
     renderDetail({ record: { ...record, powerPlatformResource: null }, activeTab: "controls" });
-    expect(screen.getByRole("button", { name: "Manage access for Package one (package-1)" })).toBeEnabled();
-    expect(screen.getByText(/Quarantine is unavailable/)).toBeVisible();
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeEnabled();
+    expect(screen.queryByRole("heading", { name: "Quarantine and restore" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
   });
@@ -661,10 +1226,10 @@ describe("UnifiedAgentDetailModal", () => {
     };
     const { props } = renderDetail({ record: group, activeTab: "controls" });
     for (const item of group.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Manage access for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "availability");
-      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await submitInlineAccess(item, "availability");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "availability", mode: "replace", scope: "none", principals: [] });
+      await submitInlineAccess(item, "installation");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "installation", mode: "replace", scope: "none", principals: [] });
       await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
       expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
     }
@@ -688,11 +1253,11 @@ describe("UnifiedAgentDetailModal", () => {
     };
     const { props } = renderDetail({ record: observed, activeTab: "controls" });
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
-    expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
+    expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
     for (const item of observed.packages) {
-      await userEvent.click(screen.getByRole("button", { name: `Manage installation for ${item.displayName} (${item.id})` }));
-      expect(props.onManagePackageAccess).toHaveBeenLastCalledWith(item, "installation");
+      await submitInlineAccess(item, "installation");
+      expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "installation", mode: "replace", scope: "none", principals: [] });
       await userEvent.click(screen.getByRole("button", { name: `${item.isBlocked ? "Unblock" : "Block"} ${item.displayName} (${item.id})` }));
       expect(props.onSetPackageBlocked).toHaveBeenLastCalledWith(item, !item.isBlocked);
     }
@@ -726,7 +1291,6 @@ describe("UnifiedAgentDetailModal", () => {
     const { props } = renderDetail({ record: observedRecord(), activeTab: "controls" }, views, scenario === "missing-metadata" ? [] : workbenchActions);
     await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
     for (const name of [
-      "Manage access for Package one (package-1)", "Manage installation for Package one (package-1)",
       "Block Package one (package-1)", "Quarantine", "Restore from quarantine",
     ]) {
       const button = screen.getByRole("button", { name });
@@ -734,7 +1298,9 @@ describe("UnifiedAgentDetailModal", () => {
       expect(button).toHaveAttribute("aria-describedby");
       await userEvent.click(button);
     }
-    expect(props.onManagePackageAccess).not.toHaveBeenCalled();
+    for (const radio of screen.getAllByRole("radio")) expect(radio).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
     expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
     expect(api.submitQuarantine).not.toHaveBeenCalled();
@@ -754,6 +1320,7 @@ describe("UnifiedAgentDetailModal", () => {
       if (scenario === "duplicate-bot") resource.identifiers.push({ kind: "cds_bot_id", value: "33333333-3333-4333-8333-333333333333" });
       renderDetail({ record: observed, activeTab: "controls" });
       if (observed.observations.powerPlatform) await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+      await userEvent.click(screen.getByText("Additional control availability"));
       expect(screen.getByText(/Quarantine is unavailable/)).toBeVisible();
       if (scenario === "missing-bot") expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
@@ -794,8 +1361,35 @@ describe("UnifiedAgentDetailModal", () => {
       action: "quarantine", snapshotId: snapshot.id, resourceNativeIds: [record.powerPlatformResource.nativeId], confirmationHash: preview.confirmationHash,
     }, expect.stringMatching(/^[0-9a-f-]{36}$/));
     expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
-    expect(props.onManagePackageAccess).not.toHaveBeenCalled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
     expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it("does not carry a quarantine job and its recovery controls to a different native target", async () => {
+    const observed = observedRecord();
+    const preview = quarantinePreview(observed);
+    const timestamp = observed.observations.powerPlatform!.observedAt;
+    vi.mocked(api.previewQuarantine).mockResolvedValue(preview);
+    vi.mocked(api.submitQuarantine).mockResolvedValue({
+      id: "previous-target-job", action: "quarantine", status: "succeeded", confirmationHash: preview.confirmationHash, confirmation: preview.summary,
+      isCanary: false, total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
+      canResume: false, canReconcile: false, createdAt: timestamp, updatedAt: timestamp, results: [],
+    });
+    const { update } = renderDetail({ record: observed, activeTab: "controls" });
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    await userEvent.click(within(confirmation).getByRole("checkbox"));
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm quarantine" }));
+    expect(await screen.findByText("Quarantine job: Succeeded")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh job status" })).toBeVisible();
+    update({ record: {
+      ...observed, id: "different-logical-agent",
+      powerPlatformResource: { ...observed.powerPlatformResource!, nativeId: "different-native-agent" },
+    } });
+    expect(screen.queryByText("Quarantine job: Succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh job status" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    expect(api.submitQuarantine).toHaveBeenCalledOnce();
   });
 
   it.each(["close button", "cancel button", "Escape"] as const)("dismisses only the quarantine confirmation using its %s", async action => {
@@ -804,7 +1398,7 @@ describe("UnifiedAgentDetailModal", () => {
     const ancestorCancel = vi.fn();
     const ancestorKeyDown = vi.fn();
     vi.mocked(api.previewQuarantine).mockResolvedValue(quarantinePreview(observed));
-    const { props } = renderDetail({ record: observed, activeTab: "controls", externalAccessEditorOpen: true }, capabilities(), workbenchActions, {
+    const { props } = renderDetail({ record: observed, activeTab: "controls" }, capabilities(), workbenchActions, {
       wrapper: ({ children }) => <dialog open aria-label="Ancestor dialog" onClose={ancestorClose} onCancel={ancestorCancel} onKeyDown={ancestorKeyDown}>{children}</dialog>,
     });
     await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
@@ -861,14 +1455,16 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
-  it("does not close the parent dialog on Escape while the access editor is open", () => {
-    const { props, update } = renderDetail({ externalAccessEditorOpen: true });
+  it("cancels an inline package confirmation before closing the agent on Escape", () => {
+    const cancelConfirmation = vi.fn();
+    const { props, update } = renderDetail({ packageConfirmation: <p>Exact package confirmation</p>, onCancelPackageConfirmation: cancelConfirmation });
     const dialog = screen.getByRole("dialog", { name: record.displayName });
     const cancel = new Event("cancel", { cancelable: true });
     fireEvent(dialog, cancel);
     expect(cancel.defaultPrevented).toBe(true);
+    expect(cancelConfirmation).toHaveBeenCalledOnce();
     expect(props.onClose).not.toHaveBeenCalled();
-    update({ externalAccessEditorOpen: false });
+    update({ packageConfirmation: undefined });
     const nextCancel = new Event("cancel", { cancelable: true });
     fireEvent(dialog, nextCancel);
     expect(nextCancel.defaultPrevented).toBe(false);

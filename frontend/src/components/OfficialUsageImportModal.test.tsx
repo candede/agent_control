@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { OfficialUsageImportModal } from "./OfficialUsageImportModal";
 import { mockNativeDialogs } from "../test/dialog";
@@ -11,6 +12,37 @@ vi.mock("./OfficialUsageImportPanel", () => ({
 }));
 
 describe("OfficialUsageImportModal", () => {
+  it("returns a deep-linked import dialog to its live external report trigger", async () => {
+    const trigger = createRef<HTMLButtonElement>();
+    render(<>
+      <button ref={trigger}>Report import trigger</button>
+      <OfficialUsageImportModal showTrigger={false} initialStagingId="retained-staging" returnFocusRef={trigger} onChanged={vi.fn()} />
+    </>);
+    const dialog = await screen.findByRole("dialog", { name: "Import and manage reports" });
+    await userEvent.click(screen.getByRole("button", { name: "Close report import" }));
+    await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
+    expect(screen.getByRole("button", { name: "Report import trigger" })).toHaveFocus();
+  });
+
+  it("prefers the actual connected opener to the fallback report trigger", async () => {
+    function Host() {
+      const [request, setRequest] = useState(0);
+      const trigger = createRef<HTMLButtonElement>();
+      return <>
+        <button ref={trigger}>Report import trigger</button>
+        <button onClick={() => setRequest(value => value + 1)}>Sync import trigger</button>
+        <OfficialUsageImportModal showTrigger={false} openRequest={request} returnFocusRef={trigger} onChanged={vi.fn()} />
+      </>;
+    }
+    render(<Host />);
+    const opener = screen.getByRole("button", { name: "Sync import trigger" });
+    await userEvent.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "Import and manage reports" });
+    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+    await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
+    expect(opener).toHaveFocus();
+  });
+
   it("opens from the native trigger, closes, and restores trigger focus", async () => {
     const user = userEvent.setup();
     render(<OfficialUsageImportModal onChanged={vi.fn()} />);

@@ -10,9 +10,11 @@ import {
   parseOfficialUsageRoute,
   parsePowerPlatformRoute,
   parseSecurityRoute,
+  parseUsersRoute,
   parseWorkbenchView,
   powerPlatformRouteSearch,
   securityRouteSearch,
+  usersRouteSearch,
   workbenchUrl,
   maximumInlinePackageRouteBytes,
   migratePowerPlatformAgentRoute,
@@ -37,8 +39,22 @@ describe("workbench routing", () => {
     expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
   });
 
+  it("round trips report-scoped user-agent matrix filters without normalizing report identities", () => {
+    const state = {
+      view: "matrix" as const, search: "Ada@example.invalid", agentId: "Report/Agent:Upper",
+      reportSetId: "11111111-1111-4111-8111-111111111111", page: 3,
+    };
+    const query = usersRouteSearch(state);
+    expect(parseUsersRoute(query.toString())).toEqual(state);
+    expect(workbenchUrl("users", query)).toContain("agent=Report%2FAgent%3AUpper");
+    expect(parseUsersRoute("view=unknown&page=-1")).toEqual({ view: "licenses", search: "", agentId: undefined, reportSetId: undefined, page: 0 });
+    expect(usersRouteSearch({ ...state, view: "licenses" }).toString()).toBe("");
+    expect(parseUsersRoute(`view=matrix&agent=${"x".repeat(513)}&snapshot=bad%0Aid`).agentId).toBeUndefined();
+    expect(parseUsersRoute("view=matrix&snapshot=bad%0Aid").reportSetId).toBeUndefined();
+  });
   it("round trips bounded agent search, status and selection", () => {
     const query = agentRouteSearch({
+      agentView: "all",
       search: "  owned bot  ",
       status: "blocked",
       publisher: "all",
@@ -60,6 +76,7 @@ describe("workbench routing", () => {
       "/agents?q=owned+bot&status=blocked&selected=native-1&selected=native-2",
     );
     expect(parseAgentRoute(query.toString())).toEqual({
+      agentView: "all",
       search: "owned bot",
       status: "blocked",
       publisher: "all",
@@ -99,6 +116,7 @@ describe("workbench routing", () => {
   it("moves an oversized 5000-package selection out of the request URL without truncating its count", () => {
     const selectedIds = Array.from({ length: 5_000 }, (_, index) => `package-${index}-${"x".repeat(32)}`);
     const query = agentRouteSearch({
+      agentView: "all",
       search: "",
       status: "all",
       publisher: "all",
@@ -234,6 +252,7 @@ describe("workbench routing", () => {
       detailId: "power_platform:env-a:bot-a",
       selectedPowerPlatformIds: ["power_platform:env-a:bot-a"],
     });
+
     expect(agentRouteSearch(route).has("source")).toBe(false);
     expect(agentRouteSearch(route).has("linkState")).toBe(false);
     expect(parseAgentRoute(agentRouteSearch(route).toString()).detailId).toBe(route.detailId);
@@ -250,6 +269,17 @@ describe("workbench routing", () => {
 
     const officialUsage = parseOfficialUsageRoute("staging=stage-old&snapshot=11111111-1111-4111-8111-111111111111&window=90");
     expect(parseOfficialUsageRoute(officialUsageRouteSearch(officialUsage).toString())).toEqual(officialUsage);
+  });
+
+  it("round trips organization views and all supported table sorts without changing old links", () => {
+    for (const agentView of ["all", "organization", "used", "unknown"] as const) {
+      for (const sortBy of ["hosts", "responses", "activeUsers", "lastActivity", "owner", "publisher"] as const) {
+        const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a"), agentView, sortBy, sortDirection: "desc" as const };
+        expect(parseAgentRoute(agentRouteSearch(route).toString())).toEqual(route);
+      }
+    }
+    expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ agentView: "all", sortBy: "displayName" });
+    expect(agentRouteSearch(parseAgentRoute("")).has("show")).toBe(false);
   });
 
   it("round trips the unified agent inventory export audit action", () => {

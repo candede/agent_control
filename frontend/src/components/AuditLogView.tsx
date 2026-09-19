@@ -28,6 +28,7 @@ import { PurviewAuditView } from "./PurviewAuditView";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
+type AuditReadState = { key: string; value: AuditEvent[]; count: number } | { key: string; error: string };
 
 type AuditLogViewProps = {
   agents: Pick<CopilotPackage, "id" | "displayName">[];
@@ -93,44 +94,32 @@ function LocalAuditLogView({
   onRouteChange: (route: AuditRouteState, push?: boolean) => void;
   route: AuditRouteState;
 }) {
-  const [events, setEvents] = useState<AuditEvent[]>([]);
-  const [totalCount, setTotalCount] = useState(0);
-  const [pageIndex, setPageIndex] = useState(route.page);
+  const [result, setResult] = useState<AuditReadState>();
   const [refreshToken, setRefreshToken] = useState(0);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string>();
-  const [query, setQuery] = useState(route.search);
-  const [actionFilter, setActionFilter] = useState<AuditFilter>(route.action as AuditFilter);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>(route.status as StatusFilter);
+  const [exportError, setExportError] = useState<{ key: string; message: string }>();
   const [detailEvent, setDetailEvent] = useState<AuditEvent>();
   const [exporting, setExporting] = useState(false);
   const exportRequest = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => exportRequest.current?.abort(), []);
+  const query = route.search;
+  const actionFilter = route.action as AuditFilter;
+  const statusFilter = route.status as StatusFilter;
+  const pageIndex = route.page;
   const deferredQuery = useDeferredValue(query);
+  const key = JSON.stringify([actionFilter, deferredQuery.trim(), pageIndex, refreshToken, statusFilter]);
+  const scoped = result?.key === key && query.trim() === deferredQuery.trim() ? result : undefined;
+  const page = scoped && "value" in scoped ? scoped : undefined;
+  const events = page?.value ?? [];
+  const totalCount = page?.count ?? 0;
+  const loading = !scoped;
+  const readError = scoped && "error" in scoped ? scoped.error : undefined;
+  const error = readError ?? (exportError?.key === key ? exportError.message : undefined);
   const syncClampedPage = useEffectEvent((page: number) => {
     onRouteChange({ ...route, page });
   });
 
-  useEffect(() => {
-    let active = true;
-    void Promise.resolve().then(() => {
-      if (!active) return;
-      setQuery(route.search);
-      setActionFilter(route.action as AuditFilter);
-      setStatusFilter(route.status as StatusFilter);
-      setPageIndex(route.page);
-    });
-    return () => { active = false; };
-  }, [route.action, route.page, route.search, route.status]);
-
   function updateRoute(next: Partial<Pick<AuditRouteState, "search" | "action" | "status" | "page">>) {
-    onRouteChange({
-      ...route,
-      search: next.search ?? query,
-      action: next.action ?? actionFilter,
-      status: next.status ?? statusFilter,
-      page: next.page ?? pageIndex,
-    });
+    onRouteChange({ ...route, ...next });
   }
 
   const agentNamesById = useMemo(
@@ -142,9 +131,6 @@ function LocalAuditLogView({
     let cancelled = false;
 
     async function loadPage() {
-      setLoading(true);
-      setError(undefined);
-
       try {
         const response = await getAuditEvents({
           limit: auditPageSize,
@@ -163,24 +149,14 @@ function LocalAuditLogView({
         }
 
         if (pageIndex > lastPageIndex) {
-          setEvents([]);
-          setTotalCount(response.count);
-          setPageIndex(lastPageIndex);
           syncClampedPage(lastPageIndex);
           return;
         }
 
-        setEvents(response.value);
-        setTotalCount(response.count);
+        setResult({ key, value: response.value, count: response.count });
       } catch (requestError) {
         if (!cancelled) {
-          setError(errorMessage(requestError));
-          setEvents([]);
-          setTotalCount(0);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
+          setResult({ key, error: errorMessage(requestError) });
         }
       }
     }
@@ -190,7 +166,7 @@ function LocalAuditLogView({
     return () => {
       cancelled = true;
     };
-  }, [actionFilter, deferredQuery, pageIndex, refreshToken, statusFilter]);
+  }, [actionFilter, deferredQuery, pageIndex, key, statusFilter]);
 
   const succeededCount = events.filter(
     (event) => event.status === "succeeded",
@@ -208,10 +184,6 @@ function LocalAuditLogView({
   const pageEnd = Math.min((pageIndex + 1) * auditPageSize, totalCount);
 
   function handleClearAuditFilters() {
-    setQuery("");
-    setActionFilter("all");
-    setStatusFilter("all");
-    setPageIndex(0);
     onRouteChange({ ...route, search: "", action: "all", status: "all", page: 0 });
   }
 
@@ -220,15 +192,16 @@ function LocalAuditLogView({
   }
 
   async function handleExportAuditCsv() {
-    if (!events.length || exportRequest.current) return;
+    if (loading || !events.length || exportRequest.current) return;
     const controller = new AbortController();
     exportRequest.current = controller;
     setExporting(true);
+    setExportError(undefined);
     try {
       const blob = await downloadAdministrativeAuditCsv(events.map(event => event.id), controller.signal);
       if (!controller.signal.aborted) downloadBlob("administrative-audit.csv", blob);
     } catch (requestError) {
-      if (!controller.signal.aborted) setError(errorMessage(requestError));
+      if (!controller.signal.aborted) setExportError({ key, message: errorMessage(requestError) });
     } finally {
       if (exportRequest.current === controller) exportRequest.current = undefined;
       if (!controller.signal.aborted) setExporting(false);
@@ -241,13 +214,15 @@ function LocalAuditLogView({
         className="summary-grid audit-summary-grid"
         aria-label="Audit summary"
       >
-        <AuditMetric label="Events" value={totalCount} />
-        <AuditMetric label="Page succeeded" value={succeededCount} />
-        <AuditMetric label="Page failed" value={failedCount} />
-        <AuditMetric label="Page skipped" value={skippedCount} />
+        <AuditMetric label="Events" value={page ? totalCount : null} />
+        <AuditMetric label="Page succeeded" value={page ? succeededCount : null} />
+        <AuditMetric label="Page failed" value={page ? failedCount : null} />
+        <AuditMetric label="Page skipped" value={page ? skippedCount : null} />
       </section>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {error ? <div className="error-banner" role="alert">{error}
+        {readError ? <button type="button" className="secondary" onClick={handleRefreshAuditLog}>Retry audit log</button> : null}
+      </div> : null}
 
       <section className="controls audit-controls" aria-label="Audit filters">
         <label className="filter-search">
@@ -255,9 +230,8 @@ function LocalAuditLogView({
           <input
             type="search"
             value={query}
+            maxLength={256}
             onChange={(event) => {
-              setQuery(event.target.value);
-              setPageIndex(0);
               updateRoute({ search: event.target.value, page: 0 });
             }}
             placeholder="Agent, user, group"
@@ -271,8 +245,6 @@ function LocalAuditLogView({
             }
             value={actionFilter}
             onChange={(event) => {
-              setActionFilter(event.target.value as AuditFilter);
-              setPageIndex(0);
               updateRoute({ action: event.target.value, page: 0 });
             }}
           >
@@ -288,6 +260,8 @@ function LocalAuditLogView({
             <option value="export-agent-inventory">Export agent inventory</option>
             <option value="export-package-inventory">Export package inventory</option>
             <option value="export-power-platform-inventory">Export Power Platform inventory</option>
+            <option value="associate-agent-usage">Associate agent usage</option>
+            <option value="remove-agent-usage-association">Remove usage association</option>
           </select>
         </label>
         <label>
@@ -298,8 +272,6 @@ function LocalAuditLogView({
             }
             value={statusFilter}
             onChange={(event) => {
-              setStatusFilter(event.target.value as StatusFilter);
-              setPageIndex(0);
               updateRoute({ status: event.target.value, page: 0 });
             }}
           >
@@ -345,8 +317,13 @@ function LocalAuditLogView({
         </div>
       </section>
 
-      {loading && events.length === 0 ? (
-        <div className="screen-state">Loading audit events...</div>
+      {loading ? (
+        <div className="screen-state" role="status">Loading audit events...</div>
+      ) : readError ? (
+        <div className="empty-state">
+          <h2>Audit events unavailable</h2>
+          <p>The saved audit evidence could not be read. This does not establish that no events occurred.</p>
+        </div>
       ) : events.length === 0 ? (
         <div className="empty-state">
           <h2>No audit events</h2>
@@ -361,15 +338,13 @@ function LocalAuditLogView({
             pageEnd={pageEnd}
             totalCount={totalCount}
             loading={loading}
-            onPageChange={next => { setPageIndex(next); updateRoute({ page: next }); }}
+            onPageChange={next => updateRoute({ page: next })}
             onPrevious={() => {
               const next = Math.max(pageIndex - 1, 0);
-              setPageIndex(next);
               updateRoute({ page: next });
             }}
             onNext={() => {
               const next = Math.min(pageIndex + 1, totalPages - 1);
-              setPageIndex(next);
               updateRoute({ page: next });
             }}
           />
@@ -404,6 +379,7 @@ function AuditTable({
       className="table-shell audit-table-shell"
       role="region"
       aria-label="Audit events"
+      tabIndex={0}
     >
       <div className="selection-summary">
         <span>{events.length.toLocaleString()} events</span>
@@ -602,19 +578,40 @@ function AuditDetailsModal({
   onClose: () => void;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const detailsLog = useRef<HTMLPreElement>(null);
   const closeOnEscape = useEffectEvent(onClose);
 
   useEffect(() => {
-    dialogRef.current?.focus();
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeButton.current?.focus();
 
     function handleKeyDown(keyboardEvent: KeyboardEvent) {
       if (keyboardEvent.key === "Escape") {
+        keyboardEvent.preventDefault();
         closeOnEscape();
+      } else if (keyboardEvent.key === "Tab") {
+        const first = closeButton.current;
+        const last = detailsLog.current ?? first;
+        const active = document.activeElement;
+        if (keyboardEvent.shiftKey && (active === first || active === dialogRef.current)) {
+          keyboardEvent.preventDefault();
+          last?.focus();
+        } else if (!keyboardEvent.shiftKey && active === last) {
+          keyboardEvent.preventDefault();
+          first?.focus();
+        }
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus();
+    };
   }, []);
 
   return (
@@ -633,14 +630,14 @@ function AuditDetailsModal({
             <p className="eyebrow">Audit details</p>
             <h2 id="audit-details-title">Event details</h2>
           </div>
-          <button type="button" className="secondary" onClick={onClose}>
+          <button ref={closeButton} type="button" className="secondary" onClick={onClose}>
             Close
           </button>
         </div>
 
         <section className="audit-details-log">
           {hasAuditDetails(event) ? (
-            <pre>{formatAuditDetailsMessage(event)}</pre>
+            <pre ref={detailsLog} tabIndex={0} aria-label="Recorded audit details">{formatAuditDetailsMessage(event)}</pre>
           ) : (
             <p>No additional details were recorded for this event.</p>
           )}
@@ -650,11 +647,11 @@ function AuditDetailsModal({
   );
 }
 
-function AuditMetric({ label, value }: { label: string; value: number }) {
+function AuditMetric({ label, value }: { label: string; value: number | null }) {
   return (
     <article className="metric">
       <span>{label}</span>
-      <strong>{value.toLocaleString()}</strong>
+      <strong>{value === null ? "Unknown" : value.toLocaleString()}</strong>
     </article>
   );
 }
@@ -663,7 +660,7 @@ function getAuditAgentDisplayName(
   event: AuditEvent,
   agentNamesById: Map<string, string>,
 ) {
-  return event.agentDisplayName || agentNamesById.get(event.agentId);
+  return event.agentDisplayName || (isUsageAssociation(event.action) ? undefined : agentNamesById.get(event.agentId));
 }
 
 function formatActionGroup(event: AuditEvent) {
@@ -692,10 +689,20 @@ function formatAuditAction(action: LocalAuditAction) {
       return "Export Defender hunting";
     case "export-agent-inventory":
       return "Export agent inventory";
+    case "associate-agent-usage":
+      return "Associate agent usage";
+    case "remove-agent-usage-association":
+      return "Remove usage association";
     case "export-package-inventory":
       return "Export package inventory";
     case "export-power-platform-inventory":
       return "Export Power Platform inventory";
+    case "export-official-usage-aggregate":
+      return "Export agent usage report";
+    case "export-official-usage-users":
+      return "Export user usage report";
+    case "export-administrative-audit":
+      return "Export administrative audit";
     case "approve-hunting":
       return "Approve Defender hunting qualification";
     case "qualify-hunting":
@@ -753,6 +760,7 @@ function auditDetailsSummary(event: AuditEvent) {
     summarizeAuditMessage(event.message) ??
     accessMetadataSummary(event) ??
     event.errorCode ??
+    (usageAssociationMetadata(event) ? "Usage association evidence" : undefined) ??
     "Details"
   );
 }
@@ -760,11 +768,11 @@ function auditDetailsSummary(event: AuditEvent) {
 function fullAuditDetailsMessage(event: AuditEvent) {
   return event.message
     ? extractAuditErrorMessage(event.message)
-    : (accessMetadataSummary(event) ?? event.errorCode ?? "Details");
+    : (accessMetadataSummary(event) ?? event.errorCode ?? (usageAssociationMetadata(event) ? "Usage association evidence" : "Details"));
 }
 
 function hasAuditDetails(event: AuditEvent) {
-  return Boolean(event.message || event.errorCode || accessMetadata(event));
+  return Boolean(event.message || event.errorCode || accessMetadata(event) || usageAssociationMetadata(event));
 }
 
 function summarizeAuditMessage(value: string | undefined) {
@@ -784,6 +792,17 @@ function summarizeAuditMessage(value: string | undefined) {
 
 function formatAuditDetailsMessage(event: AuditEvent) {
   const errorDetails = event.metadata?.errorDetails;
+  const usageDetails = usageAssociationMetadata(event);
+
+  if (usageDetails) {
+    return JSON.stringify({
+      ...usageDetails,
+      status: event.status,
+      ...(event.message ? { message: event.message } : {}),
+      ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+      ...(errorDetails !== undefined ? { errorDetails } : {}),
+    }, null, 2);
+  }
 
   if (errorDetails !== undefined) {
     return JSON.stringify(errorDetails, null, 2);
@@ -798,6 +817,22 @@ function formatAuditDetailsMessage(event: AuditEvent) {
   return event.message
     ? formatJsonIfParseable(event.message)
     : (event.errorCode ?? "Details");
+}
+
+function isUsageAssociation(action: LocalAuditAction) {
+  return action === "associate-agent-usage" || action === "remove-agent-usage-association";
+}
+
+function usageAssociationMetadata(event: AuditEvent) {
+  if (!isUsageAssociation(event.action)) return undefined;
+  const metadata = event.metadata;
+  if (!metadata) return undefined;
+  const fields = ["source", "reportSetId", "revision", "selection", "reportAgentHash", "inventoryRevision", "changed", "targetSelectionHash"];
+  const details = Object.fromEntries(fields.flatMap(key => {
+    const value = metadata[key];
+    return typeof value === "string" || typeof value === "boolean" ? [[key, value]] : [];
+  }));
+  return Object.keys(details).length ? details : undefined;
 }
 
 function accessMetadata(event: AuditEvent) {
@@ -885,7 +920,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function errorMessage(error: unknown) {
-  if (error instanceof Error) {
+  if (error instanceof Error && error.message) {
     return error.message;
   }
 
