@@ -11,7 +11,7 @@ import { AppError, errorHandler } from "../errors.js";
 import * as auditLog from "../services/auditLog.js";
 import * as csvExport from "../services/csvExport.js";
 import { parseOfficialUsageReport } from "../services/officialUsageParser.js";
-import type { OfficialUsageAgentDetailView, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
+import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import { createOfficialUsageRouter } from "./officialUsage.js";
 import { declaredRoutePolicies } from "./policy.js";
 
@@ -38,6 +38,7 @@ const providerRead = vi.fn<typeof fetch>();
 let active: PublishedOfficialUsage;
 let retained: PublishedOfficialUsage;
 let server: Server;
+let expectedInventoryReads = 0;
 
 beforeAll(async () => {
   const app = express();
@@ -64,6 +65,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  expectedInventoryReads = 0;
   active = published(activeSetId, 10);
   retained = published(retainedSetId, 25);
   database.query.mockReset().mockRejectedValue(new Error("Unexpected database access"));
@@ -84,7 +86,7 @@ beforeEach(() => {
 
 afterEach(() => {
   try {
-    expect(inventoryRead).not.toHaveBeenCalled();
+    expect(inventoryRead).toHaveBeenCalledTimes(expectedInventoryReads);
     expect(providerRead).not.toHaveBeenCalled();
     expect(database.query).not.toHaveBeenCalled();
     expect(database.connect).not.toHaveBeenCalled();
@@ -99,6 +101,29 @@ afterAll(async () => {
 });
 
 describe("official usage report-agent routes", () => {
+  it("uses the distinct active-user order consistently in aggregate JSON and CSV", async () => {
+    expectedInventoryReads = 2;
+    inventoryRead.mockResolvedValue({
+      value: [], count: 0, snapshot: null,
+      summary: { total: 0, allowed: 0, blocked: 0 },
+      filteredSummary: { total: 0, allowed: 0, blocked: 0 },
+      facets: { publishers: [], availability: [], hosts: [], platforms: [] },
+    });
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
+      completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    const json = await get<OfficialUsageAggregateView>("/api/official-usage/aggregate?sortBy=activeUsers&sortDirection=desc");
+    const csv = await get("/api/official-usage/aggregate.csv?sortBy=activeUsers&sortDirection=desc");
+    expect(json.status).toBe(200);
+    expect(csv.status).toBe(200);
+    expect(json.body.filters.sortBy).toBe("activeUsers");
+    const rows = parseCsv(csv.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+    expect(rows.map(row => row.agentId)).toEqual(json.body.agents.value.map(agent => agent.agentId));
+    expect(json.body.agents.value[0]).toMatchObject({ agentId: "Report-A", activeUsersIdentityCount: 2 });
+  });
+
   it("declares report-agent details as an authenticated Viewer read", () => {
     expect(declaredRoutePolicies.get("GET /official-usage/agents/:agentId")).toEqual({
       access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
@@ -295,9 +320,68 @@ describe("official usage report-agent routes", () => {
       expect.objectContaining({ username: "users-only", agentId: "", reportedResponsesReceived: "200" }),
     ]));
   });
+
+  it("exports all relationships of same-row matching people in the pinned snapshot without UI paging", async () => {
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
+      completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    const response = await get(`${usersPath}.csv?${new URLSearchParams({
+      setId: retainedSetId, agentId: "Report-A", creatorType: "Declarative", responsesOnly: "true",
+      sortBy: "responses", sortDirection: "asc", limit: "1", offset: "1",
+    })}`);
+    expect(response.status).toBe(200);
+    const rows = parseCsv(response.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+    expect(rows.map(row => [row.username, row.agentId, row.reportedResponsesReceived, row.reportSetId])).toEqual([
+      ["caseuser", "Report-A", "4", retainedSetId],
+      ["CaseUser", "Report-A", "50", retainedSetId],
+      ["CaseUser", "Other-agent", "50", retainedSetId],
+    ]);
+    expect(readPublished.mock.calls.every(([, setId]) => setId === retainedSetId)).toBe(true);
+    const noMatch = await get(`${usersPath}.csv?agentId=Report-A&creatorType=Custom&responsesOnly=true`);
+    expect(parseCsv(noMatch.text, { columns: true, bom: true })).toEqual([]);
+  });
+
+  it("exports missing Users totals and absent relationships as unknown, never inferred zero evidence", async () => {
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
+      completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    active.reports.users!.rows = active.reports.users!.rows.filter(row => row.username !== "caseuser");
+    const response = await get(`${usersPath}.csv`);
+    expect(response.status).toBe(200);
+    const rows = parseCsv(response.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+    expect(rows.find(row => row.username === "caseuser")).toMatchObject({
+      userMetricSource: "unknown", reportedAgentsUsed: "Unknown", reportedResponsesReceived: "Unknown",
+      responsesSentToUsers: "1", bridgeResponsesSentToUsers: "1",
+    });
+    expect(rows.find(row => row.username === "users-only")).toMatchObject({
+      reportedResponsesReceived: "200", bridgeResponsesSentToUsers: "Unknown",
+      agentId: "", responsesSentToUsers: "Unknown", hasReportMismatch: "false",
+    });
+    active.reports.userAgents = undefined;
+    const missingCompanion = await get(`${usersPath}.csv?search=CaseUser`);
+    const missingRows = parseCsv(missingCompanion.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+    expect(missingRows[0]).toMatchObject({
+      agentsAccessedTotal: "Unknown", responseProducingAgentCount: "Unknown",
+      bridgeResponsesSentToUsers: "Unknown", reportedResponsesReceived: "50",
+    });
+  });
 });
 
 describe("official usage report-agent query validation", () => {
+  it.each([usersPath, `${usersPath}.csv`])("rejects invalid date and threshold filters at %s before source reads", async path => {
+    for (const query of [
+      "startDate=2026-02-29", "endDate=2026-09-31", "startDate=2026-09-10&endDate=2026-09-09",
+      "startDate=2026-09-10T00:00:00Z", "lowResponseThreshold=0", "lowResponseThreshold=1.5",
+      "lowResponseThreshold=100000001",
+    ]) {
+      expect(await get(`${path}?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });
+    }
+    expect(readPublished).not.toHaveBeenCalled();
+  });
   it.each([
     "/api/official-usage/aggregate", "/api/official-usage/aggregate.csv", "/api/official-usage/history",
   ])("rejects ambiguous or unsupported saved-report queries at %s before reading data", async path => {

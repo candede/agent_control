@@ -163,6 +163,7 @@ export type OfficialUsageDateFilter = {
 export type OfficialUsageAgentSort =
   | "agentName"
   | "responses"
+  | "activeUsers"
   | "licensedUsers"
   | "unlicensedUsers"
   | "lastActivity";
@@ -358,7 +359,7 @@ export type OfficialUsageUserView = {
     userRows: number;
     accessRows: number;
     reportOnlyRows: number;
-    totalResponsesReceived: number;
+    totalResponsesReceived: number | null;
     mismatchCount: number;
   };
   cohorts: {

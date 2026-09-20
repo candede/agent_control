@@ -75,6 +75,7 @@ describe("AgentUsagePanel", () => {
     expect(screen.getByText(/Admin-supplied period: 2026-08-14 to 2026-09-12/)).toBeVisible();
     const link = screen.getByRole("link", { name: "View reported users" });
     const url = new URL(link.getAttribute("href")!, "http://localhost");
+    expect(url.searchParams.get("view")).toBe("activity");
     expect(url.searchParams.get("agent")).toBe(candidate.agentId);
     expect(url.searchParams.get("snapshot")).toBe(reportSetId);
     expect(api.getAgentUsageCandidates).not.toHaveBeenCalled();

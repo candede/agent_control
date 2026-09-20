@@ -30,7 +30,6 @@ import {
   getCurrentUser,
   getWorkbenchMetadata,
   getOfficialUsageAggregate,
-  getOfficialUsageUsers,
   cancelBulkActionJob,
   previewPackageMutation,
   reconcileBulkActionJob,
@@ -60,8 +59,7 @@ import {
   type InventoryRefreshJob,
   type PowerPlatformResource,
   type OfficialUsageAggregateView,
-  type OfficialUsageUserQuery,
-  type OfficialUsageUserView,
+  type OfficialUsageAgentQuery,
   type SessionUser,
   type UnifiedAgentInventoryPage,
   type UnifiedAgentRecord,
@@ -280,23 +278,11 @@ function App() {
     useState<OfficialUsageAggregateView>();
   const [officialUsageAggregateSetId, setOfficialUsageAggregateSetId] =
     useState<string | null>();
-  const [officialUsageUsers, setOfficialUsageUsers] =
-    useState<OfficialUsageUserView>();
-  const [officialUsageUsersSetId, setOfficialUsageUsersSetId] =
-    useState<string | null>();
   const [loadingOfficialUsage, setLoadingOfficialUsage] = useState(false);
   const [officialUsageLoadError, setOfficialUsageLoadError] = useState<string>();
   const [officialUsageAgentOffset, setOfficialUsageAgentOffset] = useState(0);
-  const [officialUsageAgentQuery, setOfficialUsageAgentQuery] = useState<{
-    search?: string;
-    creatorType?: string;
-    startDate?: string;
-    endDate?: string;
-    sortBy?: "agentName" | "responses" | "licensedUsers" | "unlicensedUsers" | "lastActivity";
-    sortDirection?: "asc" | "desc";
-  }>({});
-  const [officialUsageUserOffset, setOfficialUsageUserOffset] = useState(0);
-  const [officialUsageUserQuery, setOfficialUsageUserQuery] = useState<OfficialUsageUserQuery>({});
+  const [officialUsageAgentQuery, setOfficialUsageAgentQuery] = useState<OfficialUsageAgentQuery>({});
+  const [officialUsageTab, setOfficialUsageTab] = useState<"activity" | "history">("activity");
   const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
   const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
   const [powerPlatformDataRevision, setPowerPlatformDataRevision] = useState(0);
@@ -419,8 +405,6 @@ function App() {
       setBulkResult(undefined);
       setOfficialUsageAggregate(undefined);
       setOfficialUsageAggregateSetId(undefined);
-      setOfficialUsageUsers(undefined);
-      setOfficialUsageUsersSetId(undefined);
       setOfficialUsageLoadError(undefined);
       setLoadingOfficialUsage(false);
       setLoadingAgentDetailId(undefined);
@@ -502,8 +486,7 @@ function App() {
         setReportActivityWindowDays(route.activityWindowDays);
         setOfficialUsageAgentOffset(0);
         setOfficialUsageAgentQuery({});
-        setOfficialUsageUserOffset(0);
-        setOfficialUsageUserQuery({});
+        setOfficialUsageTab("activity");
         setOfficialUsageLoadError(undefined);
       }
     }
@@ -869,10 +852,10 @@ function App() {
   }, [agentEnvironmentFilter, agentPageIndex, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
 
   useEffect(() => {
-    if (user) {
-      loadSavedOfficialUsage();
-    }
-  }, [inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageReportSetId, officialUsageUserQuery, reportActivityWindowDays, officialUsageUserOffset, user]);
+    if (!user || activeView !== "official-usage" || officialUsageTab !== "activity") return;
+    loadSavedOfficialUsage();
+    return () => officialUsageAbortController.current?.abort();
+  }, [activeView, inactiveDays, officialUsageAgentOffset, officialUsageAgentQuery, officialUsageDashboardRevision, officialUsageReportSetId, officialUsageTab, reportActivityWindowDays, user]);
 
   useEffect(() => {
     if (!unifiedAgentPage || pendingPowerPlatformIds.size === 0 || !hasRole(user, "AgentControl.Admin") || activeView !== "agents") return;
@@ -1046,19 +1029,6 @@ function App() {
     setUsersRoute(route);
   }
 
-  function handleReportActivityWindowChange(activityWindowDays: number) {
-    const next = workbenchUrl("official-usage", officialUsageRouteSearch({
-      stagingId: requestedOfficialUsageStagingId,
-      reportSetId: officialUsageReportSetId,
-      activityWindowDays,
-    }));
-    savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
-    if (`${window.location.pathname}${window.location.search}` !== next) {
-      window.history.pushState({ view: "official-usage" }, "", next);
-    }
-    setReportActivityWindowDays(activityWindowDays);
-  }
-
   function handleOfficialUsageSnapshotChange(reportSetId: string | undefined) {
     const activityWindowDays = reportSetId ? 365 : 30;
     const next = workbenchUrl("official-usage", officialUsageRouteSearch({
@@ -1075,8 +1045,7 @@ function App() {
     setReportActivityWindowDays(activityWindowDays);
     setOfficialUsageAgentOffset(0);
     setOfficialUsageAgentQuery({});
-    setOfficialUsageUserOffset(0);
-    setOfficialUsageUserQuery({});
+    setOfficialUsageTab("activity");
     setOfficialUsageDashboardRevision(revision => revision + 1);
   }
 
@@ -1084,8 +1053,6 @@ function App() {
     requestCurrentAgentReload();
     setOfficialUsageAgentOffset(0);
     setOfficialUsageAgentQuery({});
-    setOfficialUsageUserOffset(0);
-    setOfficialUsageUserQuery({});
     setOfficialUsageDashboardRevision(revision => revision + 1);
     setCopilotUsersDataRevision(revision => revision + 1);
     void dataSyncPanelRef.current?.refresh();
@@ -1230,11 +1197,9 @@ function App() {
     setLinkedJobError(undefined);
     setOfficialUsageAggregate(undefined);
     setOfficialUsageAggregateSetId(undefined);
-    setOfficialUsageUsers(undefined);
-    setOfficialUsageUsersSetId(undefined);
     setOfficialUsageLoadError(undefined);
     setLoadingOfficialUsage(false);
-    setOfficialUsageUserOffset(0);
+    setOfficialUsageTab("activity");
   }
 
   async function loadSession() {
@@ -1359,8 +1324,11 @@ function App() {
     if (!user) {
       setOfficialUsageAggregate(undefined);
       setOfficialUsageAggregateSetId(undefined);
-      setOfficialUsageUsers(undefined);
-      setOfficialUsageUsersSetId(undefined);
+      setOfficialUsageLoadError(undefined);
+      setLoadingOfficialUsage(false);
+      return;
+    }
+    if (officialUsageAgentQuery.startDate && officialUsageAgentQuery.endDate && officialUsageAgentQuery.startDate > officialUsageAgentQuery.endDate) {
       setOfficialUsageLoadError(undefined);
       setLoadingOfficialUsage(false);
       return;
@@ -1368,49 +1336,30 @@ function App() {
     setLoadingOfficialUsage(true);
     setOfficialUsageLoadError(undefined);
 
-    const [aggregateResult, usersResult] = await Promise.allSettled([
-      hasRole(user, "AgentControl.Viewer")
-        ? getOfficialUsageAggregate({
-            ...officialUsageAgentQuery,
-            ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
-            activityWindowDays: reportActivityWindowDays,
-            inactiveDays,
-            limit: 100,
-            offset: officialUsageAgentOffset,
-        }, { signal: controller.signal })
-        : Promise.resolve(undefined),
-      hasRole(user, "AgentControl.Viewer")
-        ? getOfficialUsageUsers(
-          {
-            ...officialUsageUserQuery,
-            ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
-            inactiveDays,
-            limit: 100,
-            offset: officialUsageUserOffset,
-          },
-          { signal: controller.signal },
-        )
-        : Promise.resolve(undefined),
-    ]);
-
-    if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
-    let loadError: string | undefined;
-    if (aggregateResult.status === "fulfilled") {
-      setOfficialUsageAggregate(aggregateResult.value);
+    try {
+      const aggregate = hasRole(user, "AgentControl.Viewer")
+        ? await getOfficialUsageAggregate({
+          ...officialUsageAgentQuery,
+          ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
+          activityWindowDays: reportActivityWindowDays,
+          inactiveDays,
+          limit: 25,
+          offset: officialUsageAgentOffset,
+        }, { signal: controller.signal }) : undefined;
+      if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
+      setOfficialUsageAggregate(aggregate);
       setOfficialUsageAggregateSetId(requestedSetId);
-    } else if (!(aggregateResult.reason instanceof ApiError && aggregateResult.reason.kind === "aborted")) {
-      loadError = errorMessage(aggregateResult.reason);
+    } catch (failure) {
+      if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
+      if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
+        setOfficialUsageAggregate(undefined);
+        setOfficialUsageAggregateSetId(undefined);
+      }
+      setOfficialUsageLoadError(errorMessage(failure));
+    } finally {
+      if (officialUsageAbortController.current === controller) officialUsageAbortController.current = undefined;
+      if (!controller.signal.aborted && requestId === officialUsageRequestId.current) setLoadingOfficialUsage(false);
     }
-
-    if (usersResult.status === "fulfilled") {
-      setOfficialUsageUsers(usersResult.value);
-      setOfficialUsageUsersSetId(requestedSetId);
-    } else if (!(usersResult.reason instanceof ApiError && usersResult.reason.kind === "aborted")) {
-      loadError ??= errorMessage(usersResult.reason);
-    }
-    setOfficialUsageLoadError(loadError);
-    if (officialUsageAbortController.current === controller) officialUsageAbortController.current = undefined;
-    if (requestId === officialUsageRequestId.current) setLoadingOfficialUsage(false);
   }
 
   async function handleRefreshAgents(idempotencyKey?: string) {
@@ -2441,13 +2390,9 @@ function App() {
   const displayedOfficialUsageAggregate = officialUsageAggregateSetId === selectedOfficialUsageSetId
     ? officialUsageAggregate
     : undefined;
-  const displayedOfficialUsageUsers = officialUsageUsersSetId === selectedOfficialUsageSetId
-    ? officialUsageUsers
-    : undefined;
   const historicalUsageLoaded = Boolean(
     officialUsageReportSetId
-    && officialUsageAggregateSetId === officialUsageReportSetId
-    && officialUsageUsersSetId === officialUsageReportSetId,
+    && officialUsageAggregateSetId === officialUsageReportSetId,
   );
 
   return (
@@ -2886,22 +2831,23 @@ function App() {
           dataRevision={copilotUsersDataRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
-          onSyncUsers={() => {
-            navigateToView("sync");
-            setSyncHistoryRevision(revision => revision + 1);
-            return dataSyncPanelRef.current?.start("incremental", ["users"]) ?? Promise.resolve();
-          }}
         />
       ) : visibleActiveView === "official-usage" ? (
         <section className="official-usage-workbench" aria-label="Official usage">
           <header className="usage-page-header">
             <div>
               <h2>Official usage</h2>
-              <p>Microsoft 365 Copilot Agents activity</p>
+              <p>Tenant-wide agent responses and reach from Microsoft 365 reports.</p>
             </div>
-            {canImportReports ? <button ref={usageImportTrigger} type="button" className="secondary" onClick={() => setUsageImportOpenRequest(request => request + 1)}><Upload size={16} />Import reports</button> : null}
+            <div className="usage-page-header-actions">
+              <div className="usage-page-views" role="group" aria-label="Official usage views">
+                <button type="button" className="secondary" aria-pressed={officialUsageTab === "activity"} onClick={() => setOfficialUsageTab("activity")}>Agent activity</button>
+                <button type="button" className="secondary" aria-pressed={officialUsageTab === "history"} onClick={() => setOfficialUsageTab("history")}>Report history</button>
+              </div>
+              {canImportReports ? <button ref={usageImportTrigger} type="button" className="secondary" onClick={() => setUsageImportOpenRequest(request => request + 1)}><Upload size={16} />Import reports</button> : null}
+            </div>
           </header>
-          {officialUsageReportSetId ? (
+          {officialUsageTab === "activity" && officialUsageReportSetId ? (
             <div className="usage-history-selection" role="status">
               <div>
                 <strong>Historical snapshot view</strong>
@@ -2921,30 +2867,26 @@ function App() {
               <button type="button" className="secondary" onClick={() => handleOfficialUsageSnapshotChange(undefined)}>Return to current snapshot</button>
             </div>
           ) : null}
-          {officialUsageLoadError ? <div className="error-banner" role="alert">{officialUsageLoadError}</div> : null}
-          {hasRole(user, "AgentControl.Viewer") ? <ReportingView
+          {officialUsageTab === "activity" && hasRole(user, "AgentControl.Viewer") ? <ReportingView
             key={`${principalKey}:${officialUsageDashboardRevision}`}
-            activityWindowDays={reportActivityWindowDays}
             data={displayedOfficialUsageAggregate}
-            inactiveDays={inactiveDays}
-            onActivityWindowDaysChange={handleReportActivityWindowChange}
+            query={officialUsageAgentQuery}
+            offset={officialUsageAgentOffset}
+            loading={loadingOfficialUsage}
+            error={officialUsageLoadError}
+            onRetry={() => void loadOfficialUsage()}
             onAgentPageChange={setOfficialUsageAgentOffset}
             onAgentQueryChange={(query) => {
               setOfficialUsageAgentOffset(0);
               setOfficialUsageAgentQuery(query);
             }}
-            onUserPageChange={setOfficialUsageUserOffset}
-            onUserQueryChange={(query) => {
-              setOfficialUsageUserOffset(0);
-              setOfficialUsageUserQuery(query);
-            }}
-            userData={canReadSensitiveUsage ? displayedOfficialUsageUsers : undefined}
           /> : null}
-          <OfficialUsageHistoryPanel
+          {officialUsageTab === "history" ? <OfficialUsageHistoryPanel
+            key={principalKey}
             revision={officialUsageDashboardRevision}
             selectedSetId={officialUsageReportSetId}
             onSelect={handleOfficialUsageSnapshotChange}
-          />
+          /> : null}
         </section>
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />

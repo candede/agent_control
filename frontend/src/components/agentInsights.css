@@ -1,6 +1,5 @@
 .agent-usage-insights,
-.reported-agent-usage,
-.user-agent-matrix {
+.reported-agent-usage {
   display: grid;
   gap: 16px;
   min-width: 0;
@@ -312,73 +311,8 @@
   min-width: 0;
 }
 
-.agent-usage-insights a,
-.user-agent-matrix a {
+.agent-usage-insights a {
   color: var(--ink);
-}
-
-.user-agent-matrix-table {
-  min-width: 620px;
-}
-
-.user-agent-matrix-table th:first-child {
-  position: sticky;
-  left: 0;
-  z-index: 1;
-  width: 180px;
-  min-width: 160px;
-  max-width: 240px;
-  box-shadow: 1px 0 var(--border);
-}
-
-.user-agent-matrix-table thead th:first-child {
-  z-index: 2;
-}
-
-.user-agent-matrix-table th:not(:first-child) {
-  min-width: 130px;
-  max-width: 180px;
-  overflow-wrap: anywhere;
-}
-
-.matrix-agent-button,
-.matrix-user-button {
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  color: var(--ink);
-  background: transparent;
-  font: inherit;
-  font-weight: 650;
-  text-align: left;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.matrix-response {
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-}
-
-.matrix-response.active {
-  color: #21483d;
-  background: #e4f0ea;
-}
-
-.matrix-response.high {
-  color: #163a2f;
-  background: #c9e3d6;
-  font-weight: 700;
-}
-
-.matrix-response.zero {
-  color: #694a1d;
-  background: #fff5e6;
-}
-
-.matrix-response.unreported {
-  color: var(--muted);
-  font-size: 0.75rem;
 }
 
 @media (max-width: 800px) {

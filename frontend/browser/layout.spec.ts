@@ -9,8 +9,8 @@ const cases = [
     fields: [".inventory-controls"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
     fields: [".copilot-users-toolbar"] },
-  { name: "official-usage", path: "/official-usage", ready: ".reporting-view .report-chart-panel",
-    fields: [".usage-filter-grid"] },
+  { name: "official-usage", path: "/official-usage", ready: ".usage-agent-table tbody tr",
+    fields: [".usage-agent-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
   { name: "audit-purview", path: `/audit?source=purview&job=${purviewJob.id}`, ready: ".purview-history-table tbody tr",
@@ -70,7 +70,8 @@ for (const scenario of cases) {
       await expect(page.locator(".usage-report-context")).toContainText("2026-08-30");
       await expect(page.getByRole("dialog")).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeVisible();
-      await expect(page.locator(".recharts-surface").first()).toBeVisible();
+      await expect(page.getByRole("region", { name: "Agent comparison rows" }).locator("tbody tr")).toHaveCount(2);
+      await expect(page.locator(".report-chart-panel")).toHaveCount(0);
     }
     if (scenario.name === "agents") {
       await expect(page.locator(".agent-table-stack .capability-gate > button:disabled").first()).toBeVisible();
@@ -94,7 +95,6 @@ for (const scenario of cases) {
           await document.fonts.ready;
           await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
         });
-        if (scenario.name === "official-usage") await waitForChartsToSettle(page);
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}.png`), fullPage: true, animations: "disabled" });
         await assertLayout(page, scenario.fields, `${scenario.name} at ${width}px`);
@@ -114,9 +114,13 @@ for (const scenario of cases) {
           await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agents_inventory");
         }
         if (scenario.name === "official-usage") {
-          const columns = await page.locator(".activity-window-section .report-chart-grid")
+          const columns = await page.locator(".usage-headline-grid")
             .evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
-          expect.soft(columns, `Four activity charts form complete rows at ${width}px`).toBe(width === 360 ? 1 : 2);
+          expect.soft(columns, `Three headline metrics form complete rows at ${width}px`).toBe(width === 360 ? 1 : 3);
+          if (width >= 1280) {
+            const bounds = await page.getByRole("region", { name: "Agent comparison rows" }).boundingBox();
+            expect(bounds!.y, `Agent comparison begins in the first viewport at ${width}px`).toBeLessThan(760);
+          }
         }
         if (["jobs", "official-usage"].includes(scenario.name) && [360, 1920].includes(width)) {
           await test.step("Reduced-motion layout parity", async () => {
@@ -133,24 +137,11 @@ for (const scenario of cases) {
   });
 }
 
-async function waitForChartsToSettle(page: Page) {
-  let previous = "";
-  let unchanged = 0;
-  // Recharts animates SVG paths in JavaScript, outside screenshot CSS animation control.
-  await expect.poll(async () => {
-    const paths = await page.locator(".recharts-pie-sector path, .recharts-bar-rectangle path")
-      .evaluateAll(elements => elements.map(element => element.getAttribute("d")).join("|"));
-    unchanged = paths && paths === previous ? unchanged + 1 : 0;
-    previous = paths;
-    return unchanged >= 2;
-  }, { message: "Charts should finish drawing before visual evidence is captured" }).toBe(true);
-}
-
 async function assertReducedMotionParity(page: Page, description: string) {
   const surfaces = [
     ".jobs-view", ".job-card", ".job-card-heading", ".job-progress", ".job-progress > span", ".inline-actions",
     ".official-usage-workbench", ".official-usage-import", ".official-usage-fields", ".official-usage-fields > label",
-    ".reporting-view", ".report-section-header", ".report-chart-panel",
+    ".reporting-view", ".usage-comparison-header", ".usage-agent-table", ".usage-agent-filters",
   ].join(", ");
   const geometry = () => page.locator(surfaces).evaluateAll(elements => elements.map(element => {
     const rect = element.getBoundingClientRect();
@@ -206,6 +197,7 @@ async function assertLayout(page: Page, fields: string[], description: string) {
       const widths = elements.filter(element => {
         const css = getComputedStyle(element);
         return !element.classList.contains("filter-search")
+          && !element.matches(".usage-agent-filters > label:first-child")
           && ![css.gridColumnStart, css.gridColumnEnd].some(value => value.includes("span") || value === "-1");
       }).map(element => element.getBoundingClientRect().width);
       if (widths.length > 1 && Math.max(...widths) - Math.min(...widths) > tolerance) {
@@ -232,7 +224,7 @@ async function assertLayout(page: Page, fields: string[], description: string) {
     }
     for (const child of Array.from(shell.children).filter(visible)) contained(child, shell);
     const surfaces = [
-      ".catalog-controls", ".agent-summary-grid", ".inventory-view", ".user-access-view:not(.embedded-user-access)",
+      ".catalog-controls", ".agent-summary-grid", ".inventory-view", ".copilot-users",
       ".official-usage-workbench", ".audit-source-view", ".defender-hunting", ".permission-center", ".jobs-view",
     ];
     for (const surface of Array.from(shell.querySelectorAll(surfaces.join(", "))).filter(visible)) {
@@ -289,7 +281,7 @@ async function assertLayout(page: Page, fields: string[], description: string) {
       }
     }
     const equalGrids = [
-      ".summary-grid", ".report-chart-grid", ".report-table-grid", ".official-usage-lineage",
+      ".summary-grid", ".official-usage-lineage",
       ".hunting-readiness", ".hunting-result-facts", ".purview-result-facts",
     ];
     for (const selector of equalGrids) {

@@ -39,6 +39,6 @@ export function usagePageLabel(page: { value: readonly unknown[]; count: number;
   return `${(page.offset + 1).toLocaleString()}-${Math.min(page.offset + page.value.length, page.count).toLocaleString()} of ${page.count.toLocaleString()} ${items}`;
 }
 
-export function userAgentMatrixUrl(agentId?: string, reportSetId?: string, search = "") {
-  return workbenchUrl("users", usersRouteSearch({ view: "matrix", agentId, reportSetId, search, page: 0 }));
+export function reportedUserActivityUrl(agentId?: string, reportSetId?: string, search = "") {
+  return workbenchUrl("users", usersRouteSearch({ view: "activity", agentId, reportSetId, search, page: 0 }));
 }

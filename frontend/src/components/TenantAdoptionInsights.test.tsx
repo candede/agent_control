@@ -22,6 +22,7 @@ describe("tenant adoption insights", () => {
     expect(screen.getByRole("region", { name: "Tenant adoption insights" })).toBeVisible();
     expect(screen.getByRole("button", { name: /^Explore report for Researcher/ })).toBeVisible();
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Tenant adoption insights" }).querySelectorAll("a")).toHaveLength(0);
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledWith({ search: undefined, limit: 6, offset: 0 }, { signal: expect.any(AbortSignal) });
   });
@@ -52,7 +53,7 @@ describe("tenant adoption insights", () => {
     expect(within(table).getByRole("row", { name: /Ben/ })).toHaveTextContent("Zero responses reported");
     expect(within(table).getByText("Concealed report user")).toBeVisible();
     expect(within(table).queryByText(/Sep 12/)).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Open in user-agent matrix" })).toHaveAttribute("href", `/users?view=matrix&agent=synthetic-researcher&snapshot=${usageFixtureSetId}`);
+    expect(screen.getByRole("link", { name: "Open reported user activity" })).toHaveAttribute("href", `/users?view=activity&agent=synthetic-researcher&snapshot=${usageFixtureSetId}`);
     expect(api.getOfficialUsageAgentDetail).toHaveBeenCalledWith("synthetic-researcher", {
       setId: usageFixtureSetId, search: undefined, limit: 20, offset: 0,
     }, { signal: expect.any(AbortSignal) });
@@ -70,13 +71,14 @@ describe("tenant adoption insights", () => {
     expect(search).toHaveFocus();
     expect(search).toHaveValue("Helpdesk");
     await userEvent.click(await screen.findByRole("button", { name: /^Explore report for Helpdesk/ }));
-    expect(await screen.findByRole("link", { name: "Open in user-agent matrix" })).toHaveAttribute("href", `/users?view=matrix&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}`);
+    expect(await screen.findByRole("link", { name: "Open reported user activity" })).toHaveAttribute("href", `/users?view=activity&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}`);
   });
 
   it.each(["never_imported", "incomplete", "not_selected", "deleted"] as const)("gives recovery instead of zero metrics when reports are %s", async availability => {
     vi.mocked(api.getOfficialUsageAggregate).mockResolvedValue({ ...usageAggregateFixture(), availability, activeSet: null });
     render(<TenantAdoptionInsights compact />);
-    expect(await screen.findByRole("link", { name: "Open usage reports" })).toHaveAttribute("href", "/official-usage");
+    expect(await screen.findByText(/Use Official usage in the primary navigation/)).toBeVisible();
+    expect(screen.getByRole("region", { name: "Tenant adoption insights" }).querySelectorAll("a")).toHaveLength(0);
     expect(screen.queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
     expect(screen.getByText(/Missing reports are not zero activity/)).toBeVisible();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();

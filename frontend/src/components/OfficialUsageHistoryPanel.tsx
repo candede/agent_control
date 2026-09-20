@@ -23,46 +23,44 @@ export function OfficialUsageHistoryPanel({
   const [history, setHistory] = useState<OfficialUsageHistoryView>();
   const [offset, setOffset] = useState(0);
   const [reload, setReload] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [read, setRead] = useState<{ key: string; error?: string }>();
+  const readKey = JSON.stringify([offset, reload, revision]);
+  const scopedRead = read?.key === readKey ? read : undefined;
+  const loading = !scopedRead;
+  const error = scopedRead?.error;
+  const displayedHistory = history?.bundles.offset === offset ? history : undefined;
 
   useEffect(() => {
     const controller = new AbortController();
-    void Promise.resolve().then(() => {
-      if (controller.signal.aborted) return undefined;
-      setLoading(true);
-      setError("");
-      return getOfficialUsageHistory({ limit: pageSize, offset }, { signal: controller.signal });
-    })
+    void getOfficialUsageHistory({ limit: pageSize, offset }, { signal: controller.signal })
       .then(next => {
-        if (!next || controller.signal.aborted) return;
+        if (controller.signal.aborted) return;
         setHistory(next);
+        setRead({ key: readKey });
         if (offset > 0 && offset >= next.bundles.count) {
           setOffset(Math.max(0, Math.floor(Math.max(0, next.bundles.count - 1) / pageSize) * pageSize));
         }
       })
       .catch(reason => {
         if (controller.signal.aborted || (reason instanceof ApiError && reason.kind === "aborted")) return;
-        setError(reason instanceof Error ? reason.message : "Official usage history is unavailable.");
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setHistory(undefined);
+        setRead({ key: readKey, error: reason instanceof Error ? reason.message : "Official usage history is unavailable." });
       });
     return () => controller.abort();
-  }, [offset, reload, revision]);
+  }, [offset, readKey]);
 
   const selected = selectedSetId
-    ? history?.bundles.value.find(bundle => bundle.id === selectedSetId)
+    ? displayedHistory?.bundles.value.find(bundle => bundle.id === selectedSetId)
     : undefined;
-  const first = history?.bundles.count ? offset + 1 : 0;
-  const last = history ? Math.min(offset + history.bundles.value.length, history.bundles.count) : 0;
+  const first = displayedHistory?.bundles.count ? displayedHistory.bundles.offset + 1 : 0;
+  const last = displayedHistory ? Math.min(displayedHistory.bundles.offset + displayedHistory.bundles.value.length, displayedHistory.bundles.count) : 0;
 
   return (
     <section className="official-usage-history-panel" aria-labelledby="official-usage-history-title" aria-busy={loading}>
       <header className="report-section-header">
         <div>
-          <h2 id="official-usage-history-title">Accumulated official usage history</h2>
-          <p>Browse retained snapshots beyond a rolling 30-day export without changing the tenant’s current selection.</p>
+          <h3 id="official-usage-history-title">Report history</h3>
+          <p>Open a retained snapshot without changing the tenant&apos;s current report selection.</p>
         </div>
         <button type="button" className="secondary" disabled={loading} onClick={() => setReload(value => value + 1)}>
           <RefreshCw size={15} aria-hidden="true" />Refresh history
@@ -82,56 +80,42 @@ export function OfficialUsageHistoryPanel({
         </div>
       ) : null}
 
-      {error ? <div className="error-banner" role="alert">{error}</div> : null}
-      {!history && loading ? <p role="status">Loading retained official usage snapshots...</p> : null}
-      {history ? (
+      {error ? <div className="error-banner" role="alert">{error}{displayedHistory ? <p>Showing the last loaded history. Refresh successfully before opening another snapshot.</p> : null}</div> : null}
+      {loading ? <p role="status">{displayedHistory
+        ? "Showing the last loaded history while refreshing. Snapshot actions are unavailable until the refresh succeeds."
+        : "Loading retained official usage snapshots..."}</p> : null}
+      {displayedHistory ? (
         <>
-          <div className="usage-history-metrics" aria-label="Official usage history summary">
-            <HistoryMetric label="Accepted imports" value={history.summary.importCount} />
-            <HistoryMetric label="Report observations" value={history.summary.uniqueObservationCount} />
-            <HistoryMetric label="Observed rows" value={history.summary.observationRowCount} />
-            <HistoryMetric label="Unique payloads" value={history.summary.uniquePayloadCount} />
-            <HistoryMetric label="Duplicate rows reused" value={history.summary.repeatedRowsReused} />
-          </div>
-
           <div className="usage-history-warning" role="note">
             <strong>Aggregate snapshots are non-additive.</strong>
-            <span>{history.summary.warning.message}</span>
-            <span>
-              {history.summary.reportingWindows.knownCount} source window(s) known;{" "}
-              {history.summary.reportingWindows.unknownCount} unknown;{" "}
-              {history.summary.reportingWindows.overlappingKnownWindowCount} overlapping known window(s).
-            </span>
-            <span>{activityRangeLabel(history)}</span>
-            <span>Semantic duplicate observations reuse their original identity and acceptance time; they do not refresh historical acceptance dates.</span>
-            <span>Pseudonymous usernames remain scoped to each retained report set and are not assumed to identify the same person across snapshots.</span>
+            <span>{displayedHistory.summary.warning.message}</span>
           </div>
-
-          {history.bundles.value.length ? (
+          <p className="usage-result-summary">{displayedHistory.bundles.count.toLocaleString()} retained snapshots. Each row opens one report, not a cumulative total.</p>
+          {displayedHistory.bundles.value.length ? (
             <div className="table-shell usage-history-table" role="region" aria-label="Retained official usage snapshots" tabIndex={0}>
               <table>
                 <thead>
                   <tr>
-                    <th>Source window / activity range</th>
-                    <th>Reports</th>
-                    <th>Rows</th>
-                    <th>Duplicate rows reused</th>
-                    <th>Status / lineage</th>
-                    <th>Accepted</th>
-                    <th>View</th>
+                    <th scope="col">Imported</th>
+                    <th scope="col">Reporting coverage</th>
+                    <th scope="col">Source files</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">View</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {history.bundles.value.map(bundle => (
+                  {displayedHistory.bundles.value.map(bundle => (
                     <tr key={bundle.id}>
+                      <td>{bundle.acceptedAt ? formatInstant(bundle.acceptedAt) : "Incomplete"}</td>
                       <td>
                         {windowLabel(bundle)}
                         <small>{windowBasis(bundle)}</small>
                       </td>
                       <td>
-                        {bundle.kinds.map(kindLabel).join(", ")}
                         <details>
-                          <summary>{bundle.observationCount} observation(s)</summary>
+                          <summary>{bundle.kinds.length} exports</summary>
+                          <p>{bundle.kinds.map(kindLabel).join(", ")}. {bundle.rowCount.toLocaleString()} rows; {bundle.repeatedRowsReused.toLocaleString()} duplicate rows reused.</p>
+                          <p>{bundleLineage(bundle)}. {bundleRetention(bundle)}.</p>
                           <ul className="usage-history-observations">
                             {bundle.observations.map(observation => (
                               <li key={observation.versionId}>
@@ -149,21 +133,16 @@ export function OfficialUsageHistoryPanel({
                           </ul>
                         </details>
                       </td>
-                      <td>{bundle.rowCount.toLocaleString()}</td>
-                      <td>{bundle.repeatedRowsReused.toLocaleString()}</td>
                       <td>
                         <strong>{bundleStatus(bundle)}</strong>
-                        <small>{bundleLineage(bundle)}</small>
-                        <small>{bundleRetention(bundle)}</small>
                       </td>
-                      <td>{bundle.acceptedAt ? formatInstant(bundle.acceptedAt) : "Incomplete"}</td>
                       <td>
                         {selectedSetId === bundle.id ? (
                           <span className="usage-state">Viewing</span>
                         ) : bundle.isActive && !selectedSetId ? (
                           <span className="usage-state">Current</span>
                         ) : bundle.complete && !bundle.deletedAt ? (
-                          <button type="button" className="secondary" onClick={() => onSelect(bundle.id)}>
+                          <button type="button" className="secondary" disabled={loading || Boolean(error)} onClick={() => onSelect(bundle.id)}>
                             View snapshot
                           </button>
                         ) : <span>Unavailable</span>}
@@ -175,15 +154,32 @@ export function OfficialUsageHistoryPanel({
             </div>
           ) : <p>No accepted official usage snapshots are retained.</p>}
 
-          {history.bundles.count > pageSize ? (
+          {displayedHistory.bundles.count > pageSize ? (
             <nav className="table-pagination" aria-label="Official usage history pages">
               <button type="button" className="secondary" disabled={offset === 0 || loading} onClick={() => setOffset(value => Math.max(0, value - pageSize))}>Previous</button>
-              <span>{first}-{last} of {history.bundles.count.toLocaleString()}</span>
-              <button type="button" className="secondary" disabled={last >= history.bundles.count || loading} onClick={() => setOffset(value => value + pageSize)}>Next</button>
+              <span>{first}-{last} of {displayedHistory.bundles.count.toLocaleString()}</span>
+              <button type="button" className="secondary" disabled={last >= displayedHistory.bundles.count || loading} onClick={() => setOffset(value => value + pageSize)}>Next</button>
             </nav>
           ) : null}
+          <details className="usage-report-details">
+            <summary>Retention and source accounting</summary>
+            <div className="usage-history-metrics" aria-label="Official usage history summary">
+              <HistoryMetric label="Accepted imports" value={displayedHistory.summary.importCount} />
+              <HistoryMetric label="Report observations" value={displayedHistory.summary.uniqueObservationCount} />
+              <HistoryMetric label="Observed rows" value={displayedHistory.summary.observationRowCount} />
+              <HistoryMetric label="Unique payloads" value={displayedHistory.summary.uniquePayloadCount} />
+              <HistoryMetric label="Duplicate rows reused" value={displayedHistory.summary.repeatedRowsReused} />
+            </div>
+            <p>{displayedHistory.summary.reportingWindows.knownCount} source window(s) known;{" "}
+              {displayedHistory.summary.reportingWindows.unknownCount} unknown;{" "}
+              {displayedHistory.summary.reportingWindows.overlappingKnownWindowCount} overlapping known window(s).</p>
+            <p>{activityRangeLabel(displayedHistory)}</p>
+            <p>Semantic duplicate observations reuse their original identity and acceptance time; they do not refresh historical acceptance dates.</p>
+            <p>Pseudonymous usernames remain scoped to each retained report set and are not assumed to identify the same person across snapshots.</p>
+          </details>
         </>
       ) : null}
+      {!displayedHistory && !loading && error && offset > 0 ? <button type="button" className="secondary" onClick={() => setOffset(0)}>First history page</button> : null}
     </section>
   );
 }
@@ -230,7 +226,7 @@ function bundleRetention(bundle: OfficialUsageHistoryBundleSummary) {
   if (!bundle.expiresAt) return "Retained until explicitly deleted";
   const expiresAt = new Date(bundle.expiresAt);
   if (Number.isNaN(expiresAt.getTime())) return "Retention date unavailable";
-  return `Legacy finite retention until ${formatInstant(bundle.expiresAt)}`;
+  return `Legacy retention timestamp ${formatInstant(bundle.expiresAt)}; accepted history remains retained until explicitly deleted`;
 }
 
 function kindLabel(kind: OfficialUsageReportKind) {

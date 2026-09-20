@@ -327,14 +327,18 @@ test("a running sync survives back, forward, and reload without starting another
   expect(fixture.unexpected).toEqual([]);
 });
 
-test("Users Sync users navigates to Sync while starting only users", async ({ page }) => {
+test("Users navigation stays read-only and Sync retains the explicit users-only action", async ({ page }) => {
   const fixture = await mockSync(page, completedState());
   await page.goto("/users");
   await expect(page.getByRole("region", { name: "Data sync", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Sync users", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Sync users", exact: true })).toHaveCount(0);
+  await primarySync(page).click();
   await expect(page).toHaveURL(/\/sync$/);
   await expect(primarySync(page)).toHaveAttribute("aria-current", "page");
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
+  expect(fixture.starts).toEqual([]);
+  await panel.getByText("View sync details", { exact: true }).click();
+  await panel.getByRole("article", { name: "Users", exact: true }).getByRole("button", { name: "Sync users", exact: true }).click();
   await expect(panel.getByText("Syncing users", { exact: true })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Users", exact: true })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Graph packages" })).toHaveCount(0);

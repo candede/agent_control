@@ -89,7 +89,7 @@ export type OfficialUsageRouteState = {
 };
 
 export type UsersRouteState = {
-  view: "licenses" | "matrix";
+  view: "licenses" | "activity";
   search: string;
   agentId?: string;
   reportSetId?: string;
@@ -416,7 +416,7 @@ export function officialUsageRouteSearch(state: OfficialUsageRouteState) {
 export function parseUsersRoute(search: string): UsersRouteState {
   const params = new URLSearchParams(search);
   return {
-    view: params.get("view") === "matrix" ? "matrix" : "licenses",
+    view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: bounded(params.get("snapshot"), 512),
@@ -426,8 +426,8 @@ export function parseUsersRoute(search: string): UsersRouteState {
 
 export function usersRouteSearch(state: UsersRouteState) {
   const params = new URLSearchParams();
-  if (state.view !== "matrix") return params;
-  params.set("view", "matrix");
+  if (state.view !== "activity") return params;
+  params.set("view", "activity");
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
   if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);

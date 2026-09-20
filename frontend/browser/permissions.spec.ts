@@ -699,12 +699,20 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await expect(page).toHaveURL(/\/audit\?.*q=saved-actor/);
   await expect(page.getByLabel("Result")).toHaveValue("failed");
 
+  const scopedReportRequest = () => page.waitForRequest(request => {
+    const url = new URL(request.url());
+    return url.pathname === "/api/official-usage/aggregate" && url.searchParams.get("activityWindowDays") === "90";
+  });
+  const initialReportRead = scopedReportRequest();
   await page.goto("/official-usage?window=90");
-  await expect(page.getByLabel("Active in last")).toHaveValue("90");
+  await initialReportRead;
+  await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
+  await expect(page.getByLabel("Active in last")).toHaveCount(0);
   await page.getByRole("button", { name: "Jobs", exact: true }).click();
+  const restoredReportRead = scopedReportRequest();
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
   await expect(page).toHaveURL(/\/official-usage\?window=90$/);
-  await expect(page.getByLabel("Active in last")).toHaveValue("90");
+  await restoredReportRead;
 
   await page.goto("/security?template=agent_activity&operation=InvokeAgent&agentIds=saved-agent");
   await expect(page.getByLabel("Fixed template")).toHaveValue("agent_activity");
@@ -1141,14 +1149,19 @@ test("official usage imports through real HTTP and remains role-separated", asyn
 
   await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
   await page.locator(".usage-report-details > summary").click();
-  await expect(page.getByText("Microsoft 365 admin center Copilot Agents usage exports", { exact: true })).toBeVisible();
-  await expect(page.getByText("All three exports", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Microsoft 365 admin center Copilot Agents usage exports\. Source discrepancies/)).toBeVisible();
+  const lineage = page.locator(".usage-source-files");
+  await expect(lineage.locator(":scope > details")).toHaveCount(3);
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText("Report only", { exact: true }).first()).toBeVisible();
-  const lineage = page.getByRole("region", { name: "Official usage lineage" });
-  await expect(lineage.getByText(/stale after either known age exceeds/)).toBeVisible();
-  await expect(lineage.getByText("Agents: unknown; Users & agents: unknown; Users: unknown", { exact: true })).toBeVisible();
-  await expect(lineage.getByText(/activity_range/)).toBeVisible();
+  await expect(page.getByRole("region", { name: "Agent comparison rows" }).locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Agent activity report" }).getByRole("link")).toHaveCount(0);
+  for (const source of await lineage.locator(":scope > details").all()) {
+    await source.locator("summary").click();
+    await expect(source.getByText(/activity_range/)).toBeVisible();
+    await expect(source.getByText("unknown", { exact: true })).toBeVisible();
+    await expect(source.getByText("Not supplied", { exact: true })).toBeVisible();
+  }
+  await expect(page.getByText(/Import time does not establish source freshness/)).toBeVisible();
 
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   const activeSetRow = modal.getByRole("region", { name: "Retained report sets" }).getByRole("row").filter({ hasText: "Current" });
@@ -1185,19 +1198,23 @@ test("official usage imports through real HTTP and remains role-separated", asyn
 
   await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await page.getByRole("button", { name: "User-agent matrix", exact: true }).click();
+  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
   await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
-  const matrix = page.getByRole("region", { name: "User-agent response matrix" });
-  await expect(matrix.getByRole("row", { name: /Example user/ })).toContainText("Unknown");
-  await expect(matrix.getByRole("row", { name: /Example user/ })).toContainText("9");
-  await expect(matrix.getByRole("button", { name: "Support agent", exact: true })).toBeVisible();
+  const reportedUsers = page.getByRole("region", { name: "Reported users", exact: true });
+  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("Unknown");
+  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("9");
+  await reportedUsers.getByRole("button", { name: "View reported details for Example user" }).click();
+  const userDetail = page.getByRole("dialog", { name: "Example user", exact: true });
+  await expect(userDetail.getByRole("button", { name: "Support agent", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(userDetail).not.toBeVisible();
 
   await page.evaluate(() => localStorage.setItem("agent-control:usage-reports:v1", "still-untrusted"));
   await login(page, "role-Viewer");
   await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Agent insights dashboard" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
   const session = await (await page.request.get("/api/me")).json();
@@ -1207,9 +1224,9 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   });
   expect(deniedImport.status()).toBe(403);
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await page.getByRole("button", { name: "User-agent matrix", exact: true }).click();
+  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
   await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
-  await expect(matrix.getByRole("row", { name: /Example user/ })).toContainText("9");
+  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("9");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("official-usage.png"), fullPage: true });

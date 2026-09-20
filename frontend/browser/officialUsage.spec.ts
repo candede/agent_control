@@ -7,6 +7,7 @@ import { workbenchActions, workbenchViews } from "../../backend/src/services/wor
 import type { AcceptedOfficialUsageReports, ParsedOfficialUsageReport, PublishedOfficialUsage } from "../../backend/src/types/officialUsage";
 import type { OfficialUsageAdminState, OfficialUsageHistoryView, OfficialUsageStagingPreview } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
+import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
 
 const instant = "2026-09-12T14:45:00.000Z";
 const setId = "11111111-1111-4111-8111-111111111111";
@@ -54,10 +55,14 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
   unexpectedApiRequests.set(page, await mockLayoutApi(page));
   let bundleId = "22222222-2222-4222-8222-222222222222";
   let isAccepted = options.active ?? false;
+  let hasImportHistory = isAccepted;
+  let activeRevision = isAccepted ? 2 : 1;
   const stages: OfficialUsageStagingPreview[] = [];
   const reports: AcceptedOfficialUsageReports = {};
   const uploadBodies: string[] = [];
   const userRequests: URLSearchParams[] = [];
+  const agentRequests: URLSearchParams[] = [];
+  const exportRequests: URLSearchParams[] = [];
   const apiRequests: string[] = [];
   function storeReport(report: ParsedOfficialUsageReport, index: number) {
     if (report.kind === "agents") reports.agents = accepted(report, index);
@@ -72,10 +77,10 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
   };
   function published(): PublishedOfficialUsage {
     return {
-      activeRevision: isAccepted ? 2 : 1,
+      activeRevision,
       activeSet: isAccepted ? { ...activeSet, bundleId, kinds: [...activeSet.kinds] } : null,
       reports: isAccepted ? reports : {}, retainedCompleteSets: isAccepted ? 1 : 0,
-      retainedIncompleteSets: 0, hasImportHistory: isAccepted, activeSelectionIncomplete: false,
+      retainedIncompleteSets: 0, hasImportHistory, activeSelectionIncomplete: false,
     };
   }
   await page.route(url => url.pathname.startsWith("/api/"), async route => {
@@ -84,6 +89,13 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     const path = url.pathname;
     apiRequests.push(path);
     const respond = (json: unknown, status = 200) => route.fulfill({ status, json });
+    if (["/api/official-usage/aggregate", "/api/official-usage/users", "/api/official-usage/aggregate.csv"].includes(path)) {
+      expect(request.method()).toBe("GET");
+      const requestedSet = url.searchParams.get("setId");
+      if (requestedSet && (!isAccepted || requestedSet !== setId)) {
+        return respond({ code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." }, 404);
+      }
+    }
     if (path === "/api/me") return respond({
       user: { displayName: "Usage administrator", username: "admin@example.invalid", homeAccountId: "usage-admin", roles: [`AgentControl.${options.role ?? "Admin"}`] },
       csrfToken: "fixture-csrf", roleAssignmentRequired: false,
@@ -100,7 +112,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     if (path === "/api/official-usage/admin") {
       const state: OfficialUsageAdminState = {
-        activeSetId: isAccepted ? setId : null, activeRevision: isAccepted ? 2 : 1,
+        activeSetId: isAccepted ? setId : null, activeRevision,
         staging: isAccepted ? [] : stages, sets: isAccepted ? [{ ...activeSet, bundleId, kinds: [...activeSet.kinds] }] : [],
       };
       return respond(state);
@@ -137,7 +149,8 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     if (path.includes("/confirmations/")) {
       isAccepted = false;
-      return respond({ activeSetId: null, activeRevision: 3 });
+      activeRevision += 1;
+      return respond({ activeSetId: null, activeRevision });
     }
     if (path.endsWith("/preview") && path.includes("/bundles/")) return respond({
       bundleId, bundleHash: "a".repeat(64), expectedActiveRevision: 1, staging: stages,
@@ -146,14 +159,35 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     if (path.endsWith("/accept") && path.includes("/bundles/")) {
       isAccepted = true;
-      return respond({ setId, versionId: "version-1", activeRevision: 2, complete: true });
+      hasImportHistory = true;
+      activeRevision += 1;
+      return respond({ setId, versionId: "version-1", activeRevision, complete: true });
     }
-    if (path === "/api/official-usage/aggregate") return respond(buildOfficialUsageAggregateView(published(), [], {
-      staleAfterDays: 35, now: new Date(instant),
-      ...Object.fromEntries(url.searchParams),
-      agentSortBy: (["agentName", "responses", "licensedUsers", "unlicensedUsers", "lastActivity"] as const).find(value => value === url.searchParams.get("sortBy")),
-      limit: Number(url.searchParams.get("limit") ?? 100), offset: Number(url.searchParams.get("offset") ?? 0),
-    }));
+    if (path === "/api/official-usage/aggregate") {
+      agentRequests.push(url.searchParams);
+      return respond(buildOfficialUsageAggregateView(published(), [], {
+        staleAfterDays: 35, now: new Date(instant),
+        ...Object.fromEntries(url.searchParams),
+        agentSortBy: (["agentName", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"] as const).find(value => value === url.searchParams.get("sortBy")),
+        sortDirection: url.searchParams.get("sortDirection") === "asc" ? "asc" : "desc",
+        limit: Number(url.searchParams.get("limit") ?? 100), offset: Number(url.searchParams.get("offset") ?? 0),
+      }));
+    }
+    if (path === "/api/official-usage/aggregate.csv") {
+      exportRequests.push(url.searchParams);
+      const view = buildOfficialUsageAggregateView(published(), [], {
+        staleAfterDays: 35, now: new Date(instant), ...Object.fromEntries(url.searchParams),
+        agentSortBy: (["agentName", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"] as const).find(value => value === url.searchParams.get("sortBy")),
+        sortDirection: url.searchParams.get("sortDirection") === "asc" ? "asc" : "desc",
+        limit: 100_000, offset: 0,
+      });
+      return route.fulfill({
+        contentType: "text/csv",
+        headers: { "Content-Disposition": 'attachment; filename="official-agent-usage.csv"' },
+        body: usageCsvFixture(["agentId", "agentName", "responsesSentToUsers", "reportSetId"],
+          view.agents.value.map(agent => ({ ...agent, reportSetId: view.activeSet?.id }))),
+      });
+    }
     if (path === "/api/official-usage/users") {
       userRequests.push(url.searchParams);
       return respond(buildOfficialUsageUserView(published(), {
@@ -200,7 +234,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     return route.fallback();
   });
-  return { uploadBodies, userRequests, apiRequests };
+  return { uploadBodies, userRequests, agentRequests, exportRequests, apiRequests };
 }
 
 test.beforeEach(async ({ context }) => {
@@ -216,7 +250,7 @@ test.afterEach(async ({ page }) => {
 test("keeps import management off the report page and opens an accessible dialog on demand", async ({ page }, info) => {
   const { apiRequests } = await mockUsage(page);
   await page.goto("/official-usage");
-  await expect(page.getByRole("heading", { name: "Usage overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Agent comparison" })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Choose CSVs" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Retained sets" })).toHaveCount(0);
@@ -275,7 +309,7 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
     expect(body).not.toMatch(/name="(?:reportingStart|reportingEnd|sourceAsOf|downloadedAt)"/);
   }
   await page.getByRole("button", { name: "Back to reports" }).click();
-  await expect(page.getByText("Never Imported", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Reports not imported", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Validated report previews" })).toBeVisible();
   await page.getByRole("button", { name: "Accept reviewed bundle" }).click();
@@ -283,49 +317,26 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   await page.getByRole("button", { name: "Back to reports" }).click();
   await expect(modal).toBeHidden();
   await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("2,061");
-  await expect(page.getByText("Source totals differ", { exact: true })).toBeVisible();
-  await expect(page.locator(".usage-report-details")).not.toHaveAttribute("open", "");
-  await expect(page.getByText("Response reconciliation", { exact: true })).toBeHidden();
+  const report = page.getByRole("region", { name: "Agent activity report" });
+  await expect(report.getByText("Source totals differ", { exact: true }).first()).toBeVisible();
+  await expect(report.locator(".usage-report-details")).not.toHaveAttribute("open", "");
+  await expect(report.getByText("Response totals", { exact: true })).toBeHidden();
   await page.screenshot({ path: info.outputPath("reporting-first.png") });
-  await expect(page.getByText("Power User", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Power User", { exact: true })).toHaveCount(0);
   await expect(page.getByText(/bundle was not found/)).toHaveCount(0);
-  await expect(page.locator(".user-access-view")).toBeVisible();
-  const users = page.locator(".user-access-view");
-  await users.scrollIntoViewIfNeeded();
-  await page.screenshot({ path: info.outputPath("usage-dashboard.png") });
-  const search = users.getByRole("searchbox");
-  await search.fill("Zero User");
-  await expect(users.getByRole("heading", { name: "Zero User", exact: true })).toBeVisible();
-  await expect(users.getByText("zero@example.invalid", { exact: true }).first()).toBeVisible();
-  await search.fill("no-matching-user");
-  await expect(users.getByText(/No users match/)).toBeVisible();
-  await expect(search).toBeVisible();
-  await users.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await expect(users.getByRole("heading", { name: "Power User", exact: true })).toBeVisible();
-  const lowOption = await users.getByLabel("Review cohort").locator("option").filter({ hasText: /Low responses/ }).getAttribute("value");
-  if (!lowOption) throw new Error("Missing low-response review option");
-  await users.getByLabel("Review cohort").selectOption(lowOption);
-  await expect(users.getByRole("heading", { name: "Low User", exact: true })).toBeVisible();
-  await expect(users.getByText("power@example.invalid", { exact: true })).toHaveCount(0);
-  await users.getByLabel("Low-response threshold").fill("2");
-  await expect(users.getByText(/No users match/)).toBeVisible();
-  await users.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await users.locator('input[type="date"]').first().fill("2026-09-11");
-  await expect(users.getByRole("heading", { name: "Power User", exact: true })).toBeVisible();
-  await expect.poll(() => userRequests.at(-1)?.get("startDate")).toBe("2026-09-11");
-  await expect(users.getByText("low@example.invalid", { exact: true })).toHaveCount(0);
-  await users.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await expect(users.locator('input[type="date"]').first()).toHaveValue("");
-  await users.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(users.getByText("101-104 of 104", { exact: true })).toBeVisible();
-  const zeroRow = users.getByRole("row").filter({ hasText: "zero@example.invalid" });
-  await zeroRow.getByRole("button", { name: "View agents" }).click();
-  await expect(users.getByRole("heading", { name: "Zero User", exact: true })).toBeVisible();
-  await expect(users.getByText(/imported Users & agents report contains no agent rows/)).toBeVisible();
-  const agents = page.locator(".official-usage-explorer");
-  await agents.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(agents.getByText("101-103 of 103", { exact: true })).toBeVisible();
-  await expect(agents.getByText("Prompt Coach", { exact: true })).toBeVisible();
+  await expect(page.locator(".user-access-view")).toHaveCount(0);
+  const agents = page.getByRole("region", { name: "Agent comparison rows" });
+  await expect(agents.locator("tbody tr")).toHaveCount(25);
+  await page.getByRole("button", { name: "Next agents", exact: true }).click();
+  await expect(page.getByLabel("Agent usage pages")).toContainText("26-50 of 103 agents");
+  await page.getByLabel("Search agents").fill("agent-100");
+  await expect(agents.locator("tbody tr")).toHaveCount(1);
+  await expect(agents.getByRole("button", { name: "Synthetic agent 100", exact: true })).toBeVisible();
+  await page.getByLabel("Search agents").fill("no-matching-agent");
+  await expect(page.getByRole("heading", { name: "No agents match" })).toBeVisible();
+  await page.getByRole("button", { name: "Reset agent filters" }).click();
+  await expect(agents.locator("tbody tr")).toHaveCount(25);
+  expect(userRequests).toEqual([]);
 });
 
 test("allows closing during validation without dropping the staged result", async ({ page }) => {
@@ -356,23 +367,29 @@ test("keeps headline reporting prominent and preserves read-only access", async 
   const { apiRequests } = await mockUsage(page, { role: "Viewer", active: true });
   await page.goto("/official-usage");
   const summary = page.getByRole("region", { name: "Usage summary" });
-  await expect(summary).toBeInViewport();
+  await expect(summary).toBeVisible();
+  if (info.project.name === "desktop") await expect(summary).toBeInViewport();
   await expect(page.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Retained sets" })).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/admin");
-  const firstChart = page.locator(".report-chart-panel").first();
-  const reporting = await page.locator(".reporting-view").boundingBox();
-  const chart = await firstChart.boundingBox();
-  expect(reporting).not.toBeNull();
-  expect(chart).not.toBeNull();
-  expect(chart!.y - reporting!.y).toBeLessThan(450);
-  if (info.project.name === "desktop") await expect(firstChart).toBeInViewport();
+  const table = page.getByRole("region", { name: "Agent comparison rows" });
+  await expect(table.locator("tbody tr")).toHaveCount(25);
+  await expect(page.locator(".report-chart-panel")).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Official usage" }).getByRole("link")).toHaveCount(0);
+  expect(apiRequests).not.toContain("/api/official-usage/users");
+  expect(apiRequests).not.toContain("/api/official-usage/history");
+  if (info.project.name === "desktop") {
+    const bounds = await table.boundingBox();
+    expect(bounds!.y, "Agent comparisons should begin in the first desktop viewport").toBeLessThan(760);
+  }
   await expect(page.locator(".error-banner")).toHaveCount(0);
-  await expect(page.getByText("Response reconciliation", { exact: true })).toBeHidden();
+  await expect(page.getByText("Response totals", { exact: true })).toBeHidden();
+  expect((await new AxeBuilder({ page }).include(".official-usage-workbench").analyze()).violations).toEqual([]);
+  if (info.project.name === "mobile") await summary.scrollIntoViewIfNeeded();
   await page.screenshot({ path: info.outputPath("read-only-reporting.png") });
-  await page.getByText("Report details", { exact: false }).first().click();
-  await expect(page.getByText("Response reconciliation", { exact: true })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Official usage lineage" })).toContainText("source as-of absent");
+  await page.getByText("Report quality & sources", { exact: false }).first().click();
+  await expect(page.getByText("Response totals", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Import time does not establish source freshness/)).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
@@ -385,6 +402,69 @@ test("opens exact staging links in the dialog and reports unavailable staging wi
   await page.getByRole("button", { name: "Close report import" }).click();
   await expect(modal).toBeHidden();
   await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeFocused();
+});
+
+test("uses one agent table for response rankings, reach, date filters and a snapshot-pinned CSV", async ({ page }) => {
+  const { agentRequests, exportRequests, userRequests } = await mockUsage(page, { active: true });
+  await page.goto("/official-usage");
+  const table = page.getByRole("region", { name: "Agent comparison rows" });
+  await expect(table.locator("tbody tr")).toHaveCount(25);
+  await page.getByLabel("Order agents by").selectOption("responses-asc");
+  await expect(table.locator("tbody tr").first()).toContainText("Prompt Coach");
+  await page.getByLabel("Order agents by").selectOption("activeUsers-desc");
+  await expect.poll(() => agentRequests.at(-1)?.get("sortBy")).toBe("activeUsers");
+  await expect(table.locator("tbody tr").first()).toContainText("Synthetic agent 0");
+  await page.getByText("Last-activity filters", { exact: true }).click();
+  await page.getByLabel("Agent last activity on or after (UTC)").fill("2026-09-11");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.getByRole("button", { name: "Clinical assistant", exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("2,061");
+  await table.getByRole("button", { name: "Clinical assistant", exact: true }).click();
+  const evidence = page.getByRole("region", { name: "Source details for Clinical assistant" });
+  await expect(evidence.getByText(/Licensed and unlicensed source categories can overlap and are never added/)).toBeVisible();
+  await expect(evidence.getByText("agent-power", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Reset agent filters" }).click();
+  await page.getByRole("combobox", { name: "Creator type", exact: true }).selectOption("Agent built by Microsoft");
+  await page.getByLabel("Search agents").fill("Prompt");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.getByRole("button", { name: "Prompt Coach", exact: true })).toBeVisible();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export agents CSV" }).click();
+  const file = await download;
+  expect(file.suggestedFilename()).toBe("official-agent-usage.csv");
+  expect(await downloadedCsvRows(file)).toEqual([
+    { agentId: "agent-low", agentName: "Prompt Coach", responsesSentToUsers: "3", reportSetId: setId },
+  ]);
+  expect(exportRequests.at(-1)?.get("setId")).toBe(setId);
+  expect(exportRequests.at(-1)?.get("search")).toBe("Prompt");
+  expect(exportRequests.at(-1)?.get("creatorType")).toBe("Agent built by Microsoft");
+  expect(exportRequests.at(-1)?.has("limit")).toBe(false);
+  expect(exportRequests.at(-1)?.has("offset")).toBe(false);
+  expect(userRequests).toEqual([]);
+});
+
+test("separates report history from agent analysis and keeps storage accounting collapsed", async ({ page }, info) => {
+  const { apiRequests } = await mockUsage(page, { active: true });
+  await page.goto("/official-usage");
+  await expect(page.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
+  expect(apiRequests).not.toContain("/api/official-usage/history");
+  await page.getByRole("button", { name: "Report history", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Report history", exact: true })).toBeVisible();
+  const history = page.getByRole("region", { name: "Retained official usage snapshots" });
+  await expect(history).toBeVisible();
+  await expect(history.getByRole("columnheader")).toHaveCount(5);
+  await expect(page.getByLabel("Official usage history summary")).toBeHidden();
+  await expect(page.getByRole("region", { name: "Agent comparison rows" })).toHaveCount(0);
+  await expect(page.getByText("Aggregate snapshots are non-additive.")).toBeVisible();
+  await page.getByText("Retention and source accounting", { exact: true }).click();
+  await expect(page.getByLabel("Official usage history summary")).toBeVisible();
+  await page.getByText("Retention and source accounting", { exact: true }).click();
+  expect((await new AxeBuilder({ page }).include(".official-usage-workbench").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath("report-history.png"), fullPage: true });
+  await page.getByRole("button", { name: "Agent activity", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
+  expect(apiRequests).not.toContain("/api/official-usage/users");
 });
 
 test("keeps retained-set confirmation inside import management and refreshes reports on deletion", async ({ page }) => {
@@ -406,5 +486,5 @@ test("keeps retained-set confirmation inside import management and refreshes rep
   await expect(modal).toBeVisible();
   await expect(modal.getByText(/retained set was deleted/)).toBeVisible();
   await modal.getByRole("button", { name: "Back to reports" }).click();
-  await expect(page.getByText("Never Imported", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Selected report deleted", exact: true })).toBeVisible();
 });

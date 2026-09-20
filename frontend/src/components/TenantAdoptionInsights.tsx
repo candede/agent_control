@@ -5,7 +5,7 @@ import {
   type OfficialUsageAgentDetailView,
   type OfficialUsageAggregateView,
 } from "../api/client";
-import { usageCount, usageDate, usagePageLabel, userAgentMatrixUrl } from "../usageInsights";
+import { usageCount, usageDate, usagePageLabel, reportedUserActivityUrl } from "../usageInsights";
 import { UsageMetric, UsageReportContext, UsageReportRecovery } from "./UsageReportContext";
 import "./agentInsights.css";
 
@@ -64,7 +64,6 @@ export function TenantAdoptionInsights({
       </div>
       <div className="agent-insight-actions">
         {compact ? <button ref={exploreButton} type="button" className="secondary" onClick={() => setExpanded(value => !value)}>{showExplorer ? "Hide report explorer" : "Explore usage & users"}</button> : null}
-        <a href={userAgentMatrixUrl()}>User-agent matrix</a>
       </div>
       {showPicker ? <div className="agent-insight-toolbar">
         <label htmlFor={searchId}>Find a reported agent
@@ -147,7 +146,7 @@ export function ReportedAgentUsage({ agentId, reportSetId, showUsers = true }: {
     {data && agent ? <>
     <div className="agent-insight-heading">
       <div><h4>{agent.agentName || agent.agentId}</h4><p>{agent.creatorType || "Creator not reported"} <code>{agent.agentId}</code></p></div>
-      <a href={userAgentMatrixUrl(agent.agentId, data.activeSet?.id)}>Open in user-agent matrix</a>
+      <a href={reportedUserActivityUrl(agent.agentId, data.activeSet?.id)}>Open reported user activity</a>
     </div>
     <UsageReportContext data={data} />
     <div className="agent-usage-metrics" aria-label="Selected agent report metrics">
@@ -167,7 +166,7 @@ export function ReportedAgentUsage({ agentId, reportSetId, showUsers = true }: {
       {data.users.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Users of the reported agent" tabIndex={0}>
         <table className="agent-insight-table"><caption>Who used this reported agent</caption><thead><tr><th scope="col">Reported user</th><th scope="col">Responses</th><th scope="col">Activity signal</th></tr></thead>
           <tbody>{data.users.value.map(user => <tr key={user.username}>
-            <th scope="row"><a href={userAgentMatrixUrl(agent.agentId, data.activeSet?.id, user.username)}>{user.displayName || user.username}</a><small>{user.username}</small></th>
+            <th scope="row"><a href={reportedUserActivityUrl(agent.agentId, data.activeSet?.id, user.username)}>{user.displayName || user.username}</a><small>{user.username}</small></th>
             <td>{usageCount(user.responsesSentToUsers)}</td><td>{user.responsesSentToUsers > 0 ? "Using this agent" : "Zero responses reported"}</td>
           </tr>)}</tbody>
         </table>

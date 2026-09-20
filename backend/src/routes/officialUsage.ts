@@ -393,7 +393,7 @@ function aggregateOptions(query: Record<string, unknown>) {
     "setId", "search", "creatorType", "inactiveDays", "activityWindowDays",
     "startDate", "endDate", "sortBy", "sortDirection", "limit", "offset",
   ]);
-  const sortBy = queryEnum(first(query.sortBy), ["agentName", "responses", "licensedUsers", "unlicensedUsers", "lastActivity"] as const, "agent sort");
+  const sortBy = queryEnum(first(query.sortBy), ["agentName", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"] as const, "agent sort");
   const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
   const [startDate, endDate] = queryDateRange(query);
   return {
@@ -615,15 +615,15 @@ function* userExportRows(view: OfficialUsageUserView) {
     for (const row of accessRows) yield {
       username: user.username,
       displayName: user.displayName,
-      userMetricSource: user.missingUserReport ? "users_and_agents_report" : "users_report",
+      userMetricSource: user.missingUserReport ? "unknown" : "users_report",
       licenseAssignmentStatus: user.licenseAssignmentStatus,
       reviewCohort: user.reviewCohort,
       reviewCandidate: user.reviewCandidate,
       reportedAgentsUsed: user.missingUserReport ? "Unknown" : user.reportedAgentsUsed,
       reportedResponsesReceived: user.missingUserReport ? "Unknown" : user.reportedResponsesReceived,
-      agentsAccessedTotal: user.agentsAccessedTotal,
-      responseProducingAgentCount: user.responseProducingAgentCount,
-      bridgeResponsesSentToUsers: user.bridgeResponsesSentToUsers,
+      agentsAccessedTotal: userAgentsLineage ? user.agentsAccessedTotal : "Unknown",
+      responseProducingAgentCount: user.rows.length ? user.responseProducingAgentCount : "Unknown",
+      bridgeResponsesSentToUsers: user.rows.length ? user.bridgeResponsesSentToUsers : "Unknown",
       missingUserReport: user.missingUserReport,
       missingBridgeRows: user.rows.length === 0,
       hasReportMismatch: user.hasReportMismatch,

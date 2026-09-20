@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, FileText, RefreshCw, Trash2, Upload } from "lucide-react";
 import {
+  ApiError,
   acceptOfficialUsageBundle,
   acknowledgeLegacyUsageCleanup,
   confirmOfficialUsageSetOperation,
@@ -40,6 +41,7 @@ export function OfficialUsageImportPanel({
   const pendingBundleId = useRef<string | undefined>(undefined);
   const confirmationReturnFocus = useRef<HTMLElement | null>(null);
   const loadGeneration = useRef(0);
+  const lifetime = useRef<AbortController | undefined>(undefined);
   const previews = bundlePreview?.staging ?? [];
 
   function applyBundlePreview(preview: OfficialUsageBundlePreview) {
@@ -48,18 +50,40 @@ export function OfficialUsageImportPanel({
     setCorrectionMode(preview.staging.some(stage => Boolean(stage.correctionOfSetId)));
   }
 
+  const clearUnauthorized = useCallback((error: unknown) => {
+    if (!(error instanceof ApiError) || (error.status !== 401 && error.status !== 403)) return false;
+    loadGeneration.current += 1;
+    setAdminState(undefined);
+    setBundlePreview(undefined);
+    setConfirmation(undefined);
+    pendingBundleId.current = undefined;
+    setFiles([]);
+    if (fileInput.current) fileInput.current.value = "";
+    setCorrectionMode(false);
+    setCompletedImport(false);
+    setBusy(false);
+    setMessage({ tone: "error", text: errorMessage(error) });
+    return true;
+  }, []);
+
+  const showError = useCallback((error: unknown) => {
+    if (!clearUnauthorized(error)) setMessage({ tone: "error", text: errorMessage(error) });
+  }, [clearUnauthorized]);
+
   async function refresh(preferredBundleId: string | null | undefined = pendingBundleId.current) {
+    const signal = lifetime.current?.signal;
     const generation = ++loadGeneration.current;
+    setBusy(true);
     try {
-      const state = await getOfficialUsageAdminState();
-      if (generation !== loadGeneration.current) return;
+      const state = await getOfficialUsageAdminState({ signal });
+      if (signal?.aborted || generation !== loadGeneration.current) return;
       setAdminState(state);
       const retainedBundle = state.staging.some(stage => stage.status === "active" && stage.bundleId === preferredBundleId)
         || state.sets.some(reportSet => !reportSet.deletedAt && reportSet.bundleId === preferredBundleId);
       const bundleId = preferredBundleId === null ? undefined : retainedBundle ? preferredBundleId : state.staging.find(stage => stage.status === "active")?.bundleId;
       if (bundleId) {
-        const preview = await previewOfficialUsageBundle(bundleId);
-        if (generation === loadGeneration.current) applyBundlePreview(preview);
+        const preview = await previewOfficialUsageBundle(bundleId, { signal });
+        if (!signal?.aborted && generation === loadGeneration.current) applyBundlePreview(preview);
       }
       else {
         pendingBundleId.current = undefined;
@@ -70,20 +94,24 @@ export function OfficialUsageImportPanel({
       }
       return state;
     } catch (error) {
-      if (generation === loadGeneration.current) setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted && generation === loadGeneration.current) showError(error);
       return undefined;
+    } finally {
+      if (!signal?.aborted && generation === loadGeneration.current) setBusy(false);
     }
   }
 
   useEffect(() => {
     const generation = ++loadGeneration.current;
     const controller = new AbortController();
+    lifetime.current = controller;
     void Promise.resolve().then(() => {
       if (controller.signal.aborted) return undefined;
       setAdminState(undefined);
       setBundlePreview(undefined);
       pendingBundleId.current = undefined;
       setMessage(undefined);
+      setBusy(false);
       return getOfficialUsageAdminState({ signal: controller.signal });
     })
       .then(async state => {
@@ -104,20 +132,22 @@ export function OfficialUsageImportPanel({
       })
       .catch(error => {
         if (!controller.signal.aborted && generation === loadGeneration.current) {
-          setMessage({ tone: "error", text: errorMessage(error) });
+          showError(error);
         }
       });
     return () => {
       controller.abort();
-      if (generation === loadGeneration.current) loadGeneration.current += 1;
+      loadGeneration.current += 1;
     };
-  }, [initialStagingId]);
+  }, [initialStagingId, showError]);
 
   async function stageFiles() {
     if (!files.length || !adminState) {
       setMessage({ tone: "error", text: !files.length ? "Choose the original CSV files to import." : "Wait for import state to load, or refresh it before importing." });
       return;
     }
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     const existingSet = adminState.sets.find(reportSet => reportSet.bundleId === pendingBundleId.current);
     setBusy(true);
     setCompletedImport(false);
@@ -132,8 +162,11 @@ export function OfficialUsageImportPanel({
           bundleId,
           correctionOfSetId: existingSet?.supersedesSetId ?? (correctionMode ? adminState.activeSetId ?? undefined : undefined),
         });
+        if (signal?.aborted) return;
         staged.set(preview.kind, preview);
       } catch (error) {
+        if (signal?.aborted) return;
+        if (clearUnauthorized(error)) return;
         rejectedFiles.push(file);
         failures.push(`${file.name}: ${errorMessage(error)}`);
       }
@@ -143,14 +176,22 @@ export function OfficialUsageImportPanel({
     if (staged.size) pendingBundleId.current = bundleId;
     if (staged.size || pendingBundleId.current) {
       try {
-        applyBundlePreview(await previewOfficialUsageBundle(bundleId));
+        const preview = await previewOfficialUsageBundle(bundleId, { signal });
+        if (signal?.aborted) return;
+        applyBundlePreview(preview);
       } catch (error) {
+        if (signal?.aborted) return;
+        if (clearUnauthorized(error)) return;
         failures.push(`Could not load the staged bundle preview: ${errorMessage(error)} Use Refresh import state to retry.`);
       }
     }
     try {
-      setAdminState(await getOfficialUsageAdminState());
+      const state = await getOfficialUsageAdminState({ signal });
+      if (signal?.aborted) return;
+      setAdminState(state);
     } catch (error) {
+      if (signal?.aborted) return;
+      if (clearUnauthorized(error)) return;
       failures.push(`Could not refresh import history: ${errorMessage(error)}`);
     }
     setMessage(failures.length
@@ -161,16 +202,20 @@ export function OfficialUsageImportPanel({
 
   async function acceptPreviews() {
     if (!bundlePreview || bundlePreview.missingKinds.length) return;
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     const priorState = adminState;
     setBusy(true);
     setMessage(undefined);
     try {
       const accepted = await acceptOfficialUsageBundle(bundlePreview);
+      if (signal?.aborted) return;
       setCompletedImport(accepted.complete);
       pendingBundleId.current = undefined;
       setBundlePreview(undefined);
       setCorrectionMode(false);
       const refreshedState = await refresh(null);
+      if (signal?.aborted) return;
       if (refreshedState) {
         setMessage({
           tone: "success",
@@ -179,18 +224,22 @@ export function OfficialUsageImportPanel({
       }
       onChanged();
     } catch (error) {
-      setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted) showError(error);
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 
   async function discardPreviews() {
     if (!previews.length) return;
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     setBusy(true);
     try {
       const results = await Promise.allSettled(previews.map(preview => discardOfficialUsageStaging(preview.id)));
+      if (signal?.aborted) return;
       const failed = results.filter(result => result.status === "rejected");
+      if (failed.some(result => clearUnauthorized(result.reason))) return;
       if (failed.length) {
         setMessage({ tone: "error", text: `${failed.length} staged report(s) could not be discarded and remain available for retry. ${errorMessage(failed[0].reason)}` });
         await refresh(bundlePreview?.bundleId);
@@ -201,53 +250,63 @@ export function OfficialUsageImportPanel({
         await refresh(null);
       }
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 
   async function beginSetOperation(setId: string, operation: "select" | "delete") {
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     setBusy(true);
     confirmationReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     try {
-      setConfirmation(await previewOfficialUsageSetOperation(setId, operation));
+      const preview = await previewOfficialUsageSetOperation(setId, operation);
+      if (!signal?.aborted) setConfirmation(preview);
     } catch (error) {
-      setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted) showError(error);
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 
   async function resumeSet(bundleId: string) {
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     setBusy(true);
     setMessage(undefined);
     try {
-      const preview = await previewOfficialUsageBundle(bundleId);
+      const preview = await previewOfficialUsageBundle(bundleId, { signal });
+      if (signal?.aborted) return;
       applyBundlePreview(preview);
       const reportSet = adminState?.sets.find(value => value.bundleId === bundleId);
       setCorrectionMode(Boolean(reportSet?.supersedesSetId));
       setMessage({ tone: "success", text: `Resuming bundle ${bundleId.slice(0, 8)}. Add ${preview.missingKinds.map(kindLabel).join(", ") || "no missing reports"}.` });
     } catch (error) {
-      setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted) showError(error);
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 
   async function confirmSetOperation() {
     if (!confirmation) return;
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     setBusy(true);
     try {
       await confirmOfficialUsageSetOperation(confirmation);
+      if (signal?.aborted) return;
       setMessage({ tone: "success", text: confirmation.operation === "select"
         ? "The retained complete set is now active."
         : "The retained set was deleted; active selection was cleared when applicable." });
       setConfirmation(undefined);
       await refresh();
+      if (signal?.aborted) return;
       onChanged();
     } catch (error) {
-      setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted) showError(error);
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 
@@ -260,17 +319,20 @@ export function OfficialUsageImportPanel({
   }
 
   async function acknowledgeLegacy(disposition: "reimported" | "discarded") {
+    const signal = lifetime.current?.signal;
+    loadGeneration.current += 1;
     setBusy(true);
     try {
       await acknowledgeLegacyUsageCleanup(disposition);
+      if (signal?.aborted) return;
       clearLegacyUsageStorage();
       setLegacyPresent(false);
       onLegacyCleared?.();
       setMessage({ tone: "success", text: "Legacy browser report storage was removed after explicit acknowledgement." });
     } catch (error) {
-      setMessage({ tone: "error", text: errorMessage(error) });
+      if (!signal?.aborted) showError(error);
     } finally {
-      setBusy(false);
+      if (!signal?.aborted) setBusy(false);
     }
   }
 

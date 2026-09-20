@@ -6,19 +6,37 @@ import { usageAggregateFixture, usageAgentDetailFixture, usageFixtureSetId, usag
 import { mockLayoutApi } from "./layoutFixtures";
 
 async function mockUsageReports(page: Page, unexpected: string[]) {
-  await page.route("**/api/official-usage/aggregate*", route => {
+  await page.route(url => url.pathname === "/api/official-usage/aggregate", route => {
+    expect(route.request().method()).toBe("GET");
     const params = new URL(route.request().url()).searchParams;
+    if (params.has("setId") && params.get("setId") !== usageFixtureSetId) {
+      return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
+    }
     return route.fulfill({ json: usageAggregateFixture({
       staleAfterDays: 35, search: params.get("search") ?? undefined,
+      creatorType: params.get("creatorType") ?? undefined,
+      startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
+      agentSortBy: (["agentName", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"] as const).find(value => value === params.get("sortBy")),
+      sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
       limit: Number(params.get("limit") ?? 100), offset: Number(params.get("offset") ?? 0),
     }) });
   });
-  await page.route("**/api/official-usage/users*", route => {
+  await page.route(url => url.pathname === "/api/official-usage/users", route => {
+    expect(route.request().method()).toBe("GET");
     const params = new URL(route.request().url()).searchParams;
+    if (params.has("setId") && params.get("setId") !== usageFixtureSetId) {
+      return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
+    }
     return route.fulfill({ json: usageUsersFixture({
       staleAfterDays: 35, search: params.get("search") ?? undefined, agentId: params.get("agentId") ?? undefined,
+      creatorType: params.get("creatorType") ?? undefined, responsesOnly: params.get("responsesOnly") === "true",
+      startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
+      cohort: (["all", "zero", "low", "review"] as const).find(value => value === params.get("cohort")),
+      activity: (["all", "recent", "inactive", "no-activity"] as const).find(value => value === params.get("activity")),
+      lowResponseThreshold: Number(params.get("lowResponseThreshold") ?? 5),
       limit: Number(params.get("limit") ?? 100), offset: Number(params.get("offset") ?? 0),
-      userSortBy: "displayName", sortDirection: "asc",
+      userSortBy: (["displayName", "responses", "agentsUsed", "lastActivity"] as const).find(value => value === params.get("sortBy")),
+      sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
     }) });
   });
   await page.route("**/api/official-usage/agents/**", route => {
@@ -27,6 +45,9 @@ async function mockUsageReports(page: Page, unexpected: string[]) {
       return route.fulfill({ status: 405, json: { error: "Read only" } });
     }
     const url = new URL(route.request().url());
+    if (url.searchParams.has("setId") && url.searchParams.get("setId") !== usageFixtureSetId) {
+      return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
+    }
     const id = decodeURIComponent(url.pathname.slice("/api/official-usage/agents/".length));
     const data = usageAgentDetailFixture(id);
     const search = (url.searchParams.get("search") ?? "").toLowerCase();
@@ -59,7 +80,7 @@ test("agent details stay specific to the selected agent while tenant reports rem
   await tenant.getByRole("button", { name: /^Explore report for Researcher/ }).click();
   await expect(tenant.getByLabel("Selected agent report metrics")).toContainText("215");
   await expect(tenant.getByRole("row", { name: /Ben/ })).toContainText("Zero responses reported");
-  await expect(tenant.getByRole("link", { name: "Open in user-agent matrix" })).toHaveAttribute("href", `/users?view=matrix&agent=synthetic-researcher&snapshot=${usageFixtureSetId}`);
+  await expect(tenant.getByRole("link", { name: "Open reported user activity" })).toHaveAttribute("href", `/users?view=activity&agent=synthetic-researcher&snapshot=${usageFixtureSetId}`);
   const readsBeforeModal = [...reportReads];
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
@@ -81,7 +102,7 @@ test("agent details stay specific to the selected agent while tenant reports rem
   await expect(dialog.getByLabel("Find a reported agent")).toHaveCount(0);
   await expect(dialog.getByText("Researcher", { exact: true })).toHaveCount(0);
   await expect(dialog.getByRole("region", { name: "Users of the reported agent" })).toHaveCount(0);
-  await expect(dialog.getByRole("link", { name: /user-agent matrix/i })).toHaveCount(0);
+  await expect(dialog.getByRole("link", { name: /reported user activity/i })).toHaveCount(0);
   expect(await dialog.boundingBox()).toEqual(bounds);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("agent-usage-users.png") });
@@ -111,46 +132,40 @@ test("agent details stay specific to the selected agent while tenant reports rem
   expect(unexpected).toEqual([]);
 });
 
-test("users can traverse the response matrix, license details and exact reported agent without losing route state", async ({ page }, info) => {
+test("users can traverse reported activity, user details and exact agents without losing route state", async ({ page }, info) => {
   test.setTimeout(60_000);
   const unexpected = await mockLayoutApi(page);
   await mockUsageReports(page, unexpected);
   await page.goto("/users");
-  await page.getByRole("button", { name: "User-agent matrix", exact: true }).click();
-  await expect(page).toHaveURL(/\/users\?view=matrix$/);
-  const matrix = page.getByRole("region", { name: "User-agent response matrix" });
-  await expect(matrix.locator("tbody tr")).toHaveCount(4);
-  await expect(matrix.getByRole("row", { name: /Concealed report user/ })).toContainText("Unknown");
-  await expect(matrix.getByRole("row", { name: /Ben/ })).toContainText("0");
-  await expect(matrix.getByRole("row", { name: /Cleo/ })).toContainText("Not reported");
-  if (info.project.name === "mobile") {
-    await matrix.scrollIntoViewIfNeeded();
-    await matrix.evaluate(element => { element.scrollLeft = element.scrollWidth - element.clientWidth; });
-    const header = await matrix.locator("tbody th").first().boundingBox();
-    const region = await matrix.boundingBox();
-    expect(Math.abs(header!.x - region!.x), "Reported user identity stays visible while reading off-screen agent columns").toBeLessThanOrEqual(2);
-    await matrix.evaluate(element => { element.scrollLeft = 0; });
-  }
+  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
+  await expect(page).toHaveURL(/\/users\?view=activity$/);
+  const activity = page.getByRole("region", { name: "Reported users", exact: true });
+  await expect(activity.locator("tbody tr")).toHaveCount(4);
+  await expect(activity.getByRole("columnheader")).toHaveCount(6);
+  await expect(activity.getByRole("row", { name: /Concealed report user/ })).toContainText("Unknown");
+  await expect(activity.getByRole("row", { name: /Ben/ })).toContainText("0");
+  await expect(activity.getByRole("row", { name: /Cleo/ })).toContainText("Not reported");
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  await page.screenshot({ path: info.outputPath("user-agent-matrix.png"), fullPage: true });
-  await matrix.getByRole("button", { name: "Researcher", exact: true }).click();
+  await page.screenshot({ path: info.outputPath("reported-user-activity.png"), fullPage: true });
+  await activity.getByRole("button", { name: "View reported details for Ada", exact: true }).click();
+  await page.getByRole("dialog", { name: "Ada" }).getByRole("button", { name: "Researcher", exact: true }).click();
   const selectedAgentUrl = new RegExp(`agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`);
   await expect(page).toHaveURL(selectedAgentUrl);
-  await expect(matrix.locator("tbody tr")).toHaveCount(3);
-  await matrix.getByRole("button", { name: "Ada", exact: true }).click();
+  await expect(activity.locator("tbody tr")).toHaveCount(3);
+  await activity.getByRole("button", { name: "View reported details for Ada", exact: true }).click();
   const user = page.getByRole("dialog", { name: "Ada" });
-  await expect(user.getByRole("heading", { name: "Copilot in Office apps" })).toBeVisible();
+  await expect(user.getByText("Responses (Users report)", { exact: true })).toBeVisible();
   await user.getByRole("button", { name: "Researcher", exact: true }).click();
   await expect(user).not.toBeVisible();
   await expect(page).toHaveURL(selectedAgentUrl);
   await page.goBack();
-  await expect(page).toHaveURL(/\/users\?view=matrix$/);
-  await expect(matrix.locator("tbody tr")).toHaveCount(4);
+  await expect(page).toHaveURL(/\/users\?view=activity$/);
+  await expect(activity.locator("tbody tr")).toHaveCount(4);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await expect(page.getByRole("button", { name: "User-agent matrix", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(matrix.locator("tbody tr")).toHaveCount(4);
+  await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(activity.locator("tbody tr")).toHaveCount(4);
   expect(unexpected).toEqual([]);
 });
 
@@ -165,7 +180,10 @@ for (const state of ["missing", "unavailable"] as const) {
       : route.fulfill({ status: 503, json: { error: "Tenant usage unavailable.", code: "synthetic_tenant_reports_unavailable" } }));
     await page.goto("/agents");
     const tenant = page.getByRole("region", { name: "Tenant adoption insights" });
-    if (state === "missing") await expect(tenant.getByRole("link", { name: "Open usage reports" })).toBeVisible();
+    if (state === "missing") {
+      await expect(tenant.getByText(/Use Official usage in the primary navigation/)).toBeVisible();
+      await expect(tenant.getByRole("link")).toHaveCount(0);
+    }
     else await expect(tenant.getByRole("alert")).toBeVisible();
     await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
@@ -180,7 +198,7 @@ for (const state of ["missing", "unavailable"] as const) {
   });
 }
 
-test("fresh matrix links keep their search, page and snapshot separate from other workbench views", async ({ page }) => {
+test("fresh activity links keep their search, page and snapshot separate from other workbench views", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await mockUsageReports(page, unexpected);
   const history: OfficialUsageHistoryView = {
@@ -194,9 +212,9 @@ test("fresh matrix links keep their search, page and snapshot separate from othe
     bundles: { value: [], count: 0, limit: 10, offset: 0 },
   };
   await page.route("**/api/official-usage/history*", route => route.fulfill({ json: history }));
-  const matrixUrl = `/users?view=matrix&q=Ada&snapshot=${usageFixtureSetId}&page=2`;
-  await page.goto(matrixUrl);
-  await expect(page.getByRole("searchbox", { name: "Search the user-agent matrix" })).toHaveValue("Ada");
+  const activityUrl = `/users?view=activity&q=Ada&snapshot=${usageFixtureSetId}&page=2`;
+  await page.goto(activityUrl);
+  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
   await expect(page).toHaveURL(/\/agents$/);
@@ -206,7 +224,7 @@ test("fresh matrix links keep their search, page and snapshot separate from othe
   expect(new URL((await reportRead).url()).searchParams.has("setId")).toBe(false);
   await expect(page).toHaveURL(/\/official-usage$/);
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await expect(page).toHaveURL(new RegExp(`${matrixUrl.replace("?", "\\?")}$`));
-  await expect(page.getByRole("searchbox", { name: "Search the user-agent matrix" })).toHaveValue("Ada");
+  await expect(page).toHaveURL(new RegExp(`${activityUrl.replace("?", "\\?")}$`));
+  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
   expect(unexpected).toEqual([]);
 });

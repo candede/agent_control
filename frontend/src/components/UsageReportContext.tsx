@@ -25,6 +25,6 @@ export function UsageReportRecovery({ availability }: { availability: OfficialUs
       : availability === "deleted" ? "The selected bundle was deleted. Choose a retained bundle or import a new one."
         : "Import the Agents, Users & agents, and Users exports together to see responses, adoption, and who is using what."}</p>
     <p>Inventory availability and installation do not establish usage. Missing reports are not zero activity.</p>
-    <a href="/official-usage">Open usage reports</a>
+    <p>Use Official usage in the primary navigation to import or select reports.</p>
   </div>;
 }

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -8,7 +8,10 @@ import { mockNativeDialogs } from "../test/dialog";
 mockNativeDialogs();
 
 vi.mock("./OfficialUsageImportPanel", () => ({
-  OfficialUsageImportPanel: () => <div>Authoritative import panel</div>,
+  OfficialUsageImportPanel: function TestImportPanel() {
+    const [draft, setDraft] = useState("");
+    return <div>Authoritative import panel<input aria-label="Selected import draft" value={draft} onChange={event => setDraft(event.target.value)} /></div>;
+  },
 }));
 
 describe("OfficialUsageImportModal", () => {
@@ -77,5 +80,27 @@ describe("OfficialUsageImportModal", () => {
     const remountedDialog = screen.getByRole("dialog", { hidden: true });
     expect(remountedDialog).not.toHaveAttribute("open");
     expect(screen.queryByText("Authoritative import panel")).not.toBeInTheDocument();
+  });
+
+  it("preserves importer state across close/reopen, traps keyboard boundaries, and restores scrolling on Escape", async () => {
+    render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Import reports" });
+    await userEvent.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "Import and manage reports" });
+    await userEvent.type(screen.getByLabelText("Selected import draft"), "retained draft");
+    const close = screen.getByRole("button", { name: "Close report import" });
+    const back = screen.getByRole("button", { name: "Back to reports" });
+    close.focus();
+    await userEvent.tab({ shift: true });
+    expect(back).toHaveFocus();
+    await userEvent.tab();
+    expect(close).toHaveFocus();
+    expect(document.body.style.overflow).toBe("hidden");
+    fireEvent(dialog, new Event("cancel", { cancelable: true }));
+    await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
+    expect(document.body.style.overflow).not.toBe("hidden");
+    expect(trigger).toHaveFocus();
+    await userEvent.click(trigger);
+    expect(screen.getByLabelText("Selected import draft")).toHaveValue("retained draft");
   });
 });

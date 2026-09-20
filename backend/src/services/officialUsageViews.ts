@@ -212,7 +212,7 @@ export function buildOfficialUsageUserView(
       userRows: published.reports.users?.rows.length ?? 0,
       accessRows,
       reportOnlyRows: accessRows,
-      totalResponsesReceived: summaries.reduce((total, summary) => total + summary.reportedResponsesReceived, 0),
+      totalResponsesReceived: published.reports.users ? sum(published.reports.users.rows, row => row.agentResponsesReceived) : null,
       mismatchCount: summaries.filter(summary => summary.hasReportMismatch).length,
     },
     cohorts: {
@@ -444,7 +444,7 @@ function buildUserSummaries(reports: AcceptedOfficialUsageReports, reportSetId: 
       responseProducingAgentCount,
       bridgeResponsesSentToUsers,
       missingUserReport: !user,
-      hasReportMismatch: Boolean(user && (user.numberOfAgentsUsed !== rows.length || user.agentResponsesReceived !== bridgeResponsesSentToUsers)),
+      hasReportMismatch: Boolean(user && rows.length && (user.numberOfAgentsUsed !== rows.length || user.agentResponsesReceived !== bridgeResponsesSentToUsers)),
       reviewCohort,
       reviewCandidate: reviewCohort === "zero_responses" || reviewCohort === "low_responses",
       licenseAssignmentStatus: "unavailable" as const,
@@ -468,10 +468,13 @@ function filterUserSummaries(summaries: OfficialUsageUserSummary[], options: Vie
   const query = options.search?.trim().toLowerCase();
   const inactiveDays = boundedDays(options.inactiveDays, 30);
   return summaries.filter(summary => {
-    if (options.agentId !== undefined && !summary.rows.some(row => row.agentId === options.agentId)) return false;
     if (query && !summary.searchableText.includes(query)) return false;
-    if (options.creatorType && options.creatorType !== "all" && !summary.creatorTypes.includes(options.creatorType)) return false;
-    if (options.responsesOnly && !summary.rows.some(row => row.hasResponses)) return false;
+    const creatorType = options.creatorType && options.creatorType !== "all" ? options.creatorType : undefined;
+    if ((options.agentId !== undefined || creatorType || options.responsesOnly) && !summary.rows.some(row =>
+      (options.agentId === undefined || row.agentId === options.agentId)
+      && (!creatorType || row.creatorType === creatorType)
+      && (!options.responsesOnly || row.hasResponses),
+    )) return false;
     if (!inDateRange(summary.userLastActivityDateUtc, options.startDate, options.endDate)) return false;
     if (options.cohort === "zero" && summary.reviewCohort !== "zero_responses") return false;
     if (options.cohort === "low" && summary.reviewCohort !== "low_responses") return false;
@@ -574,39 +577,44 @@ function rankedUsers(rows: readonly OfficialUsageUserSummary[], direction: "asc"
 }
 
 function compareAgents(left: OfficialUsageAgent, right: OfficialUsageAgent, sortBy: OfficialUsageAgentSort, direction: "asc" | "desc") {
+  const missing = (row: OfficialUsageAgent) => sortBy === "activeUsers" ? row.activeUsersIdentityCount === null
+    : sortBy === "licensedUsers" ? row.activeUsersLicensed === null
+      : sortBy === "unlicensedUsers" ? row.activeUsersUnlicensed === null
+        : sortBy === "lastActivity" ? !row.lastActivityDateUtc : false;
+  if (missing(left) !== missing(right)) return missing(left) ? 1 : -1;
   const comparison = sortBy === "agentName"
     ? ordinal(left.agentName || left.agentId, right.agentName || right.agentId)
     : sortBy === "responses"
       ? left.responsesSentToUsers - right.responsesSentToUsers
-      : sortBy === "licensedUsers"
-        ? nullableNumber(left.activeUsersLicensed) - nullableNumber(right.activeUsersLicensed)
-        : sortBy === "unlicensedUsers"
-          ? nullableNumber(left.activeUsersUnlicensed) - nullableNumber(right.activeUsersUnlicensed)
-          : dateNumber(left.lastActivityDateUtc) - dateNumber(right.lastActivityDateUtc);
+      : sortBy === "activeUsers"
+        ? nullableNumber(left.activeUsersIdentityCount) - nullableNumber(right.activeUsersIdentityCount)
+        : sortBy === "licensedUsers"
+          ? nullableNumber(left.activeUsersLicensed) - nullableNumber(right.activeUsersLicensed)
+          : sortBy === "unlicensedUsers"
+            ? nullableNumber(left.activeUsersUnlicensed) - nullableNumber(right.activeUsersUnlicensed)
+            : dateNumber(left.lastActivityDateUtc) - dateNumber(right.lastActivityDateUtc);
   return (direction === "asc" ? comparison : -comparison) || ordinal(left.agentId, right.agentId);
 }
 
 function compareUsers(left: OfficialUsageUserSummary, right: OfficialUsageUserSummary, sortBy: OfficialUsageUserSort, direction: "asc" | "desc") {
+  if ((sortBy === "responses" || sortBy === "agentsUsed") && left.missingUserReport !== right.missingUserReport) {
+    return left.missingUserReport ? 1 : -1;
+  }
+  if (sortBy === "lastActivity" && Boolean(left.userLastActivityDateUtc) !== Boolean(right.userLastActivityDateUtc)) {
+    return left.userLastActivityDateUtc ? -1 : 1;
+  }
   const comparison = sortBy === "displayName"
     ? ordinal(left.displayName, right.displayName)
     : sortBy === "responses"
-      ? userResponses(left) - userResponses(right)
+      ? left.reportedResponsesReceived - right.reportedResponsesReceived
       : sortBy === "agentsUsed"
-        ? userAgentsUsed(left) - userAgentsUsed(right)
+        ? left.reportedAgentsUsed - right.reportedAgentsUsed
         : dateNumber(left.userLastActivityDateUtc) - dateNumber(right.userLastActivityDateUtc);
   return (direction === "asc" ? comparison : -comparison) || ordinal(left.username, right.username);
 }
 
 function nullableNumber(value: number | null) {
   return value ?? -1;
-}
-
-function userResponses(summary: OfficialUsageUserSummary) {
-  return summary.missingUserReport ? summary.bridgeResponsesSentToUsers : summary.reportedResponsesReceived;
-}
-
-function userAgentsUsed(summary: OfficialUsageUserSummary) {
-  return summary.missingUserReport ? summary.responseProducingAgentCount : summary.reportedAgentsUsed;
 }
 
 function countBy<T>(items: readonly T[], label: (item: T) => string | undefined) {

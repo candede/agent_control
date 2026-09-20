@@ -63,6 +63,8 @@
 .copilot-users-table td small { display: block; margin-top: 3px; font-size: 12px; }
 .copilot-users-table td[data-numeric] { font-variant-numeric: tabular-nums; font-weight: 700; }
 .copilot-users-table .user-name-button { padding: 0; background: none; border: 0; color: var(--ink); text-align: left; text-decoration: underline; min-height: 32px; }
+.copilot-users-provenance .copilot-users-toolbar { margin-block: 12px; }
+.copilot-users-provenance .copilot-users-pagination { margin-top: 12px; }
 .copilot-user-badge { display: inline-flex; padding: 3px 8px; border-radius: 4px; font-size: 12px; font-weight: 700; color: #20573f; background: #e4f3eb; }
 .copilot-user-badge.attention { color: #72480a; background: #fff0cb; }
 .copilot-user-badge.unknown { color: #525e5a; background: #ebece8; }

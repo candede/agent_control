@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1291,30 +1291,24 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
   });
 
-  it("opens Sync for a users-only collection without putting progress back on Users", async () => {
+  it("keeps user collection in primary Sync navigation without duplicate page actions", async () => {
     window.history.replaceState({}, "", "/users");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input.startsWith("/api/copilot-usage/users")) return Response.json(copilotUsageFixture);
-      if (input === "/api/data-sync/runs" && init?.method === "POST") return Response.json({
-        id: "users-sync", mode: "incremental", status: "running",
-        startedAt: "2026-09-15T08:00:00.000Z", updatedAt: "2026-09-15T08:00:00.000Z", completedAt: null,
-        sources: [{ source: "users", status: "running", count: null, jobId: null, lastSuccessAt: null, updatedAt: null, message: "", canRetry: false }],
-      });
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await userEvent.click(await screen.findByRole("button", { name: "Sync users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("button", { name: "Sync users" })).not.toBeInTheDocument();
+    const navigation = screen.getByRole("navigation", { name: "Primary views" });
+    await userEvent.click(within(navigation).getByRole("button", { name: "Sync" }));
     expect(window.location.pathname).toBe("/sync");
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
-    await waitFor(() => {
-      const request = transport.fetchMock.mock.calls.find(([path, init]) => path === "/api/data-sync/runs" && init?.method === "POST");
-      expect(request).toBeDefined();
-      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ mode: "incremental", sources: ["users"] });
-    });
-    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    expect(transport.fetchMock.mock.calls.some(([path, init]) => path === "/api/data-sync/runs" && init?.method === "POST")).toBe(false);
+    await userEvent.click(within(navigation).getByRole("button", { name: "Users" }));
     expect(window.location.pathname).toBe("/users");
     expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
@@ -3035,8 +3029,10 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/agents/package-private")).toBe(false);
   });
 
-  it.each(["sign-out", "account-change", "role-loss"] as const)("does not publish a pending private official-usage export after %s", async boundary => {
-    window.history.replaceState({}, "", "/official-usage");
+  it.each(["sign-out", "account-change", "role-loss"].flatMap(boundary =>
+    ["aggregate", "users"].map(kind => ({ boundary, kind })),
+  ))("does not publish a pending private $kind export after $boundary", async ({ boundary, kind }) => {
+    window.history.replaceState({}, "", kind === "users" ? "/users?view=activity" : "/official-usage");
     const transport = appTransport({
       revalidatedRoles: boundary === "role-loss" ? [] : viewer.roles,
       revalidatedUser: boundary === "account-change"
@@ -3047,12 +3043,16 @@ describe("App session revalidation", () => {
     const pending = deferredResponse();
     transport.fetchMock.mockImplementation((input, init) => input === "/api/auth/logout"
       ? Promise.resolve(new Response(null, { status: 204 }))
-      : input.startsWith("/api/official-usage/aggregate.csv") ? pending.promise : base(input, init));
+      : input.startsWith(`/api/official-usage/${kind}.csv`) ? pending.promise
+        : input === "/api/copilot-usage/users" ? Promise.resolve(Response.json(copilotUsageFixture))
+          : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     const download = mockCsvDownload();
     render(<App />);
-    await userEvent.click(await screen.findByRole("button", { name: "Export filtered agents CSV" }));
-    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith("/api/official-usage/aggregate.csv"))).toHaveLength(1);
+    const exportButton = await screen.findByRole("button", { name: kind === "users" ? "Export users CSV" : "Export agents CSV" });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await userEvent.click(exportButton);
+    expect(transport.fetchMock.mock.calls.filter(([path]) => path.startsWith(`/api/official-usage/${kind}.csv`))).toHaveLength(1);
 
     if (boundary === "sign-out") {
       await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
@@ -3063,7 +3063,7 @@ describe("App session revalidation", () => {
     await act(async () => pending.resolve(new Response("private usage CSV", { headers: { "Content-Type": "text/csv" } })));
     expect(download.filenames).toEqual([]);
     expect(download.createObjectURL).not.toHaveBeenCalled();
-    const exportCall = transport.fetchMock.mock.calls.find(([path]) => path.startsWith("/api/official-usage/aggregate.csv"))!;
+    const exportCall = transport.fetchMock.mock.calls.find(([path]) => path.startsWith(`/api/official-usage/${kind}.csv`))!;
     expect(exportCall[1]?.signal?.aborted).toBe(true);
   });
 
@@ -3073,8 +3073,8 @@ describe("App session revalidation", () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input.startsWith("/api/official-usage/aggregate") || input.startsWith("/api/official-usage/users")) {
-        return Response.json(null);
+      if (input.startsWith("/api/official-usage/aggregate")) {
+        return Response.json(usageAggregateFixture());
       }
       return base(input, init);
     });
@@ -3085,9 +3085,8 @@ describe("App session revalidation", () => {
     await waitFor(() => {
       expect(transport.fetchMock.mock.calls.some(([input]) =>
         input.startsWith(`/api/official-usage/aggregate?setId=${reportSetId}&activityWindowDays=365`))).toBe(true);
-      expect(transport.fetchMock.mock.calls.some(([input]) =>
-        input.startsWith(`/api/official-usage/users?setId=${reportSetId}`))).toBe(true);
     });
+    expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(false);
     const officialUsageCalls = transport.fetchMock.mock.calls.filter(([input]) =>
       input.startsWith("/api/official-usage/"));
     expect(officialUsageCalls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
@@ -3122,8 +3121,86 @@ describe("App session revalidation", () => {
     const exactCalls = transport.fetchMock.mock.calls.filter(([input]) =>
       input.includes(`setId=${reportSetId}`));
     expect(exactCalls.some(([input]) => input.startsWith("/api/official-usage/aggregate"))).toBe(true);
-    expect(exactCalls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(true);
+    expect(exactCalls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(false);
     expect(exactCalls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+  });
+
+  it("loads official history only on demand and keeps person-level data off Official usage", async () => {
+    window.history.replaceState({}, "", "/official-usage");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeEnabled());
+    expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/history"))).toBe(false);
+    expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(false);
+    expect(screen.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Report history" }));
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/history"))).toBe(true));
+    expect(screen.queryByRole("region", { name: "Agent comparison rows" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Report history" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Agent activity" }));
+    expect(await screen.findByRole("region", { name: "Agent comparison rows" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Report history" })).not.toBeInTheDocument();
+  });
+
+  it("ignores a late aggregate when activity returns after visiting report history", async () => {
+    window.history.replaceState({}, "", "/official-usage");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let reads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input.startsWith("/api/official-usage/aggregate?")) {
+        reads += 1;
+        return reads === 1 ? pending.promise : Promise.resolve(Response.json(usageAggregateFixture()));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => expect(reads).toBe(1));
+    const originalRead = transport.fetchMock.mock.calls.find(([input]) => input.startsWith("/api/official-usage/aggregate?"))!;
+    await userEvent.click(screen.getByRole("button", { name: "Report history" }));
+    expect(originalRead[1]?.signal?.aborted).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Agent activity" }));
+    const rows = await screen.findByRole("region", { name: "Agent comparison rows" });
+    expect(within(rows).getByRole("button", { name: "Researcher" })).toBeVisible();
+    const obsolete = usageAggregateFixture();
+    obsolete.agents.value[0].agentName = "Obsolete private aggregate";
+    await act(async () => pending.resolve(Response.json(obsolete)));
+    expect(screen.queryByText("Obsolete private aggregate")).not.toBeInTheDocument();
+    expect(within(rows).getByRole("button", { name: "Researcher" })).toBeVisible();
+    expect(reads).toBe(2);
+  });
+
+  it("clears historical loading when reversed dates cancel a pending aggregate", async () => {
+    const data = usageAggregateFixture();
+    window.history.replaceState({}, "", `/official-usage?snapshot=${data.activeSet!.id}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/official-usage/aggregate" && url.searchParams.has("startDate")) return pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("region", { name: "Agent comparison rows" });
+    await userEvent.click(screen.getByText("Last-activity filters"));
+    fireEvent.change(screen.getByLabelText("Agent last activity on or after (UTC)"), { target: { value: "2026-09-12" } });
+    expect(await screen.findByText(/Loading retained set/)).toBeVisible();
+    const pendingRequest = transport.fetchMock.mock.calls.find(([input]) => new URL(input, "http://localhost").searchParams.has("startDate"))!;
+    fireEvent.change(screen.getByLabelText("Agent last activity on or before (UTC)"), { target: { value: "2026-09-01" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before the end date");
+    expect(pendingRequest[1]?.signal?.aborted).toBe(true);
+    expect(screen.queryByText(/Loading retained set/)).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "false");
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/aggregate?"))).toHaveLength(2);
+    await act(async () => pending.resolve(Response.json(data)));
+    expect(screen.queryByRole("region", { name: "Agent comparison rows" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Reset agent filters" }));
+    expect(await screen.findByRole("region", { name: "Agent comparison rows" })).toBeVisible();
   });
 
   it.each(["/sync", "/agents"])("recovers an exact package refresh on Sync from a %s job link", async path => {

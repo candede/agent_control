@@ -2660,9 +2660,6 @@ button.icon-button.danger:hover {
   border-bottom-color: var(--ink);
 }
 
-.user-access-view,
-.user-access-layout,
-.user-detail-panel,
 .audit-view {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -3909,15 +3906,6 @@ button.audit-result-button:focus-visible {
 .user-count-stack small {
   color: var(--muted);
   white-space: nowrap;
-}
-
-.user-detail-panel {
-  padding: 18px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(240, 248, 247, 0.88), transparent 220px),
-    var(--surface);
 }
 
 .user-detail-header {

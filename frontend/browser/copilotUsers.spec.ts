@@ -1,7 +1,45 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { buildOfficialUsageUserView } from "../../backend/src/services/officialUsageViews";
 import { mockLayoutApi } from "./layoutFixtures";
+import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
 import { copilotUsageFixture, licensedUser } from "../src/test/copilotUsageFixture";
+import { usageFixtureNow, usageFixtureSetId, usageInsightsPublished, usageUsersFixture } from "../src/test/usageInsightsFixture";
+
+async function mockReportedUsers(page: Page, published = usageInsightsPublished) {
+  const measurements: Array<{ offset: number; users: number; relationships: number; bytes: number; projectionMs: number }> = [];
+  await page.route(url => url.pathname === "/api/official-usage/users", route => {
+    expect(route.request().method()).toBe("GET");
+    const params = new URL(route.request().url()).searchParams;
+    if (params.has("setId") && params.get("setId") !== published.activeSet?.id) {
+      return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
+    }
+    const sort = params.get("sortBy");
+    const cohort = params.get("cohort");
+    const activity = params.get("activity");
+    const started = performance.now();
+    const view = buildOfficialUsageUserView(published, {
+      staleAfterDays: 35, now: usageFixtureNow,
+      search: params.get("search") ?? undefined, agentId: params.get("agentId") ?? undefined,
+      creatorType: params.get("creatorType") ?? undefined, responsesOnly: params.get("responsesOnly") === "true",
+      startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
+      lowResponseThreshold: Number(params.get("lowResponseThreshold") ?? 5),
+      cohort: cohort === "zero" || cohort === "low" || cohort === "review" ? cohort : "all",
+      activity: activity === "recent" || activity === "inactive" || activity === "no-activity" ? activity : "all",
+      userSortBy: sort === "responses" || sort === "agentsUsed" || sort === "lastActivity" || sort === "displayName" ? sort : "responses",
+      sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
+      limit: Number(params.get("limit") ?? 50), offset: Number(params.get("offset") ?? 0),
+    });
+    const body = JSON.stringify(view);
+    measurements.push({
+      offset: view.users.offset, users: view.users.value.length,
+      relationships: view.users.value.reduce((count, user) => count + user.rows.length, 0),
+      bytes: Buffer.byteLength(body), projectionMs: performance.now() - started,
+    });
+    return route.fulfill({ contentType: "application/json", body });
+  });
+  return measurements;
+}
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
@@ -47,10 +85,11 @@ test("licensed users lead with useful data and support ranked employee drilldown
     const bounds = await table.boundingBox();
     expect(bounds!.y, "Useful employee rows should start within the first desktop viewport").toBeLessThan(700);
   }
-  await page.getByRole("button", { name: "Least active", exact: true }).click();
-  await expect(table.locator("tbody tr")).toHaveCount(3);
+  await page.getByLabel("Order by").selectOption("responses-asc");
+  await expect(table.locator("tbody tr")).toHaveCount(4);
   await expect(table.locator("tbody tr").first()).toContainText("Cleo");
-  await page.getByRole("button", { name: "Most active", exact: true }).click();
+  await expect(table.locator("tbody tr").last()).toContainText("Drew");
+  await page.getByLabel("Order by").selectOption("responses-desc");
   await expect(table.locator("tbody tr").first()).toContainText("Ada");
   const results = await new AxeBuilder({ page }).include(".copilot-users").analyze();
   expect(results.violations).toEqual([]);
@@ -61,7 +100,10 @@ test("licensed users lead with useful data and support ranked employee drilldown
   await expect(detail.getByRole("cell", { name: "Researcher synthetic-researcher", exact: true })).toBeVisible();
   await expect(detail.getByText("Microsoft", { exact: true })).toBeVisible();
   await expect(detail.getByText("Outlook", { exact: true })).toBeVisible();
-  await expect(detail.getByRole("link", { name: "Search interaction log" })).toHaveAttribute("href", "/audit?source=purview&user=ada%40example.invalid");
+  await expect(detail.getByRole("link")).toHaveCount(0);
+  await expect(detail.getByText("Anyone, not this user", { exact: true })).toBeVisible();
+  await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
+  await expect(page.locator(".copilot-users").getByRole("button", { name: "Sync users" })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include(".copilot-user-dialog").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("employee-detail.png"), fullPage: true });
   await page.keyboard.press("Escape");
@@ -70,14 +112,24 @@ test("licensed users lead with useful data and support ranked employee drilldown
   expect(unexpected).toEqual([]);
 });
 
-test("per-user interaction log opens with an exact identity and no automatic search", async ({ page }) => {
+test("license details focus reported agent activity on the same Users page", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
+  await mockReportedUsers(page);
+  const directory = structuredClone(copilotUsageFixture);
+  directory.users = directory.users.map(user => ({
+    ...user, importedUsage: usageUsersFixture().users.value.find(row => row.username === user.directory.userPrincipalName) ?? null,
+  }));
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: directory }));
   await page.goto("/users");
   await page.getByRole("button", { name: "Ada", exact: true }).click();
-  await page.getByRole("link", { name: "Search interaction log" }).click();
-  await expect(page).toHaveURL(/\/audit\?source=purview&user=ada%40example.invalid/);
-  await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveValue("ada@example.invalid");
-  await expect(page.getByRole("button", { name: "Run Audit Search", exact: true })).toBeDisabled();
+  await page.getByRole("dialog", { name: "Ada", exact: true }).getByRole("button", { name: "Researcher", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/users\\?view=activity&agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`));
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toBeFocused();
+  const table = page.getByRole("region", { name: "Reported users", exact: true });
+  await expect(table.locator("tbody tr")).toHaveCount(3);
+  await expect(table.getByRole("row", { name: /Concealed report user/ })).toContainText("Unknown");
+  await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });
 
@@ -96,7 +148,156 @@ test("report permission recovery is visible without hiding licensed employees", 
   await expect(notice).toBeVisible();
   await expect(notice).toContainText("Reports.Read.All");
   await expect(notice).toContainText("Reports Reader");
-  await expect(page.getByRole("link", { name: "Check connection" })).toHaveAttribute("href", "/permissions");
+  await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
+  await expect(page.getByText("Use Permissions in the top navigation to review the connection.")).toBeVisible();
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+  expect(unexpected).toEqual([]);
+});
+
+test("reported activity stays bounded with 2,053 users and 1,005 agents for one user", async ({ page }, info) => {
+  test.setTimeout(60_000);
+  const unexpected = await mockLayoutApi(page);
+  const published = structuredClone(usageInsightsPublished);
+  const largeUserName = `Person0000 ${"Long synthetic display name ".repeat(8).trim()}`;
+  const largeAgentName = `Agent1004 ${"LongAgentName".repeat(20)}`;
+  published.reports.users!.rows = Array.from({ length: 2_053 }, (_, index) => ({
+    username: `person${index}@example.invalid`, displayName: index === 0 ? largeUserName : `Person${String(index).padStart(4, "0")}`,
+    numberOfAgentsUsed: index === 0 ? 1_005 : 1, agentResponsesReceived: index === 0 ? 50_000 : 1,
+  }));
+  published.reports.userAgents!.rows = [
+    ...Array.from({ length: 1_005 }, (_, index) => ({
+      username: "person0@example.invalid", agentId: `agent-${index}`, agentName: index === 1_004 ? largeAgentName : `Agent${String(index).padStart(4, "0")}`,
+      creatorType: "Your org", responsesSentToUsers: 2,
+    })),
+    ...published.reports.users!.rows.slice(1).map((user, index) => ({
+      username: user.username, agentId: `specialist-${index + 1}`, agentName: `Specialist${index + 1}`,
+      creatorType: "Microsoft", responsesSentToUsers: 1,
+    })),
+  ];
+  const measurements = await mockReportedUsers(page, published);
+  const directory = structuredClone(copilotUsageFixture);
+  directory.sources.directory.state = "unavailable";
+  directory.users = [];
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: directory }));
+  await page.goto("/users?view=activity");
+  const table = page.getByRole("region", { name: "Reported users", exact: true });
+  await expect(table.locator("tbody tr")).toHaveCount(50);
+  await expect(table.getByRole("columnheader")).toHaveCount(6);
+  await expect(page.getByLabel("Reported user pages")).toContainText("1-50 of 2,053");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(table.getByRole("row", { name: /Person0000/ })).toContainText("Unknown");
+  await page.getByRole("button", { name: "Next users", exact: true }).click();
+  await expect(page.getByLabel("Reported user pages")).toContainText("51-100 of 2,053");
+  await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("Specialist2052");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.locator("tbody tr")).toContainText("Person2052");
+  await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("");
+  const detailButton = table.getByRole("button", { name: `View reported details for ${largeUserName}`, exact: true });
+  await detailButton.focus();
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: largeUserName, exact: true });
+  const agents = dialog.getByRole("region", { name: "User agent breakdown" });
+  await expect(agents.locator("tbody tr")).toHaveCount(50);
+  const readsBeforeAgentPaging = measurements.length;
+  await expect(dialog.getByLabel("User agent pages")).toContainText("1-50 of 1,005");
+  await dialog.getByRole("button", { name: "Next agents" }).click();
+  await expect(dialog.getByLabel("User agent pages")).toContainText("51-100 of 1,005");
+  await dialog.getByRole("searchbox", { name: "Search this user's agents" }).fill("agent-1004");
+  await expect(agents.locator("tbody tr")).toHaveCount(1);
+  await expect(agents.getByRole("button", { name: largeAgentName, exact: true })).toBeVisible();
+  expect(measurements).toHaveLength(readsBeforeAgentPaging);
+  expect(measurements.every(read => read.users <= 50)).toBe(true);
+  expect(measurements.some(read => read.relationships >= 1_005)).toBe(true);
+  await info.attach("reported-users-scale.json", { body: JSON.stringify(measurements, null, 2), contentType: "application/json" });
+  expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("reported-user-agent-detail.png"), fullPage: true });
+  await page.keyboard.press("Escape");
+  await expect(detailButton).toBeFocused();
+  await expect(dialog).not.toBeVisible();
+  expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath("reported-users.png"), fullPage: true });
+  expect(unexpected).toEqual([]);
+});
+
+test("legacy matrix links open activity and filtered CSV exports pin the displayed report", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  await mockReportedUsers(page);
+  let exported: URLSearchParams | undefined;
+  await page.route("**/api/official-usage/users.csv?*", route => {
+    exported = new URL(route.request().url()).searchParams;
+    expect(route.request().method()).toBe("GET");
+    expect(exported.get("setId")).toBe(usageFixtureSetId);
+    const users = buildOfficialUsageUserView(usageInsightsPublished, {
+      staleAfterDays: 35, now: usageFixtureNow,
+      search: exported.get("search") ?? undefined, agentId: exported.get("agentId") ?? undefined,
+      creatorType: exported.get("creatorType") ?? undefined, responsesOnly: exported.get("responsesOnly") === "true",
+      lowResponseThreshold: Number(exported.get("lowResponseThreshold") ?? 5),
+      cohort: exported.get("cohort") === "low" ? "low" : "all", limit: 100_000, offset: 0,
+    }).users.value;
+    const rows = users.flatMap(user => (user.rows.length ? user.rows : [undefined]).map(row => ({
+      username: user.username, displayName: user.displayName, reportedResponsesReceived: user.reportedResponsesReceived,
+      agentId: row?.agentId, responsesSentToUsers: row?.responsesSentToUsers, reportSetId: user.datasetScope.reportSetId,
+    })));
+    return route.fulfill({ contentType: "text/csv", body: usageCsvFixture(
+      ["username", "displayName", "reportedResponsesReceived", "agentId", "responsesSentToUsers", "reportSetId"], rows,
+    ) });
+  });
+  await page.goto(`/users?view=matrix&agent=helpdesk%2Freport%3A2&snapshot=${usageFixtureSetId}&q=Ada`);
+  const table = page.getByRole("region", { name: "Reported users", exact: true });
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(table.locator("tbody tr")).toContainText("215");
+  await expect(page.getByRole("button", { name: "Export users CSV" })).toHaveAccessibleDescription(/all agent details for matching users/);
+  await expect(page.getByText(/All-agent user totals repeat per relationship; do not sum them/)).toBeVisible();
+  await page.getByText("Advanced user filters", { exact: true }).click();
+  await page.getByLabel("Relationship creator").selectOption("Your org");
+  await page.getByLabel("Users-report response cohort").selectOption("low");
+  await page.getByLabel("Low-response threshold").fill("250");
+  await page.getByLabel("Require a response-producing relationship").check();
+  await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+  await page.getByRole("button", { name: "Apply user filters" }).click();
+  await expect(page).toHaveURL(/\/users\?view=activity/);
+  await expect(page.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export users CSV" }).click();
+  const file = await download;
+  expect(file.suggestedFilename()).toBe("reported-user-activity.csv");
+  const rows = await downloadedCsvRows(file);
+  expect(rows).toHaveLength(2);
+  expect(rows.every(row => row.username === "ada@example.invalid" && row.reportedResponsesReceived === "215" && row.reportSetId === usageFixtureSetId)).toBe(true);
+  expect(rows).toEqual(expect.arrayContaining([
+    expect.objectContaining({ agentId: "synthetic-researcher", responsesSentToUsers: "200" }),
+    expect.objectContaining({ agentId: "helpdesk/report:2", responsesSentToUsers: "15" }),
+  ]));
+  expect(exported?.get("setId")).toBe(usageFixtureSetId);
+  expect(exported?.get("agentId")).toBe("helpdesk/report:2");
+  expect(exported?.get("creatorType")).toBe("Your org");
+  expect(exported?.get("lowResponseThreshold")).toBe("250");
+  expect(exported?.get("responsesOnly")).toBe("true");
+  expect(exported?.get("cohort")).toBe("low");
+  expect(exported?.has("offset")).toBe(false);
+  expect(exported?.has("limit")).toBe(false);
+  expect(unexpected).toEqual([]);
+});
+
+test("an unavailable exact reported snapshot does not fall back to current reports", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  await mockReportedUsers(page);
+  const requests: URLSearchParams[] = [];
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/official-usage/users") requests.push(url.searchParams);
+  });
+  const unavailable = "99999999-9999-4999-8999-999999999999";
+  await page.goto(`/users?view=activity&snapshot=${unavailable}`);
+  await expect(page.getByRole("alert")).toContainText("The exact synthetic report set is unavailable.");
+  await expect(page.getByRole("region", { name: "Reported users", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+  expect(requests.length).toBeGreaterThan(0);
+  expect(requests.every(query => query.get("setId") === unavailable)).toBe(true);
+  await page.getByRole("button", { name: "Use current reports", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Reported users", exact: true }).locator("tbody tr")).toHaveCount(4);
+  expect(requests.at(-1)?.has("setId")).toBe(false);
   expect(unexpected).toEqual([]);
 });

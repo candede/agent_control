@@ -39,13 +39,15 @@ describe("workbench routing", () => {
     expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
   });
 
-  it("round trips report-scoped user-agent matrix filters without normalizing report identities", () => {
+  it("round trips report-scoped activity filters and preserves legacy matrix links", () => {
     const state = {
-      view: "matrix" as const, search: "Ada@example.invalid", agentId: "Report/Agent:Upper",
+      view: "activity" as const, search: "Ada@example.invalid", agentId: "Report/Agent:Upper",
       reportSetId: "11111111-1111-4111-8111-111111111111", page: 3,
     };
     const query = usersRouteSearch(state);
     expect(parseUsersRoute(query.toString())).toEqual(state);
+    expect(query.get("view")).toBe("activity");
+    expect(parseUsersRoute(query.toString().replace("view=activity", "view=matrix"))).toEqual(state);
     expect(workbenchUrl("users", query)).toContain("agent=Report%2FAgent%3AUpper");
     expect(parseUsersRoute("view=unknown&page=-1")).toEqual({ view: "licenses", search: "", agentId: undefined, reportSetId: undefined, page: 0 });
     expect(usersRouteSearch({ ...state, view: "licenses" }).toString()).toBe("");

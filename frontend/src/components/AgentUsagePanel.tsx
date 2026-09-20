@@ -10,7 +10,7 @@ import {
   type AgentUsageTarget,
   type UnifiedAgentRecord,
 } from "../api/client";
-import { usageCount, usageCoverageLabel, usageDate, usagePageLabel, userAgentMatrixUrl } from "../usageInsights";
+import { usageCount, usageCoverageLabel, usageDate, usagePageLabel, reportedUserActivityUrl } from "../usageInsights";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { UsageReportContext } from "./UsageReportContext";
 import "./agentInsights.css";
@@ -168,7 +168,7 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canManage,
           <span>{targetLabel(association.target)}</span>
           <small>Administrator-reviewed on {usageDate(association.reviewedAt)}</small></div>
         <div className="agent-insight-actions">
-          <a href={userAgentMatrixUrl(association.reportAgentId, usage.reportSetId ?? undefined)}>View reported users</a>
+          <a href={reportedUserActivityUrl(association.reportAgentId, usage.reportSetId ?? undefined)}>View reported users</a>
           {editable ? <WorkbenchActionGate actionId="agentUsage.remove" compact><button type="button" className="secondary"
             disabled={busy} aria-label={`Remove association for ${association.reportAgentName} (${association.reportAgentId})`}
             onClick={() => review({ kind: "remove", association })}>Remove association</button></WorkbenchActionGate> : null}

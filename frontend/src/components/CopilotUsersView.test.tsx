@@ -47,40 +47,40 @@ describe("Copilot license usage dashboard", () => {
   it("ranks measured users in both directions without treating unknown as zero", async () => {
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    await userEvent.click(screen.getByRole("button", { name: "Least active" }));
-    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Ben", "Ada"]);
-    await userEvent.click(screen.getByRole("button", { name: "Most active" }));
-    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo"]);
+    await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-asc");
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Ben", "Ada", "Drew"]);
+    await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-desc");
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo", "Drew"]);
     await userEvent.click(screen.getByRole("button", { name: "Usage unknown" }));
     expect(userRows()).toHaveLength(1);
     expect(userRows()[0]).toHaveTextContent("Drew");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
-  it("makes the all-identity matrix a primary user view independent of the license roster", async () => {
+  it("makes reported activity a primary user view independent of the license roster", async () => {
     const data = structuredClone(copilotUsageFixture);
     data.sources.directory.state = "unavailable";
     data.users = [];
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
     render(<CopilotUsersView />);
-    await userEvent.click(screen.getByRole("button", { name: "User-agent matrix" }));
-    const matrix = await screen.findByRole("region", { name: "User-agent response matrix" });
-    expect(within(matrix).getByText("Concealed report user")).toBeVisible();
-    expect(within(matrix).getAllByRole("row")).toHaveLength(5);
-    expect(screen.getByRole("button", { name: "User-agent matrix" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Reported activity" }));
+    const activity = await screen.findByRole("region", { name: "Reported users" });
+    expect(within(activity).getByText("Concealed report user")).toBeVisible();
+    expect(within(activity).getAllByRole("row")).toHaveLength(5);
+    expect(screen.getByRole("button", { name: "Reported activity" })).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("opens an exact agent matrix from a user's breakdown without stacking dialogs", async () => {
+  it("opens exact agent activity from a user's breakdown without stacking dialogs", async () => {
     const onRouteChange = vi.fn();
     render(<CopilotUsersView onRouteChange={onRouteChange} />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     await userEvent.click(within(screen.getByRole("dialog", { name: "Ada" })).getByRole("button", { name: "Researcher" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(onRouteChange).toHaveBeenCalledWith({
-      view: "matrix", agentId: "synthetic-researcher", reportSetId: "synthetic-set", search: "", page: 0,
+      view: "activity", agentId: "synthetic-researcher", reportSetId: "synthetic-set", search: "", page: 0,
     }, false);
-    expect(screen.getByRole("button", { name: "User-agent matrix" })).toHaveFocus();
-    expect(await screen.findByRole("region", { name: "User-agent response matrix" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reported activity" })).toHaveFocus();
+    expect(await screen.findByRole("region", { name: "Reported users" })).toBeVisible();
   });
   it("supports coaching cohorts and a local response threshold", async () => {
     const fixture = structuredClone(copilotUsageFixture);
@@ -108,7 +108,7 @@ describe("Copilot license usage dashboard", () => {
     expect(screen.getByText("No users match")).toBeVisible();
   });
 
-  it("shows first-party agent totals, app dates and a scoped explicit interaction-log link", async () => {
+  it("shows separate agent/app dates and restores focus without cross-page links", async () => {
     render(<CopilotUsersView />);
     const trigger = await screen.findByRole("button", { name: "Ada" });
     await userEvent.click(trigger);
@@ -117,8 +117,9 @@ describe("Copilot license usage dashboard", () => {
     expect(within(detail).getByText("Microsoft")).toBeVisible();
     expect(within(detail).getByText("Outlook")).toBeVisible();
     expect(within(detail).getByText("Word").parentElement).toHaveTextContent("Sep 11, 2026");
-    expect(within(detail).getByRole("link", { name: "Search interaction log" })).toHaveAttribute("href", "/audit?source=purview&user=ada%40example.invalid");
-    expect(within(detail).queryByText("Sep 12, 2026", { exact: true })).not.toBeInTheDocument();
+    expect(within(detail).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(detail).getByText("Agent-wide last activity")).toBeVisible();
+    expect(within(detail).getByText("Anyone, not this user")).toBeVisible();
     expect(within(detail).getByText(/not a daily event log/)).toBeVisible();
     await userEvent.click(within(detail).getByRole("button", { name: "Close user details" }));
     expect(trigger).toHaveFocus();
@@ -131,11 +132,11 @@ describe("Copilot license usage dashboard", () => {
     fixture.sources.appActivity = { ...fixture.sources.appActivity, state: "unavailable", message: "Reports.Read.All and Reports Reader are required." };
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
-    expect(await screen.findByRole("link", { name: "Connect license data" })).toHaveAttribute("href", "/permissions");
-    expect(screen.getByText(/License inventory unavailable/)).toHaveTextContent("User.Read.All");
+    expect(await screen.findByText(/Current license inventory is unverified/)).toHaveTextContent("User.Read.All");
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText(/Office app activity unavailable/)).toBeVisible();
     expect(screen.getByText(/Office app activity unavailable/)).toHaveTextContent("Reports.Read.All and Reports Reader");
-    expect(screen.getByText(/License count unavailable/)).toBeVisible();
+    expect(screen.getByText(/Current license count unavailable/)).toBeVisible();
     expect(screen.queryByText(/^0 licensed users/)).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("Licensed user summary")).getByText("Licensed users").parentElement).toHaveTextContent("Unknown");
     await userEvent.click(screen.getByText("Unlinked report identities (1)"));
@@ -201,30 +202,28 @@ describe("Copilot license usage dashboard", () => {
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
-  it("starts an explicit users sync and preserves the last saved view while a post-sync reload fails", async () => {
-    const onSyncUsers = vi.fn().mockResolvedValue(undefined);
+  it("leaves collection to Sync and preserves last saved data while a reload fails", async () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
       .mockRejectedValueOnce(new Error("Authorization changed"))
       .mockResolvedValueOnce(structuredClone(copilotUsageFixture));
-    const view = render(<CopilotUsersView dataRevision={0} onSyncUsers={onSyncUsers} />);
+    const view = render(<CopilotUsersView dataRevision={0} />);
     await screen.findByRole("button", { name: "Ada" });
-    await userEvent.click(screen.getByRole("button", { name: "Sync users" }));
-    expect(onSyncUsers).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Sync users" })).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
 
-    view.rerender(<CopilotUsersView dataRevision={1} onSyncUsers={onSyncUsers} />);
+    view.rerender(<CopilotUsersView dataRevision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Authorization changed");
     expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
     expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
     expect(screen.queryByText("Offer adoption help")).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("Licensed user summary")).getByText("Using agents").parentElement).toHaveTextContent("Unknown");
 
-    view.rerender(<CopilotUsersView dataRevision={2} onSyncUsers={onSyncUsers} />);
+    view.rerender(<CopilotUsersView dataRevision={2} />);
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(3);
   });
 
-  it("withholds current matrix licenses during and after a failed saved-user reload", async () => {
+  it("withholds current reported-user licenses during and after a failed saved-user reload", async () => {
     const data = structuredClone(copilotUsageFixture);
     data.users = data.users.map(user => ({
       ...user,
@@ -233,19 +232,18 @@ describe("Copilot license usage dashboard", () => {
     let reject!: (error: Error) => void;
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(data)
       .mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
-    const route = { view: "matrix", search: "", page: 0 } as const;
+    const route = { view: "activity", search: "", page: 0 } as const;
     const view = render(<CopilotUsersView route={route} dataRevision={0} />);
-    const matrix = await screen.findByRole("region", { name: "User-agent response matrix" });
-    await waitFor(() => expect(within(matrix).getByRole("row", { name: /Ada/ })).toHaveTextContent("Assigned"));
-    expect(within(matrix).getByRole("button", { name: "Ada" })).toBeVisible();
+    const activity = await screen.findByRole("region", { name: "Reported users" });
+    await waitFor(() => expect(within(activity).getByRole("row", { name: /Ada/ })).toHaveTextContent("Assigned"));
 
     view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
-    const refreshedMatrix = await screen.findByRole("region", { name: "User-agent response matrix" });
-    expect(within(refreshedMatrix).getByRole("row", { name: /Ada/ })).toHaveTextContent("Unknown");
+    const refreshedActivity = await screen.findByRole("region", { name: "Reported users" });
+    expect(within(refreshedActivity).getByRole("row", { name: /Ada/ })).toHaveTextContent("Unknown");
     await act(async () => reject(new Error("Saved users temporarily unavailable")));
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved users temporarily unavailable");
-    expect(within(refreshedMatrix).queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
-    expect(within(screen.getByLabelText("Matrix coverage")).getByText("Current licensed users").parentElement).toHaveTextContent("Unknown");
+    expect(within(refreshedActivity).getByRole("row", { name: /Ada/ })).toHaveTextContent("Unknown");
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 
   it("clears retained user data after read authorization is revoked", async () => {
@@ -282,6 +280,36 @@ describe("Copilot license usage dashboard", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("does not revive verified assignments or an old dialog on an A-B-A revision transition", async () => {
+    let resolveB!: (value: typeof copilotUsageFixture) => void;
+    let resolveA!: (value: typeof copilotUsageFixture) => void;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
+      .mockReturnValueOnce(new Promise(done => { resolveB = done; }))
+      .mockReturnValueOnce(new Promise(done => { resolveA = done; }));
+    const view = render(<CopilotUsersView dataRevision={0} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    view.rerender(<CopilotUsersView dataRevision={0} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
+    expect(within(screen.getByLabelText("Licensed user summary")).getByText("Licensed users").parentElement).toHaveTextContent("Unknown");
+    await act(async () => resolveB(structuredClone(copilotUsageFixture)));
+    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
+    await act(async () => resolveA(structuredClone(copilotUsageFixture)));
+    expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("closes the licensed-user dialog across external subview navigation without reviving it on return", async () => {
+    const route = { view: "licenses", search: "", page: 0 } as const;
+    const view = render(<CopilotUsersView route={route} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    view.rerender(<CopilotUsersView route={{ ...route, view: "activity" }} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    view.rerender(<CopilotUsersView route={route} />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("aborts an old principal request and ignores its late completion", async () => {
     let resolve!: (value: typeof copilotUsageFixture) => void;
     vi.mocked(getCopilotUsageUsers).mockReturnValueOnce(new Promise(done => { resolve = done; }));
@@ -296,12 +324,91 @@ describe("Copilot license usage dashboard", () => {
 
   it("retries saved reads without starting a collection job", async () => {
     vi.mocked(getCopilotUsageUsers).mockRejectedValueOnce(new Error("Saved users could not be read"));
-    const onSyncUsers = vi.fn();
-    render(<CopilotUsersView onSyncUsers={onSyncUsers} />);
+    render(<CopilotUsersView />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved users could not be read");
     await userEvent.click(screen.getByRole("button", { name: "Retry saved users" }));
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2);
-    expect(onSyncUsers).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Sync users" })).not.toBeInTheDocument();
+  });
+
+  it("makes every unlinked identity searchable and paged with same-page snapshot-scoped activity", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    data.unresolvedImportedIdentities = Array.from({ length: 153 }, (_, index) => ({
+      ...data.unresolvedImportedIdentities[0],
+      importedUsage: { ...data.unresolvedImportedIdentities[0].importedUsage, username: `concealed-${index}`, displayName: `Concealed ${index}` },
+    }));
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    const onRouteChange = vi.fn();
+    render(<CopilotUsersView onRouteChange={onRouteChange} />);
+    await userEvent.click(await screen.findByText("Unlinked report identities (153)"));
+    const table = screen.getByRole("region", { name: "Unlinked report identities" });
+    expect(within(table).getAllByRole("row")).toHaveLength(51);
+    await userEvent.click(screen.getByRole("button", { name: "Next unlinked identities" }));
+    expect(screen.getByLabelText("Unlinked identity pages")).toHaveTextContent("51-100 of 153");
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search unlinked report identities" }), "concealed-152");
+    expect(within(table).getAllByRole("row")).toHaveLength(2);
+    expect(within(table).getByText("Concealed 152")).toBeVisible();
+    await userEvent.click(within(table).getByRole("button", { name: "View reported activity" }));
+    expect(onRouteChange).toHaveBeenLastCalledWith({ view: "activity", search: "concealed-152", reportSetId: "synthetic-set", page: 0 }, false);
+    expect(await screen.findByRole("region", { name: "Reported users" })).toBeVisible();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it("uses only user-level agent-report dates for table recency and leaves Office dates separate", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    data.users[0].importedUsage!.userLastActivityDateUtc = undefined;
+    data.users[0].appActivity!.lastActivityDate = "2026-09-19";
+    data.users[1].importedUsage!.userLastActivityDateUtc = "2026-09-17";
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    await userEvent.selectOptions(screen.getByLabelText("Order by"), "activity");
+    expect(userRows()[0]).toHaveTextContent("Ben");
+    const ada = userRows().find(row => within(row).queryByRole("button", { name: "Ada" }))!;
+    expect(ada).toHaveTextContent("Not reported");
+    expect(ada).not.toHaveTextContent("Sep 19");
+    expect(ada).toHaveTextContent("Users report only");
+  });
+
+  it("never searches a concealed identity in another snapshot when its saved report scope is missing", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    data.unresolvedImportedIdentities[0].importedUsage.datasetScope.reportSetId = null;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByText("Unlinked report identities (1)"));
+    const table = screen.getByRole("region", { name: "Unlinked report identities" });
+    expect(within(table).getByText("Concealed report user")).toBeVisible();
+    expect(within(table).getByText("Report snapshot unavailable")).toBeVisible();
+    expect(within(table).queryByRole("button", { name: "View reported activity" })).not.toBeInTheDocument();
+  });
+
+  it("retains but never presents partial license assignments as current or actionable", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    data.sources.directory.state = "partial";
+    data.users[0].licenses[0].state = "error";
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    expect(userRows()[0]).toHaveTextContent("Last saved: Assignment issue");
+    expect(userRows()[0]).toHaveTextContent("Verify license inventory");
+    expect(within(screen.getByLabelText("Licensed user summary")).getByText("Licensed users").parentElement).toHaveTextContent("Unknown");
+    expect(screen.queryByText("Review assignment")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    expect(screen.getByText("Current license count unavailable; any listed assignments are last saved", { exact: false })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+  });
+
+  it("aborts a late directory read when reported-user access is denied", async () => {
+    let resolve!: (value: typeof copilotUsageFixture) => void;
+    vi.mocked(getCopilotUsageUsers).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    vi.mocked(getOfficialUsageUsers).mockRejectedValueOnce(new ApiError(403, "forbidden", "Report user access revoked"));
+    render(<CopilotUsersView route={{ view: "activity", search: "", page: 0 }} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Report user access revoked");
+    const signal = vi.mocked(getCopilotUsageUsers).mock.calls[0][0]!.signal!;
+    expect(signal.aborted).toBe(true);
+    await act(async () => resolve(copilotUsageFixture));
+    expect(screen.queryByText("Ada")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Reported users" })).not.toBeInTheDocument();
   });
 });

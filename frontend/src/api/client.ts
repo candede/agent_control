@@ -834,20 +834,22 @@ export function acknowledgeLegacyUsageCleanup(disposition: "reimported" | "disca
   });
 }
 
+export type OfficialUsageAgentQuery = {
+  inactiveDays?: number;
+  activityWindowDays?: number;
+  setId?: string;
+  search?: string;
+  creatorType?: string;
+  startDate?: string;
+  endDate?: string;
+  sortBy?: OfficialUsageAggregateView["filters"]["sortBy"];
+  sortDirection?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+};
+
 export function getOfficialUsageAggregate(
-  query: {
-    inactiveDays?: number;
-    activityWindowDays?: number;
-    setId?: string;
-    search?: string;
-    creatorType?: string;
-    startDate?: string;
-    endDate?: string;
-    sortBy?: "agentName" | "responses" | "licensedUsers" | "unlicensedUsers" | "lastActivity";
-    sortDirection?: "asc" | "desc";
-    limit?: number;
-    offset?: number;
-  } = {},
+  query: OfficialUsageAgentQuery = {},
   options: { signal?: AbortSignal } = {},
 ) {
   const params = new URLSearchParams();

@@ -1,0 +1,60 @@
+.reported-users { display: grid; gap: 12px; min-width: 0; }
+.reported-users p { margin: 0; font-size: 13px; line-height: 1.5; }
+.reported-users-intro { max-width: 100ch; }
+.reported-users-toolbar > label:first-child { flex: 2 1 280px; }
+.reported-users-toolbar > label { flex: 1 1 220px; }
+.reported-users-filters { border: 1px solid var(--border); border-radius: 8px; padding: 0 14px; }
+.reported-users-filters > summary { cursor: pointer; font-weight: 700; font-size: 13px; padding: 12px 0; }
+.reported-users-filters form { display: grid; gap: 14px; padding-bottom: 14px; }
+.reported-users-filter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.reported-users-filter-grid > label { display: grid; align-content: start; gap: 5px; min-width: 0; font-size: 13px; font-weight: 700; }
+.reported-users-filter-grid input,
+.reported-users-filter-grid select { min-height: 42px; width: 100%; min-width: 0; }
+.reported-users-filter-grid .reported-users-checkbox { display: flex; align-items: center; grid-column: 1 / -1; }
+.reported-users-checkbox input { width: 20px; min-height: 20px; flex: 0 0 20px; }
+.reported-users-actions,
+.reported-users-applied,
+.reported-users-snapshot,
+.reported-users-focus { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; }
+.reported-users-applied { justify-content: space-between; font-size: 13px; overflow-wrap: anywhere; }
+.reported-users-applied > span { flex: 1 1 240px; }
+.reported-users-focus { justify-content: space-between; padding: 12px 14px; border-left: 3px solid #4c8177; background: #edf6f3; overflow-wrap: anywhere; }
+.reported-users-focus > div { flex: 1 1 300px; }
+.reported-users-focus small { display: block; }
+.reported-users-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.reported-users-context { color: var(--muted); }
+.reported-users-empty { padding: 24px 16px; border: 1px solid var(--border); border-radius: 8px; text-align: center; }
+.reported-users-empty h3,
+.reported-users-empty h4 { margin: 0 0 8px; }
+.reported-users-empty button { margin-top: 12px; }
+.reported-users-table { table-layout: fixed; min-width: 780px; }
+.reported-users-table th:first-child { width: 25%; }
+.reported-users-table th:nth-child(2),
+.reported-users-table th:nth-child(3) { width: 14%; }
+.reported-users-table th:nth-child(4) { width: 14%; }
+.reported-users-table th:nth-child(5) { width: 18%; }
+.reported-users-table th:last-child { width: 15%; }
+.reported-users-table tbody th { color: var(--text-h); background: var(--surface); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.reported-users-table small { display: block; font-weight: 400; margin-top: 4px; overflow-wrap: anywhere; }
+.reported-users-table td { overflow-wrap: anywhere; }
+.reported-user-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 0 0 16px; }
+.reported-user-facts dt { font-size: 12px; color: var(--muted); }
+.reported-user-facts dd { font-size: 18px; font-weight: 700; margin: 4px 0 0; color: var(--text-h); }
+.reported-user-agents > p,
+.reported-user-agents > .copilot-users-toolbar,
+.reported-user-agents > .copilot-users-pagination { margin-block: 12px; }
+.reported-user-agents > .copilot-users-table-shell { max-height: min(45svh, 420px); }
+.reported-agent-table { table-layout: fixed; min-width: 640px; }
+.reported-agent-table th:first-child { width: 38%; }
+.reported-agent-table thead th { position: sticky; top: 0; z-index: 1; }
+.reported-agent-table td { overflow-wrap: anywhere; }
+.reported-agent-button { background: none; padding: 0; border: 0; color: var(--ink); text-decoration: underline; text-align: left; overflow-wrap: anywhere; }
+
+@media (max-width: 760px) {
+  .reported-users-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .reported-user-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 460px) {
+  .reported-users-filter-grid { grid-template-columns: minmax(0, 1fr); }
+  .reported-users-toolbar > button { width: 100%; }
+}
