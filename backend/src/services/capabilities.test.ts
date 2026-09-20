@@ -5,6 +5,7 @@ import type { CapabilityConfiguration, CapabilityEvidence, EvidenceKey } from ".
 import { AppError } from "../errors.js";
 import { CapabilityService } from "./capabilities.js";
 import { GraphPackagesClient } from "./graphPackages.js";
+import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 
 vi.hoisted(() => { process.env.CLIENT_ID = "22222222-2222-2222-2222-222222222222"; });
 
@@ -50,6 +51,92 @@ function deferred<T>() {
 }
 
 describe("capability decisions", () => {
+  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+    "describes an on-demand %s read without target confirmation", async id => {
+      const { value, probes, repository } = service();
+      const decision = await value.decision(id, reader);
+      expect(decision).toMatchObject({ status: "available", authorized: true, verification: "on_demand" });
+      expect(decision.remediation.join(" ")).toMatch(/read/i);
+      expect(decision.remediation.join(" ")).not.toMatch(/choose a target|confirm/i);
+      expect(probes.delegatedToken).not.toHaveBeenCalled();
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["graph.package.read.application", "purview.audit.search.application", "defender.hunting.application"] as const)(
+    "does not recommend delegated automatic checks for unverified %s", async id => {
+      const { value, probes, repository } = service();
+      repository.configurations.set(id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+      const decision = await value.decision(id, reader);
+      expect(decision.status).toBe("unknown");
+      expect(decision.remediation.join(" ")).toMatch(/explicit.*application-scope/i);
+      expect(decision.remediation.join(" ")).not.toMatch(/Run the automatic/i);
+      await value.check(reader, { retryFailed: true });
+      expect(probes.applicationToken).not.toHaveBeenCalled();
+      expect((await value.decision(id, reader)).status).toBe("unknown");
+      await expect(value.requireAvailable(id, reader)).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(probes.applicationToken).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+    "directs expired %s evidence to an explicit read rather than Check status", async id => {
+      const delegatedToken = vi.fn(async () => "delegated-token");
+      const { value, repository } = service(new MemoryRepository(), { delegatedToken });
+      await value.refresh(id, reader);
+      const evidence = [...repository.evidenceRows.values()][0];
+      evidence.expiresAt = new Date(0).toISOString();
+      const decision = await value.decision(id, reader);
+      expect(decision.status).toBe("unknown");
+      expect(decision.remediation.join(" ")).toMatch(/read from the dashboard/);
+      expect(decision.remediation.join(" ")).not.toMatch(/Run the automatic/i);
+      delegatedToken.mockClear();
+      await value.check(reader, { retryFailed: true });
+      expect(delegatedToken).not.toHaveBeenCalledWith(reader.homeAccountId, id);
+      expect((await value.decision(id, reader)).status).toBe("unknown");
+      await expect(value.requireAvailable(id, { ...reader, roles: [] })).rejects.toMatchObject({
+        code: "capability_unavailable", details: { status: "missing_internal_role" },
+      });
+      expect(delegatedToken).not.toHaveBeenCalledWith(reader.homeAccountId, id);
+      await expect(value.requireAvailable(id, reader)).resolves.toMatchObject({
+        status: "available", authorized: true, fresh: true, verification: "token",
+      });
+      expect(delegatedToken).toHaveBeenCalledWith(reader.homeAccountId, id);
+    },
+  );
+
+  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+    "preserves fresh %s failures and rechecks expired failures only for an explicit read", async id => {
+      const delegatedToken = vi.fn(async () => "delegated-token");
+      const { value, repository, probes } = service(new MemoryRepository(), { delegatedToken });
+      await value.refresh(id, reader);
+      const evidence = [...repository.evidenceRows.values()][0];
+      evidence.expiresAt = new Date(0).toISOString();
+      delegatedToken.mockRejectedValueOnce(new AppError(403, "missing_permission", "Consent required"));
+
+      await expect(value.requireAvailable(id, reader)).rejects.toMatchObject({
+        code: "capability_unavailable",
+        details: { status: "missing_permission", authorized: false, fresh: true },
+      });
+      expect(delegatedToken).toHaveBeenCalledTimes(2);
+      await expect(value.requireAvailable(id, reader)).rejects.toMatchObject({
+        code: "capability_unavailable", details: { status: "missing_permission" },
+      });
+      expect(delegatedToken).toHaveBeenCalledTimes(2);
+
+      const failedEvidence = [...repository.evidenceRows.values()][0];
+      failedEvidence.expiresAt = new Date(0).toISOString();
+      await expect(value.requireAvailable(id, reader)).resolves.toMatchObject({
+        status: "available", authorized: true, fresh: true, verification: "token",
+      });
+      expect(delegatedToken).toHaveBeenCalledTimes(3);
+      expect(probes.applicationToken).not.toHaveBeenCalled();
+      expect(probes.packageProbe).not.toHaveBeenCalled();
+      expect(probes.directoryProbe).not.toHaveBeenCalled();
+      expect(probes.inventoryProbe).not.toHaveBeenCalled();
+    },
+  );
+
   it("allows implemented Admin actions immediately without inventing provider or canary evidence", async () => {
     const { value, probes, repository } = service();
     const admin = { ...reader, roles: ["AgentControl.Admin"] as const };
@@ -58,6 +145,7 @@ describe("capability decisions", () => {
       expect(decision).toMatchObject({ status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required" });
       expect(decision.checkedAt).toBeUndefined();
       expect(decision.lastSuccessAt).toBeUndefined();
+      expect(decision.remediation.join(" ")).toContain("Choose a target and confirm the operation");
       await expect(value.requireAvailable(id, reader)).rejects.toMatchObject({ code: "capability_unavailable", details: { status: "missing_internal_role" } });
     }
     expect(probes.delegatedToken).not.toHaveBeenCalled();
@@ -306,6 +394,18 @@ describe("capability decisions", () => {
     expect(result.find(view => view.definition.id === "graph.package.read.delegated")?.decision.evidence?.category).toBe("provider_throttled");
   });
 
+  it("preserves the cooldown for the inventory adapter's generic HTTP 429 error", async () => {
+    const fetcher = vi.fn(async () => new Response(null, { status: 429 }));
+    const client = new PowerPlatformResourceQueryClient(fetcher, { maxAttempts: 1 });
+    const { value } = service(new MemoryRepository(), { inventoryProbe: token => client.checkAccess(token) });
+    const first = await value.check(reader);
+    expect(first.find(view => view.definition.id === "powerPlatform.inventory.read")?.decision).toMatchObject({
+      status: "provider_error", evidence: { category: "provider_throttled" },
+    });
+    await value.check(reader, { retryFailed: true });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("activates the inventory read adapter without pretending it qualifies preview writes", async () => {
     const { value } = service();
     expect((await value.refresh("powerPlatform.inventory.read", reader)).status).toBe("available");
@@ -499,6 +599,169 @@ describe("capability decisions", () => {
     expect(probes.delegatedToken).toHaveBeenCalledTimes(1);
     expect(probes.packageProbe).toHaveBeenCalledTimes(1);
     expect(repository.evidenceRows.size).toBe(1);
+  });
+
+  it("rejects a decision whose evidence read crossed principal invalidation", async () => {
+    const { value, repository } = service();
+    await value.refresh("graph.package.read.delegated", reader);
+    const evidence = [...repository.evidenceRows.values()][0];
+    const held = deferred<CapabilityEvidence>();
+    repository.evidence.mockClear().mockImplementationOnce(() => held.promise);
+    const pending = value.decision("graph.package.read.delegated", reader);
+    await vi.waitFor(() => expect(repository.evidence).toHaveBeenCalledOnce());
+    await value.invalidatePrincipal(reader);
+    held.resolve(evidence);
+    await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+    expect(repository.evidenceRows.size).toBe(0);
+  });
+
+  it("waits for pending invalidation before reading evidence under the new generation", async () => {
+    const { value, repository } = service();
+    await value.refresh("graph.package.read.delegated", reader);
+    const held = deferred<void>();
+    repository.invalidatePrincipal.mockImplementationOnce(async () => {
+      await held.promise;
+      repository.evidenceRows.clear();
+    });
+    const invalidation = value.invalidatePrincipal(reader);
+    await vi.waitFor(() => expect(repository.invalidatePrincipal).toHaveBeenCalledOnce());
+    const pending = value.decision("graph.package.read.delegated", reader);
+    held.resolve();
+    await invalidation;
+    await expect(pending).resolves.toMatchObject({ status: "unknown", authorized: false });
+  });
+
+  it("waits for pending application configuration before granting scope or starting a probe", async () => {
+    const { value, repository, probes } = service();
+    const id = "graph.package.read.application";
+    repository.configurations.set(id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+    const held = deferred<void>();
+    const configure = repository.setApplicationConfiguration.getMockImplementation()!;
+    repository.setApplicationConfiguration.mockImplementationOnce(async (...args) => {
+      await held.promise;
+      return configure(...args);
+    });
+    const configured = value.configureApplication(id, { ...reader, roles: ["AgentControl.Admin"] }, false, false);
+    await vi.waitFor(() => expect(repository.setApplicationConfiguration).toHaveBeenCalledOnce());
+    const scope = value.requireApplicationDataScope(id, reader);
+    const probe = value.refresh(id, reader);
+    held.resolve();
+    await Promise.all([
+      configured,
+      expect(scope).rejects.toMatchObject({ code: "not_configured" }),
+      expect(probe).resolves.toMatchObject({ status: "not_configured", authorized: false }),
+    ]);
+    expect(probes.applicationToken).not.toHaveBeenCalled();
+    expect(probes.packageProbe).not.toHaveBeenCalled();
+    expect(repository.recordEvidence).not.toHaveBeenCalled();
+  });
+
+  it("rejects a catalog assembled across an application configuration change", async () => {
+    const { value, repository } = service();
+    const id = "graph.package.read.application";
+    const configuration = { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 };
+    repository.configurations.set(id, configuration);
+    await value.refresh(id, reader);
+    const held = deferred<CapabilityConfiguration>();
+    const readConfiguration = repository.configuration.getMockImplementation()!;
+    let applicationReads = 0;
+    repository.configuration.mockImplementation((tenantId, capabilityId) => {
+      if (capabilityId === id && ++applicationReads === 2) return held.promise;
+      return readConfiguration(tenantId, capabilityId);
+    });
+    const decisions = vi.spyOn(value, "decision");
+    const pending = value.list(reader);
+    await vi.waitFor(() => expect(decisions).toHaveResolvedWith(expect.objectContaining({ capabilityId: id, authorized: true })));
+    await value.configureApplication(id, { ...reader, roles: ["AgentControl.Admin"] }, false, false);
+    held.resolve(configuration);
+    await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+  });
+
+  describe.each([
+    {
+      name: "Audit",
+      applicationId: "purview.audit.search.application" as const,
+      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated") =>
+        value.recordAuditQualificationEvidence(`purview.audit.search.${mode}`, reader, "available", {}),
+    },
+    {
+      name: "Hunting",
+      applicationId: "defender.hunting.application" as const,
+      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated") =>
+        value.recordHuntingQualificationEvidence(`defender.hunting.${mode}`, reader, "available", {}),
+    },
+  ])("$name evidence invalidation", ({ applicationId, record }) => {
+    it("does not adopt a newer principal generation during configuration lookup", async () => {
+      const { value, repository } = service();
+      const held = deferred<CapabilityConfiguration>();
+      repository.configuration.mockImplementationOnce(() => held.promise);
+      const pending = record(value);
+      await vi.waitFor(() => expect(repository.configuration).toHaveBeenCalledOnce());
+      await value.invalidatePrincipal(reader);
+      held.resolve({ enabled: false, sharedDataScope: false, previewQualified: false, revision: 1 });
+      await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+      expect(repository.evidenceRows.size).toBe(0);
+      await expect(record(value)).resolves.toMatchObject({ status: "available", verification: "provider" });
+    });
+
+    it("does not adopt a newer application generation during configuration lookup", async () => {
+      const { value, repository } = service();
+      const configuration = { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 };
+      repository.configurations.set(applicationId, configuration);
+      const held = deferred<CapabilityConfiguration>();
+      repository.configuration.mockImplementationOnce(() => held.promise);
+      const pending = record(value, "application");
+      await vi.waitFor(() => expect(repository.configuration).toHaveBeenCalledOnce());
+      await value.configureApplication(applicationId, { ...reader, roles: ["AgentControl.Admin"] }, false, false);
+      held.resolve(configuration);
+      await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+      expect(repository.evidenceRows.size).toBe(0);
+    });
+
+    it("rejects evidence invalidated while persistence is pending", async () => {
+      const { value, repository } = service();
+      const held = deferred<void>();
+      const persist = repository.recordEvidence.getMockImplementation()!;
+      repository.recordEvidence.mockImplementationOnce(async (...args) => {
+        await held.promise;
+        return persist(...args);
+      });
+      const pending = record(value);
+      await vi.waitFor(() => expect(repository.recordEvidence).toHaveBeenCalledOnce());
+      const rejected = expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+      const invalidation = value.invalidatePrincipal(reader);
+      held.resolve();
+      await invalidation;
+      await rejected;
+      expect(repository.evidenceRows.size).toBe(0);
+    });
+
+    it("rejects invalidation during the final evidence read", async () => {
+      const { value, repository } = service();
+      const held = deferred<void>();
+      repository.evidence.mockImplementationOnce(async key => {
+        const evidence = repository.evidenceRows.get(JSON.stringify(key));
+        await held.promise;
+        return evidence;
+      });
+      const pending = record(value);
+      await vi.waitFor(() => expect(repository.evidence).toHaveBeenCalledOnce());
+      await value.invalidatePrincipal(reader);
+      held.resolve();
+      await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
+      expect(repository.evidenceRows.size).toBe(0);
+    });
+
+    it("propagates persistence failures and permits a subsequent recording", async () => {
+      const { value, repository } = service();
+      const error = new Error("Evidence persistence failed");
+      repository.recordEvidence.mockRejectedValueOnce(error);
+      await expect(record(value)).rejects.toBe(error);
+      expect(repository.evidenceRows.size).toBe(0);
+      await expect(record(value)).resolves.toMatchObject({ status: "available", verification: "provider" });
+    });
   });
 
   it("stops every queued automatic probe at its original generation after invalidation", async () => {

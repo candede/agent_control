@@ -4,6 +4,8 @@ import {
   cancelBulkActionJob,
   cancelDataSyncRun,
   cancelDefenderHunt,
+  cancelInventoryRefresh,
+  cancelPackageRefreshJob,
   cancelPurviewAuditSearch,
   cancelQuarantineJob,
   discardOfficialUsageStaging,
@@ -23,23 +25,13 @@ import {
   type WorkbenchJobsResponse,
 } from "../api/client";
 import { hasRole } from "../authorization";
-import { WorkbenchActionGate } from "../workbenchActionContext";
+import { JobHistoryView } from "./JobHistoryView";
+import { jobKey } from "./jobPresentation";
 import { SyncHistoryTable } from "./SyncHistoryTable";
 
 const progressingStatuses = new Set(["queued", "running", "reconciling_create"]);
 const pollIntervalMs = 2_000;
 const pollBudgetMs = 5 * 60_000;
-const sourceLabels: Record<WorkbenchJobSource, string> = {
-  "data-sync": "Data sync",
-  "package-refresh": "Package refresh",
-  "package-controls": "Package controls",
-  "power-platform": "Power Platform",
-  "official-usage": "Official usage",
-  purview: "Purview audit",
-  defender: "Defender",
-  quarantine: "Quarantine",
-};
-
 const syncJobSources = new Set<WorkbenchJobSource>(["data-sync", "package-refresh", "power-platform", "official-usage"]);
 
 export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revision = 0 }: {
@@ -52,7 +44,8 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   const [state, setState] = useState<WorkbenchJobsResponse>();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<"all" | WorkbenchJobSource>("all");
+  const [loading, setLoading] = useState(true);
+  const [pollingPaused, setPollingPaused] = useState(false);
   const generation = useRef(0);
   const request = useRef<AbortController | undefined>(undefined);
   const timer = useRef<number | undefined>(undefined);
@@ -61,10 +54,10 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   const actionAdmission = useRef<{ owner: number; token: number } | undefined>(undefined);
   const principalKey = `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}`;
   const canManageMutationJobs = hasRole(user, "AgentControl.Admin");
-  const authorizedJobs = state?.value.filter(job =>
-    (scope === "all" || syncJobSources.has(job.source)) && (canManageMutationJobs || isReadJob(job)));
-  const visibleJobs = authorizedJobs?.filter(job => sourceFilter === "all" || job.source === sourceFilter);
-  const unavailableSources = state?.unavailableSources.filter(source => scope === "all" || syncJobSources.has(source.source)) ?? [];
+  const isVisibleJob = useCallback((job: WorkbenchJobSummary) =>
+    (scope === "all" || syncJobSources.has(job.source)) && (canManageMutationJobs || isReadJob(job)),
+  [scope, canManageMutationJobs]);
+  const authorizedJobs = state?.value.filter(isVisibleJob);
 
   const stop = useCallback(() => {
     request.current?.abort();
@@ -77,13 +70,14 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     if (request.current) return false;
     const controller = new AbortController();
     request.current = controller;
+    setLoading(true);
     try {
       const next = await getWorkbenchJobs({ signal: controller.signal });
       if (controller.signal.aborted || owner !== generation.current) return false;
       setState(next);
       if (!preserveActionError) setError("");
       const isProgressing = next.value.some(job =>
-        (scope === "all" || syncJobSources.has(job.source))
+        isVisibleJob(job)
         && (progressingStatuses.has(job.status) || (job.source === "data-sync" && job.status === "waiting")));
       if (isProgressing && pollDeadline.current === 0) pollDeadline.current = Date.now() + pollBudgetMs;
       if (!isProgressing) pollDeadline.current = 0;
@@ -98,15 +92,20 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       return false;
     } finally {
       if (request.current === controller) request.current = undefined;
+      if (!controller.signal.aborted && owner === generation.current) setLoading(false);
     }
-  }, [scope]);
+  }, [isVisibleJob]);
 
   const startPolling = useCallback((owner: number, preserveActionError = false) => {
+    setPollingPaused(false);
     const poll = async () => {
       const progressing = await load(owner, preserveActionError);
       if (owner !== generation.current || !progressing) return;
       if (Date.now() < pollDeadline.current) timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
-      else pollDeadline.current = 0;
+      else {
+        pollDeadline.current = 0;
+        setPollingPaused(true);
+      }
     };
     void poll();
   }, [load]);
@@ -123,7 +122,6 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       setState(undefined);
       setError("");
       setBusy("");
-      setSourceFilter("all");
     });
     return () => {
       generation.current += 1;
@@ -161,7 +159,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
 
   function resume(job: WorkbenchJobSummary) {
     if (job.source === "data-sync") return retryDataSyncRun(job.id);
-    if (job.source === "package-refresh") return resumePackageRefreshJob(job.id);
+    if (job.source === "package-refresh") return resumePackageRefreshJob(job.id, job.tokenMode);
     if (job.source === "power-platform") return resumeInventoryRefresh(job.id);
     if (job.source === "package-controls") return resumeBulkActionJob(job.id);
     if (job.source === "quarantine") return resumeQuarantineJob(job.id);
@@ -172,6 +170,8 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
 
   function cancel(job: WorkbenchJobSummary) {
     if (job.source === "data-sync") return cancelDataSyncRun(job.id);
+    if (job.source === "package-refresh") return cancelPackageRefreshJob(job.id, job.tokenMode);
+    if (job.source === "power-platform") return cancelInventoryRefresh(job.id);
     if (job.source === "package-controls") return cancelBulkActionJob(job.id);
     if (job.source === "quarantine") return cancelQuarantineJob(job.id);
     if (job.source === "purview") return cancelPurviewAuditSearch(job.id);
@@ -187,83 +187,26 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   }
 
   if (scope === "sync") return (
-    <SyncHistoryTable state={state} error={error} onOpenSyncRun={onOpenSyncRun} onRefresh={() => {
+    <SyncHistoryTable state={state} error={error} pollingPaused={pollingPaused} onOpenSyncRun={onOpenSyncRun} onRefresh={() => {
       stop();
       pollDeadline.current = 0;
       startPolling(generation.current);
     }} />
   );
 
-  return (
-    <section className="jobs-view" aria-labelledby="jobs-heading">
-      <div className="section-heading">
-        <div><span className="eyebrow">Operational metadata</span><h2 id="jobs-heading">Jobs</h2></div>
-        <button type="button" className="secondary" onClick={() => {
-          stop();
-          pollDeadline.current = 0;
-          startPolling(generation.current);
-        }}>Refresh status</button>
-      </div>
-      <p className="jobs-note">Safe status, correlation, target cardinality, and recovery only. Result rows and staged previews stay in their authorized source views.</p>
-      <label className="jobs-source-filter">
-        Source
-        <select aria-label="Filter jobs by source" value={sourceFilter} onChange={event => setSourceFilter(event.target.value as "all" | WorkbenchJobSource)}>
-          <option value="all">All sources</option>
-          {(Object.entries(sourceLabels) as Array<[WorkbenchJobSource, string]>).map(([source, label]) => (
-            <option key={source} value={source}>{label}</option>
-          ))}
-        </select>
-      </label>
-      {error ? <div className="error-banner" role="alert">{error}</div> : null}
-      {!state ? <div className="screen-state" role="status">Loading authorized job metadata…</div> : null}
-      {unavailableSources.length ? (
-        <div className="notice" role="status">{unavailableSources.length} authorized source{unavailableSources.length === 1 ? " is" : "s are"} temporarily unavailable. Other source statuses remain usable.</div>
-      ) : null}
-      {state && authorizedJobs?.length === 0 ? <div className="screen-state">No retained jobs are visible to this principal and role set.</div> : null}
-      {state && authorizedJobs?.length !== 0 && visibleJobs?.length === 0 ? <div className="screen-state">No retained jobs match this source filter.</div> : null}
-      {visibleJobs?.map(job => {
-        return (
-          <article className="job-card" key={`${job.source}:${job.id}`}>
-            <div className="job-card-heading">
-              <div><strong>{job.label}</strong><span>{sourceLabels[job.source]} · {job.target}</span></div>
-              <span className={`status-badge status-${job.status.replaceAll("_", "-")}`}>{job.status.replaceAll("_", " ")}</span>
-            </div>
-            <div className="job-progress">
-              <span>{job.completed ?? "—"} / {job.total ?? "—"} complete{job.partial ? " · partial/inconclusive" : ""}</span>
-              <span>Updated {new Date(job.updatedAt).toLocaleString()}</span>
-            </div>
-            <code className="job-id">{job.id}</code>
-            <div className="inline-actions">
-              <a className="primary-link secondary" href={jobHref(job)} onClick={event => {
-                if (job.source === "data-sync" && onOpenSyncRun && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
-                  event.preventDefault();
-                  onOpenSyncRun(job.id);
-                }
-              }}>
-                {job.source === "data-sync" ? "Open sync details" : "Open source view"}
-              </a>
-              {job.canResume ? <WorkbenchActionGate actionId={jobActionId(job, "resume")} compact>
-                <button type="button" disabled={busy !== ""} onClick={() => void perform(`resume:${job.id}`, () => resume(job))}>
-                  {busy === `resume:${job.id}` ? "Resuming…" : job.source === "data-sync" ? "Retry incomplete" : "Resume unsent"}
-                </button>
-              </WorkbenchActionGate> : null}
-              {job.canCancel ? <WorkbenchActionGate actionId={jobActionId(job, "cancel")} compact>
-                <button type="button" className="danger" disabled={busy !== ""} onClick={() => void perform(`cancel:${job.id}`, () => cancel(job))}>
-                  {busy === `cancel:${job.id}` ? "Cancelling…" : job.source === "data-sync" ? "Cancel run" : "Cancel valid unsent"}
-                </button>
-              </WorkbenchActionGate> : null}
-              {job.canReconcile ? <WorkbenchActionGate actionId={jobActionId(job, "reconcile")} compact>
-                <button type="button" disabled={busy !== ""} onClick={() => void perform(`reconcile:${job.id}`, () => reconcile(job))}>
-                  {busy === `reconcile:${job.id}` ? "Reconciling…" : "GET-only reconcile"}
-                </button>
-              </WorkbenchActionGate> : null}
-            </div>
-          </article>
-        );
-      })}
-      {state ? <p className="jobs-note">Last authorized projection {new Date(state.polledAt).toLocaleString()} · request {state.requestId}</p> : null}
-    </section>
-  );
+  return <JobHistoryView key={principalKey}
+    state={state ? { ...state, value: authorizedJobs ?? [] } : undefined}
+    error={error} loading={loading} busy={busy} pollingPaused={pollingPaused} onOpenSyncRun={onOpenSyncRun}
+    onRefresh={() => {
+      stop();
+      pollDeadline.current = 0;
+      startPolling(generation.current);
+    }}
+    onAction={(job, operation) => {
+      const actions = { resume: () => resume(job), cancel: () => cancel(job), reconcile: () => reconcile(job) };
+      void perform(`${operation}:${jobKey(job)}`, actions[operation]);
+    }}
+  />;
 }
 
 function isReadJob(job: WorkbenchJobSummary) {
@@ -272,19 +215,4 @@ function isReadJob(job: WorkbenchJobSummary) {
     || job.source === "power-platform"
     || job.source === "purview"
     || job.source === "defender";
-}
-
-function jobHref(job: WorkbenchJobSummary) {
-  return job.source === "data-sync" ? `/sync?syncRun=${encodeURIComponent(job.id)}` : job.href;
-}
-
-function jobActionId(job: WorkbenchJobSummary, operation: "resume" | "cancel" | "reconcile") {
-  if (job.source === "data-sync") return operation === "resume" ? "data-sync.retry" : "data-sync.cancel";
-  if (job.source === "package-controls") return `packages.${operation}`;
-  if (job.source === "quarantine") return `quarantine.${operation}`;
-  if (job.source === "purview") return `purview.${operation}`;
-  if (job.source === "defender") return `defender.${operation}`;
-  if (job.source === "power-platform") return "power-platform.resume";
-  if (job.source === "package-refresh") return job.target.startsWith("Current principal") ? "packages.refresh.resume" : "packages.refresh.exact.resume";
-  return "usage.staging.cancel";
 }

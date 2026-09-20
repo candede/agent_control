@@ -29,6 +29,23 @@ export const capabilityIds = [
 ] as const;
 
 export type CapabilityId = (typeof capabilityIds)[number];
+
+const automaticCapabilityIds = new Set<CapabilityId>([
+  "graph.package.read.delegated",
+  "graph.package.access.manage",
+  "graph.package.block.manage",
+  "graph.directory.read",
+  "powerPlatform.inventory.read",
+  "powerPlatform.quarantine.read",
+  "powerPlatform.quarantine.manage",
+  "purview.audit.search.delegated",
+  "defender.hunting.delegated",
+]);
+
+export function supportsAutomaticCapabilityCheck(capabilityId: CapabilityId): boolean {
+  return automaticCapabilityIds.has(capabilityId);
+}
+
 export type CapabilityStatus =
   | "available"
   | "missing_permission"

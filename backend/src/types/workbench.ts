@@ -58,12 +58,15 @@ export type WorkbenchJobSummary = {
   label: string;
   target: string;
   status: string;
+  /** Source-specific count: null means unknown, while confirmed empty results use zero. */
   total: number | null;
   completed: number | null;
   partial: boolean;
   canResume: boolean;
   canCancel: boolean;
   canReconcile: boolean;
+  tokenMode?: "delegated" | "application";
+  createdAt?: string;
   startedAt?: string;
   completedAt?: string;
   syncSources?: DataSyncSourceId[];

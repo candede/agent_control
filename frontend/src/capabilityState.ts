@@ -1,3 +1,4 @@
+import { supportsAutomaticCapabilityCheck } from "../../backend/src/types/capability";
 import type { CapabilityStatus, CapabilityView } from "./api/client";
 
 export const statusLabels: Record<CapabilityStatus, string> = {
@@ -12,8 +13,13 @@ export function evidenceIsFresh(view: CapabilityView, now = Date.now()) {
 }
 
 export function providerActionAllowed(view: CapabilityView | undefined, _write?: boolean, now = Date.now()) {
-  return Boolean(view?.definition.probe.adapterRegistered && capabilityModeEnabled(view) && view.decision.authorized && view.decision.status === "available"
+  return Boolean(view && hasCurrentAuthorization(view)
     && (view.decision.verification === "on_demand" ? isOnDemandDecision(view) : evidenceIsFresh(view, now)));
+}
+
+function hasCurrentAuthorization(view: CapabilityView) {
+  return view.definition.probe.adapterRegistered && view.decision.capabilityId === view.definition.id
+    && capabilityModeEnabled(view) && view.decision.authorized && view.decision.status === "available";
 }
 
 function isOnDemandDecision(view: CapabilityView) {
@@ -36,7 +42,7 @@ export function evidenceIsStale(view: CapabilityView, now = Date.now()) {
 
 export function currentVerification(view: CapabilityView, now = Date.now()) {
   const { definition, decision } = view;
-  if (!capabilityModeEnabled(view) || !decision.authorized || decision.status !== "available") return undefined;
+  if (!hasCurrentAuthorization(view)) return undefined;
   if (decision.verification === "on_demand") return isOnDemandDecision(view) ? "on_demand" : undefined;
   if (definition.mode === "local") return decision.verification === "local" ? "local" : undefined;
   if (!evidenceIsFresh(view, now)) return undefined;
@@ -72,6 +78,16 @@ export function operationAccessLabel(view: CapabilityView, now = Date.now()) {
   return "No separate operation check";
 }
 
+export function capabilityCheckGuidance(view: CapabilityView) {
+  if (view.definition.mode === "application") {
+    return "Use an explicitly approved bounded application-scope operation to check access. Check status does not run application checks.";
+  }
+  if (supportsAutomaticCapabilityCheck(view.definition.id)) return "Use Check status to retry.";
+  if (view.definition.probe.kind === "on_demand") return "Request the read from the dashboard; Check status does not run this capability.";
+  if (view.definition.mode === "local") return "Local policy does not run provider checks.";
+  return "This adapter is not implemented; permission checks cannot make it available.";
+}
+
 export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
   const { definition, decision } = view;
   const permissions = definition.permissions.join(" and ");
@@ -96,16 +112,18 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
       if (decision.evidence?.category === "provider_timeout") {
         const stage = decision.evidence.phase === "token_acquisition" ? "Microsoft token acquisition" : "The bounded provider check";
         const budget = decision.evidence.timeoutMs ? ` after ${decision.evidence.timeoutMs / 1000} seconds` : "";
-        return `${stage} timed out${budget}. Use Check status to retry. This does not establish missing permissions, roles, or licensing; authorized saved data remains readable.`;
+        return `${stage} timed out${budget}. ${capabilityCheckGuidance(view)} This does not establish missing permissions, roles, or licensing; authorized saved data remains readable.`;
       }
-      if (decision.evidence?.category === "provider_network_error") return "The provider could not be reached. Check connectivity and use Check status to retry; additional consent is not indicated.";
+      if (decision.evidence?.category === "provider_network_error") return `The provider could not be reached. Check connectivity. ${capabilityCheckGuidance(view)} Additional consent is not indicated.`;
       if (decision.evidence?.category === "provider_throttled") return "The provider throttled the check. Wait until the current evidence cooldown expires before retrying; changing permissions will not resolve throttling.";
       return "The latest capability check failed. Permission, role, and license causes are not established; authorized saved data remains readable.";
     case "unknown": return evidenceIsStale(view, now) ? staleExplanation(view)
       : definition.probe.kind === "live_qualification" && definition.mode === "application"
         ? "Provider operation access is not currently verified. An Admin must explicitly approve a bounded application-scope operation; automatic refresh does not run it."
       : decision.checkedAt ? "The check did not establish availability. Review the evidence and remediation; authorized saved data remains readable."
-        : "Not checked yet. Automatic safe checks run while this signed-in UI is active.";
+        : supportsAutomaticCapabilityCheck(definition.id)
+          ? "Not checked yet. Automatic safe checks run while this signed-in UI is active."
+          : `Not checked yet. ${capabilityCheckGuidance(view)}`;
     case "available":
       if (!decision.authorized) return "Current authorization is not established. Previous successful checks do not grant access.";
       if (currentVerification(view, now) === "on_demand") {
@@ -170,5 +188,5 @@ function providerEvidenceIsFresh(view: CapabilityView, now: number) {
 function staleExplanation(view: CapabilityView) {
   return view.definition.probe.kind === "live_qualification" && view.definition.mode === "application"
       ? "Provider operation evidence is stale. An Admin must explicitly approve a new bounded application-scope operation; automatic refresh does not run it. Authorized saved data remains readable."
-    : "Evidence is stale. Open Permissions and use Check status to retry; authorized saved data remains readable.";
+    : `Evidence is stale; authorized saved data remains readable. ${capabilityCheckGuidance(view)}`;
 }

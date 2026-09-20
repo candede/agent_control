@@ -6,14 +6,14 @@ import { workbenchActions, workbenchViews } from "../../backend/src/services/wor
 import type { CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, PackageRefreshJob, QuarantineTargetPage } from "../src/api/client";
 import { createInventoryVerification } from "../src/test/inventoryVerification";
 import { mockLayoutApi } from "./layoutFixtures";
+import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
 
 const primaryCapabilityCount = capabilityDefinitions.filter(definition => definition.probe.adapterRegistered && definition.mode !== "application").length;
 
 async function login(page: Page, scenario: string) {
-  if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser") throw new Error("Real HTTP browser checks require the isolated synthetic-auth fixture.");
-  await page.goto(`/api/auth/login?returnTo=${encodeURIComponent(`/permissions?fixture=${scenario}`)}`);
+  await page.goto(fixtureLoginUrl(scenario));
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
-  await expect(page.getByRole("article")).toHaveCount(primaryCapabilityCount);
+  await expect(page.getByRole("table", { name: "Account permissions" }).getByRole("button", { name: /^View details for/ })).toHaveCount(primaryCapabilityCount);
 }
 async function collectSavedPackages(page: Page) {
   if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser") throw new Error("Package fixture collection requires synthetic providers.");
@@ -50,7 +50,7 @@ function savedPackagePage(observedAt: string, expiresAt: string) {
   };
 }
 test.beforeEach(async ({ context }) => {
-  await context.route(url => !["localhost", "127.0.0.1"].includes(url.hostname), route => route.abort());
+  await context.route(isExternalFixtureRequest, route => route.abort());
 });
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
@@ -92,8 +92,8 @@ test("consented Admin permissions do not ask for consent until a token check rep
   await expect(check).toBeEnabled();
   await expect(page.getByRole("button", { name: `3 provider-verified / 1 local / ${primaryCapabilityCount - 4} ready to try / 0 degraded / 0 blocked` })).toBeVisible();
   await expect(page.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
-  const packageRow = page.getByRole("article", { name: "Package block management" });
-  await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
+  const packageRow = page.getByRole("row", { name: "Package block management", exact: true });
+  await expect(packageRow.getByText("Microsoft checks access when used", { exact: true })).toBeVisible();
   await expect(packageRow.getByRole("link", { name: "Open Agents" })).toBeVisible();
   missingConsent = true;
   await check.click();
@@ -102,7 +102,7 @@ test("consented Admin permissions do not ask for consent until a token check rep
   missingConsent = false;
   await check.click();
   await expect(packageRow.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
-  await expect(packageRow.getByText("Token acquired; provider authorization not verified", { exact: true })).toBeVisible();
+  await expect(packageRow.getByText("Microsoft checks access when used", { exact: true })).toBeVisible();
   expect(posts.length).toBeGreaterThanOrEqual(3);
   expect(posts.every(path => path === "/api/capabilities/check")).toBe(true);
   expect(unexpectedRequests).toEqual([]);
@@ -149,10 +149,10 @@ test("first Agents visit is saved-only and explicit collection enables exact sav
   page.on("request", request => {
     const path = new URL(request.url()).pathname;
     if (request.method() === "POST" && path.startsWith("/api/agents/") && path.endsWith("/refresh-jobs")) refreshes.push(path);
-    if (["POST", "PATCH"].includes(request.method()) && /\/api\/agents\/[^/]+\/(access|block|unblock)$/.test(path)) writes.push(path);
+    if (isPackageMutationRequest(request.method(), path)) writes.push(path);
   });
   await login(page, `first-agent-visit-${info.project.name}`);
-  await expect(page.getByRole("article", { name: "Package catalog read" }).locator(".capability-status")).toHaveText("Available");
+  await expect(page.getByRole("row", { name: "Package catalog read", exact: true }).locator(".capability-status")).toHaveText("Available");
   expect(refreshes).toEqual([]);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByText(/No saved package observation/)).toBeVisible();
@@ -223,7 +223,7 @@ test("timeout recovery retries failed checks while keeping changes ready to try"
     return route.fallback();
   });
   await page.goto("/permissions");
-  const catalog = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+  const catalog = page.getByRole("row", { name: "Package catalog read", exact: true });
   await expect(catalog.getByText("Check timed out", { exact: true })).toBeVisible();
   await expect(catalog.getByText(/bounded provider check timed out after 30 seconds/)).toBeVisible();
   await expect(page.getByRole("link", { name: "Open Audit", exact: true })).toHaveAttribute("href", "/audit");
@@ -232,7 +232,7 @@ test("timeout recovery retries failed checks while keeping changes ready to try"
   await page.getByRole("button", { name: "Check status", exact: true }).click();
   await expect(catalog.locator(".capability-status")).toHaveText("Available");
   expect(requests.filter(path => path === "/api/capabilities/check?retry=failed")).toHaveLength(1);
-  const block = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package block management", exact: true }) });
+  const block = page.getByRole("row", { name: "Package block management", exact: true });
   await expect(block.locator(".capability-status")).toHaveText("Ready to try");
   expect(unexpected).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -246,18 +246,24 @@ for (const [status, label] of Object.entries(statusLabels)) {
     page.on("pageerror", error => errors.push(error.message));
     const roleDenied = status === "missing_internal_role";
     await login(page, roleDenied ? "role-Viewer" : status);
-    const row = page.getByRole("article").filter({ has: page.getByRole("heading", {
+    const name = roleDenied ? "Package block management" : "Package catalog read";
+    const row = page.getByRole("row", {
       name: roleDenied ? "Package block management" : "Package catalog read",
       exact: true,
-    }) });
+    });
     await expect(row.locator(".capability-status")).toHaveText(label);
-    await expect(row.getByText(
+    await row.getByRole("button", { name: `View details for ${name}` }).click();
+    const details = page.getByRole("dialog", { name, exact: true });
+    await expect(details.getByText(
       roleDenied ? "delegated: CopilotPackages.ReadWrite.All" : "delegated: CopilotPackages.Read.All",
       { exact: true },
     )).toBeVisible();
-    await expect(row.getByText("https://graph.microsoft.com", { exact: true })).toBeVisible();
-    const inventory = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Power Platform inventory", exact: true }) });
+    await expect(details.getByText("https://graph.microsoft.com", { exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "View details for Power Platform inventory", exact: true }).click();
+    const inventory = page.getByRole("dialog", { name: "Power Platform inventory", exact: true });
     await expect(inventory.getByText("delegated: ResourceQuery.Resources.Read", { exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
     expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
     expect(errors).toEqual([]);
@@ -273,23 +279,20 @@ test("automatic checks, safe consent cancellation, panels and focus return", asy
     const path = new URL(request.url()).pathname;
     if (request.method() === "POST" && path === "/api/capabilities/check") checks += 1;
     if (path.endsWith("/probe")) legacyProbes += 1;
-    if (request.method() === "POST" && [
-      "/api/purview/audit/jobs",
-      "/api/hunting/jobs",
-      "/api/agents/refresh-jobs",
-      "/api/reports/imports",
-    ].includes(path)) unexpectedProviderWorkloads.push(path);
+    if (isUnexpectedPermissionCommand(request.method(), path)) unexpectedProviderWorkloads.push(`${request.method()} ${path}`);
   });
   await login(page, "stale");
-  const row = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+  const row = page.getByRole("row", { name: "Package catalog read", exact: true });
   await expect(row.locator(".capability-status")).toHaveText("Available");
   expect(checks).toBe(1);
   expect(legacyProbes).toBe(0);
   expect(unexpectedProviderWorkloads).toEqual([]);
-  const summary = row.locator("summary"); await summary.focus(); await page.keyboard.press("Enter");
-  await expect(row.locator("details")).toHaveAttribute("open", "");
-  const setup = row.getByRole("button", { name: "Setup instructions" }); await setup.click();
+  const setup = row.getByRole("button", { name: "View details for Package catalog read" });
+  await setup.focus();
+  await page.keyboard.press("Enter");
   const dialog = page.getByRole("dialog"); await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "Check evidence" })).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   for (let index = 0; index < 8; index += 1) {
     await page.keyboard.press("Tab");
@@ -300,7 +303,7 @@ test("automatic checks, safe consent cancellation, panels and focus return", asy
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
   await expect(page.getByRole("link", { name: "Sign in with Entra ID" })).toBeVisible();
   await login(page, "missing_delegated_grant");
-  const missingRow = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "Package catalog read", exact: true }) });
+  const missingRow = page.getByRole("row", { name: "Package catalog read", exact: true });
   await missingRow.getByRole("button", { name: "Request consent" }).click();
   await expect(page.getByRole("status")).toContainText("Consent was cancelled or denied");
   await expect(page.getByText("never-render-provider-text")).toHaveCount(0);
@@ -387,7 +390,8 @@ test("job deep links keep exact source identity and browser history without prov
 
   await login(page, "role-Viewer");
   await page.getByRole("button", { name: "Jobs", exact: true }).click();
-  await page.getByRole("article").filter({ hasText: "Older refresh" }).getByRole("link", { name: "Open source view" }).click();
+  await page.getByRole("button", { name: /View details for Older refresh/ }).click();
+  await page.getByRole("dialog", { name: "Job details", exact: true }).getByRole("link", { name: "Open package refresh", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`refreshJob=${olderId}`));
   await expect(page.getByRole("region", { name: "Selected package refresh job" })).toContainText("3 of 3 packages observed");
   expect(providerSends).toEqual([]);
@@ -429,7 +433,11 @@ test("package preview is responsive and cancellation dispatches no write", async
       },
     } });
   });
-  await page.route(url => url.pathname === "/api/agents/synthetic-package/block", route => { writes += 1; return route.fulfill({ status: 500 }); });
+  await page.route(url => /^\/api\/agents\//i.test(url.pathname), route => {
+    if (!isPackageMutationRequest(route.request().method(), new URL(route.request().url()).pathname)) return route.fallback();
+    writes += 1;
+    return route.fulfill({ status: 500 });
+  });
 
   await login(page, "available");
   await collectSavedPackages(page);
@@ -539,9 +547,14 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   const quarantineRequests: string[] = [];
   page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/quarantine/")) quarantineRequests.push(`${request.method()} ${url.pathname}`); });
   await login(page, "role-Admin");
-  const targets = await (await page.request.get("/api/quarantine/targets")).json() as QuarantineTargetPage;
-  const firstName = targets.value.find(target => target.botId === "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")!.displayName!;
-  const secondName = targets.value.find(target => target.botId === "cccccccc-cccc-cccc-cccc-cccccccccccc")!.displayName!;
+  const targetResponse = await page.request.get("/api/quarantine/targets");
+  expect(targetResponse.ok()).toBe(true);
+  const targets: QuarantineTargetPage = await targetResponse.json();
+  // Each viewport writes a different seeded target so neither depends on the other running first.
+  const firstBotId = testInfo.project.name === "mobile" ? "cccccccc-cccc-cccc-cccc-cccccccccccc" : "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const secondBotId = testInfo.project.name === "mobile" ? "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" : "cccccccc-cccc-cccc-cccc-cccccccccccc";
+  const firstName = targets.value.find(target => target.botId === firstBotId)!.displayName!;
+  const secondName = targets.value.find(target => target.botId === secondBotId)!.displayName!;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true })).toBeVisible();
   await expect(page.getByRole("checkbox", { name: `Select ${secondName}`, exact: true })).toBeVisible();
@@ -550,7 +563,7 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   await page.getByRole("checkbox", { name: `Select ${secondName}`, exact: true }).check();
   await page.getByRole("button", { name: "Quarantine selected" }).click();
   const confirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
-  await expect(confirmation.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / cccccccc-cccc-cccc-cccc-cccccccccccc", { exact: true })).toBeVisible();
+  await expect(confirmation.getByText(`aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / ${secondBotId}`, { exact: true })).toBeVisible();
   await expect(confirmation.getByRole("checkbox")).toBeEnabled();
   await expect(confirmation.getByRole("button", { name: "Confirm quarantine" })).toBeDisabled();
   await confirmation.getByRole("checkbox").check();
@@ -571,17 +584,16 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true }).check();
 
-  if (testInfo.project.name === "desktop") {
-    await page.getByRole("button", { name: "Quarantine selected" }).click();
-    const targetConfirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
-    await expect(targetConfirmation.getByText("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", { exact: true })).toBeVisible();
-    await targetConfirmation.getByRole("checkbox").check();
-    await targetConfirmation.getByRole("button", { name: "Confirm quarantine" }).click();
-    await expect(page.getByText("Quarantine job: Succeeded", { exact: true })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText(/1 of 1 complete · 1 verified/)).toBeVisible();
-  } else {
-    await expect(page.getByText("Quarantine job: Succeeded", { exact: true })).toBeVisible();
-  }
+  await page.getByRole("button", { name: "Quarantine selected" }).click();
+  const targetConfirmation = page.getByRole("dialog", { name: "Quarantine 1 agent" });
+  await expect(targetConfirmation.getByText(`aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa / ${firstBotId}`, { exact: true })).toBeVisible();
+  await targetConfirmation.getByRole("checkbox").check();
+  await targetConfirmation.getByRole("button", { name: "Confirm quarantine" }).click();
+  await expect(targetConfirmation).toBeHidden();
+  await expect(page.getByText("Quarantine job: Succeeded", { exact: true })).toBeVisible({ timeout: 10_000 });
+  const completedJob = page.getByRole("status").filter({ hasText: "Quarantine job: Succeeded" });
+  await expect(completedJob).toContainText(firstName);
+  await expect(completedJob).toContainText("1 of 1 complete · 1 verified");
 
   let failDirectStatus = true;
   await page.route(url => url.pathname === "/api/quarantine/status", route => {
@@ -600,7 +612,7 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   await page.getByRole("button", { name: "Check direct status" }).click();
   await expect(page.getByText("Quarantined", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Direct and inventory states disagree.", { exact: true })).toBeVisible();
-  expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(testInfo.project.name === "desktop" ? 1 : 0);
+  expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(1);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("quarantine-controls.png"), fullPage: true });
@@ -657,11 +669,16 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await page.getByRole("button", { name: "Audit", exact: true }).click();
   await expect(page.getByRole("region", { name: "Audit log", exact: true })).toBeVisible();
   expect(await page.evaluate(async () => (await fetch("/api/audit/events")).status)).toBe(200);
-  const other = await browser.newContext(); const otherPage = await other.newPage();
-  await otherPage.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { code: "provider_error" } }));
-  await otherPage.goto(new URL("/api/auth/login?returnTo=" + encodeURIComponent("/permissions?fixture=unprobed-principal"), page.url()).href);
-  await expect(otherPage.getByRole("article").first().locator(".capability-status")).toHaveText("Unknown");
-  await other.close();
+  const other = await browser.newContext();
+  try {
+    await other.route(isExternalFixtureRequest, route => route.abort());
+    const otherPage = await other.newPage();
+    await otherPage.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { code: "provider_error" } }));
+    await otherPage.goto(fixtureLoginUrl("unprobed-principal"));
+    await expect(otherPage.getByRole("row", { name: "Package catalog read", exact: true }).locator(".capability-status")).toHaveText("Unknown");
+  } finally {
+    await other.close();
+  }
 });
 test("all canonical workbench routes are deep-linkable and preserve agent state through history", async ({ page }, testInfo) => {
   await login(page, "available");
@@ -728,11 +745,15 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
 });
 test("Purview audit remains separate, explicit, partial-aware, and content-free", async ({ page }) => {
   const jobId = "77777777-7777-4777-8777-777777777777";
+  const now = Date.now();
+  const observedAt = new Date(now - 30 * 60_000).toISOString();
+  const finishedAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + 30 * 24 * 60 * 60_000).toISOString();
   const filters = {
     presetId: "copilot_interactions",
     operations: ["CopilotInteraction"],
-    startDateTime: "2026-09-08T12:00:00.000Z",
-    endDateTime: "2026-09-08T13:00:00.000Z",
+    startDateTime: new Date(now - 60 * 60_000).toISOString(),
+    endDateTime: finishedAt,
     userPrincipalNames: [],
     ipAddresses: [],
     objectIds: [],
@@ -759,15 +780,15 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
     byteCount: 2_048,
     unknownFieldCount: 4,
     pageComplete: false,
-    observedRange: { startDateTime: filters.startDateTime, endDateTime: "2026-09-08T12:45:00.000Z" },
-    unobservedRange: { startDateTime: "2026-09-08T12:45:00.000Z", endDateTime: filters.endDateTime },
+    observedRange: { startDateTime: filters.startDateTime, endDateTime: observedAt },
+    unobservedRange: { startDateTime: observedAt, endDateTime: filters.endDateTime },
     qualificationId: null,
     cancelRequested: false,
-    createdAt: "2026-09-08T13:01:00.000Z",
-    attemptedAt: "2026-09-08T13:01:01.000Z",
-    updatedAt: "2026-09-08T13:02:00.000Z",
-    finishedAt: "2026-09-08T13:02:00.000Z",
-    expiresAt: "2026-10-08T13:02:00.000Z",
+    createdAt: finishedAt,
+    attemptedAt: finishedAt,
+    updatedAt: finishedAt,
+    finishedAt,
+    expiresAt,
     canResume: false,
     remoteWorkMayContinue: false,
   };
@@ -783,14 +804,14 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
   };
   const providerCommands: string[] = [];
   const providerBodies: unknown[] = [];
-  await page.route(url => url.pathname === "/api/capabilities", async route => {
+  await page.route(url => ["/api/capabilities", "/api/capabilities/check"].includes(url.pathname), async route => {
     const response = await route.fetch();
     const body = await response.json();
     await route.fulfill({ response, json: {
       ...body,
       value: body.value.map((view: { definition: { id: string }; decision: object }) => view.definition.id === "purview.audit.search.delegated" ? {
         ...view,
-        decision: { ...view.decision, status: "available", authorized: true, fresh: true, expiresAt: "2026-10-08T13:02:00.000Z", previewQualification: "qualified", remediation: [] },
+        decision: { ...view.decision, status: "available", authorized: true, fresh: true, verification: "token", checkedAt: finishedAt, expiresAt, previewQualification: "qualified", remediation: [] },
       } : view),
     } });
   });
@@ -805,7 +826,7 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
     if (path === "/api/audit-search/jobs" && request.method() === "GET") return route.fulfill({ json: { value: [job], count: 1 } });
     if (path === "/api/audit-search/jobs" && request.method() === "POST") return route.fulfill({ status: 202, json: job });
     if (path === `/api/audit-search/jobs/${jobId}/records`) return route.fulfill({ json: { value: [{
-      projectionVersion: 1, wrapperId: "wrapper-browser", nativeEventId: "native-event-browser", eventDateTime: "2026-09-08T12:30:00.000Z",
+      projectionVersion: 1, wrapperId: "wrapper-browser", nativeEventId: "native-event-browser", eventDateTime: observedAt,
       auditLogRecordType: "copilotInteraction", operation: "CopilotInteraction", service: "Copilot", resultStatus: "Succeeded",
       actorUserId: "actor-browser", actorUserPrincipalName: "actor@example.invalid", actorUserType: "Member", objectId: "object-browser",
       clientIp: "192.0.2.20", administrativeUnits: [], correlationId: "correlation-browser", agentId: "agent-browser", appIdentity: null,
@@ -813,7 +834,7 @@ test("Purview audit remains separate, explicit, partial-aware, and content-free"
       messages: [{ id: "message-browser", isPrompt: true }], contentAvailable: false, unknownFieldCount: 2,
       association: { status: "unresolved", reason: "no_documented_cross_source_relation" },
     }], count: 1, limit: 100, offset: 0, job } });
-    if (path === `/api/audit-search/jobs/${jobId}/export.csv`) return route.fulfill({ body: "eventDateTime,contentState\r\n2026-09-08T12:30:00.000Z,Content not present in Purview audit\r\n", contentType: "text/csv" });
+    if (path === `/api/audit-search/jobs/${jobId}/export.csv`) return route.fulfill({ body: `eventDateTime,contentState\r\n${observedAt},Content not present in Purview audit\r\n`, contentType: "text/csv" });
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
 
@@ -1068,13 +1089,16 @@ test("loading and automatic-check transport failure preserve layout and fail clo
     const response = await route.fetch(); await held; await route.fulfill({ response });
   });
   await page.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { error: { code: "provider_error", message: "Synthetic outage" } } }));
-  await page.goto(`/api/auth/login?returnTo=${encodeURIComponent("/permissions?fixture=unknown")}`, { waitUntil: "domcontentloaded" });
-  await expect(page.getByText("Loading capability decisions...", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Permissions", exact: true })).toBeEnabled();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  release();
-  await expect(page.getByRole("article")).toHaveCount(primaryCapabilityCount);
-  await expect(page.getByRole("status")).toContainText("Automatic permission check failed");
+  try {
+    await page.goto(fixtureLoginUrl("unknown"), { waitUntil: "domcontentloaded" });
+    await expect(page.getByText("Loading permission status...", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Permissions", exact: true })).toBeEnabled();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  } finally {
+    release();
+  }
+  await expect(page.getByRole("table", { name: "Account permissions" }).getByRole("button", { name: /^View details for/ })).toHaveCount(primaryCapabilityCount);
+  await expect(page.getByRole("alert")).toContainText("Automatic permission check failed");
   await page.getByRole("button", { name: /^Sync/ }).click();
   const diagnosticsTrigger = page.getByRole("button", { name: "View diagnostics", exact: true });
   await diagnosticsTrigger.click();

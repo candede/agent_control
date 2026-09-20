@@ -1,5 +1,5 @@
 import type { AuthenticatedUser } from "../types/session.js";
-import { hasAppRole, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityStatus } from "../types/capability.js";
+import { hasAppRole, supportsAutomaticCapabilityCheck, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityStatus } from "../types/capability.js";
 import { AppError } from "../errors.js";
 import { config } from "../config.js";
 import { acquireApplicationToken, acquireDelegatedToken } from "../auth/msal.js";
@@ -12,18 +12,6 @@ import type { AuditAction } from "../types/audit.js";
 
 const evidenceTtlMs = 5 * 60 * 1000;
 const automaticCheckDeadlineMs = 10_000;
-const automaticCapabilityIds = new Set<CapabilityId>([
-  "graph.package.read.delegated",
-  "graph.package.access.manage",
-  "graph.package.block.manage",
-  "graph.directory.read",
-  "powerPlatform.inventory.read",
-  "powerPlatform.quarantine.read",
-  "powerPlatform.quarantine.manage",
-  "purview.audit.search.delegated",
-  "defender.hunting.delegated",
-]);
-
 type ProbeDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
   applicationToken: typeof acquireApplicationToken;
@@ -49,10 +37,11 @@ export class CapabilityService {
   constructor(private readonly repository = new CapabilityRepository(), private readonly probes: ProbeDependencies = defaultProbeDependencies) {}
 
   async list(user: AuthenticatedUser) {
-    return Promise.all(capabilityDefinitions.map(async definition => {
+    const entries = capabilityDefinitions.map(definition => ({ definition, generation: this.generation(definition.id, user) }));
+    const views = await Promise.all(entries.map(async ({ definition, generation }) => {
       const [current, configuration] = await Promise.all([
         this.decision(definition, user),
-        definition.mode === "application" ? this.repository.configuration(user.tenantId!, definition.id) : undefined,
+        definition.mode === "application" ? this.currentConfiguration(definition, user, generation) : undefined,
       ]);
       return {
         definition,
@@ -61,6 +50,8 @@ export class CapabilityService {
         ...(configuration ? { configuration: { enabled: configuration.enabled, sharedDataScope: configuration.sharedDataScope } } : {}),
       };
     }));
+    for (const { definition, generation } of entries) this.requireGeneration(definition.id, user, generation);
+    return views;
   }
 
   async check(user: AuthenticatedUser, options: { retryFailed?: boolean } = {}) {
@@ -83,19 +74,23 @@ export class CapabilityService {
 
   async decision(capability: CapabilityId | CapabilityDefinition, user: AuthenticatedUser): Promise<CapabilityDecision> {
     const definition = typeof capability === "string" ? requiredDefinition(capability) : capability;
+    const generation = this.generation(definition.id, user);
     if (!hasAnyRole(user.roles, definition.internalRoles)) return decision(definition, "missing_internal_role", undefined, definition.maturity === "preview" ? "unqualified" : "not_required");
     if (definition.mode === "local") return decision(definition, "available", undefined, "not_required");
     if (!definition.probe.adapterRegistered) return decision(definition, "not_configured", undefined, definition.maturity === "preview" ? "unqualified" : "not_required");
-    const configuration = await this.repository.configuration(user.tenantId!, definition.id);
+    const configuration = await this.currentConfiguration(definition, user, generation);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) {
       return decision(definition, "not_configured", undefined, previewState(definition, configuration));
     }
     const evidence = await this.repository.evidence(this.evidenceKey(definition, user, configuration));
+    this.requireGeneration(definition.id, user, generation);
     if (definition.probe.kind === "on_demand" && !evidence) {
       return {
         capabilityId: definition.id, status: "available", authorized: true, fresh: true,
         verification: "on_demand", previewQualification: "not_required",
-        remediation: ["Choose a target and confirm the operation. Microsoft validates delegated permissions when the request runs."],
+        remediation: [definition.dataClass === "package_control"
+          ? "Choose a target and confirm the operation. Microsoft validates delegated permissions when the request runs."
+          : "Request the read from its feature. Microsoft validates delegated permissions when the request runs."],
       };
     }
     if (!evidence || !(Date.parse(evidence.expiresAt) > Date.now())) return decision(definition, "unknown", evidence, previewState(definition, configuration));
@@ -107,7 +102,8 @@ export class CapabilityService {
     const generation = this.generation(definition.id, user);
     let current = await this.decision(definition, user);
     this.requireGeneration(definition.id, user, generation);
-    if (!current.authorized && !current.fresh && automaticCapabilityIds.has(capabilityId)) {
+    if (!current.authorized && !current.fresh
+      && (supportsAutomaticCapabilityCheck(capabilityId) || definition.probe.kind === "on_demand")) {
       current = await this.refreshAtGeneration(definition, user, generation);
     }
     if (!current.authorized) throw new AppError(403, "capability_unavailable", "The capability is not currently authorized.", current);
@@ -119,7 +115,7 @@ export class CapabilityService {
     if (definition.mode !== "application" || !hasAnyRole(user.roles, definition.internalRoles)) {
       throw new AppError(403, "missing_internal_role", "The application data scope is not authorized for this role.");
     }
-    const configuration = await this.repository.configuration(user.tenantId!, definition.id);
+    const configuration = await this.currentConfiguration(definition, user);
     if (!configuration.enabled || !configuration.sharedDataScope) {
       throw new AppError(403, "not_configured", "Application package reads require an enabled, administrator-approved shared data scope.");
     }
@@ -129,7 +125,7 @@ export class CapabilityService {
   async auditQualificationContext(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser) {
     const definition = requiredDefinition(capabilityId);
     if (!user.tenantId || !hasAnyRole(user.roles, definition.internalRoles)) throw new AppError(403, "missing_internal_role", "Audit Search qualification requires the Viewer role.");
-    const configuration = await this.repository.configuration(user.tenantId, capabilityId);
+    const configuration = await this.currentConfiguration(definition, user);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) {
       throw new AppError(403, "not_configured", "Application Audit Search requires an enabled, administrator-approved shared data scope.");
     }
@@ -144,19 +140,13 @@ export class CapabilityService {
   async recordAuditQualificationEvidence(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
     const definition = requiredDefinition(capabilityId);
     if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live lifecycle qualification.");
-    const configuration = await this.repository.configuration(user.tenantId!, capabilityId);
-    const key = this.evidenceKey(definition, user, configuration);
-    const generation = this.generation(definition.id, user);
-    await this.mutate(async () => {
-      if (generation === this.generation(definition.id, user)) await this.repository.recordEvidence(key, status, safeEvidenceDetails({ ...details, verification: "provider" }), evidenceTtlMs);
-    });
-    return this.decision(definition, user);
+    return this.recordQualificationEvidence(definition, user, status, details);
   }
 
   async huntingQualificationContext(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser) {
     const definition = requiredDefinition(capabilityId);
     if (!user.tenantId || !hasAnyRole(user.roles, definition.internalRoles)) throw new AppError(403, "missing_internal_role", "Hunting qualification requires the Viewer role.");
-    const configuration = await this.repository.configuration(user.tenantId, capabilityId);
+    const configuration = await this.currentConfiguration(definition, user);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) {
       throw new AppError(403, "not_configured", "Application hunting requires an enabled, administrator-approved shared data scope.");
     }
@@ -167,13 +157,7 @@ export class CapabilityService {
   async recordHuntingQualificationEvidence(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
     const definition = requiredDefinition(capabilityId);
     if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live hunting qualification.");
-    const configuration = await this.repository.configuration(user.tenantId!, capabilityId);
-    const key = this.evidenceKey(definition, user, configuration);
-    const generation = this.generation(definition.id, user);
-    await this.mutate(async () => {
-      if (generation === this.generation(definition.id, user)) await this.repository.recordEvidence(key, status, safeEvidenceDetails({ ...details, verification: "provider" }), evidenceTtlMs);
-    });
-    return this.decision(definition, user);
+    return this.recordQualificationEvidence(definition, user, status, details);
   }
 
   async packageQualificationIdentity(action: AuditAction, user: AuthenticatedUser) {
@@ -184,7 +168,7 @@ export class CapabilityService {
       : action === "reassign" ? "graph.package.reassign.manage" : "graph.package.access.manage";
     const definition = requiredDefinition(capabilityId);
     if (definition.mode !== "delegated") throw new AppError(409, "invalid_token_mode", "Package mutation qualification requires delegated authorization.");
-    const configuration = await this.repository.configuration(user.tenantId, capabilityId);
+    const configuration = await this.currentConfiguration(definition, user);
     return {
       capabilityId,
       contractRevision: capabilityContractRevision(definition),
@@ -196,14 +180,14 @@ export class CapabilityService {
   async quarantineAuthorityContext(user: AuthenticatedUser) {
     const definition = requiredDefinition("powerPlatform.quarantine.manage");
     if (!user.tenantId || !hasAnyRole(user.roles, definition.internalRoles)) throw new AppError(403, "missing_internal_role", "Quarantine control requires the Admin role.");
-    const configuration = await this.repository.configuration(user.tenantId, definition.id);
+    const configuration = await this.currentConfiguration(definition, user);
     return { contractRevision: capabilityContractRevision(definition), permissionRevision: capabilityPermissionRevision(definition), configurationRevision: configuration.revision };
   }
 
   async quarantineApprovalAuthorityContext(user: AuthenticatedUser) {
     const definition = requiredDefinition("powerPlatform.quarantine.manage");
     if (!user.tenantId || !hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required to approve quarantine canaries.");
-    const configuration = await this.repository.configuration(user.tenantId, definition.id);
+    const configuration = await this.currentConfiguration(definition, user);
     return { contractRevision: capabilityContractRevision(definition), permissionRevision: capabilityPermissionRevision(definition), configurationRevision: configuration.revision };
   }
 
@@ -219,8 +203,7 @@ export class CapabilityService {
     if (definition.mode === "local" || !definition.probe.adapterRegistered ||
       !["provider_read", "live_qualification", "on_demand"].includes(definition.probe.kind) ||
       definition.probe.kind === "live_qualification" && definition.mode !== "delegated") return this.decision(definition, user);
-    const configuration = await this.repository.configuration(user.tenantId!, definition.id);
-    this.requireGeneration(definition.id, user, generation);
+    const configuration = await this.currentConfiguration(definition, user, generation);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) return this.decision(definition, user);
     const key = this.evidenceKey(definition, user, configuration);
     const serializedKey = `${JSON.stringify(key)}\0${generation}`;
@@ -270,7 +253,7 @@ export class CapabilityService {
 
   private async runAutomaticCheck(user: AuthenticatedUser, generation: number, retryFailed: boolean) {
     const eligible = capabilityDefinitions
-      .filter(definition => automaticCapabilityIds.has(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
+      .filter(definition => supportsAutomaticCapabilityCheck(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
       .map(definition => ({ definition, refreshGeneration: this.generation(definition.id, user) }));
     await Promise.all(eligible.map(async ({ definition, refreshGeneration }) => {
       const current = await this.decision(definition, user);
@@ -303,6 +286,28 @@ export class CapabilityService {
   async invalidatePrincipal(user: AuthenticatedUser) {
     this.bump(this.principalGenerationKey(user.tenantId!, user.homeAccountId));
     await this.mutate(() => this.repository.invalidatePrincipal(user.tenantId!, user.homeAccountId));
+  }
+
+  private async currentConfiguration(definition: CapabilityDefinition, user: AuthenticatedUser, generation = this.generation(definition.id, user)) {
+    await this.mutationTail;
+    this.requireGeneration(definition.id, user, generation);
+    const configuration = await this.repository.configuration(user.tenantId!, definition.id);
+    this.requireGeneration(definition.id, user, generation);
+    return configuration;
+  }
+
+  private async recordQualificationEvidence(definition: CapabilityDefinition, user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
+    const generation = this.generation(definition.id, user);
+    const configuration = await this.currentConfiguration(definition, user, generation);
+    const key = this.evidenceKey(definition, user, configuration);
+    await this.mutate(async () => {
+      this.requireGeneration(definition.id, user, generation);
+      await this.repository.recordEvidence(key, status, safeEvidenceDetails({ ...details, verification: "provider" }), evidenceTtlMs);
+    });
+    this.requireGeneration(definition.id, user, generation);
+    const current = await this.decision(definition, user);
+    this.requireGeneration(definition.id, user, generation);
+    return current;
   }
 
   private evidenceKey(definition: CapabilityDefinition, user: AuthenticatedUser, configuration: CapabilityConfiguration): EvidenceKey {
@@ -363,7 +368,7 @@ function decision(definition: CapabilityDefinition, status: CapabilityStatus, ev
     verification: evidenceVerification(definition, status, evidence),
     checkedAt: evidence?.observedAt, expiresAt: evidence?.expiresAt, lastSuccessAt: evidence?.lastSuccessAt,
     evidence: evidence ? safeEvidenceView(evidence.details) : undefined,
-    previewQualification, remediation: remediation(definition.id, status,
+    previewQualification, remediation: remediation(definition, status,
       typeof evidence?.details.category === "string" ? evidence.details.category : undefined),
   };
 }
@@ -406,8 +411,8 @@ function safeProbeDetails(error: unknown) {
   const category = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")
     ? "provider_timeout"
     : error instanceof TypeError ? "provider_network_error"
-      : code && evidenceCategories.has(code) ? code
-        : error instanceof AppError && (error.status === 429 || details.throttled === true) ? "provider_throttled" : "provider_error";
+      : error instanceof AppError && (error.status === 429 || details.throttled === true) ? "provider_throttled"
+        : code && evidenceCategories.has(code) ? code : "provider_error";
   return safeEvidenceView({
     category,
     correlationId: details.correlationId ?? details.providerRequestId ?? (error as { correlationId?: unknown })?.correlationId,
@@ -423,7 +428,8 @@ function safeEvidenceDetails(details: Record<string, unknown>) {
   };
 }
 
-function remediation(capabilityId: CapabilityId, status: CapabilityStatus, category?: string) {
+function remediation(definition: CapabilityDefinition, status: CapabilityStatus, category?: string) {
+  const capabilityId = definition.id;
   if (category === "interaction_required") return ["Sign in again or complete delegated consent before retrying."];
   if (category === "authorization_expired") return ["Sign in again before retrying."];
   if (category === "authorization_not_yet_valid") return ["The Microsoft token is not yet valid. Check the application host clock and time synchronization before retrying; additional consent is not indicated."];
@@ -432,6 +438,12 @@ function remediation(capabilityId: CapabilityId, status: CapabilityStatus, categ
   if (category === "provider_network_error") return ["The provider could not be reached. Check service connectivity and retry the bounded check without broadening consent."];
   if (category === "provider_throttled") return ["The provider throttled the bounded check. Wait before retrying without changing permissions."];
   if (category === "provider_schema" || category === "provider_result_limit") return ["The provider response did not satisfy the bounded adapter contract. Check the documented endpoint and sanitized diagnostics before retrying."];
+  if (status === "unknown" && !supportsAutomaticCapabilityCheck(capabilityId)) {
+    if (definition.mode === "application") return [definition.probe.kind === "live_qualification"
+      ? "An Admin must explicitly approve a bounded application-scope operation; automatic delegated checks do not verify application access."
+      : "After an Admin enables application mode and approves its shared data scope, request an explicit bounded application-scope read; automatic delegated checks do not verify application access."];
+    if (definition.probe.kind === "on_demand") return ["Retry the read from the dashboard; automatic permission checks do not run this capability."];
+  }
   if (capabilityId.startsWith("purview.audit.search.")) {
     const auditValues: Partial<Record<CapabilityStatus, string[]>> = {
       missing_internal_role: ["Assign the AgentControl.Viewer role."],

@@ -266,7 +266,7 @@ export type PackageRefreshJob = {
   tokenMode: "delegated" | "application";
   scopeKind: "broad" | "exact";
   requestedIds: string[];
-  status: "waiting_authorization" | "running" | "succeeded" | "failed";
+  status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
   pageCount: number;
   observedCount: number;
   totalRecords: number | null;
@@ -527,8 +527,10 @@ export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
   return request<WorkbenchJobsResponse>("/api/workbench/jobs", { signal: options.signal });
 }
 
-export function beginCapabilityConsent(capabilityId: CapabilityId, returnTo = "/") {
-  return request<{ authorizationUrl: string }>("/api/auth/consent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId, returnTo }) });
+export function beginCapabilityConsent(capabilityId: CapabilityId, returnTo = "/", options: { signal?: AbortSignal } = {}) {
+  return request<{ authorizationUrl: string }>("/api/auth/consent", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId, returnTo }), signal: options.signal,
+  });
 }
 
 export function configureApplicationCapability(capabilityId: CapabilityId, enabled: boolean, sharedDataScope: boolean) {
@@ -589,9 +591,8 @@ export type UnifiedAgentExportInput = { revision: string } & (
 );
 
 export async function downloadUnifiedAgentInventoryCsv(input: UnifiedAgentExportInput) {
-  const response = await fetch("/api/agent-inventory/export.csv", {
+  return requestBlob("/api/agent-inventory/export.csv", {
     method: "POST",
-    credentials: "include",
     headers: {
       Accept: "text/csv",
       "Content-Type": "application/json",
@@ -599,14 +600,11 @@ export async function downloadUnifiedAgentInventoryCsv(input: UnifiedAgentExport
     },
     body: JSON.stringify(input),
   });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
 }
 
 export async function downloadPackageInventoryCsv(input: { ids?: string[]; snapshotId: string; filters?: Omit<PackageListQuery, "snapshotId" | "limit" | "offset"> }) {
-  const response = await fetch("/api/agents/export.csv", {
+  return requestBlob("/api/agents/export.csv", {
     method: "POST",
-    credentials: "include",
     headers: {
       Accept: "text/csv",
       "Content-Type": "application/json",
@@ -614,8 +612,6 @@ export async function downloadPackageInventoryCsv(input: { ids?: string[]; snaps
     },
     body: JSON.stringify(input),
   });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
 }
 
 export function startPackageRefresh(mode: "delegated" | "application" = "delegated", options: { idempotencyKey?: string } = {}) {
@@ -667,6 +663,14 @@ export function resumePackageRefreshJob(id: string, mode: "delegated" | "applica
   });
 }
 
+export function cancelPackageRefreshJob(id: string, mode: "delegated" | "application" = "delegated") {
+  return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
 export function getInventoryResources(query: InventoryListQuery = {}, options: { signal?: AbortSignal } = {}) {
   const params = inventorySearchParams(query);
   return request<InventoryResourcePage>(`/api/inventory/resources${params.size ? `?${params}` : ""}`, { signal: options.signal });
@@ -712,6 +716,10 @@ export function getInventoryRefreshJob(id: string, options: { signal?: AbortSign
 
 export function resumeInventoryRefresh(id: string) {
   return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/resume`, { method: "POST" });
+}
+
+export function cancelInventoryRefresh(id: string) {
+  return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
 
 export function getQuarantineTargets(query: { search?: string; limit?: number; offset?: number } = {}) {
@@ -766,9 +774,7 @@ export function reconcileQuarantineJob(id: string) {
 
 export async function downloadInventoryCsv(query: InventoryListQuery = {}) {
   const params = inventorySearchParams(query);
-  const response = await fetch(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { credentials: "include", headers: { Accept: "text/csv" } });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
+  return requestBlob(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { headers: { Accept: "text/csv" } });
 }
 
 export function getOfficialUsageAdminState(options: { signal?: AbortSignal } = {}) {
@@ -1006,9 +1012,7 @@ export function startPurviewAuditQualification(id: string) {
 }
 
 export async function downloadPurviewAuditCsv(id: string) {
-  const response = await fetch(`/api/audit-search/jobs/${encodeURIComponent(id)}/export.csv`, { credentials: "include", headers: { Accept: "text/csv" } });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
+  return requestBlob(`/api/audit-search/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" } });
 }
 
 export type DefenderHuntingCatalog = {
@@ -1072,17 +1076,13 @@ export function revokeDefenderHuntingRetainedScope(id: string) {
 }
 
 export async function downloadDefenderHuntingCsv(id: string) {
-  const response = await fetch(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, { credentials: "include", headers: { Accept: "text/csv" } });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
+  return requestBlob(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" } });
 }
 
 export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
-  const response = await fetch(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { credentials: "include", signal, headers: { Accept: "text/csv" } });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
+  return requestBlob(`/api/official-usage/${kind}.csv${params.size ? `?${params}` : ""}`, { signal, headers: { Accept: "text/csv" } });
 }
 
 function inventorySearchParams(query: InventoryListQuery) {
@@ -1242,13 +1242,11 @@ export async function unblockAllAgents(confirmationHash: string) {
 }
 
 export async function downloadAdministrativeAuditCsv(ids: string[], signal?: AbortSignal) {
-  const response = await fetch("/api/audit/events/export.csv", {
-    method: "POST", credentials: "include", signal,
+  return requestBlob("/api/audit/events/export.csv", {
+    method: "POST", signal,
     headers: { Accept: "text/csv", "Content-Type": "application/json", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}) },
     body: JSON.stringify({ ids }),
   });
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
 }
 
 export async function getAuditEvents(query: AuditEventsQuery = {}) {
@@ -1308,34 +1306,51 @@ function auditContextHeaders(context: AuditRequestContext | undefined) {
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  let response: Response;
+  return requestBody(path, {
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init.method && init.method !== "GET" ? { "Idempotency-Key": crypto.randomUUID() } : {}),
+      ...(init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method) && csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+      ...init.headers,
+    },
+  }, async response => {
+    if (response.status === 204) return undefined as T;
+    try {
+      return (await response.json()) as T;
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new ApiError(response.status, "invalid_response", "The server returned an invalid JSON response.", {
+          requestId: response.headers.get("X-Request-ID") ?? undefined,
+        });
+      }
+      throw error;
+    }
+  });
+}
+
+function requestBlob(path: string, init: RequestInit) {
+  return requestBody(path, init, response => response.blob());
+}
+
+async function requestBody<T>(path: string, init: RequestInit, readBody: (response: Response) => Promise<T>): Promise<T> {
+  let response: Response | undefined;
   try {
-    response = await fetch(path, {
-      ...init,
-      credentials: "include",
-      headers: {
-        Accept: "application/json",
-        ...(init.method && init.method !== "GET" ? { "Idempotency-Key": crypto.randomUUID() } : {}),
-        ...(init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method) && csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-        ...init.headers,
-      },
-    });
+    response = await fetch(path, { ...init, credentials: "include" });
+    if (!response.ok) throw await toApiError(response, init.signal);
+    return await readBody(response);
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
+    if (init.signal?.aborted || (error instanceof Error || error instanceof DOMException) && error.name === "AbortError") {
       throw new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
     }
-    throw new ApiError(0, "network_error", "The server could not be reached.", { kind: "network" });
+    if (error instanceof ApiError) throw error;
+    if (!response || error instanceof TypeError) {
+      throw new ApiError(0, "network_error", "The server could not be reached.", {
+        kind: "network", requestId: response?.headers.get("X-Request-ID") ?? undefined,
+      });
+    }
+    throw error;
   }
-
-  if (!response.ok) {
-    throw await toApiError(response);
-  }
-
-  if (response.status === 204) {
-    return undefined as T;
-  }
-
-  return (await response.json()) as T;
 }
 
 export function cancelBulkActionJob(id: string) {
@@ -1348,33 +1363,23 @@ export function resumeBulkActionJob(id: string) {
   });
 }
 
-async function toApiError(response: Response) {
-  let error: ApiError;
+async function toApiError(response: Response, signal?: AbortSignal | null) {
+  let body: unknown;
   try {
-    const body = (await response.json()) as {
-      type?: string;
-      status?: number;
-      detail?: string;
-      code?: string;
-      requestId?: string;
-    };
-
-    error = new ApiError(
-      body.status === response.status ? body.status : response.status,
-      body.code ?? "request_failed",
-      body.detail ?? `Request failed with status ${response.status}.`,
-      {
-        requestId: body.requestId ?? response.headers.get("X-Request-ID") ?? undefined,
-        type: body.type,
-      },
-    );
-  } catch {
-    error = new ApiError(
-      response.status,
-      "request_failed",
-      `Request failed with status ${response.status}.`,
-    );
+    body = await response.json();
+  } catch (error) {
+    if (signal?.aborted || !(error instanceof SyntaxError || error instanceof TypeError)) throw error;
   }
+  const problem = typeof body === "object" && body !== null ? body : {};
+  const error = new ApiError(
+    response.status,
+    "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
+    "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
+    {
+      requestId: "requestId" in problem && typeof problem.requestId === "string" ? problem.requestId : response.headers.get("X-Request-ID") ?? undefined,
+      type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,
+    },
+  );
   const sessionRevalidationRequired = error.authenticationExpired
     || (error.status === 403 && error.code === "missing_internal_role");
   if (sessionRevalidationRequired) {

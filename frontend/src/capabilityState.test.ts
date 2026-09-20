@@ -143,6 +143,37 @@ describe("capability UX decisions", () => {
     expect(currentVerification(candidate, now + 1)).toBeUndefined();
     expect(providerActionAllowed(candidate, false, now + 1)).toBe(false);
   });
+  it.each([
+    { id: "graph.package.read.delegated", verification: "provider" },
+    { id: "graph.package.read.delegated", verification: undefined },
+    { id: "graph.package.read.application", verification: "provider" },
+    { id: "graph.package.block.manage", verification: "token" },
+    { id: "purview.audit.search.delegated", verification: "token" },
+    { id: "reports.official.import", verification: "local" },
+  ] satisfies { id: CapabilityId; verification: CapabilityView["decision"]["verification"] }[])(
+    "does not use another capability's $verification decision for $id", ({ id, verification }) => {
+      const candidate = view("available");
+      candidate.definition = capabilityDefinitions.find(definition => definition.id === id)!;
+      candidate.decision = { ...candidate.decision, capabilityId: id, verification };
+      if (candidate.definition.mode === "local") {
+        candidate.decision.fresh = false;
+        candidate.decision.checkedAt = undefined;
+        candidate.decision.expiresAt = undefined;
+      }
+      expect(providerActionAllowed(candidate)).toBe(true);
+      expect(currentVerification(candidate)).toBe(verification);
+
+      candidate.decision.capabilityId = "graph.directory.read";
+      for (const write of [undefined, false, true]) {
+        expect(providerActionAllowed(candidate, write)).toBe(false);
+      }
+      expect(currentVerification(candidate)).toBeUndefined();
+      expect(capabilityStatusLabel(candidate)).toBe("Verification unavailable");
+      expect(verificationLabel(candidate)).not.toMatch(/Provider-verified|Token acquired|Authorized by local policy/);
+      expect(capabilityExplanation(candidate)).not.toMatch(/Token acquired|request succeeded|Authorized by current local/);
+      expect(capabilityNextStep(candidate)).toBeUndefined();
+    },
+  );
   it("names backend permissions and independent roles exactly", () => {
     expect(capabilityExplanation(view("missing_permission"))).toContain("delegated CopilotPackages.Read.All");
     expect(capabilityExplanation(view("missing_internal_role"))).toContain("AgentControl.Viewer");
@@ -244,6 +275,11 @@ describe("capability UX decisions", () => {
     };
 
     expect(providerActionAllowed(unsupported, true)).toBe(false);
+    expect(currentVerification(unsupported)).toBeUndefined();
+    expect(capabilityStatusLabel(unsupported)).toBe("Verification unavailable");
+    expect(verificationLabel(unsupported)).toBe("Current verification unavailable");
+    expect(capabilityExplanation(unsupported)).not.toContain("provider request succeeded");
+    expect(capabilityNextStep(unsupported)).toBeUndefined();
     unsupported.decision.status = "not_configured";
     unsupported.decision.authorized = false;
     expect(currentVerification(unsupported)).toBeUndefined();
@@ -288,7 +324,7 @@ describe("capability UX decisions", () => {
   it("distinguishes local policy from provider checks and local authorization failures", () => {
     const local = view("available");
     local.definition = capabilityDefinitions.find(item => item.mode === "local")!;
-    local.decision = { ...local.decision, verification: "local", checkedAt: undefined, expiresAt: undefined };
+    local.decision = { ...local.decision, capabilityId: local.definition.id, verification: "local", checkedAt: undefined, expiresAt: undefined };
     expect(currentVerification(local)).toBe("local");
     expect(verificationLabel(local)).toBe("Authorized by local policy; no provider check");
     local.decision.status = "missing_internal_role";
@@ -345,6 +381,7 @@ describe("capability UX decisions", () => {
   it("distinguishes token readiness from a successful bounded provider operation", () => {
     const operation = view("available");
     operation.definition = capabilityDefinitions.find(item => item.id === "defender.hunting.delegated")!;
+    operation.decision.capabilityId = operation.definition.id;
     operation.decision.verification = "token";
     expect(operationAccessLabel(operation)).toBe("Provider access is checked by an explicit bounded operation; no separate pre-approval required");
     operation.decision.verification = "provider";
@@ -368,4 +405,32 @@ describe("capability UX decisions", () => {
       expect(capabilityExplanation(application)).toContain("explicitly approve a new bounded application-scope operation");
     },
   );
+  it.each([
+    "graph.package.read.application", "purview.audit.search.application", "defender.hunting.application",
+    "graph.licenses.read", "reports.copilotUsage.read",
+  ] as const)("never directs excluded capability %s to automatic checks for recovery", id => {
+    const candidate = view("unknown");
+    candidate.definition = capabilityDefinitions.find(definition => definition.id === id)!;
+    candidate.decision.capabilityId = id;
+    candidate.decision.checkedAt = undefined;
+    expect(capabilityExplanation(candidate)).not.toMatch(/Automatic safe checks run/);
+    expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+
+    candidate.decision.checkedAt = new Date(0).toISOString();
+    candidate.decision.expiresAt = new Date(0).toISOString();
+    for (const status of ["unknown", "available"] as const) {
+      candidate.decision.status = status;
+      candidate.decision.authorized = status === "available";
+      expect(capabilityExplanation(candidate)).not.toMatch(/use Check status to retry/i);
+      expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+    }
+
+    candidate.decision.status = "provider_error";
+    candidate.decision.authorized = false;
+    for (const category of ["provider_timeout", "provider_network_error"]) {
+      candidate.decision.evidence = { category, phase: "provider_read", timeoutMs: 30_000 };
+      expect(capabilityExplanation(candidate)).not.toMatch(/use Check status to retry/i);
+      expect(capabilityExplanation(candidate)).toMatch(/application-scope|read from the dashboard/);
+    }
+  });
 });

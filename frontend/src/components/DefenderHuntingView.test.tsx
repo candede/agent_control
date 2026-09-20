@@ -138,6 +138,59 @@ describe("DefenderHuntingView", () => {
     expect(submitted).not.toHaveProperty("workspaceId");
   });
 
+  it.each(["current", "expired", "revoked", "different-target"])(
+    "uses exact application qualification without delegated readiness (%s)",
+    async evidence => {
+      const approvedScope = {
+        ...catalog.qualifications[0].approvedScope,
+        agentIds: [evidence === "different-target" ? "another-agent" : "application-agent"],
+      };
+      vi.mocked(getDefenderHuntingCatalog).mockResolvedValue({
+        ...catalog,
+        qualifications: [{
+          ...catalog.qualifications[0],
+          capabilityId: "defender.hunting.application",
+          approvedScope,
+          expiresAt: evidence === "expired" ? "2026-09-09T11:01:00.000Z" : "2026-09-09T12:00:00.000Z",
+        }],
+        retainedScopes: [{
+          ...catalog.retainedScopes[0],
+          tokenMode: "application",
+          capabilityId: "defender.hunting.application",
+          resultScope: { kind: "application", scopeId: "application-a", configurationRevision: 1 },
+          approvedScope,
+          revokedAt: evidence === "revoked" ? "2026-09-09T11:01:00.000Z" : null,
+        }],
+      });
+      vi.mocked(submitDefenderHunt).mockResolvedValue(job({ tokenMode: "application" }));
+      render(<CapabilityContext value={{
+        user: {
+          homeAccountId: "security-a", tenantId: "tenant-a", displayName: "Security",
+          username: "security@example.invalid", roles: ["AgentControl.Admin"],
+        },
+        loading: false, pending: false, error: undefined, now: Date.parse("2026-09-09T11:02:00.000Z"),
+        reload: vi.fn(async () => undefined), openPermissions: vi.fn(), views: [],
+      }}><DefenderHuntingView /></CapabilityContext>);
+
+      const authorization = await screen.findByLabelText("Authorization");
+      expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+      fireEvent.change(authorization, { target: { value: "application" } });
+      fireEvent.change(screen.getByLabelText("Agent IDs"), { target: { value: "application-agent" } });
+      const search = screen.getByRole("button", { name: "Run hunt" });
+      expect(search).toHaveProperty("disabled", evidence !== "current");
+      expect(submitDefenderHunt).not.toHaveBeenCalled();
+      fireEvent.click(search);
+
+      if (evidence === "current") {
+        await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledExactlyOnceWith(
+          "application", expect.objectContaining({ templateId: "agents_inventory", agentIds: ["application-agent"] }),
+        ));
+      } else {
+        expect(submitDefenderHunt).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("keeps explicit application qualification approval and run separate", async () => {
     const approved = job({ status: "waiting_authorization", complete: false, noData: false, snapshotId: null, canResume: true, qualification: {
       capabilityId: "defender.hunting.application", contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1, approvedBy: "security-a" } });

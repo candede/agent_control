@@ -8,11 +8,32 @@ import { getWorkbenchMetadata } from "./workbenchMetadata.js";
 createApp();
 
 describe("workbench metadata", () => {
+  it("uses application authorization for application package refresh recovery", () => {
+    expect(getWorkbenchMetadata().actions.find(action => action.id === "packages.refresh.application.resume")).toMatchObject({
+      roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.application",
+      method: "POST", route: "/api/agents/refresh-jobs/:id/resume", recovery: "resume_unsent",
+    });
+  });
+
   it("declares every required view once with Agents first", () => {
     const metadata = getWorkbenchMetadata();
     expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds);
     expect(metadata.views[0]).toMatchObject({ id: "agents", path: "/agents" });
     expect(new Set(metadata.views.map(view => view.path)).size).toBe(metadata.views.length);
+  });
+
+  it.each(["purview.resume", "defender.resume"])("leaves %s authorization mode to the retained job", id => {
+    expect(getWorkbenchMetadata().actions.find(action => action.id === id)).toMatchObject({
+      roles: ["AgentControl.Viewer"], capabilityId: null, nativeTarget: "provider_job_id",
+      confirmation: "explicit", recovery: "resume_unsent", method: "POST",
+    });
+  });
+
+  it.each(["purview.search", "defender.search"])("leaves %s capability checks to the selected authorization mode", id => {
+    expect(getWorkbenchMetadata().actions.find(action => action.id === id)).toMatchObject({
+      roles: ["AgentControl.Viewer"], capabilityId: null,
+      preview: "required", confirmation: "explicit", recovery: "reauthorize", method: "POST",
+    });
   });
 
   it("uses only typed roles and capabilities and keeps write targets explicit", () => {

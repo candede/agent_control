@@ -147,9 +147,12 @@ const partialJob: PurviewAuditJob = {
   remoteWorkMayContinue: false,
 };
 
-function capabilityView(authorized: boolean): CapabilityView {
+function capabilityView(
+  authorized: boolean,
+  capabilityId: CapabilityView["definition"]["id"] = "purview.audit.search.delegated",
+): CapabilityView {
   const definition = capabilityDefinitions.find(
-    (candidate) => candidate.id === "purview.audit.search.delegated",
+    (candidate) => candidate.id === capabilityId,
   )!;
 
   return {
@@ -238,6 +241,34 @@ describe("PurviewAuditView", () => {
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     expect(approvePurviewAuditQualification).not.toHaveBeenCalled();
     expect(startPurviewAuditQualification).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("uses application authorization independently of delegated readiness (available: %s)", async (available) => {
+    const user = userEvent.setup();
+    const selectedContext = context(administrator, !available);
+    selectedContext.views.push(capabilityView(available, "purview.audit.search.application"));
+    vi.mocked(submitPurviewAuditSearch).mockResolvedValue({ ...partialJob, tokenMode: "application" });
+    render(
+      <CapabilityContext value={selectedContext}>
+        <PurviewAuditView />
+      </CapabilityContext>,
+    );
+
+    const authorization = await screen.findByLabelText("Authorization");
+    const search = screen.getByRole("button", { name: "Run Audit Search" });
+    expect(search).toHaveProperty("disabled", available);
+    await user.selectOptions(authorization, "application");
+    expect(search).toHaveProperty("disabled", !available);
+    expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+    await user.click(search);
+
+    if (available) {
+      await waitFor(() => expect(submitPurviewAuditSearch).toHaveBeenCalledExactlyOnceWith(
+        "application", expect.objectContaining({ presetId: "copilot_interactions" }),
+      ));
+    } else {
+      expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
+    }
   });
 
   it("prefills an employee interaction log without starting an investigation", async () => {

@@ -81,6 +81,19 @@ describe("AgentSyncTools", () => {
     expect(actions.onOpenAgents).not.toHaveBeenCalled();
   });
 
+  it("tabs backwards from the queried resource types disclosure to the preceding action", async () => {
+    const actions = props({ inventory: inventory() });
+    render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const summary = screen.getByText("Actual queried resource types");
+    summary.focus();
+    expect(summary).toHaveFocus();
+    await userEvent.tab({ shift: true });
+    expect(screen.getByRole("button", { name: "Verify saved inventory" })).toHaveFocus();
+    expect(actions.onVerifyInventory).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Inventory diagnostics" })).toHaveAttribute("open");
+  });
+
   it.each(["needs_attention", "read_error"] as const)("keeps a concise %s notice visible when diagnostics are collapsed", state => {
     const saved = inventory();
     if (state === "needs_attention") saved.verification = createUnifiedVerification(saved.verification, { sourceScopes: false });

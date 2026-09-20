@@ -7,9 +7,10 @@ import "./dataSync.css";
 const pageSize = 10;
 const sourceJobs = new Set(["package-refresh", "power-platform"]);
 
-export function SyncHistoryTable({ state, error, onRefresh, onOpenSyncRun }: {
+export function SyncHistoryTable({ state, error, pollingPaused = false, onRefresh, onOpenSyncRun }: {
   state?: WorkbenchJobsResponse;
   error: string;
+  pollingPaused?: boolean;
   onRefresh: () => void;
   onOpenSyncRun?: (runId: string) => void;
 }) {
@@ -53,6 +54,7 @@ export function SyncHistoryTable({ state, error, onRefresh, onOpenSyncRun }: {
       </div>
       {view === "sources" ? <p className="jobs-note">Standalone refreshes and underlying Graph / Power Platform jobs, including older collection workflows. These are not additional full sync runs.</p> : null}
       {error ? <div className="error-banner" role="alert">{error}</div> : null}
+      {pollingPaused ? <p className="notice" role="status">Automatic status updates paused after five minutes. Use Refresh history to continue checking; jobs may still be running.</p> : null}
       {!state && !error ? <p role="status">Loading sync history...</p> : null}
       {unavailable.length ? <p className="notice" role="status">History is temporarily unavailable for {unavailable.map(source => source.source === "data-sync" ? "sync runs" : source.source === "package-refresh" ? "Graph packages" : "Power Platform").join(" and ")}. Displayed rows may be incomplete.</p> : null}
       {state && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"

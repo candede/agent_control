@@ -4,6 +4,7 @@ import { type Server } from "node:http";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { testDatabase, fixturePassword } from "./testDatabase.js";
+import { closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
 import { createApp } from "../src/app.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
@@ -21,19 +22,9 @@ import { CopilotStudioQuarantineClient } from "../src/services/copilotStudioQuar
 import { PowerPlatformResourceQueryClient } from "../src/services/powerPlatformResourceQuery.js";
 import type { AuthenticatedUser } from "../src/types/session.js";
 
-vi.hoisted(() => {
-  const origin = new URL(process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3001");
-  if (origin.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(origin.hostname)
-    || origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash) {
-    throw new Error("The browser fixture requires a plain HTTP loopback origin.");
-  }
-  process.env.NODE_ENV = "test";
-  process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
-  process.env.CLIENT_ID = "22222222-2222-2222-2222-222222222222";
-  process.env.CLIENT_SECRET = "synthetic-browser-client-secret";
-  process.env.SESSION_SECRET = "synthetic-browser-session-secret-0001";
-  process.env.FRONTEND_ORIGIN = origin.origin;
-  process.env.REDIRECT_URI = `${origin.origin}/api/auth/callback`;
+await vi.hoisted(async () => {
+  const { configureBrowserFixtureEnvironment } = await import("./fixtureSupport.js");
+  configureBrowserFixtureEnvironment();
 });
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, string>() }));
 vi.mock("../src/auth/msal.js", async original => {
@@ -76,7 +67,6 @@ const qualifiedQuarantineBotId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const unqualifiedQuarantineBotId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const quarantineProviderFixture = { reads: 0, writes: 0, states: new Map<string, boolean>(), updatedAt: new Map<string, string>() };
 beforeAll(async () => {
-  if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser" || process.env.NODE_ENV !== "test") throw new Error("This fixture requires its isolated browser test entry point.");
   fixture = await testDatabase();
   pool.options.database = fixture.name; pool.options.user = "agentcontrol_app"; pool.options.password = fixturePassword;
   const repository = new CapabilityRepository(fixture.runtime);
@@ -134,12 +124,14 @@ beforeAll(async () => {
   });
   console.log(JSON.stringify({ event: "isolated_browser_fixture", origin: origin.origin, database: fixture.name, liveProviders: false }));
 });
-afterAll(async () => {
-  application?.store.close();
-  if (server) await new Promise<void>(done => server.close(() => done()));
-  await pool.end(); await fixture?.close();
-  vi.unstubAllGlobals();
-});
+afterAll(() => closeFixtureResources(
+  () => application?.store.close(),
+  () => closeFixtureServer(server),
+  () => pool.end(),
+  () => fixture?.close(),
+  () => { vi.unstubAllGlobals(); },
+  () => { vi.restoreAllMocks(); },
+));
 it("qualifies the packaged Permission Center through Chromium and axe", async ({ signal }) => {
   const exitCode = await new Promise<number | null>((done, reject) => {
     const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts"], { stdio: "inherit", env: process.env, signal });
@@ -150,8 +142,7 @@ it("qualifies the packaged Permission Center through Chromium and axe", async ({
   const viewOptions = { staleAfterDays: config.officialUsageStaleDays, now: new Date("2026-09-08T12:00:00.000Z") };
   const beforeRestart = await officialUsageFingerprint(repository, viewOptions);
 
-  application.store.close();
-  await new Promise<void>(done => server.close(() => done()));
+  await closeFixtureResources(() => application.store.close(), () => closeFixtureServer(server));
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
   const origin = new URL(process.env.FRONTEND_ORIGIN!);
   await new Promise<void>((done, reject) => {
@@ -166,9 +157,9 @@ it("qualifies the packaged Permission Center through Chromium and axe", async ({
   expect(afterRestart.aggregate).toMatchObject({ responses: 9, activeUsers: 1 });
   expect(afterRestart.users).toMatchObject({ count: 1, responses: 9 });
   expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows[0].count).toBe(0);
-  expect(quarantineProviderFixture.writes).toBe(1);
+  expect(quarantineProviderFixture.writes).toBe(2);
   expect((await fixture.operator.query("SELECT status,count(*)::int AS count FROM copilot_quarantine_jobs GROUP BY status")).rows).toEqual(expect.arrayContaining([
-    { status: "succeeded", count: 1 },
+    { status: "succeeded", count: 2 },
   ]));
 });
 

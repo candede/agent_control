@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createUnifiedVerification } from "../test/inventoryVerification";
 
 import {
+  ApiError,
+  beginCapabilityConsent,
   blockAgent,
   cancelDataSyncRun,
+  cancelInventoryRefresh,
+  cancelPackageRefreshJob,
   checkCapabilities,
   getBulkActionJob,
   getDefenderHuntingJob,
@@ -16,6 +20,11 @@ import {
   associateAgentUsage,
   removeAgentUsageAssociation,
   downloadUnifiedAgentInventoryCsv,
+  downloadPackageInventoryCsv,
+  downloadInventoryCsv,
+  downloadPurviewAuditCsv,
+  downloadDefenderHuntingCsv,
+  downloadAdministrativeAuditCsv,
   downloadOfficialUsageCsv,
   getPackageRefreshJob,
   getOfficialUsageAggregate,
@@ -41,6 +50,7 @@ import {
   startExactPackageRefresh,
   startPackageRefresh,
   stageOfficialUsageReport,
+  signOut,
   startDataSync,
   subscribeSessionRevalidationRequired,
   submitQuarantine,
@@ -49,6 +59,7 @@ import {
   type PackageAccessReplacement,
   type PackageAccessUpdate,
   type AuditEvent,
+  type PackageRefreshJob,
 } from "./client";
 
 const accessUpdate: PackageAccessReplacement = {
@@ -66,6 +77,30 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it("starts consent with CSRF, the requested return path, and cancellation", async () => {
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "consent-csrf", roleAssignmentRequired: false });
+    await getCurrentUser();
+    const result = { authorizationUrl: "https://login.microsoftonline.com/fixture/authorize" };
+    fetchMock.mockResolvedValue(Response.json(result));
+    const controller = new AbortController();
+    await expect(beginCapabilityConsent("graph.package.read.delegated", "/permissions", { signal: controller.signal })).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/auth/consent", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/permissions" }),
+      signal: controller.signal,
+      credentials: "include",
+      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "consent-csrf" }),
+    }));
+  });
+
+  it("preserves the default consent return path when cancellation is omitted", async () => {
+    const fetchMock = mockJsonResponse({ authorizationUrl: "https://login.microsoftonline.com/fixture/authorize" });
+    await beginCapabilityConsent("graph.package.read.delegated");
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/consent", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/" }),
+    }));
+  });
+
   it.each([false, true])("persists record-scoped people with CSRF, cancellation and force=%s", async force => {
     const fetchMock = mockJsonResponse({ user: {}, csrfToken: "people-csrf", roleAssignmentRequired: false });
     await getCurrentUser();
@@ -393,6 +428,29 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=delegated", expect.objectContaining({ credentials: "include" }));
   });
 
+  it.each(["delegated", "application"] as const)("cancels an exact %s package refresh through the existing CSRF-protected endpoint", async mode => {
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf", roleAssignmentRequired: false });
+    await getCurrentUser();
+    fetchMock.mockResolvedValue(Response.json({ id: "job/one", status: "cancelled" }));
+    await cancelPackageRefreshJob("job/one", mode);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/agents/refresh-jobs/job%2Fone/cancel", expect.objectContaining({
+      method: "POST", credentials: "include", body: JSON.stringify({ mode }),
+      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "cancel-csrf" }),
+    }));
+  });
+
+  it("cancels an exact Power Platform refresh without acquiring provider authorization", async () => {
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf", roleAssignmentRequired: false });
+    await getCurrentUser();
+    fetchMock.mockResolvedValue(Response.json({ id: "job/one", status: "cancelled" }));
+    await cancelInventoryRefresh("job/one");
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/inventory/refresh-jobs/job%2Fone/cancel", expect.objectContaining({
+      method: "POST", credentials: "include",
+      headers: expect.objectContaining({ "X-CSRF-Token": "cancel-csrf" }),
+    }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("uses a stable idempotency key when collecting missing agent identities", async () => {
     const fetchMock = mockJsonResponse({ id: "identity-job", status: "running" });
     await startPackageRefresh("delegated", { idempotencyKey: "agent-identities-snapshot-one" });
@@ -566,6 +624,153 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/quarantine/status?snapshotId=snapshot%2Fid&nativeId=native+id&force=true", expect.objectContaining({ credentials: "include" }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/preview", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/quarantine/jobs", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": "stable-write-key" }) }));
+  });
+});
+
+describe("API response failures", () => {
+  const requests = [
+    { name: "JSON", send: () => getAgents(), body: "json" },
+    { name: "unified inventory CSV", send: () => downloadUnifiedAgentInventoryCsv({ revision: "a".repeat(64) }), body: "blob" },
+    { name: "package inventory CSV", send: () => downloadPackageInventoryCsv({ snapshotId: "snapshot-one" }), body: "blob" },
+    { name: "Power Platform CSV", send: () => downloadInventoryCsv(), body: "blob" },
+    { name: "Purview CSV", send: () => downloadPurviewAuditCsv("job/one"), body: "blob" },
+    { name: "Defender CSV", send: () => downloadDefenderHuntingCsv("job/one"), body: "blob" },
+    { name: "official usage CSV", send: () => downloadOfficialUsageCsv("aggregate"), body: "blob" },
+    { name: "administrative audit CSV", send: () => downloadAdministrativeAuditCsv(["event-one"]), body: "blob" },
+  ] as const;
+
+  describe.each(requests)("$name", ({ send, body }) => {
+    it.each(["fetch", "body"] as const)("normalizes cancellation during %s", async phase => {
+      const cause = new DOMException("Cancelled", "AbortError");
+      const response = Response.json({});
+      if (phase === "body") vi.spyOn(response, body).mockRejectedValue(cause);
+      vi.stubGlobal("fetch", phase === "fetch" ? vi.fn().mockRejectedValue(cause) : vi.fn().mockResolvedValue(response));
+
+      const result = send();
+      await expect(result).rejects.toBeInstanceOf(ApiError);
+      await expect(result).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
+    });
+
+    it.each(["fetch", "body"] as const)("normalizes connection loss during %s", async phase => {
+      const cause = new TypeError("Connection interrupted");
+      const response = Response.json({});
+      if (phase === "body") vi.spyOn(response, body).mockRejectedValue(cause);
+      vi.stubGlobal("fetch", phase === "fetch" ? vi.fn().mockRejectedValue(cause) : vi.fn().mockResolvedValue(response));
+
+      const result = send();
+      await expect(result).rejects.toBeInstanceOf(ApiError);
+      await expect(result).rejects.toMatchObject({ status: 0, code: "network_error", kind: "network" });
+    });
+
+    it("preserves HTTP errors without treating provider authorization as session expiry", async () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeSessionRevalidationRequired(listener);
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+        status: 200, code: "interaction_required", detail: "Provider consent required.", requestId: "problem-request",
+      }, { status: 401 })));
+      try {
+        await expect(send()).rejects.toMatchObject({
+          status: 401, code: "interaction_required", kind: "problem", requestId: "problem-request",
+        });
+        expect(listener).not.toHaveBeenCalled();
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+
+  describe.each([
+    { name: "JSON", send: (signal: AbortSignal) => getAgents({}, { signal }), body: "json" },
+    { name: "official usage CSV", send: (signal: AbortSignal) => downloadOfficialUsageCsv("aggregate", {}, signal), body: "blob" },
+    { name: "administrative audit CSV", send: (signal: AbortSignal) => downloadAdministrativeAuditCsv(["event-one"], signal), body: "blob" },
+  ] as const)("$name cancellation signal", ({ send, body }) => {
+    it.each(["fetch", "body", "problem body"] as const)("recognizes a custom abort reason during %s", async phase => {
+      const controller = new AbortController();
+      const cause = new TypeError("The view was closed");
+      const response = Response.json({}, { status: phase === "problem body" ? 400 : 200 });
+      vi.spyOn(response, phase === "problem body" ? "json" : body).mockImplementation(async () => {
+        controller.abort(cause);
+        throw cause;
+      });
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => {
+        if (phase === "fetch") {
+          controller.abort(cause);
+          throw cause;
+        }
+        return response;
+      }));
+      await expect(send(controller.signal)).rejects.toMatchObject({
+        status: 0, code: "request_aborted", kind: "aborted",
+      });
+    });
+  });
+
+  it("preserves a known HTTP denial when its problem body cannot be received", async () => {
+    const response = Response.json({}, { status: 403, headers: { "X-Request-ID": "denied-request" } });
+    vi.spyOn(response, "json").mockRejectedValue(new TypeError("Connection interrupted"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    await expect(getAgents()).rejects.toMatchObject({
+      status: 403, code: "request_failed", kind: "problem", requestId: "denied-request",
+    });
+  });
+
+  it("reports invalid successful JSON as a protocol error with the request ID", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not JSON", { headers: { "X-Request-ID": "invalid-json-request" } })));
+    await expect(getAgents()).rejects.toMatchObject({
+      status: 200, code: "invalid_response", kind: "problem", requestId: "invalid-json-request",
+      message: "The server returned an invalid JSON response.",
+    });
+  });
+
+  it.each(["not JSON", "null", "[]", '{"code":23,"detail":{},"requestId":false,"type":[]}'])(
+    "retains HTTP status and request diagnostics for malformed problem body %s",
+    async body => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, {
+        status: 503, headers: { "X-Request-ID": "fallback-request" },
+      })));
+      await expect(getAgents()).rejects.toMatchObject({
+        status: 503, code: "request_failed", message: "Request failed with status 503.",
+        requestId: "fallback-request", type: undefined,
+      });
+    },
+  );
+
+  it("does not replace an aborted problem body with an HTTP failure", async () => {
+    const response = Response.json({}, { status: 401 });
+    vi.spyOn(response, "json").mockRejectedValue(new DOMException("Cancelled", "AbortError"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    await expect(getAgents()).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
+  });
+
+  it("clears CSRF and notifies session owners for an expired CSV session", async () => {
+    const fetchMock = mockJsonResponse({ csrfToken: "expired-session-csrf" });
+    await getCurrentUser();
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      fetchMock.mockResolvedValueOnce(Response.json({ code: "session_invalidated" }, { status: 401 }));
+      await expect(downloadInventoryCsv()).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
+      expect(listener).toHaveBeenCalledOnce();
+      await checkCapabilities();
+      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("accepts an empty 204 logout and clears its CSRF token", async () => {
+    const fetchMock = mockJsonResponse({ csrfToken: "logout-csrf" });
+    await getCurrentUser();
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(signOut()).resolves.toBeUndefined();
+    await checkCapabilities();
+    expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+  });
+
+  it("includes the backend's cancelled package-refresh state in the client contract", () => {
+    expectTypeOf<PackageRefreshJob["status"]>().toEqualTypeOf<
+      "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled"
+    >();
   });
 });
 

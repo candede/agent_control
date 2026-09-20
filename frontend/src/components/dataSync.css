@@ -38,8 +38,7 @@
 .data-sync-page-header p,
 .data-sync-workspace p,
 .data-sync-reports p,
-.sync-inventory-summary p,
-.sync-dialog-header p {
+.sync-inventory-summary p {
   margin: 5px 0 0;
   color: var(--muted);
   font-size: 13px;
@@ -335,26 +334,6 @@
 .data-sync-links { margin-top: 9px; font-size: 13px; }
 .data-sync-admin-note { max-width: 160px; }
 
-.sync-dialog {
-  width: min(920px, calc(100% - 32px));
-  max-width: none;
-  max-height: min(90dvh, 1000px);
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  color: var(--text);
-  background: var(--surface);
-  box-shadow: 0 24px 80px #142c4033;
-  overflow: hidden;
-}
-
-.sync-dialog[open] { display: flex; flex-direction: column; }
-.sync-dialog::backdrop { background: #13242180; }
-.sync-dialog-header { display: flex; justify-content: space-between; align-items: start; gap: 16px; flex-shrink: 0; padding: 22px 24px; border-bottom: 1px solid var(--border); }
-.sync-dialog-header > div { flex: 1; min-width: 0; }
-.sync-dialog-header h2 { margin: 0; font-size: 21px; }
-.sync-dialog .sync-dialog-close { flex: 0 0 44px; width: 44px; height: 44px; min-width: 44px; display: grid; place-items: center; padding: 8px; }
-.sync-dialog-body { display: grid; gap: 20px; padding: 24px; overflow: auto; min-height: 0; overscroll-behavior: contain; }
 .data-sync-run-facts { padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .data-sync-clean-confirm { display: grid; gap: 16px; }
 .data-sync-clean-confirm p { margin: 0; color: var(--muted); line-height: 1.6; }
@@ -425,10 +404,6 @@
   .data-sync-reports { grid-template-columns: minmax(0, 1fr); }
   .data-sync-report-icon { display: none; }
   .data-sync-admin-note { max-width: none; }
-  .sync-dialog { width: calc(100% - 16px); max-height: calc(100dvh - 24px); border-radius: 10px; }
-  .sync-dialog-header,
-  .sync-dialog-body { padding: 16px; }
-  .sync-dialog-header h2 { font-size: 19px; }
   .data-sync-run-facts { grid-template-columns: minmax(0, 1fr); }
   .sync-inventory-summary { flex-wrap: wrap; }
   .sync-inventory-summary > svg { display: none; }
