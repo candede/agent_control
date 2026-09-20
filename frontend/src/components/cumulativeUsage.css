@@ -1,0 +1,106 @@
+.agent-inventory-overview,
+.cumulative-agent-activity {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.agent-inventory-overview {
+  margin-bottom: 20px;
+}
+
+.agent-overview-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.agent-overview-metrics .metric {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.agent-overview-metrics small {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.agent-overview-filter {
+  align-items: stretch;
+  color: var(--ink);
+  text-align: left;
+  font: inherit;
+}
+
+.agent-overview-filter:hover,
+.agent-overview-filter[aria-pressed="true"] {
+  border-color: var(--ink);
+}
+
+.agent-overview-filter:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.cumulative-activity-filters {
+  display: grid;
+  grid-template-columns: 2fr 1.3fr 1fr 1fr;
+  gap: 12px;
+}
+
+.cumulative-activity-filters label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  font-size: 0.85rem;
+}
+
+.cumulative-activity-filters input,
+.cumulative-activity-filters select {
+  min-width: 0;
+  width: 100%;
+}
+
+.cumulative-agent-table {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.cumulative-agent-table table {
+  min-width: 760px;
+}
+
+.cumulative-agent-table th,
+.cumulative-agent-table td {
+  overflow-wrap: anywhere;
+}
+
+.cumulative-agent-table tbody th {
+  color: var(--ink);
+  font-size: inherit;
+  text-transform: none;
+  background: transparent;
+}
+
+.cumulative-agent-table small {
+  display: block;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+@media (max-width: 1000px) {
+  .agent-overview-metrics,
+  .cumulative-activity-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .cumulative-activity-filters {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

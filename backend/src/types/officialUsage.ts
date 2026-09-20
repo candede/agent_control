@@ -433,3 +433,40 @@ export type OfficialUsageHistoryView = {
     offset: number;
   };
 };
+
+export type OfficialUsageOverviewView = {
+  revision: number;
+  summary: {
+    retainedSets: number;
+    reportedAgents: number;
+    usedAgents: number;
+    activeAgents30Days: number;
+    undatedAgents: number;
+    earliestActivityDateUtc: string | null;
+    latestActivityDateUtc: string | null;
+    asOf: string;
+    activeSinceDateUtc: string;
+  };
+  agents: {
+    value: Array<{
+      agentId: string;
+      agentName: string;
+      creatorTypes: string[];
+      hasResponses: boolean;
+      lastActivityDateUtc: string | null;
+      observationCount: number;
+      latestSetId: string;
+      latestAcceptedAt: string;
+    }>;
+    count: number;
+    limit: number;
+    offset: number;
+  };
+  filters: {
+    search: string | null;
+    startDate: string | null;
+    endDate: string | null;
+    sortBy: "agentName" | "lastActivity";
+    sortDirection: "asc" | "desc";
+  };
+};

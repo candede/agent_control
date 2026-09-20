@@ -249,7 +249,7 @@ test.afterEach(async ({ page }) => {
 
 test("keeps import management off the report page and opens an accessible dialog on demand", async ({ page }, info) => {
   const { apiRequests } = await mockUsage(page);
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   await expect(page.getByRole("heading", { name: "Agent comparison" })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Choose CSVs" })).toHaveCount(0);
@@ -257,22 +257,33 @@ test("keeps import management off the report page and opens an accessible dialog
   expect(apiRequests).not.toContain("/api/official-usage/admin");
   const trigger = page.getByRole("button", { name: "Import reports", exact: true });
   await trigger.click();
-  const modal = page.getByRole("dialog", { name: "Import and manage reports", exact: true });
+  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
   await expect(modal).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Choose CSVs", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(modal.getByRole("button", { name: "Close", exact: true })).toHaveClass(/secondary/);
   await expect(modal.getByRole("button", { name: "Close report import" })).toBeFocused();
+  await expect(modal.getByRole("button", { name: "Close report import" })).toHaveCSS("width", "44px");
+  await expect(modal.getByRole("button", { name: "Close report import" })).toHaveCSS("height", "44px");
+  await expect(modal.getByRole("button", { name: "Close report import" })).toBeInViewport({ ratio: 1 });
   await page.keyboard.press("Shift+Tab");
-  await expect(modal.getByRole("button", { name: "Back to reports" })).toBeFocused();
+  await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(modal.getByRole("button", { name: "Close report import" })).toBeFocused();
-  await expect(page.getByRole("heading", { name: "Microsoft 365 usage reports" })).toBeVisible();
+  await page.keyboard.press("Tab");
+  await expect(modal.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(modal.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
+  await expect(modal.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
+  await expect(modal.getByLabel("Import progress").locator("li")).toHaveCount(4);
+  await expect(modal.getByLabel("Import progress").locator('[aria-current="step"]')).toHaveText("1Files");
+  await expect(modal.getByRole("region", { name: "Retained report sets" })).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
   await expect(page.getByLabel("Reporting start", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Reporting end", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Source as-of, if shown", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
-  await expect(page.getByText("Export all three files", { exact: true })).toBeHidden();
-  await page.getByText("How to export the CSV files", { exact: true }).click();
-  await expect(page.getByText("Export all three files", { exact: true })).toBeVisible();
-  await page.getByText("How to export the CSV files", { exact: true }).click();
+  await expect(modal.getByRole("link", { name: "Microsoft report export guidance" })).toBeVisible();
+  await expect(modal.getByText("Technical validation details", { exact: true })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("automatic-import.png"), fullPage: true });
   await page.keyboard.press("Escape");
@@ -280,17 +291,17 @@ test("keeps import management off the report page and opens an accessible dialog
   await expect(trigger).toBeFocused();
   await expect(page.locator("body")).not.toHaveCSS("overflow", "hidden");
   await trigger.click();
-  await page.getByRole("button", { name: "Back to reports" }).click();
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   await expect(modal).toBeHidden();
   await expect(trigger).toBeFocused();
 });
 
 test("imports all CSV rows without date prompts and preserves source discrepancies", async ({ page }, info) => {
   const { uploadBodies, userRequests } = await mockUsage(page);
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  const modal = page.getByRole("dialog", { name: "Import and manage reports", exact: true });
-  await expect(page.getByRole("heading", { name: "Microsoft 365 usage reports" })).toBeVisible();
+  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
+  await expect(modal.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
   await expect(page.getByLabel("Reporting start", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Reporting end", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Source as-of, if shown", { exact: true })).toHaveCount(0);
@@ -301,20 +312,42 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await expect(modal.getByText("3 file(s) selected", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Validate and stage" }).click();
+  await expect(modal.getByRole("region", { name: "Server validation" })).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
+  await modal.getByRole("button", { name: "Continue to review" }).click();
   await expect(page.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+  const firstReport = modal.getByRole("region", { name: "Validated report rows" }).locator("tbody tr").first();
+  await expect(firstReport.getByRole("rowheader").locator("span")).toBeInViewport({ ratio: 1 });
+  await expect(firstReport.getByRole("cell").first().locator("span")).toHaveText("103");
+  await expect(firstReport.getByRole("cell").first().locator("span")).toBeInViewport({ ratio: 1 });
+  await expect(modal.getByText("Bundle hash", { exact: true })).toBeHidden();
+  await expect(modal.getByRole("region", { name: "Retained report sets" })).toHaveCount(0);
+  await expect(modal.locator(".usage-wizard-body")).toHaveCSS("overflow-y", "auto");
+  expect(await modal.locator(".usage-wizard-body").evaluate(element => element.clientHeight)).toBeGreaterThan(150);
+  await expect(modal.getByRole("button", { name: "Close report import" })).toBeInViewport({ ratio: 1 });
+  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toBeInViewport();
+  const headerBounds = await modal.locator(".usage-modal-header").boundingBox();
+  const closeBounds = await modal.getByRole("button", { name: "Close report import" }).boundingBox();
+  expect(closeBounds!.x + closeBounds!.width).toBeLessThanOrEqual(headerBounds!.x + headerBounds!.width);
+  expect(closeBounds!.y).toBeGreaterThanOrEqual(0);
+  expect(closeBounds!.y + closeBounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height);
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
+  await expect(modal.getByRole("button", { name: "Close report import" })).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("review-import.png") });
   expect(uploadBodies).toHaveLength(3);
   for (const body of uploadBodies) {
     expect(body).not.toMatch(/name="(?:reportingStart|reportingEnd|sourceAsOf|downloadedAt)"/);
   }
-  await page.getByRole("button", { name: "Back to reports" }).click();
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Reports not imported", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Validated report previews" })).toBeVisible();
   await page.getByRole("button", { name: "Accept reviewed bundle" }).click();
   await expect(page.getByText(/three-file snapshot was added to cumulative history and is current/)).toBeVisible();
-  await page.getByRole("button", { name: "Back to reports" }).click();
+  await expect(modal.getByLabel("Import progress").locator('[aria-current="step"]')).toContainText("Result");
+  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   await expect(modal).toBeHidden();
   await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("2,061");
   const report = page.getByRole("region", { name: "Agent activity report" });
@@ -347,7 +380,7 @@ test("allows closing during validation without dropping the staged result", asyn
     await uploadGate;
     await route.fallback();
   });
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await page.getByLabel("Official usage CSV files").setInputFiles({
     name: csvFiles[0].name, mimeType: "text/csv", buffer: Buffer.from(csvFiles[0].content),
@@ -356,16 +389,21 @@ test("allows closing during validation without dropping the staged result", asyn
   await page.getByRole("button", { name: "Validate and stage" }).click();
   await uploading;
   await page.getByRole("button", { name: "Close report import" }).click();
+  await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeFocused();
+  const completed = page.waitForResponse("**/api/official-usage/staging");
   releaseUpload();
+  await completed;
+  await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeFocused();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Validated report previews" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Accept reviewed bundle" })).toBeDisabled();
+  await expect(page.getByRole("region", { name: "Server validation" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
   await expect(page.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
 });
 
 test("keeps headline reporting prominent and preserves read-only access", async ({ page }, info) => {
   const { apiRequests } = await mockUsage(page, { role: "Viewer", active: true });
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   const summary = page.getByRole("region", { name: "Usage summary" });
   await expect(summary).toBeVisible();
   if (info.project.name === "desktop") await expect(summary).toBeInViewport();
@@ -396,7 +434,7 @@ test("keeps headline reporting prominent and preserves read-only access", async 
 test("opens exact staging links in the dialog and reports unavailable staging without fallback", async ({ page }) => {
   await mockUsage(page);
   await page.goto("/official-usage?staging=33333333-3333-4333-8333-333333333333");
-  const modal = page.getByRole("dialog", { name: "Import and manage reports", exact: true });
+  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
   await expect(modal).toBeVisible();
   await expect(modal.getByText(/exact staging record is expired, deleted, or unavailable/)).toBeVisible();
   await page.getByRole("button", { name: "Close report import" }).click();
@@ -406,7 +444,7 @@ test("opens exact staging links in the dialog and reports unavailable staging wi
 
 test("uses one agent table for response rankings, reach, date filters and a snapshot-pinned CSV", async ({ page }) => {
   const { agentRequests, exportRequests, userRequests } = await mockUsage(page, { active: true });
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   const table = page.getByRole("region", { name: "Agent comparison rows" });
   await expect(table.locator("tbody tr")).toHaveCount(25);
   await page.getByLabel("Order agents by").selectOption("responses-asc");
@@ -445,7 +483,7 @@ test("uses one agent table for response rankings, reach, date filters and a snap
 
 test("separates report history from agent analysis and keeps storage accounting collapsed", async ({ page }, info) => {
   const { apiRequests } = await mockUsage(page, { active: true });
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   await expect(page.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
   expect(apiRequests).not.toContain("/api/official-usage/history");
   await page.getByRole("button", { name: "Report history", exact: true }).click();
@@ -462,17 +500,22 @@ test("separates report history from agent analysis and keeps storage accounting 
   expect((await new AxeBuilder({ page }).include(".official-usage-workbench").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("report-history.png"), fullPage: true });
-  await page.getByRole("button", { name: "Agent activity", exact: true }).click();
+  await page.getByRole("button", { name: "Snapshot details", exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
   expect(apiRequests).not.toContain("/api/official-usage/users");
 });
 
 test("keeps retained-set confirmation inside import management and refreshes reports on deletion", async ({ page }) => {
   await mockUsage(page, { active: true });
-  await page.goto("/official-usage");
+  await page.goto("/official-usage?view=snapshot");
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  const modal = page.getByRole("dialog", { name: "Import and manage reports", exact: true });
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(modal.getByLabel("Import progress")).toHaveCount(0);
+  await expect(modal.getByLabel("Official usage CSV files")).toHaveCount(0);
   const deleteSet = modal.getByRole("button", { name: /Delete retained set for/ });
+  await expect(deleteSet).toBeEnabled();
+  expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
   await deleteSet.click();
   const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
   await expect(confirmation).toBeVisible();
@@ -485,6 +528,7 @@ test("keeps retained-set confirmation inside import management and refreshes rep
   await expect(confirmation).toHaveCount(0);
   await expect(modal).toBeVisible();
   await expect(modal.getByText(/retained set was deleted/)).toBeVisible();
-  await modal.getByRole("button", { name: "Back to reports" }).click();
+  await expect(modal.getByRole("heading", { name: "Manage retained reports", exact: true })).toBeFocused();
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Selected report deleted", exact: true })).toBeVisible();
 });

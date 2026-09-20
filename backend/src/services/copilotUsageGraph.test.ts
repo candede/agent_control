@@ -21,6 +21,44 @@ describe("CopilotUsageGraphClient", () => {
     ].join(" or "));
     expect(url.searchParams.get("$count")).toBe("true");
     expect(url.searchParams.get("$top")).toBe("100");
+    expect(url.searchParams.get("$select")?.split(",")).toEqual([
+      "id", "userPrincipalName", "displayName", "accountEnabled", "employeeType", "companyName", "department",
+      "userType", "assignedLicenses", "assignedPlans", "licenseAssignmentStates",
+    ]);
+  });
+
+  it.each([
+    { companyName: "  Contoso Health  ", department: "  Clinical Operations  ", expectedCompany: "Contoso Health", expectedDepartment: "Clinical Operations" },
+    { companyName: undefined, department: undefined, expectedCompany: null, expectedDepartment: null },
+    { companyName: null, department: null, expectedCompany: null, expectedDepartment: null },
+    { companyName: "", department: " \t ", expectedCompany: null, expectedDepartment: null },
+    { companyName: "C".repeat(256), department: "D".repeat(256), expectedCompany: "C".repeat(256), expectedDepartment: "D".repeat(256) },
+  ])("normalizes nullable organization metadata without excluding licensed accounts: %#", async ({ companyName, department, expectedCompany, expectedDepartment }) => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      "@odata.count": 1,
+      value: [{
+        ...graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active"),
+        companyName,
+        department,
+      }],
+    }));
+    const users = await new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("directory-token");
+    expect(users).toHaveLength(1);
+    expect(users[0].identity).toMatchObject({ companyName: expectedCompany, department: expectedDepartment });
+  });
+
+  it.each(["companyName", "department"] as const)("rejects invalid or oversized %s rather than saving malformed organization metadata", async field => {
+    for (const value of [42, {}, ["Operations"], "x".repeat(257)]) {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({
+        "@odata.count": 1,
+        value: [{
+          ...graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active"),
+          [field]: value,
+        }],
+      }));
+      await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("directory-token"))
+        .rejects.toMatchObject({ code: "provider_schema" });
+    }
   });
 
   it("loads every directory and report page and preserves missing dates as unknown", async () => {
@@ -92,6 +130,74 @@ describe("CopilotUsageGraphClient", () => {
     const client = new CopilotUsageGraphClient(withCatalog(fetcher));
     await expect(client.listLicensedUsers("secret-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("reports distinct licensed-user progress across pages and overlapping SKU batches without inventing a total", async () => {
+    const catalog = Array.from({ length: 21 }, (_, index) => ({
+      skuId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
+      skuPartNumber: `Copilot_bundle_${index}`,
+      appliesTo: "User",
+      servicePlans: [{ servicePlanId: appsPlanId }],
+    }));
+    const firstUrl = buildLicensedUsersUrl(catalog.slice(0, 20).map(sku => sku.skuId));
+    const lastUrl = buildLicensedUsersUrl([catalog[20].skuId]);
+    const nextUrl = `${firstUrl}&$skiptoken=next`;
+    const shared = graphUser("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "shared@example.com", "Active", catalog[0].skuId);
+    shared.assignedLicenses.push({ skuId: catalog[20].skuId, disabledPlans: [] });
+    shared.licenseAssignmentStates.push({ skuId: catalog[20].skuId, state: "Active", error: "None", assignedByGroup: null });
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const url = String(input);
+      if (url === buildSubscribedSkusUrl()) return Response.json({ value: catalog });
+      if (url === firstUrl) return Response.json({ value: [shared], "@odata.count": 2, "@odata.nextLink": nextUrl });
+      if (url === nextUrl) return Response.json({ value: [
+        shared, graphUser("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "first@example.com", "Active", catalog[0].skuId),
+      ] });
+      if (url === lastUrl) return Response.json({ "@odata.count": 2, value: [
+        shared, graphUser("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "last@example.com", "Active", catalog[20].skuId),
+      ] });
+      throw new Error("Unexpected directory page.");
+    });
+    const progress = vi.fn(async (_observedCount: number) => undefined);
+    expect(await new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", undefined, progress)).toHaveLength(3);
+    expect(progress.mock.calls).toEqual([[1], [2], [3]]);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["cancellation", "persistence failure"] as const)("waits for page progress and stops before the next page on %s", async failure => {
+    const controller = new AbortController();
+    const error = new Error(failure);
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: [graphUser("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "one@example.com", "Active")],
+      "@odata.count": 2,
+      "@odata.nextLink": `${buildLicensedUsersUrl(knownSkuIds)}&$skiptoken=next`,
+    }));
+    const progress = vi.fn(async (_observedCount: number) => {
+      await Promise.resolve();
+      if (failure === "cancellation") controller.abort(error);
+      else throw error;
+    });
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token", controller.signal, progress))
+      .rejects.toBe(error);
+    expect(progress.mock.calls).toEqual([[1]]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("does not request the catalog when directory collection is already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetcher = vi.fn<FetchLike>();
+    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", controller.signal))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("reports a measured zero for an empty licensed cohort (no qualifying SKU: %s)", async noSku => {
+    const fetcher = vi.fn<FetchLike>(async input => String(input) === buildSubscribedSkusUrl()
+      ? Response.json({ value: noSku ? [] : knownSkus })
+      : Response.json({ value: [], "@odata.count": 0 }));
+    const progress = vi.fn();
+    expect(await new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", undefined, progress)).toEqual([]);
+    expect(progress.mock.calls).toEqual([[0]]);
   });
 
   it.each([
@@ -468,6 +574,7 @@ function graphUser(id: string, upn: string, state: string, assignedSkuId = skuId
     displayName: upn.split("@")[0],
     accountEnabled: true,
     employeeType: "Employee",
+    companyName: "Contoso Health",
     department: "Engineering",
     userType: "Member",
     assignedLicenses: [{ skuId: assignedSkuId, disabledPlans: [] as string[] }],

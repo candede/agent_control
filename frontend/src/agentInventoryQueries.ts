@@ -50,6 +50,7 @@ function expiry(page: UnifiedAgentInventoryPage) {
       record.observations.graphPackages?.expiresAt,
       record.observations.powerPlatform?.expiresAt,
       ...Object.values(record.observations.packageSnapshots).flatMap(observation => [observation.expiresAt, observation.identityDetails?.expiresAt]),
+      ...Object.values(record.people ?? {}).map(person => person?.expiresAt),
     ]),
   ].filter((value): value is string => typeof value === "string");
   const dates = timestamps.map(value => Date.parse(value));

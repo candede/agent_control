@@ -24,6 +24,7 @@ import {
 } from "../api/client";
 import { hasRole } from "../authorization";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { SyncHistoryTable } from "./SyncHistoryTable";
 
 const progressingStatuses = new Set(["queued", "running", "reconciling_create"]);
 const pollIntervalMs = 2_000;
@@ -78,16 +79,17 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     request.current = controller;
     try {
       const next = await getWorkbenchJobs({ signal: controller.signal });
-      if (owner !== generation.current) return false;
+      if (controller.signal.aborted || owner !== generation.current) return false;
       setState(next);
       if (!preserveActionError) setError("");
       const isProgressing = next.value.some(job =>
-        progressingStatuses.has(job.status) || (job.source === "data-sync" && job.status === "waiting"));
+        (scope === "all" || syncJobSources.has(job.source))
+        && (progressingStatuses.has(job.status) || (job.source === "data-sync" && job.status === "waiting")));
       if (isProgressing && pollDeadline.current === 0) pollDeadline.current = Date.now() + pollBudgetMs;
       if (!isProgressing) pollDeadline.current = 0;
       return isProgressing;
     } catch (reason) {
-      if (owner !== generation.current || (reason instanceof ApiError && reason.kind === "aborted")) return false;
+      if (controller.signal.aborted || owner !== generation.current || (reason instanceof ApiError && reason.kind === "aborted")) return false;
       if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setState(undefined);
       const message = reason instanceof ApiError
         ? `${reason.message}${reason.requestId ? ` Request ${reason.requestId}.` : ""}`
@@ -97,7 +99,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     } finally {
       if (request.current === controller) request.current = undefined;
     }
-  }, []);
+  }, [scope]);
 
   const startPolling = useCallback((owner: number, preserveActionError = false) => {
     const poll = async () => {
@@ -184,10 +186,18 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     throw new Error("This job does not support GET-only reconciliation.");
   }
 
+  if (scope === "sync") return (
+    <SyncHistoryTable state={state} error={error} onOpenSyncRun={onOpenSyncRun} onRefresh={() => {
+      stop();
+      pollDeadline.current = 0;
+      startPolling(generation.current);
+    }} />
+  );
+
   return (
     <section className="jobs-view" aria-labelledby="jobs-heading">
       <div className="section-heading">
-        <div><span className="eyebrow">Operational metadata</span><h2 id="jobs-heading">{scope === "sync" ? "Sync history" : "Jobs"}</h2></div>
+        <div><span className="eyebrow">Operational metadata</span><h2 id="jobs-heading">Jobs</h2></div>
         <button type="button" className="secondary" onClick={() => {
           stop();
           pollDeadline.current = 0;
@@ -199,7 +209,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
         Source
         <select aria-label="Filter jobs by source" value={sourceFilter} onChange={event => setSourceFilter(event.target.value as "all" | WorkbenchJobSource)}>
           <option value="all">All sources</option>
-          {(Object.entries(sourceLabels) as Array<[WorkbenchJobSource, string]>).filter(([source]) => scope === "all" || syncJobSources.has(source)).map(([source, label]) => (
+          {(Object.entries(sourceLabels) as Array<[WorkbenchJobSource, string]>).map(([source, label]) => (
             <option key={source} value={source}>{label}</option>
           ))}
         </select>

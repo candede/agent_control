@@ -9,7 +9,7 @@ const cases = [
     fields: [".inventory-controls"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
     fields: [".copilot-users-toolbar"] },
-  { name: "official-usage", path: "/official-usage", ready: ".usage-agent-table tbody tr",
+  { name: "official-usage", path: "/official-usage?view=snapshot", ready: ".usage-agent-table tbody tr",
     fields: [".usage-agent-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },

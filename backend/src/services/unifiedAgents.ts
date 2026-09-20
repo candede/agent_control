@@ -19,7 +19,7 @@ import {
   type CopilotPackage,
   type CopilotPackageDetail,
 } from "../types/copilotPackage.js";
-import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import { powerPlatformAuthoringTool, type PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
@@ -42,8 +42,9 @@ import {
 import { powerPlatformAgentKey } from "./inventoryIdentity.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { getAuditLog } from "./auditLog.js";
-import { agentColumnValue, matchesAgentView, packageAuthoringTool, type AgentColumnValue } from "../types/agentPresentation.js";
+import { agentColumnValue, matchesAgentView, packageAuthoringTool, summarizeAgentAvailability, type AgentColumnValue } from "../types/agentPresentation.js";
 import { agentUsage, combineAgentInventoryRevision } from "./agentUsage.js";
+import { savedAgentPeople } from "./savedAgentPeople.js";
 
 export type UnifiedAgentDependencies = {
   packages: Pick<PackageInventoryRepository, "readUnifiedSource">;
@@ -53,6 +54,7 @@ export type UnifiedAgentDependencies = {
   registry?: Pick<UnifiedAgentRegistry, "withSnapshot" | "reconcile">;
   readRevision: typeof readUnifiedInventoryRevision;
   usage: Pick<typeof agentUsage, "project" | "revision">;
+  people?: Pick<typeof savedAgentPeople, "project">;
 };
 
 const defaultDependencies: UnifiedAgentDependencies = {
@@ -63,6 +65,7 @@ const defaultDependencies: UnifiedAgentDependencies = {
   registry: new UnifiedAgentRegistry(),
   readRevision: readUnifiedInventoryRevision,
   usage: agentUsage,
+  people: savedAgentPeople,
 };
 
 type SourceLoad<T> =
@@ -167,7 +170,9 @@ export class UnifiedAgentsService {
       ? await this.dependencies.registry.reconcile(database, scope, grouped) : grouped;
     const sourceCounts = verifySourceMemberships(canonicalRecords, usablePackages, usablePowerPlatform);
     const usage = await this.dependencies.usage.project(scope, canonicalRecords, database);
-    const records = canonicalRecords.map(record => {
+    const enrichedRecords = this.dependencies.people
+      ? await this.dependencies.people.project(scope, canonicalRecords, database) : canonicalRecords;
+    const records = enrichedRecords.map(record => {
       const summary = usage.summaries.get(record.id);
       if (!summary) throw new AppError(500, "agent_usage_projection_incomplete", "Saved usage did not account for every authorized inventory agent.");
       return { ...record, usage: summary };
@@ -186,7 +191,7 @@ export class UnifiedAgentsService {
     }
     const platforms = new Map(packageFacets(usablePackages).platforms.map(option => [normalizePackageAuthoringTool(option.value), option]));
     for (const resource of usablePowerPlatform) {
-      const label = resource.authoringTool?.trim();
+      const label = powerPlatformAuthoringTool(resource);
       if (label && !platforms.has(normalizePackageAuthoringTool(label))) platforms.set(normalizePackageAuthoringTool(label), { value: label, label });
     }
     const byLabel = (left: { value: string; label: string }, right: { value: string; label: string }) =>
@@ -213,6 +218,7 @@ export class UnifiedAgentsService {
     return {
       revision,
       usageContext: usage.context,
+      inventoryOverview: summarizeAgentAvailability(records),
       value: sorted.slice(offset, offset + limit),
       count: filtered.length,
       offset,
@@ -501,7 +507,7 @@ function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) 
   if (query.availableTo && !record.packages.some(value => matchesAvailability(value.availableTo, query.availableTo!))) return false;
   if (query.host && !record.packages.some(value => matchesHost(value.supportedHosts, query.host!))) return false;
   if (query.platform && !record.packages.some(value => packagePlatform(value) === normalizePackageAuthoringTool(query.platform!))
-    && normalizePackageAuthoringTool(record.powerPlatformResource?.authoringTool ?? "") !== normalizePackageAuthoringTool(query.platform)) return false;
+    && normalizePackageAuthoringTool(record.powerPlatformResource ? powerPlatformAuthoringTool(record.powerPlatformResource) ?? "" : "") !== normalizePackageAuthoringTool(query.platform)) return false;
   if (query.createdWithinDays !== undefined) {
     const threshold = Date.now() - query.createdWithinDays * 24 * 60 * 60_000;
     const createdDates = [...record.packages.map(value => value.createdDateTime), record.powerPlatformResource?.createdAt];
@@ -516,6 +522,10 @@ function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) 
     record.displayName,
     record.environmentId,
     record.powerPlatformResource?.nativeId,
+    record.powerPlatformResource?.details.ownerId,
+    record.powerPlatformResource?.createdBy,
+    record.powerPlatformResource?.details.lastModifiedBy,
+    ...Object.values(record.people ?? {}).flatMap(person => [person.objectId, person.displayName, person.userPrincipalName]),
     ...record.packages.flatMap(value => [value.id, value.displayName, value.publisher]),
     ...(record.powerPlatformResource?.identifiers.map(identifier => identifier.value) ?? []),
   ];

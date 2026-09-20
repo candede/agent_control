@@ -33,7 +33,7 @@ describe.sequential("Data sync repository", () => {
     expect(left.run.id).toBe(right.run.id);
     expect([left.created, right.created].sort()).toEqual([false, true]);
     expect(left.run.sources.map(source => source.source)).toEqual([
-      "graph_packages", "power_platform", "usage_reports", "users",
+      "graph_packages", "power_platform", "users",
     ]);
     await expect(repository.submit(scope, { mode: "full" })).rejects.toMatchObject({ code: "data_sync_active" });
     expect(await repository.listRuns(scope, 1)).toEqual([
@@ -43,6 +43,87 @@ describe.sequential("Data sync repository", () => {
     await expect(repository.listRuns(scope, 51)).rejects.toMatchObject({ code: "invalid_data_sync_limit" });
   });
 
+  it.each(["initial", "incremental", "full"] as const)("defaults %s to automatic sources and respects explicit narrower requests", async mode => {
+    const owner = { ...scope, principalId: `default-${mode}` };
+    const { run } = await repository.submit(owner, { mode });
+    expect(run.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
+    expect(run.sources.every(source => source.count === null)).toBe(true);
+    for (const source of run.sources) await repository.updateSource(owner, run.id, source.source, {
+      status: "succeeded", count: 0, message: "Saved a valid zero-row source.", canRetry: false,
+    });
+    expect((await repository.getRun(owner, run.id))?.status).toBe("completed");
+    const usersOnly = await repository.submit(owner, { mode, sources: ["users"] });
+    expect(usersOnly.run.sources).toEqual([expect.objectContaining({
+      source: "users", status: "queued", count: null, lastSuccessAt: expect.any(String),
+    })]);
+    await repository.cancel(owner, usersOnly.run.id);
+  });
+
+  it("keeps explicit legacy four-source runs waiting for manual usage and accepts a complete zero-row bundle", async () => {
+    const owner = { ...scope, principalId: "manual-usage" };
+    const { run } = await repository.submit(owner, {
+      mode: "full", sources: ["users", "graph_packages", "power_platform", "usage_reports"],
+    });
+    for (const source of run.sources) await repository.updateSource(owner, run.id, source.source, source.source === "usage_reports"
+      ? { status: "awaiting_upload", count: null, message: "Waiting for official reports.", canRetry: false }
+      : { status: "succeeded", count: 0, message: "Saved a valid zero-row source.", canRetry: false });
+    const retained = new DataSyncRepository(fixture.runtime);
+    expect(await retained.getRun(owner, run.id)).toMatchObject({ status: "waiting", sources: expect.any(Array) });
+    await retained.updateSource(owner, run.id, "usage_reports", {
+      status: "succeeded", count: 0, message: "Accepted a complete zero-row usage bundle.", canRetry: false,
+    });
+    expect((await retained.getRun(owner, run.id))?.status).toBe("completed");
+    expect((await retained.listMarkers(owner)).every(marker => marker.status === "succeeded" && marker.count === 0)).toBe(true);
+  });
+
+  it("starts new and retried counts unknown, preserves completed sources and markers, and fences old progress", async () => {
+    const owner = { ...scope, principalId: "observed-counts" };
+    await repository.recordSuccessMarker(owner, "users", 40, "2026-09-15T10:00:00.000Z");
+    await repository.recordSuccessMarker(owner, "graph_packages", 120, "2026-09-15T10:00:00.000Z");
+    const { run } = await repository.submit(owner, { mode: "incremental", sources: ["users", "graph_packages"] });
+    expect(run.sources.every(source => source.count === null)).toBe(true);
+    await repository.updateSource(owner, run.id, "graph_packages", {
+      status: "succeeded", count: 130, message: "Saved a complete package snapshot.", canRetry: false,
+    });
+    const completed = (await repository.getRun(owner, run.id))!.sources.find(source => source.source === "graph_packages")!;
+    const previousJobId = randomUUID();
+    await repository.attachJob(owner, run.id, "users", previousJobId);
+    await repository.updateSource(owner, run.id, "users", {
+      status: "running", jobId: previousJobId, count: 5, message: "Read five distinct licensed users.", canRetry: false,
+    });
+    await repository.updateSource(owner, run.id, "users", {
+      status: "failed", jobId: previousJobId, message: "A later directory page failed.", canRetry: true,
+    });
+    expect((await repository.getRun(owner, run.id))?.sources.find(source => source.source === "users"))
+      .toMatchObject({ status: "failed", count: 5 });
+    expect((await repository.listMarkers(owner)).find(source => source.source === "users"))
+      .toMatchObject({ status: "succeeded", count: 40 });
+
+    await repository.retry(owner, run.id, ["users"]);
+    await repository.updateSource(owner, run.id, "users", {
+      status: "running", jobId: previousJobId, count: 99, message: "Late progress from the old attempt.", canRetry: false,
+    });
+    const retry = (await repository.getRun(owner, run.id))!;
+    expect(retry.sources.find(source => source.source === "users")).toMatchObject({ status: "queued", count: null, jobId: null });
+    expect(retry.sources.find(source => source.source === "graph_packages")).toEqual(completed);
+    const newJobId = randomUUID();
+    await repository.attachJob(owner, run.id, "users", newJobId);
+    await repository.updateSource(owner, run.id, "users", {
+      status: "running", jobId: newJobId, count: 2, message: "Read two distinct licensed users.", canRetry: false,
+    });
+    const cancelled = await repository.cancel(owner, run.id);
+    expect(cancelled.sources.find(source => source.source === "users")).toMatchObject({ status: "cancelled", count: 2 });
+    expect(cancelled.sources.find(source => source.source === "graph_packages")).toEqual(completed);
+    expect((await repository.listMarkers(owner)).filter(source => ["users", "graph_packages"].includes(source.source))).toEqual([
+      expect.objectContaining({ source: "users", status: "succeeded", count: 40 }),
+      expect.objectContaining({ source: "graph_packages", status: "succeeded", count: 130 }),
+    ]);
+    const next = await repository.submit(owner, { mode: "incremental", sources: ["users"] });
+    await repository.updateSource(owner, next.run.id, "users", { status: "failed", message: "Failed before the first page.", canRetry: true });
+    expect((await repository.getRun(owner, next.run.id))?.sources[0]).toMatchObject({ status: "failed", count: null });
+    expect((await repository.listMarkers(owner))[0]).toMatchObject({ status: "succeeded", count: 40 });
+  });
+
   it("uses persisted success markers so a successful zero-row source is not first-use again", async () => {
     const run = (await repository.getLatestRun(scope))!;
     await repository.updateSource(scope, run.id, "users", {
@@ -50,6 +131,18 @@ describe.sequential("Data sync repository", () => {
     });
     const marker = (await repository.listMarkers(scope)).find(source => source.source === "users");
     expect(marker).toMatchObject({ status: "succeeded", count: 0 });
+  });
+
+  it("reconciles usage marker changes without changing its saved timestamp on every state read", async () => {
+    const owner = { ...scope, principalId: "usage-marker" };
+    const acceptedAt = "2026-09-15T10:00:00.000Z";
+    await repository.recordSuccessMarker(owner, "usage_reports", 0, acceptedAt);
+    const before = (await repository.listMarkers(owner))[3];
+    expect(before).toMatchObject({ status: "succeeded", count: 0, lastSuccessAt: acceptedAt });
+    await repository.recordSuccessMarker(owner, "usage_reports", 0, acceptedAt);
+    expect((await repository.listMarkers(owner))[3]).toEqual(before);
+    await repository.recordSuccessMarker(owner, "usage_reports", 4, acceptedAt);
+    expect((await repository.listMarkers(owner))[3]).toMatchObject({ status: "succeeded", count: 4, lastSuccessAt: acceptedAt });
   });
 
   it("keeps run and saved user data private to the tenant and principal", async () => {
@@ -71,6 +164,20 @@ describe.sequential("Data sync repository", () => {
       value: [{ identity: { userPrincipalName: "saved@example.com" } }],
     });
     expect(saved.appActivity).toMatchObject({ attemptStatus: "available", rowCount: 0, value: report });
+  });
+
+  it("persists company and department in the licensed-user snapshot across repository instances", async () => {
+    const owner = { ...scope, principalId: "organization-reader" };
+    const user = directoryUser("organization@example.invalid");
+    user.identity.companyName = "Example Health";
+    user.identity.department = "Clinical Services";
+    await repository.publishDirectory(owner, [user], new Date().toISOString(), "Saved organization metadata.");
+    expect(await new DataSyncRepository(fixture.runtime).getDirectorySource(owner)).toMatchObject({
+      rowCount: 1, value: [{ identity: {
+        userPrincipalName: "organization@example.invalid", companyName: "Example Health", department: "Clinical Services",
+      } }],
+    });
+    expect((await repository.getDirectorySource({ ...owner, principalId: "other-reader" })).value).toBeNull();
   });
 
   it("retries only incomplete top-level sources and retains every child association", async () => {
@@ -155,6 +262,7 @@ function directoryUser(userPrincipalName: string): CopilotDirectoryUser {
       userType: "Member",
       employeeType: "Employee",
       department: "Engineering",
+      companyName: null,
     },
     licenses: [],
     servicePlans: [],

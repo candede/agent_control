@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createUnifiedVerification } from "./test/inventoryVerification";
-import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage } from "./api/client";
+import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage, type UnifiedAgentRecord } from "./api/client";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 
 vi.mock("./api/client", async importOriginal => ({
@@ -27,6 +27,20 @@ function page(expiresAt = "2026-09-20T12:10:00.000Z"): UnifiedAgentInventoryPage
         error: { source: "power_platform", code: "snapshot_unavailable", message: "Not collected." },
       },
     },
+  };
+}
+
+function pageWithPeople(people: UnifiedAgentRecord["people"]): UnifiedAgentInventoryPage {
+  return {
+    ...page(),
+    value: [{
+      id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", displayName: "Saved agent",
+      presence: "power_platform", environmentId: null, packages: [], powerPlatformResource: null,
+      identity: { state: "unmatched", reason: null, evidence: [], packageEvidence: [] },
+      observations: { graphPackages: null, powerPlatform: null, packageSnapshots: {} },
+      people,
+    }],
+    count: 1,
   };
 }
 
@@ -101,6 +115,52 @@ describe("AgentInventoryQueries", () => {
     vi.advanceTimersByTime(5_000);
     await queries.read("owner", {}, signal());
     expect(read).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([
+    ["owner", "resolved"],
+    ["createdBy", "not_found"],
+    ["lastModifiedBy", "lookup_failed"],
+  ] as const)("expires the cached page at the %s %s person boundary", async (field, status) => {
+    const peoplePage = pageWithPeople({
+      [field]: {
+        objectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        displayName: status === "resolved" ? "Saved person" : null,
+        userPrincipalName: null, observedAt: "2026-09-20T11:00:00.000Z", status,
+        expiresAt: "2026-09-20T12:00:05.000Z",
+      },
+    });
+    read.mockResolvedValueOnce(peoplePage);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(peoplePage);
+    vi.advanceTimersByTime(4_999);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(peoplePage);
+    expect(read).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the ordinary cache window for legacy people without expiry", async () => {
+    const peoplePage = pageWithPeople({ owner: {
+      objectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      displayName: "Legacy person", userPrincipalName: "legacy@example.invalid",
+      observedAt: "2026-09-20T11:00:00.000Z",
+    } });
+    read.mockResolvedValueOnce(peoplePage);
+    await queries.read("owner", {}, signal());
+    vi.advanceTimersByTime(29_999);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(peoplePage);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed person expiry rather than extending stale name evidence", async () => {
+    read.mockResolvedValueOnce(pageWithPeople({ owner: {
+      objectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      displayName: "Saved person", userPrincipalName: null,
+      observedAt: "2026-09-20T11:00:00.000Z", expiresAt: "invalid",
+    } }));
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it("cancels provider reads on navigation and on private cache disposal", async () => {

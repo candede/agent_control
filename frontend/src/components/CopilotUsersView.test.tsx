@@ -57,6 +57,47 @@ describe("Copilot license usage dashboard", () => {
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
+  it("shows saved company and department in licensed user details and supports organization search", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.users[0].directory.companyName = "Fabrikam Clinics";
+    fixture.users[0].directory.department = "Clinical Operations";
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    const search = screen.getByLabelText("Search users or agents");
+    await userEvent.type(search, "fabrikam");
+    expect(userRows()).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Ada" }));
+    const organization = within(screen.getByRole("dialog", { name: "Ada" })).getByRole("region", { name: "Saved directory organization" });
+    expect(organization).toHaveTextContent("Company: Fabrikam Clinics");
+    expect(organization).toHaveTextContent("Department: Clinical Operations");
+    await userEvent.click(screen.getByRole("button", { name: "Close user details" }));
+    await userEvent.clear(search);
+    await userEvent.type(search, "clinical operations");
+    expect(userRows()).toHaveLength(1);
+    expect(userRows()[0]).toHaveTextContent("Ada");
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
+  it.each(["null", "legacy"] as const)("keeps %s organization metadata explicitly unknown without hiding licensed users", async mode => {
+    const fixture = structuredClone(copilotUsageFixture);
+    if (mode === "null") {
+      fixture.users[0].directory.companyName = null;
+      fixture.users[0].directory.department = null;
+    } else {
+      Reflect.deleteProperty(fixture.users[0].directory, "companyName");
+      Reflect.deleteProperty(fixture.users[0].directory, "department");
+    }
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    expect(userRows()).toHaveLength(4);
+    const organization = within(screen.getByRole("dialog", { name: "Ada" })).getByRole("region", { name: "Saved directory organization" });
+    expect(organization).toHaveTextContent("Company: Not reported");
+    expect(organization).toHaveTextContent("Department: Not reported");
+    expect(organization).not.toHaveTextContent("undefined");
+  });
+
   it("makes reported activity a primary user view independent of the license roster", async () => {
     const data = structuredClone(copilotUsageFixture);
     data.sources.directory.state = "unavailable";

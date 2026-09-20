@@ -641,7 +641,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   await login(page, "role-Viewer");
   for (const view of ["Agents", "Power Platform", "Users", "Official usage", "Audit", "Security", "Jobs"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
@@ -1076,9 +1076,15 @@ test("loading and automatic-check transport failure preserve layout and fail clo
   await expect(page.getByRole("article")).toHaveCount(primaryCapabilityCount);
   await expect(page.getByRole("status")).toContainText("Automatic permission check failed");
   await page.getByRole("button", { name: /^Sync/ }).click();
-  await page.getByText("Advanced results", { exact: true }).click();
-  const packages = page.getByRole("region", { name: "Source matching details" });
+  const diagnosticsTrigger = page.getByRole("button", { name: "View diagnostics", exact: true });
+  await diagnosticsTrigger.click();
+  const diagnostics = page.getByRole("dialog", { name: "Inventory diagnostics", exact: true });
+  await expect(diagnostics).toBeVisible();
+  const packages = diagnostics.getByRole("region", { name: "Source matching details" });
   await expect(packages.getByRole("button", { name: "Refresh agents", exact: true })).toBeDisabled();
+  await diagnostics.getByRole("button", { name: "Close inventory diagnostics", exact: true }).click();
+  await expect(diagnostics).toBeHidden();
+  await expect(diagnosticsTrigger).toBeFocused();
 });
 
 test("official usage imports through real HTTP and remains role-separated", async ({ page }) => {
@@ -1094,39 +1100,48 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   });
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  const modal = page.getByRole("dialog", { name: "Import and manage reports" });
+  const modal = page.locator("dialog.official-usage-modal");
+  await expect(page.getByRole("dialog", { name: "Import CSV reports" })).toBeVisible();
   await expect(modal.getByText(/Legacy browser report data is present/)).toBeVisible();
   await expect(modal.getByLabel("Reporting start")).toHaveCount(0);
   await expect(modal.getByLabel("Reporting end")).toHaveCount(0);
   await page.getByLabel("Official usage CSV files").setInputFiles({ name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) });
   await page.getByRole("button", { name: "Validate and stage" }).click();
-  let previews = page.getByRole("region", { name: "Validated report previews" });
-  await expect(previews).toBeVisible();
-  await expect(previews.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
-  await expect(previews.getByRole("row")).toHaveCount(2);
-  await expect(previews.getByRole("button", { name: "Accept reviewed bundle" })).toBeDisabled();
+  let validation = modal.getByRole("region", { name: "Server validation" });
+  await expect(validation).toBeVisible();
+  await expect(validation.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
+  await expect(validation.getByText(/^Agents: 1 rows staged/)).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
 
   await page.reload();
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  previews = page.getByRole("region", { name: "Validated report previews" });
-  await expect(previews.getByRole("row")).toHaveCount(2);
+  validation = modal.getByRole("region", { name: "Server validation" });
+  await expect(validation.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
   const stagedState: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
   expect(stagedState.staging.filter(stage => stage.status === "active")).toHaveLength(1);
   expect(stagedState.staging.find(stage => stage.status === "active")?.reportingPeriod.provenance).toBe("activity_range");
+  await modal.getByRole("button", { name: "Back to files" }).click();
   await page.getByLabel("Official usage CSV files").setInputFiles([
     { name: "users-agents.csv", mimeType: "text/csv", buffer: Buffer.from(userAgentsCsv) },
     { name: "users.csv", mimeType: "text/csv", buffer: Buffer.from(usersCsv) },
   ]);
   await page.getByRole("button", { name: "Validate and stage" }).click();
+  await expect(validation.getByText("All three report kinds are present", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "Continue to review" }).click();
+  const previews = modal.getByRole("region", { name: "Validated report previews" });
   await expect(previews.getByRole("row")).toHaveCount(4);
-  await expect(previews.getByText("All three kinds reviewed", { exact: true })).toBeVisible();
-  await expect(previews.getByText(/"responses":\{"agents":9,"userAgents":9,"users":9\}/)).toBeVisible();
+  await expect(previews.getByText("Bundle hash", { exact: true })).toBeHidden();
+  await previews.getByText("Technical validation details", { exact: true }).click();
+  await expect(previews.locator("pre")).toContainText('"agents": 9');
+  await expect(previews.locator("pre")).toContainText('"userAgents": 9');
+  await expect(previews.locator("pre")).toContainText('"users": 9');
   await expect(previews.getByText(/Observed last-activity dates; reporting window unknown; freshness unknown/)).toHaveCount(3);
   expect(await previews.locator(".table-shell").evaluate(element => element.scrollWidth >= element.clientWidth)).toBe(true);
   if (test.info().project.name === "mobile") {
     expect(await previews.locator(".table-shell").evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
   }
-  await previews.getByRole("button", { name: "Accept reviewed bundle" }).click();
+  await modal.getByRole("button", { name: "Accept reviewed bundle" }).click();
   if (stagedState.activeSetId) {
     await expect(modal.getByText(/upload exactly matched the current retained snapshot.*No new history entry was created/)).toBeVisible();
     const reused: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
@@ -1147,7 +1162,9 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(page.getByText(/removed after explicit acknowledgement/i)).toBeVisible();
   expect(await page.evaluate(() => ({ legacy: localStorage.getItem("agent-control:usage-reports:v1"), unrelated: localStorage.getItem("unrelated") }))).toEqual({ legacy: null, unrelated: "preserve me" });
 
-  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Retained activity summary" })).toContainText("Reported used agents");
+  await page.getByRole("button", { name: "Snapshot details", exact: true }).click();
   await page.locator(".usage-report-details > summary").click();
   await expect(page.getByText(/Microsoft 365 admin center Copilot Agents usage exports\. Source discrepancies/)).toBeVisible();
   const lineage = page.locator(".usage-source-files");
@@ -1164,6 +1181,7 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(page.getByText(/Import time does not establish source freshness/)).toBeVisible();
 
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Manage reports", exact: true }).click();
   const activeSetRow = modal.getByRole("region", { name: "Retained report sets" }).getByRole("row").filter({ hasText: "Current" });
   const deleteSet = activeSetRow.getByRole("button", { name: /^Delete retained set for / });
   await deleteSet.click();
@@ -1176,7 +1194,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(dialog).not.toBeVisible();
   await expect(deleteSet).toBeFocused();
 
-  await modal.getByText("Intentional correction options", { exact: true }).click();
+  await modal.getByRole("button", { name: "Add CSV reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Import another bundle", exact: true }).click();
   await modal.getByRole("checkbox", { name: "This upload intentionally corrects the current snapshot." }).check();
   await page.getByLabel("Official usage CSV files").setInputFiles([
     { name: "agents-correction.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv.replace("9,2026", "99,2026")) },
@@ -1184,19 +1203,21 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   ]);
   await page.getByRole("button", { name: "Validate and stage" }).click();
   await expect(modal.getByText(/1 report type\(s\) staged; 1 file\(s\) rejected/)).toBeVisible();
-  await expect(modal.getByRole("region", { name: "Validated report previews" }).getByRole("row")).toHaveCount(2);
-  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await expect(modal.getByRole("region", { name: "Server validation" }).getByText(/^Agents: 1 rows staged/)).toBeVisible();
+  await expect(modal.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+  await expect(modal.getByRole("region", { name: "Validated report previews" })).toHaveCount(0);
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
   const unchanged: OfficialUsageAggregateView = await (await page.request.get("/api/official-usage/aggregate")).json();
   expect(unchanged.activeSet?.id).toBe(accepted.activeSet?.id);
   expect(unchanged.summary.usage).toMatchObject({ totalResponses: 9, totalActiveUsers: 1 });
   await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("9");
   await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  await page.getByRole("region", { name: "Validated report previews" }).getByRole("button", { name: "Discard staging" }).click();
+  await modal.getByRole("button", { name: "Discard staging" }).click();
   await expect(modal.getByText("All staged rows were discarded.", { exact: true })).toBeVisible();
   const discarded: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
   expect(discarded.staging.filter(stage => stage.status === "active")).toEqual([]);
 
-  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await page.getByRole("button", { name: "Reported activity", exact: true }).click();
   await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
@@ -1214,6 +1235,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Official usage", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Cumulative agent activity" })).toBeVisible();
+  await page.getByRole("button", { name: "Snapshot details", exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);

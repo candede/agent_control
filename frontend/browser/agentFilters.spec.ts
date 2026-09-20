@@ -14,7 +14,7 @@ test("basic filters occupy exactly two rows on desktop and tablet, with usable m
   const filters = page.getByRole("region", { name: "Filters", exact: true });
   await expect(filters.getByRole("combobox")).toHaveCount(6);
   await expect(page.getByRole("checkbox", { name: "Advanced filters" })).not.toBeChecked();
-  for (const name of ["Show agents", "Built with", "Available to", "Host", "Package status"]) {
+  for (const name of ["Show agents", "Built with", "Assigned access", "Host", "Package status"]) {
     await expect(filters.getByRole("combobox", { name, exact: true })).toBeVisible();
   }
   await expect(filters.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
@@ -83,7 +83,7 @@ test("advanced values stay active when hidden, preserve request parameters, and 
   await expect(toggle).not.toBeChecked();
   await expect(page).toHaveURL(/\/agents$/);
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill("policy");
-  await page.getByRole("combobox", { name: "Available to", exact: true }).selectOption("available:some");
+  await page.getByRole("combobox", { name: "Assigned access", exact: true }).selectOption("available:some");
   await page.getByRole("combobox", { name: "Host", exact: true }).selectOption("Teams");
   await page.getByRole("combobox", { name: "Built with", exact: true }).selectOption("Copilot Studio");
   await page.getByRole("spinbutton", { name: "Created within days" }).fill("60");

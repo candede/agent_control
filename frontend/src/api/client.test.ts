@@ -21,6 +21,7 @@ import {
   getOfficialUsageAggregate,
   getOfficialUsageAgentDetail,
   getOfficialUsageHistory,
+  getOfficialUsageOverview,
   getOfficialUsageUsers,
   getCopilotUsageUsers,
   getDataSyncRun,
@@ -35,6 +36,8 @@ import {
   retryDataSyncRun,
   refreshPackageIdentityDetails,
   searchDirectoryPrincipals,
+  resolveDirectoryPrincipals,
+  resolveAgentPeople,
   startExactPackageRefresh,
   startPackageRefresh,
   stageOfficialUsageReport,
@@ -63,6 +66,48 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
+  it.each([false, true])("persists record-scoped people with CSRF, cancellation and force=%s", async force => {
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "people-csrf", roleAssignmentRequired: false });
+    await getCurrentUser();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ people: {}, changed: true }), {
+      headers: { "Content-Type": "application/json" },
+    }));
+    const controller = new AbortController();
+    await expect(resolveAgentPeople("agent:record", { force, signal: controller.signal })).resolves.toEqual({
+      people: {}, changed: true,
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/people/resolve", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ recordId: "agent:record", ...(force ? { force: true } : {}) }),
+      signal: controller.signal,
+      credentials: "include",
+      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "people-csrf" }),
+    }));
+  });
+
+  it("cancels exact person resolution through the existing protected directory endpoint", async () => {
+    const fetchMock = mockJsonResponse({ value: [] });
+    const controller = new AbortController();
+    const principals = [{ resourceType: "user", resourceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }];
+    await resolveDirectoryPrincipals(principals, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledWith("/api/directory/principals/resolve", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ principals }), signal: controller.signal, credentials: "include",
+    }));
+  });
+
+  it("serializes cumulative activity filters with cancellation and no implicit snapshot selection", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    await getOfficialUsageOverview({
+      search: "June & July", startDate: "2026-06-01", endDate: "2026-07-15",
+      sortBy: "lastActivity", sortDirection: "asc", limit: 25, offset: 50,
+    }, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/official-usage/overview?search=June+%26+July&startDate=2026-06-01&endDate=2026-07-15&sortBy=lastActivity&sortDirection=asc&limit=25&offset=50",
+      expect.objectContaining({ signal: controller.signal, credentials: "include" }),
+    );
+  });
+
   it("retains administrative-audit export receipts without a package blocked-state claim", async () => {
     const event: AuditEvent = {
       id: "audit-export-receipt", operationId: "export-operation", action: "export-administrative-audit",

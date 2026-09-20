@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
+import { agentPeopleResolveInput, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 
 describe("unified agent inventory query", () => {
+  it("accepts only saved record identifiers for persistent people resolution, not arbitrary directory IDs", () => {
+    expect(agentPeopleResolveInput({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }))
+      .toEqual({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", force: false });
+    expect(agentPeopleResolveInput({ recordId: "graph_packages:package", force: true }).force).toBe(true);
+    for (const input of [null, [], {}, { recordId: "unqualified" }, { recordId: "graph_packages:package", force: 1 },
+      { recordId: "graph_packages:package", principalId: "other" }, { ids: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] }]) {
+      expect(() => agentPeopleResolveInput(input)).toThrow();
+    }
+  });
+  it.each(["available", "unavailable", "availability_unknown"])("accepts the %s access view for lists and exports", view => {
+    expect(unifiedAgentInventoryQuery({ view }).view).toBe(view);
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view } }).query.view).toBe(view);
+  });
+
   it("accepts organizational and usage views and new column sorting for list and export", () => {
     expect(unifiedAgentInventoryQuery({ view: "organization", sortBy: "deployment" })).toMatchObject({ view: "organization", sortBy: "deployment" });
     expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view: "used", sortBy: "responses", sortDirection: "desc" } }).query)

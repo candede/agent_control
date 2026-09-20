@@ -56,7 +56,9 @@ describe("CopilotUsageService", () => {
       loadPublished: vi.fn(async () => published),
     });
 
-    expect((await value.users(user)).users[0].importedUsage).toBeNull();
+    const savedUser = (await value.users(user)).users[0];
+    expect(savedUser.importedUsage).toBeNull();
+    expect(savedUser.directory).toMatchObject({ companyName: "Contoso Health", department: "Engineering" });
     published = importedPublished(
       [{ username: "saved@example.com", displayName: "Saved", numberOfAgentsUsed: 1, agentResponsesReceived: 7 }],
       [],
@@ -64,6 +66,148 @@ describe("CopilotUsageService", () => {
     expect((await value.users(user)).users[0].importedUsage).toMatchObject({ reportedResponsesReceived: 7 });
     expect(graph.listLicensedUsers).not.toHaveBeenCalled();
     expect(graph.listAppActivity).not.toHaveBeenCalled();
+  });
+
+  it("returns null organization fields for older saved snapshots without changing their licensed cohort", async () => {
+    const savedUser = directoryUser("11111111-1111-4111-8111-111111111111", "legacy@example.com");
+    const legacy = JSON.parse(JSON.stringify([savedUser], (key, value: unknown) => key === "companyName" ? undefined : value)) as CopilotDirectoryUser[];
+    const missingOrganization = JSON.parse(JSON.stringify([savedUser], (key, value: unknown) => ["companyName", "department"].includes(key) ? undefined : value)) as CopilotDirectoryUser[];
+    for (const directory of [legacy, missingOrganization]) {
+      const graph = { listLicensedUsers: vi.fn(), listAppActivity: vi.fn() } as unknown as CopilotUsageGraphClient;
+      const value = new CopilotUsageService({} as pg.Pool, {
+        graph,
+        usageStore: memoryUsageStore(directory),
+        now: () => now,
+        loadPublished: vi.fn(async () => emptyPublished()),
+      });
+      const result = await value.users(user);
+      expect(result.counts.licensedUsers).toBe(1);
+      expect(result.users).toHaveLength(1);
+      expect(JSON.parse(JSON.stringify(result.users[0].directory))).toMatchObject({
+        companyName: null,
+        department: directory === legacy ? "Engineering" : null,
+      });
+      expect(result.users[0].licenses).toEqual(savedUser.licenses);
+      expect(directory[0].identity).not.toHaveProperty("companyName");
+      expect(graph.listLicensedUsers).not.toHaveBeenCalled();
+      expect(graph.listAppActivity).not.toHaveBeenCalled();
+    }
+  });
+
+  it("publishes and reads licensed organization metadata unchanged through the saved directory snapshot", async () => {
+    const directory = [directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")];
+    const graph = {
+      listLicensedUsers: vi.fn(async () => directory),
+      listAppActivity: vi.fn(async () => ({ users: [], reportRefreshDate: null })),
+    } as unknown as CopilotUsageGraphClient;
+    const usageStore = memoryUsageStore();
+    const value = new CopilotUsageService({} as pg.Pool, {
+      graph,
+      usageStore,
+      now: () => now,
+      requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
+      delegatedToken: vi.fn(async () => "directory-token") as never,
+      revalidateUser: vi.fn(async () => user),
+      requireProviderAdmissions: vi.fn(),
+      loadPublished: vi.fn(async () => emptyPublished()),
+    });
+    await value.refreshUsers(user, undefined, { publication });
+    expect(usageStore.publishDirectory).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId },
+      [expect.objectContaining({ identity: expect.objectContaining({ companyName: "Contoso Health", department: "Engineering" }) })],
+      now.toISOString(), expect.any(String), publication,
+    );
+    expect((await value.users(user)).users[0].directory).toEqual(directory[0].identity);
+    expect(graph.listLicensedUsers).toHaveBeenCalledOnce();
+  });
+
+  it("forwards awaited count-only directory progress before publishing the completed snapshot", async () => {
+    const harness = refreshHarness();
+    const directory = [
+      directoryUser("11111111-1111-4111-8111-111111111111", "one@example.com"),
+      directoryUser("22222222-2222-4222-8222-222222222222", "two@example.com"),
+    ];
+    const progress = vi.fn(async (_count: number) => {
+      expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+    });
+    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+      await onProgress?.(1);
+      await onProgress?.(2);
+      return directory;
+    });
+    const signal = new AbortController().signal;
+    expect(await harness.value.refreshUsers(user, signal, { publication, onDirectoryProgress: progress }))
+      .toMatchObject({ status: "succeeded", count: 2 });
+    expect(harness.graph.listLicensedUsers).toHaveBeenCalledWith("directory-token", signal, expect.any(Function));
+    expect(progress.mock.calls).toEqual([[1], [2]]);
+    expect(harness.usageStore.publishDirectory).toHaveBeenCalledOnce();
+  });
+
+  it.each([null, 2])("keeps saved Users data but reports only current-attempt observations after a directory failure: %s", async observedCount => {
+    const saved = [
+      directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com"),
+      directoryUser("22222222-2222-4222-8222-222222222222", "saved-two@example.com"),
+      directoryUser("33333333-3333-4333-8333-333333333333", "saved-three@example.com"),
+    ];
+    const harness = refreshHarness(saved);
+    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+      if (observedCount !== null) await onProgress?.(observedCount);
+      throw new AppError(502, "provider_error", "Directory page unavailable.");
+    });
+    expect(await harness.value.refreshUsers(user, undefined, { publication })).toMatchObject({
+      status: "partial", count: observedCount,
+    });
+    expect((await harness.usageStore.getUserSources()).directory).toMatchObject({
+      attemptStatus: "failed", rowCount: 3, value: saved,
+    });
+    expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+  });
+
+  it("does not count preserved directory data as observed by an app-activity-only retry", async () => {
+    const harness = refreshHarness([directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")]);
+    harness.graph.listAppActivity.mockRejectedValueOnce(new AppError(403, "missing_permission", "Reports permission unavailable."));
+    const progress = vi.fn();
+    expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true, onDirectoryProgress: progress }))
+      .toMatchObject({ status: "partial", count: null });
+    expect(harness.graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(progress).not.toHaveBeenCalled();
+    expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
+      .toMatchObject({ status: "succeeded", count: 1 });
+  });
+
+  it.each([
+    new Error("Progress persistence unavailable."),
+    new AppError(409, "data_sync_publication_superseded", "Attempt ownership changed."),
+  ])("surfaces progress callback errors rather than swallowing them as provider failures: %s", async error => {
+    const harness = refreshHarness();
+    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+      await onProgress?.(1);
+      return [];
+    });
+    await expect(harness.value.refreshUsers(user, undefined, {
+      publication, onDirectoryProgress: async () => { throw error; },
+    })).rejects.toBe(error);
+    expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+    expect(harness.usageStore.recordUserSourceFailure.mock.calls.some(call => call[1] === "directory")).toBe(false);
+  });
+
+  it("honors cancellation during an awaited progress callback before directory publication", async () => {
+    const harness = refreshHarness();
+    const controller = new AbortController();
+    const error = new Error("User collection cancelled.");
+    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+      await onProgress?.(1);
+      return [];
+    });
+    await expect(harness.value.refreshUsers(user, controller.signal, {
+      publication,
+      onDirectoryProgress: async () => {
+        await Promise.resolve();
+        controller.abort(error);
+      },
+    })).rejects.toBe(error);
+    expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+    expect(harness.usageStore.recordUserSourceFailure).not.toHaveBeenCalled();
   });
 
   it("returns explicit unknown counts before a first saved-data sync", async () => {
@@ -371,6 +515,25 @@ function service(options: {
   };
 }
 
+function refreshHarness(directory?: CopilotDirectoryUser[]) {
+  const usageStore = memoryUsageStore(directory);
+  const graph = {
+    listLicensedUsers: vi.fn<CopilotUsageGraphClient["listLicensedUsers"]>().mockResolvedValue([]),
+    listAppActivity: vi.fn<CopilotUsageGraphClient["listAppActivity"]>().mockResolvedValue({ users: [], reportRefreshDate: null }),
+  };
+  const value = new CopilotUsageService({} as pg.Pool, {
+    graph: graph as unknown as CopilotUsageGraphClient,
+    usageStore,
+    now: () => now,
+    requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
+    delegatedToken: vi.fn(async () => "directory-token") as never,
+    revalidateUser: vi.fn(async () => user),
+    requireProviderAdmissions: vi.fn(),
+    loadPublished: vi.fn(async () => emptyPublished()),
+  });
+  return { value, usageStore, graph };
+}
+
 function memoryUsageStore(
   directoryValue?: CopilotDirectoryUser[],
   appActivityValue?: CopilotReportResult,
@@ -385,7 +548,7 @@ function memoryUsageStore(
   return {
     getUserSources: vi.fn(async () => sources),
     publishDirectory: vi.fn(async (_scope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string) => {
-      sources.directory = savedSource("directory", [...value], observedAt, message);
+      sources.directory = savedSource("directory", JSON.parse(JSON.stringify(value)) as CopilotDirectoryUser[], observedAt, message);
       return "11111111-1111-4111-8111-111111111111";
     }),
     publishAppActivity: vi.fn(async (_scope, value: CopilotReportResult, observedAt: string, message: string) => {
@@ -425,7 +588,7 @@ function savedSource<T>(
 
 function directoryUser(objectId: string, userPrincipalName: string, displayName = userPrincipalName): CopilotDirectoryUser {
   return {
-    identity: { objectId, userPrincipalName, displayName, accountEnabled: true, userType: "Member", employeeType: "Employee", department: "Engineering" },
+    identity: { objectId, userPrincipalName, displayName, accountEnabled: true, userType: "Member", employeeType: "Employee", companyName: "Contoso Health", department: "Engineering" },
     licenses: [{
       skuId: "639dec6b-bb19-468b-871c-c5c441c4b0cb",
       skuPartNumber: "Microsoft_365_Copilot",

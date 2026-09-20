@@ -1,5 +1,5 @@
 import { AppError } from "../errors.js";
-import type { PackageAccessEntity } from "../types/copilotPackage.js";
+import { isDirectoryObjectId, type PackageAccessEntity } from "../types/copilotPackage.js";
 import { graphError, type FetchLike } from "./graphPackages.js";
 import { boundedProviderJson } from "./providerJson.js";
 
@@ -9,7 +9,6 @@ const maxSearchLimit = 50;
 const maxSearchQueryLength = 120;
 const maxResolveCount = 500;
 const resolveConcurrency = 8;
-const directoryObjectIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 
 type GraphUser = {
   id: string;
@@ -35,6 +34,7 @@ export type DirectoryPrincipal = PackageAccessEntity & {
   displayName: string;
   secondaryText?: string;
   principalKind: "user" | "securityGroup" | "microsoft365Group" | "unknown";
+  userPrincipalName?: string;
 };
 
 export class DirectoryPrincipalsClient {
@@ -95,7 +95,7 @@ export class DirectoryPrincipalsClient {
       .slice(0, normalizedLimit);
   }
 
-  async resolve(accessToken: string, entities: PackageAccessEntity[]) {
+  async resolve(accessToken: string, entities: PackageAccessEntity[], signal?: AbortSignal) {
     const unique = deduplicateEntities(entities);
 
     if (unique.length > maxResolveCount) {
@@ -110,12 +110,13 @@ export class DirectoryPrincipalsClient {
       unique,
       resolveConcurrency,
       async (entity): Promise<DirectoryPrincipal> => {
+        signal?.throwIfAborted();
         if (entity.resourceType === "user") {
-          return this.resolveUser(accessToken, entity.resourceId);
+          return this.resolveUser(accessToken, entity.resourceId, signal);
         }
 
         if (entity.resourceType === "group") {
-          return this.resolveGroup(accessToken, entity.resourceId);
+          return this.resolveGroup(accessToken, entity.resourceId, signal);
         }
 
         return fallbackPrincipal(entity);
@@ -123,11 +124,13 @@ export class DirectoryPrincipalsClient {
     );
   }
 
-  private async resolveUser(accessToken: string, id: string) {
+  private async resolveUser(accessToken: string, id: string, signal?: AbortSignal) {
     try {
       const user = await this.request<GraphUser>(
         `${graphV1}/users/${encodeURIComponent(id)}?$select=id,displayName,mail,userPrincipalName`,
         accessToken,
+        {},
+        signal,
       );
       requireResolvedIdentity(user.id, id);
       return mapUser(user);
@@ -139,11 +142,13 @@ export class DirectoryPrincipalsClient {
     }
   }
 
-  private async resolveGroup(accessToken: string, id: string) {
+  private async resolveGroup(accessToken: string, id: string, signal?: AbortSignal) {
     try {
       const group = await this.request<GraphGroup>(
         `${graphV1}/groups/${encodeURIComponent(id)}?$select=id,displayName,description,mail,groupTypes,securityEnabled`,
         accessToken,
+        {},
+        signal,
       );
       requireResolvedIdentity(group.id, id);
       return mapGroup(group);
@@ -224,6 +229,7 @@ function mapUser(user: GraphUser): DirectoryPrincipal {
     displayName: user.displayName?.trim() || user.userPrincipalName || user.id,
     secondaryText: user.mail || user.userPrincipalName || undefined,
     principalKind: "user",
+    ...(user.userPrincipalName ? { userPrincipalName: user.userPrincipalName } : {}),
   };
 }
 
@@ -258,7 +264,7 @@ function fallbackPrincipal(entity: PackageAccessEntity): DirectoryPrincipal {
 }
 
 function validatePrincipal(value: GraphUser | GraphGroup) {
-  if (!value || typeof value.id !== "string" || !directoryObjectIdPattern.test(value.id)) throw new AppError(502, "provider_schema", "Directory principal identity is not a native Microsoft Entra object ID.");
+  if (!value || typeof value.id !== "string" || !isDirectoryObjectId(value.id)) throw new AppError(502, "provider_schema", "Directory principal identity is not a native Microsoft Entra object ID.");
   for (const key of ["displayName", "mail", "userPrincipalName", "description"] as const) {
     const field = (value as Record<string, unknown>)[key];
     if (field !== undefined && field !== null && (typeof field !== "string" || field.length > 4096)) throw new AppError(502, "provider_schema", "Directory principal field is invalid.");
@@ -278,7 +284,7 @@ function deduplicateEntities(entities: PackageAccessEntity[]) {
     const resourceId = entity.resourceId.trim();
     const resourceType = entity.resourceType.trim().toLowerCase();
 
-    if ((resourceType !== "user" && resourceType !== "group") || !directoryObjectIdPattern.test(resourceId)) {
+    if ((resourceType !== "user" && resourceType !== "group") || !isDirectoryObjectId(resourceId)) {
       throw new AppError(400, "invalid_principal", "Directory resolution requires a user or group with a native Microsoft Entra object ID.");
     }
 

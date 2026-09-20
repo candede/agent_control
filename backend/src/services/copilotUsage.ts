@@ -28,6 +28,7 @@ import { capabilities } from "./capabilities.js";
 import {
   CopilotUsageGraphClient,
   normalizeCopilotIdentity,
+  type CopilotDirectoryProgress,
   type CopilotDirectoryUser,
   type CopilotReportResult,
   type CopilotReportUser,
@@ -104,11 +105,12 @@ export class CopilotUsageService {
   async refreshUsers(
     user: AuthenticatedUser,
     signal: AbortSignal | undefined,
-    options: { incompleteOnly?: boolean; publication: UserSourcePublication },
+    options: { incompleteOnly?: boolean; publication: UserSourcePublication; onDirectoryProgress?: CopilotDirectoryProgress },
   ): Promise<CopilotUsageRefreshResult> {
     const scope = dataScope(user);
     signal?.throwIfAborted();
     const before = await this.dependencies.usageStore.getUserSources(scope);
+    signal?.throwIfAborted();
     const requested: CopilotUsageSnapshotSource[] = options.incompleteOnly
       ? [
         ...(before.directory.attemptStatus === "available" ? [] : ["directory" as const]),
@@ -119,9 +121,19 @@ export class CopilotUsageService {
       return { status: "succeeded", count: before.directory.rowCount, message: "All saved user sources already completed successfully." };
     }
     this.dependencies.requireProviderAdmissions();
-    await Promise.all(requested.map(sourceId => this.refreshUserSource(scope, user, sourceId, options.publication, signal)));
+    let observedCount: number | null = null;
+    const onDirectoryProgress: CopilotDirectoryProgress = async count => {
+      signal?.throwIfAborted();
+      observedCount = count;
+      await options.onDirectoryProgress?.(count);
+      signal?.throwIfAborted();
+    };
+    await Promise.all(requested.map(sourceId => this.refreshUserSource(scope, user, sourceId, options.publication, onDirectoryProgress, signal)));
+    signal?.throwIfAborted();
     const after = await this.dependencies.usageStore.getUserSources(scope);
-    return userRefreshResult(after);
+    signal?.throwIfAborted();
+    return userRefreshResult(after, requested.includes("directory") && after.directory.attemptStatus === "available"
+      ? after.directory.rowCount : observedCount);
   }
 
   private async refreshUserSource(
@@ -129,11 +141,12 @@ export class CopilotUsageService {
     user: AuthenticatedUser,
     sourceId: CopilotUsageSnapshotSource,
     publication: UserSourcePublication,
+    onDirectoryProgress: CopilotDirectoryProgress,
     signal?: AbortSignal,
   ) {
     const attemptedAt = this.dependencies.now().toISOString();
     const loaded = sourceId === "directory"
-      ? await this.loadDirectory(user, signal)
+      ? await this.loadDirectory(user, signal, onDirectoryProgress)
       : await this.loadAppActivity(user, signal);
     signal?.throwIfAborted();
     if (!loaded.ok) {
@@ -188,13 +201,24 @@ export class CopilotUsageService {
     });
   }
 
-  private async loadDirectory(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotDirectoryUser[]>> {
+  private async loadDirectory(user: AuthenticatedUser, signal: AbortSignal | undefined, onProgress: CopilotDirectoryProgress): Promise<Loaded<CopilotDirectoryUser[]>> {
+    let progressFailure: { error: unknown } | undefined;
     try {
       const token = await this.currentDelegatedToken(dataScope(user), "graph.licenses.read");
-      const value = await this.dependencies.graph.listLicensedUsers(token, signal);
+      signal?.throwIfAborted();
+      const value = await this.dependencies.graph.listLicensedUsers(token, signal, async count => {
+        try {
+          await onProgress(count);
+        } catch (error) {
+          progressFailure = { error };
+          throw error;
+        }
+      });
       return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
     } catch (error) {
       signal?.throwIfAborted();
+      // A durable progress write failure is not a Microsoft provider failure.
+      if (progressFailure) throw progressFailure.error;
       return sourceFailure(error, "Directory license data", "User.Read.All and LicenseAssignment.Read.All");
     }
   }
@@ -320,7 +344,7 @@ export function composeCopilotUsageUsers(input: {
 function userRefreshResult(saved: {
   directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
   appActivity: SavedCopilotUsageSource<CopilotReportResult>;
-}): CopilotUsageRefreshResult {
+}, observedCount: number | null): CopilotUsageRefreshResult {
   const values = [saved.directory, saved.appActivity];
   if (values.every(value => value.attemptStatus === "available")) {
     return {
@@ -333,17 +357,17 @@ function userRefreshResult(saved: {
     const incomplete = values.filter(value => value.attemptStatus !== "available").map(value => value.source);
     return {
       status: "partial",
-      count: saved.directory.rowCount,
+      count: observedCount,
       message: `Saved user data remains available, but ${incomplete.join(" and ")} did not complete the latest refresh.`,
     };
   }
   if (values.some(value => value.attemptStatus === "waiting_authorization")) {
-    return { status: "waiting_authorization", count: null, message: "Explicit resume with renewed Microsoft authorization is required." };
+    return { status: "waiting_authorization", count: observedCount, message: "Explicit resume with renewed Microsoft authorization is required." };
   }
   if (values.some(value => value.attemptStatus === "permission_required")) {
-    return { status: "permission_required", count: null, message: "Required delegated Microsoft read permission or provider role is unavailable." };
+    return { status: "permission_required", count: observedCount, message: "Required delegated Microsoft read permission or provider role is unavailable." };
   }
-  return { status: "failed", count: null, message: "User sources failed before any normalized saved data could be published." };
+  return { status: "failed", count: observedCount, message: "User sources failed before any normalized saved data could be published." };
 }
 
 function savedSourceSummary<T>(saved: SavedCopilotUsageSource<T>, current: CopilotUsageSourceSummary): CopilotUsageSourceSummary {
@@ -526,7 +550,11 @@ function buildUser(
   if (directory.licenses.some(license => license.state === "error")) attention.push("license_error");
   if (directory.licenses.some(license => license.state === "disabled")) attention.push("license_disabled");
   return {
-    directory: directory.identity,
+    directory: {
+      ...directory.identity,
+      companyName: directory.identity.companyName ?? null,
+      department: directory.identity.department ?? null,
+    },
     licenses: directory.licenses,
     servicePlans: directory.servicePlans,
     importedUsage,

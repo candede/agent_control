@@ -13,6 +13,7 @@ import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
 import { createInventoryVerification } from "../test/inventoryVerification";
 import { usageAggregateFixture, usageAgentDetailFixture } from "../test/usageInsightsFixture";
+import { automaticAgentUsageFixture, automaticUsageContext, automaticUsagePackageId, automaticUsageReportName } from "../test/automaticAgentUsageFixture";
 
 mockNativeDialogs();
 
@@ -160,13 +161,317 @@ function renderDetail(
     record, roles: user.roles, onTabChange: vi.fn(), onClose: vi.fn(), onInspectPackage: vi.fn(),
     onUpdatePackageAccess: vi.fn().mockResolvedValue(undefined), onSetPackageBlocked: vi.fn(), ...overrides,
   };
-  const content = (next: Partial<typeof props> = {}, nextViews = views) => <CapabilityContext value={{
-    views: nextViews, user: { ...user, roles: next.roles ?? props.roles }, now: Date.now(),
+  const content = (next: Partial<typeof props> = {}, nextViews = views, principal = user) => <CapabilityContext value={{
+    views: nextViews, user: { ...principal, roles: next.roles ?? props.roles }, now: Date.now(),
     loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
   }}><WorkbenchActionProvider value={actions}><UnifiedAgentDetailModal {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
   const result = render(content(), options);
-  return { ...result, props, update: (next: Partial<typeof props>, nextViews = views) => result.rerender(content(next, nextViews)) };
+  return { ...result, props, update: (next: Partial<typeof props>, nextViews = views, principal = user) => result.rerender(content(next, nextViews, principal)) };
 }
+
+describe("unified authoring and person evidence", () => {
+  const ownerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const creatorId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const savedPerson = {
+    objectId: ownerId, displayName: "Saved owner", userPrincipalName: "saved.owner@example.invalid",
+    observedAt: "2026-09-17T12:00:00Z",
+  };
+  const resolved = (id = ownerId, displayName = "Directory person") => ({
+    objectId: id, displayName, userPrincipalName: "person@example.invalid",
+    observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    status: "resolved" as const,
+  });
+  function nativeRecord(): UnifiedAgentRecord {
+    return {
+      ...record, packages: [], presence: "power_platform",
+      powerPlatformResource: {
+        ...record.powerPlatformResource, authoringTool: null, displayName: null,
+        createdBy: ownerId, details: { createdIn: "Copilot Studio Lite", ownerId: ownerId.toUpperCase() },
+      },
+    };
+  }
+  const field = (label: string) => within(screen.getByRole("region", { name: "Agent information" }))
+    .getByText(label, { selector: "dt" }).nextElementSibling;
+
+  it("fills Built with from legacy Lite metadata and does not infer deletion from a missing name", () => {
+    const value = nativeRecord();
+    value.displayName = value.powerPlatformResource!.nativeId;
+    renderDetail({ record: value, activeTab: "power-platform", roles: ["AgentControl.Viewer"] });
+    expect(field("Built with")).toHaveTextContent("Microsoft 365 Copilot Agent Builder");
+    expect(screen.getByText("Authoring tool").nextElementSibling).toHaveTextContent("Microsoft 365 Copilot Agent Builder");
+    expect(screen.getByText("Authoring tool (raw)").nextElementSibling).toHaveTextContent("Copilot Studio Lite");
+    expect(screen.getByText(/This does not establish whether the agent was deleted/)).toBeVisible();
+  });
+
+  it("uses saved names and sign-in addresses without requiring live directory permission or lookup", () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople");
+    const value = { ...nativeRecord(), people: { owner: savedPerson, createdBy: savedPerson } };
+    renderDetail({ record: value, roles: ["AgentControl.Viewer"] });
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Owner")).toHaveTextContent("saved.owner@example.invalid");
+    expect(field("Created by")).toHaveTextContent("Saved owner");
+    expect(field("Created by")).toHaveTextContent(`ID: ${ownerId}`);
+    expect(field("Owner")).toHaveTextContent("Saved directory:");
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("does not discard a validated saved GUID match just because live lookup supports a narrower ID format", () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople");
+    const id = "cccccccc-cccc-7ccc-8ccc-cccccccccccc";
+    const value = nativeRecord();
+    value.powerPlatformResource!.createdBy = id;
+    value.powerPlatformResource!.details.ownerId = id;
+    const person = { ...savedPerson, objectId: id };
+    value.people = { owner: person, createdBy: person };
+    renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Created by")).toHaveTextContent("saved.owner@example.invalid");
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("persists missing people once through the saved record, independent of callback identity and package rerenders", async () => {
+    const value = nativeRecord();
+    value.powerPlatformResource!.details.lastModifiedBy = creatorId;
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({
+      people: { owner: resolved(), createdBy: resolved(), lastModifiedBy: resolved(creatorId, "Last editor") }, changed: true,
+    });
+    const changed = vi.fn();
+    const rendered = renderDetail({ record: value, roles: ["AgentControl.Viewer"], onPeopleChanged: changed }, capabilitiesWithDirectory());
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Directory person"));
+    expect(field("Created by")).toHaveTextContent("person@example.invalid");
+    expect(field("Last modified by")).toHaveTextContent("Last editor");
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(value.id, { signal: expect.any(AbortSignal) });
+    expect(changed).toHaveBeenCalledOnce();
+    rendered.update({ record: structuredClone(value), onPeopleChanged: vi.fn() });
+    rendered.update({ activeTab: "audit-security" });
+    rendered.update({ activeTab: "identities" });
+    expect(field("Owner")).toHaveTextContent("Directory person");
+    expect(lookup).toHaveBeenCalledOnce();
+  });
+
+  it("keeps saved people visible during a failed missing-person lookup and supports retry", async () => {
+    const value = nativeRecord();
+    value.powerPlatformResource!.createdBy = creatorId;
+    value.people = { owner: savedPerson };
+    const lookup = vi.spyOn(api, "resolveAgentPeople")
+      .mockRejectedValueOnce(new api.ApiError(503, "unavailable", "Directory temporarily unavailable."))
+      .mockResolvedValueOnce({ people: { owner: savedPerson, createdBy: resolved(creatorId, "Original creator") }, changed: true });
+    renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(await screen.findByRole("alert")).toHaveTextContent("Directory temporarily unavailable.");
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Created by")).toHaveTextContent(creatorId);
+    expect(lookup.mock.calls[0][0]).toBe(value.id);
+    await userEvent.click(screen.getByRole("button", { name: "Retry person lookup" }));
+    await waitFor(() => expect(field("Created by")).toHaveTextContent("Original creator"));
+    expect(lookup).toHaveBeenLastCalledWith(value.id, { force: true, signal: expect.any(AbortSignal) });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each(["not_found", "lookup_failed"] as const)("shows fresh %s evidence honestly and only retries explicitly", async status => {
+    const value = nativeRecord();
+    const person = { ...resolved(), displayName: null, userPrincipalName: null, status };
+    value.people = { owner: person, createdBy: person };
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({ people: value.people, changed: false });
+    const changed = vi.fn();
+    const rendered = renderDetail({ record: value, onPeopleChanged: changed }, capabilitiesWithDirectory());
+    expect(field("Owner")).toHaveTextContent(status === "not_found" ? "User not found" : "Directory lookup failed");
+    expect(field("Owner")).not.toHaveTextContent("deleted");
+    expect(lookup).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Retry person lookup" }));
+    await waitFor(() => expect(screen.queryByText("Resolving agent people...")).not.toBeInTheDocument());
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(value.id, { force: true, signal: expect.any(AbortSignal) });
+    rendered.update({ record: structuredClone(value), onPeopleChanged: vi.fn() });
+    rendered.update({}, capabilities());
+    expect(screen.getByText(/Directory lookup is unavailable/)).toBeVisible();
+    rendered.update({}, capabilitiesWithDirectory());
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(changed).not.toHaveBeenCalled();
+  });
+
+  it("refreshes expired evidence once, retains last known names after a saved failure and a failed retry", async () => {
+    const value = nativeRecord();
+    const expired = { ...savedPerson, expiresAt: new Date(Date.now() - 1_000).toISOString() };
+    value.people = { owner: expired, createdBy: expired };
+    const failure = { ...resolved(), displayName: "Saved owner", status: "lookup_failed" as const, errorCode: "provider_error" };
+    const lookup = vi.spyOn(api, "resolveAgentPeople")
+      .mockResolvedValueOnce({ people: { owner: failure, createdBy: failure }, changed: true })
+      .mockRejectedValueOnce(new Error("Retry temporarily unavailable."));
+    const rendered = renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Owner")).toHaveTextContent("Saved lookup expired");
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Directory lookup failed. Last known identity shown."));
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(value.id, { signal: expect.any(AbortSignal) });
+    rendered.update({ record: structuredClone(value) });
+    expect(lookup).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "Retry person lookup" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Retry temporarily unavailable.");
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Owner")).toHaveTextContent("Directory lookup failed");
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps legacy resolved snapshots without expiry and does not retry fresh saved names", () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople");
+    const value = nativeRecord();
+    value.people = { owner: savedPerson, createdBy: savedPerson };
+    renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(lookup).not.toHaveBeenCalled();
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(screen.queryByRole("button", { name: "Retry person lookup" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the original name observation separate from a later failed lookup attempt", () => {
+    const value = nativeRecord();
+    const person = {
+      ...savedPerson, status: "lookup_failed" as const, checkedAt: "2026-09-19T12:00:00Z",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    value.people = { owner: person, createdBy: person };
+    const lookup = vi.spyOn(api, "resolveAgentPeople");
+    renderDetail({ record: value });
+    expect(field("Owner")).toHaveTextContent("Saved owner");
+    expect(field("Owner")).toHaveTextContent("Saved directory: Sep 17, 2026");
+    expect(field("Owner")).toHaveTextContent("Last lookup attempt: Sep 19, 2026");
+    expect(field("Owner")).toHaveTextContent("Directory lookup failed. Last known identity shown.");
+    expect(field("Owner")).not.toHaveTextContent("deleted");
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("refreshes newly expired persisted evidence without forcing and does not reuse the old record's expiry", async () => {
+    const now = Date.now();
+    const value = nativeRecord();
+    const original = { ...savedPerson, expiresAt: new Date(now + 1_000).toISOString() };
+    value.people = { owner: original };
+    const refreshed = { ...resolved(), expiresAt: new Date(now + 10_000).toISOString() };
+    const lookup = vi.spyOn(api, "resolveAgentPeople")
+      .mockResolvedValueOnce({ people: { owner: refreshed, createdBy: refreshed }, changed: true })
+      .mockResolvedValueOnce({ people: { owner: { ...refreshed, expiresAt: new Date(now + 30_000).toISOString() },
+        createdBy: { ...refreshed, expiresAt: new Date(now + 30_000).toISOString() } }, changed: true });
+    const rendered = renderDetail({ record: value }, capabilitiesWithDirectory());
+    await waitFor(() => expect(field("Created by")).toHaveTextContent("Directory person"));
+    vi.spyOn(Date, "now").mockReturnValue(now + 2_000);
+    rendered.update({}, capabilitiesWithDirectory());
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(field("Owner")).not.toHaveTextContent("expired");
+    vi.mocked(Date.now).mockReturnValue(now + 11_000);
+    rendered.update({}, capabilitiesWithDirectory());
+    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(2));
+    expect(lookup).toHaveBeenLastCalledWith(value.id, { signal: expect.any(AbortSignal) });
+    await waitFor(() => expect(field("Owner")).not.toHaveTextContent("expired"));
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the latest change callback without restarting an in-flight request on rerender", async () => {
+    type Response = Awaited<ReturnType<typeof api.resolveAgentPeople>>;
+    let finish!: (value: Response) => void;
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockReturnValue(new Promise(done => { finish = done; }));
+    const previous = vi.fn();
+    const current = vi.fn();
+    const rendered = renderDetail({ record: nativeRecord(), onPeopleChanged: previous }, capabilitiesWithDirectory());
+    rendered.update({ onPeopleChanged: current });
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    await act(async () => finish({ people: { owner: resolved(), createdBy: resolved() }, changed: true }));
+    expect(current).toHaveBeenCalledOnce();
+    expect(previous).not.toHaveBeenCalled();
+  });
+
+  it("never guesses a name for an invalid identifier or an exact user not found in the directory", async () => {
+    const value = nativeRecord();
+    value.powerPlatformResource!.details.ownerId = "source-specific-owner";
+    vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({
+      people: { createdBy: { ...resolved(), displayName: null, userPrincipalName: null, status: "not_found" } }, changed: true,
+    });
+    renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(field("Owner")).toHaveTextContent("not a resolvable Entra user ID");
+    await waitFor(() => expect(field("Created by")).toHaveTextContent("User not found"));
+    expect(field("Created by")).toHaveTextContent(ownerId);
+  });
+
+  it("retains persisted results when live permission is lost, but hides them when the app role is lost", async () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({
+      people: { owner: resolved(), createdBy: resolved() }, changed: true,
+    });
+    const rendered = renderDetail({ record: nativeRecord() });
+    expect(lookup).not.toHaveBeenCalled();
+    expect(screen.getByText(/unverified people are shown by ID/)).toBeVisible();
+    expect(field("Owner")).toHaveTextContent("Unverified directory identity.");
+    rendered.update({}, capabilitiesWithDirectory());
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Directory person"));
+    rendered.update({}, capabilities());
+    expect(field("Owner")).toHaveTextContent("Directory person");
+    expect(field("Owner")).toHaveTextContent(ownerId.toUpperCase());
+    expect(lookup).toHaveBeenCalledTimes(1);
+    rendered.update({ roles: [] }, capabilitiesWithDirectory());
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(field("Owner")).not.toHaveTextContent("Directory person");
+  });
+
+  it("rejects mismatched saved and live identities rather than attaching another user's name", async () => {
+    const value = nativeRecord();
+    value.people = { owner: { ...savedPerson, objectId: creatorId, displayName: "Wrong saved person" } };
+    vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({
+      people: { owner: resolved(creatorId, "Wrong live person") }, changed: true,
+    });
+    renderDetail({ record: value }, capabilitiesWithDirectory());
+    expect(await screen.findByRole("alert")).toHaveTextContent("requested agent's person identities");
+    expect(screen.queryByText(/Wrong .* person/)).not.toBeInTheDocument();
+    expect(field("Created by")).toHaveTextContent(ownerId);
+  });
+
+  it("ignores an aborted A-to-B-to-A response even if its transport completes after the new read", async () => {
+    type Response = Awaited<ReturnType<typeof api.resolveAgentPeople>>;
+    let finish!: (value: Response) => void;
+    const lookup = vi.spyOn(api, "resolveAgentPeople")
+      .mockReturnValueOnce(new Promise(done => { finish = done; }))
+      .mockResolvedValueOnce({ people: { owner: resolved(creatorId, "Person B"), createdBy: resolved(creatorId, "Person B") }, changed: true })
+      .mockResolvedValueOnce({ people: { owner: resolved(ownerId, "Current A"), createdBy: resolved(ownerId, "Current A") }, changed: true });
+    const original = nativeRecord();
+    const rendered = renderDetail({ record: original }, capabilitiesWithDirectory());
+    const second = nativeRecord();
+    second.powerPlatformResource!.createdBy = creatorId;
+    second.powerPlatformResource!.details.ownerId = creatorId;
+    rendered.update({ record: second });
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Person B"));
+    rendered.update({ record: original });
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Current A"));
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await act(async () => finish({ people: { owner: resolved(ownerId, "Obsolete A") }, changed: true }));
+    expect(field("Owner")).toHaveTextContent("Current A");
+    expect(screen.queryByText("Obsolete A")).not.toBeInTheDocument();
+  });
+
+  it("aborts a pending lookup on permission loss and never announces its late persisted change", async () => {
+    type Response = Awaited<ReturnType<typeof api.resolveAgentPeople>>;
+    let finish!: (value: Response) => void;
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockReturnValue(new Promise(done => { finish = done; }));
+    const changed = vi.fn();
+    const rendered = renderDetail({ record: nativeRecord(), onPeopleChanged: changed }, capabilitiesWithDirectory());
+    rendered.update({}, capabilities());
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await act(async () => finish({ people: { owner: resolved(), createdBy: resolved() }, changed: true }));
+    expect(field("Owner")).not.toHaveTextContent("Directory person");
+    expect(changed).not.toHaveBeenCalled();
+    expect(screen.getByText(/Directory lookup is unavailable/)).toBeVisible();
+  });
+
+  it("discards a previous account's late response even when the record, tenant and app roles match", async () => {
+    type Response = Awaited<ReturnType<typeof api.resolveAgentPeople>>;
+    let finish!: (value: Response) => void;
+    const lookup = vi.spyOn(api, "resolveAgentPeople")
+      .mockReturnValueOnce(new Promise(done => { finish = done; }))
+      .mockResolvedValueOnce({ people: { owner: resolved(ownerId, "Current account person") }, changed: false });
+    const changed = vi.fn();
+    const rendered = renderDetail({ record: nativeRecord(), onPeopleChanged: changed }, capabilitiesWithDirectory());
+    rendered.update({}, capabilitiesWithDirectory(), { ...user, homeAccountId: "second-account" });
+    await waitFor(() => expect(field("Owner")).toHaveTextContent("Current account person"));
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await act(async () => finish({ people: { owner: resolved(ownerId, "Previous account person") }, changed: true }));
+    expect(field("Owner")).toHaveTextContent("Current account person");
+    expect(screen.queryByText("Previous account person")).not.toBeInTheDocument();
+    expect(changed).not.toHaveBeenCalled();
+  });
+});
 
 async function submitInlineAccess(item: CopilotPackage, target: PackageAccessTarget) {
   const versions = screen.queryByRole("combobox", { name: "Published version details" });
@@ -531,6 +836,18 @@ describe("UnifiedAgentDetailModal", () => {
   });
 
   it.each([
+    { availableTo: "all", isBlocked: false, expected: "All users" },
+    { availableTo: "some", isBlocked: false, expected: "Specific users or groups" },
+    { availableTo: "all", isBlocked: true, expected: "Not available" },
+    { availableTo: "none", isBlocked: false, expected: "Not available" },
+    { availableTo: "unknown", isBlocked: false, expected: "Unknown" },
+  ])("keeps detail end-user access consistent with the repository list ($availableTo, blocked=$isBlocked)", ({ availableTo, isBlocked, expected }) => {
+    const item = { ...record.packages[0], availableTo, isBlocked };
+    renderDetail({ record: { ...record, packages: [item] }, packageDetail: item });
+    expect(screen.getByText("End-user access", { selector: ".agent-overview-facts span" }).parentElement).toHaveTextContent(expected);
+  });
+
+  it.each([
     { deployedTo: undefined, expected: "Partially known" },
     { deployedTo: "unknownFutureValue", expected: "Partially known" },
     { deployedTo: "none", expected: "No users" },
@@ -820,7 +1137,7 @@ describe("UnifiedAgentDetailModal", () => {
     };
     const { props, update } = renderDetail({ record: current, activeTab: "reports" });
     const usage = await screen.findByRole("region", { name: "Usage and users for Researcher" });
-    expect(within(usage).getByRole("heading", { name: "No verified usage data for this agent" })).toBeVisible();
+    expect(within(usage).getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
     expect(within(usage).getByText(/Its response totals, active users, and last-used date are unavailable/)).toHaveTextContent("Researcher");
     expect(within(usage).getByText(/Missing usage data does not mean zero usage/)).toBeVisible();
     expect(screen.queryByRole("region", { name: "Users of the reported agent" })).not.toBeInTheDocument();
@@ -857,7 +1174,7 @@ describe("UnifiedAgentDetailModal", () => {
     const { update } = renderDetail({ record: first, activeTab: "reports" });
     expect(await screen.findByRole("region", { name: "Usage and users for Researcher" })).toBeVisible();
     update({ record: { ...first, id: "different-agent" } });
-    expect(screen.getByRole("heading", { name: "No verified usage data for this agent" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
     update({ record: { ...first, id: "different-agent", displayName: "Different agent" } });
     expect(screen.getByRole("region", { name: "Usage and users for Different agent" })).toBeVisible();
     expect(screen.queryByText("Researcher")).not.toBeInTheDocument();
@@ -865,6 +1182,31 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
     expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+  });
+
+  it("shows automatically matched report identities in the modal without setup, candidates or writes", () => {
+    const candidates = vi.spyOn(api, "getAgentUsageCandidates");
+    const associate = vi.spyOn(api, "associateAgentUsage");
+    const remove = vi.spyOn(api, "removeAgentUsageAssociation");
+    const { update } = renderDetail({
+      activeTab: "reports", usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64), onUsageChanged: vi.fn(),
+      record: {
+        ...record, displayName: "Excel", packages: [{ ...record.packages[0], id: automaticUsagePackageId, displayName: "Excel" }],
+        usage: automaticAgentUsageFixture(),
+      },
+    });
+    const usage = screen.getByRole("region", { name: "Usage and users for Excel" });
+    expect(within(usage).getByLabelText("Selected agent report metrics")).toHaveTextContent("181");
+    expect(within(usage).getByText(automaticUsageReportName)).toBeVisible();
+    expect(within(usage).getByText(/Automatically matched: exact report Agent ID/)).toBeVisible();
+    expect(within(usage).queryByRole("button")).not.toBeInTheDocument();
+    expect(candidates).not.toHaveBeenCalled();
+    expect(associate).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    update({ usageContext: { ...automaticUsageContext, reportSet: { ...automaticUsageContext.reportSet!, id: "other-snapshot" } } });
+    expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
+    expect(screen.getByText(/saved usage belongs to a different report snapshot/)).toBeVisible();
   });
 
   it("resets panel scroll when switching tasks", () => {
@@ -924,7 +1266,7 @@ describe("UnifiedAgentDetailModal", () => {
     const diagnostic = screen.getByText("Invalid saved matching metadata.");
     expect(diagnostic).toBeVisible();
     expect(diagnostic.parentElement).toHaveTextContent("Select this agent on Agents");
-    expect(diagnostic.parentElement).toHaveTextContent("Sync > Advanced results");
+    expect(diagnostic.parentElement).toHaveTextContent("Sync > View diagnostics");
     expect(diagnostic.parentElement).toHaveTextContent("Refresh matching details");
     expect(screen.getByRole("button", { name: /^Available to/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: /^Installed for/ })).toBeEnabled();

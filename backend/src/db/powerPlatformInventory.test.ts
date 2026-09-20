@@ -49,6 +49,35 @@ async function submitAndRun(idempotencyKey: string, roleScope: "full" | "ai" | "
 }
 
 describe.sequential("Power Platform inventory repository", () => {
+  it("projects recognized authoring metadata from an existing saved row without changing its raw evidence", async () => {
+    const legacyFixture = await testDatabase();
+    const legacyRepository = new PowerPlatformInventoryRepository(legacyFixture.runtime);
+    try {
+      const owner = { tenantId: "legacy-authoring", principalId: "reader" };
+      const job = await legacyRepository.submit(owner, {
+        idempotencyKey: "legacy-lite", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
+      });
+      await legacyRepository.markRunning(owner, job.id);
+      const saved = await legacyRepository.publish(owner, job.id, {
+        ...queryScope(["microsoft.copilotstudio/agents"]), totalRecords: 1, pages: 1, unknownFieldCount: 0,
+        resources: [resource("legacy-lite", {
+          tenantId: owner.tenantId, authoringTool: null, details: { createdIn: "Copilot Studio Lite" },
+          provenance: { authoringTool: { sourceSystem: "power_platform", path: "not_supplied", maturity: "ga" } },
+        })],
+      });
+      const page = await legacyRepository.list(owner);
+      expect(page.value[0]).toMatchObject({
+        authoringTool: "Microsoft 365 Copilot Agent Builder", details: { createdIn: "Copilot Studio Lite" },
+        provenance: { authoringTool: { path: "properties.createdIn" } },
+      });
+      expect((await legacyRepository.readUnifiedSource(owner)).resources[0].authoringTool).toBe("Microsoft 365 Copilot Agent Builder");
+      expect((await legacyFixture.runtime.query("SELECT authoring_tool,details->>'createdIn' AS raw FROM power_platform_inventory_resources WHERE snapshot_id=$1", [saved.snapshotId])).rows)
+        .toEqual([{ authoring_tool: null, raw: "Copilot Studio Lite" }]);
+    } finally {
+      await legacyFixture.close();
+    }
+  });
+
   it("joins saved environment names across current snapshots without crossing owner or expiry boundaries", async () => {
     const environmentFixture = await testDatabase();
     const environmentRepository = new PowerPlatformInventoryRepository(environmentFixture.runtime);

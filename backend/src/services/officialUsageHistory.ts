@@ -161,7 +161,7 @@ export function validateOfficialUsageHistoryOptions(options: OfficialUsageHistor
   return { limit, offset };
 }
 
-const retainedSetIntegritySql = `(SELECT count(*) FROM official_usage_set_versions candidate
+export const retainedSetIntegritySql = `(SELECT count(*) FROM official_usage_set_versions candidate
       WHERE candidate.set_id=report_set.id AND candidate.tenant_id=report_set.tenant_id)=3
     AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions candidate
       JOIN official_usage_versions candidate_version ON candidate_version.id=candidate.version_id

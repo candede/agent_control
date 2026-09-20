@@ -9,7 +9,8 @@ import { pool } from "../db/pool.js";
 import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
 import { AppError } from "../errors.js";
 import type {
-  AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext, AgentUsageSummary,
+  AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage,
+  AgentUsageContext, AgentUsageSummary,
 } from "../types/agentUsage.js";
 import type { AuditActor, AgentUsageAuditAction } from "../types/audit.js";
 import type { AgentUsageRow, OfficialUsageAvailability, PublishedOfficialUsage } from "../types/officialUsage.js";
@@ -160,7 +161,7 @@ export function buildAgentUsageContext(scope: AgentUsageScope, snapshot: AgentUs
   const reportSet = published.activeSet;
   const lineages = (["agents", "userAgents", "users"] as const).flatMap(kind => published.reports[kind]?.lineage ?? []);
   const availability = usageAvailability(published, staleAfterDays, snapshot.now);
-  const revision = hash(["agent-usage-v1", scope.tenantId, published.activeRevision, snapshot.associationRevision,
+  const revision = hash(["agent-usage-v2", scope.tenantId, published.activeRevision, snapshot.associationRevision,
     reportSet, lineages, availability, snapshot.expiresAt?.toISOString() ?? null,
     snapshot.associations.map(value => [value.report_agent_id, agentUsageSourceKey(value), value.reviewed_at.toISOString()])]);
   return { reportSet, lineages, availability, revision, expiresAt: snapshot.expiresAt?.toISOString() ?? null };
@@ -180,6 +181,7 @@ export function buildAgentUsageProjection(scope: AgentUsageScope, records: reado
   const recordsById = new Map(records.map(record => [record.id, record]));
   const packagesByRecord = new Map(records.map(record => [record.id, new Set(record.packages.map(value => value.id))]));
   const recordsBySource = new Map<string, string>();
+  const recordsByPackage = new Map<string, string>();
   for (const source of sources) {
     if (source.expires_at <= snapshot.now) continue;
     const record = recordsById.get(`agent:${source.agent_id}`);
@@ -192,9 +194,41 @@ export function buildAgentUsageProjection(scope: AgentUsageScope, records: reado
         && record.powerPlatformResource.nativeId === source.native_id
         && (record.powerPlatformResource.environmentId ?? "") === source.environment_id
         && record.observations.powerPlatform?.snapshotId === source.power_platform_snapshot_id;
-    if (belongs) recordsBySource.set(agentUsageSourceKey(source), record.id);
+    if (!belongs) continue;
+    const key = agentUsageSourceKey(source);
+    if (recordsBySource.has(key) && recordsBySource.get(key) !== record.id
+      || source.source === "graph_packages" && recordsByPackage.has(source.native_id)
+        && recordsByPackage.get(source.native_id) !== record.id) {
+      throw new AppError(409, "agent_usage_integrity", "A saved source identity belongs to multiple agents. Refresh inventory before attributing usage.");
+    }
+    recordsBySource.set(key, record.id);
+    if (source.source === "graph_packages") recordsByPackage.set(source.native_id, record.id);
   }
   const reportAgents = new Map(reports.agents!.rows.map(value => [value.agentId, value]));
+  const matches: Array<{ recordId: string; association: AgentUsageAssociation }> = [];
+  const reviewed = new Set<string>();
+  for (const association of snapshot.associations) {
+    if (reviewed.has(association.report_agent_id)) continue;
+    reviewed.add(association.report_agent_id);
+    const recordId = recordsBySource.get(agentUsageSourceKey(association));
+    if (!recordId) continue;
+    const report = reportAgents.get(association.report_agent_id);
+    if (!report) throw new AppError(409, "agent_usage_integrity", "A reviewed association no longer has its immutable Agents export evidence.");
+    matches.push({ recordId, association: {
+      reportAgentId: report.agentId, reportAgentName: report.agentName, target: agentUsageTarget(association),
+      basis: "admin_reviewed", reviewedAt: association.reviewed_at.toISOString(),
+    } });
+  }
+  for (const report of reportAgents.values()) {
+    // Explicit reviewed mappings remain overrides; automatic matches never reassign them.
+    if (reviewed.has(report.agentId)) continue;
+    const recordId = recordsByPackage.get(report.agentId);
+    if (!recordId) continue;
+    matches.push({ recordId, association: {
+      reportAgentId: report.agentId, reportAgentName: report.agentName,
+      target: { source: "graph_packages", packageId: report.agentId }, basis: "exact_package_id",
+    } });
+  }
   const bridge = new Map<string, Set<string>>();
   for (const row of reports.userAgents?.rows ?? []) {
     const users = bridge.get(row.agentId) ?? new Set<string>();
@@ -203,23 +237,14 @@ export function buildAgentUsageProjection(scope: AgentUsageScope, records: reado
   }
   const usersByRecord = new Map<string, Set<string>>();
   const unknownUsers = new Set<string>();
-  const seen = new Set<string>();
-  for (const association of snapshot.associations) {
-    if (seen.has(association.report_agent_id)) continue;
-    seen.add(association.report_agent_id);
-    const recordId = recordsBySource.get(agentUsageSourceKey(association));
-    if (!recordId) continue;
-    const report = reportAgents.get(association.report_agent_id);
-    if (!report) throw new AppError(409, "agent_usage_integrity", "A reviewed association no longer has its immutable Agents export evidence.");
+  for (const { recordId, association } of matches) {
+    const report = reportAgents.get(association.reportAgentId)!;
     const summary = summaries.get(recordId)!;
     summary.status = "linked";
     summary.responses = addResponses(summary.responses ?? 0, report);
     const activity = report.lastActivityDateUtc ?? null;
     if (activity && (!summary.lastActivityDateUtc || activity > summary.lastActivityDateUtc)) summary.lastActivityDateUtc = activity;
-    summary.associations.push({
-      reportAgentId: report.agentId, reportAgentName: report.agentName, target: agentUsageTarget(association),
-      basis: "admin_reviewed", reviewedAt: association.reviewed_at.toISOString(),
-    });
+    summary.associations.push(association);
     const users = usersByRecord.get(recordId) ?? new Set<string>();
     const identities = bridge.get(report.agentId);
     if (!identities) unknownUsers.add(recordId);

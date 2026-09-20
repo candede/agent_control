@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import {
+  automaticDataSyncSourceIds,
   dataSyncSourceIds,
   type DataSyncMode,
   type DataSyncRun,
@@ -123,7 +124,7 @@ export class DataSyncRepository {
       [id, scope.tenantId, scope.principalId, input.mode, JSON.stringify(sources), requestHash, input.clearSavedData ?? false]);
       await client.query(`INSERT INTO data_sync_run_sources(
           run_id,tenant_id,principal_id,source_id,status,count,last_success_at,message,can_retry)
-        SELECT $1,$2,$3,requested.source_id,'queued',marker.count,marker.last_success_at,
+        SELECT $1,$2,$3,requested.source_id,'queued',NULL,marker.last_success_at,
           'Waiting for the durable sync worker.',false
         FROM jsonb_array_elements_text($4::jsonb) AS requested(source_id)
         LEFT JOIN data_sync_success_markers marker
@@ -290,7 +291,9 @@ export class DataSyncRepository {
         tenant_id,principal_id,source_id,count,last_success_at)
       VALUES($1,$2,$3,$4,$5)
       ON CONFLICT (tenant_id,principal_id,source_id) DO UPDATE SET
-        count=EXCLUDED.count,last_success_at=EXCLUDED.last_success_at,updated_at=clock_timestamp()`,
+        count=EXCLUDED.count,last_success_at=EXCLUDED.last_success_at,updated_at=clock_timestamp()
+      WHERE data_sync_success_markers.count IS DISTINCT FROM EXCLUDED.count
+        OR data_sync_success_markers.last_success_at IS DISTINCT FROM EXCLUDED.last_success_at`,
     [scope.tenantId, scope.principalId, sourceId, count, lastSuccessAt]);
   }
 
@@ -315,7 +318,7 @@ export class DataSyncRepository {
         throw new AppError(409, "data_sync_source_complete", "Only incomplete data sync sources can be retried.");
       }
       const reset = await client.query(`UPDATE data_sync_run_sources SET
-          status='queued',job_id=NULL,attempt=attempt+1,updated_at=clock_timestamp(),
+          status='queued',job_id=NULL,count=NULL,attempt=attempt+1,updated_at=clock_timestamp(),
           message='Waiting for the durable sync worker.',can_retry=false
         WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND source_id=ANY($4::text[])
           AND attempt<20`, [id, scope.tenantId, scope.principalId, selected]);
@@ -420,20 +423,30 @@ export class DataSyncRepository {
     directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
     appActivity: SavedCopilotUsageSource<CopilotReportResult>;
   }> {
+    const values = await this.readUserSources(scope, ["directory", "app_activity"], this.database);
+    return {
+      directory: projectSavedSource<CopilotDirectoryUser[]>("directory", values.get("directory")),
+      appActivity: projectSavedSource<CopilotReportResult>("app_activity", values.get("app_activity")),
+    };
+  }
+
+  async getDirectorySource(scope: DataSyncScope, database: Pick<pg.Pool, "query"> = this.database) {
+    const values = await this.readUserSources(scope, ["directory"], database);
+    return projectSavedSource<CopilotDirectoryUser[]>("directory", values.get("directory"));
+  }
+
+  private async readUserSources(scope: DataSyncScope, sources: readonly CopilotUsageSnapshotSource[], database: Pick<pg.Pool, "query">) {
     validateScope(scope);
-    const result = await this.database.query<SavedSourceRow>(`SELECT state.source_id,state.attempt_status,state.message,
+    const result = await database.query<SavedSourceRow>(`SELECT state.source_id,state.attempt_status,state.message,
         state.attempted_at,state.last_success_at,state.row_count,snapshot.observed_at,snapshot.snapshot_data
       FROM copilot_usage_source_state state
       LEFT JOIN copilot_usage_snapshots snapshot
         ON snapshot.id=state.current_snapshot_id AND snapshot.tenant_id=state.tenant_id
         AND snapshot.principal_id=state.principal_id AND snapshot.source_id=state.source_id
         AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-      WHERE state.tenant_id=$1 AND state.principal_id=$2`, [scope.tenantId, scope.principalId]);
-    const values = new Map(result.rows.map(row => [row.source_id, row]));
-    return {
-      directory: projectSavedSource<CopilotDirectoryUser[]>("directory", values.get("directory")),
-      appActivity: projectSavedSource<CopilotReportResult>("app_activity", values.get("app_activity")),
-    };
+      WHERE state.tenant_id=$1 AND state.principal_id=$2 AND state.source_id=ANY($3::text[])`,
+    [scope.tenantId, scope.principalId, sources]);
+    return new Map(result.rows.map(row => [row.source_id, row]));
   }
 
   private async publishUserSource(
@@ -477,12 +490,11 @@ export class DataSyncRepository {
 
 function normalizeSources(mode: DataSyncMode, requested: readonly DataSyncSourceId[] | undefined) {
   if (!["initial", "incremental", "full"].includes(mode)) throw new AppError(400, "invalid_data_sync_mode", "Data sync mode is invalid.");
-  const sourceSet = new Set(requested ?? dataSyncSourceIds);
-  if (requested && (!Array.isArray(requested) || requested.length < 1 || requested.length > dataSyncSourceIds.length || sourceSet.size !== requested.length)) {
+  if (requested !== undefined && (!Array.isArray(requested) || requested.length < 1 || requested.length > dataSyncSourceIds.length || new Set(requested).size !== requested.length)) {
     throw new AppError(400, "invalid_data_sync_sources", "Data sync sources must be a non-empty list without duplicates.");
   }
+  const sourceSet = new Set<DataSyncSourceId>(requested ?? automaticDataSyncSourceIds);
   if ([...sourceSet].some(source => !dataSyncSourceIds.includes(source))) throw new AppError(400, "invalid_data_sync_sources", "Data sync source is invalid.");
-  if (mode === "initial" || mode === "full") sourceSet.add("usage_reports");
   return dataSyncSourceIds.filter(source => sourceSet.has(source));
 }
 
@@ -577,7 +589,7 @@ async function lockScope(client: pg.PoolClient, scope: DataSyncScope) {
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
 }
 
-async function requireUserPublication(client: pg.PoolClient, scope: DataSyncScope, publication: UserSourcePublication) {
+export async function requireUserPublication(client: pg.PoolClient, scope: DataSyncScope, publication: UserSourcePublication) {
   const current = await client.query(`SELECT 1 FROM data_sync_runs run
     JOIN data_sync_run_sources source ON source.run_id=run.id
       AND source.tenant_id=run.tenant_id AND source.principal_id=run.principal_id

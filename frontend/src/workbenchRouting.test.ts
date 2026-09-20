@@ -21,6 +21,13 @@ import {
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it.each(["available", "unavailable", "availability_unknown"] as const)("round trips the %s end-user access filter", agentView => {
+    const state = { ...parseAgentRoute(""), agentView };
+    const query = agentRouteSearch(state);
+    expect(query.get("show")).toBe(agentView);
+    expect(parseAgentRoute(query.toString()).agentView).toBe(agentView);
+  });
+
   it("maps every canonical deep link without a query-string view alias", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
     expect(parseWorkbenchView("/power-platform/")).toBe("power-platform");
@@ -294,16 +301,26 @@ describe("workbench routing", () => {
     const reportSetId = "11111111-1111-4111-8111-111111111111";
     const historical = parseOfficialUsageRoute(`snapshot=${reportSetId}`);
     expect(historical).toEqual({
+      view: "snapshot",
       stagingId: undefined,
       reportSetId,
       activityWindowDays: 365,
     });
     expect(officialUsageRouteSearch(historical).toString()).toBe(`snapshot=${reportSetId}`);
     expect(parseOfficialUsageRoute("")).toEqual({
+      view: "overview",
       stagingId: undefined,
       reportSetId: undefined,
       activityWindowDays: 30,
     });
+  });
+
+  it("keeps cumulative, explicit snapshot, history and legacy window routes distinct", () => {
+    expect(officialUsageRouteSearch(parseOfficialUsageRoute("")).toString()).toBe("");
+    expect(officialUsageRouteSearch(parseOfficialUsageRoute("view=snapshot")).toString()).toBe("view=snapshot");
+    expect(officialUsageRouteSearch(parseOfficialUsageRoute("view=history")).toString()).toBe("view=history");
+    expect(parseOfficialUsageRoute("window=90")).toMatchObject({ view: "snapshot", activityWindowDays: 90 });
+    expect(officialUsageRouteSearch(parseOfficialUsageRoute("window=90")).toString()).toBe("window=90");
   });
 
   it("carries an exact employee identity into an explicit Purview search", () => {

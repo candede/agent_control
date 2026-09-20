@@ -18,6 +18,12 @@ export const workbenchRouter = Router();
 const packageRepository = new PackageInventoryRepository();
 const inventoryRepository = new PowerPlatformInventoryRepository();
 const officialUsageRepository = new OfficialUsageRepository();
+const syncSourceLabels = {
+  users: "Users",
+  graph_packages: "Graph packages",
+  power_platform: "Power Platform",
+  usage_reports: "Usage reports",
+};
 
 export function dataSyncJobSummary(run: DataSyncRun): WorkbenchJobSummary {
   const completed = run.sources.filter(source => source.status === "succeeded").length;
@@ -25,7 +31,7 @@ export function dataSyncJobSummary(run: DataSyncRun): WorkbenchJobSummary {
     id: run.id,
     source: "data-sync",
     label: run.mode === "initial" ? "Initial data sync" : run.mode === "full" ? "Full data resync" : "Data sync",
-    target: `${run.sources.length} source${run.sources.length === 1 ? "" : "s"}`,
+    target: run.sources.map(source => syncSourceLabels[source.source]).join(", "),
     status: run.status,
     total: run.sources.length,
     completed,
@@ -34,8 +40,45 @@ export function dataSyncJobSummary(run: DataSyncRun): WorkbenchJobSummary {
     canCancel: !["completed", "cancelled"].includes(run.status)
       && run.sources.some(source => ["queued", "running", "waiting_authorization", "awaiting_upload"].includes(source.status)),
     canReconcile: false,
+    startedAt: run.startedAt,
+    ...(run.completedAt ? { completedAt: run.completedAt } : {}),
+    syncSources: run.sources.map(source => source.source),
     updatedAt: run.updatedAt,
     href: `/sync?syncRun=${encodeURIComponent(run.id)}`,
+  };
+}
+
+export function packageRefreshJobSummary(
+  job: Awaited<ReturnType<PackageInventoryRepository["listJobs"]>>["value"][number],
+): WorkbenchJobSummary {
+  return {
+    id: job.id, source: "package-refresh", label: "Package inventory refresh",
+    target: job.scopeKind === "exact" ? `${job.requestedIds.length} exact Graph package target${job.requestedIds.length === 1 ? "" : "s"}` : "Current principal Graph package catalog",
+    status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
+    canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
+    ...sourceJobDates(job),
+    updatedAt: job.updatedAt,
+    href: `/sync?refreshJob=${encodeURIComponent(job.id)}${job.tokenMode === "application" ? "&mode=application" : ""}`,
+  };
+}
+
+export function powerPlatformJobSummary(
+  job: Awaited<ReturnType<PowerPlatformInventoryRepository["listJobs"]>>["value"][number],
+): WorkbenchJobSummary {
+  return {
+    id: job.id, source: "power-platform", label: "Power Platform inventory refresh",
+    target: `${job.requestedTypes.length} allowlisted resource type${job.requestedTypes.length === 1 ? "" : "s"}${job.environmentScope ? " in one exact environment" : ""}`,
+    status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
+    canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
+    ...sourceJobDates(job),
+    updatedAt: job.updatedAt, href: `/power-platform?refreshJob=${encodeURIComponent(job.id)}`,
+  };
+}
+
+function sourceJobDates(job: { attemptedAt: string | null; finishedAt: string | null }) {
+  return {
+    ...(job.attemptedAt ? { startedAt: job.attemptedAt } : {}),
+    ...(job.finishedAt ? { completedAt: job.finishedAt } : {}),
   };
 }
 
@@ -57,23 +100,10 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
   const loaders: Array<{ source: WorkbenchJobSource; load: () => Promise<WorkbenchJobSummary[]> }> = [];
   loaders.push({ source: "data-sync", load: async () => (await dataSync.listRuns(scope, 20)).map(dataSyncJobSummary) });
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {
-    loaders.push({ source: "package-refresh", load: async () => (await packageRepository.listJobs(scope, user.homeAccountId, 20)).value.map(job => ({
-      id: job.id, source: "package-refresh", label: "Package inventory refresh",
-      target: job.scopeKind === "exact" ? `${job.requestedIds.length} exact Graph package target${job.requestedIds.length === 1 ? "" : "s"}` : "Current principal Graph package catalog",
-      status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
-      canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
-      updatedAt: job.updatedAt,
-      href: `/sync?refreshJob=${encodeURIComponent(job.id)}${job.tokenMode === "application" ? "&mode=application" : ""}` as const,
-    })) });
+    loaders.push({ source: "package-refresh", load: async () => (await packageRepository.listJobs(scope, user.homeAccountId, 20)).value.map(packageRefreshJobSummary) });
   }
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {
-    loaders.push({ source: "power-platform", load: async () => (await inventoryRepository.listJobs(scope, 20)).value.map(job => ({
-      id: job.id, source: "power-platform", label: "Power Platform inventory refresh",
-      target: `${job.requestedTypes.length} allowlisted resource type${job.requestedTypes.length === 1 ? "" : "s"}${job.environmentScope ? " in one exact environment" : ""}`,
-      status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
-      canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
-      updatedAt: job.updatedAt, href: `/power-platform?refreshJob=${encodeURIComponent(job.id)}` as const,
-    })) });
+    loaders.push({ source: "power-platform", load: async () => (await inventoryRepository.listJobs(scope, 20)).value.map(powerPlatformJobSummary) });
   }
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {
     loaders.push({ source: "package-controls", load: async () => (await bulkJobs.list(scope, 20)).value.map(job => ({

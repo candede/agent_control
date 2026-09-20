@@ -120,6 +120,22 @@ export type PowerPlatformResource = {
   unknownFieldCount: number;
 };
 
+export function derivePowerPlatformAuthoringTool(type: PowerPlatformResourceType, createdIn?: string | null): string | null {
+  if (type === "microsoft.copilotstudio/agents") {
+    const normalized = createdIn?.toLowerCase().replace(/[^a-z0-9]/g, "");
+    return normalized === "copilotstudio" ? "Copilot Studio"
+      : normalized === "copilotstudiolite" || normalized === "microsoft365copilotagentbuilder"
+        ? "Microsoft 365 Copilot Agent Builder" : null;
+  }
+  if (type.startsWith("microsoft.powerapps/")) return "Power Apps";
+  if (type === "microsoft.powerautomate/cloudflows" || type === "microsoft.powerautomate/agentflows") return "Power Automate";
+  return null;
+}
+
+export function powerPlatformAuthoringTool(resource: Pick<PowerPlatformResource, "type" | "authoringTool" | "details">): string | null {
+  return resource.authoringTool?.trim() || derivePowerPlatformAuthoringTool(resource.type, resource.details.createdIn);
+}
+
 export type ResourceQueryResult = {
   resources: PowerPlatformResource[];
   queriedTypes: PowerPlatformResourceType[];

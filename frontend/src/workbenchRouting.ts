@@ -83,6 +83,7 @@ export type SecurityRouteState = {
 };
 
 export type OfficialUsageRouteState = {
+  view?: "overview" | "snapshot" | "history";
   stagingId?: string;
   reportSetId?: string;
   activityWindowDays: number;
@@ -395,7 +396,10 @@ export function parseOfficialUsageRoute(search: string): OfficialUsageRouteState
   const params = new URLSearchParams(search);
   const reportSetId = bounded(params.get("snapshot"), 512);
   const activityWindowDays = Number(params.get("window"));
+  const requestedView = params.get("view");
   return {
+    view: requestedView === "history" ? "history" : requestedView === "snapshot" || reportSetId
+      || Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365 ? "snapshot" : "overview",
     stagingId: bounded(params.get("staging"), 512),
     reportSetId,
     activityWindowDays: Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365
@@ -409,6 +413,8 @@ export function officialUsageRouteSearch(state: OfficialUsageRouteState) {
   if (state.stagingId && validSelectedId(state.stagingId)) params.set("staging", state.stagingId);
   if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);
   const defaultWindowDays = state.reportSetId ? 365 : 30;
+  if (state.view === "history") params.set("view", "history");
+  else if (state.view === "snapshot" && !state.reportSetId && state.activityWindowDays === defaultWindowDays) params.set("view", "snapshot");
   if (state.activityWindowDays !== defaultWindowDays) params.set("window", String(Math.min(365, Math.max(1, state.activityWindowDays))));
   return params;
 }

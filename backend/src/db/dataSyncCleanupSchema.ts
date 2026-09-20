@@ -52,3 +52,16 @@ CREATE TRIGGER clear_admitted_data_sync_snapshots
   FOR EACH ROW WHEN (NEW.clear_saved_data)
   EXECUTE FUNCTION clear_admitted_data_sync_snapshots();
 `;
+
+export const dataSyncAutomaticSourcesMigrationSql = `
+ALTER TABLE data_sync_runs DROP CONSTRAINT data_sync_cleanup_full_scope;
+ALTER TABLE data_sync_runs ADD CONSTRAINT data_sync_cleanup_full_scope CHECK (
+  NOT clear_saved_data OR (
+    mode='full' AND source_ids @> '["users","graph_packages","power_platform"]'::jsonb
+    AND (
+      jsonb_array_length(source_ids)=3
+      OR (jsonb_array_length(source_ids)=4 AND source_ids @> '["usage_reports"]'::jsonb)
+    )
+  )
+);
+`;

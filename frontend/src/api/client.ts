@@ -3,14 +3,14 @@ import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventoryResourcePage, InventorySnapshot, InventorySnapshotList, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
-import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
 import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
-import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery } from "../../../backend/src/types/unifiedAgents";
+import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
 import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
 export type { AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
 import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
@@ -29,11 +29,12 @@ export type {
   UnifiedAgentPowerPlatformObservation,
   UnifiedAgentSourceFilter,
 } from "../../../backend/src/types/unifiedAgents";
-export type { OfficialUsageAgent, OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+export type { OfficialUsageAgent, OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 export type { CopilotAppActivity, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+export { automaticDataSyncSourceIds } from "../../../backend/src/types/dataSync";
 export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus, QuarantineTargetCandidate, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
 
 export type QuarantineStatusView = {
@@ -848,6 +849,22 @@ export type OfficialUsageAgentQuery = {
   offset?: number;
 };
 
+export type OfficialUsageOverviewQuery = {
+  search?: string;
+  startDate?: string;
+  endDate?: string;
+  sortBy?: "agentName" | "lastActivity";
+  sortDirection?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+};
+
+export function getOfficialUsageOverview(query: OfficialUsageOverviewQuery = {}, options: { signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
+  return request<OfficialUsageOverviewView>(`/api/official-usage/overview${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
+
 export function getOfficialUsageAggregate(
   query: OfficialUsageAgentQuery = {},
   options: { signal?: AbortSignal } = {},
@@ -1095,15 +1112,29 @@ export async function searchDirectoryPrincipals(search: string, limit = 25) {
 
 export async function resolveDirectoryPrincipals(
   principals: PackageAccessEntity[],
+  options: { signal?: AbortSignal } = {},
 ) {
   return request<{ value: DirectoryPrincipal[] }>(
     "/api/directory/principals/resolve",
     {
+      signal: options.signal,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ principals }),
     },
   );
+}
+
+export async function resolveAgentPeople(
+  recordId: string,
+  options: { force?: boolean; signal?: AbortSignal } = {},
+) {
+  return request<{ people: UnifiedAgentRecord["people"]; changed: boolean }>("/api/agent-inventory/people/resolve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ recordId, ...(options.force ? { force: true } : {}) }),
+    signal: options.signal,
+  });
 }
 
 export async function updateAgentAccess(

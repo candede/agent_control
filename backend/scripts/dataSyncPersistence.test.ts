@@ -8,6 +8,53 @@ import { fixturePassword, testDatabase } from "./testDatabase.js";
 const scope = { tenantId: "sync-persistence-tenant", principalId: "sync-reader" };
 
 describe("data sync persistence integration", () => {
+  it("upgrades the clean-full constraint for automatic sources without changing legacy intent or migration checksums", async () => {
+    const fixture = await testDatabase(false);
+    try {
+      await bootstrap(fixture.operator, fixturePassword);
+      await migrate(fixture.operator, migrations.slice(0, -1));
+      await grantRuntime(fixture.operator);
+      const prior = (await fixture.operator.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows;
+      const legacySources = ["users", "graph_packages", "power_platform", "usage_reports"];
+      const legacy = await fixture.operator.query<{ id: string }>(`INSERT INTO data_sync_runs
+        (id,tenant_id,principal_id,mode,source_ids,request_hash,status,completed_at,clear_saved_data)
+        VALUES(gen_random_uuid(),$1,$2,'full',$3::jsonb,repeat('a',64),'completed',clock_timestamp(),true) RETURNING id`,
+      [scope.tenantId, scope.principalId, JSON.stringify(legacySources)]);
+      await fixture.operator.query(`INSERT INTO data_sync_run_sources
+        (run_id,tenant_id,principal_id,source_id,status,count,message,can_retry)
+        SELECT $1,$2,$3,source,'succeeded',0,'Saved a legacy source.',false
+        FROM jsonb_array_elements_text($4::jsonb) source`,
+      [legacy.rows[0].id, scope.tenantId, scope.principalId, JSON.stringify(legacySources)]);
+      const repository = new DataSyncRepository(fixture.runtime);
+      await expect(repository.submit(scope, { mode: "full", clearSavedData: true })).rejects.toMatchObject({
+        code: "23514", constraint: "data_sync_cleanup_full_scope",
+      });
+
+      await migrate(fixture.operator);
+      await verifySchema(fixture.runtime);
+      expect((await fixture.runtime.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows.slice(0, prior.length)).toEqual(prior);
+      expect((await repository.getRun(scope, legacy.rows[0].id))?.sources).toHaveLength(4);
+      const current = await repository.submit(scope, { mode: "full", clearSavedData: true });
+      expect(current.run.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
+      for (const [mode, sources] of [
+        ["full", ["users", "graph_packages"]],
+        ["full", ["users", "graph_packages", "power_platform", "users"]],
+        ["full", ["users", "graph_packages", "power_platform", "unknown"]],
+        ["incremental", ["users", "graph_packages", "power_platform"]],
+      ] as const) {
+        await expect(fixture.runtime.query(`INSERT INTO data_sync_runs
+          (id,tenant_id,principal_id,mode,source_ids,request_hash,clear_saved_data)
+          VALUES(gen_random_uuid(),$1,'invalid-clean-scope',$2,$3::jsonb,repeat('b',64),true)`,
+        [scope.tenantId, mode, JSON.stringify(sources)])).rejects.toMatchObject({
+          code: "23514", constraint: "data_sync_cleanup_full_scope",
+        });
+      }
+      await expect(fixture.runtime.query("DELETE FROM data_sync_success_markers")).rejects.toThrow();
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("upgrades schema 30 without changing prior checksums or administrative audit", async () => {
     const fixture = await testDatabase(false);
     try {
@@ -25,7 +72,7 @@ describe("data sync persistence integration", () => {
       expect((await fixture.runtime.query("SELECT event_id FROM audit_events")).rows).toEqual([{ event_id: "preserved-sync-audit" }]);
       const repository = new DataSyncRepository(fixture.runtime);
       const { run } = await repository.submit(scope, { mode: "initial" });
-      expect(run.sources).toHaveLength(4);
+      expect(run.sources).toHaveLength(3);
       await repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, new Date().toISOString(), "Saved empty activity report.");
       expect((await repository.getUserSources(scope)).appActivity.rowCount).toBe(0);
       for (const table of ["data_sync_runs", "copilot_usage_snapshots", "data_sync_success_markers"]) {

@@ -97,6 +97,19 @@ describe("PowerPlatformResourceQueryClient", () => {
     });
   });
 
+  it.each(["Copilot Studio Lite", "copilotStudioLite", "COPILOT_STUDIO_LITE"])("recognizes %s as Agent Builder without fabricating a name or bot identity", async createdIn => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
+      ...resource, properties: { createdIn },
+    }] }));
+    const parsed = (await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).resources[0];
+    expect(parsed).toMatchObject({
+      authoringTool: "Microsoft 365 Copilot Agent Builder", agentKind: "agent_builder_agent",
+      displayName: null, lifecycle: "unknown", details: { createdIn },
+      provenance: { authoringTool: { sourceSystem: "power_platform", path: "properties.createdIn", maturity: "ga" } },
+    });
+    expect(parsed.identifiers.some(value => value.kind === "cds_bot_id")).toBe(false);
+  });
+
   it("rejects GUID casing aliases across pages but preserves distinct opaque native IDs", async () => {
     const nativeId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const first = { ...resource, name: nativeId, properties: { environmentId: `Default-${resource.tenantId}` } };

@@ -4,7 +4,7 @@ import { pool } from "../db/pool.js";
 import { DataSyncRepository, type DataSyncScope } from "../db/dataSync.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
 import { AppError, errorTelemetry } from "../errors.js";
-import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../types/dataSync.js";
+import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncSourceStatus, type DataSyncState, type StartDataSyncInput } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { PublishedOfficialUsage } from "../types/officialUsage.js";
@@ -13,6 +13,7 @@ import { packageInventory, type PackageInventoryService } from "./packageInvento
 import { powerPlatformInventory, type PowerPlatformInventoryService } from "./powerPlatformInventory.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { operationalLog } from "./telemetry.js";
+import { AgentPeopleService } from "./agentPeople.js";
 
 type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
 type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>>;
@@ -25,6 +26,7 @@ type DataSyncDependencies = {
   packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
   powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
   copilotUsage: Pick<CopilotUsageService, "refreshUsers">;
+  agentPeople: Pick<AgentPeopleService, "refreshReferences">;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
@@ -61,14 +63,14 @@ export class DataSyncService {
     let run = await this.dependencies.repository.getLatestRun(scope);
     const published = await this.dependencies.officialUsage.getPublished(scope.tenantId);
     if (run) run = await this.reconcileRun(user, scope, run, published);
-    else if (hasAcceptedUsage(published)) {
+    if (hasAcceptedUsage(published)) {
       await this.dependencies.repository.recordSuccessMarker(scope, "usage_reports", usageRowCount(published), usageAcceptedAt(published));
     }
     const markers = await this.dependencies.repository.listMarkers(scope);
     const usageImportRequired = !hasAcceptedUsage(published);
-    const sources = run?.sources ?? reconcileUsageMarker(markers, published);
+    const sources = reconcileUsageMarker(markers, published);
     return {
-      onboardingRequired: markers.some(source => source.status !== "succeeded"),
+      onboardingRequired: automaticDataSyncSourceIds.some(id => sources.find(source => source.source === id)?.status !== "succeeded"),
       usageImportRequired,
       run: run ?? null,
       sources,
@@ -249,10 +251,12 @@ export class DataSyncService {
     signal: AbortSignal,
     activeRun: ActiveRun,
   ) {
+    const inventoryReady = sources.includes("power_platform")
+      ? this.runPowerPlatform(user, scope, runId, signal, activeRun) : undefined;
     await Promise.all(sources.map(source => {
-      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal);
+      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal, inventoryReady);
       if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun);
-      if (source === "power_platform") return this.runPowerPlatform(user, scope, runId, signal, activeRun);
+      if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
   }
@@ -263,21 +267,55 @@ export class DataSyncService {
     runId: string,
     incompleteOnly: boolean,
     signal: AbortSignal,
+    inventoryReady: Promise<void> | undefined,
   ) {
     const jobId = randomUUID();
+    let observedCount: number | null = null;
+    const progress = async (message: string, count: number | null = null) => {
+      signal.throwIfAborted();
+      const current = await this.dependencies.repository.updateSource(scope, runId, "users", {
+        status: "running", jobId, count, message, canRetry: false,
+      });
+      signal.throwIfAborted();
+      const source = current?.sources.find(value => value.source === "users");
+      if (source?.jobId !== jobId || source.status !== "running") {
+        throw new AppError(409, "data_sync_publication_superseded", "This user-source attempt stopped or was superseded.");
+      }
+    };
     try {
       await this.dependencies.repository.attachJob(scope, runId, "users", jobId);
-      signal.throwIfAborted();
-      await this.dependencies.repository.updateSource(scope, runId, "users", {
-        status: "running",
-        jobId,
-        message: "Reading normalized directory/license and app-activity sources.",
-        canRetry: false,
-      });
-      signal.throwIfAborted();
-      const result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
+      await progress("Reading normalized directory/license and app-activity sources.");
+      let result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
         incompleteOnly, publication: { runId, jobId },
+        onDirectoryProgress: async count => {
+          observedCount = count;
+          await progress(`Read ${count} distinct licensed users. Directory/license and app-activity collection is in progress.`, count);
+        },
       });
+      signal.throwIfAborted();
+      if (inventoryReady) {
+        await progress("Directory/license and app-activity collection finished. Waiting for Power Platform inventory before resolving agent people.");
+        await inventoryReady;
+      }
+      await progress("Directory/license and app-activity collection finished. Resolving agent people from saved inventory references.");
+      try {
+        const people = await this.dependencies.agentPeople.refreshReferences(user, signal, { runId, jobId }, { incompleteOnly });
+        result = {
+          ...result,
+          status: people.failed && result.status === "succeeded" ? "partial" : result.status,
+          count: people.failed && result.status === "succeeded" ? observedCount : result.count,
+          message: `${result.message} Agent people: ${people.resolved} resolved, ${people.notFound} not found, ${people.failed} lookup failures.`,
+        };
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof AppError && error.code === "data_sync_publication_superseded") throw error;
+        operationalLog("warn", "agent_people_sync_failed", { ...errorTelemetry(error), jobId });
+        result = {
+          ...result, status: result.status === "succeeded" ? "partial" : result.status,
+          count: result.status === "succeeded" ? observedCount : result.count,
+          message: `${result.message} Agent people were not fully refreshed. ${error instanceof AppError ? error.message : "Directory lookup failed; retry Users sync."}`,
+        };
+      }
       signal.throwIfAborted();
       await this.dependencies.repository.updateSource(scope, runId, "users", userSourceUpdate(jobId, result));
     } catch (error) {
@@ -304,7 +342,7 @@ export class DataSyncService {
       await this.dependencies.repository.updateSource(scope, runId, "graph_packages", {
         status: "waiting_authorization",
         jobId,
-        count: job.totalRecords,
+        count: job.observedCount,
         message: "Waiting for delegated authorization to collect the agent list and matching identities.",
         canRetry: true,
       });
@@ -338,7 +376,7 @@ export class DataSyncService {
       await this.dependencies.repository.updateSource(scope, runId, "power_platform", {
         status: "waiting_authorization",
         jobId,
-        count: job.totalRecords,
+        count: job.observedCount,
         message: "Waiting for explicit delegated authorization to read Power Platform agents and non-agent resources.",
         canRetry: true,
       });
@@ -544,6 +582,7 @@ function defaultDependencies(database: pg.Pool): DataSyncDependencies {
     packages: packageInventory,
     powerPlatform: powerPlatformInventory,
     copilotUsage: new CopilotUsageService(database),
+    agentPeople: new AgentPeopleService(database),
     wait: waitFor,
   };
 }
@@ -582,8 +621,8 @@ function userSourceUpdate(jobId: string, result: CopilotUsageRefreshResult) {
 }
 
 function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
-  const count = job.totalRecords ?? job.observedCount;
   if (job.status === "succeeded") {
+    const count = job.totalRecords ?? job.observedCount;
     return {
       status: "succeeded" as const,
       jobId: job.id,
@@ -597,7 +636,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
     return {
       status: "running" as const,
       jobId: job.id,
-      count,
+      count: job.observedCount,
       message: job.message ?? `${label} source is running (${job.observedCount} records observed).`,
       canRetry: false,
     };
@@ -606,7 +645,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
     return {
       status: "waiting_authorization" as const,
       jobId: job.id,
-      count,
+      count: job.observedCount,
       message: job.message ?? `${label} source requires explicit current authorization.`,
       canRetry: true,
     };
@@ -615,7 +654,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
     return {
       status: "cancelled" as const,
       jobId: job.id,
-      count,
+      count: job.observedCount,
       message: job.message ?? `${label} source was cancelled.`,
       canRetry: true,
     };
@@ -623,7 +662,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
   return {
     status: "failed" as const,
     jobId: job.id,
-    count,
+    count: job.observedCount,
     message: job.message ?? `${label} source failed before complete publication.`,
     canRetry: true,
   };
@@ -665,7 +704,16 @@ function usageAcceptedAt(published: PublishedOfficialUsage) {
 }
 
 function reconcileUsageMarker(sources: DataSyncSourceStatus[], published: PublishedOfficialUsage) {
-  if (!hasAcceptedUsage(published)) return sources;
+  if (!hasAcceptedUsage(published)) return sources.map(source => source.source === "usage_reports" ? {
+    source: source.source,
+    status: "not_started" as const,
+    jobId: null,
+    count: null,
+    lastSuccessAt: null,
+    updatedAt: null,
+    message: "No complete accepted three-CSV Microsoft admin-center usage bundle is currently available.",
+    canRetry: false,
+  } : source);
   return sources.map(source => source.source === "usage_reports" ? {
     ...source,
     status: "succeeded" as const,

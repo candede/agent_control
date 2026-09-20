@@ -81,6 +81,9 @@ export async function grantRuntime(database: pg.Pool) {
         ON unified_agent_sources TO agentcontrol_app;
     `);
   }
+  if ((await database.query("SELECT to_regclass('public.agent_people_cache') AS table_name")).rows[0].table_name) {
+    await database.query("GRANT SELECT,INSERT,UPDATE ON agent_people_cache TO agentcontrol_app");
+  }
   if ((await database.query("SELECT to_regclass('public.purview_audit_jobs') AS table_name")).rows[0].table_name) {
     await database.query(`
       GRANT SELECT, INSERT, UPDATE ON purview_audit_qualifications TO agentcontrol_app;
@@ -181,6 +184,9 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
       "status='running' AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())",
       "status='failed',error_code='package_refresh_expired',message='The package refresh expired during retention.',finished_at=clock_timestamp(),updated_at=clock_timestamp()");
     await remove("packageSnapshots", "package_inventory_snapshots", "expires_at<clock_timestamp()");
+    if ((await client.query("SELECT to_regclass('public.agent_people_cache') AS name")).rows[0].name) {
+      await remove("agentPeople", "agent_people_cache", "expires_at<clock_timestamp()");
+    }
     await remove("packageJobs", "package_refresh_jobs", "expires_at<clock_timestamp() AND status<>'running'");
     await remove("packageQualifications", "package_mutation_qualifications", "expires_at<clock_timestamp()");
     if ((await client.query("SELECT to_regclass('public.unified_agents') AS name")).rows[0].name) {

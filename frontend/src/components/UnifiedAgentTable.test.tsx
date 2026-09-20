@@ -9,6 +9,8 @@ import { quarantineTargetKey } from "../quarantineTarget";
 import { UnifiedAgentTable } from "./UnifiedAgentTable";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { createInventoryVerification } from "../test/inventoryVerification";
+import { automaticAgentUsageFixture, automaticUsageContext } from "../test/automaticAgentUsageFixture";
+import { usageCoverageLabel } from "../usageInsights";
 
 const packageBase = {
   displayName: "Builder package",
@@ -185,9 +187,9 @@ describe("UnifiedAgentTable", () => {
   });
 
   it("keeps zero responses distinct from unlinked usage and makes columns available for an empty view", () => {
-    const { update } = renderTable({ records: [{
+    const { update } = renderTable({ usageContext: automaticUsageContext, records: [{
       ...record,
-      usage: { status: "linked", reportSetId: "report-1", responses: 0, activeUsers: 0, lastActivityDateUtc: null, associations: [] },
+      usage: automaticAgentUsageFixture({ responses: 0, activeUsers: 0, lastActivityDateUtc: null }),
     }] });
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
@@ -198,6 +200,31 @@ describe("UnifiedAgentTable", () => {
     update({ records: [] });
     expect(screen.getByRole("heading", { name: "No matching agents" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Columns" })).toBeEnabled();
+  });
+
+  it("shows automatic report counts only for an available matching snapshot", () => {
+    const { update } = renderTable({
+      records: [{ ...record, usage: automaticAgentUsageFixture() }], usageContext: automaticUsageContext,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Active users" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
+    expect(screen.getByRole("cell", { name: "7" })).toBeVisible();
+    const range = screen.getByText(usageCoverageLabel(automaticUsageContext.reportSet));
+    expect(range.closest(".agent-grid-toolbar")).not.toBeNull();
+    expect(screen.queryByText(/Usage covers the selected Microsoft 365 report/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Selected report.")).not.toBeInTheDocument();
+    update({ usageContext: { ...automaticUsageContext, reportSet: { ...automaticUsageContext.reportSet!, id: "different-snapshot" } } });
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    expect(screen.queryByRole("cell", { name: "181" })).not.toBeInTheDocument();
+    update({ usageContext: undefined });
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    update({ usageContext: { ...automaticUsageContext, availability: "deleted" } });
+    expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
+    update({ usageContext: { ...automaticUsageContext, availability: "stale" } });
+    expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
   });
 
   it("surfaces malformed optional timestamps without crashing the table or inventing dates", () => {
@@ -227,7 +254,7 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("region", { name: "Unified agents" })).toContainElement(screen.getByRole("table"));
     expect(screen.getAllByRole("row")).toHaveLength(2);
     expect(screen.getAllByRole("columnheader").map(header => header.textContent)).toEqual([
-      "Select agents", "Agent", "Environment", "Built with", "Availability", "Status", "Actions",
+      "Select agents", "Agent", "Environment", "Built with", "End-user access", "Status", "Actions",
     ]);
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
     expect(screen.getByText("Production")).toBeInTheDocument();
@@ -461,16 +488,18 @@ describe("UnifiedAgentTable", () => {
     expect(screen.queryByText(/Active|All allowed|counterpart missing|No verified link/i)).not.toBeInTheDocument();
   });
 
-  it("summarizes known, mixed and partially known availability without inferring access from block state", () => {
+  it("shows the widest confirmed unblocked user scope without inventing unknown access", () => {
     const { update } = renderTable({
       records: [{ ...record, packages: record.packages.map(item => ({ ...item, availableTo: "allowedForAll" })) }],
     });
     expect(screen.getByText("All users")).toBeInTheDocument();
     update({ records: [{ ...record, packages: [{ ...record.packages[0], availableTo: "all" }, { ...record.packages[1], availableTo: "none", isBlocked: true }] }] });
-    expect(screen.getByText("Varies by package")).toBeInTheDocument();
+    expect(screen.getByText("All users")).toBeInTheDocument();
     expect(screen.getByText("1 not blocked · 1 blocked")).toBeInTheDocument();
     update({ records: [{ ...record, packages: [{ ...record.packages[0], availableTo: "some" }, record.packages[1]] }] });
-    expect(screen.getByText("Partially known")).toBeInTheDocument();
+    expect(screen.getByText("Specific users or groups")).toBeInTheDocument();
+    update({ records: [{ ...record, packages: [{ ...record.packages[0], availableTo: "all", isBlocked: true }] }] });
+    expect(screen.getByText("Not available")).toBeInTheDocument();
   });
 
   it.each([false, true])("retains exact one-package quick action callbacks (blocked=%s)", isBlocked => {

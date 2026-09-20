@@ -24,7 +24,8 @@ export function licensedUser(index: number, displayName: string, count: number |
   return {
     directory: {
       objectId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
-      displayName, userPrincipalName: username, accountEnabled: true, userType: "Member", employeeType: null, department: "Operations",
+      displayName, userPrincipalName: username, accountEnabled: true, userType: "Member", employeeType: null,
+      companyName: "Contoso Health", department: "Operations",
     },
     licenses: [{
       skuId: "639dec6b-bb19-468b-871c-c5c441c4b0cb", skuPartNumber: "Microsoft_365_Copilot",

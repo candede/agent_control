@@ -50,6 +50,7 @@ export type CopilotDirectoryIdentity = {
   accountEnabled: boolean | null;
   userType: string | null;
   employeeType: string | null;
+  companyName: string | null;
   department: string | null;
 };
 

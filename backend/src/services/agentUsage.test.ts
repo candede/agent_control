@@ -8,6 +8,7 @@ import type { ParsedOfficialUsageReport, PublishedOfficialUsage } from "../types
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { AgentUsageService, buildAgentUsageContext, buildAgentUsageProjection, combineAgentInventoryRevision } from "./agentUsage.js";
 import { agentUsageAssociationInput, agentUsageAssociationRemoval, agentUsageCandidateQuery } from "./agentUsageValidation.js";
+import { allowlistedPackage } from "./packageObservation.js";
 
 const scope = { tenantId: "tenant-a", principalId: "principal-a" };
 const firstId = "11111111-1111-4111-8111-111111111111";
@@ -35,14 +36,111 @@ describe("report-backed inventory usage", () => {
     });
   });
 
-  it("never autojoins matching names, report IDs, package IDs or equal strings", () => {
-    const fixture = data();
-    fixture.snapshot.associations = [];
-    fixture.snapshot.published.reports.agents!.rows[0].agentId = "Package-A";
-    fixture.snapshot.published.reports.agents!.rows[0].agentName = fixture.records[0].displayName;
-    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
-      status: "unlinked", responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
+  it("matches full report/package IDs without names or manual writes and deduplicates merged-agent users", () => {
+    const fixture = automaticData();
+    const before = structuredClone(fixture);
+    fixture.sources.push(fixture.sources[0]);
+    const summary = project(fixture).summaries.get(fixture.records[0].id)!;
+    expect(summary).toMatchObject({
+      status: "linked", reportSetId: setId, responses: 30, activeUsers: 3, lastActivityDateUtc: "2026-09-18T00:00:00.000Z",
     });
+    expect(summary.associations).toEqual(fixture.records[0].packages.map((value, index) => ({
+      reportAgentId: value.id, reportAgentName: index ? "Report B" : "Report A",
+      target: { source: "graph_packages", packageId: value.id }, basis: "exact_package_id",
+    })));
+    expect(fixture.records).toEqual(before.records);
+    expect(fixture.snapshot).toEqual(before.snapshot);
+    expect(summary.associations.every(value => !("reviewedAt" in value))).toBe(true);
+  });
+
+  it.each(["name", "guid-fragment", "prefix", "case", "manifest", "app", "asset"] as const)(
+    "does not infer a package identity from a matching %s",
+    kind => {
+      const fixture = automaticData();
+      const value = fixture.records[0].packages[0];
+      value.manifestId = value.appId = value.assetId = firstId;
+      const row = fixture.snapshot.published.reports.agents!.rows[0];
+      row.agentName = fixture.records[0].displayName;
+      row.agentId = kind === "name" ? value.displayName
+        : kind === "prefix" ? value.id.replace(/^T_/, "P_")
+          : kind === "case" ? value.id.toLowerCase() : firstId;
+      fixture.snapshot.published.reports.agents!.rows = [row];
+      expect(project(fixture).summaries.get(fixture.records[0].id)).toEqual({
+        status: "unlinked", reportSetId: setId, responses: null, activeUsers: null, lastActivityDateUtc: null, associations: [],
+      });
+    },
+  );
+
+  it.each(["missing", "snapshot", "expired"] as const)("requires a current authorized package membership, not %s evidence", mismatch => {
+    const fixture = automaticData();
+    fixture.snapshot.published.reports.agents!.rows = fixture.snapshot.published.reports.agents!.rows.slice(0, 1);
+    if (mismatch === "missing") fixture.sources = [];
+    if (mismatch === "snapshot") fixture.sources[0].package_snapshot_id = secondId;
+    if (mismatch === "expired") fixture.sources[0].expires_at = new Date("2026-09-01");
+    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
+      status: "unlinked", responses: null, activeUsers: null, associations: [],
+    });
+  });
+
+  it("preserves automatic explicit zero and leaves absent companion evidence unknown", () => {
+    const fixture = automaticData();
+    const row = fixture.snapshot.published.reports.agents!.rows[0];
+    row.responsesSentToUsers = 0;
+    delete row.lastActivityDateUtc;
+    fixture.snapshot.published.reports.agents!.rows = [row];
+    fixture.snapshot.published.reports.userAgents!.rows = [{
+      agentId: row.agentId, agentName: row.agentName, creatorType: row.creatorType, username: "zero", responsesSentToUsers: 0,
+    }];
+    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
+      status: "linked", responses: 0, activeUsers: 0, lastActivityDateUtc: null,
+    });
+    delete fixture.snapshot.published.reports.userAgents;
+    expect(project(fixture).summaries.get(fixture.records[0].id)).toMatchObject({
+      status: "linked", responses: 0, activeUsers: null, lastActivityDateUtc: null,
+    });
+  });
+
+  it("recomputes matches for a new selected report without summing overlapping snapshot totals", () => {
+    const fixture = automaticData();
+    const row = fixture.snapshot.published.reports.agents!.rows[0];
+    row.responsesSentToUsers = 179;
+    fixture.snapshot.published.reports.agents!.rows = [row];
+    const previous = project(fixture);
+    expect(previous.summaries.get(fixture.records[0].id)?.responses).toBe(179);
+    fixture.snapshot.published.activeSet!.id = secondId;
+    fixture.snapshot.published.activeRevision += 1;
+    row.responsesSentToUsers = 181;
+    const next = project(fixture);
+    expect(next.summaries.get(fixture.records[0].id)).toMatchObject({
+      reportSetId: secondId, status: "linked", responses: 181,
+      associations: [{ basis: "exact_package_id" }],
+    });
+    expect(next.context.revision).not.toBe(previous.context.revision);
+    expect(fixture.snapshot.associations).toEqual([]);
+  });
+
+  it.each([true, false])("preserves a reviewed override without automatic reassignment (target authorized: %s)", authorized => {
+    const fixture = automaticData();
+    fixture.snapshot.associations = [{
+      ...fixture.sources[2], report_agent_id: fixture.records[0].packages[0].id, reviewed_at: new Date(observedAt),
+    }];
+    if (!authorized) fixture.sources = fixture.sources.slice(0, 2);
+    const result = project(fixture);
+    expect(result.summaries.get(fixture.records[0].id)).toMatchObject({ responses: 20, associations: [{ basis: "exact_package_id" }] });
+    expect(result.summaries.get(fixture.records[1].id)).toMatchObject(authorized
+      ? { responses: 10, associations: [{ basis: "admin_reviewed" }] }
+      : { status: "unlinked", responses: null, associations: [] });
+  });
+
+  it("fails explicitly rather than choosing between conflicting canonical owners of one package", () => {
+    const fixture = automaticData();
+    const packageId = fixture.records[0].packages[0].id;
+    fixture.records[1].packages.push(fixture.records[0].packages[0]);
+    fixture.records[1].observations.packageSnapshots[packageId] = fixture.records[0].observations.packageSnapshots[packageId];
+    fixture.sources.push({ ...fixture.sources[0], agent_id: secondId });
+    expect(() => project(fixture)).toThrow("belongs to multiple agents");
+    fixture.sources.reverse();
+    expect(() => project(fixture)).toThrow("belongs to multiple agents");
   });
 
   it("deduplicates report IDs and positive-response user identities across a merged logical agent", () => {
@@ -227,14 +325,15 @@ describe("strict usage association contracts", () => {
   });
 });
 
-function data() {
+function data(packageIds = ["Package-A", "Package-B", "Package-C"]) {
   const records: UnifiedAgentRecord[] = [firstId, secondId].map((id, index) => ({
     id: `agent:${id}`, displayName: "Same visible name", presence: "graph_packages", environmentId: null,
-    packages: (index ? ["Package-C"] : ["Package-A", "Package-B"]).map(id => ({ id, displayName: "Same visible name" })),
+    packages: (index ? packageIds.slice(2) : packageIds.slice(0, 2))
+      .map(id => allowlistedPackage({ id, displayName: "Same visible name", isBlocked: false })),
     powerPlatformResource: null, identity: { state: "unmatched", evidence: [], packageEvidence: [], reason: null },
     observations: {
       graphPackages: { ...observation, tokenMode: "delegated", scopeKind: "broad", observedCount: 3, totalRecords: 3 },
-      packageSnapshots: Object.fromEntries((index ? ["Package-C"] : ["Package-A", "Package-B"]).map(id => [id, {
+      packageSnapshots: Object.fromEntries((index ? packageIds.slice(2) : packageIds.slice(0, 2)).map(id => [id, {
         ...observation, scopeKind: "broad", identityDetails: null,
       }])), powerPlatform: null,
     },
@@ -282,4 +381,13 @@ function accepted<T extends ParsedOfficialUsageReport>(report: T) {
 
 function project(fixture: ReturnType<typeof data>) {
   return buildAgentUsageProjection(scope, fixture.records, fixture.sources, fixture.snapshot);
+}
+
+function automaticData() {
+  const fixture = data([`T_${firstId}`, `P_${secondId}`, "Package-C"]);
+  fixture.snapshot.associations = [];
+  for (const report of [fixture.snapshot.published.reports.agents, fixture.snapshot.published.reports.userAgents]) {
+    for (const row of report!.rows) row.agentId = fixture.records[0].packages[row.agentId === "Report-A" ? 0 : 1].id;
+  }
+  return fixture;
 }

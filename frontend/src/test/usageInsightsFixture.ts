@@ -1,6 +1,6 @@
 import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../../../backend/src/services/officialUsageViews";
 import type { OfficialUsageLineage, PublishedOfficialUsage } from "../../../backend/src/types/officialUsage";
-import type { OfficialUsageAgentDetailView } from "../api/client";
+import type { OfficialUsageAgentDetailView, OfficialUsageOverviewQuery, OfficialUsageOverviewView } from "../api/client";
 
 const period = { startDate: "2026-08-14", endDate: "2026-09-12", days: 30, provenance: "operator_asserted" as const };
 const acceptedAt = "2026-09-12T10:00:00.000Z";
@@ -60,6 +60,38 @@ export function usageAggregateFixture(query: Parameters<typeof buildOfficialUsag
 
 export function usageUsersFixture(query: Parameters<typeof buildOfficialUsageUserView>[1] = { staleAfterDays: 35 }) {
   return buildOfficialUsageUserView(structuredClone(usageInsightsPublished), { now: usageFixtureNow, ...query });
+}
+
+export function usageOverviewFixture(query: OfficialUsageOverviewQuery = {}): OfficialUsageOverviewView {
+  const agents = usageAggregateFixture().agents.value.map(agent => ({
+    agentId: agent.agentId, agentName: agent.agentName, creatorTypes: [agent.creatorType],
+    hasResponses: agent.responsesSentToUsers > 0, lastActivityDateUtc: agent.lastActivityDateUtc ?? null,
+    observationCount: 2, latestSetId: usageFixtureSetId, latestAcceptedAt: acceptedAt,
+  }));
+  const search = query.search?.toLowerCase();
+  const matching = agents.filter(agent => (!search || `${agent.agentName} ${agent.agentId} ${agent.creatorTypes.join(" ")}`.toLowerCase().includes(search))
+    && (!query.startDate || Boolean(agent.lastActivityDateUtc && agent.lastActivityDateUtc.slice(0, 10) >= query.startDate))
+    && (!query.endDate || Boolean(agent.lastActivityDateUtc && agent.lastActivityDateUtc.slice(0, 10) <= query.endDate)));
+  const sortBy = query.sortBy ?? "lastActivity";
+  const sortDirection = query.sortDirection ?? "desc";
+  matching.sort((a, b) => {
+    const left = sortBy === "agentName" ? a.agentName : a.lastActivityDateUtc;
+    const right = sortBy === "agentName" ? b.agentName : b.lastActivityDateUtc;
+    if (left === null || right === null) return left === right ? a.agentId.localeCompare(b.agentId) : left === null ? 1 : -1;
+    return (sortDirection === "asc" ? 1 : -1) * left.localeCompare(right) || a.agentId.localeCompare(b.agentId);
+  });
+  const offset = query.offset ?? 0;
+  const limit = query.limit ?? 25;
+  return {
+    revision: 1,
+    summary: {
+      retainedSets: 1, reportedAgents: 2, usedAgents: 2, activeAgents30Days: 2, undatedAgents: 0,
+      earliestActivityDateUtc: "2026-09-11", latestActivityDateUtc: "2026-09-12",
+      asOf: usageFixtureNow.toISOString(), activeSinceDateUtc: "2026-08-20",
+    },
+    agents: { value: matching.slice(offset, offset + limit), count: matching.length, limit, offset },
+    filters: { search: query.search ?? null, startDate: query.startDate ?? null, endDate: query.endDate ?? null, sortBy, sortDirection },
+  };
 }
 
 export function usageAgentDetailFixture(agentId = "synthetic-researcher"): OfficialUsageAgentDetailView {

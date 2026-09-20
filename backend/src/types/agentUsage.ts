@@ -12,10 +12,17 @@ export type AgentUsageTarget =
 export type AgentUsageAssociation = {
   reportAgentId: string;
   reportAgentName: string;
-  target: AgentUsageTarget;
-  basis: "admin_reviewed";
-  reviewedAt: string;
-};
+} & (
+  | {
+      target: Extract<AgentUsageTarget, { source: "graph_packages" }>;
+      basis: "exact_package_id";
+    }
+  | {
+      target: AgentUsageTarget;
+      basis: "admin_reviewed";
+      reviewedAt: string;
+    }
+);
 
 export type AgentUsageContext = {
   reportSet: OfficialUsageSetSummary | null;

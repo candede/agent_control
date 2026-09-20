@@ -1,5 +1,4 @@
-.agent-usage-insights,
-.reported-agent-usage {
+.agent-usage-insights {
   display: grid;
   gap: 16px;
   min-width: 0;
@@ -12,7 +11,6 @@
   background: #fff;
 }
 
-.agent-insight-heading,
 .agent-insight-actions,
 .agent-insight-toolbar,
 .agent-insight-pagination,
@@ -24,29 +22,9 @@
   min-width: 0;
 }
 
-.agent-insight-heading {
-  align-items: flex-start;
-  justify-content: space-between;
-}
-
-.agent-insight-heading > div:first-child {
-  flex: 1 1 240px;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.agent-insight-heading h3,
-.agent-insight-heading h4,
-.agent-insight-heading p,
 .agent-insight-empty h4,
 .agent-usage-context p {
   margin: 0;
-}
-
-.agent-insight-heading p {
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 0.9rem;
 }
 
 .agent-usage-context {

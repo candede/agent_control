@@ -13,6 +13,7 @@ describe("route policy declarations", () => {
       "GET /capabilities", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
       "GET /agent-inventory", "POST /agent-inventory/export.csv", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
+      "POST /agent-inventory/people/resolve",
       "GET /agent-inventory/:recordId/usage-candidates", "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
       "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry", "POST /data-sync/runs/:id/cancel",
@@ -25,7 +26,7 @@ describe("route policy declarations", () => {
       "POST /quarantine/jobs/:id/cancel", "POST /quarantine/jobs/:id/resume", "POST /quarantine/jobs/:id/reconcile",
       "POST /quarantine/canary-approvals", "GET /quarantine/canary-approvals", "POST /quarantine/canary-approvals/:id/execute",
       "GET /copilot-usage/users",
-      "POST /official-usage/staging", "GET /official-usage/admin", "GET /official-usage/history", "DELETE /official-usage/staging/:id",
+      "POST /official-usage/staging", "GET /official-usage/admin", "GET /official-usage/history", "GET /official-usage/overview", "DELETE /official-usage/staging/:id",
       "POST /official-usage/bundles/:id/preview", "POST /official-usage/bundles/:id/accept",
       "POST /official-usage/sets/:id/preview", "POST /official-usage/confirmations/:id", "POST /official-usage/legacy-cleanup-acknowledgements",
       "GET /official-usage/aggregate", "GET /official-usage/aggregate.csv", "GET /official-usage/agents/:agentId", "GET /official-usage/users", "GET /official-usage/users.csv",
@@ -42,6 +43,13 @@ describe("route policy declarations", () => {
       if (policy.access === "authenticated" && !key.startsWith("GET ")) expect(policy.csrf).toBe(true);
       if (policy.access === "authenticated") expect(policy.dataClass.length).toBeGreaterThan(0);
     }
+  });
+
+  it("requires directory-read authorization, Viewer access and CSRF for persisted people resolution", () => {
+    expect(declaredRoutePolicies.get("POST /agent-inventory/people/resolve")).toEqual({
+      access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"],
+      capabilityId: "graph.directory.read", csrf: true,
+    });
   });
 
   it("does not allow direct route registration outside the policy helper", () => {

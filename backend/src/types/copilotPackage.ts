@@ -3,6 +3,10 @@ export type PackageAccessEntity = {
   resourceType: "user" | "group" | string;
 };
 
+export function isDirectoryObjectId(value: string) {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value);
+}
+
 export type PackageAccessTarget = "availability" | "installation";
 
 export type PackageAccessMutationMode = "add" | "replace";
@@ -99,11 +103,14 @@ export function formatPackageFacetLabel(value: string) {
 
 export function normalizePackageAuthoringTool(value: string) {
   const normalized = value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+  if (normalized === "copilotstudiolite" || normalized === "microsoftcopilotstudiolite") return "microsoft365copilotagentbuilder";
   return normalized.includes("copilotstudio") ? "copilotstudio" : normalized;
 }
 
 export function formatAgentAuthoringTool(value: string) {
-  return normalizePackageAuthoringTool(value) === "copilotstudio" ? "Copilot Studio" : formatPackageFacetLabel(value);
+  const normalized = normalizePackageAuthoringTool(value);
+  return normalized === "copilotstudio" ? "Copilot Studio"
+    : normalized === "microsoft365copilotagentbuilder" ? "Microsoft 365 Copilot Agent Builder" : formatPackageFacetLabel(value);
 }
 
 export type BulkPackageResult = {

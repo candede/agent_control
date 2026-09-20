@@ -4,6 +4,10 @@
 
 Data sync distinguishes an uncollected source from an authorized collection with zero licensed users. A failed resync does not erase the last successful data. Source timestamps and errors remain visible; saved state is not represented as a fresh live observation. Syncing does not change license assignments or create synthetic activity.
 
+The licensed-user snapshot includes nullable **company name** and **department** from Entra ID. These are saved directory attributes, not inferred from email domains, report text or agent names. Missing values remain unknown, and older snapshots remain readable until the next successful Users sync populates the additional company field. Company/department describe the user's organization at collection time, not necessarily when historical agent activity occurred. The licensed cohort stays unchanged; no all-tenant user synchronization or company/department analytics is introduced.
+
+Users sync additionally enriches only the exact creator/owner/last-modifier IDs referenced by saved native agents and missing from the licensed roster. This separate, tenant/account-scoped identity cache does not add users to license-adoption counts. Full sync waits for native inventory publication before this step; a people-lookup failure leaves collected license data intact but marks the Users result partial and retryable. Results distinguish not-found from lookup failure, never infer deleted accounts, and require the existing `graph.directory.read` capability. Authorized agent-detail lookups and explicit retries persist into the same cache; ordinary saved-list reads do not contact Graph.
+
 ## Provider requirements
 
 - `User.Read.All` reads user identity, member type, account state, `assignedLicenses`, and `licenseAssignmentStates`.

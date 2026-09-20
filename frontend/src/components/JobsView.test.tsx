@@ -67,7 +67,9 @@ describe("JobsView", () => {
     expect(screen.queryByText("Package mutation")).not.toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "Package controls" })).not.toBeInTheDocument();
     expect(screen.queryByText(/authorized source.*temporarily unavailable/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("link", { name: "Open sync details" }));
+    expect(screen.getByRole("table", { name: "Sync run history" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry incomplete" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("link", { name: /View details for Retained sync/ }));
     expect(onOpenSyncRun).toHaveBeenCalledWith("sync-history");
   });
 
@@ -77,6 +79,26 @@ describe("JobsView", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/workbench/jobs", expect.objectContaining({ credentials: "include", signal: expect.any(AbortSignal) }));
     expect(screen.getByText(/request request-1/)).toBeInTheDocument();
+  });
+
+  it("does not replace refreshed sync history with an aborted older response", async () => {
+    let resolveOld!: (response: Response) => void;
+    const entry = (label: string) => ({
+      id: label, label, source: "data-sync", target: "1 source", status: "completed",
+      total: 1, completed: 1, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      updatedAt: emptyProjection.polledAt, href: `/sync?syncRun=${label}`,
+    });
+    fetchMock.mockReturnValueOnce(new Promise<Response>(resolve => { resolveOld = resolve; }))
+      .mockResolvedValue(Response.json({ ...emptyProjection, value: [entry("New history")] }));
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} scope="sync" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const signal = fetchMock.mock.calls[0][1].signal as AbortSignal;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh history" }));
+    expect(signal.aborted).toBe(true);
+    expect(await screen.findByText("New history")).toBeVisible();
+    await act(async () => resolveOld(Response.json({ ...emptyProjection, value: [entry("Old history")] })));
+    expect(screen.getByText("New history")).toBeVisible();
+    expect(screen.queryByText("Old history")).not.toBeInTheDocument();
   });
 
   it("routes package control recovery without exposing result bodies", async () => {

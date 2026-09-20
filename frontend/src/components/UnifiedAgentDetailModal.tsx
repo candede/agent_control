@@ -12,9 +12,11 @@ import {
   type UnifiedAgentRecord,
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
+import { powerPlatformAuthoringTool } from "../../../backend/src/types/powerPlatformInventory";
 import { quarantineTargetReason } from "../quarantineTarget";
 import { CapabilityContext } from "../capabilityContext";
 import { providerActionAllowed } from "../capabilityState";
+import { useAgentPeople } from "../useAgentPeople";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
@@ -58,6 +60,7 @@ type Props = {
   usageContext?: AgentUsageContext;
   inventoryRevision?: string;
   onUsageChanged?: () => void;
+  onPeopleChanged?: () => void;
 };
 
 export function UnifiedAgentDetailModal({
@@ -84,7 +87,9 @@ export function UnifiedAgentDetailModal({
   usageContext,
   inventoryRevision,
   onUsageChanged,
+  onPeopleChanged,
 }: Props) {
+  const peopleState = useAgentPeople(record, roles, onPeopleChanged);
   const dialog = useRef<HTMLDialogElement>(null);
   const dialogMounted = useRef(false);
   const panel = useRef<HTMLElement>(null);
@@ -258,7 +263,7 @@ export function UnifiedAgentDetailModal({
       </div>
       {record.identity.invalidMetadata ? <div className="notice" role="status">
         <strong>Invalid saved matching metadata.</strong>{" "}
-        Select this agent on Agents, then open <strong>Sync &gt; Advanced results</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
+        Select this agent on Agents, then open <strong>Sync &gt; View diagnostics</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
       </div> : null}
       {packageDetailError ? <p className="error-banner unified-agent-detail-error" role="alert">{packageDetailError}</p> : null}
       <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
@@ -282,9 +287,9 @@ export function UnifiedAgentDetailModal({
             : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional saved details require the package read action to be available. The saved inventory information remains visible.</p> : null}
         </> : null}
         {selectedTab === "identities" ? <AgentOverview key={`${record.id}:${selectedPackage?.id ?? "native"}:${selectedDetail?.observation?.observedAt ?? "saved"}`}
-          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} environmentNames={environmentNames} /> : null}
-        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.revision, inventoryRevision])}
-          record={record} context={usageContext} inventoryRevision={inventoryRevision} canManage={canManage}
+          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} environmentNames={environmentNames} peopleState={peopleState} /> : null}
+        {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.reportSet?.id, usageContext?.availability, usageContext?.revision, inventoryRevision])}
+          record={record} context={usageContext} inventoryRevision={inventoryRevision} canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy} onChanged={onUsageChanged} /> : null}
         {selectedTab === "identities" ? <details className="agent-technical-details" open={activeTab === "power-platform" || undefined}>
           <summary>Technical details</summary>
@@ -391,7 +396,7 @@ function PowerPlatformPanel({ record }: { record: UnifiedAgentRecord }) {
       <Detail label="Entra agent ID" value={resource.identifiers.find(item => item.kind === "entra_agent_id")?.value} />
       <Detail label="Schema name" value={resource.details.schemaName} />
       <Detail label="Authoring tool (raw)" value={resource.details.createdIn} />
-      <Detail label="Authoring tool" value={resource.authoringTool} />
+      <Detail label="Authoring tool" value={powerPlatformAuthoringTool(resource)} />
     </div>
     <p>{resource.unknownFieldCount} unknown or malformed fields were omitted from the saved observation.</p>
   </>;

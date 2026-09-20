@@ -18,6 +18,7 @@ import { PrincipalPicker } from "./PrincipalPicker";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { useCapabilityContext } from "../capabilityContext";
 import { providerActionAllowed, capabilityExplanation } from "../capabilityState";
+import { trapDialogFocus } from "../dialogFocus";
 
 type AccessAssignmentModalProps = {
   context: "single" | "bulk";
@@ -509,40 +510,3 @@ function fallbackPrincipal(entity: PackageAccessEntity): DirectoryPrincipal {
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Access update failed.";
 }
-
-function trapDialogFocus(event: KeyboardEvent, dialog: HTMLElement | null) {
-  if (!dialog) {
-    return;
-  }
-
-  const focusable = [
-    ...dialog.querySelectorAll<HTMLElement>(focusableSelector),
-  ].filter((element) => !element.hasAttribute("disabled"));
-
-  if (focusable.length === 0) {
-    event.preventDefault();
-    dialog.focus();
-    return;
-  }
-
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  const active = document.activeElement;
-
-  if (event.shiftKey && (active === first || active === dialog)) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && active === last) {
-    event.preventDefault();
-    first.focus();
-  }
-}
-
-const focusableSelector = [
-  "a[href]",
-  "button",
-  "input",
-  "select",
-  "textarea",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");

@@ -1,7 +1,9 @@
-import { Download, RefreshCw } from "lucide-react";
+import { useState } from "react";
+import { CircleAlert, Download, RefreshCw, ShieldCheck } from "lucide-react";
 import type { InventoryRefreshJob, UnifiedAgentInventoryPage } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
+import { SyncDialog } from "./SyncDialog";
 
 type Props = {
   inventory?: UnifiedAgentInventoryPage;
@@ -38,23 +40,33 @@ export function AgentSyncTools({
   onExportPowerPlatform,
   onOpenAgents,
 }: Props) {
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const observation = inventory?.sources.powerPlatform.observation;
   const snapshotId = observation?.snapshotId;
   const currentInventory = !verifyingInventory && !inventoryError ? inventory : undefined;
   const invalidPackages = currentInventory?.identityCollection?.invalidPackages ?? 0;
+  const needsAttention = !verifyingInventory && Boolean(inventoryError || currentInventory?.verification.status === "needs_attention" || currentInventory?.partial || invalidPackages);
+  const health = verifyingInventory ? "Checking"
+    : needsAttention ? "Needs attention" : currentInventory ? "Verified" : "Not checked";
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">
-      {!verifyingInventory && (inventoryError || currentInventory?.verification.status === "needs_attention" || currentInventory?.partial) ? (
-        <div className="notice" role={inventoryError ? "alert" : "status"}>
-          Inventory needs attention. Open Advanced results for details.
+      <div className="sync-inventory-summary">
+        {needsAttention ? <CircleAlert size={22} aria-hidden="true" /> : <ShieldCheck size={22} aria-hidden="true" />}
+        <div>
+          <div className="sync-health-heading"><h3 id="sync-inventory-heading">Inventory health</h3><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory ? "success" : "progress"}`}>{health}</span></div>
+          <p role={!verifyingInventory && inventoryError ? "alert" : "status"}>{verifyingInventory
+            ? "Checking saved inventory. Previous results are not the result of this check."
+            : needsAttention ? "Saved inventory checks need attention. View diagnostics for the cause and recovery options."
+              : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
         </div>
-      ) : null}
-      <details className="data-sync-source-details">
-        <summary id="sync-inventory-heading">Advanced results</summary>
-        <div className="data-sync-source-details-content">
+        <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setDiagnosticsOpen(true)}>View diagnostics</button>
+      </div>
+      <SyncDialog open={diagnosticsOpen} title="Inventory diagnostics"
+        description="Technical checks and recovery tools for saved inventory. These checks do not collect new Microsoft data."
+        onClose={() => setDiagnosticsOpen(false)}>
           <div className="section-heading">
             <h2>Agent inventory sources</h2>
-            <button type="button" className="secondary" onClick={onOpenAgents}>Browse agents</button>
+            <button type="button" className="secondary" onClick={() => { setDiagnosticsOpen(false); onOpenAgents(); }}>Browse agents</button>
           </div>
           <SavedAgentInventoryVerification inventory={inventory} loading={verifyingInventory} error={inventoryError} onVerify={onVerifyInventory} />
           {currentInventory ? <dl className="sync-inventory-counts" aria-label="Agent source coverage">
@@ -87,7 +99,7 @@ export function AgentSyncTools({
                   Refresh matching details
                 </button>
               </WorkbenchActionGate>
-              <button type="button" className="secondary" onClick={onOpenAgents}>Select packages on Agents</button>
+              <button type="button" className="secondary" onClick={() => { setDiagnosticsOpen(false); onOpenAgents(); }}>Select packages on Agents</button>
             </div>
           </section>
           <section className="sync-source-tools" aria-label="Power Platform agent source">
@@ -115,8 +127,8 @@ export function AgentSyncTools({
               </WorkbenchActionGate>
             </div>
           </section>
-        </div>
-      </details>
+          <p className="data-sync-run-meta">Sync collects inventory, not unlimited logs or transcripts. Investigate activity separately with <a href="/audit">Audit searches</a> or <a href="/security">Security hunts</a>.</p>
+      </SyncDialog>
     </section>
   );
 }

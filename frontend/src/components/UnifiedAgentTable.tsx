@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Info, Lock, LockOpen, ShieldCheck } from "lucide-react";
 import { columnVisibilityFeature, rowSortingFeature, tableFeatures, useTable, type CellContext, type ColumnDef, type ColumnVisibilityState } from "@tanstack/react-table";
-import { agentAccessSummary, agentColumnValue, agentStatusLabels } from "../../../backend/src/types/agentPresentation";
+import { agentColumnValue, agentStatusLabels } from "../../../backend/src/types/agentPresentation";
 import type { UnifiedAgentSort, UnifiedAgentSortDirection } from "../../../backend/src/types/unifiedAgents";
 import type { AgentUsageContext } from "../../../backend/src/types/agentUsage";
 import type { UnifiedAgentRecord } from "../api/client";
@@ -40,6 +40,7 @@ type Props = {
 
 type AgentRow = {
   record: UnifiedAgentRecord;
+  usageMatchesReport: boolean;
   environmentName: string | null;
   selectableCount: number;
   selectedCount: number;
@@ -59,6 +60,7 @@ const columns: ColumnDef<typeof features, AgentRow>[] = [
       id, header: definition.label,
       accessorFn: row => {
         try {
+          if (definition.group === "Usage" && !row.usageMatchesReport) return null;
           return id === "environment" ? row.environmentName : agentColumnValue(row.record, id);
         } catch (error) {
           if (error instanceof RangeError) return error;
@@ -108,8 +110,11 @@ export function UnifiedAgentTable({
       + Number(quarantineSelectable && record.powerPlatformResource !== null
         && selectedPowerPlatformKeys.has(quarantineTargetKey(record.powerPlatformResource)));
     const environmentName = record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : null;
-    return { record, environmentName, selectableCount, selectedCount, quarantineReason };
-  }), [records, environmentNames, packageSelectionAllowed, quarantineSelectionAllowed, selectedPackageIds, selectedPowerPlatformKeys]);
+    const usageMatchesReport = Boolean(usageContext?.reportSet?.complete
+      && (usageContext.availability === "active" || usageContext.availability === "stale")
+      && record.usage?.reportSetId === usageContext.reportSet.id);
+    return { record, usageMatchesReport, environmentName, selectableCount, selectedCount, quarantineReason };
+  }), [records, usageContext, environmentNames, packageSelectionAllowed, quarantineSelectionAllowed, selectedPackageIds, selectedPowerPlatformKeys]);
   const selectedAgents = rows.filter(row => row.selectedCount > 0).length;
   function changeVisibility(updater: ColumnVisibilityState | ((current: ColumnVisibilityState) => ColumnVisibilityState)) {
     const next = typeof updater === "function" ? updater(preferences.visibility) : updater;
@@ -144,17 +149,19 @@ export function UnifiedAgentTable({
     <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
     <div className="agent-grid" role="region" aria-label="Unified agents">
       <div className="agent-grid-toolbar">
-        <span className="muted-cell">Choose columns; sort using column headings.</span>
+        <span className="muted-cell" title={showUsageContext
+          ? "Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero."
+          : undefined}>
+          {showUsageContext && usageContext
+            ? <>{usageCoverageLabel(usageContext.reportSet)}{usageContext.availability !== "active" ? ` · ${usageAvailabilityLabel(usageContext.availability)}` : ""}</>
+            : "Choose columns; sort using column headings."}
+        </span>
         <AgentColumnPicker columns={agentColumns.map(definition => {
           const column = requiredColumn(definition.id);
           return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
         })} onToggle={id => requiredColumn(id).toggleVisibility()} onReset={() => changeVisibility({ ...defaultAgentColumnVisibility })} />
       </div>
       {preferences.error ? <p className="notice" role="status">{preferences.error}</p> : null}
-      {showUsageContext ? <p className="agent-usage-column-context" role="status">
-        {usageContext ? `${usageAvailabilityLabel(usageContext.availability)}. ${usageCoverageLabel(usageContext.reportSet)}. ` : ""}
-        Usage covers the selected Microsoft 365 report, not lifetime or all-channel activity. Unavailable is not zero; associations are administrator-reviewed.
-      </p> : null}
       {selectedAgents > 0 || packageSelectionAllowed && selectedPackageIds.size > 0 || quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <div className="selection-summary">
         {selectedAgents > 0 ? <span>{selectedAgents} agent{selectedAgents === 1 ? "" : "s"} selected on this page</span> : null}
         {packageSelectionAllowed && selectedPackageIds.size > 0 ? <span>{selectedPackageIds.size} published version{selectedPackageIds.size === 1 ? "" : "s"} selected</span> : null}
@@ -251,7 +258,7 @@ export function AgentAuthoringTools({ record }: { record: UnifiedAgentRecord }) 
 }
 
 export function AgentAvailability({ record }: { record: UnifiedAgentRecord }) {
-  return <>{agentAccessSummary(record, "availableTo") ?? "Unknown"}</>;
+  return <>{agentColumnValue(record, "availability") ?? "Unknown"}</>;
 }
 
 export function AgentStatus({ record }: { record: UnifiedAgentRecord }) {

@@ -5,6 +5,7 @@ import { requireProviderAdmissions } from "../services/operationalState.js";
 import { powerPlatformAgentKey, powerPlatformInventoryIdentity, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { inventoryQueryTypes } from "../services/inventoryRoleScope.js";
 import {
+  derivePowerPlatformAuthoringTool,
   powerPlatformResourceTypes,
   type InventoryRefreshJob,
   type InventoryRefreshJobList,
@@ -571,11 +572,19 @@ function listFilters(snapshotId: string, scope: InventoryDataScope, query: Inven
 }
 
 function projectResource(row: ResourceRow): PowerPlatformResource {
+  const authoringTool = row.authoring_tool?.trim() || derivePowerPlatformAuthoringTool(row.resource_type, row.details.createdIn);
   return {
     tenantId: row.tenant_id, nativeId: row.native_id, type: row.resource_type, environmentId: row.environment_id || null, location: row.location,
     displayName: row.display_name, createdAt: row.created_at?.toISOString() ?? null, createdBy: row.created_by, lastPublishedAt: row.last_published_at?.toISOString() ?? null,
-    sourceSystem: row.source_system, authoringTool: row.authoring_tool, creatorType: row.creator_type, agentKind: row.agent_kind, lifecycle: row.lifecycle,
-    identityConfidence: row.identity_confidence, identifiers: row.identifiers, provenance: row.provenance, details: row.details, unknownFieldCount: row.unknown_field_count,
+    sourceSystem: row.source_system, authoringTool, creatorType: row.creator_type, agentKind: row.agent_kind, lifecycle: row.lifecycle,
+    identityConfidence: row.identity_confidence, identifiers: row.identifiers,
+    provenance: !row.authoring_tool?.trim() && authoringTool ? {
+      ...row.provenance, authoringTool: {
+        sourceSystem: "power_platform",
+        path: row.resource_type === "microsoft.copilotstudio/agents" ? "properties.createdIn" : "type", maturity: "ga",
+      },
+    } : row.provenance,
+    details: row.details, unknownFieldCount: row.unknown_field_count,
   };
 }
 

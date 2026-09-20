@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { agentColumns, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
+import { agentColumns, agentViewOptions, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
 import { unifiedAgentSortKeys } from "../../backend/src/types/unifiedAgents";
 
 afterEach(() => {
@@ -8,6 +8,16 @@ afterEach(() => {
 });
 
 describe("agent column preferences", () => {
+  it("describes automatic and existing reviewed evidence for selected-report usage filters", () => {
+    const used = agentViewOptions.find(option => option.value === "used")!;
+    expect(used.description).toContain("matched automatically by exact saved package ID");
+    expect(used.description).toContain("existing administrator-reviewed association");
+    expect(used.description).toContain("not a live or all-channel activity measure");
+    expect(agentViewOptions.find(option => option.value === "organization")!.description).toContain("does not establish end-user access");
+    expect(agentViewOptions.find(option => option.value === "all")!.label).toBe("All agents in repository");
+    expect(agentViewOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
+  });
+
   it("offers every supported data column exactly once and keeps the original defaults", () => {
     expect(agentColumns.filter(column => column.id !== "actions").map(column => column.id).sort()).toEqual([...unifiedAgentSortKeys].sort());
     expect(Object.entries(defaultAgentColumnVisibility).filter(([, visible]) => visible).map(([id]) => id))

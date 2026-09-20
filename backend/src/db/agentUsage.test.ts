@@ -22,6 +22,82 @@ afterAll(async () => { await fixture?.close(); });
 afterEach(() => vi.restoreAllMocks());
 
 describe("persisted reviewed agent usage", () => {
+  it("projects exact package IDs onto existing logical agents without association writes or inventory changes", async () => {
+    const scope = newUsageScope();
+    const records = await saveUsageInventory(fixture.runtime, scope, [
+      { packages: ["Report-A", "Report-B"], native: { nativeId: "Native-A", environmentId: "env-a" } },
+      { packages: ["Report-Zero"] },
+      { packages: ["Report-Missing"] },
+      { packages: [], native: { nativeId: "Report-A", environmentId: "env-b" } },
+    ]);
+    await publishUsageReports(fixture.runtime, scope);
+    const before = await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY source,native_id", [scope.tenantId]);
+    const result = await service.project(scope, records);
+    expect(result.summaries.get(records[0].id)).toMatchObject({
+      status: "linked", responses: 30, activeUsers: 3,
+      associations: [
+        { reportAgentId: "Report-A", basis: "exact_package_id", target: { source: "graph_packages", packageId: "Report-A" } },
+        { reportAgentId: "Report-B", basis: "exact_package_id", target: { source: "graph_packages", packageId: "Report-B" } },
+      ],
+    });
+    expect(result.summaries.get(records[1].id)).toMatchObject({ status: "linked", responses: 0, activeUsers: 0 });
+    expect(result.summaries.get(records[2].id)).toMatchObject({ status: "linked", responses: 1, activeUsers: null });
+    expect(result.summaries.get(records[3].id)).toMatchObject({ status: "unlinked", responses: null });
+    expect(await associationCount(scope.tenantId)).toBe(0);
+    expect(await new AuditLog(scope, fixture.runtime).listEvents({ action: "associate-agent-usage" })).toEqual([]);
+    expect((await fixture.runtime.query("SELECT to_jsonb(source) AS value FROM unified_agent_sources source WHERE tenant_id=$1 ORDER BY source,native_id", [scope.tenantId])).rows)
+      .toEqual(before.rows);
+  });
+
+  it("matches each newly selected report automatically and never adds overlapping report totals", async () => {
+    const scope = newUsageScope();
+    const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    const first = await publishUsageReports(fixture.runtime, scope, 179);
+    const previous = await service.project(scope, records);
+    const second = await publishUsageReports(fixture.runtime, scope, 181);
+    const current = await service.project(scope, records);
+    expect(previous.summaries.get(records[0].id)).toMatchObject({ reportSetId: first.setId, responses: 179 });
+    expect(current.summaries.get(records[0].id)).toMatchObject({
+      reportSetId: second.setId, responses: 181, associations: [{ basis: "exact_package_id" }],
+    });
+    expect(current.context.revision).not.toBe(previous.context.revision);
+    const reports = new OfficialUsageRepository(fixture.runtime);
+    const selection = await reports.previewSetOperation(scope, "select", first.setId);
+    await reports.confirmSetOperation(scope, selection.id, {
+      operation: "select", setId: first.setId, expectedRevision: selection.expectedRevision, confirmationHash: selection.confirmationHash,
+    });
+    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({
+      reportSetId: first.setId, responses: 179,
+    });
+    await deleteUsageSet(fixture.runtime, scope, first.setId);
+    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({
+      status: "unavailable", responses: null,
+    });
+    expect(await associationCount(scope.tenantId)).toBe(0);
+  });
+
+  it("scopes automatic matching to each tenant and viewer's current saved package evidence", async () => {
+    const scope = newUsageScope();
+    const records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
+    await publishUsageReports(fixture.runtime, scope);
+    const viewer = { ...scope, principalId: "automatic-viewer" };
+    const otherRecords = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Report-A"] }]);
+    expect(otherRecords[0].id).not.toBe(records[0].id);
+    expect((await service.project(viewer, otherRecords)).summaries.get(otherRecords[0].id)).toMatchObject({
+      status: "linked", responses: 10,
+    });
+    const otherTenant = newUsageScope();
+    const foreign = await saveUsageInventory(fixture.runtime, otherTenant, [{ packages: ["Report-A"] }]);
+    expect((await service.project(otherTenant, foreign)).summaries.get(foreign[0].id)).toMatchObject({ status: "unavailable", responses: null });
+    await publishUsageReports(fixture.runtime, otherTenant, 99);
+    expect((await service.project(otherTenant, foreign)).summaries.get(foreign[0].id)).toMatchObject({ responses: 99 });
+    await fixture.operator.query("UPDATE package_inventory_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2",
+      [scope.tenantId, scope.principalId]);
+    expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ status: "unlinked", responses: null });
+    expect((await service.project(viewer, otherRecords)).summaries.get(otherRecords[0].id)).toMatchObject({ responses: 10 });
+    expect(await associationCount(scope.tenantId)).toBe(0);
+  });
+
   it("provides explicit unavailable metrics and current-record-only candidate browsing", async () => {
     const scope = newUsageScope();
     const records = await saveUsageInventory(fixture.runtime, scope);

@@ -10,6 +10,9 @@ import { policyRoute } from "./policy.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
+import { agentPeople } from "../services/agentPeople.js";
+import { savedAgentPeople } from "../services/savedAgentPeople.js";
+import { isDirectoryObjectId } from "../types/copilotPackage.js";
 
 export const unifiedAgentsRouter = Router();
 
@@ -20,6 +23,40 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory", {
 }, async (request, response) => {
   response.json(await unifiedAgents.list(requestScope(request), unifiedAgentInventoryQuery(request.query)));
 });
+
+policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
+  access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"],
+  capabilityId: "graph.directory.read", csrf: true,
+}, async (request, response) => {
+  const input = agentPeopleResolveInput(request.body);
+  const scope = requestScope(request);
+  const controller = new AbortController();
+  const disconnected = () => { if (!response.writableEnded) controller.abort(); };
+  response.once("close", disconnected);
+  try {
+    const generation = await agentPeople.generation(scope);
+    const page = await unifiedAgents.list(scope, { recordId: input.recordId, limit: 1 });
+    if (page.count !== 1 || !page.value[0]) throw new AppError(404, "agent_not_found", "The saved agent is unavailable.");
+    const record = page.value[0];
+    const ids = [record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
+      record.powerPlatformResource?.details.lastModifiedBy]
+      .filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id));
+    const result = await agentPeople.resolve(request.session.user!, ids, { generation, force: input.force, signal: controller.signal });
+    const [updated] = await savedAgentPeople.project(scope, [record]);
+    response.json({ people: updated.people, changed: result.changed });
+  } finally {
+    response.off("close", disconnected);
+  }
+});
+
+export function agentPeopleResolveInput(value: unknown): { recordId: string; force: boolean } {
+  if (!isRecord(value) || Object.keys(value).some(key => !["recordId", "force"].includes(key))
+    || typeof value.recordId !== "string" || !value.recordId
+    || value.force !== undefined && typeof value.force !== "boolean") {
+    throw new AppError(400, "invalid_agent_people", "Agent people require an exact saved record ID and an optional refresh flag.");
+  }
+  return { recordId: exactRecordId(value.recordId)!, force: value.force === true };
+}
 
 policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/export.csv", {
   access: "authenticated", dataClass: "private_inventory_export", roles: ["AgentControl.Viewer"], csrf: true,

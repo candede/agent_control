@@ -1,4 +1,5 @@
 import { afterEach, beforeEach } from "vitest";
+import { cleanup } from "@testing-library/react";
 
 export function mockNativeDialogs() {
   const originalShowModal = HTMLDialogElement.prototype.showModal;
@@ -16,6 +17,7 @@ export function mockNativeDialogs() {
   });
 
   afterEach(() => {
+    cleanup();
     HTMLDialogElement.prototype.showModal = originalShowModal;
     HTMLDialogElement.prototype.close = originalClose;
   });

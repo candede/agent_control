@@ -1,5 +1,6 @@
 import { formatAgentAuthoringTool, formatPackageFacetLabel, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
-import type { UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
+import { powerPlatformAuthoringTool } from "./powerPlatformInventory.js";
+import type { SavedAgentPerson, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
 
 export type AgentRelevanceReason = "organization_created" | "organization_shared" | "microsoft" | "deployed" | "reported_usage";
 export type AgentColumnValue = string | number | null;
@@ -29,9 +30,52 @@ export function agentRelevanceReasons(record: UnifiedAgentRecord): AgentRelevanc
 
 export function matchesAgentView(record: UnifiedAgentRecord, view: UnifiedAgentView = "all") {
   if (view === "all") return true;
+  if (view === "available" || view === "unavailable") return agentUserAvailability(record) === view;
+  if (view === "availability_unknown") return agentUserAvailability(record) === "unknown";
   if (view === "used") return record.usage?.status === "linked" && (record.usage.responses ?? 0) > 0;
   const reasons = agentRelevanceReasons(record);
   return view === "organization" ? reasons.length > 0 : reasons.length === 0;
+}
+
+function packageAvailableToUsers(item: CopilotPackage) {
+  const availability = normalizePackageStatus(item.availableTo);
+  return item.isBlocked === false && (availability === "all" || availability === "some");
+}
+
+export function agentUserAvailability(record: UnifiedAgentRecord): "available" | "unavailable" | "unknown" {
+  if (record.powerPlatformResource?.details.isQuarantined === true) return "unavailable";
+  if (record.packages.some(packageAvailableToUsers)) return "available";
+  if (record.packages.length > 0 && record.packages.every(item =>
+    item.isBlocked === true || normalizePackageStatus(item.availableTo) === "none")) return "unavailable";
+  return "unknown";
+}
+
+export function agentUserAvailabilityLabel(record: UnifiedAgentRecord): string | null {
+  const availability = agentUserAvailability(record);
+  if (availability === "unknown") return null;
+  if (availability === "unavailable") return "Not available";
+  return record.packages.some(item => packageAvailableToUsers(item) && normalizePackageStatus(item.availableTo) === "all")
+    ? "All users" : "Specific users or groups";
+}
+
+export function summarizeAgentAvailability(records: readonly UnifiedAgentRecord[]) {
+  let availableToUsers = 0;
+  let organizationCreated = 0;
+  let teamsAvailable = 0;
+  let createdOrAvailable = 0;
+  for (const record of records) {
+    if (agentUserAvailability(record) === "available") availableToUsers += 1;
+    const created = agentRelevanceReasons(record).includes("organization_created");
+    const available = record.packages.some(item => {
+      const availability = normalizePackageStatus(item.availableTo);
+      return item.isBlocked === false && (availability === "all" || availability === "some")
+        && item.supportedHosts?.some(host => host.trim().toLowerCase() === "teams");
+    });
+    if (created) organizationCreated += 1;
+    if (available) teamsAvailable += 1;
+    if (created || available) createdOrAvailable += 1;
+  }
+  return { availableToUsers, organizationCreated, teamsAvailable, createdOrAvailable };
 }
 
 export function agentAccessLabel(value: string | undefined): string | null {
@@ -70,7 +114,16 @@ export function packageAuthoringTool(item: Pick<CopilotPackage, "authoringTool" 
 }
 
 export function agentAuthoringToolLabels(record: UnifiedAgentRecord) {
-  return uniqueValues([record.powerPlatformResource?.authoringTool, ...record.packages.map(packageAuthoringTool)], formatAgentAuthoringTool);
+  return uniqueValues([record.powerPlatformResource ? powerPlatformAuthoringTool(record.powerPlatformResource) : null,
+    ...record.packages.map(packageAuthoringTool)], formatAgentAuthoringTool);
+}
+
+export function agentPersonLabel(person: SavedAgentPerson | undefined, nativeId: string | null | undefined): string | null {
+  if (!person || !nativeId || person.objectId.toLowerCase() !== nativeId.trim().toLowerCase()) return nativeId ?? null;
+  const name = person.displayName && person.userPrincipalName ? `${person.displayName} (${person.userPrincipalName})`
+    : person.displayName || person.userPrincipalName || nativeId;
+  return person.status === "not_found" ? `${nativeId} (not found)`
+    : person.status === "lookup_failed" ? `${name} (lookup failed)` : name;
 }
 
 export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgentSort, environmentNames: Readonly<Record<string, string>> = {}): AgentColumnValue {
@@ -80,7 +133,7 @@ export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgen
     case "displayName": return record.displayName;
     case "environment": return record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : null;
     case "builtWith": return agentAuthoringToolLabels(record).join(" / ") || null;
-    case "availability": return agentAccessSummary(record, "availableTo");
+    case "availability": return agentUserAvailabilityLabel(record);
     case "status": {
       const hasKnownStatus = record.packages.some(item => typeof item.isBlocked === "boolean")
         || resource?.lifecycle === "published" || resource?.lifecycle === "draft"
@@ -94,8 +147,8 @@ export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgen
       ...(resource ? ["Organization-created"] : []),
     ]);
     case "deployment": return agentAccessSummary(record, "deployedTo");
-    case "owner": return details?.ownerId ?? null;
-    case "createdBy": return resource?.createdBy ?? null;
+    case "owner": return agentPersonLabel(record.people?.owner, details?.ownerId);
+    case "createdBy": return agentPersonLabel(record.people?.createdBy, resource?.createdBy);
     case "createdAt": return dateValue(resource?.createdAt ? [resource.createdAt] : record.packages.map(item => item.createdDateTime), "earliest");
     case "lastModifiedAt": return dateValue([details?.lastModifiedAt, resource?.lastPublishedAt, resource?.createdAt,
       ...record.packages.map(item => item.lastModifiedDateTime)]);

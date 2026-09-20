@@ -59,6 +59,7 @@ import {
   type InventoryRefreshJob,
   type PowerPlatformResource,
   type OfficialUsageAggregateView,
+  type OfficialUsageOverviewQuery,
   type OfficialUsageAgentQuery,
   type SessionUser,
   type UnifiedAgentInventoryPage,
@@ -85,10 +86,11 @@ import { CapabilityHealth, PermissionCenter } from "./components/PermissionCente
 import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
 import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
-import { TenantAdoptionInsights } from "./components/TenantAdoptionInsights";
 import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { ReportingView } from "./components/ReportingView";
+import { AgentInventoryOverview } from "./components/AgentInventoryOverview";
+import { CumulativeAgentActivity } from "./components/CumulativeAgentActivity";
 import { CopilotUsersView } from "./components/CopilotUsersView";
 import { InventoryExplorer } from "./components/InventoryExplorer";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
@@ -282,11 +284,15 @@ function App() {
   const [officialUsageLoadError, setOfficialUsageLoadError] = useState<string>();
   const [officialUsageAgentOffset, setOfficialUsageAgentOffset] = useState(0);
   const [officialUsageAgentQuery, setOfficialUsageAgentQuery] = useState<OfficialUsageAgentQuery>({});
-  const [officialUsageTab, setOfficialUsageTab] = useState<"activity" | "history">("activity");
+  const [officialUsageOverviewQuery, setOfficialUsageOverviewQuery] = useState<OfficialUsageOverviewQuery>({});
+  const [officialUsageTab, setOfficialUsageTab] = useState<"overview" | "activity" | "history">(
+    initialOfficialUsageRoute.view === "snapshot" ? "activity" : initialOfficialUsageRoute.view === "history" ? "history" : "overview",
+  );
   const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
   const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
   const [powerPlatformDataRevision, setPowerPlatformDataRevision] = useState(0);
   const [usageImportOpenRequest, setUsageImportOpenRequest] = useState(0);
+  const [usageImportView, setUsageImportView] = useState<"import" | "manage">("import");
   const usageImportTrigger = useRef<HTMLButtonElement>(null);
   const inactiveDays = 30;
   const [reportActivityWindowDays, setReportActivityWindowDays] = useState(initialOfficialUsageRoute.activityWindowDays);
@@ -486,7 +492,7 @@ function App() {
         setReportActivityWindowDays(route.activityWindowDays);
         setOfficialUsageAgentOffset(0);
         setOfficialUsageAgentQuery({});
-        setOfficialUsageTab("activity");
+        setOfficialUsageTab(route.view === "snapshot" ? "activity" : route.view === "history" ? "history" : "overview");
         setOfficialUsageLoadError(undefined);
       }
     }
@@ -581,6 +587,7 @@ function App() {
   useEffect(() => {
     if (activeView !== "official-usage") return;
     const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      view: officialUsageTab === "activity" ? "snapshot" : officialUsageTab,
       stagingId: requestedOfficialUsageStagingId,
       reportSetId: officialUsageReportSetId,
       activityWindowDays: reportActivityWindowDays,
@@ -589,7 +596,7 @@ function App() {
     if (`${window.location.pathname}${window.location.search}` !== next) {
       window.history.replaceState({ view: "official-usage" }, "", next);
     }
-  }, [activeView, officialUsageReportSetId, reportActivityWindowDays, requestedOfficialUsageStagingId]);
+  }, [activeView, officialUsageReportSetId, officialUsageTab, reportActivityWindowDays, requestedOfficialUsageStagingId]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
@@ -1029,16 +1036,18 @@ function App() {
     setUsersRoute(route);
   }
 
-  function handleOfficialUsageSnapshotChange(reportSetId: string | undefined) {
+  function handleOfficialUsageSnapshotChange(reportSetId: string | undefined, replace = false) {
     const activityWindowDays = reportSetId ? 365 : 30;
     const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      view: "snapshot",
       stagingId: requestedOfficialUsageStagingId,
       reportSetId,
       activityWindowDays,
     }));
     savedViewSearches.current.set("official-usage", next.includes("?") ? next.slice(next.indexOf("?")) : "");
     if (`${window.location.pathname}${window.location.search}` !== next) {
-      window.history.pushState({ view: "official-usage" }, "", next);
+      if (replace) window.history.replaceState({ view: "official-usage" }, "", next);
+      else window.history.pushState({ view: "official-usage" }, "", next);
     }
     setOfficialUsageLoadError(undefined);
     setOfficialUsageReportSetId(reportSetId);
@@ -1049,6 +1058,16 @@ function App() {
     setOfficialUsageDashboardRevision(revision => revision + 1);
   }
 
+  function handleCumulativeUsageView() {
+    const next = workbenchUrl("official-usage", officialUsageRouteSearch({
+      view: "overview", stagingId: requestedOfficialUsageStagingId, activityWindowDays: 30,
+    }));
+    if (`${window.location.pathname}${window.location.search}` !== next) window.history.pushState({ view: "official-usage" }, "", next);
+    setOfficialUsageReportSetId(undefined);
+    setReportActivityWindowDays(30);
+    setOfficialUsageTab("overview");
+  }
+
   function handleOfficialUsageChanged() {
     requestCurrentAgentReload();
     setOfficialUsageAgentOffset(0);
@@ -1056,6 +1075,11 @@ function App() {
     setOfficialUsageDashboardRevision(revision => revision + 1);
     setCopilotUsersDataRevision(revision => revision + 1);
     void dataSyncPanelRef.current?.refresh();
+  }
+
+  function openUsageImport(view: "import" | "manage" = "import") {
+    setUsageImportView(view);
+    setUsageImportOpenRequest(request => request + 1);
   }
 
   function handleDataSyncSourcesChanged(sources: DataSyncSourceId[]) {
@@ -1199,7 +1223,8 @@ function App() {
     setOfficialUsageAggregateSetId(undefined);
     setOfficialUsageLoadError(undefined);
     setLoadingOfficialUsage(false);
-    setOfficialUsageTab("activity");
+    setOfficialUsageTab("overview");
+    setOfficialUsageOverviewQuery({});
   }
 
   async function loadSession() {
@@ -2493,7 +2518,8 @@ function App() {
           onSetupRequiredChange={setSyncSetupRequired}
           onRunsChanged={handleSyncRunsChanged}
           requestedRunId={requestedDataSyncRunId}
-          onOpenUsageImport={() => setUsageImportOpenRequest(request => request + 1)}
+          onOpenUsageImport={() => openUsageImport()}
+          onManageUsageReports={() => openUsageImport("manage")}
           onRequestedRunChange={handleRequestedSyncRunChange}
           onSourcesChanged={handleDataSyncSourcesChanged}
         />
@@ -2501,6 +2527,7 @@ function App() {
       {visibleActiveView === "sync" ? (
         <>
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
+          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} />
           <AgentSyncTools
             inventory={unifiedAgentPage}
             verifyingInventory={loadingAgents || deferredQuery !== query}
@@ -2518,7 +2545,6 @@ function App() {
             onExportPowerPlatform={() => void handleExportPowerPlatformAgentCsv()}
             onOpenAgents={() => navigateToView("agents")}
           />
-          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} />
         </>
       ) : null}
       {canImportReports ? (
@@ -2526,10 +2552,15 @@ function App() {
           key={`${principalKey}:${requestedOfficialUsageStagingId ?? ""}`}
           initialStagingId={requestedOfficialUsageStagingId}
           openRequest={usageImportOpenRequest}
+          openView={usageImportView}
           showTrigger={false}
           returnFocusRef={usageImportTrigger}
           onChanged={handleOfficialUsageChanged}
           onLegacyCleared={() => setLegacyUsagePresent(false)}
+          onViewSnapshot={setId => {
+            navigateToView("official-usage");
+            handleOfficialUsageSnapshotChange(setId, true);
+          }}
         />
       ) : null}
       {legacyUsagePresent && visibleActiveView !== "official-usage" ? (
@@ -2582,7 +2613,9 @@ function App() {
             </div>
           </div>
 
-          <TenantAdoptionInsights key={principalKey} compact dataRevision={officialUsageDashboardRevision} />
+          {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
+            inventory={unifiedAgentReadError ? undefined : unifiedAgentPage} revision={officialUsageDashboardRevision}
+            view={agentView} onViewChange={view => { handleClearAgentFilters(); setAgentView(view); }} /> : null}
 
           {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
             <span>{agentExportError?.message ?? (unifiedAgentReadError
@@ -2639,7 +2672,8 @@ function App() {
               </label>
               <label>
                 <span>Show agents</span>
-                <select value={agentView} className={agentView === "all" ? undefined : "active-filter-select"} onChange={event => {
+                <select value={agentView} title={agentViewOptions.find(option => option.value === agentView)?.description}
+                  className={agentView === "all" ? undefined : "active-filter-select"} onChange={event => {
                   const option = agentViewOptions.find(item => item.value === event.target.value);
                   if (!option) {
                     setError("Choose a supported agent view.");
@@ -2659,9 +2693,9 @@ function App() {
                 </select>
               </label>
               <label>
-                <span>Available to</span>
+                <span>Assigned access</span>
                 <select value={availableToFilter} className={availableToFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setAvailableToFilter(event.target.value); setAgentPageIndex(0); }}>
-                  <option value="all">All availability</option>
+                  <option value="all">Any assignment</option>
                   {availableToOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </label>
@@ -2693,7 +2727,7 @@ function App() {
                   }}
                 >
                   <option value="all">All states</option>
-                  <option value="allowed">Allowed</option>
+                  <option value="allowed">Not blocked</option>
                   <option value="blocked">Blocked</option>
                 </select>
               </label>
@@ -2752,8 +2786,6 @@ function App() {
               </div>
             </div>
           </section>
-
-          {agentView !== "all" ? <p className="agent-view-note" role="status">{agentViewOptions.find(option => option.value === agentView)?.description}</p> : null}
 
           {canOperate && (selectedPowerPlatformTargets.size > 0 || pendingPowerPlatformIds.size > 0 || requestedQuarantineJobId) ? <CopilotStudioQuarantineControls
             snapshot={selectedQuarantineObservation}
@@ -2841,12 +2873,16 @@ function App() {
             </div>
             <div className="usage-page-header-actions">
               <div className="usage-page-views" role="group" aria-label="Official usage views">
-                <button type="button" className="secondary" aria-pressed={officialUsageTab === "activity"} onClick={() => setOfficialUsageTab("activity")}>Agent activity</button>
+                <button type="button" className="secondary" aria-pressed={officialUsageTab === "overview"} onClick={handleCumulativeUsageView}>Cumulative activity</button>
+                <button type="button" className="secondary" aria-pressed={officialUsageTab === "activity"} onClick={() => handleOfficialUsageSnapshotChange(officialUsageReportSetId)}>Snapshot details</button>
                 <button type="button" className="secondary" aria-pressed={officialUsageTab === "history"} onClick={() => setOfficialUsageTab("history")}>Report history</button>
               </div>
-              {canImportReports ? <button ref={usageImportTrigger} type="button" className="secondary" onClick={() => setUsageImportOpenRequest(request => request + 1)}><Upload size={16} />Import reports</button> : null}
+              {canImportReports ? <button ref={usageImportTrigger} type="button" className="secondary" onClick={() => openUsageImport()}><Upload size={16} />Import reports</button> : null}
             </div>
           </header>
+          {officialUsageTab === "overview" && hasRole(user, "AgentControl.Viewer") ? <CumulativeAgentActivity
+            key={principalKey} revision={officialUsageDashboardRevision} onSnapshot={handleOfficialUsageSnapshotChange}
+            initialQuery={officialUsageOverviewQuery} onQueryChange={setOfficialUsageOverviewQuery} /> : null}
           {officialUsageTab === "activity" && officialUsageReportSetId ? (
             <div className="usage-history-selection" role="status">
               <div>
@@ -2908,10 +2944,14 @@ function App() {
 
       {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
+          key={principalKey}
           record={selectedUnifiedAgent}
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
           inventoryRevision={unifiedAgentDetailPage?.sourcePage?.revision}
           onUsageChanged={() => {
+            if (sessionOwnerRef.current === principalKey) requestCurrentAgentReload();
+          }}
+          onPeopleChanged={() => {
             if (sessionOwnerRef.current === principalKey) requestCurrentAgentReload();
           }}
           dataRevision={officialUsageDashboardRevision}

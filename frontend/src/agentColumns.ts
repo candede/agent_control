@@ -1,10 +1,13 @@
 import { unifiedAgentSortKeys, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 
 export const agentViewOptions = [
-  { value: "all", label: "All catalog", description: "All agents in the authorized saved catalog and native inventory." },
-  { value: "organization", label: "Organization view", description: "Organization-created or shared agents, Microsoft agents, and agents with deployment or administrator-associated usage evidence. Availability alone does not qualify." },
-  { value: "used", label: "Used in selected report", description: "Agents with positive responses in the selected Microsoft 365 report and an administrator-reviewed association. This is not a live or all-channel activity measure." },
-  { value: "unknown", label: "Catalog only / unclassified", description: "Agents without qualifying organizational, deployment or linked usage evidence. Missing evidence does not prove that an agent is unused." },
+  { value: "all", label: "All agents in repository", description: "All agents in saved repository and Power Platform data, whether or not users can access them." },
+  { value: "available", label: "Available to end users", description: "Unblocked agents available to all or selected users, excluding known quarantined agents. Access is based on saved settings, not proof of use or an individual user's permissions." },
+  { value: "unavailable", label: "Not available to end users", description: "Agents known to be blocked, quarantined, or available to no users." },
+  { value: "availability_unknown", label: "End-user access unknown", description: "Agents without enough saved access information. Creation, publication, installation or past usage alone does not establish access." },
+  { value: "organization", label: "Organization-related agents", description: "Organization-created or shared agents, Microsoft agents, and agents with installation or reported usage. This does not establish end-user access." },
+  { value: "used", label: "Used in selected report", description: "Agents with positive responses in the selected Microsoft 365 report, matched automatically by exact saved package ID or through an existing administrator-reviewed association. This is not a live or all-channel activity measure." },
+  { value: "unknown", label: "No organization or usage evidence", description: "Agents without known organizational origin, installation or linked usage. This does not establish end-user access." },
 ] as const;
 
 export type AgentColumnId = UnifiedAgentSort | "actions";
@@ -22,7 +25,7 @@ export const agentColumns: readonly AgentColumnDefinition[] = [
   { id: "displayName", label: "Agent", group: "Overview" },
   { id: "environment", label: "Environment", group: "Overview" },
   { id: "builtWith", label: "Built with", group: "Overview" },
-  { id: "availability", label: "Availability", group: "Overview" },
+  { id: "availability", label: "End-user access", group: "Overview", description: "Saved access settings, accounting for blocking and known quarantine. Specific users or groups does not mean everyone has access." },
   { id: "status", label: "Status", group: "Overview" },
   { id: "hosts", label: "Hosts", group: "Overview", description: "Supported hosts, not evidence of usage in each host." },
   { id: "publisher", label: "Publisher", group: "Overview" },

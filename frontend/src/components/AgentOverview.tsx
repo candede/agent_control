@@ -5,17 +5,21 @@ import { formatPackageFacetLabel } from "../../../backend/src/types/copilotPacka
 import { extractConnectedServices, getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetails";
 import { usageDate } from "../usageInsights";
 import { AgentAuthoringTools, AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
+import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 
 const referencePageSize = 20;
 
-export function AgentOverview({ record, selectedPackage, packageDetail, environmentNames }: {
+export function AgentOverview({ record, selectedPackage, packageDetail, environmentNames, peopleState }: {
   record: UnifiedAgentRecord;
   selectedPackage?: CopilotPackage;
   packageDetail?: CopilotPackageDetail;
   environmentNames: Record<string, string>;
+  peopleState: ReturnType<typeof useAgentPeople>;
 }) {
   const [referenceOffset, setReferenceOffset] = useState(0);
   const resource = record.powerPlatformResource;
+  const { people, loading: loadingPeople, error: peopleError, unavailable: peopleUnavailable, canRetry, retry: retryPeople } = peopleState;
+  const missingName = resource && !resource.displayName?.trim() && record.displayName === resource.nativeId;
   const metadata = packageDetail ?? selectedPackage;
   const observedRecord = packageDetail ? {
     ...record,
@@ -49,11 +53,11 @@ export function AgentOverview({ record, selectedPackage, packageDetail, environm
     { label: "Built with", value: <AgentAuthoringTools record={observedRecord} /> },
     { label: "Environment", value: record.environmentId ? environmentNames[record.environmentId.toLowerCase()] || record.environmentId : undefined },
     { label: "Type", value: metadata?.type ? formatPackageFacetLabel(metadata.type) : undefined },
-    { label: "Owner", value: resource?.details.ownerId },
-    { label: "Created by", value: resource?.createdBy },
+    { label: "Owner", value: people.owner ? <Person value={people.owner} /> : undefined },
+    { label: "Created by", value: people.createdBy ? <Person value={people.createdBy} /> : undefined },
     { label: "Created", value: dateValue(resource?.createdAt ?? metadata?.createdDateTime) },
     { label: "Last modified", value: dateValue(resource?.details.lastModifiedAt ?? metadata?.lastModifiedDateTime) },
-    { label: "Last modified by", value: resource?.details.lastModifiedBy },
+    { label: "Last modified by", value: people.lastModifiedBy ? <Person value={people.lastModifiedBy} /> : undefined },
     { label: "Last published", value: dateValue(resource?.lastPublishedAt) },
     { label: "Last quarantined", value: dateValue(resource?.details.quarantinedAt) },
     { label: "Hosts", value: metadata?.supportedHosts?.map(formatPackageFacetLabel).join(", ") },
@@ -74,18 +78,23 @@ export function AgentOverview({ record, selectedPackage, packageDetail, environm
   return <div className="agent-overview">
     <div className="inventory-detail-grid agent-overview-facts">
       <OverviewFact label="Status" value={<AgentStatus record={observedRecord} />} />
-      <OverviewFact label="Available to" value={<AgentAvailability record={observedRecord} />} />
+      <OverviewFact label="End-user access" value={<AgentAvailability record={observedRecord} />} />
       <OverviewFact label="Installed for" value={installationSummary ?? (observedRecord.packages.length ? "Unknown" : "Not reported")} />
       <OverviewFact label="Connected services" value={serviceSummary} />
     </div>
-    {record.packages.length > 1 ? <p className="agent-insight-note">Status, availability and installation cover all {record.packages.length} published versions. Description and service references are for the selected version.</p> : null}
+    {record.packages.length > 1 ? <p className="agent-insight-note">Status, end-user access and installation cover all {record.packages.length} published versions. Description and service references are for the selected version.</p> : null}
     {descriptionHtml ? <div className="agent-overview-description rich-description" aria-label="Agent description" dangerouslySetInnerHTML={{ __html: descriptionHtml }} />
       : <p className="agent-overview-description">{description}</p>}
+    {missingName ? <p className="agent-insight-note">The saved inventory did not supply an agent name, so its resource ID is shown. This does not establish whether the agent was deleted.</p> : null}
     <section className="agent-overview-section" aria-label="Agent information">
       <h3>Agent information</h3>
       <dl className="agent-property-grid">
         {information.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{typeof item.value === "boolean" ? item.value ? "Yes" : "No" : item.value}</dd></div>)}
       </dl>
+      {loadingPeople ? <p role="status">Resolving agent people...</p> : null}
+      {peopleUnavailable ? <p className="agent-insight-note">{peopleUnavailable}</p> : null}
+      {peopleError ? <p className="error-banner" role="alert">{peopleError}</p> : null}
+      {canRetry ? <button type="button" className="secondary" onClick={retryPeople}>Retry person lookup</button> : null}
     </section>
     <section className="agent-overview-section" aria-label="Connected services">
       <h3>Connected services</h3>
@@ -122,6 +131,21 @@ export function AgentOverview({ record, selectedPackage, packageDetail, environm
         : hasReferences || connectors !== undefined ? "No connected-service metadata was reported for this agent." : "Connected-service metadata was not supplied for this agent."}</p> : null}
     </section>
   </div>;
+}
+
+function Person({ value }: { value: AgentPerson }) {
+  return <span className="agent-person">
+    <span>{value.displayName || value.address || value.id}</span>
+    {value.address ? <small>Sign-in: {value.address}</small> : null}
+    {value.displayName || value.address ? <small>ID: {value.id}</small> : null}
+    {value.observedAt ? <small>Saved directory: {usageDate(value.observedAt)}</small> : null}
+    {value.checkedAt && value.checkedAt !== value.observedAt ? <small>Last lookup attempt: {usageDate(value.checkedAt)}</small> : null}
+    {value.status === "not_found" ? <small>User not found at the last directory lookup.</small> : null}
+    {value.status === "lookup_failed" ? <small>Directory lookup failed.{value.displayName || value.address ? " Last known identity shown." : ""}</small> : null}
+    {value.expired ? <small>Saved lookup expired.</small> : null}
+    {value.invalidId ? <small>The saved identifier is not a resolvable Entra user ID.</small>
+      : value.status === "unverified" ? <small>Unverified directory identity.</small> : null}
+  </span>;
 }
 
 function OverviewFact({ label, value }: { label: string; value: ReactNode }) {

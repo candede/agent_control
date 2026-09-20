@@ -70,6 +70,7 @@ type GraphUser = {
   displayName?: unknown;
   accountEnabled?: unknown;
   employeeType?: unknown;
+  companyName?: unknown;
   department?: unknown;
   userType?: unknown;
   assignedLicenses?: unknown;
@@ -91,6 +92,8 @@ export type CopilotDirectoryUser = {
   servicePlans: CopilotServicePlan[];
 };
 
+export type CopilotDirectoryProgress = (observedCount: number) => void | Promise<void>;
+
 export type CopilotReportUser = {
   normalizedUserPrincipalName: string;
   activity: CopilotAppActivity;
@@ -104,8 +107,10 @@ export type CopilotReportResult = {
 export class CopilotUsageGraphClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
-  async listLicensedUsers(accessToken: string, signal?: AbortSignal): Promise<CopilotDirectoryUser[]> {
+  async listLicensedUsers(accessToken: string, signal?: AbortSignal, onProgress?: CopilotDirectoryProgress): Promise<CopilotDirectoryUser[]> {
+    signal?.throwIfAborted();
     const skus = await this.listCopilotSkus(accessToken, signal);
+    signal?.throwIfAborted();
     const users = new Map<string, CopilotDirectoryUser>();
     let observedRows = 0;
     const visited = new Set<string>();
@@ -116,9 +121,11 @@ export class CopilotUsageGraphClient {
       let expectedCount: number | undefined;
       let nextUrl: string | undefined = buildLicensedUsersUrl(batchIds);
       while (nextUrl) {
+        signal?.throwIfAborted();
         enforcePageBounds(nextUrl, visited, observedRows, maximumUsers, "Directory");
         visited.add(nextUrl);
         const page = await this.request<GraphCollection<GraphUser>>(nextUrl, accessToken, "directory", signal);
+        signal?.throwIfAborted();
         if (!Array.isArray(page.value)) throw providerSchema("Directory users response has an invalid collection.");
         if (expectedCount === undefined) {
           if (typeof page["@odata.count"] !== "number" || !Number.isSafeInteger(page["@odata.count"]) || page["@odata.count"] < 0) {
@@ -149,10 +156,16 @@ export class CopilotUsageGraphClient {
           page: visited.size, returnedCount: page.value.length, totalRecords: expectedCount,
           observedCount: batchUsers.size, hasContinuation: Boolean(nextUrl),
         });
+        await onProgress?.(users.size);
+        signal?.throwIfAborted();
       }
       if (batchUsers.size !== expectedCount) {
         throw new AppError(502, "provider_count_mismatch", "Directory license totals changed or paging was incomplete; refresh usage.");
       }
+    }
+    if (!skuIds.length) {
+      await onProgress?.(0);
+      signal?.throwIfAborted();
     }
     operationalLog("info", "copilot_license_inventory", {
       count: users.size, pages: visited.size, observedCount: observedRows, catalogScopedCount: skus.size,
@@ -166,9 +179,11 @@ export class CopilotUsageGraphClient {
     let observedRows = 0;
     let nextUrl: string | undefined = buildSubscribedSkusUrl();
     while (nextUrl) {
+      signal?.throwIfAborted();
       enforcePageBounds(nextUrl, visited, observedRows, maximumSkus, "License catalog");
       visited.add(nextUrl);
       const page = await this.request<GraphCollection<unknown>>(nextUrl, accessToken, "catalog", signal);
+      signal?.throwIfAborted();
       if (!Array.isArray(page.value)) throw providerSchema("Tenant license catalog has an invalid collection.");
       observedRows += page.value.length;
       if (observedRows > maximumSkus) throw providerLimit("Tenant license catalog exceeded the result limit.");
@@ -261,7 +276,7 @@ export function buildSubscribedSkusUrl() {
 export function buildLicensedUsersUrl(skuIds: readonly string[]) {
   if (skuIds.length === 0 || skuIds.length > skusPerQuery) throw providerSchema("Directory SKU filter has an invalid size.");
   const url = new URL(`${graphV1}/users`);
-  url.searchParams.set("$select", "id,userPrincipalName,displayName,accountEnabled,employeeType,department,userType,assignedLicenses,assignedPlans,licenseAssignmentStates");
+  url.searchParams.set("$select", "id,userPrincipalName,displayName,accountEnabled,employeeType,companyName,department,userType,assignedLicenses,assignedPlans,licenseAssignmentStates");
   url.searchParams.set("$filter", skuIds
     .map(skuId => `assignedLicenses/any(value:value/skuId eq ${skuId})`).join(" or "));
   url.searchParams.set("$count", "true");
@@ -357,6 +372,7 @@ function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, string>): 
       accountEnabled: optionalBoolean(user.accountEnabled, "Directory account state"),
       userType,
       employeeType: optionalText(user.employeeType, "Directory employee type", 128),
+      companyName: optionalText(user.companyName, "Directory company name", 256),
       department: optionalText(user.department, "Directory department", 256),
     },
     licenses: copilot.map(license => ({

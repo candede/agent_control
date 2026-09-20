@@ -157,6 +157,21 @@ describe("DirectoryPrincipalsClient", () => {
     });
   });
 
+  it("keeps UPN separate from mail and honors caller cancellation", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      id: userId, displayName: "Person", mail: "mail@example.invalid", userPrincipalName: "login@example.invalid",
+    }));
+    const client = new DirectoryPrincipalsClient(fetcher);
+    expect((await client.resolve("token", [{ resourceType: "user", resourceId: userId }]))[0]).toMatchObject({
+      secondaryText: "mail@example.invalid", userPrincipalName: "login@example.invalid",
+    });
+    fetcher.mockClear();
+    const controller = new AbortController();
+    controller.abort(new Error("Stopped"));
+    await expect(client.resolve("token", [{ resourceType: "user", resourceId: userId }], controller.signal)).rejects.toThrow("Stopped");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("bounds concurrent requests while resolving principals", async () => {
     let activeRequests = 0;
     let peakRequests = 0;

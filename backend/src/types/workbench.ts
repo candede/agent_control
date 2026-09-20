@@ -1,4 +1,5 @@
 import type { AppRole, CapabilityId } from "./capability.js";
+import type { DataSyncSourceId } from "./dataSync.js";
 
 export const workbenchViewIds = [
   "agents",
@@ -63,6 +64,9 @@ export type WorkbenchJobSummary = {
   canResume: boolean;
   canCancel: boolean;
   canReconcile: boolean;
+  startedAt?: string;
+  completedAt?: string;
+  syncSources?: DataSyncSourceId[];
   updatedAt: string;
   expiresAt?: string;
   href: `/${string}`;

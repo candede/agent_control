@@ -2,12 +2,6 @@
   min-width: 0;
 }
 
-.agent-view-note {
-  margin: 0;
-  color: var(--muted);
-  font-size: 13px;
-}
-
 .agent-grid-toolbar,
 .agent-column-popover-heading {
   display: flex;
@@ -104,15 +98,6 @@ button.agent-sort-heading {
   flex: 0 0 auto;
 }
 
-.agent-usage-column-context {
-  margin: 0 0 12px;
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--muted);
-  font-size: 13px;
-}
-
 .agent-summary-status {
   display: grid;
   gap: 0.2rem;
@@ -129,6 +114,11 @@ button.agent-sort-heading {
   text-align: left;
   text-decoration: underline;
   text-underline-offset: 3px;
+}
+
+.agent-name-button:hover {
+  background: transparent;
+  text-decoration-thickness: 2px;
 }
 
 .unified-agent-detail-modal .agent-summary-status {
@@ -368,6 +358,16 @@ button.agent-sort-heading {
   margin: 4px 0 0;
   color: var(--text-h);
   font-weight: 600;
+}
+
+.agent-person {
+  display: grid;
+  gap: 3px;
+}
+
+.agent-person small {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .agent-service-list {

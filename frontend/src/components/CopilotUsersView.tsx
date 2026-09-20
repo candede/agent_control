@@ -134,7 +134,8 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
     const query = search.trim().toLowerCase();
     return data.users.filter(user => {
       if (query && ![
-        user.directory.displayName, user.directory.userPrincipalName, user.directory.objectId, user.directory.department,
+        user.directory.displayName, user.directory.userPrincipalName, user.directory.objectId,
+        user.directory.companyName, user.directory.department,
         ...(user.importedUsage?.rows.flatMap(row => [row.displayAgentName, row.creatorType]) ?? []),
       ].some(value => value?.toLowerCase().includes(query))) return false;
       if (cohort === "attention") return directoryCurrent && needsAttention(user, threshold, agentUsageFresh, appActivityFresh);
@@ -198,7 +199,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
     </div>
 
     <div className="copilot-users-toolbar" aria-label="Licensed user filters">
-      <label><span>Search users or agents</span><input type="search" placeholder="Name, email, agent or Microsoft" value={search} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
+      <label><span>Search users or agents</span><input type="search" placeholder="Name, email, company, department or agent" value={search} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
       <label><span>Order by</span><select value={sort} onChange={event => {
         const value = event.target.value;
         if (value === "responses-desc" || value === "responses-asc" || value === "activity" || value === "name") { setSort(value); setPage(0); }
@@ -327,7 +328,7 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
     onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); onClose(); } }}
     onCancel={event => { event.preventDefault(); onClose(); }}>
     <header>
-      <div><h2 id="copilot-user-name">{name(user)}</h2><p>{user.directory.userPrincipalName}{user.directory.department ? ` | ${user.directory.department}` : ""}</p><span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span></div>
+      <div><h2 id="copilot-user-name">{name(user)}</h2><p>{user.directory.userPrincipalName}</p><span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span></div>
       <button ref={close} type="button" className="secondary icon-button" aria-label="Close user details" onClick={onClose}><X size={20} aria-hidden="true" /></button>
     </header>
     <div className="copilot-user-metrics">
@@ -335,6 +336,11 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
       <Metric label="Agent responses" value={responses(user)} hint={fresh ? "Imported Users report total" : "Historical or missing report"} />
       <Metric label="Agents used" value={imported && !imported.missingUserReport ? imported.reportedAgentsUsed : null} hint="Imported Users report total" />
     </div>
+    <section aria-label="Saved directory organization">
+      <h3>Organization</h3>
+      <p>Company: {user.directory.companyName || "Not reported"}</p>
+      <p>Department: {user.directory.department || "Not reported"}</p>
+    </section>
     <section aria-label="User license details">
       <h3>License assignment</h3>
       <p>{user.licenses.map(license => `${license.skuPartNumber}: ${license.state}`).join("; ")}{user.directory.accountEnabled === false ? ". This directory account is disabled." : ""}</p>

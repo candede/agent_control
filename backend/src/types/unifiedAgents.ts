@@ -20,7 +20,7 @@ export const unifiedAgentSortKeys = [
 ] as const;
 export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
-export const unifiedAgentViews = ["all", "organization", "used", "unknown"] as const;
+export const unifiedAgentViews = ["all", "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
 export type UnifiedAgentView = typeof unifiedAgentViews[number];
 
 export type UnifiedAgentTarget =
@@ -122,6 +122,18 @@ export type UnifiedAgentSourceStatus =
       error: UnifiedAgentSourceError;
     };
 
+export type SavedAgentPerson = {
+  objectId: string;
+  displayName: string | null;
+  /** Directory sign-in name, not a verified email address. */
+  userPrincipalName: string | null;
+  observedAt: string;
+  status?: "resolved" | "not_found" | "lookup_failed";
+  checkedAt?: string;
+  expiresAt?: string;
+  errorCode?: string;
+};
+
 export type UnifiedAgentRecord = {
   id: string;
   displayName: string;
@@ -129,6 +141,11 @@ export type UnifiedAgentRecord = {
   environmentId: string | null;
   packages: CopilotPackage[];
   powerPlatformResource: PowerPlatformResource | null;
+  people?: {
+    owner?: SavedAgentPerson;
+    createdBy?: SavedAgentPerson;
+    lastModifiedBy?: SavedAgentPerson;
+  };
   usage?: AgentUsageSummary;
   identity: {
     state: UnifiedAgentLinkState;
@@ -177,6 +194,12 @@ export type UnifiedAgentInventoryVerification = {
 export type UnifiedAgentInventoryPage = {
   revision?: string;
   usageContext?: AgentUsageContext;
+  inventoryOverview?: {
+    availableToUsers: number;
+    organizationCreated: number;
+    teamsAvailable: number;
+    createdOrAvailable: number;
+  };
   value: UnifiedAgentRecord[];
   count: number;
   offset: number;

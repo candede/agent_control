@@ -65,7 +65,7 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "not_registered", adapterRegistered: false, description: "The beta POST contract is documented, but package detail exposes no owner field for required provider readback." },
   },
   {
-    id: "graph.directory.read", displayName: "Directory lookup", purpose: "Resolve users and groups for exact package access assignments.",
+    id: "graph.directory.read", displayName: "Directory lookup", purpose: "Resolve agent people and users or groups for exact package access assignments.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
     permissions: ["User.ReadBasic.All", "Group.Read.All"], providerRoles: [], licenses: [], configuration: ["Delegated consent"],
     sources: [directorySource], dataClass: "directory", internalRoles: viewer, consentGroup: "graph.directory.read",

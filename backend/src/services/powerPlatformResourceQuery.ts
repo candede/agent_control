@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import {
+  derivePowerPlatformAuthoringTool,
   powerPlatformResourceTypes,
   type InventoryConnector,
   type InventoryConnectorOperation,
@@ -445,7 +446,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     if (typeof value.tenantId === "string" || value.tenantId === null) details.sourceTenantId = value.tenantId;
     context.provenance.sourceTenantId = { sourceSystem: "power_platform", path: value.tenantId === undefined ? "not_supplied" : "tenantId", maturity: "ga" };
   }
-  const authoringTool = deriveAuthoringTool(type, createdIn);
+  const authoringTool = derivePowerPlatformAuthoringTool(type, createdIn);
   const agentKind = deriveAgentKind(type, createdIn, details.subType);
   const lifecycle = deriveLifecycle(type, context.properties.lastPublishedAt, Object.hasOwn(context.properties, "lastPublishedAt"), lastPublishedAt);
   context.provenance.sourceSystem = { sourceSystem: "power_platform", path: "PowerPlatformResources", maturity: "ga" };
@@ -646,20 +647,9 @@ function optionalStringArray(context: ProjectionContext, property: string, path:
   return retained;
 }
 
-function deriveAuthoringTool(type: PowerPlatformResourceType, createdIn: string | null) {
-  if (type === "microsoft.copilotstudio/agents") {
-    const normalized = createdIn?.toLowerCase().replace(/[^a-z0-9]/g, "");
-    return normalized === "copilotstudio" ? "Copilot Studio"
-      : normalized === "microsoft365copilotagentbuilder" ? "Microsoft 365 Copilot Agent Builder" : null;
-  }
-  if (type.startsWith("microsoft.powerapps/")) return "Power Apps";
-  if (type === "microsoft.powerautomate/cloudflows" || type === "microsoft.powerautomate/agentflows") return "Power Automate";
-  return null;
-}
-
 function deriveAgentKind(type: PowerPlatformResourceType, createdIn: string | null, subType?: string) {
   if (type === "microsoft.copilotstudio/agents") {
-    const authoringTool = deriveAuthoringTool(type, createdIn);
+    const authoringTool = derivePowerPlatformAuthoringTool(type, createdIn);
     return authoringTool === "Microsoft 365 Copilot Agent Builder" ? "agent_builder_agent"
       : authoringTool === "Copilot Studio" ? "copilot_studio_agent" : "agent";
   }

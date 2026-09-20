@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus } from "../types/dataSync.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import type { CopilotUsageRefreshResult, CopilotUsageService } from "./copilotUsage.js";
 import { DataSyncService } from "./dataSync.js";
 
 const user: AuthenticatedUser = {
@@ -23,14 +24,10 @@ describe("DataSyncService", () => {
     expect(harness.repository.getRun).toHaveBeenCalledWith(scope, harness.run.id);
   });
 
-  it("starts broad delegated core sources, includes non-agent Power Platform types, and waits for required uploads", async () => {
+  it.each(["initial", "incremental", "full"] as const)("starts only automatic sources by default in %s mode", async mode => {
     const harness = serviceHarness();
-    const started = await harness.service.start(user, { mode: "initial" });
-    expect(started.sources.find(source => source.source === "usage_reports")).toMatchObject({
-      status: "awaiting_upload",
-      canRetry: false,
-      message: expect.stringContaining("requiresAdmin"),
-    });
+    const started = await harness.service.start(user, { mode });
+    expect(started.sources.map(source => source.source)).toEqual(["users", "graph_packages", "power_platform"]);
     await vi.waitFor(() => {
       expect(harness.packages.submit).toHaveBeenCalled();
       expect(harness.powerPlatform.submit).toHaveBeenCalled();
@@ -50,7 +47,10 @@ describe("DataSyncService", () => {
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), {
       incompleteOnly: false,
       publication: { runId: harness.run.id, jobId: expect.any(String) },
+      onDirectoryProgress: expect.any(Function),
     });
+    await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
+    expect((await harness.service.state(user)).usageImportRequired).toBe(true);
   });
 
   it("passes the clean full opt-in through admission while retaining accepted official usage", async () => {
@@ -60,10 +60,52 @@ describe("DataSyncService", () => {
     expect(harness.repository.submit).toHaveBeenCalledWith({
       tenantId: user.tenantId, principalId: user.homeAccountId,
     }, { mode: "full", clearSavedData: true });
-    expect(started.sources.find(source => source.source === "usage_reports")).toMatchObject({
+    expect(started.sources.map(source => source.source)).toEqual(["users", "graph_packages", "power_platform"]);
+    expect((await harness.service.state(user)).sources.find(source => source.source === "usage_reports")).toMatchObject({
       status: "succeeded", count: 3, canRetry: false,
     });
     await vi.waitFor(() => expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled());
+  });
+
+  it("waits for the new native inventory before resolving people, without delaying licensed collection", async () => {
+    const harness = serviceHarness();
+    const pending = deferred<ReturnType<typeof powerPlatformJob>>();
+    harness.powerPlatform.start.mockReturnValueOnce(pending.promise);
+    harness.copilotUsage.refreshUsers.mockImplementationOnce(async (_user, _signal, options) => {
+      await options.onDirectoryProgress?.(7);
+      return { status: "succeeded", count: 7, message: "Saved seven licensed users." };
+    });
+    await harness.service.start(user, { mode: "full" });
+    await vi.waitFor(() => expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled());
+    await vi.waitFor(() => expect(harness.run.sources.find(source => source.source === "users")).toMatchObject({
+      status: "running", count: null, message: expect.stringContaining("Waiting for Power Platform"),
+    }));
+    expect(harness.agentPeople.refreshReferences).not.toHaveBeenCalled();
+    pending.resolve(powerPlatformJob(randomUUID(), "succeeded", 2));
+    await vi.waitFor(() => expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(
+      user, expect.any(AbortSignal), { runId: harness.run.id, jobId: expect.any(String) }, { incompleteOnly: false },
+    ));
+    await vi.waitFor(() => expect(harness.run.sources.find(value => value.source === "users")).toMatchObject({
+      status: "succeeded", count: 7,
+    }));
+  });
+
+  it("reports partial Users success when referenced identities fail and preserves licensed counts", async () => {
+    const harness = serviceHarness();
+    harness.agentPeople.refreshReferences.mockResolvedValueOnce({ changed: true, resolved: 3, notFound: 1, failed: 2 });
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources.find(value => value.source === "users")).toMatchObject({
+      status: "partial", count: 0, canRetry: true, message: expect.stringContaining("2 lookup failures"),
+    }));
+  });
+
+  it("does not silently declare success when the people provider fails", async () => {
+    const harness = serviceHarness();
+    harness.agentPeople.refreshReferences.mockRejectedValueOnce(new Error("network unavailable"));
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources.find(value => value.source === "users")).toMatchObject({
+      status: "partial", count: 0, canRetry: true, message: expect.stringContaining("not fully refreshed"),
+    }));
   });
 
   it("reconciles child progress on state reads without starting or submitting provider work", async () => {
@@ -81,6 +123,204 @@ describe("DataSyncService", () => {
     expect(harness.packages.submit).not.toHaveBeenCalled();
     expect(harness.packages.start).not.toHaveBeenCalled();
     expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps every saved source visible after a users-only completed run, without requiring manual reports for onboarding", async () => {
+    const harness = serviceHarness();
+    for (const [index, marker] of harness.markers.entries()) {
+      if (marker.source !== "usage_reports") Object.assign(marker, {
+        status: "succeeded", count: index * 10, lastSuccessAt: harness.run.startedAt,
+      });
+    }
+    harness.run.sources = [{ ...harness.run.sources[0], status: "succeeded", count: 0 }];
+    harness.run.status = "completed";
+    const state = await harness.service.state(user);
+    expect(state).toMatchObject({ onboardingRequired: false, usageImportRequired: true });
+    expect(state.sources).toEqual([
+      expect.objectContaining({ source: "users", status: "succeeded", count: 0 }),
+      expect.objectContaining({ source: "graph_packages", status: "succeeded", count: 10 }),
+      expect.objectContaining({ source: "power_platform", status: "succeeded", count: 20 }),
+      expect.objectContaining({ source: "usage_reports", status: "not_started", count: null }),
+    ]);
+    expect(state.run?.sources).toHaveLength(1);
+  });
+
+  it.each(["partial", "failed", "cancelled"] as const)("retains saved counts while the newer Users attempt is %s", async status => {
+    const harness = serviceHarness();
+    Object.assign(harness.markers[0], { status: "succeeded", count: 40, lastSuccessAt: harness.run.startedAt });
+    harness.run.sources = [{ ...harness.run.sources[0], status, count: 3, canRetry: true }];
+    harness.run.status = status === "cancelled" ? "cancelled" : "partial";
+    const state = await harness.service.state(user);
+    expect(state.sources[0]).toMatchObject({ source: "users", status: "succeeded", count: 40 });
+    expect(state.run?.sources[0]).toMatchObject({ source: "users", status, count: 3 });
+  });
+
+  it.each(["users-only", "succeeded", "cancelled", "no-run"] as const)(
+    "reconciles the currently accepted usage selection independently of a %s latest run",
+    async latest => {
+      const harness = serviceHarness();
+      const missing = await harness.officialUsage.getPublished();
+      harness.run.sources = [harness.run.sources.find(source => source.source === (latest === "users-only" ? "users" : "usage_reports"))!];
+      harness.run.sources[0].status = latest === "cancelled" ? "cancelled" : "succeeded";
+      harness.run.sources[0].count = 99;
+      harness.run.status = latest === "cancelled" ? "cancelled" : "completed";
+      if (latest === "no-run") harness.repository.getLatestRun.mockResolvedValue(undefined);
+      const historical = structuredClone(harness.run);
+      harness.officialUsage.getPublished.mockResolvedValue(acceptedUsage() as never);
+      expect((await harness.service.state(user)).sources[3]).toMatchObject({ status: "succeeded", count: 3 });
+
+      const replacement = acceptedUsage();
+      replacement.reports.users.rows.push({});
+      replacement.activeSet.acceptedAt = "2026-09-16T10:00:00.000Z";
+      harness.officialUsage.getPublished.mockResolvedValue(replacement as never);
+      const current = await harness.service.state(user);
+      expect(current.sources[3]).toMatchObject({
+        source: "usage_reports", status: "succeeded", count: 4, lastSuccessAt: replacement.activeSet.acceptedAt,
+      });
+      expect(harness.repository.recordSuccessMarker).toHaveBeenLastCalledWith(
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, "usage_reports", 4, replacement.activeSet.acceptedAt,
+      );
+
+      harness.officialUsage.getPublished.mockResolvedValue(missing);
+      const removed = await harness.service.state(user);
+      expect(removed.usageImportRequired).toBe(true);
+      expect(removed.sources[3]).toMatchObject({
+        status: "not_started", count: null, lastSuccessAt: null, updatedAt: null,
+      });
+      expect(harness.run).toEqual(historical);
+    },
+  );
+
+  it("preserves explicit manual report requests and waits for an administrator's upload", async () => {
+    const harness = serviceHarness();
+    expect((await harness.service.start(user, { mode: "initial", sources: ["usage_reports"] })).sources).toEqual([
+      expect.objectContaining({ source: "usage_reports", status: "awaiting_upload", count: null, canRetry: false }),
+    ]);
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+  });
+
+  it("treats a complete accepted zero-row report bundle as saved usage rather than a required import", async () => {
+    const harness = serviceHarness();
+    const published = acceptedUsage();
+    for (const report of Object.values(published.reports)) report.rows.length = 0;
+    harness.officialUsage.getPublished.mockResolvedValue(published as never);
+    const state = await harness.service.state(user);
+    expect(state.usageImportRequired).toBe(false);
+    expect(state.sources[3]).toMatchObject({ source: "usage_reports", status: "succeeded", count: 0 });
+  });
+
+  it.each(["graph_packages", "power_platform"] as const)("projects measured %s progress and preserves its phase message", async sourceId => {
+    const harness = serviceHarness();
+    const source = harness.run.sources.find(value => value.source === sourceId)!;
+    source.status = "running";
+    source.jobId = randomUUID();
+    Object.assign(harness.markers.find(value => value.source === sourceId)!, { status: "succeeded", count: 50 });
+    const job = {
+      ...(sourceId === "graph_packages" ? packageJob(source.jobId, "running", 7) : powerPlatformJob(source.jobId, "running", 7)),
+      totalRecords: 120,
+      message: "Checking matching identities: 7 of 120 checked.",
+    };
+    const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+    provider.get.mockResolvedValueOnce(job as never);
+    const state = await harness.service.state(user);
+    expect(state.run?.sources.find(value => value.source === sourceId)).toMatchObject({
+      status: "running", count: 7, message: job.message,
+    });
+    expect(state.sources.find(value => value.source === sourceId)).toMatchObject({ status: "succeeded", count: 50 });
+
+    provider.get.mockResolvedValueOnce({ ...job, status: "succeeded", totalRecords: 12, observedCount: 10 } as never);
+    const completed = await harness.service.state(user);
+    expect(completed.run?.sources.find(value => value.source === sourceId)).toMatchObject({ status: "succeeded", count: 12 });
+    expect(completed.sources.find(value => value.source === sourceId)).toMatchObject({ status: "succeeded", count: 12 });
+  });
+
+  it.each(["graph_packages", "power_platform"] as const)("does not label %s targets as observed records before or after a failed attempt", async sourceId => {
+    const harness = serviceHarness();
+    const job = sourceId === "graph_packages"
+      ? packageJob(randomUUID(), "waiting_authorization", 0)
+      : powerPlatformJob(randomUUID(), "waiting_authorization", 0);
+    const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+    provider.submit.mockResolvedValueOnce({ ...job, totalRecords: 90 } as never);
+    provider.start.mockResolvedValueOnce({ ...job, status: "failed", observedCount: 4, totalRecords: 90 } as never);
+    await harness.service.start(user, { mode: "incremental", sources: [sourceId] });
+    await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({ status: "failed", count: 4 }));
+    expect(harness.repository.updateSource).toHaveBeenCalledWith(
+      expect.anything(), harness.run.id, sourceId, expect.objectContaining({ status: "waiting_authorization", count: 0 }),
+    );
+  });
+
+  it("persists count-only Users page progress and exposes the agent-people phase before success", async () => {
+    const harness = serviceHarness();
+    Object.assign(harness.markers[0], { status: "succeeded", count: 40, lastSuccessAt: harness.run.startedAt });
+    const reading = deferred<CopilotUsageRefreshResult>();
+    const resolving = deferred<Awaited<ReturnType<typeof harness.agentPeople.refreshReferences>>>();
+    harness.copilotUsage.refreshUsers.mockImplementationOnce(async (_user, _signal, options) => {
+      await options.onDirectoryProgress?.(12);
+      return reading.promise;
+    });
+    harness.agentPeople.refreshReferences.mockReturnValueOnce(resolving.promise);
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({
+      status: "running", count: 12, message: expect.stringContaining("12 distinct licensed users"),
+    }));
+    reading.resolve({ status: "succeeded", count: 12, message: "Saved directory/license and app-activity sources." });
+    await vi.waitFor(() => expect(harness.agentPeople.refreshReferences).toHaveBeenCalled());
+    expect(harness.run.sources[0]).toMatchObject({
+      status: "running", count: null, message: expect.stringContaining("Resolving agent people"),
+    });
+    const state = await harness.service.state(user);
+    expect(state.sources[0]).toMatchObject({ source: "users", status: "succeeded", count: 40 });
+    expect(state.run?.sources[0]).toMatchObject({ source: "users", status: "running", count: null });
+    resolving.resolve({ changed: true, resolved: 2, notFound: 1, failed: 0 });
+    await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({ status: "succeeded", count: 12 }));
+  });
+
+  it("does not present a retained directory total as newly observed when a people-only retry fails", async () => {
+    const harness = serviceHarness();
+    harness.copilotUsage.refreshUsers.mockResolvedValueOnce({
+      status: "succeeded", count: 80, message: "All saved user sources already completed successfully.",
+    });
+    harness.agentPeople.refreshReferences.mockResolvedValueOnce({ changed: false, resolved: 0, notFound: 0, failed: 1 });
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({ status: "partial", count: null }));
+  });
+
+  it("surfaces failed durable Users progress writes as a failed attempt", async () => {
+    const harness = serviceHarness();
+    const update = harness.repository.updateSource.getMockImplementation()!;
+    harness.repository.updateSource.mockImplementation(async (...args) => {
+      if (args[3].count === 5) throw new Error("Progress persistence unavailable.");
+      return update(...args);
+    });
+    harness.copilotUsage.refreshUsers.mockImplementationOnce(async (_user, _signal, options) => {
+      await options.onDirectoryProgress?.(5);
+      throw new Error("Must not continue after failed progress persistence.");
+    });
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({ status: "failed", count: null, canRetry: true }));
+    expect(harness.agentPeople.refreshReferences).not.toHaveBeenCalled();
+  });
+
+  it("rejects late Users page progress after cancellation without writing or resolving people", async () => {
+    const harness = serviceHarness();
+    const reading = deferred<CopilotUsageRefreshResult>();
+    let onProgress: Parameters<CopilotUsageService["refreshUsers"]>[2]["onDirectoryProgress"];
+    harness.copilotUsage.refreshUsers.mockImplementationOnce(async (_user, _signal, options) => {
+      onProgress = options.onDirectoryProgress;
+      await onProgress?.(2);
+      return reading.promise;
+    });
+    await harness.service.start(user, { mode: "incremental", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources[0].count).toBe(2));
+    const cancellation = harness.service.cancel(user, harness.run.id);
+    await vi.waitFor(() => expect(harness.repository.cancel).toHaveBeenCalled());
+    await expect(onProgress!(3)).rejects.toMatchObject({ code: "read_job_cancelled" });
+    reading.resolve({ status: "succeeded", count: 3, message: "Finished after cancellation." });
+    await cancellation;
+    expect(harness.run.sources[0]).toMatchObject({ status: "cancelled", count: 2 });
+    expect(harness.agentPeople.refreshReferences).not.toHaveBeenCalled();
+    expect(harness.repository.updateSource.mock.calls.some(call => call[3].count === 3)).toBe(false);
   });
 
   it("lets an existing complete accepted three-report bundle satisfy a nondestructive resync", async () => {
@@ -302,16 +542,21 @@ describe("DataSyncService", () => {
 
 function serviceHarness() {
   const run = dataSyncRun();
-  const markers = run.sources.map(source => ({ ...source, status: "not_started" as const, updatedAt: null }));
+  const markers: DataSyncSourceStatus[] = run.sources.map(source => ({ ...source, status: "not_started", updatedAt: null }));
+  const saveMarker = (source: DataSyncSourceId, count: number | null, lastSuccessAt: string) => {
+    Object.assign(markers.find(value => value.source === source)!, {
+      status: "succeeded", count, lastSuccessAt, updatedAt: lastSuccessAt,
+    });
+  };
   const repository = {
     submit: vi.fn(async (_scope, input) => {
-      const requested = new Set<DataSyncSourceId>(input.sources ?? ["users", "graph_packages", "power_platform", "usage_reports"]);
-      if (input.mode === "initial" || input.mode === "full") requested.add("usage_reports");
+      const requested = new Set<DataSyncSourceId>(input.sources ?? ["users", "graph_packages", "power_platform"]);
+      run.mode = input.mode;
       run.sources = run.sources.filter(source => requested.has(source.source));
       return { run, created: true };
     }),
     getRun: vi.fn(async () => run),
-    getLatestRun: vi.fn(async () => run),
+    getLatestRun: vi.fn(async (): Promise<DataSyncRun | undefined> => run),
     listRuns: vi.fn(async () => [run]),
     getSourceAttempt: vi.fn(async () => 1),
     listMarkers: vi.fn(async () => markers),
@@ -319,12 +564,24 @@ function serviceHarness() {
       run.sources.find(value => value.source === source)!.jobId = jobId;
     }),
     updateSource: vi.fn(async (_scope, _runId, source: DataSyncSourceId, update: Partial<DataSyncSourceStatus>) => {
-      Object.assign(run.sources.find(value => value.source === source)!, update, { updatedAt: new Date().toISOString() });
+      const current = run.sources.find(value => value.source === source)!;
+      if (!["running", "waiting"].includes(run.status) || current.status === "succeeded"
+        || (update.jobId && current.jobId && update.jobId !== current.jobId)) return run;
+      Object.assign(current, update, { updatedAt: new Date().toISOString() });
+      if (current.status === "succeeded") saveMarker(source, current.count, current.lastSuccessAt ?? current.updatedAt!);
+      const statuses = run.sources.map(value => value.status);
+      run.status = statuses.some(status => ["queued", "running"].includes(status)) ? "running"
+        : statuses.some(status => ["waiting_authorization", "permission_required", "awaiting_upload"].includes(status)) ? "waiting"
+          : statuses.every(status => status === "succeeded") ? "completed" : "partial";
       return run;
     }),
-    recordSuccessMarker: vi.fn(),
+    recordSuccessMarker: vi.fn(async (_scope, source: DataSyncSourceId, count: number | null, lastSuccessAt: string) => saveMarker(source, count, lastSuccessAt)),
     retry: vi.fn(async (_scope, _id, sources) => sources ?? []),
-    cancel: vi.fn(async () => run),
+    cancel: vi.fn(async () => {
+      run.status = "cancelled";
+      for (const source of run.sources) if (source.status !== "succeeded") source.status = "cancelled";
+      return run;
+    }),
     pausePrincipal: vi.fn(async () => 1),
     recoverInterrupted: vi.fn(async () => 0),
   };
@@ -343,11 +600,15 @@ function serviceHarness() {
     waitForPrincipalAuthorization: vi.fn(async () => undefined),
   };
   const copilotUsage = {
-    refreshUsers: vi.fn(async () => ({
-      status: "succeeded" as const,
-      count: 0,
-      message: "Saved normalized zero-row user sources.",
-    })),
+    refreshUsers: vi.fn(async (
+      _user: AuthenticatedUser, _signal: AbortSignal | undefined, options: Parameters<CopilotUsageService["refreshUsers"]>[2],
+    ): Promise<CopilotUsageRefreshResult> => {
+      await options.onDirectoryProgress?.(0);
+      return { status: "succeeded", count: 0, message: "Saved normalized zero-row user sources." };
+    }),
+  };
+  const agentPeople = {
+    refreshReferences: vi.fn(async () => ({ changed: false, resolved: 0, notFound: 0, failed: 0 })),
   };
   const officialUsage = {
     getPublished: vi.fn(async () => ({
@@ -365,10 +626,11 @@ function serviceHarness() {
     packages,
     powerPlatform,
     copilotUsage,
+    agentPeople,
     officialUsage,
     wait: vi.fn(async () => undefined),
   } as never);
-  return { service, run, repository, packages, powerPlatform, copilotUsage, officialUsage };
+  return { service, run, markers, repository, packages, powerPlatform, copilotUsage, agentPeople, officialUsage };
 }
 
 function dataSyncRun(): DataSyncRun {

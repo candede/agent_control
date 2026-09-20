@@ -10,6 +10,7 @@ import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { parseOfficialUsageReport, OfficialUsageValidationError } from "../services/officialUsageParser.js";
 import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
+import { OfficialUsageOverviewService } from "../services/officialUsageOverview.js";
 import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
@@ -138,6 +139,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   const router = Router();
   const repository = new OfficialUsageRepository(database);
   const history = new OfficialUsageHistoryService(database);
+  const overview = new OfficialUsageOverviewService(database);
   const packageRepository = new PackageInventoryRepository(database);
 
   policyRoute(router, "post", "/official-usage/staging", {
@@ -199,6 +201,25 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     const scope = requestScope(request);
     validateViewQuery(request.query, ["limit", "offset"]);
     response.json(await history.getHistory(scope.tenantId, {
+      limit: queryInteger(first(request.query.limit), 25, 100, true),
+      offset: queryInteger(first(request.query.offset), 0, 100_000, false),
+    }));
+  });
+
+  policyRoute(router, "get", "/official-usage/overview", {
+    access: "authenticated", dataClass: "official_usage_overview", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    const scope = requestScope(request);
+    validateViewQuery(request.query, ["search", "startDate", "endDate", "sortBy", "sortDirection", "limit", "offset"]);
+    if (request.query.sortBy === "" || request.query.sortDirection === "") {
+      throw new AppError(400, "invalid_usage_query", "The official usage overview sort is invalid.");
+    }
+    response.json(await overview.getOverview(scope.tenantId, {
+      search: first(request.query.search),
+      startDate: first(request.query.startDate),
+      endDate: first(request.query.endDate),
+      sortBy: queryEnum(first(request.query.sortBy), ["agentName", "lastActivity"] as const, "overview sort"),
+      sortDirection: queryEnum(first(request.query.sortDirection), ["asc", "desc"] as const, "sort direction"),
       limit: queryInteger(first(request.query.limit), 25, 100, true),
       offset: queryInteger(first(request.query.offset), 0, 100_000, false),
     }));

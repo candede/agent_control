@@ -8,9 +8,14 @@ import { mockNativeDialogs } from "../test/dialog";
 mockNativeDialogs();
 
 vi.mock("./OfficialUsageImportPanel", () => ({
-  OfficialUsageImportPanel: function TestImportPanel() {
+  OfficialUsageImportPanel: function TestImportPanel({ view, active, onViewSnapshot }: {
+    view: string; active: boolean; onViewSnapshot?: (setId: string) => void;
+  }) {
     const [draft, setDraft] = useState("");
-    return <div>Authoritative import panel<input aria-label="Selected import draft" value={draft} onChange={event => setDraft(event.target.value)} /></div>;
+    return <div>Authoritative import panel<span data-testid="panel-view">{view}</span><span data-testid="panel-active">{String(active)}</span>
+      <input aria-label="Selected import draft" value={draft} onChange={event => setDraft(event.target.value)} />
+      {onViewSnapshot ? <button type="button" onClick={() => onViewSnapshot("retained-snapshot")}>View fixture snapshot</button> : null}
+    </div>;
   },
 }));
 
@@ -21,7 +26,7 @@ describe("OfficialUsageImportModal", () => {
       <button ref={trigger}>Report import trigger</button>
       <OfficialUsageImportModal showTrigger={false} initialStagingId="retained-staging" returnFocusRef={trigger} onChanged={vi.fn()} />
     </>);
-    const dialog = await screen.findByRole("dialog", { name: "Import and manage reports" });
+    const dialog = await screen.findByRole("dialog", { name: "Import CSV reports" });
     await userEvent.click(screen.getByRole("button", { name: "Close report import" }));
     await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
     expect(screen.getByRole("button", { name: "Report import trigger" })).toHaveFocus();
@@ -40,8 +45,8 @@ describe("OfficialUsageImportModal", () => {
     render(<Host />);
     const opener = screen.getByRole("button", { name: "Sync import trigger" });
     await userEvent.click(opener);
-    const dialog = await screen.findByRole("dialog", { name: "Import and manage reports" });
-    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+    const dialog = await screen.findByRole("dialog", { name: "Import CSV reports" });
+    await userEvent.click(screen.getByRole("button", { name: /^Close$/ }));
     await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
     expect(opener).toHaveFocus();
   });
@@ -53,7 +58,7 @@ describe("OfficialUsageImportModal", () => {
     expect(screen.queryByText("Authoritative import panel")).not.toBeInTheDocument();
 
     await user.click(trigger);
-    const dialog = screen.getByRole("dialog", { name: "Import and manage reports" });
+    const dialog = screen.getByRole("dialog", { name: "Import CSV reports" });
     expect(dialog).toHaveAttribute("open");
     expect(screen.getByText("Authoritative import panel")).toBeVisible();
 
@@ -70,7 +75,7 @@ describe("OfficialUsageImportModal", () => {
 
     view.rerender(<OfficialUsageImportModal key="principal-one" {...props} openRequest={1} />);
     await waitFor(() => expect(dialog).toHaveAttribute("open"));
-    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+    await userEvent.click(screen.getByRole("button", { name: /^Close$/ }));
     await waitFor(() => expect(dialog).not.toHaveAttribute("open"));
 
     view.rerender(<OfficialUsageImportModal key="principal-one" {...props} openRequest={1} />);
@@ -86,10 +91,10 @@ describe("OfficialUsageImportModal", () => {
     render(<OfficialUsageImportModal onChanged={vi.fn()} />);
     const trigger = screen.getByRole("button", { name: "Import reports" });
     await userEvent.click(trigger);
-    const dialog = screen.getByRole("dialog", { name: "Import and manage reports" });
+    const dialog = screen.getByRole("dialog", { name: "Import CSV reports" });
     await userEvent.type(screen.getByLabelText("Selected import draft"), "retained draft");
     const close = screen.getByRole("button", { name: "Close report import" });
-    const back = screen.getByRole("button", { name: "Back to reports" });
+    const back = screen.getByRole("button", { name: /^Close$/ });
     close.focus();
     await userEvent.tab({ shift: true });
     expect(back).toHaveFocus();
@@ -102,5 +107,37 @@ describe("OfficialUsageImportModal", () => {
     expect(trigger).toHaveFocus();
     await userEvent.click(trigger);
     expect(screen.getByLabelText("Selected import draft")).toHaveValue("retained draft");
+  });
+
+  it("applies openView only to new open requests and preserves the draft between sibling views", async () => {
+    const props = { showTrigger: false, onChanged: vi.fn() };
+    const view = render(<OfficialUsageImportModal {...props} openRequest={0} />);
+    view.rerender(<OfficialUsageImportModal {...props} openRequest={1} openView="manage" />);
+    expect(await screen.findByRole("dialog", { name: "Manage reports" })).toBeVisible();
+    expect(screen.getByTestId("panel-view")).toHaveTextContent("manage");
+    await userEvent.type(screen.getByLabelText("Selected import draft"), "kept");
+    await userEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
+    view.rerender(<OfficialUsageImportModal {...props} openRequest={1} openView="manage" />);
+    expect(screen.getByRole("dialog", { name: "Import CSV reports" })).toBeVisible();
+    expect(screen.getByTestId("panel-view")).toHaveTextContent("import");
+    view.rerender(<OfficialUsageImportModal {...props} openRequest={2} openView="manage" />);
+    expect(await screen.findByRole("dialog", { name: "Manage reports" })).toBeVisible();
+    expect(screen.getByLabelText("Selected import draft")).toHaveValue("kept");
+    await userEvent.click(screen.getByRole("button", { name: /^Close$/ }));
+    expect(screen.getByTestId("panel-active")).toHaveTextContent("false");
+    view.rerender(<OfficialUsageImportModal {...props} openRequest={2} openView="import" />);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("closes the native dialog before navigating to a retained snapshot", async () => {
+    const onViewSnapshot = vi.fn(() => {
+      expect(screen.getByRole("dialog", { hidden: true })).not.toHaveAttribute("open");
+    });
+    render(<OfficialUsageImportModal onChanged={vi.fn()} onViewSnapshot={onViewSnapshot} />);
+    const trigger = screen.getByRole("button", { name: "Import reports" });
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByRole("button", { name: "View fixture snapshot" }));
+    expect(onViewSnapshot).toHaveBeenCalledExactlyOnceWith("retained-snapshot");
+    expect(trigger).toHaveFocus();
   });
 });

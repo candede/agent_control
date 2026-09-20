@@ -4,6 +4,8 @@ import { workbenchActions, workbenchViews } from "../../backend/src/services/wor
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
 import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
+import { usageOverviewFixture } from "../src/test/usageInsightsFixture";
+import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
@@ -360,7 +362,7 @@ export async function mockLayoutApi(page: Page) {
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
     "/api/agents": packages,
     ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}`, item])),
-    "/api/agent-inventory": unifiedAgents,
+    "/api/agent-inventory": { ...unifiedAgents, inventoryOverview: summarizeAgentAvailability(unifiedAgents.value) },
     "/api/data-sync/state": {
       onboardingRequired: false, usageImportRequired: false, run: null,
       sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
@@ -374,6 +376,7 @@ export async function mockLayoutApi(page: Page) {
     "/api/quarantine/jobs": { value: [] },
     "/api/official-usage/admin": usageAdmin, "/api/official-usage/aggregate": aggregate, "/api/official-usage/users": users,
     "/api/official-usage/history": usageHistory,
+    "/api/official-usage/overview": usageOverviewFixture(),
     "/api/copilot-usage/users": copilotUsageFixture,
     "/api/audit/events": { value: auditEvents, count: auditEvents.length },
     "/api/audit-search/catalog": purviewCatalog, "/api/audit-search/jobs": { value: [purviewJob], count: 1, limit: 20, offset: 0 },
@@ -384,6 +387,15 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/official-usage/overview") {
+      const params = new URL(route.request().url()).searchParams;
+      return route.fulfill({ json: usageOverviewFixture({
+        search: params.get("search") ?? undefined, startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
+        sortBy: params.get("sortBy") === "agentName" ? "agentName" : "lastActivity",
+        sortDirection: params.get("sortDirection") === "asc" ? "asc" : "desc",
+        limit: Number(params.get("limit") ?? 25), offset: Number(params.get("offset") ?? 0),
+      }) });
+    }
     if (!path.startsWith("/api/")) return route.fallback();
     const method = route.request().method();
     if ((method === "GET" || (method === "POST" && path === "/api/capabilities/check")) && path in responses) {

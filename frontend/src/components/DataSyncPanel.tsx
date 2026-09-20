@@ -33,29 +33,19 @@ import {
   type DataSyncState,
 } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { SyncDialog } from "./SyncDialog";
+import {
+  automaticSyncSources,
+  formatSyncInstant as formatInstant,
+  syncDuration,
+  syncModeLabel as modeLabel,
+  syncSourceDetails as sourceDetails,
+  syncStatusLabel as statusLabel,
+} from "./syncPresentation";
 import "./dataSync.css";
 
 const pollIntervalMs = 1_000;
 const pollBudgetMs = 5 * 60_000;
-
-const sourceDetails: Record<DataSyncSourceId, { label: string; description: string }> = {
-  users: {
-    label: "Users",
-    description: "Entra users, license assignments, and Microsoft 365 Copilot app activity.",
-  },
-  graph_packages: {
-    label: "Graph packages",
-    description: "Copilot agents and packages available through Microsoft Graph.",
-  },
-  power_platform: {
-    label: "Power Platform objects",
-    description: "Environments, resources, and Copilot Studio agents.",
-  },
-  usage_reports: {
-    label: "Official usage reports",
-    description: "Three CSV exports uploaded by an admin. Not collected automatically.",
-  },
-};
 
 const incompleteStates = new Set<DataSyncSourceState>([
   "not_started",
@@ -80,6 +70,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onRunsChanged?: () => void;
   requestedRunId?: string;
   onOpenUsageImport: () => void;
+  onManageUsageReports?: () => void;
   onRequestedRunChange: (runId: string | undefined) => void;
   onSourcesChanged: (sources: DataSyncSourceId[]) => void;
 }>(function DataSyncPanel({
@@ -90,6 +81,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onRunsChanged,
   requestedRunId,
   onOpenUsageImport,
+  onManageUsageReports,
   onRequestedRunChange,
   onSourcesChanged,
 }, ref) {
@@ -101,7 +93,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const [requestedPollingPaused, setRequestedPollingPaused] = useState(false);
   const [confirmClean, setConfirmClean] = useState(false);
   const [cleanAcknowledged, setCleanAcknowledged] = useState(false);
-  const [showSetupGuide, setShowSetupGuide] = useState(false);
+  const [checkedAt, setCheckedAt] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"start" | "retry" | "cancel">();
   const [error, setError] = useState("");
@@ -186,8 +178,13 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const applyRun = useCallback((run: DataSyncRun) => {
     const current = stateRef.current;
     if (!current) return;
-    applyState({ ...current, run, sources: run.sources });
-  }, [applyState]);
+    observeSources(current.sources.map(source =>
+      run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded") ?? source,
+    ), sourceStatuses);
+    const next = { ...current, run };
+    stateRef.current = next;
+    setState(next);
+  }, [observeSources]);
 
   const load = useCallback(async (owner: number, preserveActionError = false) => {
     if (loadController.current) return false;
@@ -197,6 +194,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       const next = await getDataSyncState({ signal: controller.signal });
       if (controller.signal.aborted || owner !== generation.current) return false;
       applyState(next);
+      setCheckedAt(new Date().toISOString());
       if (!preserveActionError) setError("");
       return isProgressing(next.run);
     } catch (reason) {
@@ -252,7 +250,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       setPollingPaused(false);
       setConfirmClean(false);
       setCleanAcknowledged(false);
-      setShowSetupGuide(false);
+      setCheckedAt(undefined);
     });
     startPolling(owner, true);
     return () => {
@@ -350,7 +348,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const start = useCallback(async (mode: DataSyncMode, sources?: DataSyncSourceId[], clearSavedData = false) => {
     setConfirmClean(false);
     setCleanAcknowledged(false);
-    setShowSetupGuide(false);
     if (requestedRunId) {
       requestedRunIdRef.current = undefined;
       onRequestedRunChange(undefined);
@@ -361,6 +358,17 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         { signal },
       );
       if (clearSavedData && !signal.aborted) {
+        const current = stateRef.current;
+        if (current) {
+          const sources = current.sources.map(source => source.source === "usage_reports" ? source : {
+            ...source, status: "not_started" as const, count: null, lastSuccessAt: null, jobId: null,
+            message: "Saved data was reset. A new collection has not completed.", canRetry: false,
+          });
+          const next = { ...current, sources, onboardingRequired: true };
+          sourceStatuses.current = new Map(sources.map(source => [source.source, source]));
+          stateRef.current = next;
+          setState(next);
+        }
         onSourcesChangedRef.current(["users", "graph_packages", "power_platform"]);
       }
       return run;
@@ -374,24 +382,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
 
   useImperativeHandle(ref, () => ({ refresh, start }), [refresh, start]);
 
-  const displayedRun = requestedRunId ? requestedRun : state?.run;
-  const displayedSources = requestedRunId ? requestedRun?.sources ?? [] : state?.sources ?? [];
-  const displayedState = state ? { ...state, run: displayedRun ?? null, sources: displayedSources } : undefined;
-  const retrySources = displayedRun?.sources
-    .filter(source => source.canRetry && incompleteStates.has(source.status))
-    .map(source => source.source) ?? [];
-  const runActive = isProgressing(displayedRun);
-  const runComplete = isComplete(displayedRun);
-  const status = requestedRunId && requestedRunLoading
-    ? "Loading requested run"
-    : requestedRunId && requestedRunError
-      ? "Run unavailable"
-      : panelStatus(displayedState, loading);
-  const tone = requestedRunId && requestedRunError ? "error" : panelTone(displayedState);
-  const updatesPaused = requestedRunId ? requestedPollingPaused : pollingPaused;
-  const cannotStart = isProgressing(state?.run) || runActive || Boolean(busy);
-  const retryBlockedByRun = displayedRun?.status === "running"
-    || (isProgressing(state?.run) && state?.run?.id !== displayedRun?.id);
+  const currentRun = state?.run;
+  const cannotStart = !state || isProgressing(currentRun) || isProgressing(requestedRun) || Boolean(busy);
+  const savedSources = state?.sources.filter(source => source.source !== "usage_reports") ?? [];
+  const savedSourceCount = savedSources.filter(source => source.status === "succeeded").length;
+  const usage = state?.sources.find(source => source.source === "usage_reports");
+  const usageReady = usage?.status === "succeeded" && !state?.usageImportRequired;
 
   useEffect(() => {
     if (active && !wasActive.current) void refresh();
@@ -402,321 +398,309 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     wasActive.current = active;
   }, [active, refresh]);
 
+  function runActions(run: DataSyncRun, paused: boolean) {
+    const retrySources = run.sources
+      .filter(source => source.canRetry && incompleteStates.has(source.status))
+      .map(source => source.source);
+    const retryBlocked = run.status === "running"
+      || (isProgressing(currentRun) && currentRun?.id !== run.id);
+    return (
+      <div className="data-sync-run-actions">
+        {paused && isProgressing(run) ? (
+          <>
+            <p className="data-sync-poll-note" role="status">Live updates are paused. The server job is not stopped.</p>
+            <WorkbenchActionGate actionId="data-sync.read" compact>
+              <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void refresh()}>
+                <RotateCcw size={15} aria-hidden="true" />Resume updates
+              </button>
+            </WorkbenchActionGate>
+          </>
+        ) : null}
+        {retrySources.length ? (
+          <WorkbenchActionGate actionId="data-sync.retry">
+            <button type="button" className="secondary" disabled={Boolean(busy) || retryBlocked}
+              onClick={() => void perform("retry", signal => retryDataSyncRun(run.id, retrySources, { signal }))}>
+              Retry incomplete ({retrySources.length})
+            </button>
+          </WorkbenchActionGate>
+        ) : null}
+        {retrySources.length > 0 && retryBlocked ? (
+          <p className="data-sync-run-meta">Finish or cancel the active sync run before retrying these sources.</p>
+        ) : null}
+        {isProgressing(run) ? (
+          <WorkbenchActionGate actionId="data-sync.cancel">
+            <button type="button" className="secondary" disabled={Boolean(busy)}
+              onClick={() => void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }))}>
+              <Square size={14} aria-hidden="true" />{busy === "cancel" ? "Cancelling..." : "Cancel run"}
+            </button>
+          </WorkbenchActionGate>
+        ) : null}
+      </div>
+    );
+  }
+
   if (!active) return null;
 
   return (
-    <section className={`data-sync-panel${state?.onboardingRequired ? " onboarding-required" : ""}`} aria-labelledby="data-sync-heading">
-        <header className="data-sync-page-header">
-          <div className="data-sync-page-icon"><Database size={24} aria-hidden="true" /></div>
-          <div>
-            <h2 id="data-sync-heading">Data sync</h2>
-            <p>Collect saved data for this workspace. Sync never changes settings in Microsoft 365.</p>
-          </div>
-          <span className={`data-sync-state state-${error ? "error" : tone}`}>{error ? "Status unavailable" : status}</span>
-        </header>
-        <div id="data-sync-details" className="data-sync-details">
-          {runActive ? <p className="data-sync-run-meta">Sync continues when you switch tabs. Return here for progress and source logs.</p> : null}
-          {requestedRunId ? (
-            <div className="data-sync-selected-run" role="status">
-              <div>
-                <strong>Requested sync run {requestedRunId}</strong>
-                <p>This exact retained run is shown below. Current onboarding requirements still come from the central saved sync state.</p>
+    <section className="data-sync-panel" aria-labelledby="data-sync-heading">
+      <header className="data-sync-page-header">
+        <div className="data-sync-page-icon"><Database size={24} aria-hidden="true" /></div>
+        <div>
+          <h2 id="data-sync-heading">Data sync</h2>
+          <p>Keep workspace data up to date. Sync reads Microsoft data without changing its settings.</p>
+        </div>
+        <div className="data-sync-toolbar">
+          {state ? <WorkbenchActionGate actionId="data-sync.start">
+            <button type="button" disabled={cannotStart} onClick={() => void start(state.onboardingRequired ? "initial" : "incremental")}>
+              <RefreshCw size={16} aria-hidden="true" />
+              {busy === "start" ? "Starting sync..." : state.onboardingRequired ? "Start initial sync" : "Sync all sources"}
+            </button>
+          </WorkbenchActionGate> : null}
+          <WorkbenchActionGate actionId="data-sync.read" compact>
+            <button type="button" className="secondary" disabled={loading || Boolean(busy)} onClick={() => void refresh()}
+              title="Reload saved status without starting a Microsoft data collection">
+              <RotateCcw size={15} aria-hidden="true" />{error ? "Retry status check" : "Check status"}
+            </button>
+          </WorkbenchActionGate>
+        </div>
+      </header>
+      <div className="data-sync-details">
+        {error && !requestedRunId ? <div className="error-banner" role="alert">{error}</div> : null}
+        {!state && loading ? <p role="status">Loading saved data sync status...</p> : null}
+        {state ? (
+          <>
+            {currentRun ? (
+              isProgressing(currentRun) || currentRun.status === "partial" ? (
+                <section className="data-sync-activity" aria-label="Current sync">
+                  <SyncProgress run={currentRun} />
+                  {runActions(currentRun, pollingPaused)}
+                  <p className="data-sync-run-meta">
+                    Sync continues when you switch tabs.
+                    {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
+                  </p>
+                </section>
+              ) : (
+                <div className="data-sync-last-run" role="status">
+                  {isComplete(currentRun) ? <CircleCheck size={19} aria-hidden="true" /> : <CircleAlert size={19} aria-hidden="true" />}
+                  <div>
+                    <strong>{isComplete(currentRun) ? "Sync complete" : "Sync cancelled"}</strong>
+                    <span>{currentRun.sources.map(source => sourceDetails[source.source].label).join(", ")}
+                      {" · "}{formatInstant(currentRun.completedAt ?? currentRun.updatedAt)}</span>
+                  </div>
+                  <button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
+                </div>
+              )
+            ) : null}
+            <section className="data-sync-workspace" aria-labelledby="sync-workspace-heading">
+              <div className="section-heading">
+                <div>
+                  <h3 id="sync-workspace-heading">Workspace data</h3>
+                  <p>Last successful collection across all sources, not just the latest run.</p>
+                </div>
+                <span className={`data-sync-state state-${savedSourceCount === automaticSyncSources.length ? "success" : "attention"}`}>
+                  {savedSourceCount} of {automaticSyncSources.length} sources synced
+                </span>
               </div>
-              <button type="button" className="secondary" onClick={() => onRequestedRunChange(undefined)}>Return to latest run</button>
-            </div>
-          ) : null}
-
-          {error ? <div className="error-banner" role="alert">{error}</div> : null}
-          {requestedRunError ? <div className="error-banner" role="alert">{requestedRunError}</div> : null}
-          {error || requestedRunError ? (
-            <WorkbenchActionGate actionId="data-sync.read" compact>
-              <button type="button" className="secondary" disabled={loading || requestedRunLoading || Boolean(busy)} onClick={() => void refresh()}>
-                <RefreshCw size={15} aria-hidden="true" />Retry status check
+              {savedSourceCount === 0 ? <p className="data-sync-empty">Start a sync to collect users and inventory. CSV reports are imported separately below.</p> : null}
+              <div className="data-sync-sources" aria-label="Workspace sync sources">
+                {savedSources.map(source => (
+                  <SavedSourceRow
+                    key={source.source}
+                    source={source}
+                    attempt={currentRun?.sources.find(attempt => attempt.source === source.source)}
+                    disabled={cannotStart}
+                    onSync={() => void start("incremental", [source.source])}
+                  />
+                ))}
+              </div>
+              <div className="data-sync-workspace-footer">
+                <p>Sync keeps previous successful data until a replacement is ready.
+                  {checkedAt ? <> Status checked <time dateTime={checkedAt}>{new Date(checkedAt).toLocaleTimeString()}</time>.</> : null}
+                </p>
+                <WorkbenchActionGate actionId="data-sync.start" compact>
+                  <button type="button" className="sync-text-button" disabled={cannotStart} onClick={() => setConfirmClean(true)}>
+                    Reset saved data...
+                  </button>
+                </WorkbenchActionGate>
+              </div>
+            </section>
+            <section className="data-sync-reports" aria-labelledby="sync-reports-heading">
+              <div className="data-sync-report-icon"><Upload size={22} aria-hidden="true" /></div>
+              <div>
+                <div className="sync-health-heading"><h3 id="sync-reports-heading">CSV usage reports</h3><span className={`data-sync-state state-${usageReady ? "success" : "attention"}`}>{usageReady ? "Available" : "Import needed"}</span></div>
+                <p>{usageReady
+                  ? `${usage.count?.toLocaleString() ?? "Validated"} report rows across three accepted CSVs.`
+                  : "Import Agents, Users & agents, and Users exports for the same 7- or 30-day selection."}</p>
+                {usageReady && usage.lastSuccessAt ? <p>Accepted <time dateTime={usage.lastSuccessAt}>{formatInstant(usage.lastSuccessAt)}</time>. Overlapping snapshots are not added together.</p>
+                  : <p>Manual import is separate from automatic sync and does not block collecting users or inventory.</p>}
+                <div className="data-sync-links">
+                  <a href="/official-usage?view=history">View report history</a>
+                  {canUploadUsage && onManageUsageReports ? <button type="button" className="sync-text-button" onClick={onManageUsageReports}>Manage reports</button> : null}
+                </div>
+              </div>
+              {canUploadUsage ? <button type="button" className="secondary" onClick={onOpenUsageImport}>
+                <Upload size={16} aria-hidden="true" />Add CSV reports
+              </button> : <p className="data-sync-admin-note">An AgentControl.Admin can import reports.</p>}
+            </section>
+          </>
+        ) : null}
+      </div>
+      <SyncDialog open={Boolean(requestedRunId)} title="Sync run details"
+        description="Results for this run, not your overall workspace state."
+        onClose={() => onRequestedRunChange(undefined)}>
+        {requestedRunLoading ? <p role="status">Loading exact sync run {requestedRunId}...</p> : null}
+        {requestedRunError ? <div className="error-banner" role="alert">{requestedRunError}</div> : null}
+        {error ? <div className="error-banner" role="alert">{error}</div> : null}
+        {requestedRunError ? <button type="button" className="secondary" onClick={() => void refresh()}>Retry status check</button> : null}
+        {requestedRun ? (
+          <>
+            <dl className="data-sync-run-facts">
+              <div><dt>Run</dt><dd><code>{requestedRun.id}</code></dd></div>
+              <div><dt>Collection</dt><dd>{modeLabel(requestedRun.mode)}</dd></div>
+              <div><dt>Started</dt><dd>{formatInstant(requestedRun.startedAt)}</dd></div>
+              <div><dt>{requestedRun.completedAt ? "Duration (including waits)" : "Last update"}</dt><dd>{requestedRun.completedAt
+                ? syncDuration(requestedRun.startedAt, requestedRun.completedAt) : formatInstant(requestedRun.updatedAt)}</dd></div>
+            </dl>
+            <SyncProgress run={requestedRun} showJobIds />
+            {runActions(requestedRun, requestedPollingPaused)}
+            {requestedRun.sources.some(source => source.status === "awaiting_upload") ? (
+              <div className="notice">
+                <p>This older run includes a manual CSV step. Import reports to complete it, or cancel the waiting run before starting a new automatic sync.</p>
+                {canUploadUsage ? <button type="button" className="secondary" onClick={() => { onRequestedRunChange(undefined); onOpenUsageImport(); }}>Add CSV reports</button> : null}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+        <button type="button" className="secondary" onClick={() => onRequestedRunChange(undefined)}>Back to workspace</button>
+      </SyncDialog>
+      <SyncDialog open={confirmClean} title="Reset saved data" onClose={() => { setConfirmClean(false); setCleanAcknowledged(false); }}>
+        <div className="data-sync-clean-confirm">
+          <strong>Clear saved data before syncing?</strong>
+          <p>Your account's saved users, license and app-activity data, Graph packages, and Power Platform inventory will be removed first. These views may be empty until sync succeeds. A failed or cancelled sync does not restore the cleared data.</p>
+          <p>Accepted usage reports, report history, audit records, configuration, and other users' saved data are kept.</p>
+          <label>
+            <input type="checkbox" checked={cleanAcknowledged} onChange={event => setCleanAcknowledged(event.target.checked)} />
+            I understand my saved users and inventory will be cleared.
+          </label>
+          <div className="data-sync-run-actions">
+            <button type="button" className="secondary" onClick={() => { setConfirmClean(false); setCleanAcknowledged(false); }}>Keep saved data</button>
+            <WorkbenchActionGate actionId="data-sync.start">
+              <button type="button" className="danger" disabled={cannotStart || !cleanAcknowledged} onClick={() => void start("full", undefined, true)}>
+                Clear and start full resync
               </button>
             </WorkbenchActionGate>
-          ) : null}
-          {!state && loading ? <p role="status">Loading saved data sync status...</p> : null}
-          {state && requestedRunId && requestedRunLoading ? <p role="status">Loading exact sync run {requestedRunId}...</p> : null}
-
-          {state ? (
-            <>
-              {displayedRun ? <SyncProgress run={displayedRun} /> : null}
-              {!displayedRun && !requestedRunId ? (
-                <div className="data-sync-start-card">
-                  <div>
-                    <h3>{state.onboardingRequired ? "Set up your saved data" : "Update your workspace"}</h3>
-                    <p>{state.onboardingRequired
-                      ? "Read users, Graph packages, and Power Platform inventory for the first time. No saved data is deleted."
-                      : "Read the latest users and inventory. Keep existing data available until each replacement is ready."}</p>
-                  </div>
-                  <WorkbenchActionGate actionId="data-sync.start">
-                    <button type="button" disabled={cannotStart} onClick={() => void start(state.onboardingRequired ? "initial" : "incremental")}>
-                      <RefreshCw size={16} aria-hidden="true" />
-                      {busy === "start" ? "Starting sync..." : state.onboardingRequired ? "Start initial sync" : "Refresh saved data"}
-                    </button>
-                  </WorkbenchActionGate>
-                </div>
-              ) : null}
-              {updatesPaused && runActive ? (
-                <div className="data-sync-run-actions">
-                  <p className="data-sync-poll-note" role="status">Live updates are paused. The server job is not stopped.</p>
-                  <WorkbenchActionGate actionId="data-sync.read" compact>
-                    <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void refresh()}>
-                      <RotateCcw size={15} aria-hidden="true" />Resume updates
-                    </button>
-                  </WorkbenchActionGate>
-                </div>
-              ) : null}
-              {displayedRun ? (
-                <div className="data-sync-run-actions">
-                  {!runActive && !retrySources.length ? (
-                    <WorkbenchActionGate actionId="data-sync.start">
-                      <button type="button" className="secondary" disabled={cannotStart} onClick={() => void start("incremental")}>
-                        <RefreshCw size={16} aria-hidden="true" />
-                        {busy === "start" ? "Starting sync..." : "Refresh saved data"}
-                      </button>
-                    </WorkbenchActionGate>
-                  ) : null}
-                  {retrySources.length ? (
-                    <WorkbenchActionGate actionId="data-sync.retry">
-                      <button
-                        type="button"
-                        className="secondary"
-                        disabled={Boolean(busy) || retryBlockedByRun}
-                        onClick={() => void perform(
-                          "retry",
-                          signal => retryDataSyncRun(displayedRun.id, retrySources, { signal }),
-                        )}
-                      >
-                        Retry incomplete ({retrySources.length})
-                      </button>
-                    </WorkbenchActionGate>
-                  ) : null}
-                  {retrySources.length > 0 && retryBlockedByRun ? (
-                    <p className="data-sync-run-meta" role="status">Finish or cancel the active sync run before retrying these sources.</p>
-                  ) : null}
-                  {runActive ? (
-                    <WorkbenchActionGate actionId="data-sync.cancel">
-                      <button
-                        type="button"
-                        className="secondary"
-                        disabled={Boolean(busy)}
-                        onClick={() => void perform(
-                          "cancel",
-                          signal => cancelDataSyncRun(displayedRun.id, { signal }),
-                        )}
-                      >
-                        <Square size={14} aria-hidden="true" />Cancel run
-                      </button>
-                    </WorkbenchActionGate>
-                  ) : null}
-                </div>
-              ) : null}
-
-              {displayedRun || !requestedRunId ? (
-                <details className="data-sync-source-details" key={displayedRun?.id ?? "setup"} open={!runComplete}>
-                  <summary>{runComplete ? "View sync details" : "Source details"}</summary>
-                  <div className="data-sync-source-details-content">
-                    {displayedRun ? (
-                      <p className="data-sync-run-meta">
-                        {modeLabel(displayedRun.mode)} run <code>{displayedRun.id}</code> · {displayedRun.status.replaceAll("_", " ")}
-                      </p>
-                    ) : null}
-                    <div className="data-sync-sources" aria-label="Data sync sources">
-                      {displayedSources.map(source => (
-                        <SourceStatus
-                          key={source.source}
-                          source={source}
-                          canUploadUsage={canUploadUsage}
-                          disabled={cannotStart}
-                          onOpenUsageImport={onOpenUsageImport}
-                          onSync={() => void start("incremental", [source.source])}
-                        />
-                      ))}
-                    </div>
-                    {!runActive ? (
-                      <section className="data-sync-clean" aria-label="Full resync">
-                        <div>
-                          <strong>Need a fresh start?</strong>
-                          <p>Clear your saved users and inventory, then collect them again from Microsoft.</p>
-                        </div>
-                        {confirmClean ? (
-                          <div className="data-sync-clean-confirm">
-                            <strong>Clear saved data before syncing?</strong>
-                            <p>Your account's saved users, license and app-activity data, Graph packages, and Power Platform inventory will be removed first. These views may be empty until sync succeeds. A failed or cancelled sync does not restore the cleared data.</p>
-                            <p>Accepted usage reports, report history, audit records, configuration, and other users' saved data are kept.</p>
-                            <label>
-                              <input type="checkbox" checked={cleanAcknowledged} onChange={event => setCleanAcknowledged(event.target.checked)} />
-                              I understand my saved users and inventory will be cleared.
-                            </label>
-                            <div className="data-sync-run-actions">
-                              <WorkbenchActionGate actionId="data-sync.start">
-                                <button type="button" className="danger" disabled={cannotStart || !cleanAcknowledged} onClick={() => void start("full", undefined, true)}>
-                                  Clear and start full resync
-                                </button>
-                              </WorkbenchActionGate>
-                              <button type="button" className="secondary" onClick={() => { setConfirmClean(false); setCleanAcknowledged(false); }}>Keep saved data</button>
-                            </div>
-                          </div>
-                        ) : (
-                          <WorkbenchActionGate actionId="data-sync.start">
-                            <button type="button" className="secondary" disabled={cannotStart} onClick={() => setConfirmClean(true)}>
-                              <RotateCcw size={15} aria-hidden="true" />Clear saved data and resync
-                            </button>
-                          </WorkbenchActionGate>
-                        )}
-                      </section>
-                    ) : null}
-                    {showSetupGuide ? (
-                      <section className="data-sync-setup" aria-label="Sync scope">
-                        <div>
-                          <strong>What is included?</strong>
-                          <p>
-                            Users, Graph packages, and Power Platform objects are read from Microsoft.
-                            Official usage comes from CSVs you upload separately. Audit and security data
-                            are separate, bounded query workflows rather than an all-logs collection.
-                          </p>
-                          <div className="data-sync-links">
-                            <a href="/audit">Open bounded audit searches</a>
-                            <a href="/security">Open bounded security hunts</a>
-                          </div>
-                        </div>
-                        <button type="button" className="secondary" onClick={() => setShowSetupGuide(false)}>Hide setup guide</button>
-                      </section>
-                    ) : (
-                      <button type="button" className="data-sync-guide-link" onClick={() => setShowSetupGuide(true)}>
-                        What does sync include?
-                      </button>
-                    )}
-                  </div>
-                </details>
-              ) : null}
-              {state.usageImportRequired ? (
-                <div className="data-sync-usage-callout" role="status">
-                  <CircleAlert size={20} aria-hidden="true" />
-                  <div>
-                    <strong>Three official usage CSVs are still required.</strong>
-                    <p>
-                      Export Agents, Users &amp; agents, and Users for the same 7- or 30-day selection from
-                      Microsoft 365 admin center → Reports → Usage → Microsoft Copilot → Agents.
-                    </p>
-                    <p>
-                      Uploads accumulate retained snapshots. Exact duplicates are reused; previous imports
-                      remain available, and changed aggregate metrics are recorded as later observations,
-                      not overwritten or summed across overlapping windows.
-                    </p>
-                  </div>
-                  {canUploadUsage ? (
-                    <button type="button" onClick={onOpenUsageImport}><Upload size={16} aria-hidden="true" />Upload three CSVs</button>
-                  ) : (
-                    <span>Ask an AgentControl.Admin to upload the three-report bundle. Other authorized pages remain available.</span>
-                  )}
-                </div>
-              ) : null}
-            </>
-          ) : null}
+          </div>
         </div>
+      </SyncDialog>
     </section>
   );
 });
 
-function SyncProgress({ run }: { run: DataSyncRun }) {
-  const completed = run.sources.filter(source => source.status === "succeeded").length;
-  const running = run.sources.filter(source => source.status === "running");
-  const queued = run.sources.some(source => source.status === "queued");
+function SyncProgress({ run, showJobIds = false }: { run: DataSyncRun; showJobIds?: boolean }) {
+  const automatic = run.sources.filter(source => source.source !== "usage_reports");
+  const completed = automatic.filter(source => source.status === "succeeded").length;
+  const running = automatic.filter(source => source.status === "running");
+  const queued = automatic.some(source => source.status === "queued");
   const complete = isComplete(run);
-  const active = isProgressing(run);
+  const collecting = isProgressing(run) && (running.length > 0 || queued);
   const heading = complete
     ? "Sync complete"
     : run.status === "cancelled"
       ? "Sync cancelled"
       : running.length
         ? `Syncing ${running.map(source => sourceDetails[source.source].label.toLowerCase()).join(", ")}`
-        : queued && active
+        : queued && isProgressing(run)
           ? "Preparing your sync"
-          : "Sync needs your attention";
+          : "Sync needs attention";
   return (
-    <section className={`data-sync-progress${complete ? " is-complete" : ""}`} aria-label="Sync status">
+    <section className={`data-sync-progress${complete ? " is-complete" : ""}${collecting ? " is-running" : ""}`} aria-label="Sync status">
       <div className="data-sync-progress-heading" role="status" aria-live="polite">
         {complete ? <CircleCheck size={24} aria-hidden="true" />
-          : active && (running.length > 0 || queued) ? <LoaderCircle className="data-sync-spinning" size={24} aria-hidden="true" />
+          : collecting ? <LoaderCircle className="data-sync-spinning" size={24} aria-hidden="true" />
             : <CircleAlert size={24} aria-hidden="true" />}
         <div>
           <strong>{heading}</strong>
-          <p>{completed} of {run.sources.length} sources complete</p>
+          <p>{automatic.length ? `${completed} of ${automatic.length} automatic sources complete` : "Manual report step"}
+            {" · "}{modeLabel(run.mode)}</p>
         </div>
       </div>
-      {!complete && run.sources.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={run.sources.length} /> : null}
-      <p>{complete
-        ? "Requested source collection completed. Saved inventory checks run automatically. Optional diagnostics are in Advanced results."
-        : active && (running.length > 0 || queued)
-          ? "Sources can run in parallel. Counts appear as results are saved; this is source progress, not an estimated time."
-          : "Review the source statuses below. Completed sources remain available; retry only the sources that need it."}</p>
+      {!complete && automatic.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={automatic.length} /> : null}
+      <ol className="data-sync-live-sources" aria-label="Progress by source">
+        {run.sources.map(source => (
+          <li key={source.source} className={`data-sync-live-source source-${source.status.replaceAll("_", "-")}`}>
+            <SourceBadge status={source.status} />
+            <div>
+              <strong>{sourceDetails[source.source].label}</strong>
+              <p>{source.message || (source.status === "queued" ? "Waiting for collection to start."
+                : source.status === "running" ? "Waiting for the provider's next update." : statusLabel(source.status))}</p>
+              {source.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
+              {source.status === "permission_required" ? <a href="/permissions">Review permissions</a> : null}
+              {showJobIds && source.jobId ? <p className="data-sync-run-meta">Source job <code>{source.jobId}</code></p> : null}
+            </div>
+            <div className="data-sync-live-count">
+              <strong>{source.status === "queued" || source.count === null ? "—" : source.count.toLocaleString()}</strong>
+              <span>{source.status === "succeeded" ? `${sourceDetails[source.source].unit} saved`
+                : source.status === "running" ? "processed in this stage" : "reported, not a saved total"}</span>
+            </div>
+          </li>
+        ))}
+      </ol>
+      <p className="data-sync-progress-note">{collecting
+        ? "Counts update as the provider responds and may restart for a new stage. The bar measures completed sources, not time or total objects."
+        : complete ? "These are this run's results. Other successful source collections remain in Workspace data."
+          : "Previous successful data stays available. Only incomplete sources need recovery."}</p>
+      <p className="data-sync-run-meta">Started {formatInstant(run.startedAt)} · Last update {formatInstant(run.updatedAt)}</p>
     </section>
   );
 }
 
-function SourceStatus({
-  source,
-  canUploadUsage,
-  disabled,
-  onOpenUsageImport,
-  onSync,
-}: {
+function SavedSourceRow({ source, attempt, disabled, onSync }: {
   source: DataSyncSourceStatus;
-  canUploadUsage: boolean;
+  attempt?: DataSyncSourceStatus;
   disabled: boolean;
-  onOpenUsageImport: () => void;
   onSync: () => void;
 }) {
   const details = sourceDetails[source.source];
+  const saved = source.status === "succeeded" || source.lastSuccessAt !== null;
   return (
-    <article className={`data-sync-source source-${source.status.replaceAll("_", "-")}`} aria-label={details.label}>
-      <div className="data-sync-source-heading">
+    <article className="data-sync-source" aria-label={details.label}>
+      <div className="data-sync-source-name">
         <strong>{details.label}</strong>
-        <span className={`status-badge status-${source.status.replaceAll("_", "-")}`}>
-          {source.status === "succeeded" ? <Check size={14} aria-hidden="true" />
-            : source.status === "running" ? <LoaderCircle size={14} className="data-sync-spinning" aria-hidden="true" />
-              : source.status === "queued" || source.status === "not_started" ? <Clock3 size={14} aria-hidden="true" />
-                : source.status === "awaiting_upload" ? <Upload size={14} aria-hidden="true" />
-                  : <CircleAlert size={14} aria-hidden="true" />}
-          {statusLabel(source.status)}
-        </span>
+        <p>{details.description}</p>
       </div>
-      <p className="data-sync-source-description">{details.description}</p>
       <dl>
         <div>
-          <dt>{source.status === "succeeded" ? "Saved count" : "Reported count"}</dt>
-          <dd>{source.count === null ? "Not reported" : source.count.toLocaleString()}</dd>
+          <dt>Last saved count</dt>
+          <dd>{saved ? source.count === null ? "Not reported" : source.count.toLocaleString() : "Not synced"}</dd>
+          {saved && source.count !== null ? <dd className="data-sync-count-unit">{details.unit}</dd> : null}
         </div>
         <div>
-          <dt>Last successful</dt>
-          <dd>{source.lastSuccessAt ? formatInstant(source.lastSuccessAt) : "Never"}</dd>
+          <dt>Last successful sync</dt>
+          <dd>{source.lastSuccessAt ? formatInstant(source.lastSuccessAt) : saved ? "Not recorded" : "Never"}</dd>
         </div>
       </dl>
-      {source.message ? <p>{source.message}</p> : null}
       <div className="data-sync-source-actions">
-        {source.source === "usage_reports" ? (
-          canUploadUsage ? (
-            <button type="button" className="secondary" onClick={onOpenUsageImport}>
-              <Upload size={15} aria-hidden="true" />Manage uploads
-            </button>
-          ) : <span>Uploads require AgentControl.Admin.</span>
-        ) : (
-          <WorkbenchActionGate actionId="data-sync.start" compact>
-            <button type="button" className="secondary" disabled={disabled} onClick={onSync}>
-              Sync {details.label.toLowerCase()}
-            </button>
-          </WorkbenchActionGate>
-        )}
-        {source.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
-        {source.status === "permission_required" ? <a href="/permissions">Review permissions</a> : null}
-        {source.source === "usage_reports" && source.status === "awaiting_upload"
-          ? <a href="https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide" target="_blank" rel="noreferrer">Microsoft export guidance</a>
-          : null}
+        <div className="data-sync-source-attempt">
+          <span>{attempt ? "Latest attempt" : "Last collection"}</span>
+          <SourceBadge status={attempt?.status ?? source.status} />
+        </div>
+        <WorkbenchActionGate actionId="data-sync.start" compact>
+          <button type="button" className="secondary" disabled={disabled} onClick={onSync}>Sync {details.label.toLowerCase()}</button>
+        </WorkbenchActionGate>
       </div>
     </article>
   );
+}
+
+function SourceBadge({ status }: { status: DataSyncSourceState }) {
+  return <span className={`status-badge status-${status.replaceAll("_", "-")}`}>
+    {status === "succeeded" ? <Check size={14} aria-hidden="true" />
+      : status === "running" ? <LoaderCircle size={14} className="data-sync-spinning" aria-hidden="true" />
+        : status === "queued" || status === "not_started" ? <Clock3 size={14} aria-hidden="true" />
+          : status === "awaiting_upload" ? <Upload size={14} aria-hidden="true" />
+            : <CircleAlert size={14} aria-hidden="true" />}
+    {statusLabel(status)}
+  </span>;
 }
 
 function isProgressing(run: DataSyncRun | null | undefined) {
@@ -727,59 +711,10 @@ function isComplete(run: DataSyncRun | null | undefined) {
   return run?.status === "completed" && run.sources.every(source => source.status === "succeeded");
 }
 
-function panelStatus(state: DataSyncState | undefined, loading: boolean) {
-  if (!state) return loading ? "Loading status" : "Status unavailable";
-  if (state.run?.status === "running") return "Sync running";
-  if (state.run?.status === "waiting") return "Action required";
-  if (state.onboardingRequired) return "Setup required";
-  const usage = state.sources.find(source => source.source === "usage_reports");
-  if (state.usageImportRequired || usage?.status === "awaiting_upload" || usage?.status === "not_started") {
-    return "Usage upload required";
-  }
-  if (state.sources.some(source => source.status !== "succeeded")) return "Needs attention";
-  return "Setup complete";
-}
-
-function panelTone(state: DataSyncState | undefined) {
-  if (isProgressing(state?.run)) return "progress";
-  const usage = state?.sources.find(source => source.source === "usage_reports");
-  if (
-    !state
-    || state.onboardingRequired
-    || state.usageImportRequired
-    || usage?.status === "awaiting_upload"
-    || usage?.status === "not_started"
-  ) return "attention";
-  if (state.sources.some(source => source.status !== "succeeded")) return "error";
-  return "success";
-}
-
 function sourceObservationIdentity(source: DataSyncSourceStatus) {
   return source.status === "succeeded"
-    ? `succeeded:${source.jobId ?? ""}:${source.lastSuccessAt ?? ""}`
+    ? `succeeded:${source.lastSuccessAt ?? source.jobId ?? ""}`
     : `status:${source.status}`;
-}
-
-function statusLabel(status: DataSyncSourceState) {
-  if (status === "succeeded") return "Complete";
-  if (status === "running") return "Syncing";
-  if (status === "not_started") return "Not started";
-  if (status === "queued") return "Queued";
-  if (status === "failed") return "Failed";
-  if (status === "partial") return "Incomplete";
-  if (status === "cancelled") return "Cancelled";
-  if (status === "awaiting_upload") return "Awaiting upload";
-  if (status === "permission_required") return "Permission required";
-  if (status === "waiting_authorization") return "Sign-in required";
-  return status;
-}
-
-function modeLabel(mode: DataSyncMode) {
-  return mode === "full" ? "Full resync" : mode === "initial" ? "Initial sync" : "Saved data refresh";
-}
-
-function formatInstant(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
 function requestError(reason: unknown, fallback: string) {

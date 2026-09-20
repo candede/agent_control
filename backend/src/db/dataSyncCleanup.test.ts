@@ -91,7 +91,7 @@ describe("clean full data sync admission", () => {
     const preserved = await tableRows(preservedTables);
     const result = await repository.submit(scope, cleanInput);
     expect(result.created).toBe(true);
-    expect(result.run.sources.filter(source => source.source !== "usage_reports")).toEqual([
+    expect(result.run.sources).toEqual([
       expect.objectContaining({ source: "graph_packages", count: null, lastSuccessAt: null }),
       expect.objectContaining({ source: "power_platform", count: null, lastSuccessAt: null }),
       expect.objectContaining({ source: "users", count: null, lastSuccessAt: null }),

@@ -6,6 +6,7 @@ import { AgentUsageService } from "../services/agentUsage.js";
 import {
   newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIntent,
 } from "./agentUsageTestSupport.js";
+import { agentUsageMigrationSql } from "./agentUsageSchema.js";
 import { migrations, migrationChecksum, verifySchema } from "./schema.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -36,7 +37,7 @@ describe("usage association migration and runtime boundary", () => {
       expect((await upgrade.runtime.query("SELECT version,checksum FROM schema_migrations WHERE version<=33 ORDER BY version")).rows).toEqual(checksums);
       expect((await upgrade.runtime.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows)
         .toEqual(migrations.map(step => ({ version: step.version, checksum: migrationChecksum(step.sql) })));
-      expect(migrations.at(-1)?.version).toBe(34);
+      expect(migrations).toContainEqual({ version: 34, sql: agentUsageMigrationSql });
       const service = new AgentUsageService(upgrade.runtime);
       await service.attach(scope, records[0].id, await usageIntent(upgrade.runtime, scope), usageAudit(scope));
       expect((await service.project(scope, records)).summaries.get(records[0].id)).toMatchObject({ responses: 10, activeUsers: 2 });

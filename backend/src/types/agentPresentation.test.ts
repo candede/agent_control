@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentColumnValue, agentRelevanceReasons, matchesAgentView } from "./agentPresentation.js";
+import { agentColumnValue, agentPersonLabel, agentRelevanceReasons, agentUserAvailability, matchesAgentView, summarizeAgentAvailability } from "./agentPresentation.js";
 import type { CopilotPackage } from "./copilotPackage.js";
 import type { UnifiedAgentRecord } from "./unifiedAgents.js";
 
@@ -18,6 +18,95 @@ function record(packages: Array<Partial<CopilotPackage>> = [{}]): UnifiedAgentRe
 }
 
 describe("agent presentation and organizational relevance", () => {
+  it("only presents a saved person's label for the same exact native user ID", () => {
+    const person = {
+      objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", displayName: "Saved Person",
+      userPrincipalName: "saved@example.invalid", observedAt: "2026-09-17T10:00:00Z",
+    };
+    expect(agentPersonLabel(person, person.objectId.toUpperCase())).toBe("Saved Person (saved@example.invalid)");
+    expect(agentPersonLabel(person, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    expect(agentPersonLabel(person, null)).toBeNull();
+    expect(agentPersonLabel({ ...person, userPrincipalName: null }, person.objectId)).toBe("Saved Person");
+    expect(agentPersonLabel({ ...person, status: "lookup_failed" }, person.objectId))
+      .toBe("Saved Person (saved@example.invalid) (lookup failed)");
+    expect(agentPersonLabel({ ...person, status: "not_found", displayName: null, userPrincipalName: null }, person.objectId))
+      .toBe(`${person.objectId} (not found)`);
+  });
+
+  it("uses known legacy authoring evidence and deduplicates Lite and Agent Builder labels across sources", () => {
+    const value = record([{ authoringTool: "Microsoft 365 Copilot Agent Builder" }, { authoringTool: "Copilot Studio Lite" }]);
+    value.powerPlatformResource = {
+      tenantId: "tenant", nativeId: "native", type: "microsoft.copilotstudio/agents",
+      location: null, displayName: null, environmentId: "environment", createdAt: null, createdBy: null,
+      lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown",
+      agentKind: "agent", lifecycle: "unknown", identityConfidence: "exact_native", identifiers: [],
+      provenance: {}, details: { createdIn: "Copilot Studio Lite" }, unknownFieldCount: 0,
+    };
+    expect(agentColumnValue(value, "builtWith")).toBe("Microsoft 365 Copilot Agent Builder");
+    value.packages = [];
+    expect(agentColumnValue(value, "builtWith")).toBe("Microsoft 365 Copilot Agent Builder");
+    value.powerPlatformResource.details.createdIn = "Future authoring service";
+    expect(agentColumnValue(value, "builtWith")).toBeNull();
+    value.powerPlatformResource.authoringTool = "Explicit provider tool";
+    expect(agentColumnValue(value, "builtWith")).toBe("Explicit provider tool");
+  });
+
+  it("counts created or Teams-available logical agents once without claiming usage", () => {
+    const both = record([
+      { type: "custom", availableTo: "all", supportedHosts: ["Teams"] },
+      { type: "custom", availableTo: "some", supportedHosts: ["teams"] },
+    ]);
+    const available = record([{ type: "external", availableTo: "availableToSome", supportedHosts: [" Teams "] }]);
+    const created = record([{ type: "custom", isBlocked: true }]);
+    const unknown = record([{ type: "external", supportedHosts: ["Teams"], availableTo: "unknown" }]);
+    const blocked = record([{ type: "external", isBlocked: true, supportedHosts: ["Teams"], availableTo: "all" }]);
+    const otherHost = record([{ type: "external", supportedHosts: ["Copilot"], availableTo: "all" }]);
+    expect(summarizeAgentAvailability([both, available, created, unknown, blocked, otherHost])).toEqual({
+      availableToUsers: 3, organizationCreated: 2, teamsAvailable: 2, createdOrAvailable: 3,
+    });
+    expect(matchesAgentView(both, "used")).toBe(false);
+    expect(summarizeAgentAvailability([])).toEqual({ availableToUsers: 0, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 0 });
+  });
+
+  it.each([
+    { packages: [{ type: "external", availableTo: "all", supportedHosts: ["Copilot"] }], state: "available", label: "All users" },
+    { packages: [{ availableTo: "Available-To-Some" }], state: "available", label: "Specific users or groups" },
+    { packages: [{ availableTo: "all", isBlocked: true }], state: "unavailable", label: "Not available" },
+    { packages: [{ availableTo: "none", type: "custom", deployedTo: "all" }], state: "unavailable", label: "Not available" },
+    { packages: [{ availableTo: "futureValue", type: "microsoft", deployedTo: "all" }], state: "unknown", label: null },
+    { packages: [{ availableTo: "all", isBlocked: undefined }], state: "unknown", label: null },
+    { packages: [{ availableTo: "all", isBlocked: true }, { availableTo: "none" }], state: "unavailable", label: "Not available" },
+    { packages: [{ availableTo: "all", isBlocked: true }, { availableTo: "some" }], state: "available", label: "Specific users or groups" },
+    { packages: [{ availableTo: "all", isBlocked: true }, {}], state: "unknown", label: null },
+    { packages: [], state: "unknown", label: null },
+  ])("uses the same end-user access classification for counts, filters and columns: $state $label", ({ packages, state, label }) => {
+    const value = record(packages);
+    value.usage = { status: "linked", reportSetId: "report", responses: 12, activeUsers: 1, lastActivityDateUtc: null, associations: [] };
+    expect(agentUserAvailability(value)).toBe(state);
+    expect(matchesAgentView(value, "all")).toBe(true);
+    expect(matchesAgentView(value, "available")).toBe(state === "available");
+    expect(matchesAgentView(value, "unavailable")).toBe(state === "unavailable");
+    expect(matchesAgentView(value, "availability_unknown")).toBe(state === "unknown");
+    expect(summarizeAgentAvailability([value]).availableToUsers).toBe(Number(state === "available"));
+    expect(agentColumnValue(value, "availability")).toBe(label);
+  });
+
+  it("does not treat native publication as user access and excludes known quarantine", () => {
+    const value = record([{ availableTo: "all" }]);
+    value.powerPlatformResource = {
+      tenantId: "tenant", nativeId: "native", type: "microsoft.copilotstudio/agents",
+      location: null, displayName: null, environmentId: "environment", createdAt: null, createdBy: null,
+      lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown",
+      agentKind: "agent", lifecycle: "published", identityConfidence: "exact_native", identifiers: [],
+      provenance: {}, details: { isQuarantined: true }, unknownFieldCount: 0,
+    };
+    expect(agentUserAvailability(value)).toBe("unavailable");
+    expect(summarizeAgentAvailability([value]).availableToUsers).toBe(0);
+    value.powerPlatformResource.details.isQuarantined = false;
+    value.packages = [];
+    expect(agentUserAvailability(value)).toBe("unknown");
+  });
+
   it.each(["microsoft", "custom", "shared"])("includes documented %s origin without pretending it was used", type => {
     const value = record([{ type, deployedTo: "none", isBlocked: true }]);
     expect(matchesAgentView(value, "organization")).toBe(true);
@@ -61,7 +150,7 @@ describe("agent presentation and organizational relevance", () => {
     ]);
     expect(agentColumnValue(value, "hosts")).toBe("Copilot / Teams");
     expect(agentColumnValue(value, "builtWith")).toBe("Copilot Studio");
-    expect(agentColumnValue(value, "availability")).toBe("Varies by package");
+    expect(agentColumnValue(value, "availability")).toBe("All users");
     expect(agentColumnValue(value, "deployment")).toBe("Partially known");
     expect(agentColumnValue(value, "versions")).toBe("1 / 2");
   });
