@@ -1,4 +1,5 @@
 import { useEffect, useEffectEvent, useId, useMemo, useRef, useState } from "react";
+import type { SortingState } from "@tanstack/react-table";
 import {
   ApiError,
   downloadOfficialUsageCsv,
@@ -10,8 +11,11 @@ import {
   type OfficialUsageUserView,
 } from "../api/client";
 import { downloadBlob } from "../agentExport";
+import { restoreTableSortFocus, useListTable, type ListColumn } from "../listTable";
+import { useSavedRead } from "../savedQueries";
 import type { UsersRouteState } from "../workbenchRouting";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate, usagePageLabel } from "../usageInsights";
+import { ListTableHead } from "./ListTableHead";
 import { ReportedUserDetail } from "./ReportedUserDetail";
 import "./reportedUsers.css";
 
@@ -30,6 +34,7 @@ type AdvancedFilters = {
 const defaultFilters: AdvancedFilters = {
   creatorType: "", activity: "all", responsesOnly: false, startDate: "", endDate: "", lowResponseThreshold: "5", cohort: "all",
 };
+const defaultReportedSorting: SortingState = [{ id: "responses", desc: true }];
 const sorts: { value: string; label: string; sortBy: OfficialUsageUserView["filters"]["sortBy"]; sortDirection: "asc" | "desc" }[] = [
   { value: "responses-desc", label: "Most agent responses", sortBy: "responses", sortDirection: "desc" },
   { value: "responses-asc", label: "Fewest agent responses", sortBy: "responses", sortDirection: "asc" },
@@ -37,7 +42,8 @@ const sorts: { value: string; label: string; sortBy: OfficialUsageUserView["filt
   { value: "agents-asc", label: "Fewest reported agents used", sortBy: "agentsUsed", sortDirection: "asc" },
   { value: "activity-desc", label: "Latest user activity", sortBy: "lastActivity", sortDirection: "desc" },
   { value: "activity-asc", label: "Oldest user activity", sortBy: "lastActivity", sortDirection: "asc" },
-  { value: "name", label: "Name", sortBy: "displayName", sortDirection: "asc" },
+  { value: "name", label: "Name A–Z", sortBy: "displayName", sortDirection: "asc" },
+  { value: "name-desc", label: "Name Z–A", sortBy: "displayName", sortDirection: "desc" },
 ];
 
 export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, directoryData, onAccessDenied }: {
@@ -51,22 +57,26 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   const [retry, setRetry] = useState(0);
   const [applied, setApplied] = useState(defaultFilters);
   const [draft, setDraft] = useState(defaultFilters);
-  const [sort, setSort] = useState(sorts[0]);
+  const [sorting, setSorting] = useState<SortingState>(defaultReportedSorting);
   const [selectedUser, setSelectedUser] = useState<{ key: object; username: string }>();
   const [exportState, setExportState] = useState<ExportState>();
   const exportController = useRef<AbortController | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
+  const reportedTable = useRef<HTMLDivElement>(null);
+  const pendingSortFocus = useRef<string | undefined>(undefined);
   const filterDescription = useId();
   const exportDescription = useId();
   const reportAccessDenied = useEffectEvent((message: string) => onAccessDenied?.(message));
+  const readSaved = useSavedRead();
   const { agentId, reportSetId, search, page } = route;
+  const activeSort = sorts.find(item => item.sortBy === sorting[0]?.id && item.sortDirection === (sorting[0]?.desc ? "desc" : "asc")) ?? sorts[0];
   const query: OfficialUsageUserQuery = useMemo(() => ({
     agentId, setId: reportSetId, search: search.trim() || undefined,
     creatorType: applied.creatorType || undefined, activity: applied.activity, inactiveDays: 30,
     responsesOnly: applied.responsesOnly, startDate: applied.startDate || undefined, endDate: applied.endDate || undefined,
     lowResponseThreshold: Number(applied.lowResponseThreshold), cohort: applied.cohort,
-    sortBy: sort.sortBy, sortDirection: sort.sortDirection, limit: pageSize, offset: page * pageSize,
-  }), [agentId, applied, page, reportSetId, search, sort]);
+    sortBy: activeSort.sortBy, sortDirection: activeSort.sortDirection, limit: pageSize, offset: page * pageSize,
+  }), [activeSort, agentId, applied, page, reportSetId, search]);
   // Revisiting the same filters must not revive an aborted read or export.
   const key = useMemo(() => ({ query, dataRevision, retry }), [query, dataRevision, retry]);
   const exportKey = useMemo(() => ({ key, draft }), [key, draft]);
@@ -93,10 +103,40 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   const hasFilters = Boolean(search || agentId || JSON.stringify(applied) !== JSON.stringify(defaultFilters) || draftChanged);
   const exportDisabled = !data?.activeSet || draftChanged || scopedExport?.status === "pending";
   const focusedName = agentId ? data?.users.value.flatMap(user => user.rows).find(row => row.agentId === agentId)?.displayAgentName : undefined;
+  const columns = useMemo<ListColumn<OfficialUsageUserSummary>[]>(() => [
+    { id: "displayName", header: "Reported user", accessorFn: user => user.displayName || user.username },
+    {
+      id: "responses", header: "Agent responses (Users report)",
+      accessorFn: user => user.missingUserReport ? undefined : user.reportedResponsesReceived,
+      sortDescFirst: true,
+    },
+    {
+      id: "agentsUsed", header: "Agents used (Users report)",
+      accessorFn: user => user.missingUserReport ? undefined : user.reportedAgentsUsed,
+      sortDescFirst: true,
+    },
+    { id: "license", header: "Current license", enableSorting: false },
+    { id: "lastActivity", header: "User last activity (Users report)", accessorFn: user => user.userLastActivityDateUtc, sortDescFirst: true },
+    { id: "details", header: "Details", enableSorting: false },
+  ], []);
+  const table = useListTable({
+    data: data?.users.value ?? [],
+    columns,
+    sorting,
+    manualSorting: true,
+    getRowId: reportUserKey,
+    onSortingChange: update => {
+      const next = typeof update === "function" ? update(sorting) : update;
+      if (!sorts.some(item => item.sortBy === next[0]?.id)) return;
+      pendingSortFocus.current = next[0]?.id;
+      setSorting(next);
+      onRouteChange({ ...route, page: 0 });
+    },
+  });
 
   useEffect(() => {
     const controller = new AbortController();
-    void getOfficialUsageUsers(query, { signal: controller.signal }).then(value => {
+    void readSaved(["official-usage-users", query, dataRevision, retry], signal => getOfficialUsageUsers(query, { signal }), controller.signal).then(value => {
       if (!controller.signal.aborted) setResult({ key, value });
     }).catch((failure: unknown) => {
       if (controller.signal.aborted) return;
@@ -105,14 +145,22 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
       if (isAccessDenied(failure)) reportAccessDenied(message);
     });
     return () => controller.abort();
-  }, [key, query]);
+  }, [dataRevision, key, query, readSaved, retry]);
 
   useEffect(() => () => exportController.current?.abort(), [exportKey]);
+
+  useEffect(() => {
+    if (!data || !pendingSortFocus.current) return;
+    const column = columns.find(item => item.id === pendingSortFocus.current);
+    const label = typeof column?.header === "string" ? column.header : undefined;
+    restoreTableSortFocus(reportedTable.current, label);
+    pendingSortFocus.current = undefined;
+  }, [columns, data]);
 
   function resetFilters() {
     setDraft(defaultFilters);
     setApplied(defaultFilters);
-    setSort(sorts[0]);
+    setSorting(defaultReportedSorting);
     onRouteChange({ ...route, search: "", agentId: undefined, page: 0 });
   }
 
@@ -150,9 +198,9 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
     <div className="copilot-users-toolbar reported-users-toolbar">
       <label><span>Search reported users or agents</span><input ref={searchInput} type="search" maxLength={256} placeholder="User, agent name, ID or creator" value={search}
         onChange={event => onRouteChange({ ...route, search: event.target.value, page: 0 }, true)} /></label>
-      <label><span>Order reported users by</span><select value={sort.value} onChange={event => {
+      <label><span>Order reported users by</span><select value={activeSort.value} onChange={event => {
         const next = sorts.find(item => item.value === event.target.value);
-        if (next) { setSort(next); onRouteChange({ ...route, page: 0 }); }
+        if (next) { setSorting([{ id: next.sortBy, desc: next.sortDirection === "desc" }]); onRouteChange({ ...route, page: 0 }); }
       }}>{sorts.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
       <button type="button" className="secondary" aria-describedby={exportDescription} disabled={exportDisabled} onClick={() => void exportUsers()}>{scopedExport?.status === "pending" ? "Exporting users…" : "Export users CSV"}</button>
     </div>
@@ -215,17 +263,20 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
       </div> : <>
         {!hasRelationships ? <p className="reported-users-note">The Users &amp; agents companion is missing. Relationships are unknown, not zero.</p> : null}
         <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. Current licenses require a unique exact link to this report snapshot.</p>
-        {data.users.value.length ? <div className="copilot-users-table-shell" role="region" aria-label="Reported users" tabIndex={0}>
+        {data.users.value.length ? <div ref={reportedTable} className="copilot-users-table-shell" role="region" aria-label="Reported users" tabIndex={0}>
           <table className="copilot-users-table reported-users-table">
-            <thead><tr><th scope="col">Reported user</th><th scope="col">Agent responses<br />(Users report)</th><th scope="col">Agents used<br />(Users report)</th><th scope="col">Current license</th><th scope="col">User last activity<br />(Users report)</th><th scope="col">Details</th></tr></thead>
-            <tbody>{data.users.value.slice(0, pageSize).map(user => <tr key={reportUserKey(user)}>
+            <ListTableHead table={table} />
+            <tbody>{table.getRowModel().rows.map(row => {
+              const user = row.original;
+              return <tr key={row.id}>
               <th scope="row">{user.displayName || user.username}<small>{user.username}</small></th>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedResponsesReceived)}{user.hasReportMismatch ? <small>Report totals differ</small> : null}</td>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</td>
               <td>{licenseLabel(directoryMatches.get(reportUserKey(user)))}</td>
               <td>{usageDate(user.userLastActivityDateUtc)}</td>
               <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key, username: user.username })}>View details</button></td>
-            </tr>)}</tbody>
+            </tr>;
+            })}</tbody>
           </table>
         </div> : <div className="reported-users-empty">
           <h3>{data.users.count ? "No reported users on this page" : data.counts.users ? "No reported users match" : "No reported user identities"}</h3>

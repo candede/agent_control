@@ -35,7 +35,7 @@ describe("SyncHistoryTable", () => {
     expect(screen.queryByText("Old Graph refresh")).not.toBeInTheDocument();
     expect(screen.queryByText("Report draft")).not.toBeInTheDocument();
     expect(screen.queryByText("Audit search")).not.toBeInTheDocument();
-    expect(within(table).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(table).queryByRole("button", { name: /Retry|Cancel|Resume/ })).not.toBeInTheDocument();
     await userEvent.click(within(table).getByRole("link", { name: /View details/ }));
     expect(onOpenSyncRun).toHaveBeenCalledExactlyOnceWith("run-1");
     await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
@@ -53,6 +53,9 @@ describe("SyncHistoryTable", () => {
     expect(screen.getByText(/1-10 of 13 recent records/)).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Next" }));
     expect(screen.getByText(/11-13 of 13 recent records/)).toBeVisible();
+    await userEvent.click(within(screen.getByRole("table")).getByRole("button", { name: "Sort by Started" }));
+    expect(screen.getByText(/1-10 of 13 recent records/)).toBeVisible();
+    expect(within(screen.getByRole("table")).getAllByRole("row")[1]).toHaveTextContent("Sync 0");
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Outcome" }), "incomplete");
     expect(screen.getByText(/1-1 of 1 recent records/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Previous" })).not.toBeInTheDocument();
@@ -79,5 +82,57 @@ describe("SyncHistoryTable", () => {
     }} error="" onRefresh={vi.fn()} />);
     expect(screen.getByRole("status")).toHaveTextContent("History is temporarily unavailable");
     expect(screen.queryByText(/No retained sync runs yet/)).not.toBeInTheDocument();
+  });
+
+  it("sorts numeric source results rather than their localized count labels", async () => {
+    render(<SyncHistoryTable state={projection([
+      job(1, { source: "package-refresh", label: "Zero", status: "succeeded", completed: 0, total: 0 }),
+      job(2, { source: "package-refresh", label: "Twenty", status: "succeeded", completed: 20, total: 20 }),
+      job(3, { source: "power-platform", label: "Thousand", status: "succeeded", completed: 1_000, total: 1_000 }),
+      job(4, { source: "power-platform", label: "Unknown", status: "failed", completed: null, total: null }),
+    ])} error="" onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
+    const table = screen.getByRole("table", { name: "Source job history" });
+    const labels = () => within(table).getAllByRole("row").slice(1).map(row => row.querySelector("strong")?.textContent);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Zero", "Twenty", "Thousand", "Unknown"]);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Thousand", "Twenty", "Zero", "Unknown"]);
+  });
+
+  it("keeps partial successful statuses out of complete outcomes and never calls their counts saved", async () => {
+    render(<SyncHistoryTable state={projection([
+      job(1, { source: "package-refresh", label: "Partial refresh", status: "succeeded", partial: true, completed: 7, total: 10 }),
+      job(2, { source: "package-refresh", label: "Complete refresh", status: "succeeded", completed: 0, total: 0 }),
+    ])} error="" onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
+    const partial = screen.getByText("Partial refresh").closest("tr")!;
+    expect(partial).toHaveTextContent("Complete with partial results");
+    expect(partial.querySelector(".status-badge")).toHaveClass("status-partial");
+    expect(partial).toHaveTextContent("7 reported so far");
+    expect(partial).not.toHaveTextContent("10 records saved");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Outcome" }), "complete");
+    expect(screen.getByRole("table")).toHaveTextContent("Complete refresh");
+    expect(screen.queryByText("Partial refresh")).not.toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Outcome" }), "incomplete");
+    expect(screen.getByRole("table")).toHaveTextContent("Partial refresh");
+    expect(screen.queryByText("Complete refresh")).not.toBeInTheDocument();
+  });
+
+  it("keeps missing and backwards dates unknown and sorts equal dates deterministically", async () => {
+    render(<SyncHistoryTable state={projection([
+      job(2, { startedAt: "2026-09-10T10:00:00.000Z", completedAt: "2026-09-09T10:00:00.000Z" }),
+      job(1, { startedAt: "2026-09-10T10:00:00.000Z", completedAt: "2026-09-10T10:01:00.000Z" }),
+      job(0, { startedAt: undefined, updatedAt: "", completedAt: undefined, completed: null, total: null }),
+    ])} error="" onRefresh={vi.fn()} />);
+    const table = screen.getByRole("table");
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Sync 1");
+    expect(screen.getByText("Sync 2").closest("tr")).toHaveTextContent("Not recorded");
+    expect(screen.getByText("Sync 0").closest("tr")).toHaveTextContent("Count not reported");
+    expect(screen.getByText("Sync 0").closest("tr")).not.toHaveTextContent("0s");
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Duration" }));
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Sync 1");
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Duration" }));
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Sync 1");
   });
 });

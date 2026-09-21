@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   ApiError,
   cancelBulkActionJob,
@@ -25,6 +25,7 @@ import {
   type WorkbenchJobsResponse,
 } from "../api/client";
 import { hasRole } from "../authorization";
+import { useSavedRead } from "../savedQueries";
 import { JobHistoryView } from "./JobHistoryView";
 import { jobKey } from "./jobPresentation";
 import { SyncHistoryTable } from "./SyncHistoryTable";
@@ -47,11 +48,16 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   const [loading, setLoading] = useState(true);
   const [pollingPaused, setPollingPaused] = useState(false);
   const generation = useRef(0);
+  const pollingGeneration = useRef(0);
   const request = useRef<AbortController | undefined>(undefined);
   const timer = useRef<number | undefined>(undefined);
   const pollDeadline = useRef(0);
   const actionSequence = useRef(0);
+  const actionRevision = useRef(0);
   const actionAdmission = useRef<{ owner: number; token: number } | undefined>(undefined);
+  const readOwner = useId();
+  const loadedRevision = useRef(revision);
+  const readSaved = useSavedRead();
   const principalKey = `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}`;
   const canManageMutationJobs = hasRole(user, "AgentControl.Admin");
   const isVisibleJob = useCallback((job: WorkbenchJobSummary) =>
@@ -60,6 +66,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   const authorizedJobs = state?.value.filter(isVisibleJob);
 
   const stop = useCallback(() => {
+    pollingGeneration.current += 1;
     request.current?.abort();
     request.current = undefined;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
@@ -72,7 +79,11 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     request.current = controller;
     setLoading(true);
     try {
-      const next = await getWorkbenchJobs({ signal: controller.signal });
+      const next = await readSaved(
+        ["workbench-jobs", principalKey, revision, actionRevision.current ? `${readOwner}:${actionRevision.current}` : 0],
+        signal => getWorkbenchJobs({ signal }),
+        controller.signal,
+      );
       if (controller.signal.aborted || owner !== generation.current) return false;
       setState(next);
       if (!preserveActionError) setError("");
@@ -84,30 +95,32 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       return isProgressing;
     } catch (reason) {
       if (controller.signal.aborted || owner !== generation.current || (reason instanceof ApiError && reason.kind === "aborted")) return false;
-      if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setState(undefined);
+      const denied = reason instanceof ApiError && (reason.status === 401 || reason.status === 403);
+      if (denied) setState(undefined);
       const message = reason instanceof ApiError
         ? `${reason.message}${reason.requestId ? ` Request ${reason.requestId}.` : ""}`
         : "Job status is unavailable.";
-      setError(current => preserveActionError && current ? current : message);
+      setError(current => preserveActionError && !denied && current ? current : message);
       return false;
     } finally {
       if (request.current === controller) request.current = undefined;
       if (!controller.signal.aborted && owner === generation.current) setLoading(false);
     }
-  }, [isVisibleJob]);
+  }, [isVisibleJob, principalKey, readOwner, readSaved, revision]);
 
   const startPolling = useCallback((owner: number, preserveActionError = false) => {
+    const pollingOwner = pollingGeneration.current;
     setPollingPaused(false);
     const poll = async () => {
       const progressing = await load(owner, preserveActionError);
-      if (owner !== generation.current || !progressing) return;
+      if (owner !== generation.current || pollingOwner !== pollingGeneration.current || !progressing) return;
       if (Date.now() < pollDeadline.current) timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
       else {
         pollDeadline.current = 0;
         setPollingPaused(true);
       }
     };
-    void poll();
+    return poll();
   }, [load]);
 
   useEffect(() => {
@@ -115,6 +128,8 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     const owner = generation.current;
     actionAdmission.current = undefined;
     stop();
+    if (loadedRevision.current !== revision) actionRevision.current += 1;
+    loadedRevision.current = revision;
     pollDeadline.current = 0;
     startPolling(owner);
     void Promise.resolve().then(() => {
@@ -137,24 +152,41 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     setBusy(key);
     setError("");
     stop();
+    // A post-action status check must not join a GET admitted before the mutation.
+    actionRevision.current += 1;
+    let actionFailed = false;
+    let denied = false;
     try {
       await operation();
       if (owner !== generation.current) return;
       onChanged?.();
-      pollDeadline.current = 0;
-      startPolling(owner);
     } catch (reason) {
       if (owner !== generation.current) return;
-      if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setState(undefined);
+      actionFailed = true;
+      denied = reason instanceof ApiError && (reason.status === 401 || reason.status === 403);
+      if (denied) setState(undefined);
       setError(reason instanceof ApiError
         ? `${reason.message}${reason.requestId ? ` Request ${reason.requestId}.` : ""}`
         : "The job operation failed.");
-      pollDeadline.current = 0;
-      startPolling(owner, true);
+      if (!denied) onChanged?.();
     } finally {
+      if (owner === generation.current && !denied) {
+        actionRevision.current += 1;
+        stop();
+        pollDeadline.current = 0;
+        await startPolling(owner, actionFailed);
+      }
       if (actionAdmission.current?.token === token) actionAdmission.current = undefined;
       if (owner === generation.current) setBusy("");
     }
+  }
+
+  function refresh() {
+    if (actionAdmission.current?.owner === generation.current) return;
+    actionRevision.current += 1;
+    stop();
+    pollDeadline.current = 0;
+    void startPolling(generation.current);
   }
 
   function resume(job: WorkbenchJobSummary) {
@@ -187,21 +219,14 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   }
 
   if (scope === "sync") return (
-    <SyncHistoryTable state={state} error={error} pollingPaused={pollingPaused} onOpenSyncRun={onOpenSyncRun} onRefresh={() => {
-      stop();
-      pollDeadline.current = 0;
-      startPolling(generation.current);
-    }} />
+    <SyncHistoryTable key={principalKey} state={state} error={error} loading={loading} pollingPaused={pollingPaused}
+      onOpenSyncRun={onOpenSyncRun} onRefresh={refresh} />
   );
 
   return <JobHistoryView key={principalKey}
     state={state ? { ...state, value: authorizedJobs ?? [] } : undefined}
     error={error} loading={loading} busy={busy} pollingPaused={pollingPaused} onOpenSyncRun={onOpenSyncRun}
-    onRefresh={() => {
-      stop();
-      pollDeadline.current = 0;
-      startPolling(generation.current);
-    }}
+    onRefresh={refresh}
     onAction={(job, operation) => {
       const actions = { resume: () => resume(job), cancel: () => cancel(job), reconcile: () => reconcile(job) };
       void perform(`${operation}:${jobKey(job)}`, actions[operation]);

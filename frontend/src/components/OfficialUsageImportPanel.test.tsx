@@ -1,4 +1,5 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -8,6 +9,7 @@ import type {
 } from "../api/client";
 import { ApiError } from "../api/client";
 import { legacyUsageStorageKey } from "../legacyUsageStorage";
+import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 import { OfficialUsageImportPanel } from "./OfficialUsageImportPanel";
 import { OfficialUsageImportModal } from "./OfficialUsageImportModal";
 import { mockNativeDialogs } from "../test/dialog";
@@ -146,6 +148,102 @@ describe("OfficialUsageImportPanel", () => {
       complete: true,
     }));
   });
+
+  it("deduplicates concurrent initial metadata reads during actual StrictMode replay", async () => {
+    const client = createSavedQueryClient();
+    render(<QueryClientProvider client={client}>
+      <OfficialUsageImportPanel onChanged={vi.fn()} />
+      <OfficialUsageImportPanel onChanged={vi.fn()} />
+    </QueryClientProvider>, { reactStrictMode: true });
+    await waitFor(() => {
+      for (const button of screen.getAllByRole("button", { name: "Refresh import state" })) expect(button).toBeEnabled();
+    });
+    expect(api.getAdminState).toHaveBeenCalledOnce();
+    expect(api.previewBundle).not.toHaveBeenCalled();
+    expect(api.previewOperation).not.toHaveBeenCalled();
+    expect(api.stage).not.toHaveBeenCalled();
+    expect(api.acceptBundle).not.toHaveBeenCalled();
+    expect(api.confirm).not.toHaveBeenCalled();
+  });
+
+  it.each(["stage", "discard", "refresh", "accept", "select", "delete"] as const)(
+    "verifies %s with a fresh read rather than joining pre-mutation metadata", async operation => {
+      const reportSet = retainedSet("33333333-3333-4333-8333-333333333333");
+      staged = operation === "accept" || operation === "discard" ? [preview("agents"), preview("userAgents"), preview("users")] : [];
+      const initial = { ...emptyAdminState, staging: staged, sets: operation === "accept" ? [] : [reportSet] };
+      const published = operation === "accept" || operation === "select";
+      const updated = {
+        ...emptyAdminState, activeRevision: 2,
+        activeSetId: published ? reportSet.id : null,
+        sets: published ? [reportSet] : [],
+      };
+      let finishOld!: (state: OfficialUsageAdminState) => void;
+      api.getAdminState.mockResolvedValueOnce(initial)
+        .mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }))
+        .mockResolvedValue(updated);
+      api.previewOperation.mockResolvedValue({
+        id: "set-confirmation", operation, setId: reportSet.id,
+        expectedRevision: 1, confirmationHash: "reviewed-hash", activeSetId: null,
+        expiresAt: "2027-01-01T00:00:00.000Z",
+      });
+      api.confirm.mockResolvedValue({ activeSetId: updated.activeSetId, activeRevision: 2 });
+      const client = createSavedQueryClient();
+      const managing = operation === "select" || operation === "delete" || operation === "refresh";
+      render(<QueryClientProvider client={client}>
+        <OfficialUsageImportPanel view={managing ? "manage" : "import"} onChanged={vi.fn()} />
+      </QueryClientProvider>);
+      if (managing) await screen.findByText("Retained", { exact: true });
+      else if (operation === "stage") {
+        await userEvent.upload(screen.getByLabelText("Official usage CSV files"),
+          new File(["agents"], "agents.csv", { type: "text/csv" }));
+        await waitFor(() => expect(screen.getByRole("button", { name: "Validate and stage" })).toBeEnabled());
+      } else await validationReady();
+      const cancelledLease = new AbortController();
+      const cancelledRead = readSavedQuery(client, ["official-usage-admin"],
+        signal => api.getAdminState({ signal }), cancelledLease.signal);
+      const lease = new AbortController();
+      const oldRead = readSavedQuery(client, ["official-usage-admin"],
+        signal => api.getAdminState({ signal }), lease.signal);
+      expect(api.getAdminState).toHaveBeenCalledTimes(2);
+      cancelledLease.abort();
+      await expect(cancelledRead).rejects.toMatchObject({ kind: "aborted" });
+      expect(api.getAdminState.mock.calls[1][0].signal.aborted).toBe(false);
+      const assertCurrentMetadata = () => {
+        if (operation === "accept") expect(screen.getByText(/added to cumulative history and is current/)).toBeVisible();
+        else if (operation === "select") expect(screen.getByText("Current", { exact: true })).toBeVisible();
+        else if (operation === "stage") expect(screen.getByText(/saved report selection changed during validation/)).toBeVisible();
+        else if (operation === "discard") expect(screen.getByText("All staged rows were discarded.")).toBeVisible();
+        else expect(screen.getByText("No retained official usage sets.")).toBeVisible();
+      };
+      try {
+        if (operation === "accept") {
+          await continueToReview();
+          await userEvent.click(screen.getByRole("button", { name: "Accept reviewed bundle" }));
+        } else if (operation === "stage") {
+          await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+        } else if (operation === "discard") {
+          await userEvent.click(screen.getByRole("button", { name: "Discard staging" }));
+        } else if (operation === "refresh") {
+          await userEvent.click(screen.getByRole("button", { name: "Refresh import state" }));
+        } else {
+          await userEvent.click(screen.getByRole("button", {
+            name: operation === "select" ? "Make current" : /Delete retained set for/,
+          }));
+          await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+        }
+        await waitFor(() => expect(api.getAdminState).toHaveBeenCalledTimes(3));
+        expect(api.getAdminState.mock.calls[1][0].signal.aborted).toBe(false);
+        await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+        assertCurrentMetadata();
+      } finally {
+        await act(async () => {
+          finishOld(initial);
+          await oldRead;
+        });
+      }
+      assertCurrentMetadata();
+    },
+  );
 
   it("stages all three exports, shows server metadata and warnings, then accepts the bundle", async () => {
     const onChanged = vi.fn();
@@ -565,6 +663,32 @@ describe("OfficialUsageImportPanel", () => {
     expect(api.previewBundle).toHaveBeenCalled();
   });
 
+  it.each([401, 403])("clears denied parallel discard data before its sibling settles for %s", async status => {
+    staged = [preview("agents"), preview("users")];
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    let finishSibling!: () => void;
+    api.discard.mockRejectedValueOnce(new ApiError(status, "access_revoked", "Import access was revoked."))
+      .mockReturnValueOnce(new Promise<void>(resolve => { finishSibling = resolve; }));
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Discard staging" }));
+    try {
+      expect(await screen.findByRole("alert")).toHaveTextContent("Import access was revoked.");
+      expect(screen.queryByRole("region", { name: "Server validation" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Discard staging" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled();
+      api.getAdminState.mockResolvedValue(emptyAdminState);
+      await userEvent.click(screen.getByRole("button", { name: "Refresh import state" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+    } finally {
+      await act(async () => finishSibling());
+    }
+    expect(api.discard).toHaveBeenCalledTimes(2);
+    expect(api.getAdminState).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("All staged rows were discarded.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Server validation" })).not.toBeInTheDocument();
+  });
+
   it("does not stage remaining files or refresh private data after its principal-bound panel unmounts", async () => {
     let finish!: (value: OfficialUsageStagingPreview) => void;
     api.stage.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
@@ -659,6 +783,101 @@ describe("OfficialUsageImportPanel", () => {
     expect(onChanged).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: /Delete retained set for/ })).toBeDisabled();
     expect(screen.getByText("Not verified", { exact: true })).toBeVisible();
+  });
+
+  it.each(["success", "failure"] as const)(
+    "does not steal focus after closing a pending deletion that ends in %s", async outcome => {
+      const reportSet = retainedSet("retained-private-set");
+      api.getAdminState.mockResolvedValueOnce({ ...emptyAdminState, sets: [reportSet] })
+        .mockResolvedValue(emptyAdminState);
+      api.previewOperation.mockResolvedValue({
+        id: "delete-confirmation", operation: "delete", setId: reportSet.id,
+        expectedRevision: 1, confirmationHash: "reviewed-hash", activeSetId: null,
+        expiresAt: "2027-01-01T00:00:00.000Z",
+      });
+      let complete!: () => void;
+      api.confirm.mockReturnValueOnce(new Promise((resolve, reject) => {
+        complete = () => outcome === "success"
+          ? resolve({ activeSetId: null, activeRevision: 2 })
+          : reject(new Error("Deletion was not confirmed."));
+      }));
+      render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+      await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+      await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
+      await userEvent.click(await screen.findByRole("button", { name: /Delete retained set for/ }));
+      const confirmation = screen.getByRole("dialog", { name: "Confirm delete" });
+      await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm" }));
+      expect(within(confirmation).getByRole("button", { name: "Confirm" })).toBeDisabled();
+      await userEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+      const newControl = screen.getByRole("button", { name: "Manage reports" });
+      await userEvent.click(newControl);
+      expect(newControl).toHaveFocus();
+      await act(async () => complete());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+      await act(async () => { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); });
+      expect(newControl).toHaveFocus();
+      expect(screen.queryByRole("dialog", { name: "Confirm delete" })).not.toBeInTheDocument();
+      expect(screen.getByText(outcome === "success" ? /retained set was deleted/ : "Deletion was not confirmed.")).toBeVisible();
+    },
+  );
+
+  it("announces confirmation errors inside the open native modal and keeps cancellation usable", async () => {
+    const reportSet = retainedSet("retained-private-set");
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, sets: [reportSet] });
+    api.previewOperation.mockResolvedValue({
+      id: "delete-confirmation", operation: "delete", setId: reportSet.id,
+      expectedRevision: 1, confirmationHash: "reviewed-hash", activeSetId: null,
+      expiresAt: "2027-01-01T00:00:00.000Z",
+    });
+    api.confirm.mockRejectedValueOnce(new Error("Deletion was not confirmed."));
+    render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+    await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
+    const opener = await screen.findByRole("button", { name: /Delete retained set for/ });
+    await userEvent.click(opener);
+    const confirmation = screen.getByRole("dialog", { name: "Confirm delete" });
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Confirm" }));
+    expect(await within(confirmation).findByRole("alert")).toHaveTextContent("Deletion was not confirmed.");
+    expect(within(confirmation).getByRole("button", { name: "Confirm" })).toBeEnabled();
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(opener).toHaveFocus());
+    expect(screen.getByRole("alert")).toHaveTextContent("Deletion was not confirmed.");
+  });
+
+  it.each([401, 403])("clears denied confirmation data and returns focus to surviving management for %s", async status => {
+    const reportSet = retainedSet("retained-private-set");
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, sets: [reportSet] });
+    api.previewOperation.mockResolvedValue({
+      id: "delete-confirmation", operation: "delete", setId: reportSet.id,
+      expectedRevision: 1, confirmationHash: "reviewed-hash", activeSetId: null,
+      expiresAt: "2027-01-01T00:00:00.000Z",
+    });
+    api.confirm.mockRejectedValueOnce(new ApiError(status, "access_revoked", "Import access was revoked."));
+    render(<OfficialUsageImportPanel view="manage" onChanged={vi.fn()} />);
+    await userEvent.click(await screen.findByRole("button", { name: /Delete retained set for/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Import access was revoked.");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Managed report history" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Make current" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Manage retained reports" })).toHaveFocus());
+  });
+
+  it("drops an old confirmation when a different staging context starts", async () => {
+    const reportSet = retainedSet("retained-private-set");
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, sets: [reportSet] });
+    api.previewOperation.mockResolvedValue({
+      id: "delete-confirmation", operation: "delete", setId: reportSet.id,
+      expectedRevision: 1, confirmationHash: "reviewed-hash", activeSetId: null,
+      expiresAt: "2027-01-01T00:00:00.000Z",
+    });
+    const { rerender } = render(<OfficialUsageImportPanel view="manage" onChanged={vi.fn()} />);
+    await userEvent.click(await screen.findByRole("button", { name: /Delete retained set for/ }));
+    expect(screen.getByRole("dialog", { name: "Confirm delete" })).toBeVisible();
+    rerender(<OfficialUsageImportPanel view="manage" initialStagingId="different-stage" onChanged={vi.fn()} />);
+    expect(await screen.findByText(/exact staging record is expired, deleted, or unavailable/)).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.confirm).not.toHaveBeenCalled();
   });
 
   it("disables stale approval after a failed preview refresh and requires reviewing the refreshed validation", async () => {

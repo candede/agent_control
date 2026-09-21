@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as usageApi from "../api/client";
@@ -88,13 +88,52 @@ describe("focused official agent reporting", () => {
 
   it.each([
     ["activeUsers-desc", "activeUsers", "desc"],
+    ["activeUsers-asc", "activeUsers", "asc"],
     ["responses-asc", "responses", "asc"],
     ["lastActivity-desc", "lastActivity", "desc"],
+    ["lastActivity-asc", "lastActivity", "asc"],
     ["agentName-asc", "agentName", "asc"],
+    ["agentName-desc", "agentName", "desc"],
   ])("uses the same server-backed table for order %s", async (selection, sortBy, sortDirection) => {
     const { props } = renderReport();
     await userEvent.selectOptions(screen.getByLabelText("Order agents by"), selection);
     expect(props.onAgentQueryChange).toHaveBeenLastCalledWith({ sortBy, sortDirection });
+  });
+
+  it("delegates sortable table headers to the server and exposes the applied direction", async () => {
+    const { props, rerender } = renderReport();
+    const responses = screen.getByRole("columnheader", { name: "Responses" });
+    expect(responses).toHaveAttribute("aria-sort", "descending");
+    const sort = within(responses).getByRole("button", { name: "Sort by Responses" });
+    sort.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(props.onAgentQueryChange).toHaveBeenLastCalledWith({ sortBy: "responses", sortDirection: "asc" });
+    const query = { sortBy: "responses" as const, sortDirection: "asc" as const };
+    rerender(<ReportingView {...props} query={query} loading />);
+    expect(screen.queryByRole("button", { name: "Sort by Responses" })).not.toBeInTheDocument();
+    const data = usageAggregateFixture();
+    data.filters.sortDirection = "asc";
+    rerender(<ReportingView {...props} query={query} data={data} />);
+    const applied = await screen.findByRole("button", { name: "Sort by Responses" });
+    expect(applied.closest("th")).toHaveAttribute("aria-sort", "ascending");
+    expect(screen.getByLabelText("Order agents by")).toHaveValue("responses-asc");
+    expect(within(screen.getByRole("region", { name: "Agent comparison rows" })).getAllByRole("rowheader")
+      .map(header => within(header).getByRole("button").textContent)).toEqual(data.agents.value.map(agent => agent.agentName));
+    await waitFor(() => expect(applied).toHaveFocus());
+  });
+
+  it("does not reclaim sort focus after the user moves to another report control", async () => {
+    const { props, rerender } = renderReport();
+    await userEvent.click(screen.getByRole("button", { name: "Sort by Responses" }));
+    const query = { sortBy: "responses" as const, sortDirection: "asc" as const };
+    rerender(<ReportingView {...props} query={query} loading />);
+    const search = screen.getByRole("searchbox", { name: "Search agents" });
+    await userEvent.click(search);
+    const data = usageAggregateFixture();
+    data.filters.sortDirection = "asc";
+    rerender(<ReportingView {...props} query={query} data={data} />);
+    expect(await screen.findByRole("button", { name: "Sort by Responses" })).toBeVisible();
+    expect(search).toHaveFocus();
   });
 
   it("preserves snapshot totals while searches and pagination apply to the whole agent dataset", async () => {

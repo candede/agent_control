@@ -1,17 +1,21 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers } from "../api/client";
+import { ApiError, downloadOfficialUsageCsv, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers } from "../api/client";
+import { downloadBlob } from "../agentExport";
 import { copilotUsageFixture, licensedUser } from "../test/copilotUsageFixture";
 import { usageAgentDetailFixture, usageUsersFixture } from "../test/usageInsightsFixture";
 import { CopilotUsersView } from "./CopilotUsersView";
+import { SavedQueryProvider } from "./SavedQueryProvider";
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof import("../api/client")>(),
   getCopilotUsageUsers: vi.fn(),
+  downloadOfficialUsageCsv: vi.fn(),
   getOfficialUsageUsers: vi.fn(),
   getOfficialUsageAgentDetail: vi.fn(),
 }));
+vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
 function userRows() {
   return within(screen.getByRole("region", { name: "Licensed users" })).getAllByRole("row").slice(1);
@@ -26,6 +30,32 @@ describe("Copilot license usage dashboard", () => {
     HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
   });
   afterEach(() => { vi.clearAllMocks(); });
+
+  it("isolates a new data revision from a saved read kept alive by another observer", async () => {
+    let completePrevious!: (value: typeof copilotUsageFixture) => void;
+    const previous = new Promise<typeof copilotUsageFixture>(resolve => { completePrevious = resolve; });
+    const currentData = structuredClone(copilotUsageFixture);
+    currentData.users = currentData.users.map(user => ({
+      ...user, directory: { ...user.directory, displayName: `Current ${user.directory.displayName}` },
+    }));
+    vi.mocked(getCopilotUsageUsers).mockReturnValueOnce(previous).mockResolvedValue(currentData);
+    const panels = (revision: number) => <SavedQueryProvider>
+      <section aria-label="Previous reader"><CopilotUsersView dataRevision={0} /></section>
+      <section aria-label="Current reader"><CopilotUsersView dataRevision={revision} /></section>
+    </SavedQueryProvider>;
+    const view = render(panels(0));
+    await waitFor(() => expect(getCopilotUsageUsers).toHaveBeenCalledOnce());
+    const previousSignal = vi.mocked(getCopilotUsageUsers).mock.calls[0][0]?.signal;
+    view.rerender(panels(1));
+    const current = within(screen.getByRole("region", { name: "Current reader" }));
+    expect(await current.findByRole("button", { name: "Current Ada" })).toBeVisible();
+    expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2);
+    expect(previousSignal?.aborted).toBe(false);
+    await act(async () => completePrevious(structuredClone(copilotUsageFixture)));
+    expect(await within(screen.getByRole("region", { name: "Previous reader" })).findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(current.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(current.getByRole("button", { name: "Current Ada" })).toBeVisible();
+  });
 
   it("leads with all licensed users and keeps technical provenance collapsed", async () => {
     render(<CopilotUsersView />);
@@ -55,6 +85,162 @@ describe("Copilot license usage dashboard", () => {
     expect(userRows()).toHaveLength(1);
     expect(userRows()[0]).toHaveTextContent("Drew");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
+  it("sorts the complete licensed snapshot before paging and resets the page from header sorting", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.users = Array.from({ length: 2_053 }, (_, index) =>
+      licensedUser(index + 1, `Person${String(index).padStart(4, "0")}`, index < 2_050 ? 2_050 - index : null));
+    fixture.counts.licensedUsers = fixture.users.length;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+
+    const table = await screen.findByRole("region", { name: "Licensed users" });
+    const responseHeader = within(table).getByRole("columnheader", { name: "Agent responses" });
+    expect(responseHeader).toHaveAttribute("aria-sort", "descending");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByLabelText("Licensed user pages")).toHaveTextContent("51-100 of 2,053");
+
+    await userEvent.click(within(responseHeader).getByRole("button", { name: "Sort by Agent responses" }));
+    expect(screen.getByLabelText("Licensed user pages")).toHaveTextContent("1-50 of 2,053");
+    expect(screen.getByLabelText("Order by")).toHaveValue("responses-asc");
+    expect(responseHeader).toHaveAttribute("aria-sort", "ascending");
+    expect(userRows()[0]).toHaveTextContent("Person2049");
+    expect(userRows().some(row => row.textContent?.includes("Unknown"))).toBe(false);
+
+    await userEvent.click(within(responseHeader).getByRole("button", { name: "Sort by Agent responses" }));
+    expect(screen.getByLabelText("Order by")).toHaveValue("responses-desc");
+    expect(responseHeader).toHaveAttribute("aria-sort", "descending");
+    expect(userRows()[0]).toHaveTextContent("Person0000");
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["User", "name", "name-desc", [2, 1, 0, 3], [3, 0, 1, 2]],
+    ["License", "license-asc", "license-desc", [3, 2, 1, 0], [0, 1, 2, 3]],
+    ["Agent responses", "responses-asc", "responses-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
+    ["Agents used", "agents-asc", "agents-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
+    ["Agent-report last activity", "activity-asc", "activity", [2, 1, 0, 3], [0, 1, 2, 3]],
+    ["Follow-up", "follow-up-asc", "follow-up-desc", [1, 2, 3, 0], [0, 3, 1, 2]],
+  ] as const)("compares %s values in both directions and synchronizes keyboard headers with the selector", async (header, ascending, descending, ascOrder, descOrder) => {
+    const data = structuredClone(copilotUsageFixture);
+    data.users = [
+      licensedUser(1, "Person10", 10), licensedUser(2, "Person2", 2),
+      licensedUser(3, "Person0", 0), licensedUser(4, "PersonMissing", 999),
+    ];
+    data.users.forEach((user, index) => {
+      user.importedUsage!.reportedAgentsUsed = [10, 2, 0, 999][index];
+      user.importedUsage!.userLastActivityDateUtc = [
+        "2026-10-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "2025-12-31T00:00:00.000Z", undefined,
+      ][index];
+    });
+    data.users[1].licenses[0].state = "error";
+    data.users[2].licenses[0].state = "disabled";
+    data.users[3].licenses[0].state = "assigned";
+    data.users[3].importedUsage!.missingUserReport = true;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    const table = await screen.findByRole("region", { name: "Licensed users" });
+    const order = screen.getByLabelText("Order by");
+    const names = () => userRows().map(row => within(row).getByRole("button").textContent);
+    await userEvent.selectOptions(order, ascending);
+    expect(names()).toEqual(ascOrder.map(index => data.users[index].directory.displayName));
+    const heading = within(table).getByRole("columnheader", { name: header });
+    expect(heading).toHaveAttribute("aria-sort", "ascending");
+    const sortButton = within(heading).getByRole("button", { name: `Sort by ${header}` });
+    sortButton.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(names()).toEqual(descOrder.map(index => data.users[index].directory.displayName));
+    expect(heading).toHaveAttribute("aria-sort", "descending");
+    expect(order).toHaveValue(descending);
+    expect(sortButton).toHaveFocus();
+    const unknown = userRows().find(row => within(row).queryByRole("button", { name: "PersonMissing" }))!;
+    expect(within(unknown).getAllByRole("cell")[2]).toHaveTextContent(/^Unknown$/);
+    expect(within(unknown).getAllByRole("cell")[3]).toHaveTextContent(/^Unknown$/);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
+  it("keeps equal-name directory identities attached to their rows and selected details after reordering", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    const high = licensedUser(1, "Kai", 10);
+    const low = licensedUser(2, "Kai", 2);
+    low.directory.userPrincipalName = "different-kai@example.invalid";
+    data.users = [high, low];
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    await screen.findByRole("region", { name: "Licensed users" });
+    const lowTrigger = within(userRows()[1]).getByRole("button", { name: "Kai" });
+    await userEvent.click(screen.getByRole("button", { name: "Sort by Agent responses" }));
+    expect(within(userRows()[0]).getByRole("button", { name: "Kai" })).toBe(lowTrigger);
+    await userEvent.click(lowTrigger);
+    const dialog = screen.getByRole("dialog", { name: "Kai" });
+    expect(within(dialog).getByText(low.directory.userPrincipalName)).toBeVisible();
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("2");
+    await userEvent.keyboard("{Escape}");
+    expect(lowTrigger).toHaveFocus();
+  });
+
+  it("ignores the replayed first read under root React Strict Mode", async () => {
+    let resolve!: (value: typeof copilotUsageFixture) => void;
+    vi.mocked(getCopilotUsageUsers).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    render(<CopilotUsersView />, { reactStrictMode: true });
+    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(getCopilotUsageUsers).mock.calls[0][0]?.signal?.aborted).toBe(true);
+    const old = structuredClone(copilotUsageFixture);
+    old.users[0].directory.displayName = "Obsolete user";
+    await act(async () => resolve(old));
+    expect(screen.queryByRole("button", { name: "Obsolete user" })).not.toBeInTheDocument();
+  });
+
+  it("delegates reported-user header sorting to the backend and exports that same sort", async () => {
+    const initial = usageUsersFixture();
+    vi.mocked(getOfficialUsageUsers).mockImplementation(async (query = {}) => ({
+      ...structuredClone(initial),
+      users: { ...structuredClone(initial.users), count: 100, offset: query.offset ?? 0 },
+      filters: {
+        ...structuredClone(initial.filters),
+        sortBy: query.sortBy ?? "responses",
+        sortDirection: query.sortDirection ?? "desc",
+      },
+    }));
+    vi.mocked(downloadOfficialUsageCsv).mockResolvedValue(new Blob(["csv"]));
+    render(<CopilotUsersView />);
+    await userEvent.click(screen.getByRole("button", { name: "Reported activity" }));
+    await screen.findByRole("region", { name: "Reported users" });
+    await userEvent.click(screen.getByRole("button", { name: "Next users" }));
+    await waitFor(() => expect(getOfficialUsageUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sortBy: "responses", sortDirection: "desc", offset: 50 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ));
+
+    await userEvent.click(within(screen.getByRole("region", { name: "Reported users" }))
+      .getByRole("button", { name: "Sort by Reported user" }));
+    await waitFor(() => expect(getOfficialUsageUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sortBy: "displayName", sortDirection: "asc", offset: 0 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ));
+    expect(screen.getByLabelText("Order reported users by")).toHaveValue("name");
+    const ascendingHeader = within(screen.getByRole("region", { name: "Reported users" }))
+      .getByRole("columnheader", { name: "Reported user" });
+    expect(ascendingHeader).toHaveAttribute("aria-sort", "ascending");
+    expect(within(ascendingHeader).getByRole("button", { name: "Sort by Reported user" })).toHaveFocus();
+
+    await userEvent.click(within(screen.getByRole("region", { name: "Reported users" }))
+      .getByRole("button", { name: "Sort by Reported user" }));
+    await waitFor(() => expect(getOfficialUsageUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sortBy: "displayName", sortDirection: "desc", offset: 0 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    ));
+    expect(screen.getByLabelText("Order reported users by")).toHaveValue("name-desc");
+
+    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    await waitFor(() => expect(downloadOfficialUsageCsv).toHaveBeenCalledWith(
+      "users",
+      expect.objectContaining({ sortBy: "displayName", sortDirection: "desc" }),
+      expect.any(AbortSignal),
+    ));
+    expect(downloadBlob).toHaveBeenCalledWith("reported-user-activity.csv", expect.any(Blob));
   });
 
   it("shows saved company and department in licensed user details and supports organization search", async () => {

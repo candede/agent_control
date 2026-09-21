@@ -2,6 +2,7 @@ import {
   forwardRef,
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useRef,
   useState,
@@ -32,6 +33,7 @@ import {
   type DataSyncSourceStatus,
   type DataSyncState,
 } from "../api/client";
+import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { SyncDialog } from "./SyncDialog";
 import {
@@ -98,10 +100,14 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const [busy, setBusy] = useState<"start" | "retry" | "cancel">();
   const [error, setError] = useState("");
   const [pollingPaused, setPollingPaused] = useState(false);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const readOwner = useId();
   const generation = useRef(0);
   const pollingGeneration = useRef(0);
   const loadController = useRef<AbortController | undefined>(undefined);
   const actionController = useRef<AbortController | undefined>(undefined);
+  const accessDenied = useRef(false);
+  const actionRevision = useRef(0);
   const timer = useRef<number | undefined>(undefined);
   const pollDeadline = useRef(0);
   const sourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
@@ -110,10 +116,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const requestedRunGeneration = useRef(0);
   const requestedRunController = useRef<AbortController | undefined>(undefined);
   const requestedRunTimer = useRef<number | undefined>(undefined);
+  const requestedPollDeadline = useRef(0);
   const requestedSourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const onSourcesChangedRef = useRef(onSourcesChanged);
   const onRunsChangedRef = useRef(onRunsChanged);
   const wasActive = useRef(active);
+  const readSaved = useSavedRead();
   useEffect(() => {
     onSetupRequiredChange?.(state?.onboardingRequired ?? false);
   }, [onSetupRequiredChange, state?.onboardingRequired]);
@@ -129,6 +137,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   useEffect(() => {
     requestedRunIdRef.current = requestedRunId;
     requestedSourceStatuses.current = undefined;
+    requestedPollDeadline.current = 0;
   }, [principalKey, requestedRunId]);
 
   const stopPolling = useCallback(() => {
@@ -145,6 +154,36 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     if (requestedRunTimer.current !== undefined) window.clearTimeout(requestedRunTimer.current);
     requestedRunTimer.current = undefined;
   }, []);
+
+  const clearDeniedState = useCallback((reason: unknown) => {
+    if (!(reason instanceof ApiError) || (reason.status !== 401 && reason.status !== 403)) return false;
+    accessDenied.current = true;
+    generation.current += 1;
+    requestedRunGeneration.current += 1;
+    stopPolling();
+    stopRequestedRunPolling();
+    actionController.current?.abort();
+    actionController.current = undefined;
+    actionRevision.current += 1;
+    stateRef.current = undefined;
+    sourceStatuses.current = undefined;
+    requestedSourceStatuses.current = undefined;
+    pollDeadline.current = 0;
+    requestedPollDeadline.current = 0;
+    setState(undefined);
+    setRequestedRun(undefined);
+    setRequestedRunError("");
+    setRequestedRunLoading(false);
+    setLoading(false);
+    setBusy(undefined);
+    setError(requestError(reason, "Data sync access was denied."));
+    setPollingPaused(false);
+    setRequestedPollingPaused(false);
+    setCheckedAt(undefined);
+    setConfirmClean(false);
+    setCleanAcknowledged(false);
+    return true;
+  }, [stopPolling, stopRequestedRunPolling]);
 
   const observeSources = useCallback((
     sources: DataSyncSourceStatus[],
@@ -169,10 +208,9 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   }, []);
 
   const applyState = useCallback((next: DataSyncState) => {
-    observeSources(next.sources, sourceStatuses);
-
     stateRef.current = next;
     setState(next);
+    observeSources(next.sources, sourceStatuses);
   }, [observeSources]);
 
   const applyRun = useCallback((run: DataSyncRun) => {
@@ -190,15 +228,22 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     if (loadController.current) return false;
     const controller = new AbortController();
     loadController.current = controller;
+    setLoading(true);
     try {
-      const next = await getDataSyncState({ signal: controller.signal });
+      const next = await readSaved(
+        ["data-sync-state", principalKey, actionRevision.current ? `${readOwner}:${actionRevision.current}` : 0],
+        signal => getDataSyncState({ signal }),
+        controller.signal,
+      );
       if (controller.signal.aborted || owner !== generation.current) return false;
       applyState(next);
+      if (controller.signal.aborted || owner !== generation.current) return false;
       setCheckedAt(new Date().toISOString());
       if (!preserveActionError) setError("");
       return isProgressing(next.run);
     } catch (reason) {
-      if (controller.signal.aborted || owner !== generation.current) return false;
+      if (controller.signal.aborted || owner !== generation.current || (reason instanceof ApiError && reason.kind === "aborted")) return false;
+      if (clearDeniedState(reason)) return false;
       const message = requestError(reason, "Saved data sync status is unavailable.");
       setError(current => preserveActionError && current ? current : message);
       return false;
@@ -206,7 +251,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       if (loadController.current === controller) loadController.current = undefined;
       if (!controller.signal.aborted && owner === generation.current) setLoading(false);
     }
-  }, [applyState]);
+  }, [applyState, clearDeniedState, principalKey, readOwner, readSaved]);
 
   const startPolling = useCallback((owner: number, resetBudget: boolean, preserveActionError = false) => {
     stopPolling();
@@ -223,18 +268,18 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         return;
       }
       if (Date.now() >= pollDeadline.current) {
-        pollDeadline.current = 0;
         setPollingPaused(true);
         return;
       }
       timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
     };
-    void poll();
+    return poll();
   }, [load, stopPolling]);
 
   useEffect(() => {
     generation.current += 1;
     const owner = generation.current;
+    accessDenied.current = false;
     stopPolling();
     actionController.current?.abort();
     actionController.current = undefined;
@@ -269,21 +314,27 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       if (owner !== requestedRunGeneration.current) return;
       setRequestedRun(undefined);
       setRequestedRunError("");
-      setRequestedRunLoading(Boolean(requestedRunId));
+      setRequestedRunLoading(Boolean(requestedRunId) && !accessDenied.current);
       setRequestedPollingPaused(false);
     });
-    if (!requestedRunId) return;
+    if (!requestedRunId || accessDenied.current) return;
 
-    const deadline = Date.now() + pollBudgetMs;
+    if (requestedPollDeadline.current === 0) requestedPollDeadline.current = Date.now() + pollBudgetMs;
+    const deadline = requestedPollDeadline.current;
     const poll = async () => {
       const controller = new AbortController();
       requestedRunController.current = controller;
       try {
-        const run = await getDataSyncRun(requestedRunId, { signal: controller.signal });
+        const run = await readSaved(
+          ["data-sync-run", principalKey, requestedRunId, requestedRunReload, actionRevision.current ? `${readOwner}:${actionRevision.current}` : 0],
+          signal => getDataSyncRun(requestedRunId, { signal }),
+          controller.signal,
+        );
         if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
         setRequestedRun(run);
         setRequestedRunError("");
         observeSources(run.sources, requestedSourceStatuses);
+        if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
         if (!isProgressing(run)) return;
         if (Date.now() >= deadline) {
           setRequestedPollingPaused(true);
@@ -291,7 +342,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         }
         requestedRunTimer.current = window.setTimeout(() => void poll(), pollIntervalMs);
       } catch (reason) {
-        if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
+        if (controller.signal.aborted || owner !== requestedRunGeneration.current || (reason instanceof ApiError && reason.kind === "aborted")) return;
+        if (clearDeniedState(reason)) return;
         setRequestedRun(undefined);
         setRequestedRunError(requestError(reason, "The requested data sync run is unavailable."));
       } finally {
@@ -304,19 +356,23 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       requestedRunGeneration.current += 1;
       stopRequestedRunPolling();
     };
-  }, [observeSources, principalKey, requestedRunId, requestedRunReload, stopRequestedRunPolling]);
+  }, [clearDeniedState, observeSources, principalKey, readOwner, readSaved, requestedRunId, requestedRunReload, stopRequestedRunPolling]);
 
   const perform = useCallback(async (
     key: "start" | "retry" | "cancel",
     operation: (signal: AbortSignal) => Promise<DataSyncRun>,
   ) => {
-    if (actionController.current) return;
+    if (actionController.current || accessDenied.current) return;
     const owner = generation.current;
     stopPolling();
+    requestedRunGeneration.current += 1;
+    stopRequestedRunPolling();
+    actionRevision.current += 1;
     const controller = new AbortController();
     actionController.current = controller;
     setBusy(key);
     setError("");
+    let actionFailed = false;
     try {
       const run = await operation(controller.signal);
       if (controller.signal.aborted || owner !== generation.current) return;
@@ -326,26 +382,34 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         setRequestedRun(run);
         setRequestedRunError("");
         observeSources(run.sources, requestedSourceStatuses);
-        setRequestedRunReload(value => value + 1);
       } else if (key === "start" || stateRef.current?.run?.id === run.id) {
         applyRun(run);
       }
-      startPolling(owner, true);
     } catch (reason) {
       if (controller.signal.aborted || owner !== generation.current) return;
+      if (clearDeniedState(reason)) return;
+      actionFailed = true;
       setError(requestError(reason, "The data sync operation failed."));
-      if (requestedRunIdRef.current) setRequestedRunReload(value => value + 1);
-      startPolling(owner, true, true);
     } finally {
+      if (!controller.signal.aborted && owner === generation.current) {
+        // Route changes can admit reads during a command; fence again after it settles.
+        actionRevision.current += 1;
+        requestedRunGeneration.current += 1;
+        stopRequestedRunPolling();
+        requestedPollDeadline.current = 0;
+        if (requestedRunIdRef.current) setRequestedRunReload(value => value + 1);
+        await startPolling(owner, true, actionFailed);
+      }
       if (actionController.current === controller) actionController.current = undefined;
       if (owner === generation.current) {
         setBusy(undefined);
         onRunsChangedRef.current?.();
       }
     }
-  }, [applyRun, observeSources, startPolling, stopPolling, stopRequestedRunPolling]);
+  }, [applyRun, clearDeniedState, observeSources, startPolling, stopPolling, stopRequestedRunPolling]);
 
   const start = useCallback(async (mode: DataSyncMode, sources?: DataSyncSourceId[], clearSavedData = false) => {
+    if (actionController.current || accessDenied.current) return;
     setConfirmClean(false);
     setCleanAcknowledged(false);
     if (requestedRunId) {
@@ -375,10 +439,17 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     });
   }, [onRequestedRunChange, perform, requestedRunId]);
 
-  const refresh = useCallback(async () => {
-    startPolling(generation.current, true);
+  const refresh = useCallback(async (resetBudget = true) => {
+    if (actionController.current) return;
+    if (accessDenied.current && !resetBudget) return;
+    accessDenied.current = false;
+    actionRevision.current += 1;
+    requestedRunGeneration.current += 1;
+    stopRequestedRunPolling();
+    if (resetBudget) requestedPollDeadline.current = 0;
+    void startPolling(generation.current, resetBudget);
     if (requestedRunId) setRequestedRunReload(value => value + 1);
-  }, [requestedRunId, startPolling]);
+  }, [requestedRunId, startPolling, stopRequestedRunPolling]);
 
   useImperativeHandle(ref, () => ({ refresh, start }), [refresh, start]);
 
@@ -390,7 +461,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const usageReady = usage?.status === "succeeded" && !state?.usageImportRequired;
 
   useEffect(() => {
-    if (active && !wasActive.current) void refresh();
+    if (active && !wasActive.current) void refresh(false);
     if (!active && wasActive.current) void Promise.resolve().then(() => {
       setConfirmClean(false);
       setCleanAcknowledged(false);
@@ -442,11 +513,11 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   if (!active) return null;
 
   return (
-    <section className="data-sync-panel" aria-labelledby="data-sync-heading">
+    <section className="data-sync-panel" aria-labelledby="data-sync-heading" aria-busy={loading || Boolean(busy)}>
       <header className="data-sync-page-header">
         <div className="data-sync-page-icon"><Database size={24} aria-hidden="true" /></div>
         <div>
-          <h2 id="data-sync-heading">Data sync</h2>
+          <h2 id="data-sync-heading" ref={heading} tabIndex={-1}>Data sync</h2>
           <p>Keep workspace data up to date. Sync reads Microsoft data without changing its settings.</p>
         </div>
         <div className="data-sync-toolbar">
@@ -470,7 +541,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         {state ? (
           <>
             {currentRun ? (
-              isProgressing(currentRun) || currentRun.status === "partial" ? (
+              !isComplete(currentRun) && currentRun.status !== "cancelled" ? (
                 <section className="data-sync-activity" aria-label="Current sync">
                   <SyncProgress run={currentRun} />
                   {runActions(currentRun, pollingPaused)}
@@ -547,6 +618,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       </div>
       <SyncDialog open={Boolean(requestedRunId)} title="Sync run details"
         description="Results for this run, not your overall workspace state."
+        fallbackFocusRef={heading}
         onClose={() => onRequestedRunChange(undefined)}>
         {requestedRunLoading ? <p role="status">Loading exact sync run {requestedRunId}...</p> : null}
         {requestedRunError ? <div className="error-banner" role="alert">{requestedRunError}</div> : null}
@@ -573,7 +645,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         ) : null}
         <button type="button" className="secondary" onClick={() => onRequestedRunChange(undefined)}>Back to workspace</button>
       </SyncDialog>
-      <SyncDialog open={confirmClean} title="Reset saved data" onClose={() => { setConfirmClean(false); setCleanAcknowledged(false); }}>
+      <SyncDialog open={confirmClean} title="Reset saved data" fallbackFocusRef={heading} onClose={() => { setConfirmClean(false); setCleanAcknowledged(false); }}>
         <div className="data-sync-clean-confirm">
           <strong>Clear saved data before syncing?</strong>
           <p>Your account's saved users, license and app-activity data, Graph packages, and Power Platform inventory will be removed first. These views may be empty until sync succeeds. A failed or cancelled sync does not restore the cleared data.</p>

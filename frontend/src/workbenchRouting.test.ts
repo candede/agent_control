@@ -297,6 +297,16 @@ describe("workbench routing", () => {
     expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
   });
 
+  it.each([
+    "reassign", "approve-hunting", "qualify-hunting", "submit-hunting", "query-hunting",
+    "cancel-hunting", "delete-hunting", "revoke-hunting-scope",
+    "export-official-usage-aggregate", "export-official-usage-users", "export-administrative-audit",
+  ])("round trips the backend-supported %s administrative audit filter", action => {
+    const route = parseAuditRoute(`action=${action}&status=succeeded`);
+    expect(route.action).toBe(action);
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
+  });
+
   it("defaults retained usage snapshots to the full historical activity window", () => {
     const reportSetId = "11111111-1111-4111-8111-111111111111";
     const historical = parseOfficialUsageRoute(`snapshot=${reportSetId}`);

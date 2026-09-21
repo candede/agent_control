@@ -1,11 +1,14 @@
-import { Fragment, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type RefObject } from "react";
+import type { SortingState } from "@tanstack/react-table";
 import {
   downloadOfficialUsageCsv,
   type OfficialUsageAgentQuery,
   type OfficialUsageAggregateView,
 } from "../api/client";
 import { downloadBlob } from "../agentExport";
+import { restoreTableSortFocus, useListTable, type ListColumn } from "../listTable";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate, usagePageLabel } from "../usageInsights";
+import { ListTableHead } from "./ListTableHead";
 import "./officialUsage.css";
 
 type AgentFilters = Pick<OfficialUsageAgentQuery, "search" | "creatorType" | "startDate" | "endDate" | "sortBy" | "sortDirection">;
@@ -24,16 +27,22 @@ type Props = {
 
 const orders = [
   { id: "responses-desc", label: "Most responses", sortBy: "responses", sortDirection: "desc" },
-  { id: "activeUsers-desc", label: "Most active users", sortBy: "activeUsers", sortDirection: "desc" },
   { id: "responses-asc", label: "Fewest responses (including zero)", sortBy: "responses", sortDirection: "asc" },
+  { id: "activeUsers-desc", label: "Most active users", sortBy: "activeUsers", sortDirection: "desc" },
+  { id: "activeUsers-asc", label: "Fewest active users", sortBy: "activeUsers", sortDirection: "asc" },
   { id: "lastActivity-desc", label: "Latest activity", sortBy: "lastActivity", sortDirection: "desc" },
+  { id: "lastActivity-asc", label: "Oldest activity", sortBy: "lastActivity", sortDirection: "asc" },
   { id: "agentName-asc", label: "Agent name (A-Z)", sortBy: "agentName", sortDirection: "asc" },
+  { id: "agentName-desc", label: "Agent name (Z-A)", sortBy: "agentName", sortDirection: "desc" },
 ] as const;
+const sortableAgentColumns = new Set<NonNullable<AgentFilters["sortBy"]>>(["agentName", "responses", "activeUsers", "lastActivity"]);
 
 export function ReportingView({ data, query, offset, loading = false, error, onRetry, onAgentPageChange, onAgentQueryChange }: Props) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<{ key: string; message: string }>();
   const exportController = useRef<AbortController | undefined>(undefined);
+  const tableRegion = useRef<HTMLDivElement>(null);
+  const pendingSortFocus = useRef<string | undefined>(undefined);
   const queryKey = filterKey(query);
   const exportKey = JSON.stringify([data?.activeSet?.id, data?.lineages.map(lineage => lineage.versionId), queryKey]);
   const filtersApplied = Boolean(data && filterKey(data.filters) === queryKey && data.agents.offset === offset);
@@ -44,6 +53,10 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
   const dateError = query.startDate && query.endDate && query.startDate > query.endDate
     ? "The activity start date must be on or before the end date." : undefined;
   const pending = !error && !dateError && (loading || Boolean(data && !filtersApplied));
+  const sorting: SortingState = [{
+    id: query.sortBy ?? "responses",
+    desc: (query.sortDirection ?? "desc") === "desc",
+  }];
 
   useEffect(() => () => {
     exportController.current?.abort();
@@ -51,6 +64,18 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
     setExporting(false);
     setExportError(undefined);
   }, [exportKey, loading, error]);
+
+  useEffect(() => {
+    if (!ready || !pendingSortFocus.current) return;
+    const label = {
+      agentName: "Agent",
+      responses: "Responses",
+      activeUsers: "Active users",
+      lastActivity: "Last reported activity",
+    }[pendingSortFocus.current];
+    restoreTableSortFocus(tableRegion.current, label);
+    pendingSortFocus.current = undefined;
+  }, [data, ready]);
 
   async function exportAgents() {
     if (!ready || !data?.activeSet || dateError) return;
@@ -140,7 +165,15 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
       {data?.activeSet && !error && !dateError ? pending
         ? <p role="status">Updating agent results...</p>
         : <>
-          <AgentUsageTable key={JSON.stringify([data.activeSet.id, queryKey, data.agents.offset])} agents={data.agents.value} count={data.agents.count} hasFilters={hasFilters} hasAgentEvidence={hasAgentEvidence} />
+          <AgentUsageTable tableRegion={tableRegion} agents={data.agents.value} count={data.agents.count}
+            hasFilters={hasFilters} hasAgentEvidence={hasAgentEvidence} sorting={sorting}
+            onSortingChange={next => {
+              const selected = next[0];
+              if (!selected || !sortableAgentColumns.has(selected.id as NonNullable<AgentFilters["sortBy"]>)) return;
+              const sortBy = selected.id as NonNullable<AgentFilters["sortBy"]>;
+              pendingSortFocus.current = sortBy;
+              onAgentQueryChange({ ...query, sortBy, sortDirection: selected.desc ? "desc" : "asc" });
+            }} />
           {data.agents.count > data.agents.limit || data.agents.offset > 0 ? <nav className="pagination-controls" aria-label="Agent usage pages">
             <button type="button" className="secondary" disabled={data.agents.offset === 0}
               onClick={() => onAgentPageChange(Math.max(0, data.agents.offset - data.agents.limit))}>Previous agents</button>
@@ -163,17 +196,43 @@ function Metric({ label, value, hint }: { label: string; value: number | null; h
   return <div className="metric"><span>{label}</span><strong>{usageCount(value)}</strong><small>{hint}</small></div>;
 }
 
-function AgentUsageTable({ agents, count, hasFilters, hasAgentEvidence }: { agents: Agent[]; count: number; hasFilters: boolean; hasAgentEvidence: boolean }) {
+function AgentUsageTable({
+  agents, count, hasFilters, hasAgentEvidence, sorting, onSortingChange, tableRegion,
+}: {
+  agents: Agent[];
+  count: number;
+  hasFilters: boolean;
+  hasAgentEvidence: boolean;
+  sorting: SortingState;
+  onSortingChange: (sorting: SortingState) => void;
+  tableRegion: RefObject<HTMLDivElement | null>;
+}) {
   const [selected, setSelected] = useState<string>();
   const id = useId();
+  const columns = useMemo<ListColumn<Agent>[]>(() => [
+    { id: "agentName", header: "Agent", accessorFn: agent => agent.agentName || agent.agentId },
+    { id: "creatorType", header: "Creator type", enableSorting: false },
+    { id: "responses", header: "Responses", accessorFn: agent => agent.responsesSentToUsers, sortDescFirst: true },
+    { id: "activeUsers", header: "Active users", accessorFn: agent => agent.activeUsersIdentityCount ?? undefined, sortDescFirst: true },
+    { id: "lastActivity", header: "Last reported activity", accessorFn: agent => agent.lastActivityDateUtc, sortDescFirst: true },
+  ], []);
+  const table = useListTable({
+    data: agents,
+    columns,
+    sorting,
+    manualSorting: true,
+    getRowId: agent => agent.agentId,
+    onSortingChange: updater => onSortingChange(typeof updater === "function" ? updater(sorting) : updater),
+  });
   if (!agents.length) return <div className="usage-empty-state">
     <h4>{!hasAgentEvidence ? "Agent usage evidence unavailable" : count ? "No agents on this page" : hasFilters ? "No agents match" : "No reported agents"}</h4>
     <p>{!hasAgentEvidence ? "The selected snapshot has no Agents or Users & agents evidence." : count || hasFilters ? "Change the search or filters, or return to the first page." : "The selected snapshot contains no agent rows."} Missing usage is not zero usage or a measure of total Copilot activity.</p>
   </div>;
-  return <div className="table-shell usage-agent-table" role="region" aria-label="Agent comparison rows" tabIndex={0}>
+  return <div ref={tableRegion} className="table-shell usage-agent-table" role="region" aria-label="Agent comparison rows" tabIndex={0}>
     <table>
-      <thead><tr><th scope="col">Agent</th><th scope="col">Creator type</th><th scope="col">Responses</th><th scope="col" title="Distinct positive-response identities per agent; not additive across agents">Active users</th><th scope="col">Last reported activity</th></tr></thead>
-      <tbody>{agents.map((agent, index) => {
+      <ListTableHead table={table} titles={{ activeUsers: "Distinct positive-response identities per agent; not additive across agents" }} />
+      <tbody>{table.getRowModel().rows.map((row, index) => {
+        const agent = row.original;
         const expanded = selected === agent.agentId;
         const detailId = `${id}-${index}`;
         return <Fragment key={agent.agentId}>

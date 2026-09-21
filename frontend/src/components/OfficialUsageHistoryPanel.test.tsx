@@ -9,6 +9,7 @@ import type {
 } from "../api/client";
 import { ApiError } from "../api/client";
 import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
+import { SavedQueryProvider } from "./SavedQueryProvider";
 
 const api = vi.hoisted(() => ({
   getHistory: vi.fn(),
@@ -145,6 +146,52 @@ describe("OfficialUsageHistoryPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     api.getHistory.mockResolvedValue(history());
+  });
+
+  it("deduplicates concurrent history reads through the shared saved-query client", async () => {
+    render(<SavedQueryProvider>
+      <OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />
+      <OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />
+    </SavedQueryProvider>);
+    expect(await screen.findAllByRole("region", { name: "Retained official usage snapshots" })).toHaveLength(2);
+    expect(api.getHistory).toHaveBeenCalledOnce();
+  });
+
+  it("cancels abandoned StrictMode history reads while deduplicating the surviving observers", async () => {
+    let finishAbandoned!: (value: OfficialUsageHistoryView) => void;
+    api.getHistory.mockReturnValueOnce(new Promise(resolve => { finishAbandoned = resolve; }));
+    render(<SavedQueryProvider>
+      <OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />
+      <OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />
+    </SavedQueryProvider>, { reactStrictMode: true });
+    expect(await screen.findAllByRole("region", { name: "Retained official usage snapshots" })).toHaveLength(2);
+    expect(api.getHistory).toHaveBeenCalledTimes(2);
+    expect(api.getHistory.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(api.getHistory.mock.calls[1][1].signal.aborted).toBe(false);
+    await act(async () => finishAbandoned(history([])));
+    expect(screen.getAllByRole("button", { name: "View snapshot" })).toHaveLength(2);
+    expect(screen.queryByText("No accepted official usage snapshots are retained.")).not.toBeInTheDocument();
+  });
+
+  it("keeps a post-mutation revision independent from an older shared history read", async () => {
+    let finishOld!: (value: OfficialUsageHistoryView) => void;
+    api.getHistory.mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }))
+      .mockResolvedValueOnce(history([]));
+    const panels = (revision: number) => <SavedQueryProvider>
+      <section aria-label="Current history reader"><OfficialUsageHistoryPanel revision={revision} onSelect={vi.fn()} /></section>
+      <section aria-label="Earlier history reader"><OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} /></section>
+    </SavedQueryProvider>;
+    const { rerender } = render(panels(0));
+    expect(api.getHistory).toHaveBeenCalledOnce();
+    rerender(panels(1));
+    const current = within(screen.getByRole("region", { name: "Current history reader" }));
+    expect(await current.findByText("No accepted official usage snapshots are retained.")).toBeVisible();
+    expect(api.getHistory).toHaveBeenCalledTimes(2);
+    expect(api.getHistory.mock.calls[0][1].signal.aborted).toBe(false);
+    await act(async () => finishOld(history()));
+    expect(current.getByText("No accepted official usage snapshots are retained.")).toBeVisible();
+    expect(current.queryByRole("button", { name: "View snapshot" })).not.toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Earlier history reader" })).getByRole("button", { name: "View snapshot" })).toBeEnabled();
   });
 
   it("labels overlapping and unknown windows as non-additive and exposes duplicate reuse", async () => {

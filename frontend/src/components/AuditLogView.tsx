@@ -2,6 +2,7 @@ import {
   useDeferredValue,
   useEffect,
   useEffectEvent,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -14,6 +15,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import {
+  ApiError,
   getAuditEvents,
   downloadAdministrativeAuditCsv,
   type AuditEvent,
@@ -22,22 +24,51 @@ import {
   type LocalAuditAction,
 } from "../api/client";
 import { downloadBlob } from "../agentExport";
+import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { auditRouteSearch, parseAuditRoute, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
 import { PurviewAuditView } from "./PurviewAuditView";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
-type AuditReadState = { key: string; value: AuditEvent[]; count: number } | { key: string; error: string };
 
 type AuditLogViewProps = {
   agents: Pick<CopilotPackage, "id" | "displayName">[];
 };
 
 const auditPageSize = 100;
+const auditActionLabels: Record<LocalAuditAction, string> = {
+  block: "Block",
+  unblock: "Unblock",
+  "update-availability": "Update availability",
+  "update-installation": "Update installation",
+  reassign: "Reassign owner",
+  "view-audit-search": "View provider audit",
+  "export-audit-search": "Export provider audit",
+  "view-hunting": "View Defender hunting",
+  "export-hunting": "Export Defender hunting",
+  "approve-hunting": "Approve Defender hunting qualification",
+  "qualify-hunting": "Run Defender hunting qualification",
+  "submit-hunting": "Submit Defender hunt",
+  "query-hunting": "Query Defender hunting",
+  "cancel-hunting": "Cancel Defender hunt",
+  "delete-hunting": "Delete Defender hunt",
+  "revoke-hunting-scope": "Revoke saved Defender scope",
+  "export-agent-inventory": "Export agent inventory",
+  "export-package-inventory": "Export package inventory",
+  "export-power-platform-inventory": "Export Power Platform inventory",
+  "export-official-usage-aggregate": "Export agent usage report",
+  "export-official-usage-users": "Export user usage report",
+  "export-administrative-audit": "Export administrative audit",
+  "associate-agent-usage": "Associate agent usage",
+  "remove-agent-usage-association": "Remove usage association",
+};
 
 export function AuditLogView({ agents }: AuditLogViewProps) {
   const [route, setRoute] = useState(() => parseAuditRoute(window.location.search));
+  const sourceId = useId();
+  const localTab = useRef<HTMLButtonElement>(null);
+  const purviewTab = useRef<HTMLButtonElement>(null);
 
   function commitRoute(next: AuditRouteState, push = false) {
     setRoute(next);
@@ -55,33 +86,50 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
 
   return (
     <section className="audit-source-view" aria-label="Audit evidence">
-      <div className="audit-source-tabs" role="tablist" aria-label="Audit source">
+      <div className="audit-source-tabs" role="tablist" aria-label="Audit source" onKeyDown={event => {
+        if (event.altKey || event.ctrlKey || event.metaKey || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const source = event.key === "Home" ? "local" : event.key === "End" ? "purview" : route.source === "local" ? "purview" : "local";
+        commitRoute({ ...route, source, jobId: source === "local" ? undefined : route.jobId }, true);
+        (source === "local" ? localTab : purviewTab).current?.focus();
+      }}>
         <button
+          ref={localTab}
+          id={`${sourceId}-local`}
           type="button"
           role="tab"
           aria-selected={route.source === "local"}
+          aria-controls={`${sourceId}-local-panel`}
+          tabIndex={route.source === "local" ? 0 : -1}
           className={route.source === "local" ? "active" : undefined}
           onClick={() => commitRoute({ ...route, source: "local", jobId: undefined }, true)}
         >
           Local control audit
         </button>
         <button
+          ref={purviewTab}
+          id={`${sourceId}-purview`}
           type="button"
           role="tab"
           aria-selected={route.source === "purview"}
+          aria-controls={`${sourceId}-purview-panel`}
+          tabIndex={route.source === "purview" ? 0 : -1}
           className={route.source === "purview" ? "active" : undefined}
           onClick={() => commitRoute({ ...route, source: "purview" }, true)}
         >
           Purview Audit Search
         </button>
       </div>
-      {route.source === "local" ? (
-        <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} />
-      ) : <PurviewAuditView
-        initialJobId={route.jobId}
-        initialUserPrincipalName={route.userPrincipalName}
-        onSelectedJobChange={jobId => commitRoute({ ...route, source: "purview", jobId }, true)}
-      />}
+      <div id={`${sourceId}-local-panel`} role="tabpanel" aria-labelledby={`${sourceId}-local`} hidden={route.source !== "local"}>
+        {route.source === "local" ? <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} /> : null}
+      </div>
+      <div id={`${sourceId}-purview-panel`} role="tabpanel" aria-labelledby={`${sourceId}-purview`} hidden={route.source !== "purview"}>
+        {route.source === "purview" ? <PurviewAuditView
+          initialJobId={route.jobId}
+          initialUserPrincipalName={route.userPrincipalName}
+          onSelectedJobChange={jobId => commitRoute({ ...route, source: "purview", jobId }, true)}
+        /> : null}
+      </div>
     </section>
   );
 }
@@ -94,25 +142,46 @@ function LocalAuditLogView({
   onRouteChange: (route: AuditRouteState, push?: boolean) => void;
   route: AuditRouteState;
 }) {
-  const [result, setResult] = useState<AuditReadState>();
-  const [refreshToken, setRefreshToken] = useState(0);
-  const [exportError, setExportError] = useState<{ key: string; message: string }>();
-  const [detailEvent, setDetailEvent] = useState<AuditEvent>();
-  const [exporting, setExporting] = useState(false);
+  const [refreshToken, setRefreshToken] = useState<string>();
+  const [exportError, setExportError] = useState<{ key: string; message: string; denied: boolean }>();
+  const [detailSelection, setDetailSelection] = useState<{ key: string; id: string }>();
+  const [exportKey, setExportKey] = useState<string>();
   const exportRequest = useRef<AbortController | undefined>(undefined);
-  useEffect(() => () => exportRequest.current?.abort(), []);
   const query = route.search;
   const actionFilter = route.action as AuditFilter;
   const statusFilter = route.status as StatusFilter;
   const pageIndex = route.page;
   const deferredQuery = useDeferredValue(query);
-  const key = JSON.stringify([actionFilter, deferredQuery.trim(), pageIndex, refreshToken, statusFilter]);
-  const scoped = result?.key === key && query.trim() === deferredQuery.trim() ? result : undefined;
-  const page = scoped && "value" in scoped ? scoped : undefined;
+  const auditQuery = useMemo(() => ({
+    limit: auditPageSize,
+    offset: pageIndex * auditPageSize,
+    action: actionFilter === "all" ? undefined : actionFilter,
+    status: statusFilter === "all" ? undefined : statusFilter,
+    search: deferredQuery.trim() || undefined,
+  }), [actionFilter, deferredQuery, pageIndex, statusFilter]);
+  const key = JSON.stringify([auditQuery, refreshToken, query.trim()]);
+  const exporting = exportKey === key;
+  useEffect(() => () => {
+    exportRequest.current?.abort();
+    exportRequest.current = undefined;
+  }, [key]);
+  const auditRead = useSavedQuery({
+    queryKey: ["audit-events", auditQuery, refreshToken],
+    queryFn: ({ signal }) => getAuditEvents(auditQuery, { signal }),
+  });
+  const lastPageIndex = auditRead.data
+    ? Math.max(Math.ceil(auditRead.data.count / auditPageSize) - 1, 0)
+    : 0;
+  const deferredMatches = query.trim() === deferredQuery.trim();
+  const exportDenial = exportError?.key === key && exportError.denied ? exportError.message : undefined;
+  const page = !exportDenial && !auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex <= lastPageIndex && deferredMatches
+    ? auditRead.data
+    : undefined;
   const events = page?.value ?? [];
+  const detailEvent = detailSelection?.key === key ? events.find(event => event.id === detailSelection.id) : undefined;
   const totalCount = page?.count ?? 0;
-  const loading = !scoped;
-  const readError = scoped && "error" in scoped ? scoped.error : undefined;
+  const readError = exportDenial ?? (deferredMatches && auditRead.error ? errorMessage(auditRead.error) : undefined);
+  const loading = !page && !readError;
   const error = readError ?? (exportError?.key === key ? exportError.message : undefined);
   const syncClampedPage = useEffectEvent((page: number) => {
     onRouteChange({ ...route, page });
@@ -128,45 +197,10 @@ function LocalAuditLogView({
   );
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadPage() {
-      try {
-        const response = await getAuditEvents({
-          limit: auditPageSize,
-          offset: pageIndex * auditPageSize,
-          action: actionFilter === "all" ? undefined : actionFilter,
-          status: statusFilter === "all" ? undefined : statusFilter,
-          search: deferredQuery.trim() || undefined,
-        });
-        const lastPageIndex = Math.max(
-          Math.ceil(response.count / auditPageSize) - 1,
-          0,
-        );
-
-        if (cancelled) {
-          return;
-        }
-
-        if (pageIndex > lastPageIndex) {
-          syncClampedPage(lastPageIndex);
-          return;
-        }
-
-        setResult({ key, value: response.value, count: response.count });
-      } catch (requestError) {
-        if (!cancelled) {
-          setResult({ key, error: errorMessage(requestError) });
-        }
-      }
+    if (!auditRead.isFetching && !auditRead.isError && auditRead.data && pageIndex > lastPageIndex) {
+      syncClampedPage(lastPageIndex);
     }
-
-    void loadPage();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [actionFilter, deferredQuery, pageIndex, key, statusFilter]);
+  }, [auditRead.data, auditRead.isError, auditRead.isFetching, lastPageIndex, pageIndex]);
 
   const succeededCount = events.filter(
     (event) => event.status === "succeeded",
@@ -188,23 +222,27 @@ function LocalAuditLogView({
   }
 
   function handleRefreshAuditLog() {
-    setRefreshToken((current) => current + 1);
+    setRefreshToken(crypto.randomUUID());
   }
 
   async function handleExportAuditCsv() {
     if (loading || !events.length || exportRequest.current) return;
     const controller = new AbortController();
     exportRequest.current = controller;
-    setExporting(true);
+    setExportKey(key);
     setExportError(undefined);
     try {
       const blob = await downloadAdministrativeAuditCsv(events.map(event => event.id), controller.signal);
       if (!controller.signal.aborted) downloadBlob("administrative-audit.csv", blob);
     } catch (requestError) {
-      if (!controller.signal.aborted) setExportError({ key, message: errorMessage(requestError) });
+      if (!controller.signal.aborted) setExportError({
+        key,
+        message: errorMessage(requestError),
+        denied: requestError instanceof ApiError && (requestError.status === 401 || requestError.status === 403),
+      });
     } finally {
       if (exportRequest.current === controller) exportRequest.current = undefined;
-      if (!controller.signal.aborted) setExporting(false);
+      if (!controller.signal.aborted) setExportKey(undefined);
     }
   }
 
@@ -249,19 +287,7 @@ function LocalAuditLogView({
             }}
           >
             <option value="all">All actions</option>
-            <option value="block">Block</option>
-            <option value="unblock">Unblock</option>
-            <option value="update-availability">Update availability</option>
-            <option value="update-installation">Update installation</option>
-            <option value="view-audit-search">View provider audit</option>
-            <option value="export-audit-search">Export provider audit</option>
-            <option value="view-hunting">View Defender hunting</option>
-            <option value="export-hunting">Export Defender hunting</option>
-            <option value="export-agent-inventory">Export agent inventory</option>
-            <option value="export-package-inventory">Export package inventory</option>
-            <option value="export-power-platform-inventory">Export Power Platform inventory</option>
-            <option value="associate-agent-usage">Associate agent usage</option>
-            <option value="remove-agent-usage-association">Remove usage association</option>
+            {Object.entries(auditActionLabels).map(([action, label]) => <option key={action} value={action}>{label}</option>)}
           </select>
         </label>
         <label>
@@ -351,14 +377,14 @@ function LocalAuditLogView({
           <AuditTable
             events={events}
             agentNamesById={agentNamesById}
-            onViewDetails={setDetailEvent}
+            onViewDetails={event => setDetailSelection({ key, id: event.id })}
           />
         </>
       )}
       {detailEvent ? (
         <AuditDetailsModal
           event={detailEvent}
-          onClose={() => setDetailEvent(undefined)}
+          onClose={() => setDetailSelection(undefined)}
         />
       ) : null}
     </section>
@@ -668,54 +694,7 @@ function formatActionGroup(event: AuditEvent) {
 }
 
 function formatAuditAction(action: LocalAuditAction) {
-  switch (action) {
-    case "block":
-      return "Block";
-    case "unblock":
-      return "Unblock";
-    case "update-availability":
-      return "Update availability";
-    case "update-installation":
-      return "Update installation";
-    case "reassign":
-      return "Reassign owner";
-    case "view-audit-search":
-      return "View provider audit";
-    case "export-audit-search":
-      return "Export provider audit";
-    case "view-hunting":
-      return "View Defender hunting";
-    case "export-hunting":
-      return "Export Defender hunting";
-    case "export-agent-inventory":
-      return "Export agent inventory";
-    case "associate-agent-usage":
-      return "Associate agent usage";
-    case "remove-agent-usage-association":
-      return "Remove usage association";
-    case "export-package-inventory":
-      return "Export package inventory";
-    case "export-power-platform-inventory":
-      return "Export Power Platform inventory";
-    case "export-official-usage-aggregate":
-      return "Export agent usage report";
-    case "export-official-usage-users":
-      return "Export user usage report";
-    case "export-administrative-audit":
-      return "Export administrative audit";
-    case "approve-hunting":
-      return "Approve Defender hunting qualification";
-    case "qualify-hunting":
-      return "Run Defender hunting qualification";
-    case "submit-hunting":
-      return "Submit Defender hunt";
-    case "query-hunting":
-      return "Query Defender hunting";
-    case "cancel-hunting":
-      return "Cancel Defender hunt";
-    case "delete-hunting":
-      return "Delete Defender hunt";
-  }
+  return auditActionLabels[action];
 }
 
 function shortOperationId(operationId: string) {

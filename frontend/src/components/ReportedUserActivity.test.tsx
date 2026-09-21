@@ -9,6 +9,7 @@ import type { UsersRouteState } from "../workbenchRouting";
 import { copilotUsageFixture } from "../test/copilotUsageFixture";
 import { usageFixtureNow, usageFixtureSetId, usageInsightsPublished, usageUsersFixture } from "../test/usageInsightsFixture";
 import { ReportedUserActivity } from "./ReportedUserActivity";
+import { SavedQueryProvider } from "./SavedQueryProvider";
 
 vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
@@ -61,6 +62,31 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe("reported user activity", () => {
+  it("isolates a new data revision from a saved read kept alive by another observer", async () => {
+    const previous = deferred<api.OfficialUsageUserView>();
+    const previousData = usageUsersFixture();
+    previousData.users.value[0].displayName = "Previous report identity";
+    const currentData = usageUsersFixture();
+    currentData.users.value[0].displayName = "Current report identity";
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(previous.promise).mockResolvedValue(currentData);
+    const panels = (revision: number) => <SavedQueryProvider>
+      <section aria-label="Previous reader"><ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} dataRevision={0} /></section>
+      <section aria-label="Current reader"><ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} dataRevision={revision} /></section>
+    </SavedQueryProvider>;
+    const view = render(panels(0));
+    await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenCalledOnce());
+    const previousSignal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]?.signal;
+    view.rerender(panels(1));
+    const current = within(screen.getByRole("region", { name: "Current reader" }));
+    expect(await current.findByRole("button", { name: "View reported details for Current report identity" })).toBeVisible();
+    expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(2);
+    expect(previousSignal?.aborted).toBe(false);
+    await act(async () => previous.resolve(previousData));
+    expect(await within(screen.getByRole("region", { name: "Previous reader" }))
+      .findByRole("button", { name: "View reported details for Previous report identity" })).toBeVisible();
+    expect(current.queryByRole("button", { name: "View reported details for Previous report identity" })).not.toBeInTheDocument();
+  });
+
   it("shows every report identity in a single six-field table with no automatic detail or cross-page links", async () => {
     renderActivity();
     const table = await screen.findByRole("region", { name: "Reported users" });
@@ -292,17 +318,84 @@ describe("reported user activity", () => {
   });
 
   it.each([
+    ["responses-desc", "responses", "desc"],
     ["responses-asc", "responses", "asc"],
     ["agents-desc", "agentsUsed", "desc"],
     ["agents-asc", "agentsUsed", "asc"],
     ["activity-desc", "lastActivity", "desc"],
     ["activity-asc", "lastActivity", "asc"],
     ["name", "displayName", "asc"],
+    ["name-desc", "displayName", "desc"],
   ])("requests the %s ordering across all users", async (value, sortBy, sortDirection) => {
     renderActivity();
     await screen.findByRole("region", { name: "Reported users" });
     await userEvent.selectOptions(screen.getByLabelText("Order reported users by"), value);
     await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ sortBy, sortDirection, offset: 0, limit: 50 }), expect.anything()));
+  });
+
+  it.each([
+    ["Agent responses (Users report)", "responses-asc", "responses", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
+    ["Agents used (Users report)", "agents-asc", "agentsUsed", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
+    ["User last activity (Users report)", "activity-asc", "lastActivity", ["u0", "u2", "u10", "unknown"], ["u10", "u2", "u0", "unknown"]],
+    ["Reported user", "name", "displayName", ["u0", "u10", "u2", "unknown"], ["unknown", "u2", "u10", "u0"]],
+  ] as const)("honors backend %s comparisons in both directions and exports the same ordering", async (header, order, sortBy, ascending, descending) => {
+    const published = structuredClone(usageInsightsPublished);
+    published.reports.users!.rows = [
+      { username: "u10", displayName: "User10", numberOfAgentsUsed: 10, agentResponsesReceived: 10, lastActivityDateUtc: "2026-10-01T00:00:00.000Z" },
+      { username: "u2", displayName: "User2", numberOfAgentsUsed: 2, agentResponsesReceived: 2, lastActivityDateUtc: "2026-01-02T00:00:00.000Z" },
+      { username: "u0", displayName: "User0", numberOfAgentsUsed: 0, agentResponsesReceived: 0, lastActivityDateUtc: "2025-12-31T00:00:00.000Z" },
+    ];
+    published.reports.userAgents!.rows = [{ ...published.reports.userAgents!.rows[0], username: "unknown", responsesSentToUsers: 999 }];
+    vi.mocked(api.getOfficialUsageUsers).mockImplementation(async query => buildOfficialUsageUserView(published, {
+      ...query, staleAfterDays: 35, now: usageFixtureNow, userSortBy: query?.sortBy,
+    }));
+    renderActivity();
+    await screen.findByRole("region", { name: "Reported users" });
+    const usernames = () => reportedRows().map(row => within(row).getByRole("rowheader").querySelector("small")?.textContent);
+    await userEvent.selectOptions(screen.getByLabelText("Order reported users by"), order);
+    await waitFor(() => expect(usernames()).toEqual(ascending));
+    const sortButton = screen.getByRole("button", { name: `Sort by ${header}` });
+    sortButton.focus();
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(usernames()).toEqual(descending));
+    expect(screen.getByRole("columnheader", { name: header })).toHaveAttribute("aria-sort", "descending");
+    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sortBy, sortDirection: "desc", offset: 0, limit: 50 }), expect.anything(),
+    );
+    const unknown = reportedRows().find(row => within(row).getByRole("rowheader").querySelector("small")?.textContent === "unknown")!;
+    expect(within(unknown).getAllByRole("cell")[0]).toHaveTextContent(/^Unknown$/);
+    expect(within(unknown).getAllByRole("cell")[1]).toHaveTextContent(/^Unknown$/);
+    await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    expect(api.downloadOfficialUsageCsv).toHaveBeenLastCalledWith(
+      "users", expect.objectContaining({ setId: usageFixtureSetId, sortBy, sortDirection: "desc" }), expect.any(AbortSignal),
+    );
+  });
+
+  it("leaves focus in the search input after a delayed server sort finishes", async () => {
+    renderActivity();
+    await screen.findByRole("region", { name: "Reported users" });
+    const pending = deferred<api.OfficialUsageUserView>();
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
+    await userEvent.click(screen.getByRole("button", { name: "Sort by Reported user" }));
+    const search = screen.getByRole("searchbox", { name: "Search reported users or agents" });
+    search.focus();
+    await act(async () => pending.resolve(usageUsersFixture({ staleAfterDays: 35, userSortBy: "displayName", sortDirection: "asc" })));
+    expect(screen.getByRole("region", { name: "Reported users" })).toBeVisible();
+    expect(search).toHaveFocus();
+  });
+
+  it("survives root Strict Mode replay without reviving its first saved read", async () => {
+    const pending = deferred<api.OfficialUsageUserView>();
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
+    render(<ReportedUserActivity route={initialRoute} onRouteChange={vi.fn()} />, { reactStrictMode: true });
+    await screen.findByRole("region", { name: "Reported users" });
+    expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]?.signal?.aborted).toBe(true);
+    const old = usageUsersFixture();
+    old.users.value[0].displayName = "Obsolete user";
+    await act(async () => pending.resolve(old));
+    expect(screen.queryByRole("row", { name: /Obsolete user/ })).not.toBeInTheDocument();
+    expect(reportedRows()).toHaveLength(4);
   });
 
   it.each(["responses-desc", "responses-asc", "agents-desc", "agents-asc"])("keeps missing Users-report metrics last for %s", async order => {
@@ -416,19 +509,26 @@ describe("reported user activity", () => {
     expect(screen.queryByText(/User CSV downloaded/)).not.toBeInTheDocument();
   });
 
-  it("aborts requests and exports on unmount", async () => {
+  it("aborts pending exports on unmount without downloading late content", async () => {
     const late = deferred<Blob>();
     vi.mocked(api.downloadOfficialUsageCsv).mockReturnValue(late.promise);
     const view = renderActivity();
     await screen.findByRole("region", { name: "Reported users" });
     await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    const readSignal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]!.signal!;
     const exportSignal = vi.mocked(api.downloadOfficialUsageCsv).mock.calls[0][2]!;
     view.unmount();
-    expect(readSignal.aborted).toBe(true);
     expect(exportSignal.aborted).toBe(true);
     await act(async () => late.resolve(new Blob(["old"])));
     expect(downloadBlob).not.toHaveBeenCalled();
+  });
+
+  it("aborts an in-flight reported-user read on unmount", () => {
+    const pending = deferred<api.OfficialUsageUserView>();
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
+    const view = renderActivity();
+    const signal = vi.mocked(api.getOfficialUsageUsers).mock.calls[0][1]!.signal!;
+    view.unmount();
+    expect(signal.aborted).toBe(true);
   });
 
   it("does not revive an aborted export when draft filters are reset to their previous values", async () => {

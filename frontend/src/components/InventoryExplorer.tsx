@@ -1,25 +1,38 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Download, Eye, RefreshCw, RotateCw, X } from "lucide-react";
+import type { SortingState } from "@tanstack/react-table";
 import {
-  downloadInventoryCsv, getInventoryQuarantineSelection, getInventoryRefreshJob, getInventoryRefreshJobs, getInventoryResources, getInventorySnapshots, getInventorySourceAwareDetail, refreshInventory, resumeInventoryRefresh,
+  ApiError, downloadInventoryCsv, getInventoryQuarantineSelection, getInventoryRefreshJob, getInventoryRefreshJobs, getInventoryResources, getInventorySnapshots, getInventorySourceAwareDetail, refreshInventory, resumeInventoryRefresh,
   powerPlatformResourceTypes,
   type InventoryListQuery, type InventoryRefreshJob, type InventoryRefreshJobList, type InventoryResourcePage, type InventorySnapshot, type InventorySourceAwareDetail, type PowerPlatformResource, type PowerPlatformResourceType,
 } from "../api/client";
+import { restoreTableSortFocus, useListTable, type ListColumn } from "../listTable";
+import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { quarantineTargetReason } from "../quarantineTarget";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
+import { ListTableHead } from "./ListTableHead";
 import { parsePowerPlatformRoute, powerPlatformRouteSearch, workbenchUrl } from "../workbenchRouting";
 import { inventoryCoverageValue, inventoryRequestScope } from "../inventoryVerification";
 import { SavedPowerPlatformVerification } from "./SavedInventoryVerification";
 
 const pageSize = 50;
+type InventorySortKey = NonNullable<InventoryListQuery["sortBy"]>;
+type InventoryRead = { key: object; error?: string };
+type InventoryDetailSelection = { snapshotId: string; resource: PowerPlatformResource };
+type InventoryReadRevision = { dataRevision: number; reload: string };
+type InventoryMetadataRead<T> = { value: T; error?: string; denied?: boolean };
+type InventoryJobRead = { generation: number; source: "history" | "exact" | "action"; value?: InventoryRefreshJob };
+type InventoryJobAction = { targetId?: string; invalidated: boolean; deniedJobIds: Set<string> };
+const tableSortKeys = new Set<InventorySortKey>(["displayName", "type", "environmentId", "lastPublishedAt"]);
 const noQuarantineTargets = new Map<string, PowerPlatformResource>();
+const emptyJobHistory: InventoryRefreshJobList = { value: [], lastAttemptAt: null, lastSuccessAt: null };
 const nonAgentResourceTypes = powerPlatformResourceTypes.filter(
   (resourceType): resourceType is Exclude<PowerPlatformResourceType, "microsoft.copilotstudio/agents"> =>
     resourceType !== "microsoft.copilotstudio/agents",
 );
 
-export function InventoryExplorer({ canManageQuarantine = true }: { canManageQuarantine?: boolean; packages?: unknown[] }) {
+export function InventoryExplorer({ canManageQuarantine = true, dataRevision = 0 }: { canManageQuarantine?: boolean; dataRevision?: number; packages?: unknown[] }) {
   const [initialRoute] = useState(() => parsePowerPlatformRoute(window.location.search));
   const [page, setPage] = useState<InventoryResourcePage>();
   const [pageIndex, setPageIndex] = useState(initialRoute.page);
@@ -29,19 +42,23 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   const [sortBy, setSortBy] = useState<InventoryListQuery["sortBy"]>(initialRoute.sortBy);
   const [sortDirection, setSortDirection] = useState<InventoryListQuery["sortDirection"]>(initialRoute.sortDirection);
   const [snapshotId, setSnapshotId] = useState(initialRoute.snapshotId);
-  const [snapshots, setSnapshots] = useState<InventorySnapshot[]>([]);
-  const [jobHistory, setJobHistory] = useState<InventoryRefreshJobList>({ value: [], lastAttemptAt: null, lastSuccessAt: null });
+  const [snapshotRead, setSnapshotRead] = useState<InventoryMetadataRead<InventorySnapshot[]>>({ value: [] });
+  const [historyRead, setHistoryRead] = useState<InventoryMetadataRead<InventoryRefreshJobList>>({ value: emptyJobHistory });
+  const snapshots = snapshotRead.value;
+  const jobHistory = historyRead.value;
   const [refreshType, setRefreshType] = useState<"all" | PowerPlatformResourceType>("all");
   const [refreshEnvironment, setRefreshEnvironment] = useState("");
-  const [reload, setReload] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [exporting, setExporting] = useState(false);
-  const [submittingRefresh, setSubmittingRefresh] = useState(false);
+  const [reload, setReload] = useState("");
+  const reloadSaved = useCallback(() => setReload(crypto.randomUUID()), []);
+  const readRevision = useMemo<InventoryReadRevision>(() => ({ dataRevision, reload }), [dataRevision, reload]);
+  const [read, setRead] = useState<InventoryRead>();
+  const [exportingKey, setExportingKey] = useState<object>();
+  const [submittingJobAction, setSubmittingJobAction] = useState(false);
   const [error, setError] = useState<string>();
-  const [inventoryReadError, setInventoryReadError] = useState<string>();
   const [jobError, setJobError] = useState<string>();
-  const [job, setJob] = useState<InventoryRefreshJob>();
-  const [detail, setDetail] = useState<PowerPlatformResource>();
+  const [jobRead, setJobRead] = useState<InventoryJobRead>();
+  const job = jobRead?.value;
+  const [detailSelection, setDetailSelection] = useState<InventoryDetailSelection>();
   const [detailTab, setDetailTab] = useState(initialRoute.detailTab ?? "identity");
   const [routeDetailId, setRouteDetailId] = useState(initialRoute.detailId);
   const [routeDetailType, setRouteDetailType] = useState(initialRoute.detailType);
@@ -50,38 +67,153 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   const [routeRefreshJobId, setRouteRefreshJobId] = useState(initialRoute.refreshJobId);
   const [routeQuarantineJobId, setRouteQuarantineJobId] = useState(initialRoute.quarantineJobId);
   const [quarantineSelection, setQuarantineSelection] = useState<{ snapshotId: string; targets: Map<string, PowerPlatformResource> }>();
+  const [selectionDenied, setSelectionDenied] = useState(false);
+  const [selectionError, setSelectionError] = useState<string>();
+  const [selectionReload, setSelectionReload] = useState("");
   const [displayTime, setDisplayTime] = useState(Date.now);
   const detailTrigger = useRef<HTMLButtonElement>(null);
+  const inventoryTable = useRef<HTMLDivElement>(null);
+  const pendingSortFocus = useRef<InventorySortKey | undefined>(undefined);
   const active = useRef(true);
   const listGeneration = useRef(0);
+  const selectionGeneration = useRef(0);
+  const selectionController = useRef<AbortController | null>(null);
+  const jobGeneration = useRef(0);
+  // Unrelated history failures may revoke reads without revoking an admitted command.
+  const jobAction = useRef<InventoryJobAction | undefined>(undefined);
+  const selectedRefreshJob = useRef(initialRoute.refreshJobId);
+  const currentJobRead = useRef<InventoryJobRead | undefined>(undefined);
+  const exactJobController = useRef<AbortController | null>(null);
+  const jobPollController = useRef<AbortController | null>(null);
+  // Fence the next admitted read without automatically retrying a denied source.
+  const authorizationGenerations = useRef({ snapshots: "", history: "", jobs: "" });
+  const exportController = useRef<AbortController | null>(null);
+  const readSaved = useSavedRead();
   const deferredSearch = useDeferredValue(search);
   const deferredEnvironment = useDeferredValue(environmentId);
-  const quarantineTargets = quarantineSelection && quarantineSelection.snapshotId === page?.snapshot?.id ? quarantineSelection.targets : noQuarantineTargets;
+  const quarantineTargets = useMemo(() => {
+    if (selectionDenied || !quarantineSelection || quarantineSelection.snapshotId !== page?.snapshot?.id) return noQuarantineTargets;
+    return new Map([...quarantineSelection.targets].filter(([id]) => routeSelectedIds.has(id)));
+  }, [page?.snapshot?.id, quarantineSelection, routeSelectedIds, selectionDenied]);
   const query = useMemo<InventoryListQuery>(() => ({
     snapshotId: snapshotId || undefined, excludeAgents: true,
     type: type === "all" ? undefined : type, environmentId: deferredEnvironment.trim() || undefined, search: deferredSearch.trim() || undefined,
     sortBy, sortDirection, limit: pageSize, offset: pageIndex * pageSize,
   }), [deferredEnvironment, deferredSearch, pageIndex, snapshotId, sortBy, sortDirection, type]);
+  const readKey = useMemo(() => ({ query, readRevision }), [query, readRevision]);
+  const scopedRead = read?.key === readKey ? read : undefined;
+  const loading = !scopedRead || deferredSearch !== search || deferredEnvironment !== environmentId;
+  const inventoryReadError = scopedRead?.error;
+  const exportKey = useMemo(() => ({ readKey, search, environmentId }), [readKey, search, environmentId]);
+  const exporting = exportingKey === exportKey;
+  const exportDisabled = exporting || loading || Boolean(inventoryReadError) || !page?.snapshot;
+  const detail = detailSelection && detailSelection.snapshotId === page?.snapshot?.id
+    && (!snapshotId || detailSelection.snapshotId === snapshotId) ? detailSelection.resource : undefined;
+  const sorting = useMemo<SortingState>(() =>
+    tableSortKeys.has(sortBy ?? "displayName") ? [{ id: sortBy ?? "displayName", desc: sortDirection === "desc" }] : [],
+  [sortBy, sortDirection]);
+  const columns = useMemo<ListColumn<PowerPlatformResource>[]>(() => [
+    ...(canManageQuarantine ? [{
+      id: "selection", header: () => <span className="sr-only">Select quarantine targets</span>, enableSorting: false,
+    } satisfies ListColumn<PowerPlatformResource>] : []),
+    { id: "displayName", header: "Name", accessorFn: resource => resource.displayName ?? resource.nativeId },
+    { id: "type", header: "Type", accessorFn: resource => resource.type },
+    { id: "environmentId", header: "Environment", accessorFn: resource => resource.environmentId ?? "" },
+    { id: "authoringTool", header: "Built with", accessorFn: resource => resource.authoringTool ?? "", enableSorting: false },
+    { id: "lifecycle", header: "Lifecycle", accessorFn: resource => resource.lifecycle, enableSorting: false },
+    { id: "lastPublishedAt", header: "Published", accessorFn: resource => resource.lastPublishedAt ?? "" },
+    { id: "actions", header: () => <span className="sr-only">Actions</span>, enableSorting: false },
+  ], [canManageQuarantine]);
+  const table = useListTable({
+    data: page?.value ?? [],
+    columns,
+    sorting,
+    manualSorting: true,
+    getRowId: resource => JSON.stringify([resource.type, resource.environmentId, resource.nativeId]),
+    onSortingChange: update => {
+      const next = typeof update === "function" ? update(sorting) : update;
+      const primary = next[0];
+      if (!primary || !tableSortKeys.has(primary.id as InventorySortKey)) return;
+      pendingSortFocus.current = primary.id as InventorySortKey;
+      setSortBy(primary.id as InventorySortKey);
+      setSortDirection(primary.desc ? "desc" : "asc");
+      setPageIndex(0);
+    },
+  });
+
+  const clearSelection = useCallback((denied = false) => {
+    selectionGeneration.current += 1;
+    selectionController.current?.abort();
+    setSelectionReload(crypto.randomUUID());
+    setRouteSelectedIds(new Set());
+    setQuarantineSelection(undefined);
+    if (denied) setSelectionDenied(true);
+    else setSelectionError(undefined);
+  }, []);
+
+  const publishJobRead = useCallback((next: InventoryJobRead | undefined) => {
+    currentJobRead.current = next;
+    setJobRead(next);
+  }, []);
+
+  const ownsJobAction = useCallback((action: InventoryJobAction, resultId?: string) =>
+    active.current && jobAction.current === action && !action.invalidated
+      && (resultId === undefined || !action.deniedJobIds.has(resultId)), []);
+
+  const denyJobRead = useCallback((owner: number, deniedJobId?: string) => {
+    if (owner !== jobGeneration.current) return;
+    const pending = jobAction.current;
+    if (deniedJobId && pending) {
+      pending.deniedJobIds.add(deniedJobId);
+      if (pending.targetId === deniedJobId) pending.invalidated = true;
+    }
+    jobGeneration.current += 1;
+    authorizationGenerations.current.jobs = crypto.randomUUID();
+    exactJobController.current?.abort();
+    jobPollController.current?.abort();
+    publishJobRead(undefined);
+  }, [publishJobRead]);
+
+  const recordReadFailure = useCallback((failure: unknown, key: object) => {
+    setRead({ key, error: errorMessage(failure) });
+    if (isAccessDenied(failure)) {
+      setPage(undefined);
+      setDetailSelection(undefined);
+      setRouteDetailId(undefined);
+      setRouteDetailType(undefined);
+      setRouteDetailEnvironmentId(undefined);
+      clearSelection(true);
+    }
+  }, [clearSelection]);
 
   const selectSnapshot = useCallback((id: string) => {
     setSnapshotId(id);
     setPageIndex(0);
     setPage(undefined);
-    setLoading(true);
-    setRouteSelectedIds(new Set());
-    setQuarantineSelection(undefined);
-    setDetail(undefined);
+    clearSelection();
+    setDetailSelection(undefined);
     setRouteDetailId(undefined);
     setRouteDetailType(undefined);
     setRouteDetailEnvironmentId(undefined);
     setRouteQuarantineJobId(undefined);
-  }, []);
+  }, [clearSelection]);
 
-  const updateRefreshJob = useCallback((next: InventoryRefreshJob) => {
-    setJob(next);
+  const updateRefreshJob = useCallback((next: InventoryRefreshJob, owner: number | InventoryJobAction) => {
+    if (typeof owner !== "number") {
+      if (!ownsJobAction(owner, next.id)) return false;
+      jobGeneration.current += 1;
+      exactJobController.current?.abort();
+      jobPollController.current?.abort();
+      publishJobRead({ value: next, source: "action", generation: jobGeneration.current });
+    } else {
+      const current = currentJobRead.current;
+      if (owner !== jobGeneration.current || current?.generation !== owner) return false;
+      publishJobRead({ ...current, value: next });
+    }
     if (next.status === "succeeded" && next.snapshotId) selectSnapshot(next.snapshotId);
-    if (next.status !== "running") setReload(value => value + 1);
-  }, [selectSnapshot]);
+    if (next.status !== "running") reloadSaved();
+    return true;
+  }, [ownsJobAction, publishJobRead, reloadSaved, selectSnapshot]);
 
   useEffect(() => {
     active.current = true;
@@ -92,6 +224,10 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
   useEffect(() => {
     function restoreRoute() {
       const route = parsePowerPlatformRoute(window.location.search);
+      if (route.refreshJobId !== selectedRefreshJob.current) {
+        if (jobAction.current) jobAction.current.invalidated = true;
+        selectedRefreshJob.current = route.refreshJobId;
+      }
       setSearch(route.search);
       setType(route.type as typeof type);
       setEnvironmentId(route.environmentId);
@@ -106,9 +242,10 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
       setRouteSelectedIds(new Set(route.selectedIds));
       setRouteRefreshJobId(route.refreshJobId);
       setRouteQuarantineJobId(route.quarantineJobId);
-      setDetail(current => !current ? undefined : current.nativeId === route.detailId
-        && (!route.detailType || current.type === route.detailType)
-        && (route.detailEnvironmentId === undefined || (current.environmentId ?? "") === route.detailEnvironmentId) ? current : undefined);
+      setDetailSelection(current => current?.snapshotId === route.snapshotId
+        && current.resource.nativeId === route.detailId
+        && (!route.detailType || current.resource.type === route.detailType)
+        && (route.detailEnvironmentId === undefined || (current.resource.environmentId ?? "") === route.detailEnvironmentId) ? current : undefined);
     }
     window.addEventListener("popstate", restoreRoute);
     return () => window.removeEventListener("popstate", restoreRoute);
@@ -132,206 +269,325 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     const controller = new AbortController();
     void Promise.resolve().then(() => {
       if (controller.signal.aborted) return;
-      setLoading(true);
       setError(undefined);
-      return getInventoryResources(query, { signal: controller.signal });
+      return readSaved(["inventory-resources", query, readRevision], signal => getInventoryResources(query, { signal }), controller.signal);
     }).then(result => {
       if (!result) return;
       if (controller.signal.aborted || owner !== listGeneration.current) return;
       const lastPage = Math.max(Math.ceil(result.count / pageSize) - 1, 0);
       if (pageIndex > lastPage) setPageIndex(lastPage);
       setPage(result);
-      setInventoryReadError(undefined);
+      setRead({ key: readKey });
       if (!snapshotId && result.snapshot) setSnapshotId(result.snapshot.id);
     }).catch(requestError => {
       if (!controller.signal.aborted && owner === listGeneration.current) {
         setError(errorMessage(requestError));
-        setInventoryReadError(errorMessage(requestError));
+        recordReadFailure(requestError, readKey);
       }
-    })
-      .finally(() => { if (!controller.signal.aborted && owner === listGeneration.current) setLoading(false); });
+    });
     return () => { controller.abort(); };
-  }, [pageIndex, query, reload, snapshotId]);
+  }, [pageIndex, query, readKey, readRevision, readSaved, recordReadFailure, snapshotId]);
+
+  useEffect(() => () => exportController.current?.abort(), [exportKey]);
 
   useEffect(() => {
-    if (!page?.snapshot) return;
+    if (loading || !pendingSortFocus.current) return;
+    const column = columns.find(candidate => candidate.id === pendingSortFocus.current);
+    const label = typeof column?.header === "string" ? column.header : undefined;
+    restoreTableSortFocus(inventoryTable.current, label);
+    pendingSortFocus.current = undefined;
+  }, [columns, loading, page]);
+
+  useEffect(() => {
+    if (!page?.snapshot || (snapshotId && snapshotId !== page.snapshot.id)) return;
     let cancelled = false;
+    const owner = selectionGeneration.current;
     void Promise.resolve().then(() => {
       if (cancelled) return;
-      setQuarantineSelection(current => {
-        const targets = new Map(current && current.snapshotId === page.snapshot!.id ? current.targets : []);
-        for (const resource of page.value) if (routeSelectedIds.has(resource.nativeId)) targets.set(resource.nativeId, resource);
-        return { snapshotId: page.snapshot!.id, targets };
-      });
+      if (!selectionDenied && owner === selectionGeneration.current) {
+        setQuarantineSelection(current => {
+          const targets = new Map(current && current.snapshotId === page.snapshot!.id
+            ? [...current.targets].filter(([id]) => routeSelectedIds.has(id)) : []);
+          for (const resource of page.value) if (routeSelectedIds.has(resource.nativeId)) targets.set(resource.nativeId, resource);
+          return { snapshotId: page.snapshot!.id, targets };
+        });
+      }
       if (routeDetailId) {
-        const exact = page.value.find(resource => resource.nativeId === routeDetailId
+        const matches = page.value.filter(resource => resource.nativeId === routeDetailId
           && (!routeDetailType || resource.type === routeDetailType)
           && (routeDetailEnvironmentId === undefined || (resource.environmentId ?? "") === routeDetailEnvironmentId));
-        if (exact) setDetail(current => current?.nativeId === exact.nativeId ? current : exact);
+        const exact = matches.length === 1 ? matches[0] : undefined;
+        setDetailSelection(current => exact
+          ? current?.snapshotId === page.snapshot!.id && current.resource === exact
+            ? current : { snapshotId: page.snapshot!.id, resource: exact }
+          : undefined);
       }
     });
     return () => { cancelled = true; };
-  }, [page, routeDetailEnvironmentId, routeDetailId, routeDetailType, routeSelectedIds]);
+  }, [page, routeDetailEnvironmentId, routeDetailId, routeDetailType, routeSelectedIds, selectionDenied, snapshotId]);
 
   useEffect(() => {
     if (!snapshotId || routeSelectedIds.size === 0) return;
+    const owner = ++selectionGeneration.current;
     const controller = new AbortController();
-    getInventoryQuarantineSelection(snapshotId, [...routeSelectedIds], { signal: controller.signal }).then(result => {
-      if (!controller.signal.aborted) setQuarantineSelection({ snapshotId: result.snapshot.id, targets: new Map(result.value.map(resource => [resource.nativeId, resource])) });
+    selectionController.current = controller;
+    const selectedIds = [...routeSelectedIds];
+    readSaved(["inventory-quarantine-selection", snapshotId, selectedIds, readRevision, selectionReload], signal =>
+      getInventoryQuarantineSelection(snapshotId, selectedIds, { signal }), controller.signal).then(result => {
+      if (controller.signal.aborted || owner !== selectionGeneration.current) return;
+      setSelectionDenied(false);
+      setSelectionError(undefined);
+      setQuarantineSelection({ snapshotId: result.snapshot.id, targets: new Map(result.value.map(resource => [resource.nativeId, resource])) });
     }).catch(reason => {
-      if (!controller.signal.aborted) setError(`Selected target resolution failed: ${errorMessage(reason)}`);
+      if (controller.signal.aborted || owner !== selectionGeneration.current) return;
+      setSelectionError(`Selected target resolution failed: ${errorMessage(reason)}`);
+      if (isAccessDenied(reason)) clearSelection(true);
     });
-    return () => controller.abort();
-  }, [routeSelectedIds, snapshotId]);
+    return () => {
+      controller.abort();
+      if (selectionController.current === controller) selectionController.current = null;
+    };
+  }, [clearSelection, readRevision, readSaved, routeSelectedIds, selectionReload, snapshotId]);
 
   useEffect(() => {
     const controller = new AbortController();
-    void Promise.all([getInventorySnapshots({ signal: controller.signal }), getInventoryRefreshJobs({ signal: controller.signal })]).then(([snapshotResult, jobResult]) => {
+    const jobOwner = jobGeneration.current;
+    void readSaved(["inventory-snapshots", readRevision, routeRefreshJobId ?? "", authorizationGenerations.current.snapshots], signal =>
+      getInventorySnapshots({ signal }), controller.signal).then(result => {
+      if (!controller.signal.aborted) setSnapshotRead({ value: result.value });
+    }).catch(requestError => {
       if (controller.signal.aborted) return;
-      setSnapshots(snapshotResult.value);
-      setJobHistory(jobResult);
-      if (!routeRefreshJobId) {
-        setJob(current => current ?? jobResult.value.find(candidate => candidate.status === "running" || candidate.status === "waiting_authorization") ?? jobResult.value[0]);
+      if (isAccessDenied(requestError)) {
+        authorizationGenerations.current.snapshots = crypto.randomUUID();
+        setSnapshotRead({ value: [], error: errorMessage(requestError), denied: true });
+      } else setSnapshotRead(current => ({ ...current, error: errorMessage(requestError) }));
+    });
+    void readSaved(["inventory-refresh-jobs", readRevision, routeRefreshJobId ?? "", authorizationGenerations.current.history, authorizationGenerations.current.jobs], signal =>
+      getInventoryRefreshJobs({ signal }), controller.signal).then(result => {
+      if (controller.signal.aborted) return;
+      setHistoryRead({ value: result });
+      // A late history response cannot revive a job whose own read was denied.
+      if (!routeRefreshJobId && jobOwner === jobGeneration.current && !currentJobRead.current?.value) {
+        const value = result.value.find(candidate => candidate.status === "running" || candidate.status === "waiting_authorization") ?? result.value[0];
+        if (value) publishJobRead({ value, generation: jobOwner, source: "history" });
       }
-    }).catch(requestError => { if (!controller.signal.aborted) setError(errorMessage(requestError)); });
+    }).catch(requestError => {
+      if (controller.signal.aborted) return;
+      if (isAccessDenied(requestError)) {
+        authorizationGenerations.current.history = crypto.randomUUID();
+        setHistoryRead({ value: emptyJobHistory, error: errorMessage(requestError), denied: true });
+        if (currentJobRead.current?.source === "history") denyJobRead(jobOwner);
+      } else setHistoryRead(current => ({ ...current, error: errorMessage(requestError) }));
+    });
     return () => { controller.abort(); };
-  }, [reload, routeRefreshJobId]);
+  }, [denyJobRead, publishJobRead, readRevision, readSaved, routeRefreshJobId]);
 
   useEffect(() => {
     if (!routeRefreshJobId) {
-      void Promise.resolve().then(() => setJobError(undefined));
-      return;
+      let cancelled = false;
+      const owner = jobGeneration.current;
+      void Promise.resolve().then(() => { if (!cancelled && owner === jobGeneration.current) setJobError(undefined); });
+      return () => { cancelled = true; };
     }
     const controller = new AbortController();
+    const owner = ++jobGeneration.current;
+    const pending: InventoryJobRead = { generation: owner, source: "exact" };
+    currentJobRead.current = pending;
+    exactJobController.current = controller;
+    jobPollController.current?.abort();
     void Promise.resolve().then(() => {
-      if (controller.signal.aborted) return undefined;
-      setJob(undefined);
+      if (controller.signal.aborted || owner !== jobGeneration.current) return undefined;
+      publishJobRead(pending);
       setJobError(undefined);
-      return getInventoryRefreshJob(routeRefreshJobId, { signal: controller.signal });
+      return readSaved(["inventory-refresh-job", routeRefreshJobId, readRevision, authorizationGenerations.current.jobs], signal =>
+        getInventoryRefreshJob(routeRefreshJobId, { signal }), controller.signal);
     })
-      .then(result => { if (!controller.signal.aborted) setJob(result); })
+      .then(result => {
+        if (result && !controller.signal.aborted && owner === jobGeneration.current) publishJobRead({ ...pending, value: result });
+      })
       .catch(requestError => {
-        if (!controller.signal.aborted) setJobError(`The exact inventory refresh job is unavailable to this account: ${errorMessage(requestError)}`);
+        if (controller.signal.aborted || owner !== jobGeneration.current) return;
+        setJobError(`The exact inventory refresh job is unavailable to this account: ${errorMessage(requestError)}`);
+        if (isAccessDenied(requestError)) denyJobRead(owner, routeRefreshJobId);
       });
-    return () => controller.abort();
-  }, [routeRefreshJobId]);
+    return () => {
+      controller.abort();
+      if (exactJobController.current === controller) exactJobController.current = null;
+    };
+  }, [denyJobRead, publishJobRead, readRevision, readSaved, routeRefreshJobId]);
 
   const pollingJobId = job?.status === "running" ? job.id : undefined;
   useEffect(() => {
-    if (!pollingJobId) return;
+    const owner = jobRead?.generation;
+    if (!pollingJobId || owner === undefined || owner !== jobGeneration.current) return;
     const controller = new AbortController();
+    jobPollController.current = controller;
     const deadline = Date.now() + 5 * 60_000;
     let timer: number | undefined;
     const poll = async () => {
       try {
         const next = await getInventoryRefreshJob(pollingJobId, { signal: controller.signal });
-        if (controller.signal.aborted) return;
-        updateRefreshJob(next);
+        if (controller.signal.aborted || !updateRefreshJob(next, owner)) return;
         if (next.status === "running") {
           if (Date.now() < deadline) timer = window.setTimeout(() => void poll(), 1_000);
           else setError("Inventory job polling reached its five-minute bound. Use Jobs for explicit status.");
         }
       } catch (requestError) {
-        if (!controller.signal.aborted) setError(errorMessage(requestError));
+        if (controller.signal.aborted || owner !== jobGeneration.current) return;
+        setJobError(errorMessage(requestError));
+        if (isAccessDenied(requestError)) denyJobRead(owner, pollingJobId);
       }
     };
     timer = window.setTimeout(() => void poll(), 1_000);
-    return () => { controller.abort(); if (timer !== undefined) window.clearTimeout(timer); };
-  }, [pollingJobId, updateRefreshJob]);
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (jobPollController.current === controller) jobPollController.current = null;
+    };
+  }, [denyJobRead, jobRead?.generation, pollingJobId, updateRefreshJob]);
 
   const totalPages = Math.max(Math.ceil((page?.count ?? 0) / pageSize), 1);
+  const pagingUnverified = loading || Boolean(inventoryReadError);
   const currentVerification = !loading && !inventoryReadError && page?.snapshot?.verification;
   const covered = currentVerification ? page.typeCounts.filter(item => item.status === "covered").length : loading ? "Checking..." : "Not established";
   const restricted = currentVerification ? page.typeCounts.filter(item => item.status === "not_authorized_scope").length : loading ? "Checking..." : "Not established";
+  const bannerError = error ?? selectionError ?? jobError ?? snapshotRead.error ?? historyRead.error;
+
+  function beginJobAction(targetId?: string) {
+    if (!active.current || jobAction.current) return undefined;
+    const action: InventoryJobAction = { targetId, invalidated: false, deniedJobIds: new Set() };
+    jobAction.current = action;
+    setSubmittingJobAction(true);
+    return action;
+  }
+
+  function finishJobAction(action: InventoryJobAction) {
+    if (jobAction.current !== action) return;
+    jobAction.current = undefined;
+    if (active.current) setSubmittingJobAction(false);
+  }
 
   async function handleRefresh() {
+    if (currentJobRead.current?.value?.status === "running") return;
+    const action = beginJobAction();
+    if (!action) return;
     setError(undefined);
     setJobError(undefined);
-    setSubmittingRefresh(true);
     try {
       const next = await refreshInventory({
         types: refreshType === "all" ? nonAgentResourceTypes : [refreshType],
         ...(refreshEnvironment.trim() ? { environmentId: refreshEnvironment.trim() } : {}),
       });
-      if (!active.current) return;
+      if (!ownsJobAction(action, next.id)) return;
+      selectedRefreshJob.current = undefined;
       setRouteRefreshJobId(undefined);
-      updateRefreshJob(next);
-      setReload(value => value + 1);
-    } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
-    finally { if (active.current) setSubmittingRefresh(false); }
+      updateRefreshJob(next, action);
+      reloadSaved();
+    } catch (requestError) { if (ownsJobAction(action)) setError(errorMessage(requestError)); }
+    finally { finishJobAction(action); }
   }
 
   async function handleResume() {
-    if (!job) return;
+    const target = currentJobRead.current?.value;
+    if (!target || target.status !== "waiting_authorization"
+      || selectedRefreshJob.current && selectedRefreshJob.current !== target.id) return;
+    const action = beginJobAction(target.id);
+    if (!action) return;
     setError(undefined);
     try {
-      const next = await resumeInventoryRefresh(job.id);
-      if (!active.current) return;
-      updateRefreshJob(next);
-      setReload(value => value + 1);
-    } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
+      const next = await resumeInventoryRefresh(target.id);
+      if (!ownsJobAction(action, next.id)) return;
+      updateRefreshJob(next, action);
+      reloadSaved();
+    } catch (requestError) { if (ownsJobAction(action)) setError(errorMessage(requestError)); }
+    finally { finishJobAction(action); }
   }
 
   async function handleExport() {
-    setExporting(true);
+    if (exportDisabled || !page?.snapshot) return;
+    exportController.current?.abort();
+    const controller = new AbortController();
+    exportController.current = controller;
+    setExportingKey(exportKey);
     setError(undefined);
     try {
-      if (!page?.snapshot) throw new Error("The exact inventory snapshot is no longer available.");
-      const blob = await downloadInventoryCsv({ ...query, snapshotId: page.snapshot.id, limit: undefined, offset: undefined });
-      if (!active.current) return;
+      const blob = await downloadInventoryCsv({ ...query, snapshotId: page.snapshot.id, limit: undefined, offset: undefined }, controller.signal);
+      if (controller.signal.aborted) return;
       const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "power-platform-inventory.csv"; anchor.click(); URL.revokeObjectURL(url);
-    } catch (requestError) { if (active.current) setError(errorMessage(requestError)); }
-    finally { if (active.current) setExporting(false); }
+    } catch (requestError) {
+      if (!controller.signal.aborted) {
+        setError(errorMessage(requestError));
+        if (isAccessDenied(requestError)) {
+          recordReadFailure(requestError, readKey);
+        }
+      }
+    }
+    finally { if (!controller.signal.aborted) setExportingKey(undefined); }
   }
 
   function closeDetails() {
-    setDetail(undefined);
+    const trigger = detailTrigger.current;
+    setDetailSelection(undefined);
     setRouteDetailId(undefined);
     setRouteDetailType(undefined);
     setRouteDetailEnvironmentId(undefined);
-    window.requestAnimationFrame(() => detailTrigger.current?.focus());
+    window.requestAnimationFrame(() => {
+      const focused = document.activeElement;
+      if (trigger?.isConnected && (!focused || focused === document.body)) trigger.focus();
+    });
+  }
+
+  function openDetails(resource: PowerPlatformResource, trigger: HTMLButtonElement) {
+    if (!page?.snapshot) return;
+    detailTrigger.current = trigger;
+    setRouteDetailId(resource.nativeId);
+    setRouteDetailType(resource.type);
+    setRouteDetailEnvironmentId(resource.environmentId ?? "");
+    setDetailSelection({ snapshotId: page.snapshot.id, resource });
   }
 
   function toggleQuarantineTarget(resource: PowerPlatformResource) {
     const currentSnapshotId = page?.snapshot?.id;
     if (!currentSnapshotId) return;
-    const next = new Map(quarantineTargets);
-    if (next.has(resource.nativeId)) next.delete(resource.nativeId);
-    else if (next.size < 25) next.set(resource.nativeId, resource);
-    setRouteSelectedIds(new Set(next.keys()));
+    selectionGeneration.current += 1;
+    selectionController.current?.abort();
+    const selectedIds = new Set(routeSelectedIds);
+    const next = new Map(quarantineSelection?.snapshotId === currentSnapshotId ? quarantineSelection.targets : []);
+    if (selectedIds.has(resource.nativeId)) { selectedIds.delete(resource.nativeId); next.delete(resource.nativeId); }
+    else if (selectedIds.size < 25) { selectedIds.add(resource.nativeId); next.set(resource.nativeId, resource); }
+    setRouteSelectedIds(selectedIds);
     setQuarantineSelection({ snapshotId: currentSnapshotId, targets: next });
   }
 
   function clearQuarantineTargets() {
-    if (page?.snapshot) setQuarantineSelection({ snapshotId: page.snapshot.id, targets: new Map() });
-    setRouteSelectedIds(new Set());
+    clearSelection();
   }
 
-  return <section className="inventory-view" aria-label="Power Platform inventory explorer">
+  return <section className="inventory-view" aria-label="Power Platform inventory explorer" aria-busy={loading}>
     <div className="inventory-heading">
       <div><p className="eyebrow">Saved delegated inventory</p><h2>Inventory Explorer</h2></div>
       <div className="inventory-actions">
-        <button type="button" className="secondary" disabled={loading} onClick={() => { setLoading(true); setReload(value => value + 1); }}>
+        <button type="button" className="secondary" disabled={loading} onClick={reloadSaved}>
           <RotateCw size={15} aria-hidden="true" />{loading ? "Verifying saved inventory..." : "Verify saved inventory"}
         </button>
-        <button type="button" className="secondary icon-button" title="Export filtered inventory CSV" aria-label="Export filtered inventory CSV" disabled={exporting || !page?.snapshot} onClick={() => void handleExport()}><Download aria-hidden="true" /></button>
+        <button type="button" className="secondary icon-button" title="Export filtered inventory CSV" aria-label="Export filtered inventory CSV" disabled={exportDisabled} onClick={() => void handleExport()}><Download aria-hidden="true" /></button>
         <WorkbenchActionGate actionId="power-platform.refresh">
-          <button type="button" className="primary-link inventory-refresh" disabled={submittingRefresh || job?.status === "running"} onClick={() => void handleRefresh()}><RefreshCw aria-hidden="true" /> Refresh selected scope</button>
+          <button type="button" className="primary-link inventory-refresh" disabled={submittingJobAction || job?.status === "running"} onClick={() => void handleRefresh()}><RefreshCw aria-hidden="true" /> Refresh selected scope</button>
         </WorkbenchActionGate>
       </div>
     </div>
 
-    {error || jobError ? <div className="error-banner" role="alert">{error ?? jobError}</div> : null}
+    {bannerError ? <div className="error-banner" role="alert">{bannerError}</div> : null}
     {routeSelectedIds.size > quarantineTargets.size ? <div className="notice" role="status">{routeSelectedIds.size - quarantineTargets.size} selected exact target{routeSelectedIds.size - quarantineTargets.size === 1 ? " is" : "s are"} still resolving; confirmation remains disabled until all are visible.</div> : null}
-    {job ? <RefreshStatus job={job} onResume={handleResume} /> : null}
+    {job ? <RefreshStatus job={job} onResume={handleResume} busy={submittingJobAction} /> : null}
 
     <section className="summary-grid inventory-summary" aria-label="Inventory summary">
       <Metric label="Matching resources" value={page?.snapshot ? loading ? "Checking..." : inventoryReadError ? "Not verified" : page.count : "Unknown"} />
       <Metric label="Verified type queries" value={covered} />
       <Metric label="Scope-excluded types" value={restricted} />
       <Metric label="Observed" value={page?.snapshot ? formatRelativeDate(page.snapshot.observedAt) : "No snapshot"} />
-      <Metric label="Last attempt" value={formatDateTime(jobHistory.lastAttemptAt, "None")} />
-      <Metric label="Last success" value={formatDateTime(jobHistory.lastSuccessAt, "None")} />
+      <Metric label="Last attempt" value={historyRead.denied ? "Not authorized" : formatDateTime(jobHistory.lastAttemptAt, "None")} />
+      <Metric label="Last success" value={historyRead.denied ? "Not authorized" : formatDateTime(jobHistory.lastSuccessAt, "None")} />
     </section>
 
     <SavedPowerPlatformVerification snapshot={page?.snapshot} loading={loading} error={inventoryReadError} />
@@ -342,40 +598,54 @@ export function InventoryExplorer({ canManageQuarantine = true }: { canManageQua
     </div> : null}
 
     <section className="controls inventory-controls" aria-label="Inventory filters">
-      <label><span>Saved scope</span><select value={snapshotId} onChange={event => selectSnapshot(event.target.value)}><option value="">Preferred broad or latest</option>{snapshots.map(snapshot => <option key={snapshot.id} value={snapshot.id}>{scopeText(snapshot)} · {formatRelativeDate(snapshot.observedAt)}</option>)}</select></label>
+      <label><span>Saved scope</span><select value={snapshotRead.denied ? "" : snapshotId} disabled={snapshotRead.denied} onChange={event => selectSnapshot(event.target.value)}><option value="">{snapshotRead.denied ? "Saved scopes unavailable" : "Preferred broad or latest"}</option>{snapshots.map(snapshot => <option key={snapshot.id} value={snapshot.id}>{scopeText(snapshot)} · {formatRelativeDate(snapshot.observedAt)}</option>)}</select></label>
       <label className="filter-search"><span>Search</span><input type="search" value={search} placeholder="Name or native ID" onChange={event => { setSearch(event.target.value); setPageIndex(0); }} /></label>
       <label><span>Resource type</span><select value={type} onChange={event => { setType(event.target.value as typeof type); setPageIndex(0); }}><option value="all">All resource types</option>{page?.typeCounts.map(item => <option key={item.type} value={item.type}>{shortType(item.type)}</option>)}</select></label>
       <label><span>Environment ID</span><input value={environmentId} placeholder="All environments" onChange={event => { setEnvironmentId(event.target.value); setPageIndex(0); }} /></label>
-      <label><span>Sort</span><select value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="displayName">Name</option><option value="type">Type</option><option value="environmentId">Environment</option><option value="createdAt">Created</option><option value="lastPublishedAt">Published</option></select></label>
-      <label><span>Direction</span><select value={sortDirection} onChange={event => setSortDirection(event.target.value as typeof sortDirection)}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
+      <label><span>Sort</span><select value={sortBy} onChange={event => { setSortBy(event.target.value as typeof sortBy); setPageIndex(0); }}><option value="displayName">Name</option><option value="type">Type</option><option value="environmentId">Environment</option><option value="createdAt">Created</option><option value="lastPublishedAt">Published</option></select></label>
+      <label><span>Direction</span><select value={sortDirection} onChange={event => { setSortDirection(event.target.value as typeof sortDirection); setPageIndex(0); }}><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
       <label><span>Refresh resource scope</span><select value={refreshType} onChange={event => setRefreshType(event.target.value as typeof refreshType)}><option value="all">All non-agent types</option>{page?.typeCounts.filter(item => item.type !== "microsoft.copilotstudio/agents").map(item => <option key={item.type} value={item.type}>{shortType(item.type)}</option>)}</select></label>
       <label><span>Refresh environment scope</span><input value={refreshEnvironment} placeholder="All environments" onChange={event => setRefreshEnvironment(event.target.value)} /></label>
     </section>
 
     {canManageQuarantine && routeSelectedIds.size === quarantineTargets.size ? <CopilotStudioQuarantineControls snapshot={page?.snapshot ?? null} targets={[...quarantineTargets.values()]} variant="bulk" canManage={canManageQuarantine} onClear={clearQuarantineTargets} initialJobId={routeQuarantineJobId} /> : null}
 
-    {loading && !page ? <div className="screen-state">Loading saved inventory...</div> : !page?.snapshot ? <div className="empty-state"><h2>No saved inventory</h2><p>Run an explicit refresh after Power Platform inventory access is available.</p></div> : page.value.length === 0 ? <div className="empty-state"><h2>{loading || inventoryReadError ? "Matching results not yet verified" : "No matching resources"}</h2><p>{loading || inventoryReadError ? "A current matching count is not established." : "The saved snapshot has no resources for these filters. Unrequested, scope-excluded and unverified types are not proven zero."}</p></div> : <>
-      <div className="inventory-pagination"><span>{page.count ? `${pageIndex * pageSize + 1}-${Math.min((pageIndex + 1) * pageSize, page.count)} of ${page.count}` : "0 resources"}</span><div><button type="button" className="icon-button" aria-label="Previous inventory page" disabled={pageIndex === 0 || loading} onClick={() => setPageIndex(value => value - 1)}><ChevronLeft aria-hidden="true" /></button><span>Page {pageIndex + 1} of {totalPages}</span><button type="button" className="icon-button" aria-label="Next inventory page" disabled={pageIndex >= totalPages - 1 || loading} onClick={() => setPageIndex(value => value + 1)}><ChevronRight aria-hidden="true" /></button></div></div>
-      <div className="table-shell inventory-table"><table><thead><tr>{canManageQuarantine ? <th className="inventory-select"><span className="sr-only">Select quarantine targets</span></th> : null}<th>Name</th><th>Type</th><th>Environment</th><th>Built with</th><th>Lifecycle</th><th>Published</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{page.value.map(resource => { const reason=quarantineTargetReason(resource,page.snapshot,displayTime); const selected=quarantineTargets.has(resource.nativeId); return <tr key={`${resource.type}:${resource.environmentId}:${resource.nativeId}`}>{canManageQuarantine ? <td className="inventory-select">{resource.type === "microsoft.copilotstudio/agents" ? <input type="checkbox" aria-label={`Select ${resource.displayName ?? resource.nativeId} for quarantine control`} title={reason} checked={selected} disabled={Boolean(reason) || (!selected && quarantineTargets.size >= 25)} onChange={() => toggleQuarantineTarget(resource)} /> : <span aria-hidden="true">-</span>}</td> : null}<td><strong>{resource.displayName ?? "Not supplied"}</strong><small>{resource.nativeId}</small></td><td>{shortType(resource.type)}</td><td>{resource.environmentId ?? "Not supplied"}</td><td>{resource.authoringTool ?? "Not supplied"}</td><td>{title(resource.lifecycle)}</td><td>{formatDate(resource.lastPublishedAt)}</td><td><button type="button" className="icon-button" title="View inventory details" aria-label={`View details for ${resource.displayName ?? resource.nativeId}`} onClick={event => { detailTrigger.current=event.currentTarget; setDetail(resource); }}><Eye aria-hidden="true" /></button></td></tr>; })}</tbody></table></div>
+    {loading && !page?.snapshot ? <div className="screen-state">Loading saved inventory...</div> : !page?.snapshot ? <div className="empty-state">
+      <h2>{inventoryReadError !== undefined ? "Saved inventory unavailable" : "No saved inventory"}</h2>
+      <p>{inventoryReadError !== undefined
+        ? "The saved read failed, so an empty inventory has not been established. Verify saved inventory again or review Permissions."
+        : "Run an explicit refresh after Power Platform inventory access is available."}</p>
+    </div> : page.value.length === 0 ? <div className="empty-state"><h2>{loading || inventoryReadError ? "Matching results not yet verified" : "No matching resources"}</h2><p>{loading || inventoryReadError ? "A current matching count is not established." : "The saved snapshot has no resources for these filters. Unrequested, scope-excluded and unverified types are not proven zero."}</p></div> : <>
+      <div className="inventory-pagination"><span>{pagingUnverified ? "Page and count not verified" : page.count ? `${pageIndex * pageSize + 1}-${Math.min((pageIndex + 1) * pageSize, page.count)} of ${page.count}` : "0 resources"}</span><div><button type="button" className="icon-button" aria-label="Previous inventory page" disabled={pageIndex === 0 || pagingUnverified} onClick={() => setPageIndex(value => value - 1)}><ChevronLeft aria-hidden="true" /></button>{!pagingUnverified ? <span>Page {pageIndex + 1} of {totalPages}</span> : null}<button type="button" className="icon-button" aria-label="Next inventory page" disabled={pageIndex >= totalPages - 1 || pagingUnverified} onClick={() => setPageIndex(value => value + 1)}><ChevronRight aria-hidden="true" /></button></div></div>
+      <div ref={inventoryTable} className="table-shell inventory-table"><table><ListTableHead table={table} /><tbody>{table.getRowModel().rows.map(row => { const resource=row.original; const reason=quarantineTargetReason(resource,page.snapshot,displayTime); const selected=routeSelectedIds.has(resource.nativeId); return <tr key={row.id}>{canManageQuarantine ? <td className="inventory-select">{resource.type === "microsoft.copilotstudio/agents" ? <input type="checkbox" aria-label={`Select ${resource.displayName ?? resource.nativeId} for quarantine control`} title={reason} checked={selected} disabled={Boolean(reason) || (!selected && routeSelectedIds.size >= 25)} onChange={() => toggleQuarantineTarget(resource)} /> : <span aria-hidden="true">-</span>}</td> : null}<td><strong>{resource.displayName ?? "Not supplied"}</strong><small>{resource.nativeId}</small></td><td>{shortType(resource.type)}</td><td>{resource.environmentId ?? "Not supplied"}</td><td>{resource.authoringTool ?? "Not supplied"}</td><td>{title(resource.lifecycle)}</td><td>{formatDate(resource.lastPublishedAt)}</td><td><button type="button" className="icon-button" title="View inventory details" aria-label={`View details for ${resource.displayName ?? resource.nativeId}`} onClick={event => openDetails(resource, event.currentTarget)}><Eye aria-hidden="true" /></button></td></tr>; })}</tbody></table></div>
     </>}
-    {detail ? <InventoryDetails resource={detail} snapshot={page?.snapshot ?? null} activeTab={detailTab} onTabChange={setDetailTab} canManageQuarantine={canManageQuarantine} onClose={closeDetails} /> : null}
+    {detail ? <InventoryDetails key={JSON.stringify([page?.snapshot?.id, detail.type, detail.environmentId, detail.nativeId])} resource={detail} snapshot={page?.snapshot ?? null} readRevision={readRevision} activeTab={detailTab} onTabChange={setDetailTab} canManageQuarantine={canManageQuarantine} onClose={closeDetails} /> : null}
   </section>;
 }
 
-function RefreshStatus({ job, onResume }: { job: InventoryRefreshJob; onResume: () => Promise<void> }) {
-  return <div className={`inventory-job ${job.status}`} role="status" aria-live="polite"><div><strong>{job.status === "running" ? "Refreshing inventory" : title(job.status)}</strong><span>{job.pageCount} pages, {job.observedCount}{job.totalRecords === null ? "" : ` of ${job.totalRecords}`} resources observed</span>{job.message ? <span>{job.message}</span> : null}</div>{job.status === "waiting_authorization" ? <WorkbenchActionGate actionId="power-platform.resume"><button type="button" className="secondary" onClick={() => void onResume()}><RotateCw aria-hidden="true" /> Resume with current authorization</button></WorkbenchActionGate> : null}</div>;
+function isAccessDenied(failure: unknown) {
+  return failure instanceof ApiError && (failure.status === 401 || failure.status === 403);
+}
+
+function RefreshStatus({ job, onResume, busy }: { job: InventoryRefreshJob; onResume: () => Promise<void>; busy: boolean }) {
+  return <div className={`inventory-job ${job.status}`} role="status" aria-live="polite"><div><strong>{job.status === "running" ? "Refreshing inventory" : title(job.status)}</strong><span>{job.pageCount} pages, {job.observedCount}{job.totalRecords === null ? "" : ` of ${job.totalRecords}`} resources observed</span>{job.message ? <span>{job.message}</span> : null}</div>{job.status === "waiting_authorization" ? <WorkbenchActionGate actionId="power-platform.resume"><button type="button" className="secondary" disabled={busy} onClick={() => void onResume()}><RotateCw aria-hidden="true" /> Resume with current authorization</button></WorkbenchActionGate> : null}</div>;
 }
 
 const inventoryDetailTabs = ["identity", "power-platform", "package", "reports", "audit", "security", "controls"] as const;
 type InventoryDetailTab = typeof inventoryDetailTabs[number];
 
-function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManageQuarantine, onClose }: {
+function InventoryDetails({ resource, snapshot, readRevision, activeTab, onTabChange, canManageQuarantine, onClose }: {
   resource: PowerPlatformResource; snapshot: InventorySnapshot | null; activeTab: string;
+  readRevision: InventoryReadRevision;
   onTabChange: (tab: InventoryDetailTab) => void; canManageQuarantine: boolean; onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const [related, setRelated] = useState<InventorySourceAwareDetail>();
-  const [relatedError, setRelatedError] = useState("");
+  const [relatedRead, setRelatedRead] = useState<{ key: object; value?: InventorySourceAwareDetail; error?: string }>();
+  const [relatedReload, setRelatedReload] = useState(0);
+  const relatedKey = useMemo(() => ({ readRevision, relatedReload, resource, snapshotId: snapshot?.id }), [readRevision, relatedReload, resource, snapshot?.id]);
+  const related = relatedRead?.key === relatedKey ? relatedRead.value : undefined;
+  const relatedError = relatedRead?.key === relatedKey ? relatedRead.error : undefined;
+  const readSaved = useSavedRead();
   const selectedTab: InventoryDetailTab = inventoryDetailTabs.includes(activeTab as InventoryDetailTab) ? activeTab as InventoryDetailTab : "identity";
   function closeDialog() {
     if (typeof dialog.current?.close === "function") dialog.current.close();
@@ -396,18 +666,18 @@ function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManag
     const controller = new AbortController();
     void Promise.resolve().then(() => {
       if (controller.signal.aborted) return;
-      setRelated(undefined);
-      setRelatedError("");
-      return getInventorySourceAwareDetail({
+      const input = {
         snapshotId: exactSnapshotId, nativeId: resource.nativeId, type: resource.type, environmentId: resource.environmentId,
-      }, { signal: controller.signal });
+      };
+      return readSaved(["inventory-source-aware-detail", input, readRevision, relatedReload], signal =>
+        getInventorySourceAwareDetail(input, { signal }), controller.signal);
     }).then(result => {
-      if (result && !controller.signal.aborted) setRelated(result);
+      if (result && !controller.signal.aborted) setRelatedRead({ key: relatedKey, value: result });
     }).catch(reason => {
-      if (!controller.signal.aborted) setRelatedError(errorMessage(reason));
+      if (!controller.signal.aborted) setRelatedRead({ key: relatedKey, error: errorMessage(reason) });
     });
     return () => controller.abort();
-  }, [resource.environmentId, resource.nativeId, resource.type, snapshot?.id]);
+  }, [readRevision, readSaved, relatedKey, relatedReload, resource.environmentId, resource.nativeId, resource.type, snapshot?.id]);
   return <dialog ref={dialog} className="inventory-detail-modal" aria-labelledby="inventory-detail-title" onClose={onClose} onMouseDown={event => { if (event.target === event.currentTarget) closeDialog(); }} onKeyDown={event => {
     if (event.key === "Escape") { event.preventDefault(); closeDialog(); return; }
     if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) && (event.target as HTMLElement).getAttribute("role") === "tab") {
@@ -426,11 +696,7 @@ function InventoryDetails({ resource, snapshot, activeTab, onTabChange, canManag
     else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first?.focus();}
   }}><header><div><p className="eyebrow">{shortType(resource.type)}</p><h2 id="inventory-detail-title">{resource.displayName ?? resource.nativeId}</h2></div><button type="button" className="icon-button" aria-label="Close inventory details" onClick={closeDialog}><X aria-hidden="true" /></button></header>
     <div className="detail-tabs" role="tablist" aria-label="Source-aware details">{inventoryDetailTabs.map(tab => <button key={tab} id={`inventory-tab-${tab}`} type="button" role="tab" aria-selected={selectedTab === tab} aria-controls={`inventory-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => onTabChange(tab)}>{title(tab)}</button>)}</div>
-    {relatedError ? <div className="error-banner" role="alert">{relatedError} <button type="button" onClick={() => {
-      if (!snapshot) return;
-      setRelatedError("");
-      getInventorySourceAwareDetail({ snapshotId: snapshot.id, nativeId: resource.nativeId, type: resource.type, environmentId: resource.environmentId }).then(setRelated).catch(reason => setRelatedError(errorMessage(reason)));
-    }}>Retry authorized lookup</button></div> : null}
+    {relatedError ? <div className="error-banner" role="alert">{relatedError} <button type="button" onClick={() => setRelatedReload(value => value + 1)}>Retry authorized lookup</button></div> : null}
     {!related && !relatedError ? <div className="screen-state" role="status">Loading authorized source associations…</div> : null}
     <section id={`inventory-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`inventory-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
       {selectedTab === "identity" ? <><h3>Exact identities</h3><div className="inventory-detail-grid"><Detail label="Native ID" value={resource.nativeId} /><Detail label="Source" value="Power Platform inventory" /><Detail label="Identity confidence" value={title(resource.identityConfidence)} /><Detail label="Environment" value={resource.environmentId} /><Detail label="Snapshot observed" value={related?.observedAt ?? snapshot?.observedAt} /><Detail label="Snapshot ID" value={snapshot?.id} /></div><p className="association-status">{associationText(resource.association)}</p><dl className="inventory-identifiers">{resource.identifiers.map(identifier => <div key={`${identifier.kind}:${identifier.value}`}><dt>{title(identifier.kind)}</dt><dd>{identifier.value}</dd></div>)}</dl></> : null}

@@ -89,7 +89,7 @@ function AccessAssignmentForm({
     && !principalsInitialized;
   const [confirming, setConfirming] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const locked = busy || submitting || readOnly;
+  const locked = busy || submitting || readOnly || !active;
   const [error, setError] = useState<string>();
   const dialogRef = useRef<HTMLElement>(null);
 
@@ -124,29 +124,29 @@ function AccessAssignmentForm({
   }, [busy, inline, onCancel, submitting]);
 
   useEffect(() => {
-    if (!active || readOnly || !directoryAllowed || !resolving) {
+    if (!active || scope !== "specific" || readOnly || !directoryAllowed || !resolving) {
       return;
     }
 
-    let cancelled = false;
+    const controller = new AbortController();
 
-    void resolveDirectoryPrincipals(initialAccess.principals)
+    void resolveDirectoryPrincipals(initialAccess.principals, { signal: controller.signal })
       .then((response) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setAssignments({ selected: response.value, initialized: true });
         }
       })
       .catch((requestError) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setAssignments({ selected: initialAccess.principals.map(fallbackPrincipal), initialized: true });
           setError(errorMessage(requestError));
         }
       });
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [initialAccess, resolving, directoryAllowed, active, readOnly]);
+  }, [initialAccess, resolving, directoryAllowed, active, readOnly, scope]);
 
   function handleModeChange(nextMode: PackageAccessMutationMode) {
     setMode(nextMode);

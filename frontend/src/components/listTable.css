@@ -1,0 +1,27 @@
+.table-sort-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.table-sort-heading svg {
+  flex-shrink: 0;
+}
+
+.table-sort-heading:hover {
+  background: transparent;
+  color: var(--ink);
+}
+
+.table-sort-heading:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
+}

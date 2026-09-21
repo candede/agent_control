@@ -63,6 +63,18 @@ test("all licensed accounts remain searchable beyond two thousand while the tabl
   expect(initialSnapshots).toBeGreaterThan(0);
   await page.getByRole("button", { name: "Next", exact: true }).click();
   await expect(page.getByLabel("Licensed user pages")).toContainText("51-100 of 2,053");
+  const responsesHeading = table.getByRole("button", { name: "Sort by Agent responses", exact: true });
+  await responsesHeading.click();
+  await expect(page.getByLabel("Licensed user pages")).toContainText("1-50 of 2,053");
+  await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "ascending");
+  await expect(table.locator("tbody tr").first()).toContainText("Person0009");
+  await expect(table.locator("tbody tr").nth(10)).toContainText("Unknown");
+  await expect(page.getByLabel("Order by")).toHaveValue("responses-asc");
+  await expect(responsesHeading).toBeFocused();
+  await responsesHeading.press("Enter");
+  await expect(table.locator("tbody tr").first()).toContainText("Person0000");
+  await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "descending");
+  await expect(page.getByLabel("Order by")).toHaveValue("responses-desc");
   await page.getByRole("searchbox", { name: "Search users or agents" }).fill("person2052");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.locator("tbody tr")).toContainText("Person2052");

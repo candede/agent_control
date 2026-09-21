@@ -80,9 +80,13 @@ describe("Job history layout", () => {
     expect(screen.getByText("1-1 of 1 recent history records")).toBeVisible();
     expect(table).toHaveTextContent("Refresh 0");
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
-    await userEvent.click(screen.getByRole("button", { name: "Order history oldest first" }));
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Created" }));
     expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Refresh 0");
     expect(within(table).getByRole("columnheader", { name: "Created" })).toHaveAttribute("aria-sort", "ascending");
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Job / scope" }));
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Refresh 0");
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Job / scope" }));
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("Refresh 31");
     await userEvent.type(screen.getByRole("searchbox", { name: "Search jobs" }), "job-29");
     expect(screen.getByText("1-1 of 1 recent history records")).toBeVisible();
     expect(table).toHaveTextContent("Refresh 29");
@@ -101,6 +105,22 @@ describe("Job history layout", () => {
     expect(current).toHaveTextContent("Refresh 20");
     await userEvent.click(screen.getByRole("button", { name: "Next current jobs page" }));
     expect(screen.getByText("11-13 of 13 current jobs")).toBeVisible();
+  });
+
+  it("sorts result counts numerically across thousands separators with unknown values last", async () => {
+    render(<JobHistoryView {...props} state={projection([
+      job(1, { label: "Zero", completed: 0, total: 0 }),
+      job(2, { label: "Twenty", completed: 20, total: 20 }),
+      job(3, { label: "Thousand", source: "official-usage", status: "accepted", completed: null, total: 1_000 }),
+      job(4, { label: "Unknown", completed: null, total: null }),
+    ])} />);
+    const table = screen.getByRole("table", { name: "Job history" });
+    const labels = () => within(table).getAllByRole("row").slice(1)
+      .map(row => within(row).getByRole("button").textContent);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Zero", "Twenty", "Thousand", "Unknown"]);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Thousand", "Twenty", "Zero", "Unknown"]);
   });
 
   it("renders prototype-named unknown statuses in history and details", async () => {
@@ -160,5 +180,25 @@ describe("Job history layout", () => {
     expect((await axe.run(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
     await userEvent.click(screen.getByRole("button", { name: "Close job details" }));
     expect(trigger).toHaveFocus();
+  });
+
+  it("keeps unknown durations and counts last in either direction and preserves chronological ties", async () => {
+    render(<JobHistoryView {...props} state={projection([
+      job(2, { createdAt: "2026-09-10T10:00:00.000Z", startedAt: undefined, completedAt: undefined, completed: null, total: null }),
+      job(1, { createdAt: "2026-09-10T10:00:00.000Z", completedAt: "2026-08-01T10:00:00.000Z" }),
+      job(0, { createdAt: "2026-09-10T10:00:00.000Z", completed: 0, total: 0 }),
+    ])} />);
+    const history = screen.getByRole("table", { name: "Job history" });
+    expect(within(history).getAllByRole("row")[1]).toHaveTextContent("Refresh 0");
+    for (const column of ["Duration", "Result"]) {
+      await userEvent.click(within(history).getByRole("button", { name: `Sort by ${column}` }));
+      expect(within(history).getAllByRole("row").at(-1)).toHaveTextContent("Refresh 2");
+      await userEvent.click(within(history).getByRole("button", { name: `Sort by ${column}` }));
+      expect(within(history).getAllByRole("row").at(-1)).toHaveTextContent("Refresh 2");
+    }
+    await userEvent.click(within(history).getByRole("button", { name: "Sort by Duration" }));
+    await userEvent.click(within(history).getByRole("button", { name: "Sort by Duration" }));
+    expect(within(history).getAllByRole("row")[1]).toHaveTextContent("Refresh 0");
+    expect(screen.getByText("Refresh 1").closest("tr")).toHaveTextContent("Not recorded");
   });
 });

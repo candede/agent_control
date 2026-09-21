@@ -284,7 +284,7 @@ export class PowerPlatformInventoryRepository {
     const { sql, values } = listFilters(snapshot.id, scope, query);
     const countResult = await this.database.query<{ count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT count(*)::int AS count FROM scoped WHERE ${sql}`, values);
     const countRows = await this.database.query<{ resource_type: PowerPlatformResourceType; count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT resource_type,count(*)::int AS count FROM scoped WHERE ${sql} GROUP BY resource_type`, values);
-    const sortColumn = { displayName: `display_name COLLATE "C"`, type: `resource_type COLLATE "C"`, environmentId: `environment_id COLLATE "C"`, createdAt: "created_at", lastPublishedAt: "last_published_at" }[query.sortBy ?? "displayName"];
+    const sortColumn = { displayName: `display_name COLLATE "C"`, type: `resource_type COLLATE "C"`, environmentId: `NULLIF(environment_id, '') COLLATE "C"`, createdAt: "created_at", lastPublishedAt: "last_published_at" }[query.sortBy ?? "displayName"];
     const direction = query.sortDirection === "desc" ? "DESC" : "ASC";
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 5000);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
@@ -402,7 +402,9 @@ export class PowerPlatformInventoryRepository {
       WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3 AND resource_type='microsoft.copilotstudio/agents' AND native_id=ANY($4::text[])
       ORDER BY environment_id COLLATE "C",native_id COLLATE "C"`,
     [snapshot.id, scope.tenantId, scope.principalId, nativeIds]);
-    if (rows.rows.length !== nativeIds.length) throw new AppError(409, "inventory_selection_stale", "One or more exact selected resources are absent or ambiguous in the authorized snapshot.");
+    if (rows.rows.length !== nativeIds.length || new Set(rows.rows.map(row => row.native_id)).size !== nativeIds.length) {
+      throw new AppError(409, "inventory_selection_stale", "One or more exact selected resources are absent or ambiguous in the authorized snapshot.");
+    }
     const [verifiedSnapshot] = await this.verifySnapshots(scope, [snapshot]);
     return { value: rows.rows.map(projectResource), snapshot: verifiedSnapshot };
   }

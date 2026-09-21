@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, checkCapabilities, getCapabilities, type CapabilityView, type SessionUser } from "./api/client";
 import { hasRole } from "./authorization";
+import { useSavedRead } from "./savedQueries";
 
 const expiryRetryDelayMs = 30_000;
 const maximumTimerDelayMs = 2_147_483_647;
 
-function principalKey(user: SessionUser | undefined) {
+function principalKey(user: SessionUser | undefined, sessionEpoch: number) {
   if (!user || !hasRole(user, "AgentControl.Viewer")) return undefined;
-  return `${user.tenantId ?? ""}\0${user.homeAccountId}\0${[...user.roles].sort().join(",")}`;
+  return JSON.stringify([user.tenantId ?? "", user.homeAccountId, [...user.roles].sort(), sessionEpoch]);
+}
+
+function accessDenied(cause: unknown) {
+  return cause instanceof ApiError && (cause.status === 401 || cause.status === 403)
+    && cause.code !== "invalid_origin" && cause.code !== "invalid_csrf";
 }
 
 function evidenceExpiries(views: CapabilityView[]) {
@@ -23,8 +29,9 @@ function expiredEvidenceSignature(views: CapabilityView[], now = Date.now()) {
   return evidenceExpiries(delegatedViews).filter(expiry => expiry <= now).join(",") || undefined;
 }
 
-export function useCapabilities(user: SessionUser | undefined) {
-  const key = principalKey(user);
+export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0) {
+  const readSaved = useSavedRead();
+  const key = principalKey(user, sessionEpoch);
   const [stateKey, setStateKey] = useState(key);
   const [views, setViews] = useState<CapabilityView[]>([]);
   const [owner, setOwner] = useState<string>();
@@ -48,6 +55,16 @@ export function useCapabilities(user: SessionUser | undefined) {
     setPending(false);
     setError(undefined);
   }
+
+  const discardDeniedEvidence = useCallback(() => {
+    setViews([]);
+    setError("Capability access was denied. Verify the current account and app roles, then use Check status to retry.");
+    initialCheckRequired.current = false;
+    attemptedExpiry.current = undefined;
+    expiryRetryCounts.current.clear();
+    if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
+    expiryRetryTimer.current = undefined;
+  }, []);
 
   const runCheck = useCallback((current: number, controller: AbortController, expirySignature?: string, retryFailed = false) => {
     const existing = request.current;
@@ -94,12 +111,17 @@ export function useCapabilities(user: SessionUser | undefined) {
         }
       })
       .catch(cause => {
-        if (generation.current !== current || controller.signal.aborted) return;
+        if (generation.current !== current || controller.signal.aborted
+          || cause instanceof ApiError && cause.kind === "aborted"
+          || cause instanceof Error && cause.name === "AbortError") return;
+        if (accessDenied(cause)) {
+          discardDeniedEvidence();
+          return;
+        }
         const detail = cause instanceof ApiError && cause.code === "invalid_origin" ? ` ${cause.message}` : "";
         setError(`Automatic permission check failed.${detail} Existing decisions and saved-data permissions are unchanged. Use Check status to retry.`);
         setNow(Date.now());
         scheduleExpiryRetry(expirySignature);
-        if (cause instanceof Error && cause.name === "AbortError") return;
       })
       .finally(() => {
         if (generation.current === current) setPending(false);
@@ -107,7 +129,7 @@ export function useCapabilities(user: SessionUser | undefined) {
       });
     request.current = { generation: current, controller, promise };
     return promise;
-  }, [key]);
+  }, [discardDeniedEvidence, key]);
 
   useEffect(() => {
     const current = ++generation.current;
@@ -126,7 +148,7 @@ export function useCapabilities(user: SessionUser | undefined) {
         generation.current += 1;
       };
     }
-    void getCapabilities({ signal: controller.signal })
+    void readSaved(["capabilities", key], signal => getCapabilities({ signal }), controller.signal)
       .then(result => {
         if (generation.current !== current) return;
         initialCheckRequired.current = true;
@@ -136,11 +158,12 @@ export function useCapabilities(user: SessionUser | undefined) {
         setLoading(false);
         setNow(Date.now());
       })
-      .catch(() => {
+      .catch(cause => {
         if (generation.current !== current || controller.signal.aborted) return;
         setViews([]);
         setOwner(key);
-        setError("Capability status could not be loaded. Saved-data permissions are unchanged.");
+        if (accessDenied(cause)) discardDeniedEvidence();
+        else setError("Capability status could not be loaded. Saved-data permissions are unchanged.");
         setLoading(false);
         setPending(false);
       });
@@ -151,7 +174,7 @@ export function useCapabilities(user: SessionUser | undefined) {
       expiryRetryTimer.current = undefined;
       generation.current += 1;
     };
-  }, [key]);
+  }, [discardDeniedEvidence, key, readSaved]);
 
   useEffect(() => {
     if (!key || owner !== key) return;
@@ -199,7 +222,8 @@ export function useCapabilities(user: SessionUser | undefined) {
     setLoading(true);
     setPending(false);
     try {
-      const result = await getCapabilities({ signal: controller.signal });
+      const result = await readSaved(["capabilities", key, current],
+        signal => getCapabilities({ signal }), controller.signal);
       if (current !== generation.current) return;
       setViews(result.value);
       setOwner(key);
@@ -209,10 +233,11 @@ export function useCapabilities(user: SessionUser | undefined) {
       const expiredSignature = expiredEvidenceSignature(result.value);
       attemptedExpiry.current = expiredSignature;
       await runCheck(current, controller, expiredSignature, true);
-    } catch {
+    } catch (cause) {
       if (current === generation.current && !controller.signal.aborted) {
         setOwner(key);
-        setError("Capability status could not be loaded. Existing decisions and saved-data permissions are unchanged.");
+        if (accessDenied(cause)) discardDeniedEvidence();
+        else setError("Capability status could not be loaded. Existing decisions and saved-data permissions are unchanged.");
       }
     } finally { if (current === generation.current) setLoading(false); }
   }

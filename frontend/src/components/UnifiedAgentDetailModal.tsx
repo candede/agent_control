@@ -17,6 +17,7 @@ import { quarantineTargetReason } from "../quarantineTarget";
 import { CapabilityContext } from "../capabilityContext";
 import { providerActionAllowed } from "../capabilityState";
 import { useAgentPeople } from "../useAgentPeople";
+import { useSavedRead } from "../savedQueries";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
@@ -90,6 +91,7 @@ export function UnifiedAgentDetailModal({
   onPeopleChanged,
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
+  const readSaved = useSavedRead();
   const dialog = useRef<HTMLDialogElement>(null);
   const dialogMounted = useRef(false);
   const panel = useRef<HTMLElement>(null);
@@ -193,12 +195,13 @@ export function UnifiedAgentDetailModal({
   useEffect(() => {
     if (!resource || !snapshot || !relatedKey) return;
     const controller = new AbortController();
-    getInventorySourceAwareDetail({
+    const input = {
       snapshotId: snapshot.snapshotId,
       nativeId: resource.nativeId,
       type: resource.type,
       environmentId: resource.environmentId,
-    }, { signal: controller.signal })
+    };
+    readSaved(["inventory-source-aware-detail", input, relatedRetry, dataRevision], signal => getInventorySourceAwareDetail(input, { signal }), controller.signal)
       .then(result => {
         if (!controller.signal.aborted) setRelatedState({ key: relatedKey, status: "available", value: result });
       })
@@ -212,7 +215,7 @@ export function UnifiedAgentDetailModal({
         }
       });
     return () => controller.abort();
-  }, [relatedKey, resource, snapshot]);
+  }, [readSaved, relatedKey, relatedRetry, dataRevision, resource, snapshot]);
 
   function selectTab(tab: DetailTab) {
     setInternalTab(tab);

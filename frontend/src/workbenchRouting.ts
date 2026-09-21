@@ -319,9 +319,11 @@ export function migratePowerPlatformAgentRoute(search: string) {
 }
 
 const localAuditActions = new Set([
-  "block", "unblock", "update-availability", "update-installation",
+  "block", "unblock", "update-availability", "update-installation", "reassign",
   "view-audit-search", "export-audit-search", "view-hunting", "export-hunting",
+  "approve-hunting", "qualify-hunting", "submit-hunting", "query-hunting", "cancel-hunting", "delete-hunting", "revoke-hunting-scope",
   "export-package-inventory", "export-power-platform-inventory", "export-agent-inventory",
+  "export-official-usage-aggregate", "export-official-usage-users", "export-administrative-audit",
   "associate-agent-usage", "remove-agent-usage-association",
 ]);
 const localAuditStatuses = new Set([

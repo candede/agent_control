@@ -16,6 +16,7 @@ import {
 } from "../api/client";
 import { clearLegacyUsageStorage, hasLegacyUsageStorage } from "../legacyUsageStorage";
 import { trapDialogFocus } from "../dialogFocus";
+import { useSavedRead } from "../savedQueries";
 import { OfficialUsageImportReview } from "./OfficialUsageImportReview";
 import { OfficialUsageManageReports } from "./OfficialUsageManageReports";
 import {
@@ -61,16 +62,21 @@ export function OfficialUsageImportPanel({
   const [validating, setValidating] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string }>();
   const [legacyPresent, setLegacyPresent] = useState(hasLegacyUsageStorage);
+  const readSaved = useSavedRead();
   const fileInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const pendingBundleId = useRef<string | undefined>(undefined);
   const pendingCorrection = useRef<string | undefined>(undefined);
   const confirmationReturnFocus = useRef<HTMLElement | null>(null);
+  const confirmationFocusPending = useRef(false);
   const loadGeneration = useRef(0);
   const lifetime = useRef<AbortController | undefined>(undefined);
   const activeRef = useRef(active);
   const priorScreen = useRef(view === "manage" ? "manage" : `import:${step}`);
   const previews = bundlePreview?.staging ?? [];
+  const readAdminState = useCallback((signal: AbortSignal) =>
+    readSaved(["official-usage-admin"], readSignal => getOfficialUsageAdminState({ signal: readSignal }), signal),
+  [readSaved]);
 
   useEffect(() => { activeRef.current = active; }, [active]);
   useEffect(() => {
@@ -86,6 +92,28 @@ export function OfficialUsageImportPanel({
     });
     return () => cancelAnimationFrame(frame);
   }, [step, view, active]);
+
+  useEffect(() => {
+    if (!active) {
+      confirmationFocusPending.current = false;
+      confirmationReturnFocus.current = null;
+      return;
+    }
+    if (!confirmationFocusPending.current || confirmation) return;
+    const frame = requestAnimationFrame(() => {
+      if (!activeRef.current) return;
+      const target = confirmationReturnFocus.current;
+      const focused = document.activeElement;
+      // A delayed mutation may finish after the user has left the confirmation.
+      if (!focused || focused === document.body || !focused.isConnected || focused === target) {
+        if (target?.isConnected && !target.matches(":disabled")) target.focus();
+        else heading.current?.focus({ preventScroll: true });
+      }
+      confirmationReturnFocus.current = null;
+      confirmationFocusPending.current = false;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, adminState, busy, confirmation]);
 
   function isLive(generation: number) {
     return !lifetime.current?.signal.aborted && generation === loadGeneration.current;
@@ -110,6 +138,7 @@ export function OfficialUsageImportPanel({
     setBundlePreview(undefined);
     setPreviewVerified(false);
     setAcceptanceRetry(undefined);
+    confirmationFocusPending.current = activeRef.current && Boolean(confirmationReturnFocus.current);
     setConfirmation(undefined);
     pendingBundleId.current = undefined;
     pendingCorrection.current = undefined;
@@ -141,6 +170,9 @@ export function OfficialUsageImportPanel({
       setBundlePreview(undefined);
       setPreviewVerified(false);
       setAcceptanceRetry(undefined);
+      setConfirmation(undefined);
+      confirmationFocusPending.current = false;
+      confirmationReturnFocus.current = null;
       setDraft(undefined);
       pendingBundleId.current = undefined;
       pendingCorrection.current = undefined;
@@ -152,7 +184,7 @@ export function OfficialUsageImportPanel({
       setMessage(undefined);
       setValidating(false);
       setBusy(true);
-      const state = await getOfficialUsageAdminState({ signal: controller.signal });
+      const state = await readAdminState(controller.signal);
       if (controller.signal.aborted || generation !== loadGeneration.current) return;
       setAdminState(state);
       setAdminVerified(true);
@@ -183,7 +215,7 @@ export function OfficialUsageImportPanel({
       controller.abort();
       loadGeneration.current += 1;
     };
-  }, [initialStagingId, showError]);
+  }, [initialStagingId, readAdminState, showError]);
 
   async function refresh(preferredBundleId: string | null | undefined = pendingBundleId.current) {
     const signal = lifetime.current?.signal;
@@ -193,6 +225,8 @@ export function OfficialUsageImportPanel({
     setPreviewVerified(false);
     if (result) setResult({ ...result, verifiedState: undefined, refreshError: undefined });
     try {
+      if (!signal) return;
+      // Explicit refresh/readback must not join metadata fetched before a mutation.
       const state = await getOfficialUsageAdminState({ signal });
       if (!isLive(generation)) return;
       setAdminState(state);
@@ -298,6 +332,7 @@ export function OfficialUsageImportPanel({
       }
     }
     try {
+      if (!signal) return;
       const state = await getOfficialUsageAdminState({ signal });
       if (!isLive(generation)) return;
       setAdminState(state);
@@ -347,6 +382,7 @@ export function OfficialUsageImportPanel({
       setAdminVerified(false);
       onChanged();
       try {
+        if (!signal) return;
         const state = await getOfficialUsageAdminState({ signal });
         if (!isLive(generation)) return;
         setAdminState(state);
@@ -374,7 +410,14 @@ export function OfficialUsageImportPanel({
     const generation = ++loadGeneration.current;
     setBusy(true);
     setPreviewVerified(false);
-    const outcomes = await Promise.allSettled(previews.map(preview => discardOfficialUsageStaging(preview.id)));
+    const outcomes = await Promise.allSettled(previews.map(async preview => {
+      try {
+        await discardOfficialUsageStaging(preview.id);
+      } catch (error) {
+        if (isLive(generation)) clearUnauthorized(error);
+        throw error;
+      }
+    }));
     if (!isLive(generation)) return;
     const failed = outcomes.filter(outcome => outcome.status === "rejected");
     if (failed.some(outcome => clearUnauthorized(outcome.reason))) return;
@@ -427,6 +470,7 @@ export function OfficialUsageImportPanel({
     if (busy || !adminVerified) return;
     const generation = ++loadGeneration.current;
     setBusy(true);
+    setMessage(undefined);
     confirmationReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     try {
       const preview = await previewOfficialUsageSetOperation(setId, operation);
@@ -439,20 +483,15 @@ export function OfficialUsageImportPanel({
   }
 
   function cancelSetOperation() {
+    confirmationFocusPending.current = activeRef.current;
     setConfirmation(undefined);
-    requestAnimationFrame(() => {
-      if (activeRef.current) {
-        if (confirmationReturnFocus.current?.isConnected && !confirmationReturnFocus.current.matches(":disabled")) confirmationReturnFocus.current.focus();
-        else heading.current?.focus({ preventScroll: true });
-      }
-      confirmationReturnFocus.current = null;
-    });
   }
 
   async function confirmSetOperation() {
     if (busy || !confirmation) return;
     const generation = ++loadGeneration.current;
     setBusy(true);
+    setMessage(undefined);
     try {
       await confirmOfficialUsageSetOperation(confirmation);
       if (!isLive(generation)) return;
@@ -515,7 +554,7 @@ export function OfficialUsageImportPanel({
             <RefreshCw size={16} aria-hidden="true" />Refresh import state
           </button>
         </header>
-        {message ? <div className={`report-status ${message.tone}`} role={message.tone === "error" ? "alert" : "status"}>{message.text}</div> : null}
+        {message && !confirmation ? <div className={`report-status ${message.tone}`} role={message.tone === "error" ? "alert" : "status"}>{message.text}</div> : null}
         {view === "manage" && acceptanceRetry ? <p className="usage-context-warning">An acceptance response is unresolved. Return to Add CSV reports and retry the same acceptance before changing reports.</p> : null}
         {view === "manage" ? <OfficialUsageManageReports state={adminState} verified={adminVerified} busy={busy || Boolean(acceptanceRetry)}
           onResume={bundleId => void resumeSet(bundleId)} onOperation={(setId, operation) => void beginSetOperation(setId, operation)}
@@ -614,16 +653,18 @@ export function OfficialUsageImportPanel({
         </div>
       </footer> : null}
       {confirmation ? <SetConfirmationDialog confirmation={confirmation} reportSet={adminState?.sets.find(reportSet => reportSet.id === confirmation.setId)}
-        active={active} busy={busy} onCancel={cancelSetOperation} onConfirm={() => void confirmSetOperation()} /> : null}
+        active={active} busy={busy} error={message?.tone === "error" ? message.text : undefined}
+        onCancel={cancelSetOperation} onConfirm={() => void confirmSetOperation()} /> : null}
     </section>
   );
 }
 
-function SetConfirmationDialog({ confirmation, reportSet, active, busy, onCancel, onConfirm }: {
+function SetConfirmationDialog({ confirmation, reportSet, active, busy, error, onCancel, onConfirm }: {
   confirmation: OfficialUsageConfirmation;
   reportSet?: OfficialUsageAdminState["sets"][number];
   active: boolean;
   busy: boolean;
+  error?: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -637,6 +678,7 @@ function SetConfirmationDialog({ confirmation, reportSet, active, busy, onCancel
     onKeyDown={event => { event.stopPropagation(); trapDialogFocus(event, dialog.current); }}
     onCancel={event => { event.preventDefault(); onCancel(); }} onClose={onCancel}>
     <h2 id="usage-set-confirm-title">Confirm {confirmation.operation}</h2>
+    {error ? <p className="report-status error" role="alert">{error}</p> : null}
     <p>Set {confirmation.setId}</p>
     <p>{reportSet ? `Activity coverage / supplied period: ${formatCoverage(reportSet.reportingPeriod)}.` : "Activity coverage unavailable."}</p>
     <p>{confirmation.operation === "delete" ? "Deletion removes retained content. Deleting the active set clears selection and never falls back automatically." : "Selection replaces the active pointer with this retained complete set."}</p>

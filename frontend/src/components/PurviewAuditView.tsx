@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState, type FormEvent } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  ApiError,
   approvePurviewAuditQualification,
   cancelPurviewAuditSearch,
   deletePurviewAuditSearch,
@@ -34,7 +35,8 @@ import {
 import { hasRole } from "../authorization";
 import { providerActionAllowed } from "../capabilityState";
 import { useCapabilityContext } from "../capabilityContext";
-import { WorkbenchActionGate } from "../workbenchActionContext";
+import { useSavedRead } from "../savedQueries";
+import { useWorkbenchAction, WorkbenchActionGate } from "../workbenchActionContext";
 
 const activeStatuses = new Set<PurviewAuditJob["status"]>([
   "running",
@@ -46,6 +48,9 @@ const readableStatuses = new Set<PurviewAuditJob["status"]>([
 ]);
 const recordPageSize = 100;
 const historyPageSize = 20;
+const providerAuthorizationErrors = new Set([
+  "capability_unavailable", "missing_permission", "provider_denied", "interaction_required", "authorization_expired", "not_configured",
+]);
 
 function purviewCapabilityKey(views: ReturnType<typeof useCapabilityContext>["views"]) {
   return views
@@ -58,6 +63,10 @@ function purviewCapabilityKey(views: ReturnType<typeof useCapabilityContext>["vi
       view.decision.checkedAt ?? "",
       view.decision.expiresAt ?? "",
       view.decision.previewQualification,
+      view.decision.verification ?? "",
+      view.enabled ?? "",
+      view.configuration?.enabled ?? "",
+      view.configuration?.sharedDataScope ?? "",
     ].join(":"))
     .sort()
     .join("|");
@@ -73,7 +82,7 @@ export function PurviewAuditView({
   onSelectedJobChange?: (jobId: string | undefined) => void;
 } = {}) {
   const capability = useCapabilityContext();
-  const accountKey = `${capability.user?.tenantId ?? ""}:${capability.user?.homeAccountId ?? ""}`;
+  const accountKey = JSON.stringify([capability.user?.tenantId, capability.user?.homeAccountId, [...(capability.user?.roles ?? [])].sort()]);
   return <PurviewAuditSession key={`${accountKey}:${purviewCapabilityKey(capability.views)}:${initialUserPrincipalName ?? ""}`} initialJobId={initialJobId} initialUserPrincipalName={initialUserPrincipalName} onSelectedJobChange={onSelectedJobChange} />;
 }
 
@@ -87,10 +96,22 @@ function PurviewAuditSession({
   onSelectedJobChange?: (jobId: string | undefined) => void;
 }) {
   const capability = useCapabilityContext();
+  const readSaved = useSavedRead();
+  const searchAction = useWorkbenchAction("purview.search");
   const requestGeneration = useRef(0);
+  const actionGeneration = useRef(0);
+  const historyGeneration = useRef(0);
+  const savedReadRevision = useRef<string | undefined>(undefined);
+  const actionController = useRef<AbortController | undefined>(undefined);
+  const savedController = useRef(new AbortController());
+  const detailController = useRef<AbortController | undefined>(undefined);
+  const resolvedRouteJobId = useRef<string | undefined>(undefined);
+  const selectionOrigin = useRef<"history" | "route">("route");
+  const selectedRef = useRef<PurviewAuditJob | undefined>(undefined);
   const [catalog, setCatalog] = useState<PurviewAuditCatalog>();
   const [jobs, setJobs] = useState<PurviewAuditJob[]>([]);
-  const [historyCount, setHistoryCount] = useState(0);
+  const [historyCount, setHistoryCount] = useState<number>();
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [historyOffset, setHistoryOffset] = useState(0);
   const [selected, setSelected] = useState<PurviewAuditJob>();
   const [records, setRecords] = useState<PurviewAuditRecordPage>();
@@ -115,42 +136,140 @@ function PurviewAuditSession({
   const [approvalAcknowledged, setApprovalAcknowledged] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
+  const [pollCycle, setPollCycle] = useState(0);
+  const [pollPaused, setPollPaused] = useState(false);
+  const pollBudget = useRef<{ deadline: number; attempts: number } | undefined>(undefined);
+  const refreshedQualification = useRef<string | undefined>(undefined);
 
-  function invalidateQualification() {
-    setQualification(undefined);
-    setApprovalAcknowledged(false);
+  function selectJob(job: PurviewAuditJob | undefined, origin: "history" | "route" = "history", notify = true) {
+    selectedRef.current = job;
+    selectionOrigin.current = origin;
+    resolvedRouteJobId.current = job?.id;
+    setSelected(job);
+    setRecords(undefined);
+    setRecordOffset(0);
+    if (notify) onSelectedJobChange?.(job?.id);
   }
 
-  async function loadHistory(
-    offset = historyOffset,
-    generation = requestGeneration.current,
-  ) {
-    const history = await getPurviewAuditJobs(historyPageSize, offset);
-    if (requestGeneration.current !== generation) {
-      return;
-    }
+  function invalidateQualification() {
+    actionGeneration.current += 1;
+    actionController.current?.abort();
+    detailController.current?.abort();
+    setQualification(undefined);
+    setApprovalAcknowledged(false);
+    setBusy(undefined);
+    selectJob(undefined);
+  }
 
+  function currentRequest(generation: number, action?: number) {
+    return requestGeneration.current === generation
+      && (action === undefined || actionGeneration.current === action);
+  }
+
+  const failSavedRead = useCallback((requestError: unknown, context = "") => {
+    requestGeneration.current += 1;
+    actionGeneration.current += 1;
+    savedController.current.abort();
+    detailController.current?.abort();
+    actionController.current?.abort();
+    selectedRef.current = undefined;
+    setBusy(undefined);
+    setCatalog(undefined);
+    setJobs([]);
+    setHistoryCount(undefined);
+    setHistoryLoading(false);
+    setSelected(undefined);
+    setRecords(undefined);
+    setRecordOffset(0);
+    setQualification(undefined);
+    setApprovalAcknowledged(false);
+    setPollPaused(true);
+    setError(`${context}${errorMessage(requestError)}`);
+  }, []);
+
+  const readSavedData = useCallback(async <T,>(
+    key: readonly unknown[],
+    read: (signal: AbortSignal) => Promise<T>,
+    signal: AbortSignal,
+    context = "",
+  ): Promise<T> => {
+    const generation = requestGeneration.current;
+    const currentSignal = AbortSignal.any([signal, savedController.current.signal]);
+    // Another observer can keep a pre-action request alive after this view aborts.
+    const revision = savedReadRevision.current;
+    const currentKey = revision ? [...key, { revision }] : key;
+    try {
+      return await readSaved(currentKey, read, currentSignal);
+    } catch (requestError) {
+      if (!currentSignal.aborted && requestGeneration.current === generation) failSavedRead(requestError, context);
+      throw requestError;
+    }
+  }, [failSavedRead, readSaved]);
+
+  function clearPrivateSavedState(requestError: unknown) {
+    if (requestError instanceof ApiError && (requestError.status === 401 || requestError.status === 403)
+      && !providerAuthorizationErrors.has(requestError.code)) failSavedRead(requestError);
+  }
+
+  function commitHistory(history: Awaited<ReturnType<typeof getPurviewAuditJobs>>) {
     setJobs(history.value);
     setHistoryCount(history.count);
     setHistoryOffset(history.offset);
-    setSelected((current) =>
-      current
-        ? history.value.find((job) => job.id === current.id) ?? (current.id === initialJobId ? current : undefined)
-        : undefined,
-    );
+    setHistoryLoading(false);
+    const current = selectedRef.current;
+    if (!current) return;
+    const updated = history.value.find(job => job.id === current.id);
+    if (updated) {
+      selectedRef.current = updated;
+      setSelected(updated);
+      if (!readableStatuses.has(updated.status) || updated.updatedAt !== current.updatedAt) setRecords(undefined);
+    } else if (selectionOrigin.current !== "route") {
+      selectJob(undefined);
+    }
   }
 
-  const pollHistory = useEffectEvent(async () => {
+  async function loadHistory(
+    offset: number,
+    generation: number,
+    signal: AbortSignal,
+    action?: number,
+  ) {
+    const historyRequest = ++historyGeneration.current;
+    const history = await readSavedData(
+      ["purview-audit-jobs", { limit: historyPageSize, offset }, action],
+      requestSignal => getPurviewAuditJobs(historyPageSize, offset, { signal: requestSignal }),
+      signal,
+    );
+    if (signal.aborted || !currentRequest(generation, action) || historyRequest !== historyGeneration.current) {
+      return;
+    }
+
+    const lastOffset = Math.max(Math.ceil(history.count / historyPageSize) - 1, 0) * historyPageSize;
+    if (offset > lastOffset) return loadHistory(lastOffset, generation, signal, action);
+    commitHistory(history);
+  }
+
+  const pollHistory = useEffectEvent(async (signal: AbortSignal) => {
+    if (busy || actionController.current && !actionController.current.signal.aborted) return;
     const generation = requestGeneration.current;
     try {
-      await loadHistory(historyOffset, generation);
+      await loadHistory(historyOffset, generation, signal);
+      if (signal.aborted || !currentRequest(generation)) return;
+      const current = selectedRef.current;
+      if (current && selectionOrigin.current === "route" && activeStatuses.has(current.status)) {
+        const job = await readSavedData(["purview-audit-job", current.id], requestSignal => getPurviewAuditJob(current.id, { signal: requestSignal }), signal);
+        if (!signal.aborted && currentRequest(generation) && selectedRef.current?.id === job.id) {
+          selectedRef.current = job;
+          setSelected(job);
+        }
+      }
     } catch (requestError) {
-      if (requestGeneration.current === generation) {
-        setError(errorMessage(requestError));
+      if (!signal.aborted && currentRequest(generation)) {
+        failSavedRead(requestError);
       }
     }
   });
-  const hasProgressingJobs = jobs.some(job => activeStatuses.has(job.status));
+  const hasProgressingJobs = jobs.some(job => activeStatuses.has(job.status)) || Boolean(selected && activeStatuses.has(selected.status));
 
   const reloadCapability = useEffectEvent(async () => {
     await capability.reload();
@@ -158,10 +277,20 @@ function PurviewAuditSession({
 
   useEffect(() => {
     const generation = ++requestGeneration.current;
+    savedController.current.abort();
+    savedController.current = new AbortController();
+    const controller = new AbortController();
 
-    Promise.all([getPurviewAuditCatalog(), getPurviewAuditJobs(historyPageSize, 0)])
+    Promise.all([
+      readSavedData(["purview-audit-catalog"], signal => getPurviewAuditCatalog({ signal }), controller.signal),
+      readSavedData(
+        ["purview-audit-jobs", { limit: historyPageSize, offset: 0 }],
+        signal => getPurviewAuditJobs(historyPageSize, 0, { signal }),
+        controller.signal,
+      ),
+    ])
       .then(([catalogResult, history]) => {
-        if (requestGeneration.current !== generation) {
+        if (controller.signal.aborted || !currentRequest(generation)) {
           return;
         }
 
@@ -169,42 +298,67 @@ function PurviewAuditSession({
         setJobs(history.value);
         setHistoryCount(history.count);
         setHistoryOffset(history.offset);
+        setHistoryLoading(false);
       })
       .catch((requestError: unknown) => {
-        if (requestGeneration.current === generation) {
-          setError(errorMessage(requestError));
+        if (!controller.signal.aborted && currentRequest(generation)) {
+          failSavedRead(requestError);
         }
       });
 
     return () => {
-      if (requestGeneration.current === generation) {
-        requestGeneration.current += 1;
-      }
+      controller.abort();
+      savedController.current.abort();
+      requestGeneration.current += 1;
     };
-  }, []);
+  }, [failSavedRead, readSavedData]);
+
+  useEffect(() => () => actionController.current?.abort(), []);
 
   useEffect(() => {
-    if (!initialJobId) return;
+    if (resolvedRouteJobId.current === initialJobId && (initialJobId !== undefined || !selectedRef.current)) return;
+    resolvedRouteJobId.current = initialJobId;
+    selectionOrigin.current = "route";
+    actionGeneration.current += 1;
+    actionController.current?.abort();
+    detailController.current?.abort();
     const generation = requestGeneration.current;
+    const action = actionGeneration.current;
     const controller = new AbortController();
+    detailController.current = controller;
     void Promise.resolve().then(() => {
       if (controller.signal.aborted) return undefined;
+      selectedRef.current = undefined;
       setSelected(undefined);
       setRecords(undefined);
       setRecordOffset(0);
-      setError(undefined);
-      return getPurviewAuditJob(initialJobId, { signal: controller.signal });
+      setBusy(undefined);
+      setQualification(undefined);
+      setApprovalAcknowledged(false);
+      if (!initialJobId || savedController.current.signal.aborted) return undefined;
+      return readSavedData(
+        ["purview-audit-job", initialJobId],
+        signal => getPurviewAuditJob(initialJobId, { signal }),
+        controller.signal,
+        "The exact Audit Search job is expired, deleted, or unavailable to this account. ",
+      );
     })
       .then(job => {
-        if (job && !controller.signal.aborted && requestGeneration.current === generation) setSelected(job);
+        if (job && !controller.signal.aborted && currentRequest(generation, action)) {
+          selectedRef.current = job;
+          setSelected(job);
+        }
       })
       .catch(requestError => {
         if (!controller.signal.aborted && requestGeneration.current === generation) {
-          setError(`The exact Audit Search job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
+          failSavedRead(requestError, "The exact Audit Search job is expired, deleted, or unavailable to this account. ");
         }
       });
-    return () => controller.abort();
-  }, [initialJobId]);
+    return () => {
+      controller.abort();
+      if (detailController.current === controller && resolvedRouteJobId.current === initialJobId) resolvedRouteJobId.current = undefined;
+    };
+  }, [failSavedRead, initialJobId, readSavedData]);
 
   useEffect(() => {
     if (!qualification) {
@@ -221,25 +375,40 @@ function PurviewAuditSession({
   }, [capability.now, qualification]);
 
   useEffect(() => {
-    if (!hasProgressingJobs) return;
+    if (!hasProgressingJobs && pollCycle === 0) return;
+    // Only explicit restarts clear the budget; passive visibility changes reuse it.
+    const budget = pollBudget.current ?? { deadline: Date.now() + 5 * 60_000, attempts: 0 };
+    pollBudget.current = budget;
+    if (!hasProgressingJobs || pollPaused) return;
     let cancelled = false;
     let timer: number | undefined;
-    const deadline = Date.now() + 5 * 60_000;
+    const controller = new AbortController();
     const poll = async () => {
-      await pollHistory();
-      if (!cancelled && Date.now() < deadline) timer = window.setTimeout(() => void poll(), 2_000);
+      if (cancelled || pollBudget.current !== budget) return;
+      if (Date.now() >= budget.deadline || budget.attempts >= 150) {
+        setPollPaused(true);
+        return;
+      }
+      budget.attempts += 1;
+      await pollHistory(controller.signal);
+      if (!cancelled && pollBudget.current === budget) timer = window.setTimeout(() => void poll(), 2_000);
     };
     timer = window.setTimeout(() => void poll(), 2_000);
-    return () => { cancelled = true; if (timer !== undefined) window.clearTimeout(timer); };
-  }, [hasProgressingJobs]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [hasProgressingJobs, pollCycle, pollPaused]);
 
   useEffect(() => {
     const qualificationJob = qualification?.jobId
       ? jobs.find((job) => job.id === qualification.jobId)
       : undefined;
 
-    if (qualificationJob?.status === "succeeded") {
-      void reloadCapability();
+    if (qualificationJob?.status === "succeeded" && refreshedQualification.current !== qualificationJob.id) {
+      refreshedQualification.current = qualificationJob.id;
+      void reloadCapability().catch(requestError => setError(errorMessage(requestError)));
     }
   }, [jobs, qualification]);
 
@@ -270,39 +439,66 @@ function PurviewAuditSession({
   });
   const rangeError = getRangeError(filters, catalog);
   const operationError = operations.length ? undefined : "Select at least one supported operation.";
+  const qualificationRangeError = applicationMode && !available && filters
+    && Date.parse(filters.endDateTime) - Date.parse(filters.startDateTime) > (catalog?.limits.qualificationWindowHours ?? 1) * 3_600_000
+    ? `Qualification must not exceed ${catalog?.limits.qualificationWindowHours ?? 1} hours.` : undefined;
+
+  async function refreshSaved(generation: number, action: number, signal: AbortSignal) {
+    const exactId = selectionOrigin.current === "route" ? selectedRef.current?.id ?? initialJobId : undefined;
+    setHistoryLoading(true);
+    const [nextCatalog, history, exactJob] = await Promise.all([
+      readSavedData(["purview-audit-catalog", action], requestSignal => getPurviewAuditCatalog({ signal: requestSignal }), signal),
+      readSavedData(["purview-audit-jobs", { limit: historyPageSize, offset: historyOffset }, action],
+        requestSignal => getPurviewAuditJobs(historyPageSize, historyOffset, { signal: requestSignal }), signal),
+      exactId ? readSavedData(["purview-audit-job", exactId, action],
+        requestSignal => getPurviewAuditJob(exactId, { signal: requestSignal }), signal,
+        "The exact Audit Search job is expired, deleted, or unavailable to this account. ") : undefined,
+    ]);
+    if (signal.aborted || !currentRequest(generation, action)) return;
+    setCatalog(nextCatalog);
+    const lastOffset = Math.max(Math.ceil(history.count / historyPageSize) - 1, 0) * historyPageSize;
+    if (historyOffset > lastOffset) await loadHistory(lastOffset, generation, signal, action);
+    else commitHistory(history);
+    if (exactJob && currentRequest(generation, action)) selectJob(exactJob, "route", false);
+    if (currentRequest(generation, action) && qualification?.jobId
+      && [...history.value, ...(exactJob ? [exactJob] : [])].some(job => job.id === qualification.jobId && job.status === "succeeded")) {
+      refreshedQualification.current = qualification.jobId;
+      await capability.reload();
+    }
+  }
 
   async function handleSearch(event: FormEvent) {
     event.preventDefault();
 
-    if (!filters || rangeError) {
+    if (!searchAction || !available || !catalog || !searchAction.roles.some(role => hasRole(capability.user, role))
+      || busy || !filters || rangeError || operationError) {
       return;
     }
 
-    await perform("search", async (generation) => {
-      const job = await submitPurviewAuditSearch(tokenMode, filters);
-      if (requestGeneration.current !== generation) {
+    await perform("search", async (generation, action, signal) => {
+      const job = await submitPurviewAuditSearch(tokenMode, filters, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
-      setSelected(job);
-      onSelectedJobChange?.(job.id);
-      setRecords(undefined);
-      setRecordOffset(0);
-      await loadHistory(0, generation);
+      selectJob(job, "route");
+      await loadHistory(0, generation, signal, action);
     });
   }
 
   async function handleApproveQualification() {
-    if (!filters) {
+    if (!canQualify || !approvalAcknowledged || !catalog || busy || !filters || rangeError || operationError
+      || Date.parse(filters.endDateTime) - Date.parse(filters.startDateTime) > catalog.limits.qualificationWindowHours * 3_600_000) {
       return;
     }
 
-    await perform("approve", async (generation) => {
+    await perform("approve", async (generation, action, signal) => {
       const approved = await approvePurviewAuditQualification(
         tokenMode,
         filters,
+        { signal },
       );
-      if (requestGeneration.current !== generation) {
+      if (!currentRequest(generation, action)) {
         return;
       }
 
@@ -313,66 +509,71 @@ function PurviewAuditSession({
 
   async function handleRunQualification() {
     if (
-      !qualification ||
+      !canQualify || busy || !qualification ||
       qualification.status !== "approved" ||
-      Date.parse(qualification.expiresAt) <= capability.now
+      !(Date.parse(qualification.expiresAt) > capability.now)
     ) {
       return;
     }
 
-    await perform("qualification", async (generation) => {
-      const job = await startPurviewAuditQualification(qualification.id);
-      if (requestGeneration.current !== generation) {
+    await perform("qualification", async (generation, action, signal) => {
+      const job = await startPurviewAuditQualification(qualification.id, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
       setQualification({ ...qualification, jobId: job.id, status: "running" });
-      setSelected(job);
-      onSelectedJobChange?.(job.id);
-      setRecords(undefined);
-      await loadHistory(0, generation);
+      selectJob(job, "route");
+      await loadHistory(0, generation, signal, action);
     });
   }
 
   async function handleView(job: PurviewAuditJob, offset = 0) {
-    if (offset === 0 && selected?.id !== job.id) onSelectedJobChange?.(job.id);
-    await perform(`view:${job.id}`, async (generation) => {
-      const page = await getPurviewAuditRecords(
-        job.id,
-        recordPageSize,
-        offset,
+    if (busy || historyLoading) return;
+    selectJob(job, selectedRef.current?.id === job.id ? selectionOrigin.current : "history", selectedRef.current?.id !== job.id);
+    await perform(`view:${job.id}`, async (generation, action, signal) => {
+      const page = await readSavedData(
+        ["purview-audit-records", job.id, { limit: recordPageSize, offset }, action],
+        requestSignal => getPurviewAuditRecords(
+          job.id,
+          recordPageSize,
+          offset,
+          { signal: requestSignal },
+        ),
+        signal,
       );
-      if (requestGeneration.current !== generation) {
+      if (!currentRequest(generation, action)) {
         return;
       }
 
+      selectedRef.current = page.job;
       setSelected(page.job);
       setRecords(page);
-      setRecordOffset(offset);
+      setRecordOffset(page.offset);
     });
   }
 
   async function handleResume(job: PurviewAuditJob) {
-    await perform(`resume:${job.id}`, async (generation) => {
-      const resumed = await resumePurviewAuditSearch(job.id);
-      if (requestGeneration.current !== generation) {
+    await perform(`resume:${job.id}`, async (generation, action, signal) => {
+      const resumed = await resumePurviewAuditSearch(job.id, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
-      setSelected(resumed);
-      await loadHistory(historyOffset, generation);
+      selectJob(resumed, "route");
+      await loadHistory(historyOffset, generation, signal, action);
     });
   }
 
   async function handleCancel(job: PurviewAuditJob) {
-    await perform(`cancel:${job.id}`, async (generation) => {
-      const cancelled = await cancelPurviewAuditSearch(job.id);
-      if (requestGeneration.current !== generation) {
+    await perform(`cancel:${job.id}`, async (generation, action, signal) => {
+      const cancelled = await cancelPurviewAuditSearch(job.id, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
-      setSelected(cancelled);
-      await loadHistory(historyOffset, generation);
+      selectJob(cancelled, "route");
+      await loadHistory(historyOffset, generation, signal, action);
     });
   }
 
@@ -385,26 +586,24 @@ function PurviewAuditSession({
       return;
     }
 
-    await perform(`delete:${job.id}`, async (generation) => {
-      await deletePurviewAuditSearch(job.id);
-      if (requestGeneration.current !== generation) {
+    await perform(`delete:${job.id}`, async (generation, action, signal) => {
+      await deletePurviewAuditSearch(job.id, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
-      if (selected?.id === job.id) {
-        setSelected(undefined);
-        setRecords(undefined);
-        onSelectedJobChange?.(undefined);
+      if (selectedRef.current?.id === job.id || initialJobId === job.id) {
+        selectJob(undefined);
       }
 
-      await loadHistory(historyOffset, generation);
+      await loadHistory(historyOffset, generation, signal, action);
     });
   }
 
   async function handleExport(job: PurviewAuditJob) {
-    await perform(`export:${job.id}`, async (generation) => {
-      const blob = await downloadPurviewAuditCsv(job.id);
-      if (requestGeneration.current !== generation) {
+    await perform(`export:${job.id}`, async (generation, action, signal) => {
+      const blob = await downloadPurviewAuditCsv(job.id, { signal });
+      if (!currentRequest(generation, action)) {
         return;
       }
 
@@ -424,21 +623,45 @@ function PurviewAuditSession({
 
   async function perform(
     key: string,
-    operation: (generation: number) => Promise<void>,
+    operation: (generation: number, action: number, signal: AbortSignal) => Promise<void>,
   ) {
-    const generation = requestGeneration.current;
+    if (actionController.current && !actionController.current.signal.aborted) return;
+    savedReadRevision.current = crypto.randomUUID();
+    const generation = ++requestGeneration.current;
+    const action = ++actionGeneration.current;
+    savedController.current.abort();
+    savedController.current = new AbortController();
+    detailController.current?.abort();
+    actionController.current?.abort();
+    const controller = new AbortController();
+    actionController.current = controller;
+    if (key.startsWith("history:")) {
+      selectJob(undefined);
+      setHistoryLoading(true);
+    }
     setBusy(key);
     setError(undefined);
 
     try {
-      await operation(generation);
+      await operation(generation, action, controller.signal);
+      if (currentRequest(generation, action) && /^(refresh|search|qualification|resume:)/.test(key)) {
+        pollBudget.current = undefined;
+        setPollPaused(false);
+        setPollCycle(current => current + 1);
+      }
     } catch (requestError) {
-      if (requestGeneration.current === generation) {
+      if (!controller.signal.aborted && currentRequest(generation, action)) {
+        clearPrivateSavedState(requestError);
         setError(errorMessage(requestError));
+        controller.abort();
       }
     } finally {
-      if (requestGeneration.current === generation) {
+      if (actionController.current === controller) {
+        actionController.current = undefined;
+      }
+      if (currentRequest(generation, action)) {
         setBusy(undefined);
+        setHistoryLoading(false);
       }
     }
   }
@@ -461,8 +684,8 @@ function PurviewAuditSession({
           title="Refresh Audit Search history"
           disabled={Boolean(busy)}
           onClick={() =>
-            void perform("refresh", async () => {
-              await loadHistory();
+            void perform("refresh", async (generation, action, signal) => {
+              await refreshSaved(generation, action, signal);
             })
           }
         >
@@ -473,8 +696,13 @@ function PurviewAuditSession({
       {error ? (
         <div className="error-banner" role="alert">
           {error}
+          {initialJobId ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => {
+            selectJob(undefined);
+            void perform("refresh", refreshSaved);
+          }}>Return to Audit Search history</button> : null}
         </div>
       ) : null}
+      {pollPaused ? <p role="status">Automatic history refresh paused. Refresh Audit Search history to retry saved reads.</p> : null}
 
       <div className="purview-evidence-strip" role="note">
         <span>
@@ -583,9 +811,9 @@ function PurviewAuditSession({
           <div className="error-banner" role="alert">{operationError}</div>
         ) : null}
 
-        {rangeError ? (
+        {rangeError || qualificationRangeError ? (
           <div className="error-banner" role="alert">
-            {rangeError}
+            {rangeError ?? qualificationRangeError}
           </div>
         ) : null}
 
@@ -665,22 +893,15 @@ function PurviewAuditSession({
                     Approve one narrow remote query for contract qualification
                   </span>
                 </label>
-              ) : !available ? (
-                <section className="purview-qualification" aria-label="Audit Search authorization pending">
-                  <div>
-                    <strong>Delegated authorization is not ready</strong>
-                    <p>Automatic safe permission checks run while this signed-in session is active. No audit search is submitted by those checks.</p>
-                  </div>
-                  <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
-                </section>
               ) : null}
               {canQualify ? (
                 <button
                   type="button"
                   disabled={
                     !approvalAcknowledged ||
+                    !catalog ||
                     !filters ||
-                    Boolean(rangeError) ||
+                    Boolean(rangeError || qualificationRangeError) ||
                     Boolean(operationError) ||
                     Boolean(busy)
                   }
@@ -702,6 +923,14 @@ function PurviewAuditSession({
               ) : null}
             </div>
           </section>
+        ) : !available ? (
+          <section className="purview-qualification" aria-label="Audit Search authorization pending">
+            <div>
+              <strong>Delegated authorization is not ready</strong>
+              <p>Automatic safe permission checks run while this signed-in session is active. No audit search is submitted by those checks.</p>
+            </div>
+            <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
+          </section>
         ) : null}
 
         <div className="purview-search-actions">
@@ -709,7 +938,7 @@ function PurviewAuditSession({
           <button
             type="submit"
             disabled={
-              !available || !filters || Boolean(rangeError) || Boolean(busy)
+              !available || !catalog || !filters || Boolean(rangeError) || Boolean(busy)
               || Boolean(operationError)
             }
           >
@@ -737,9 +966,11 @@ function PurviewAuditSession({
               Cancellation and deletion do not stop or remove remote Purview work.
             </p>
           </div>
-          <span>{historyCount.toLocaleString()} jobs</span>
+          <span>{historyCount === undefined ? "Unknown" : historyCount.toLocaleString()} jobs</span>
         </header>
-        {jobs.length === 0 ? (
+        {historyLoading ? <div className="compact-empty-state" role="status">Loading Audit Search history...</div>
+          : historyCount === undefined ? <div className="compact-empty-state"><strong>Audit Search history unavailable</strong><span>Retry saved reads; unavailable evidence is not an empty history.</span></div>
+          : jobs.length === 0 ? (
           <div className="compact-empty-state">
             <strong>No Audit Search history</strong>
             <span>
@@ -748,7 +979,7 @@ function PurviewAuditSession({
           </div>
         ) : (
           <HistoryTable
-            busy={Boolean(busy)}
+            busy={Boolean(busy) || historyLoading}
             jobs={jobs}
             selectedId={selected?.id}
             onCancel={handleCancel}
@@ -758,7 +989,7 @@ function PurviewAuditSession({
             onView={handleView}
           />
         )}
-        {historyCount > historyPageSize ? (
+        {historyCount !== undefined && historyCount > historyPageSize ? (
           <div className="audit-pagination" aria-label="Audit Search history pagination">
             <span>
               Showing {historyOffset + 1}-{Math.min(historyOffset + jobs.length, historyCount)} of {historyCount.toLocaleString()}
@@ -766,12 +997,14 @@ function PurviewAuditSession({
             <div className="purview-row-actions">
               <button type="button" className="secondary icon-button control-icon-button" aria-label="Previous Audit Search history page"
                 title="Previous history page" disabled={Boolean(busy) || historyOffset === 0}
-                onClick={() => void perform("history:previous", () => loadHistory(Math.max(0, historyOffset - historyPageSize)))}>
+                onClick={() => void perform("history:previous", (generation, action, signal) =>
+                  loadHistory(Math.max(0, historyOffset - historyPageSize), generation, signal, action))}>
                 <ChevronLeft aria-hidden="true" />
               </button>
               <button type="button" className="secondary icon-button control-icon-button" aria-label="Next Audit Search history page"
                 title="Next history page" disabled={Boolean(busy) || historyOffset + jobs.length >= historyCount}
-                onClick={() => void perform("history:next", () => loadHistory(historyOffset + historyPageSize))}>
+                onClick={() => void perform("history:next", (generation, action, signal) =>
+                  loadHistory(historyOffset + historyPageSize, generation, signal, action))}>
                 <ChevronRight aria-hidden="true" />
               </button>
             </div>
@@ -782,9 +1015,9 @@ function PurviewAuditSession({
       {selected ? (
         <SearchDetail
           job={selected}
-          records={records}
+          records={records?.job.id === selected.id && readableStatuses.has(selected.status) ? records : undefined}
           recordOffset={recordOffset}
-          busy={Boolean(busy)}
+          busy={Boolean(busy) || historyLoading}
           onPageChange={(offset) => void handleView(selected, offset)}
         />
       ) : null}
@@ -1093,14 +1326,17 @@ function SearchDetail({
 
       {!records ? (
         <div className="compact-empty-state">
-          <span>
+          {readableStatuses.has(job.status) ? <button type="button" className="secondary" disabled={busy} onClick={() => onPageChange(0)}>
+            <Eye aria-hidden="true" /> Load minimized results
+          </button> : <span>
             Select View results after a search reaches a saved terminal state.
-          </span>
+          </span>}
         </div>
       ) : records.value.length === 0 ? (
         <div className="compact-empty-state">
           <strong>No matching metadata records</strong>
-          <span>The provider lifecycle completed for the requested range.</span>
+          <span>{job.pageComplete ? "The provider lifecycle completed for the requested range."
+            : "Empty saved results do not establish complete coverage of the requested range."}</span>
         </div>
       ) : (
         <>

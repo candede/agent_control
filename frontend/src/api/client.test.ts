@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import type { LocalAuditAction as BackendLocalAuditAction } from "../../../backend/src/types/audit";
 import { createUnifiedVerification } from "../test/inventoryVerification";
 
 import {
@@ -8,6 +9,8 @@ import {
   cancelDataSyncRun,
   cancelInventoryRefresh,
   cancelPackageRefreshJob,
+  cancelPurviewAuditSearch,
+  cancelDefenderHunt,
   checkCapabilities,
   getBulkActionJob,
   getDefenderHuntingJob,
@@ -26,6 +29,10 @@ import {
   downloadDefenderHuntingCsv,
   downloadAdministrativeAuditCsv,
   downloadOfficialUsageCsv,
+  deletePurviewAuditSearch,
+  deleteDefenderHunt,
+  approvePurviewAuditQualification,
+  approveDefenderHuntingQualification,
   getPackageRefreshJob,
   getOfficialUsageAggregate,
   getOfficialUsageAgentDetail,
@@ -35,7 +42,13 @@ import {
   getCopilotUsageUsers,
   getDataSyncRun,
   getDataSyncState,
+  getDefenderHuntingCatalog,
   getPurviewAuditJob,
+  getDefenderHuntingJobs,
+  getDefenderHuntingRows,
+  getPurviewAuditCatalog,
+  getPurviewAuditJobs,
+  getPurviewAuditRecords,
   getQuarantineJob,
   getQuarantineTargets,
   getQuarantineStatus,
@@ -43,6 +56,9 @@ import {
   previewPackageMutation,
   reconcileBulkActionJob,
   retryDataSyncRun,
+  resumePurviewAuditSearch,
+  resumeDefenderHunt,
+  revokeDefenderHuntingRetainedScope,
   refreshPackageIdentityDetails,
   searchDirectoryPrincipals,
   resolveDirectoryPrincipals,
@@ -52,14 +68,21 @@ import {
   stageOfficialUsageReport,
   signOut,
   startDataSync,
+  startPurviewAuditQualification,
+  startDefenderHuntingQualification,
   subscribeSessionRevalidationRequired,
+  submitPurviewAuditSearch,
+  submitDefenderHunt,
   submitQuarantine,
   updateAgentAccess,
   updateAgentsAccess,
   type PackageAccessReplacement,
   type PackageAccessUpdate,
   type AuditEvent,
+  type AuditEventsQuery,
   type PackageRefreshJob,
+  type PurviewAuditFilters,
+  type DefenderHuntingFilters,
 } from "./client";
 
 const accessUpdate: PackageAccessReplacement = {
@@ -157,6 +180,26 @@ describe("access API client", () => {
     expect(result.value[0]).not.toHaveProperty("targetBlockedState");
   });
 
+  it("keeps audit receipt and query actions aligned with the backend contract", () => {
+    expectTypeOf<AuditEvent["action"]>().toEqualTypeOf<BackendLocalAuditAction>();
+    expectTypeOf<AuditEventsQuery["action"]>().toEqualTypeOf<BackendLocalAuditAction | undefined>();
+  });
+
+  it("filters and retains hunting-scope revocation receipts without package blocked state", async () => {
+    const event: AuditEvent = {
+      id: "hunting-scope-revocation", operationId: "revoke-operation", action: "revoke-hunting-scope",
+      scope: "single", agentId: "retained-scope-one", status: "succeeded",
+      actor: { displayName: "Reviewer", username: "reviewer@example.invalid", homeAccountId: "reviewer", roles: ["AgentControl.Admin"] },
+      startedAt: "2026-09-15T12:00:00.000Z", completedAt: "2026-09-15T12:00:01.000Z",
+      requestPath: "/api/hunting/retained-scopes/retained-scope-one/revoke",
+    };
+    const fetchMock = mockJsonResponse({ value: [event], count: 1 });
+    const result = await getAuditEvents({ action: "revoke-hunting-scope" });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/audit/events?action=revoke-hunting-scope", expect.objectContaining({ credentials: "include" }));
+    expect(result.value).toEqual([event]);
+    expect(result.value[0]).not.toHaveProperty("targetBlockedState");
+  });
+
   it.each(["aggregate", "users"] as const)("passes cancellation through the %s official-usage CSV request", async kind => {
     const fetchMock = vi.fn(async () => new Response("selected-report-csv", { headers: { "Content-Type": "text/csv" } }));
     vi.stubGlobal("fetch", fetchMock);
@@ -167,6 +210,33 @@ describe("access API client", () => {
       credentials: "include", signal: controller.signal, headers: { Accept: "text/csv" },
     });
     expect(await blob.text()).toBe("selected-report-csv");
+  });
+
+  it.each([false, true])("preserves pinned Power Platform CSV filters with cancellation supplied: %s", async cancellable => {
+    const fetchMock = vi.fn(async () => new Response("selected-inventory-csv", { headers: { "Content-Type": "text/csv" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const signal = cancellable ? controller.signal : undefined;
+    const blob = await downloadInventoryCsv({
+      snapshotId: "snapshot / saved", type: undefined, excludeAgents: false, environmentId: "env & one",
+      search: "Agent & bot", sortBy: "displayName", sortDirection: "asc", limit: undefined, offset: undefined,
+    }, signal);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "/api/inventory/export.csv?snapshotId=snapshot+%2F+saved&excludeAgents=false&environmentId=env+%26+one&search=Agent+%26+bot&sortBy=displayName&sortDirection=asc",
+      { credentials: "include", signal, headers: { Accept: "text/csv" } },
+    );
+    expect(await blob.text()).toBe("selected-inventory-csv");
+  });
+
+  it("rejects a late Power Platform CSV result after its export owner cancels", async () => {
+    const pending = deferredResponse();
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
+    const controller = new AbortController();
+    const result = downloadInventoryCsv({ snapshotId: "snapshot-one" }, controller.signal);
+    const cancelled = expect(result).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
+    controller.abort();
+    pending.resolve(new Response("superseded-inventory-csv"));
+    await cancelled;
   });
 
   it("encodes agent usage reads and sends confirmed, CSRF-protected association changes", async () => {
@@ -596,6 +666,30 @@ describe("access API client", () => {
     }
   });
 
+  it("passes cancellation through all saved audit and hunting reads", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    await getAuditEvents({ action: "block", limit: 100, offset: 200 }, { signal: controller.signal });
+    await getPurviewAuditCatalog({ signal: controller.signal });
+    await getPurviewAuditJobs(20, 40, { signal: controller.signal });
+    await getPurviewAuditRecords("audit/job", 100, 300, { signal: controller.signal });
+    await getDefenderHuntingCatalog({ signal: controller.signal });
+    await getDefenderHuntingJobs(20, 60, { signal: controller.signal });
+    await getDefenderHuntingRows("hunt/job", 100, 400, { signal: controller.signal });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/api/audit/events?limit=100&offset=200&action=block",
+      "/api/audit-search/catalog",
+      "/api/audit-search/jobs?limit=20&offset=40",
+      "/api/audit-search/jobs/audit%2Fjob/records?limit=100&offset=300",
+      "/api/hunting/catalog",
+      "/api/hunting/jobs?limit=20&offset=60",
+      "/api/hunting/jobs/hunt%2Fjob/rows?limit=100&offset=400",
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init).toEqual(expect.objectContaining({ signal: controller.signal }));
+    }
+  });
+
   it("previews exact mutation intent and submits the returned hash", async () => {
     const fetchMock = mockJsonResponse({ confirmationHash: "c".repeat(64), summary: {} });
     await previewPackageMutation({ action: "block", ids: ["package-1"], mutationScope: "single" });
@@ -616,18 +710,283 @@ describe("access API client", () => {
 
   it("encodes exact quarantine status targets and preserves a caller-owned write key", async () => {
     const fetchMock = mockJsonResponse({ confirmationHash: "c".repeat(64), summary: {} });
-    await getQuarantineTargets({ search: "Agent & one", limit: 25, offset: 50 });
+    const controller = new AbortController();
+    await getQuarantineTargets({ search: "Agent & one", limit: 25, offset: 50 }, { signal: controller.signal });
     await getQuarantineStatus("snapshot/id", "native id", true);
     await previewQuarantine({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] });
     await submitQuarantine({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"], confirmationHash: "c".repeat(64) }, "stable-write-key");
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/quarantine/targets?search=Agent+%26+one&limit=25&offset=50", expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/quarantine/targets?search=Agent+%26+one&limit=25&offset=50", expect.objectContaining({ credentials: "include", signal: controller.signal }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/quarantine/status?snapshotId=snapshot%2Fid&nativeId=native+id&force=true", expect.objectContaining({ credentials: "include" }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/preview", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/quarantine/jobs", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": "stable-write-key" }) }));
   });
+
+  it.each(["status", "preview"] as const)("cancels an explicitly admitted quarantine %s read without changing its target", async kind => {
+    const pending = deferredResponse();
+    const fetchMock = mockJsonResponse({});
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const controller = new AbortController();
+    const intent = { action: "quarantine" as const, snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] };
+    const read = kind === "status"
+      ? getQuarantineStatus("snapshot-a", "native-a", true, { signal: controller.signal })
+      : previewQuarantine(intent, { signal: controller.signal });
+    const cancelled = expect(read).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+    controller.abort();
+    pending.resolve(Response.json({}));
+    await cancelled;
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      kind === "status" ? "/api/quarantine/status?snapshotId=snapshot-a&nativeId=native-a&force=true" : "/api/quarantine/preview",
+      expect.objectContaining({
+        signal: controller.signal, credentials: "include",
+        ...(kind === "preview" ? { method: "POST", body: JSON.stringify(intent) } : {}),
+      }),
+    );
+  });
+});
+
+describe("investigation request cancellation", () => {
+  const id = "job/one";
+  const auditFilters: PurviewAuditFilters = {
+    presetId: "copilot_interactions", startDateTime: "2026-09-20T00:00:00Z", endDateTime: "2026-09-20T01:00:00Z",
+    operations: [], userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
+  };
+  const huntingFilters: DefenderHuntingFilters = {
+    templateId: "agents_inventory", startDateTime: "2026-09-20T00:00:00Z", endDateTime: "2026-09-20T01:00:00Z",
+    agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [],
+  };
+  const auditBody = JSON.stringify({ tokenMode: "delegated", filters: auditFilters });
+  const huntingBody = JSON.stringify({ tokenMode: "application", filters: huntingFilters });
+  const confirmationBody = JSON.stringify({ confirmation: id });
+  const requests: Array<{
+    name: string; path: string; method?: "POST" | "DELETE"; body?: string;
+    send: (options?: { signal?: AbortSignal }) => Promise<unknown>;
+  }> = [
+    { name: "Purview submit", path: "/api/audit-search/jobs", method: "POST", body: auditBody, send: options => submitPurviewAuditSearch("delegated", auditFilters, options) },
+    { name: "Purview resume", path: "/api/audit-search/jobs/job%2Fone/resume", method: "POST", send: options => resumePurviewAuditSearch(id, options) },
+    { name: "Purview cancel", path: "/api/audit-search/jobs/job%2Fone/cancel", method: "POST", send: options => cancelPurviewAuditSearch(id, options) },
+    { name: "Purview delete", path: "/api/audit-search/jobs/job%2Fone", method: "DELETE", body: confirmationBody, send: options => deletePurviewAuditSearch(id, options) },
+    { name: "Purview qualification approval", path: "/api/audit-search/qualifications", method: "POST", body: auditBody, send: options => approvePurviewAuditQualification("delegated", auditFilters, options) },
+    { name: "Purview qualification start", path: "/api/audit-search/qualifications/job%2Fone/start", method: "POST", send: options => startPurviewAuditQualification(id, options) },
+    { name: "Purview CSV", path: "/api/audit-search/jobs/job%2Fone/export.csv", send: options => downloadPurviewAuditCsv(id, options) },
+    { name: "Defender submit", path: "/api/hunting/jobs", method: "POST", body: huntingBody, send: options => submitDefenderHunt("application", huntingFilters, options) },
+    { name: "Defender resume", path: "/api/hunting/jobs/job%2Fone/resume", method: "POST", send: options => resumeDefenderHunt(id, options) },
+    { name: "Defender cancel", path: "/api/hunting/jobs/job%2Fone/cancel", method: "POST", send: options => cancelDefenderHunt(id, options) },
+    { name: "Defender delete", path: "/api/hunting/jobs/job%2Fone", method: "DELETE", body: confirmationBody, send: options => deleteDefenderHunt(id, options) },
+    { name: "Defender qualification approval", path: "/api/hunting/qualifications", method: "POST", body: huntingBody, send: options => approveDefenderHuntingQualification("application", huntingFilters, options) },
+    { name: "Defender qualification start", path: "/api/hunting/qualifications/job%2Fone/start", method: "POST", send: options => startDefenderHuntingQualification(id, options) },
+    { name: "Defender scope revocation", path: "/api/hunting/retained-scopes/job%2Fone/revoke", method: "POST", body: confirmationBody, send: options => revokeDefenderHuntingRetainedScope(id, options) },
+    { name: "Defender CSV", path: "/api/hunting/jobs/job%2Fone/export.csv", send: options => downloadDefenderHuntingCsv(id, options) },
+  ];
+
+  describe.each(requests)("$name", ({ path, method, body, send }) => {
+    it.each([false, true])("preserves exact request intent with cancellation supplied: %s", async cancellable => {
+      const fetchMock = mockJsonResponse({});
+      const controller = new AbortController();
+      await send(cancellable ? { signal: controller.signal } : undefined);
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(path, expect.objectContaining({
+        credentials: "include",
+      }));
+      const init = fetchMock.mock.calls[0][1];
+      expect(init.signal).toBe(cancellable ? controller.signal : undefined);
+      expect(init.method ?? "GET").toBe(method ?? "GET");
+      expect(init.body).toBe(body);
+    });
+
+    it("rejects an aborted response even when the transport completes late", async () => {
+      const pending = deferredResponse();
+      vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
+      const controller = new AbortController();
+      const result = send({ signal: controller.signal });
+      const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+      controller.abort();
+      pending.resolve(Response.json({}));
+      await cancelled;
+    });
+  });
+
+  it.each(["capability_unavailable", "hunting_scope_unqualified", "not_configured"])(
+    "keeps explicit provider failure %s separate from session invalidation",
+    async code => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code }, { status: 403 })));
+      const listener = vi.fn();
+      const unsubscribe = subscribeSessionRevalidationRequired(listener);
+      try {
+        await expect(submitDefenderHunt("application", huntingFilters)).rejects.toMatchObject({ status: 403, code });
+        expect(listener).not.toHaveBeenCalled();
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
 });
 
 describe("API response failures", () => {
+  describe.each(["JSON", "CSV"] as const)("logout completion ownership (%s)", format => {
+    const csv = "saved,private,csv";
+    const response = () => format === "JSON" ? Response.json({ value: [] }) : new Response(csv);
+    const send = () => format === "JSON" ? getAgents() : downloadInventoryCsv();
+    const expected = format === "JSON" ? { value: [] } : { size: csv.length };
+
+    it.each(["fetch", "body"] as const)("fences a during-logout read waiting for %s after logout succeeds", async phase => {
+      const fetchMock = mockJsonResponse({ csrfToken: "logout-session-csrf" });
+      await getCurrentUser();
+      const logoutResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(logoutResponse.promise);
+      const logout = signOut();
+      const readResponse = deferredResponse();
+      const earlyResponse = response();
+      const body = vi.spyOn(earlyResponse, format === "JSON" ? "json" : "blob")
+        .mockImplementation(() => readResponse.promise.then(value => format === "JSON" ? value.json() : value.blob()));
+      if (phase === "fetch") fetchMock.mockReturnValueOnce(readResponse.promise);
+      else fetchMock.mockResolvedValueOnce(earlyResponse);
+      const read = send();
+      const cancelled = expect(read).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
+      if (phase === "body") await vi.waitFor(() => expect(body).toHaveBeenCalledOnce());
+      logoutResponse.resolve(new Response(null, { status: 204 }));
+      await logout;
+      readResponse.resolve(response());
+      await cancelled;
+      await checkCapabilities();
+      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+    });
+
+    it.each([
+      { status: 503, code: "service_unavailable" },
+      { status: 403, code: "invalid_origin" },
+    ])("preserves during-logout reads and CSRF after logout fails with $code", async ({ status, code }) => {
+      const fetchMock = mockJsonResponse({ csrfToken: "retained-session-csrf" });
+      await getCurrentUser();
+      const logoutResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(logoutResponse.promise);
+      const failure = expect(signOut()).rejects.toMatchObject({ status, code });
+      const readResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(readResponse.promise);
+      const read = send();
+      logoutResponse.resolve(Response.json({ code }, { status }));
+      await failure;
+      readResponse.resolve(response());
+      await expect(read).resolves.toMatchObject(expected);
+      await checkCapabilities();
+      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "retained-session-csrf");
+    });
+
+    it("does not retire a newer session validation when the older logout finishes", async () => {
+      const fetchMock = mockJsonResponse({ csrfToken: "original-session-csrf" });
+      await getCurrentUser();
+      const logoutResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(logoutResponse.promise);
+      const staleLogout = expect(signOut()).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+      const sessionResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(sessionResponse.promise);
+      const session = getCurrentUser();
+      const readResponse = deferredResponse();
+      fetchMock.mockReturnValueOnce(readResponse.promise);
+      const read = send();
+      logoutResponse.resolve(new Response(null, { status: 204 }));
+      await staleLogout;
+      sessionResponse.resolve(Response.json({ csrfToken: "newer-session-csrf" }));
+      await expect(session).resolves.toMatchObject({ csrfToken: "newer-session-csrf" });
+      readResponse.resolve(response());
+      await expect(read).resolves.toMatchObject(expected);
+      await checkCapabilities();
+      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "newer-session-csrf");
+    });
+  });
+
+  it("forwards session-read cancellation and never installs a cancelled CSRF token", async () => {
+    const pending = deferredResponse();
+    const fetchMock = mockJsonResponse({});
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const controller = new AbortController();
+    const result = getCurrentUser({ signal: controller.signal });
+    const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/me", expect.objectContaining({ signal: controller.signal }));
+    controller.abort();
+    pending.resolve(Response.json({ csrfToken: "cancelled-session-csrf" }));
+    await cancelled;
+    await checkCapabilities();
+    expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+  });
+
+  it.each(["JSON", "CSV"] as const)("rejects a late %s success from a denied session", async format => {
+    const pending = deferredResponse();
+    const fetchMock = mockJsonResponse({});
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const result = format === "JSON" ? getAgents() : downloadInventoryCsv();
+    const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
+    fetchMock.mockResolvedValueOnce(Response.json({ code: "unauthorized" }, { status: 401 }));
+    await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+    pending.resolve(format === "JSON" ? Response.json({ value: ["private"] }) : new Response("private,csv"));
+    await cancelled;
+  });
+
+  it("does not revalidate a replacement session for a cancelled request's late denial", async () => {
+    const pending = deferredResponse();
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    const controller = new AbortController();
+    try {
+      const result = getAgents({}, { signal: controller.signal });
+      const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted" });
+      controller.abort();
+      pending.resolve(Response.json({ code: "missing_internal_role" }, { status: 403 }));
+      await cancelled;
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each([401, 403])("revalidates a %s denial whose problem body is unavailable", async status => {
+    const response = Response.json({}, { status });
+    vi.spyOn(response, "json").mockRejectedValue(new TypeError("Connection interrupted"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      await expect(getAgents()).rejects.toMatchObject({ status, code: "request_failed" });
+      expect(listener).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status, code: "request_failed" }));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("preserves the denial when a session owner cancels protected reads during notification", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code: "unauthorized" }, { status: 401 })));
+    const controller = new AbortController();
+    const unsubscribe = subscribeSessionRevalidationRequired(() => controller.abort());
+    try {
+      await expect(getAgents({}, { signal: controller.signal })).rejects.toMatchObject({
+        status: 401, code: "unauthorized", kind: "problem",
+      });
+      expect(controller.signal.aborted).toBe(true);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each(["new session", "sign-out"] as const)("does not install an old session after %s completes", async boundary => {
+    const pending = deferredResponse();
+    const fetchMock = mockJsonResponse({ csrfToken: "current-session-csrf" });
+    fetchMock.mockReturnValueOnce(pending.promise);
+    const previous = getCurrentUser();
+    const cancelled = expect(previous).rejects.toMatchObject({ code: "request_aborted" });
+    if (boundary === "new session") await getCurrentUser();
+    else {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+      await signOut();
+    }
+    pending.resolve(Response.json({ csrfToken: "old-session-csrf" }));
+    await cancelled;
+    await checkCapabilities();
+    if (boundary === "new session") {
+      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "current-session-csrf");
+    } else {
+      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+    }
+  });
+
   const requests = [
     { name: "JSON", send: () => getAgents(), body: "json" },
     { name: "unified inventory CSV", send: () => downloadUnifiedAgentInventoryCsv({ revision: "a".repeat(64) }), body: "blob" },
@@ -681,6 +1040,7 @@ describe("API response failures", () => {
 
   describe.each([
     { name: "JSON", send: (signal: AbortSignal) => getAgents({}, { signal }), body: "json" },
+    { name: "Power Platform CSV", send: (signal: AbortSignal) => downloadInventoryCsv({}, signal), body: "blob" },
     { name: "official usage CSV", send: (signal: AbortSignal) => downloadOfficialUsageCsv("aggregate", {}, signal), body: "blob" },
     { name: "administrative audit CSV", send: (signal: AbortSignal) => downloadAdministrativeAuditCsv(["event-one"], signal), body: "blob" },
   ] as const)("$name cancellation signal", ({ send, body }) => {
@@ -783,4 +1143,10 @@ function mockJsonResponse(body: unknown) {
   );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+function deferredResponse() {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>(complete => { resolve = complete; });
+  return { promise, resolve };
 }

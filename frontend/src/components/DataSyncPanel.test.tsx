@@ -1,6 +1,7 @@
 import { createRef } from "react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   DataSyncPanelHandle,
@@ -12,8 +13,11 @@ import type {
   DataSyncSourceStatus,
   DataSyncState,
 } from "../api/client";
+import { ApiError } from "../api/client";
 import { DataSyncPanel } from "./DataSyncPanel";
 import { mockNativeDialogs } from "../test/dialog";
+import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
+import { SavedQueryProvider } from "./SavedQueryProvider";
 
 mockNativeDialogs();
 
@@ -96,6 +100,7 @@ function renderPanel(options: {
   principalKey?: string;
   requestedRunId?: string;
   ref?: React.RefObject<DataSyncPanelHandle | null>;
+  strictMode?: boolean;
 } = {}) {
   const props = {
     ref: options.ref,
@@ -108,7 +113,7 @@ function renderPanel(options: {
     onSetupRequiredChange: options.onSetupRequiredChange,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
   };
-  const view = render(<DataSyncPanel {...props} />);
+  const view = render(<DataSyncPanel {...props} />, { reactStrictMode: options.strictMode });
   return {
     ...view,
     rerenderPanel(changes: Partial<typeof options>) {
@@ -401,6 +406,233 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledTimes(2);
     expect(api.start).not.toHaveBeenCalled();
     expect(api.retry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["state", 401], ["state", 403], ["run", 401], ["run", 403],
+  ] as const)("clears all private sync data after a denied %s read (%s) and fences a concurrent success", async (denied, status) => {
+    const sources = [source("users", "succeeded", { count: 42 })];
+    const saved = syncState({ onboardingRequired: false, sources });
+    const exact = run("partial", [source("users", "failed", { canRetry: true })], { id: "exact-run" });
+    api.getState.mockResolvedValue(saved);
+    api.getRun.mockResolvedValue(exact);
+    const panelRef = createRef<DataSyncPanelHandle>();
+    const onSourcesChanged = vi.fn();
+    renderPanel({ ref: panelRef, requestedRunId: exact.id, onSourcesChanged });
+    await screen.findByText(exact.id, { selector: "code" });
+    expect(screen.getByRole("article", { name: "Users" })).toHaveTextContent("42");
+
+    let settleLate!: () => void;
+    const failure = new ApiError(status, "forbidden", "Sync access was denied.");
+    if (denied === "state") {
+      api.getState.mockRejectedValueOnce(failure);
+      api.getRun.mockReturnValueOnce(new Promise(resolve => { settleLate = () => resolve(exact); }));
+    } else {
+      api.getState.mockReturnValueOnce(new Promise(resolve => { settleLate = () => resolve(saved); }));
+      api.getRun.mockRejectedValueOnce(failure);
+    }
+    await act(async () => { void panelRef.current?.refresh(); });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sync access was denied.");
+    expect(screen.queryByRole("heading", { name: "Workspace data" })).not.toBeInTheDocument();
+    expect(screen.queryByText(exact.id, { selector: "code" })).not.toBeInTheDocument();
+    await act(async () => { settleLate(); });
+    expect(screen.queryByRole("article", { name: "Users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Retry incomplete/ })).not.toBeInTheDocument();
+    expect(onSourcesChanged).not.toHaveBeenCalled();
+
+    await act(async () => { void panelRef.current?.refresh(); });
+    expect(await screen.findByRole("article", { name: "Users" })).toHaveTextContent("42");
+    expect(await screen.findByText(exact.id, { selector: "code" })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps read and command admission busy until the post-command saved status settles", async () => {
+    const running = run("running", [source("users", "running")]);
+    let resolveStart!: (value: DataSyncRun) => void;
+    let resolveStatus!: (value: DataSyncState) => void;
+    api.getState.mockResolvedValueOnce(syncState())
+      .mockReturnValueOnce(new Promise(resolve => { resolveStatus = resolve; }));
+    api.start.mockReturnValueOnce(new Promise(resolve => { resolveStart = resolve; }));
+    const panelRef = createRef<DataSyncPanelHandle>();
+    renderPanel({ ref: panelRef });
+    await userEvent.click(await screen.findByRole("button", { name: "Start initial sync" }));
+    await act(async () => { void panelRef.current?.refresh(); });
+    expect(api.getState).toHaveBeenCalledOnce();
+    await act(async () => { resolveStart(running); });
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Starting sync..." })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeDisabled();
+    await act(async () => { void panelRef.current?.start("incremental"); });
+    expect(api.start).toHaveBeenCalledOnce();
+    await act(async () => { resolveStatus(syncState({ run: running })); });
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+  });
+
+  it("revalidates the newly selected exact run after a different run's pending mutation settles", async () => {
+    const failed = run("partial", [source("users", "failed", { canRetry: true })]);
+    const newer = run("completed", [source("users", "succeeded", { count: 2 })], { id: "newer-run" });
+    api.getState.mockResolvedValue(syncState());
+    api.getRun.mockResolvedValueOnce(failed).mockResolvedValue(newer);
+    let resolveRetry!: (value: DataSyncRun) => void;
+    api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
+    const view = renderPanel({ requestedRunId: failed.id });
+    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+    view.rerenderPanel({ requestedRunId: newer.id });
+    await screen.findByText(newer.id, { selector: "code" });
+    expect(api.getRun).toHaveBeenCalledTimes(2);
+    await act(async () => { resolveRetry(run("running", [source("users", "running")])); });
+    await waitFor(() => expect(api.getRun).toHaveBeenCalledTimes(3));
+    expect(api.getRun).toHaveBeenLastCalledWith(newer.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(screen.getByText(newer.id, { selector: "code" })).toBeVisible();
+  });
+
+  it.each(["state", "run"] as const)("preserves the %s five-minute budget across navigation and real Strict Mode effect replay", async target => {
+    vi.useFakeTimers();
+    const active = run("running", [source("users", "running")]);
+    api.getState.mockResolvedValue(syncState({ run: target === "state" ? active : null }));
+    api.getRun.mockResolvedValue(active);
+    const view = renderPanel({ strictMode: true, requestedRunId: target === "run" ? active.id : undefined });
+    await act(async () => { await vi.advanceTimersByTimeAsync(240_000); });
+    await act(async () => { view.rerenderPanel({ active: false }); });
+    await act(async () => { view.rerenderPanel({ active: true }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_001); });
+    expect(screen.getByRole("button", { name: "Resume updates" })).toBeVisible();
+    const reads = api.getState.mock.calls.length;
+    const runReads = api.getRun.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(api.getState).toHaveBeenCalledTimes(reads);
+    expect(api.getRun).toHaveBeenCalledTimes(runReads);
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("refreshes after an external action without joining or cancelling another observer's pre-action read", async () => {
+    const client = createSavedQueryClient();
+    let resolveOld!: (value: DataSyncState) => void;
+    api.getState.mockReturnValueOnce(new Promise(resolve => { resolveOld = resolve; }))
+      .mockResolvedValue(syncState({ sources: [source("users", "succeeded", { count: 7 })] }));
+    const panelRef = createRef<DataSyncPanelHandle>();
+    render(<SavedQueryProvider client={client}><DataSyncPanel
+      ref={panelRef} principalKey="tenant:user:viewer" canUploadUsage
+      onOpenUsageImport={vi.fn()} onRequestedRunChange={vi.fn()} onSourcesChanged={vi.fn()}
+    /></SavedQueryProvider>);
+    await waitFor(() => expect(api.getState).toHaveBeenCalledOnce());
+    const oldSignal = api.getState.mock.calls[0][0].signal as AbortSignal;
+    const query = client.getQueryCache().getAll().find(query => query.state.fetchStatus === "fetching")!;
+    const peer = new AbortController();
+    const peerRead = readSavedQuery<DataSyncState>(client, query.queryKey.slice(1), () => Promise.reject(new Error("Expected deduplication")), peer.signal);
+    await act(async () => { void panelRef.current?.refresh(); });
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    expect(oldSignal.aborted).toBe(false);
+    expect(await screen.findByRole("article", { name: "Users" })).toHaveTextContent("7");
+    await act(async () => {
+      resolveOld(syncState({ sources: [source("users", "succeeded", { count: 3 })] }));
+      await peerRead;
+    });
+    expect(screen.getByRole("article", { name: "Users" })).toHaveTextContent("7");
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("fences denied sibling reads without purging unrelated data or cancelling an independent observer", async () => {
+    const client = createSavedQueryClient();
+    const unrelatedKey = ["saved", "independent-provider-metadata"];
+    const unrelated = new QueryObserver(client, {
+      queryKey: unrelatedKey, initialData: "Still authorized", enabled: false,
+    });
+    const unsubscribe = unrelated.subscribe(() => {});
+    const sources = [source("users", "succeeded", { count: 42 })];
+    const exact = run("partial", [source("users", "failed", { canRetry: true })], { id: "exact-run" });
+    api.getState.mockResolvedValue(syncState({ sources }));
+    api.getRun.mockResolvedValue(exact);
+    const panelRef = createRef<DataSyncPanelHandle>();
+    const onSourcesChanged = vi.fn();
+    render(<SavedQueryProvider client={client}><DataSyncPanel
+      ref={panelRef} principalKey="tenant:user:viewer" requestedRunId={exact.id} canUploadUsage
+      onOpenUsageImport={vi.fn()} onRequestedRunChange={vi.fn()} onSourcesChanged={onSourcesChanged}
+    /></SavedQueryProvider>);
+    try {
+      await screen.findByText(exact.id, { selector: "code" });
+      let rejectState!: (reason: Error) => void;
+      let resolveRun!: (value: DataSyncRun) => void;
+      api.getState.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectState = reject; }));
+      api.getRun.mockReturnValueOnce(new Promise(resolve => { resolveRun = resolve; }));
+      await act(async () => { void panelRef.current?.refresh(); });
+      await waitFor(() => expect(api.getRun).toHaveBeenCalledTimes(2));
+      const query = client.getQueryCache().getAll().find(query =>
+        query.queryKey[1] === "data-sync-run" && query.state.fetchStatus === "fetching")!;
+      const peerRead = readSavedQuery<DataSyncRun>(client, query.queryKey.slice(1),
+        () => Promise.reject(new Error("Expected deduplication")), new AbortController().signal);
+      const runSignal = api.getRun.mock.calls[1][1].signal as AbortSignal;
+
+      await act(async () => { rejectState(new ApiError(403, "forbidden", "This workflow is no longer authorized.")); });
+      expect(screen.getByRole("alert")).toHaveTextContent("This workflow is no longer authorized.");
+      expect(screen.queryByRole("article", { name: "Users" })).not.toBeInTheDocument();
+      expect(runSignal.aborted).toBe(false);
+      expect(client.getQueryData(unrelatedKey)).toBe("Still authorized");
+
+      const lateRun = run("completed", [source("users", "succeeded", { count: 99 })], { id: exact.id });
+      await act(async () => {
+        resolveRun(lateRun);
+        expect(await peerRead).toEqual(lateRun);
+      });
+      expect(screen.queryByText(exact.id, { selector: "code" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("article", { name: "Users" })).not.toBeInTheDocument();
+      expect(onSourcesChanged).not.toHaveBeenCalled();
+      expect(client.getQueryData(unrelatedKey)).toBe("Still authorized");
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("aborts an outstanding mutation after a concurrent exact-run denial and ignores its late success", async () => {
+    const failed = run("partial", [source("users", "failed", { canRetry: true })]);
+    const onSourcesChanged = vi.fn();
+    let resolveRetry!: (value: DataSyncRun) => void;
+    api.getState.mockResolvedValue(syncState({ sources: [source("users", "succeeded", { count: 42 })] }));
+    api.getRun.mockResolvedValueOnce(failed).mockRejectedValue(new ApiError(403, "forbidden", "Run access was denied."));
+    api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
+    const view = renderPanel({ requestedRunId: failed.id, onSourcesChanged });
+    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+    const signal = api.retry.mock.calls[0][2].signal as AbortSignal;
+    view.rerenderPanel({ requestedRunId: "no-longer-authorized" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Run access was denied.");
+    expect(signal.aborted).toBe(true);
+    await act(async () => { resolveRetry(run("completed", [source("users", "succeeded", { count: 99 })])); });
+    expect(screen.queryByRole("article", { name: "Users" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
+    expect(api.getState).toHaveBeenCalledOnce();
+    expect(onSourcesChanged).not.toHaveBeenCalled();
+  });
+
+  it("shows saved-status refresh as busy and restores details focus when its opener disappears", async () => {
+    const partial = run("partial", [source("users", "failed", { canRetry: true })]);
+    api.getState.mockResolvedValueOnce(syncState({ run: partial }));
+    api.getRun.mockResolvedValue(partial);
+    const panelRef = createRef<DataSyncPanelHandle>();
+    const onRequestedRunChange = vi.fn();
+    const view = renderPanel({ ref: panelRef, onRequestedRunChange });
+    onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => view.rerenderPanel({ requestedRunId }));
+    await userEvent.click(await screen.findByRole("button", { name: "View run details" }));
+    await screen.findByText(partial.id, { selector: "code" });
+    let resolveState!: (value: DataSyncState) => void;
+    api.getState.mockReturnValueOnce(new Promise(resolve => { resolveState = resolve; }));
+    await act(async () => { void panelRef.current?.refresh(); });
+    expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
+    await act(async () => { resolveState(syncState()); });
+    await userEvent.click(screen.getByRole("button", { name: "Back to workspace" }));
+    expect(screen.getByRole("heading", { name: "Data sync" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
+  });
+
+  it("does not call an inconsistent completed run cancelled or fully successful", async () => {
+    api.getState.mockResolvedValue(syncState({
+      run: run("completed", [source("users", "failed", { count: 3, canRetry: true })]),
+    }));
+    renderPanel();
+    expect(await screen.findByText("Sync needs attention")).toBeVisible();
+    expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sync cancelled")).not.toBeInTheDocument();
+    expect(screen.getByText("reported, not a saved total")).toBeVisible();
   });
 
   it("keeps current upload requirements visible when viewing a completed historical run", async () => {
@@ -955,6 +1187,7 @@ describe("DataSyncPanel", () => {
       screen.getByRole("button", { name: "Start initial sync" }).click();
       await vi.advanceTimersByTimeAsync(0);
     });
+
     expect(screen.getByRole("alert")).toHaveTextContent("The start response was lost.");
     expect(api.start).toHaveBeenCalledOnce();
     expect(api.getState).toHaveBeenCalledTimes(2);
@@ -967,6 +1200,33 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledTimes(3);
     expect(onChanged).toHaveBeenCalledWith(sourceIds);
     expect(screen.getByRole("alert")).toHaveTextContent("The start response was lost.");
+  });
+
+  it("never joins post-command state revalidation to a GET admitted before the command", async () => {
+    const sources = [source("users", "running")];
+    const active = syncState({ run: run("running", sources), sources });
+    const cancelled = syncState({ run: run("cancelled", sources), sources });
+    let resolveOld!: (value: DataSyncState) => void;
+    api.getState
+      .mockResolvedValueOnce(active)
+      .mockReturnValueOnce(new Promise(resolve => { resolveOld = resolve; }))
+      .mockResolvedValue(cancelled);
+    api.cancel.mockResolvedValue(run("cancelled", sources));
+    const panelRef = createRef<DataSyncPanelHandle>();
+    renderPanel({ ref: panelRef });
+    await screen.findByRole("button", { name: "Cancel run" });
+    await act(async () => { await panelRef.current?.refresh(); });
+    await waitFor(() => expect(api.getState).toHaveBeenCalledTimes(2));
+    const staleSignal = api.getState.mock.calls[1][0].signal as AbortSignal;
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+
+    await waitFor(() => expect(api.getState).toHaveBeenCalledTimes(3));
+    expect(staleSignal.aborted).toBe(true);
+    expect(screen.getByText("Sync cancelled")).toBeVisible();
+    await act(async () => resolveOld(active));
+    expect(screen.getByText("Sync cancelled")).toBeVisible();
+    expect(api.cancel).toHaveBeenCalledOnce();
   });
 
   it("loads and displays an exact requested run without falling back to the latest state run", async () => {

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within, type RenderOptions } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
@@ -11,6 +11,8 @@ import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
+import { SavedQueryProvider } from "./SavedQueryProvider";
+import { createSavedQueryClient } from "../savedQueries";
 import { createInventoryVerification } from "../test/inventoryVerification";
 import { usageAggregateFixture, usageAgentDetailFixture } from "../test/usageInsightsFixture";
 import { automaticAgentUsageFixture, automaticUsageContext, automaticUsagePackageId, automaticUsageReportName } from "../test/automaticAgentUsageFixture";
@@ -1028,7 +1030,7 @@ describe("UnifiedAgentDetailModal", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
     expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
     expect(await screen.findByText("Installed user", { exact: true })).toBeVisible();
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups, { signal: expect.any(AbortSignal) });
   });
 
   it("restarts pending assignment resolution after a saved-detail reload and ignores the cancelled response", async () => {
@@ -1047,7 +1049,7 @@ describe("UnifiedAgentDetailModal", () => {
       activeTab: "controls", packageDetail: detail, packageAccessRevisions: new Map([[detail.id, 1]]),
     }, capabilitiesWithDirectory());
     await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups, { signal: expect.any(AbortSignal) });
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     update({ packageDetail: undefined, packageDetailLoading: true });
     expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
@@ -1077,7 +1079,7 @@ describe("UnifiedAgentDetailModal", () => {
       activeTab: "controls", packageDetail: detail, packageAccessRevisions: new Map([[detail.id, 1]]),
     }, capabilitiesWithDirectory());
     await userEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups, { signal: expect.any(AbortSignal) });
     const interrupt = request.then(() => {
       flushSync(() => update({ packageDetail: undefined, packageDetailLoading: true }));
     });
@@ -1089,7 +1091,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("region", { name: "Installation settings" })).toBeVisible();
     expect(screen.getByText("Installed user", { exact: true })).toBeVisible();
     expect(screen.queryByText("Resolving current assignments...")).not.toBeInTheDocument();
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(detail.acquireUsersAndGroups, { signal: expect.any(AbortSignal) });
   });
 
   it("does not relabel an unsaved assignment draft as saved when directory permission becomes unavailable", async () => {
@@ -1113,6 +1115,26 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByRole("group", { name: "Saved users and groups" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
     expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+  });
+
+  it.each(["main tab", "access target"])("cancels hidden directory searches after changing the %s", async transition => {
+    let complete!: (value: { value: api.DirectoryPrincipal[] }) => void;
+    const search = vi.spyOn(api, "searchDirectoryPrincipals")
+      .mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    const { update } = renderDetail({
+      activeTab: "controls", packageDetail: { ...record.packages[0], availableTo: "none", deployedTo: "none" },
+    }, capabilitiesWithDirectory());
+    fireEvent.click(screen.getByRole("radio", { name: /Specific users or groups/ }));
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Directory" } });
+    await waitFor(() => expect(search).toHaveBeenCalledOnce());
+
+    if (transition === "main tab") update({ activeTab: "identities" });
+    else fireEvent.click(screen.getByRole("button", { name: /^Installed for/ }));
+    expect(search.mock.calls[0][2]?.signal?.aborted).toBe(true);
+    await act(async () => complete({ value: [{
+      resourceId: "obsolete-user", resourceType: "user", principalKind: "user", displayName: "Hidden directory result",
+    }] }));
+    expect(screen.queryByText("Hidden directory result")).not.toBeInTheDocument();
   });
 
   it("keeps preview errors and retry in the inline editor without creating another dialog", async () => {
@@ -1352,7 +1374,7 @@ describe("UnifiedAgentDetailModal", () => {
       await waitFor(() => expect(api.previewQuarantine).toHaveBeenCalledExactlyOnceWith({
         action: "quarantine", snapshotId: grouped.observations.powerPlatform!.snapshotId,
         resourceNativeIds: [grouped.powerPlatformResource!.nativeId],
-      }));
+      }, { signal: expect.any(AbortSignal) }));
       expect(grouped.powerPlatformResource!.nativeId).not.toBe(botApplicationId);
     } else {
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
@@ -1489,7 +1511,44 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
     expect(screen.queryByText(/Previous target/)).not.toBeInTheDocument();
     unmount();
-    expect(lookup.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts an in-flight source lookup when the detail dialog unmounts", () => {
+    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
+      .mockImplementationOnce(() => new Promise<InventorySourceAwareDetail>(() => {}));
+    const { unmount } = renderDetail({ record: observedRecord(), activeTab: "audit-security" });
+    expect(lookup).toHaveBeenCalledOnce();
+    unmount();
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
+
+  it("does not reuse a peer's pre-revision activity request for a fresh mutation follow-up", async () => {
+    const observed = observedRecord();
+    let completeOld!: (value: InventorySourceAwareDetail) => void;
+    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
+      .mockReturnValueOnce(new Promise(resolve => { completeOld = resolve; }))
+      .mockResolvedValueOnce({
+        ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Fresh revision activity" },
+      });
+    const client = createSavedQueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => <SavedQueryProvider client={client}>{children}</SavedQueryProvider>;
+    const peer = renderDetail({ record: { ...observed, displayName: "Peer activity reader" }, activeTab: "audit-security" },
+      undefined, undefined, { wrapper });
+    const { container, update } = renderDetail({ record: observed, activeTab: "audit-security" }, undefined, undefined, { wrapper });
+    expect(lookup).toHaveBeenCalledOnce();
+
+    update({ dataRevision: 1 });
+    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(2));
+    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    const current = within(container).getByRole("dialog");
+    expect(within(current).getByText("Unavailable: Fresh revision activity")).toBeVisible();
+    await act(async () => completeOld({
+      ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Pre-revision activity" },
+    }));
+    expect(within(current).queryByText("Unavailable: Pre-revision activity")).not.toBeInTheDocument();
+    expect(within(within(peer.container).getByRole("dialog"))
+      .getByText("Unavailable: Pre-revision activity")).toBeVisible();
   });
 
   it.each([0, 1, 20, 21])("distinguishes %s total activity associations from the bounded displayed rows", async count => {
@@ -1685,7 +1744,7 @@ describe("UnifiedAgentDetailModal", () => {
     await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
     expect(api.previewQuarantine).toHaveBeenCalledExactlyOnceWith({
       action: "quarantine", snapshotId: snapshot.id, resourceNativeIds: [record.powerPlatformResource.nativeId],
-    });
+    }, { signal: expect.any(AbortSignal) });
     const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
     expect(within(confirmation).getByText(`${environmentId} / ${botId}`)).toBeVisible();
     expect(within(confirmation).getByText("Not provider-atomic; each target is verified independently")).toBeVisible();

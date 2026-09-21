@@ -155,7 +155,7 @@ test("Jobs filters old outcomes without promoting failed runs or accepted report
   await page.keyboard.press("Escape");
 
   await page.getByRole("button", { name: "Clear filters", exact: true }).click();
-  await page.getByRole("button", { name: "Order history oldest first", exact: true }).click();
+  await history.getByRole("button", { name: "Sort by Created", exact: true }).click();
   await expect(history.getByRole("row").nth(1)).toContainText("Defender fixed-template investigation");
   await expect(history.getByRole("row").nth(1)).toContainText("0 rows retained");
   await expect(history.getByRole("row").nth(1)).toContainText("Last update; original date not recorded");

@@ -49,14 +49,18 @@ export function jobStatusLabel(job: WorkbenchJobSummary) {
   return Object.hasOwn(labels, job.status) ? labels[job.status] : job.status.replaceAll("_", " ");
 }
 
+export function jobResultCount(job: WorkbenchJobSummary) {
+  return (job.source === "official-usage" ? job.total ?? job.completed : job.completed) ?? undefined;
+}
+
 export function jobResultLabel(job: WorkbenchJobSummary) {
-  const completed = job.completed?.toLocaleString();
-  const total = job.total?.toLocaleString();
+  const value = jobResultCount(job);
+  if (value === undefined) return "Count not reported";
   if (job.source === "official-usage") {
-    const rows = total ?? completed;
-    return rows === undefined ? "Count not reported" : `${rows} ${countUnit("row", job.total ?? job.completed)} ${job.status === "accepted" ? "accepted" : "validated"}`;
+    return `${value.toLocaleString()} ${countUnit("row", value)} ${job.status === "accepted" ? "accepted" : "validated"}`;
   }
-  if (completed === undefined) return "Count not reported";
+  const completed = value.toLocaleString();
+  const total = job.total?.toLocaleString();
   const count = total === undefined ? completed : `${completed} of ${total}`;
   if (job.source === "data-sync") return `${count} ${countUnit("source", job.total ?? job.completed)} complete`;
   if (job.source === "package-controls" || job.source === "quarantine") return `${count} ${countUnit("target", job.total ?? job.completed)} processed`;

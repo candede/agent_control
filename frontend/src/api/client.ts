@@ -374,7 +374,7 @@ export type ReassignAuditAction = "reassign";
 export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
 export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
 export type HuntingReadAction = "view-hunting" | "export-hunting";
-export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting";
+export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
 export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
 export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AgentUsageAuditAction | "export-administrative-audit";
 
@@ -493,6 +493,7 @@ export class ApiError extends Error {
 }
 
 let csrfToken: string | undefined;
+let sessionGeneration = 0;
 const sessionRevalidationListeners = new Set<(error: ApiError) => void>();
 
 export function subscribeSessionRevalidationRequired(listener: (error: ApiError) => void) {
@@ -502,8 +503,12 @@ export function subscribeSessionRevalidationRequired(listener: (error: ApiError)
   };
 }
 
-export async function getCurrentUser() {
-  const result = await request<{ user: SessionUser; csrfToken: string; roleAssignmentRequired: boolean }>("/api/me");
+export async function getCurrentUser(options: { signal?: AbortSignal } = {}) {
+  assertCurrentRequest(sessionGeneration, options.signal);
+  const generation = ++sessionGeneration;
+  csrfToken = undefined;
+  const result = await request<{ user: SessionUser; csrfToken: string; roleAssignmentRequired: boolean }>("/api/me", { signal: options.signal });
+  assertCurrentRequest(generation, options.signal);
   csrfToken = result.csrfToken;
   return result;
 }
@@ -722,23 +727,26 @@ export function cancelInventoryRefresh(id: string) {
   return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
 
-export function getQuarantineTargets(query: { search?: string; limit?: number; offset?: number } = {}) {
+export function getQuarantineTargets(
+  query: { search?: string; limit?: number; offset?: number } = {},
+  options: { signal?: AbortSignal } = {},
+) {
   const params = new URLSearchParams();
   if (query.search) params.set("search", query.search);
   if (query.limit !== undefined) params.set("limit", String(query.limit));
   if (query.offset !== undefined) params.set("offset", String(query.offset));
-  return request<QuarantineTargetPage>(`/api/quarantine/targets${params.size ? `?${params}` : ""}`);
+  return request<QuarantineTargetPage>(`/api/quarantine/targets${params.size ? `?${params}` : ""}`, { signal: options.signal });
 }
 
-export function getQuarantineStatus(snapshotId: string, nativeId: string, force = false) {
+export function getQuarantineStatus(snapshotId: string, nativeId: string, force = false, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ snapshotId, nativeId });
   if (force) params.set("force", "true");
-  return request<QuarantineStatusView>(`/api/quarantine/status?${params}`);
+  return request<QuarantineStatusView>(`/api/quarantine/status?${params}`, { signal: options.signal });
 }
 
-export function previewQuarantine(input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; forceStatus?: boolean }) {
+export function previewQuarantine(input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; forceStatus?: boolean }, options: { signal?: AbortSignal } = {}) {
   return request<QuarantinePreview>("/api/quarantine/preview", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal: options.signal,
   });
 }
 
@@ -748,8 +756,8 @@ export function submitQuarantine(input: { action: QuarantineAction; snapshotId: 
   });
 }
 
-export function getQuarantineJobs(limit = 20) {
-  return request<{ value: QuarantineJob[] }>(`/api/quarantine/jobs?limit=${limit}`);
+export function getQuarantineJobs(limit = 20, options: { signal?: AbortSignal } = {}) {
+  return request<{ value: QuarantineJob[] }>(`/api/quarantine/jobs?limit=${limit}`, { signal: options.signal });
 }
 
 export function getQuarantineJob(id: string, options: { signal?: AbortSignal } = {}) {
@@ -772,9 +780,9 @@ export function reconcileQuarantineJob(id: string) {
   });
 }
 
-export async function downloadInventoryCsv(query: InventoryListQuery = {}) {
+export async function downloadInventoryCsv(query: InventoryListQuery = {}, signal?: AbortSignal) {
   const params = inventorySearchParams(query);
-  return requestBlob(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { headers: { Accept: "text/csv" } });
+  return requestBlob(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { signal, headers: { Accept: "text/csv" } });
 }
 
 export function getOfficialUsageAdminState(options: { signal?: AbortSignal } = {}) {
@@ -967,52 +975,52 @@ export type PurviewAuditCatalog = {
   retentionNotice: string;
 };
 
-export function getPurviewAuditCatalog() {
-  return request<PurviewAuditCatalog>("/api/audit-search/catalog");
+export function getPurviewAuditCatalog(options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditCatalog>("/api/audit-search/catalog", { signal: options.signal });
 }
 
-export function getPurviewAuditJobs(limit = 20, offset = 0) {
+export function getPurviewAuditJobs(limit = 20, offset = 0, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<PurviewAuditHistory>(`/api/audit-search/jobs?${params}`);
+  return request<PurviewAuditHistory>(`/api/audit-search/jobs?${params}`, { signal: options.signal });
 }
 
 export function getPurviewAuditJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
 
-export function submitPurviewAuditSearch(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters) {
-  return request<PurviewAuditJob>("/api/audit-search/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }) });
+export function submitPurviewAuditSearch(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditJob>("/api/audit-search/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
 }
 
-export function getPurviewAuditRecords(id: string, limit = 100, offset = 0) {
+export function getPurviewAuditRecords(id: string, limit = 100, offset = 0, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<PurviewAuditRecordPage>(`/api/audit-search/jobs/${encodeURIComponent(id)}/records?${params}`);
+  return request<PurviewAuditRecordPage>(`/api/audit-search/jobs/${encodeURIComponent(id)}/records?${params}`, { signal: options.signal });
 }
 
-export function resumePurviewAuditSearch(id: string) {
-  return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" });
+export function resumePurviewAuditSearch(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}/resume`, { method: "POST", signal: options.signal });
 }
 
-export function cancelPurviewAuditSearch(id: string) {
-  return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export function cancelPurviewAuditSearch(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditJob>(`/api/audit-search/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
 }
 
-export function deletePurviewAuditSearch(id: string) {
+export function deletePurviewAuditSearch(id: string, options: { signal?: AbortSignal } = {}) {
   return request<void>(`/api/audit-search/jobs/${encodeURIComponent(id)}`, {
-    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }),
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal,
   });
 }
 
-export function approvePurviewAuditQualification(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters) {
-  return request<PurviewAuditQualification>("/api/audit-search/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }) });
+export function approvePurviewAuditQualification(tokenMode: PurviewAuditTokenMode, filters: PurviewAuditFilters, options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditQualification>("/api/audit-search/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
 }
 
-export function startPurviewAuditQualification(id: string) {
-  return request<PurviewAuditJob>(`/api/audit-search/qualifications/${encodeURIComponent(id)}/start`, { method: "POST" });
+export function startPurviewAuditQualification(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<PurviewAuditJob>(`/api/audit-search/qualifications/${encodeURIComponent(id)}/start`, { method: "POST", signal: options.signal });
 }
 
-export async function downloadPurviewAuditCsv(id: string) {
-  return requestBlob(`/api/audit-search/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" } });
+export async function downloadPurviewAuditCsv(id: string, options: { signal?: AbortSignal } = {}) {
+  return requestBlob(`/api/audit-search/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
 export type DefenderHuntingCatalog = {
@@ -1027,56 +1035,56 @@ export type DefenderHuntingCatalog = {
   defenderPortalUrl: string;
 };
 
-export function getDefenderHuntingCatalog() {
-  return request<DefenderHuntingCatalog>("/api/hunting/catalog");
+export function getDefenderHuntingCatalog(options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingCatalog>("/api/hunting/catalog", { signal: options.signal });
 }
 
-export function getDefenderHuntingJobs(limit = 20, offset = 0) {
+export function getDefenderHuntingJobs(limit = 20, offset = 0, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<DefenderHuntingHistory>(`/api/hunting/jobs?${params}`);
+  return request<DefenderHuntingHistory>(`/api/hunting/jobs?${params}`, { signal: options.signal });
 }
 
 export function getDefenderHuntingJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
 
-export function submitDefenderHunt(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters) {
-  return request<DefenderHuntingJob>("/api/hunting/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }) });
+export function submitDefenderHunt(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingJob>("/api/hunting/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
 }
 
-export function getDefenderHuntingRows(id: string, limit = 100, offset = 0) {
+export function getDefenderHuntingRows(id: string, limit = 100, offset = 0, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<DefenderHuntingRowPage>(`/api/hunting/jobs/${encodeURIComponent(id)}/rows?${params}`);
+  return request<DefenderHuntingRowPage>(`/api/hunting/jobs/${encodeURIComponent(id)}/rows?${params}`, { signal: options.signal });
 }
 
-export function resumeDefenderHunt(id: string) {
-  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" });
+export function resumeDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/resume`, { method: "POST", signal: options.signal });
 }
 
-export function cancelDefenderHunt(id: string) {
-  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+export function cancelDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
 }
 
-export function deleteDefenderHunt(id: string) {
-  return request<void>(`/api/hunting/jobs/${encodeURIComponent(id)}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }) });
+export function deleteDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<void>(`/api/hunting/jobs/${encodeURIComponent(id)}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal });
 }
 
-export function approveDefenderHuntingQualification(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters) {
-  return request<DefenderHuntingJob>("/api/hunting/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }) });
+export function approveDefenderHuntingQualification(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingJob>("/api/hunting/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
 }
 
-export function startDefenderHuntingQualification(id: string) {
-  return request<DefenderHuntingJob>(`/api/hunting/qualifications/${encodeURIComponent(id)}/start`, { method: "POST" });
+export function startDefenderHuntingQualification(id: string, options: { signal?: AbortSignal } = {}) {
+  return request<DefenderHuntingJob>(`/api/hunting/qualifications/${encodeURIComponent(id)}/start`, { method: "POST", signal: options.signal });
 }
 
-export function revokeDefenderHuntingRetainedScope(id: string) {
+export function revokeDefenderHuntingRetainedScope(id: string, options: { signal?: AbortSignal } = {}) {
   return request<DefenderHuntingRetainedScope>(`/api/hunting/retained-scopes/${encodeURIComponent(id)}/revoke`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal,
   });
 }
 
-export async function downloadDefenderHuntingCsv(id: string) {
-  return requestBlob(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" } });
+export async function downloadDefenderHuntingCsv(id: string, options: { signal?: AbortSignal } = {}) {
+  return requestBlob(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
 export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
@@ -1103,10 +1111,11 @@ export async function getAgentDetailsBatch(ids: string[]) {
   });
 }
 
-export async function searchDirectoryPrincipals(search: string, limit = 25) {
+export async function searchDirectoryPrincipals(search: string, limit = 25, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({ search, limit: String(limit) });
   return request<{ value: DirectoryPrincipal[] }>(
     `/api/directory/principals?${params.toString()}`,
+    { signal: options.signal },
   );
 }
 
@@ -1249,7 +1258,10 @@ export async function downloadAdministrativeAuditCsv(ids: string[], signal?: Abo
   });
 }
 
-export async function getAuditEvents(query: AuditEventsQuery = {}) {
+export async function getAuditEvents(
+  query: AuditEventsQuery = {},
+  options: { signal?: AbortSignal } = {},
+) {
   const searchParams = new URLSearchParams();
 
   if (query.limit) {
@@ -1291,11 +1303,16 @@ export async function getAuditEvents(query: AuditEventsQuery = {}) {
   const queryString = searchParams.toString();
   return request<AuditEventsResponse>(
     `/api/audit/events${queryString ? `?${queryString}` : ""}`,
+    { signal: options.signal },
   );
 }
 
-export async function signOut() {
-  await request<void>("/api/auth/logout", { method: "POST" });
+export async function signOut(options: { signal?: AbortSignal } = {}) {
+  assertCurrentRequest(sessionGeneration, options.signal);
+  const generation = ++sessionGeneration;
+  await request<void>("/api/auth/logout", { method: "POST", signal: options.signal });
+  assertCurrentRequest(generation, options.signal);
+  sessionGeneration += 1;
   csrfToken = undefined;
 }
 
@@ -1334,22 +1351,36 @@ function requestBlob(path: string, init: RequestInit) {
 }
 
 async function requestBody<T>(path: string, init: RequestInit, readBody: (response: Response) => Promise<T>): Promise<T> {
+  const generation = sessionGeneration;
   let response: Response | undefined;
   try {
+    assertCurrentRequest(generation, init.signal);
     response = await fetch(path, { ...init, credentials: "include" });
+    assertCurrentRequest(generation, init.signal);
     if (!response.ok) throw await toApiError(response, init.signal);
-    return await readBody(response);
+    const result = await readBody(response);
+    assertCurrentRequest(generation, init.signal);
+    return result;
   } catch (error) {
-    if (init.signal?.aborted || (error instanceof Error || error instanceof DOMException) && error.name === "AbortError") {
+    if (generation !== sessionGeneration || init.signal?.aborted || (error instanceof Error || error instanceof DOMException) && error.name === "AbortError") {
       throw new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
     }
-    if (error instanceof ApiError) throw error;
+    if (error instanceof ApiError) {
+      notifySessionRevalidation(error);
+      throw error;
+    }
     if (!response || error instanceof TypeError) {
       throw new ApiError(0, "network_error", "The server could not be reached.", {
         kind: "network", requestId: response?.headers.get("X-Request-ID") ?? undefined,
       });
     }
     throw error;
+  }
+}
+
+function assertCurrentRequest(generation: number, signal?: AbortSignal | null) {
+  if (generation !== sessionGeneration || signal?.aborted) {
+    throw new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
   }
 }
 
@@ -1371,7 +1402,7 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     if (signal?.aborted || !(error instanceof SyntaxError || error instanceof TypeError)) throw error;
   }
   const problem = typeof body === "object" && body !== null ? body : {};
-  const error = new ApiError(
+  return new ApiError(
     response.status,
     "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
     "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
@@ -1380,10 +1411,16 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
       type: "type" in problem && typeof problem.type === "string" ? problem.type : undefined,
     },
   );
+}
+
+function notifySessionRevalidation(error: ApiError) {
+  const unclassifiedDenial = (error.status === 401 || error.status === 403) && error.code === "request_failed";
   const sessionRevalidationRequired = error.authenticationExpired
-    || (error.status === 403 && error.code === "missing_internal_role");
+    || (error.status === 403 && error.code === "missing_internal_role")
+    || unclassifiedDenial;
   if (sessionRevalidationRequired) {
-    if (error.authenticationExpired) csrfToken = undefined;
+    sessionGeneration += 1;
+    if (error.authenticationExpired || unclassifiedDenial && error.status === 401) csrfToken = undefined;
     for (const listener of sessionRevalidationListeners) {
       try {
         listener(error);
@@ -1392,5 +1429,4 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
       }
     }
   }
-  return error;
 }

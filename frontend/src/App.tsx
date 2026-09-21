@@ -121,6 +121,8 @@ import {
   type WorkbenchViewId,
 } from "./workbenchRouting";
 import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionContext";
+import { SavedQueryProvider } from "./components/SavedQueryProvider";
+import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
@@ -192,18 +194,25 @@ function readInitialAgentRoute() {
 }
 
 function App() {
+  const [savedQueries] = useState(createSavedQueryClient);
+  return <SavedQueryProvider client={savedQueries}><Workbench savedQueries={savedQueries} /></SavedQueryProvider>;
+}
+
+function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSavedQueryClient> }) {
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
   const [initialAgentRoute] = useState(readInitialAgentRoute);
   const initialOfficialUsageRoute = useRef(parseOfficialUsageRoute(readViewSearch("official-usage"))).current;
   const [usersRoute, setUsersRoute] = useState(() => parseUsersRoute(readViewSearch("users")));
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
+  const [agentScopeEpoch, setAgentScopeEpoch] = useState(0);
+  const agentScopeEpochRef = useRef(0);
   const [loadedWorkbenchMetadata, setLoadedWorkbenchMetadata] = useState<{
     principalKey: string;
     value: Awaited<ReturnType<typeof getWorkbenchMetadata>>;
   }>();
   const [legacyUsagePresent, setLegacyUsagePresent] = useState(hasLegacyUsageStorage);
-  const capabilityState = useCapabilities(user);
+  const capabilityState = useCapabilities(user, sessionEpoch);
   const [trackedJob, setTrackedJob] = useState<BulkActionJob>();
   const [bulkJobStorageError, setBulkJobStorageError] = useState<string>();
   const [linkedPackageRefreshJob, setLinkedPackageRefreshJob] = useState<PackageRefreshJob>();
@@ -226,6 +235,7 @@ function App() {
   const [savedAgentPageOwner, setSavedAgentPageOwner] = useState<{ principalKey: string; requestId: number; verificationOnly: boolean }>();
   const [agentSnapshotId, setAgentSnapshotId] = useState<string>();
   const [loadingSession, setLoadingSession] = useState(true);
+  const [signingOut, setSigningOut] = useState(false);
   const [loadingAgents, setLoadingAgents] = useState(false);
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState(initialAgentRoute.search);
@@ -278,8 +288,8 @@ function App() {
   const [agentReloadRevision, setAgentReloadRevision] = useState(0);
   const [officialUsageAggregate, setOfficialUsageAggregate] =
     useState<OfficialUsageAggregateView>();
-  const [officialUsageAggregateSetId, setOfficialUsageAggregateSetId] =
-    useState<string | null>();
+  const [officialUsageAggregateOwner, setOfficialUsageAggregateOwner] =
+    useState<{ principalKey: string; setId: string | null; revision: number }>();
   const [loadingOfficialUsage, setLoadingOfficialUsage] = useState(false);
   const [officialUsageLoadError, setOfficialUsageLoadError] = useState<string>();
   const [officialUsageAgentOffset, setOfficialUsageAgentOffset] = useState(0);
@@ -324,6 +334,9 @@ function App() {
   const officialUsageRequestId = useRef(0);
   const officialUsageAbortController = useRef<AbortController | undefined>(undefined);
   const dataSyncPanelRef = useRef<DataSyncPanelHandle>(null);
+  const sessionRequestId = useRef(0);
+  const sessionAbortController = useRef<AbortController | undefined>(undefined);
+  const signOutAbortController = useRef<AbortController | undefined>(undefined);
   const sessionRevalidationInFlight = useRef(false);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
@@ -335,6 +348,7 @@ function App() {
   const principalKey = user
     ? `${user.tenantId ?? ""}:${user.homeAccountId}:${[...user.roles].sort().join(",")}:${sessionEpoch}`
     : `signed-out:${sessionEpoch}`;
+  useEffect(() => () => savedQueries.clear(), [principalKey, savedQueries]);
   const sessionOwnerRef = useRef<string | undefined>(principalKey);
   const activeViewRef = useRef(activeView);
   const workbenchMetadata = loadedWorkbenchMetadata?.principalKey === principalKey
@@ -359,6 +373,11 @@ function App() {
     sessionRevalidationInFlight.current = true;
     clearPrivateState();
     setUser(undefined);
+    if (signOutAbortController.current) {
+      setLoadingSession(false);
+      sessionRevalidationInFlight.current = false;
+      return;
+    }
     void loadSession().finally(() => {
       sessionRevalidationInFlight.current = false;
     });
@@ -375,6 +394,11 @@ function App() {
 
   useEffect(() => {
     void loadSession();
+    return () => {
+      sessionRequestId.current += 1;
+      sessionAbortController.current?.abort();
+      signOutAbortController.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -395,7 +419,6 @@ function App() {
       setAgents([]);
       setAgentPage(undefined);
       setUnifiedAgentPage(undefined);
-      setUnifiedAgentReadError(undefined);
       setSelectedUnifiedAgent(undefined);
       setUnifiedAgentDetailPage(undefined);
       setAgentPackageSelection(undefined);
@@ -410,7 +433,7 @@ function App() {
       setBulkProgress(undefined);
       setBulkResult(undefined);
       setOfficialUsageAggregate(undefined);
-      setOfficialUsageAggregateSetId(undefined);
+      setOfficialUsageAggregateOwner(undefined);
       setOfficialUsageLoadError(undefined);
       setLoadingOfficialUsage(false);
       setLoadingAgentDetailId(undefined);
@@ -420,15 +443,15 @@ function App() {
   useEffect(() => {
     if (!user) return;
     const controller = new AbortController();
-    getWorkbenchMetadata({ signal: controller.signal })
-      .then(value => setLoadedWorkbenchMetadata({ principalKey, value }))
+    readSavedQuery(savedQueries, ["workbench-metadata", principalKey], signal => getWorkbenchMetadata({ signal }), controller.signal)
+      .then(value => { if (!controller.signal.aborted) setLoadedWorkbenchMetadata({ principalKey, value }); })
       .catch((requestError) => {
         if (!controller.signal.aborted && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
           setError(errorMessage(requestError));
         }
       });
     return () => controller.abort();
-  }, [principalKey, user]);
+  }, [principalKey, savedQueries, user]);
 
   useEffect(() => {
     function restoreRoute() {
@@ -628,7 +651,9 @@ function App() {
       setAgentDetailError(undefined);
       const target = parseUnifiedAgentRecordId(requestedAgentDetailId)
         ?? { source: "graph_packages" as const, packageId: requestedAgentDetailId };
-      const resolved = await getUnifiedAgents({ recordId: unifiedAgentRecordId(target) }, { signal: controller.signal });
+      const recordId = unifiedAgentRecordId(target);
+      const resolved = await readSavedQuery(savedQueries, ["unified-agent-detail", principalKey, recordId, agentReloadRevision],
+        signal => getUnifiedAgents({ recordId }, { signal }), controller.signal);
       if (controller.signal.aborted || requestId !== agentDetailRequestId.current) return;
       if (resolved.count > 1 || resolved.value.length > 1) throw new Error("The agent link is ambiguous; select an exact source-qualified agent.");
       if (resolved.value.length === 1) {
@@ -640,7 +665,8 @@ function App() {
         return;
       }
       if (target.source !== "graph_packages") throw new Error("The exact agent is not available in the current saved inventory. Refresh saved agent inventory and retry.");
-      const detail = await getAgentDetails(target.packageId, { signal: controller.signal });
+      const detail = await readSavedQuery(savedQueries, ["package-detail", principalKey, target.packageId, agentReloadRevision],
+        signal => getAgentDetails(target.packageId, { signal }), controller.signal);
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
         const fallbackRecord: UnifiedAgentRecord = {
           id: unifiedAgentRecordId({ source: "graph_packages", packageId: detail.id }),
@@ -674,7 +700,7 @@ function App() {
       }
     });
     return () => controller.abort();
-  }, [activeView, agentDetail?.id, agentEnvironmentFilter, loadingAgentDetailId, principalKey, requestedAgentDetailId, selectedUnifiedAgent?.id, unifiedAgentDetailPage, unifiedAgentPage, user]);
+  }, [activeView, agentDetail?.id, agentEnvironmentFilter, agentReloadRevision, loadingAgentDetailId, principalKey, requestedAgentDetailId, savedQueries, selectedUnifiedAgent?.id, unifiedAgentDetailPage, unifiedAgentPage, user]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || (activeView !== "agents" && activeView !== "sync") || !requestedPackageRefreshJobId) {
@@ -867,6 +893,7 @@ function App() {
   useEffect(() => {
     if (!unifiedAgentPage || pendingPowerPlatformIds.size === 0 || !hasRole(user, "AgentControl.Admin") || activeView !== "agents") return;
     const controller = new AbortController();
+    const scopeEpoch = agentScopeEpochRef.current;
     void Promise.all([...pendingPowerPlatformIds].map(async key => {
       try {
         const known = findUnifiedAgentRecord(unifiedAgentPage.value, key, agentEnvironmentFilter);
@@ -875,7 +902,9 @@ function App() {
           ? { source: "power_platform" as const, nativeId: key, environmentId: agentEnvironmentFilter }
           : undefined);
         if (!target) throw new Error("An exact environment and native resource identity is required.");
-        const page = await getUnifiedAgents({ recordId: unifiedAgentRecordId(target) }, { signal: controller.signal });
+        const recordId = unifiedAgentRecordId(target);
+        const page = await readSavedQuery(savedQueries, ["unified-agent-detail", principalKey, recordId, agentReloadRevision],
+          signal => getUnifiedAgents({ recordId }, { signal }), controller.signal);
         if (page.count > 1 || page.value.length > 1) throw new Error("The bookmarked agent identity is ambiguous.");
         if (page.value.length !== 1) throw new Error("The exact agent is unavailable in the current saved inventory.");
         return { record: page.value[0] };
@@ -883,7 +912,7 @@ function App() {
         return { error: errorMessage(requestError) };
       }
     })).then(results => {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || scopeEpoch !== agentScopeEpochRef.current) return;
       const resolved = new Map(selectedPowerPlatformTargets);
       let snapshot = selectedPowerPlatformSnapshot;
       const failures: string[] = [];
@@ -926,13 +955,14 @@ function App() {
       }
     });
     return () => controller.abort();
-  }, [activeView, agentEnvironmentFilter, pendingPowerPlatformIds, requestedInventorySnapshotId, selectedPowerPlatformSnapshot, selectedPowerPlatformTargets, unifiedAgentPage, user]);
+  }, [activeView, agentEnvironmentFilter, agentReloadRevision, pendingPowerPlatformIds, principalKey, requestedInventorySnapshotId, savedQueries, selectedPowerPlatformSnapshot, selectedPowerPlatformTargets, unifiedAgentPage, user]);
 
   useEffect(
     () => {
       const timerIds = stateChangeTimerIds.current;
       return () => {
         agentInventoryQueries.clear();
+        savedQueries.clear();
         sessionOwnerRef.current = undefined;
         agentDetailRequestId.current += 1;
         agentDetailAbortController.current?.abort();
@@ -948,7 +978,7 @@ function App() {
         }
       };
     },
-    [agentInventoryQueries],
+    [agentInventoryQueries, savedQueries],
   );
 
   const effectivePlatformFilter = platformFilter;
@@ -1155,11 +1185,27 @@ function App() {
   );
 
   function clearPrivateState() {
-    agentInventoryQueries.clear();
+    sessionRequestId.current += 1;
+    sessionAbortController.current?.abort();
     sessionOwnerRef.current = undefined;
-    setShowAdvancedFilters(false);
-    clearPackageSelection(user);
     setSessionEpoch(current => current + 1);
+    clearAgentState();
+    savedQueries.clear();
+    officialUsageRequestId.current += 1;
+    officialUsageAbortController.current?.abort();
+    setLoadedWorkbenchMetadata(undefined);
+    setRequestedDataSyncRunId(undefined);
+    setOfficialUsageAggregate(undefined);
+    setOfficialUsageAggregateOwner(undefined);
+    setOfficialUsageLoadError(undefined);
+    setLoadingOfficialUsage(false);
+    setOfficialUsageTab("overview");
+    setOfficialUsageOverviewQuery({});
+  }
+
+  function clearAgentState() {
+    agentScopeEpochRef.current += 1;
+    setAgentScopeEpoch(agentScopeEpochRef.current);
     agentDetailRequestId.current += 1;
     agentDetailAbortController.current?.abort();
     agentListRequestId.current += 1;
@@ -1169,15 +1215,21 @@ function App() {
     packageRefreshRequestId.current += 1;
     inventoryRefreshRequestId.current += 1;
     linkedPackageRefreshRequestId.current += 1;
-    officialUsageRequestId.current += 1;
-    officialUsageAbortController.current?.abort();
+    agentInventoryQueries.clear();
+    savedQueries.removeQueries({
+      predicate: ({ queryKey }) => queryKey[0] === "saved"
+        && queryKey[2] === principalKey
+        && typeof queryKey[1] === "string"
+        && ["package-summaries", "inventory-refresh-jobs", "unified-agent-detail", "package-detail"].includes(queryKey[1]),
+    });
     resumedBulkJobIds.current.clear();
     agentDetailsCache.current.clear();
     stateChangeVersions.current.clear();
     for (const timerId of stateChangeTimerIds.current) window.clearTimeout(timerId);
     stateChangeTimerIds.current.clear();
     clearActiveBulkJobId();
-    setLoadedWorkbenchMetadata(undefined);
+    clearPackageSelection(user);
+    setShowAdvancedFilters(false);
     setAgents([]);
     setAgentPage(undefined);
     setUnifiedAgentPage(undefined);
@@ -1188,12 +1240,17 @@ function App() {
     setPackageControlError(undefined);
     setSelectedPowerPlatformTargets(new Map());
     setSelectedPowerPlatformSnapshot(null);
+    setPendingPowerPlatformIds(new Set());
+    setRequestedInventorySnapshotId(undefined);
+    setRequestedQuarantineJobId(undefined);
     setSavedAgentPageOwner(undefined);
     setAgentSnapshotId(undefined);
     setSelectedAgentIds(new Set());
     setPendingStoredAgentSelectionCount(undefined);
     setSelectionRouteNotice(undefined);
-    setRequestedDataSyncRunId(undefined);
+    setRequestedAgentDetailId(undefined);
+    setRequestedPackageRefreshJobId(undefined);
+    setRequestedPackageControlJobId(undefined);
     setBulkConfirmation(undefined);
     setBulkAccessAgentIds(undefined);
     setAgentDetail(undefined);
@@ -1219,29 +1276,34 @@ function App() {
     setTrackedJob(undefined);
     setLinkedPackageRefreshJob(undefined);
     setLinkedJobError(undefined);
-    setOfficialUsageAggregate(undefined);
-    setOfficialUsageAggregateSetId(undefined);
-    setOfficialUsageLoadError(undefined);
-    setLoadingOfficialUsage(false);
-    setOfficialUsageTab("overview");
-    setOfficialUsageOverviewQuery({});
   }
 
   async function loadSession() {
+    const requestId = ++sessionRequestId.current;
+    sessionAbortController.current?.abort();
+    const controller = new AbortController();
+    sessionAbortController.current = controller;
+    const isCurrent = () => requestId === sessionRequestId.current && !controller.signal.aborted;
     setLoadingSession(true);
     setError(undefined);
 
     try {
-      const setup = await fetch("/api/auth/status", { credentials: "include" });
-      if (setup.ok) setAuthSetup(await setup.json());
-      const session = await getCurrentUser();
-      setUser(session.user);
+      const setup = await fetch("/api/auth/status", { credentials: "include", signal: controller.signal });
+      if (!isCurrent()) return;
+      if (setup.ok) {
+        const value = await setup.json();
+        if (!isCurrent()) return;
+        setAuthSetup(value);
+      }
+      const session = await getCurrentUser({ signal: controller.signal });
+      if (isCurrent()) setUser(session.user);
     } catch (requestError) {
-      if (!(requestError instanceof ApiError && requestError.status === 401)) {
+      if (isCurrent() && !(requestError instanceof ApiError && (requestError.status === 401 || requestError.kind === "aborted"))) {
         setError(errorMessage(requestError));
       }
     } finally {
-      setLoadingSession(false);
+      if (isCurrent()) setLoadingSession(false);
+      if (sessionAbortController.current === controller) sessionAbortController.current = undefined;
     }
   }
 
@@ -1273,8 +1335,7 @@ function App() {
     setError(undefined);
 
     try {
-      const [response, unifiedResponse, inventoryRefreshJobs] = await Promise.all([
-        getAgents({
+      const packageQuery = {
           ...(!forceCurrentSnapshot && agentSnapshotId && savedAgentPageOwner?.principalKey === principalKey ? { snapshotId: agentSnapshotId } : {}),
           ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
           ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
@@ -1283,11 +1344,15 @@ function App() {
           ...(hostFilter === "all" ? {} : { host: hostFilter }),
           ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
           ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
-          sortBy: agentSortBy === "publisher" || agentSortBy === "lastModifiedAt" ? agentSortBy : "displayName",
+          sortBy: agentSortBy === "publisher" || agentSortBy === "lastModifiedAt" ? agentSortBy : "displayName" as const,
           sortDirection: agentSortDirection,
           limit: agentDisplayPageSize,
           offset: 0,
-        }, { signal: controller.signal }).catch(requestError => {
+      };
+      const [response, unifiedResponse, inventoryRefreshJobs] = await Promise.all([
+        readSavedQuery(savedQueries, ["package-summaries", principalKey, packageQuery, agentReloadRevision],
+          signal => getAgents(packageQuery, { signal }), controller.signal).catch(requestError => {
+          if (isAccessDenied(requestError)) throw requestError;
           if (requestId === agentListRequestId.current && !controller.signal.aborted) {
             setError(`Saved package summaries are unavailable: ${errorMessage(requestError)}`);
           }
@@ -1298,7 +1363,9 @@ function App() {
           limit: agentDisplayPageSize,
           offset: agentPageIndex * agentDisplayPageSize,
         }, controller.signal),
-        getInventoryRefreshJobs({ signal: controller.signal }).catch(requestError => {
+        readSavedQuery(savedQueries, ["inventory-refresh-jobs", principalKey, agentReloadRevision],
+          signal => getInventoryRefreshJobs({ signal }), controller.signal).catch(requestError => {
+          if (isAccessDenied(requestError)) throw requestError;
           if (requestId === agentListRequestId.current && !controller.signal.aborted) {
             setError(`Unable to load Power Platform agent refresh history: ${errorMessage(requestError)}`);
           }
@@ -1332,6 +1399,7 @@ function App() {
       agentDetailsCache.current.clear();
     } catch (requestError) {
       if (requestId === agentListRequestId.current && !(requestError instanceof ApiError && requestError.code === "request_aborted")) {
+        if (isAccessDenied(requestError)) clearAgentState();
         setError(errorMessage(requestError));
         setUnifiedAgentReadError(errorMessage(requestError));
       }
@@ -1348,7 +1416,7 @@ function App() {
     officialUsageAbortController.current = controller;
     if (!user) {
       setOfficialUsageAggregate(undefined);
-      setOfficialUsageAggregateSetId(undefined);
+      setOfficialUsageAggregateOwner(undefined);
       setOfficialUsageLoadError(undefined);
       setLoadingOfficialUsage(false);
       return;
@@ -1362,23 +1430,25 @@ function App() {
     setOfficialUsageLoadError(undefined);
 
     try {
-      const aggregate = hasRole(user, "AgentControl.Viewer")
-        ? await getOfficialUsageAggregate({
+      const reportQuery = {
           ...officialUsageAgentQuery,
           ...(officialUsageReportSetId ? { setId: officialUsageReportSetId } : {}),
           activityWindowDays: reportActivityWindowDays,
           inactiveDays,
           limit: 25,
           offset: officialUsageAgentOffset,
-        }, { signal: controller.signal }) : undefined;
+      };
+      const aggregate = hasRole(user, "AgentControl.Viewer")
+        ? await readSavedQuery(savedQueries, ["official-usage-aggregate", principalKey, reportQuery, officialUsageDashboardRevision],
+          signal => getOfficialUsageAggregate(reportQuery, { signal }), controller.signal) : undefined;
       if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
       setOfficialUsageAggregate(aggregate);
-      setOfficialUsageAggregateSetId(requestedSetId);
+      setOfficialUsageAggregateOwner({ principalKey, setId: requestedSetId, revision: officialUsageDashboardRevision });
     } catch (failure) {
       if (controller.signal.aborted || requestId !== officialUsageRequestId.current) return;
       if (failure instanceof ApiError && (failure.status === 401 || failure.status === 403)) {
         setOfficialUsageAggregate(undefined);
-        setOfficialUsageAggregateSetId(undefined);
+        setOfficialUsageAggregateOwner(undefined);
       }
       setOfficialUsageLoadError(errorMessage(failure));
     } finally {
@@ -1388,7 +1458,7 @@ function App() {
   }
 
   async function handleRefreshAgents(idempotencyKey?: string) {
-    if (!user || sessionRevalidationInFlight.current) return;
+    if (!isCurrentAgentScope() || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
     const deadline = Date.now() + identityCollectionPollBudgetMs;
@@ -1426,6 +1496,7 @@ function App() {
   }
 
   async function handleRefreshMatchingDetails() {
+    if (!isCurrentAgentScope()) return;
     const ids = [...selectedAgentIds];
     if (ids.length < 1 || ids.length > 100 || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
@@ -1460,6 +1531,7 @@ function App() {
   }
 
   async function handleRefreshExactPackage(id: string) {
+    if (!isCurrentAgentScope()) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
     const deadline = Date.now() + foregroundJobPollBudgetMs;
@@ -1487,18 +1559,27 @@ function App() {
   }
 
   async function handleSignOut() {
+    if (signOutAbortController.current) return;
+    const controller = new AbortController();
+    signOutAbortController.current = controller;
+    setSigningOut(true);
+    sessionRequestId.current += 1;
+    sessionAbortController.current?.abort();
     agentDetailRequestId.current += 1;
     agentDetailAbortController.current?.abort();
 
     try {
-      await signOut();
+      await signOut({ signal: controller.signal });
+      if (controller.signal.aborted) return;
+      clearPrivateState();
+      setUser(undefined);
+      setLoadingSession(false);
     } catch (requestError) {
-      setError(errorMessage(requestError));
-      return;
+      if (!controller.signal.aborted) setError(errorMessage(requestError));
+    } finally {
+      if (signOutAbortController.current === controller) signOutAbortController.current = undefined;
+      if (!controller.signal.aborted) setSigningOut(false);
     }
-
-    clearPrivateState();
-    setUser(undefined);
   }
 
   function handleSearchQueryChange(nextQuery: string) {
@@ -1506,6 +1587,7 @@ function App() {
   }
 
   async function handleViewAgentDetails(agent: CopilotPackage) {
+    if (!isCurrentAgentScope()) return;
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
     const controller = new AbortController();
@@ -1517,7 +1599,8 @@ function App() {
     setLoadingAgentDetailId(agent.id);
 
     try {
-      const savedDetail = await getAgentDetails(agent.id, { signal: controller.signal });
+      const savedDetail = await readSavedQuery(savedQueries, ["package-detail", principalKey, agent.id, agentReloadRevision],
+        signal => getAgentDetails(agent.id, { signal }), controller.signal);
       if (savedDetail.id !== agent.id) throw new Error("Saved agent details did not match the requested published version.");
       const detail = withPackageSummaryFallback(
         savedDetail,
@@ -1541,6 +1624,7 @@ function App() {
   }
 
   function handleViewUnifiedAgentDetails(record: UnifiedAgentRecord) {
+    if (!isCurrentAgentScope()) return;
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
     if (!ownsAgentFlowRequest(requestId, principalKey)) return;
@@ -1554,6 +1638,7 @@ function App() {
   }
 
   async function refreshAccessDetails(id: string, requestId: number, deadline = Date.now() + foregroundJobPollBudgetMs) {
+    if (!isCurrentAgentScope()) return;
     const access = capabilityState.views.find(view => view.definition.id === "graph.package.access.manage");
     if (!hasRole(user, "AgentControl.Admin") || !providerActionAllowed(access, true, Date.now())) {
       throw new Error("Current Admin access and package access-management authorization are required.");
@@ -1576,6 +1661,7 @@ function App() {
   }
 
   async function handleManageAgentAccess(agent: CopilotPackage, target: PackageAccessTarget = "availability") {
+    if (!isCurrentAgentScope()) return;
     const requestId = agentDetailRequestId.current + 1;
     agentDetailRequestId.current = requestId;
     agentDetailAbortController.current?.abort();
@@ -1608,6 +1694,7 @@ function App() {
     agent: CopilotPackage,
     targetBlockedState: boolean,
   ) {
+    if (!isCurrentAgentScope()) return;
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
     const owner = principalKey;
@@ -1636,6 +1723,7 @@ function App() {
   }
 
   async function handleInlineAccessUpdate(agent: CopilotPackage, update: PackageAccessUpdate) {
+    if (!isCurrentAgentScope()) return;
     if (!selectedUnifiedAgent?.packages.some(item => item.id === agent.id)) {
       throw new Error("This published version is no longer selected. Reopen the agent before changing access.");
     }
@@ -1662,6 +1750,7 @@ function App() {
     update: PackageAccessUpdate,
     mutationScope: "single" | "bulk",
   ) {
+    if (!isCurrentAgentScope()) return false;
     if (mutationScope === "single" && update.mode !== "replace") {
       throw new Error("Single-agent access updates must replace assignments.");
     }
@@ -1677,7 +1766,7 @@ function App() {
   }
 
   function requestExportCsv() {
-    if (exportingCsv || loadingAgents) return;
+    if (!isCurrentAgentScope() || exportingCsv || loadingAgents) return;
     if (!agentExportRevision || agentExportNeedsReload) {
       setAgentExportError({ message: "Reload the saved agent inventory before exporting; a valid saved revision is required.", reloadRequired: true });
       return;
@@ -1688,7 +1777,7 @@ function App() {
   async function handleExportCsv(scope: UnifiedAgentExportScope) {
     if (exportingCsv) return;
     const owner = principalKey;
-    if (!ownsSession(owner) || !hasRole(user, "AgentControl.Viewer")) return;
+    if (!ownsAgentScope(owner) || !hasRole(user, "AgentControl.Viewer")) return;
     if (!agentExportRevision || agentExportNeedsReload) {
       setAgentExportError({ message: "Reload the saved agent inventory before exporting; a valid saved revision is required.", reloadRequired: true });
       return;
@@ -1716,10 +1805,10 @@ function App() {
         recordIds: selectedAgentExportReferences(unifiedAgentPage?.value ?? [], selectedAgentIds, selectedPowerPlatformTargets.keys()),
         query: { sortBy: query.sortBy, sortDirection: query.sortDirection },
       } : { revision: agentExportRevision, query });
-      if (!ownsSession(owner)) return;
+      if (!ownsAgentScope(owner)) return;
       downloadBlob("agents.csv", blob);
     } catch (requestError) {
-      if (ownsSession(owner)) {
+      if (ownsAgentScope(owner)) {
         const invalidated = requestError instanceof ApiError && requestError.status === 409;
         setAgentExportError({
           message: invalidated
@@ -1729,11 +1818,12 @@ function App() {
         });
       }
     } finally {
-      if (ownsSession(owner)) setExportingCsv(false);
+      if (ownsAgentScope(owner)) setExportingCsv(false);
     }
   }
 
   async function handleExportPowerPlatformAgentCsv() {
+    if (!isCurrentAgentScope()) return;
     const snapshotId = unifiedAgentPage?.sources.powerPlatform.observation?.snapshotId;
     if (!snapshotId || exportingPowerPlatformCsv) {
       return;
@@ -1750,18 +1840,19 @@ function App() {
         search: deferredQuery.trim() || undefined,
         environmentId: agentEnvironmentFilter.trim() || undefined,
       });
-      if (!ownsSession(owner)) return;
+      if (!ownsAgentScope(owner)) return;
       downloadBlob(`power-platform-agent-inventory-${snapshotId}.csv`, blob);
     } catch (caught) {
-      if (ownsSession(owner)) {
+      if (ownsAgentScope(owner)) {
         setError(caught instanceof Error ? caught.message : "Unable to export Power Platform agent inventory.");
       }
     } finally {
-      if (ownsSession(owner)) setExportingPowerPlatformCsv(false);
+      if (ownsAgentScope(owner)) setExportingPowerPlatformCsv(false);
     }
   }
 
   async function handleRefreshPowerPlatformAgents() {
+    if (!isCurrentAgentScope()) return;
     if (refreshingPowerPlatformAgents || powerPlatformAgentRefreshJob?.status === "running") {
       return;
     }
@@ -1793,6 +1884,7 @@ function App() {
   }
 
   async function handleResumePowerPlatformAgentRefresh() {
+    if (!isCurrentAgentScope()) return;
     if (!powerPlatformAgentRefreshJob || refreshingPowerPlatformAgents) {
       return;
     }
@@ -1822,6 +1914,7 @@ function App() {
   }
 
   async function requestBulkAction(targetBlockedState: boolean) {
+    if (!isCurrentAgentScope()) return;
     const label = targetBlockedState ? "block" : "unblock";
     const scope = [...selectedAgentIds];
 
@@ -1846,6 +1939,7 @@ function App() {
   }
 
   async function runConfirmedBulkAction(confirmation: BulkConfirmation) {
+    if (!isCurrentAgentScope()) return;
     const { action: label, ids, mutationScope, preview, accessUpdate } = confirmation;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
@@ -1909,6 +2003,7 @@ function App() {
   }
 
   function requestBulkAccessUpdate() {
+    if (!isCurrentAgentScope()) return;
     if (selectedAgentIds.size === 0) {
       setError("Select one or more agents before managing access.");
       return;
@@ -1919,6 +2014,7 @@ function App() {
   }
 
   async function runBulkAccessUpdate(update: PackageAccessUpdate) {
+    if (!isCurrentAgentScope()) return;
     const ids = bulkAccessAgentIds ?? [];
 
     if (ids.length === 0) {
@@ -1946,6 +2042,7 @@ function App() {
   }
 
   async function followBulkJob(jobId: string, initialJob?: BulkActionJob, persist = true, packageId?: string) {
+    if (!isCurrentAgentScope()) return;
     const requestId = bulkJobPollRequestId.current + 1;
     bulkJobPollRequestId.current = requestId;
     const owner = principalKey;
@@ -2084,6 +2181,7 @@ function App() {
   }
 
   async function handleResumeJob() {
+    if (!isCurrentAgentScope()) return;
     if (!trackedJob || !window.confirm("Resume only unsent items with your current authorization? Inconclusive writes will not be replayed.")) return;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
@@ -2100,6 +2198,7 @@ function App() {
   }
 
   async function handleCancelJob() {
+    if (!isCurrentAgentScope()) return;
     if (!trackedJob) return;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
@@ -2118,6 +2217,7 @@ function App() {
   }
 
   async function handleReconcileJob() {
+    if (!isCurrentAgentScope()) return;
     if (!trackedJob) return;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
@@ -2338,29 +2438,35 @@ function App() {
 
   function ownsAgentFlowRequest(requestId: number, owner: string) {
     return agentDetailRequestId.current === requestId
-      && ownsSession(owner)
+      && ownsAgentScope(owner)
       && activeViewRef.current === "agents";
   }
 
-  function ownsSession(owner: string) {
-    return sessionOwnerRef.current === owner && !sessionRevalidationInFlight.current;
+  function isCurrentAgentScope() {
+    return agentScopeEpochRef.current === agentScopeEpoch;
+  }
+
+  function ownsAgentScope(owner: string) {
+    return isCurrentAgentScope()
+      && sessionOwnerRef.current === owner && !sessionRevalidationInFlight.current;
   }
 
   function ownsBulkJobRequest(requestId: number, owner: string) {
-    return bulkJobPollRequestId.current === requestId && ownsSession(owner);
+    return bulkJobPollRequestId.current === requestId && ownsAgentScope(owner);
   }
 
   function ownsPackageRefreshRequest(requestId: number, owner: string) {
     return packageRefreshRequestId.current === requestId
-      && ownsSession(owner);
+      && ownsAgentScope(owner);
   }
 
   function ownsInventoryRefreshRequest(requestId: number, owner: string) {
     return inventoryRefreshRequestId.current === requestId
-      && ownsSession(owner);
+      && ownsAgentScope(owner);
   }
 
   function requestCurrentAgentReload() {
+    if (!isCurrentAgentScope()) return;
     agentInventoryQueries.clear();
     forceCurrentAgentReload.current = true;
     setAgentReloadRevision(revision => revision + 1);
@@ -2412,16 +2518,18 @@ function App() {
   }
 
   const selectedOfficialUsageSetId = officialUsageReportSetId ?? null;
-  const displayedOfficialUsageAggregate = officialUsageAggregateSetId === selectedOfficialUsageSetId
+  const displayedOfficialUsageAggregate = officialUsageAggregateOwner?.principalKey === principalKey
+    && officialUsageAggregateOwner.setId === selectedOfficialUsageSetId
+    && officialUsageAggregateOwner.revision === officialUsageDashboardRevision
     ? officialUsageAggregate
     : undefined;
   const historicalUsageLoaded = Boolean(
     officialUsageReportSetId
-    && officialUsageAggregateSetId === officialUsageReportSetId,
+    && displayedOfficialUsageAggregate,
   );
 
   return (
-    <CapabilityContext value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
+    <CapabilityContext key={principalKey} value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
     <WorkbenchActionProvider value={workbenchMetadata?.actions}>
     <main className="app-shell">
       <header className="top-bar">
@@ -2432,7 +2540,7 @@ function App() {
         <div className="user-menu">
           <CapabilityHealth />
           <span>{user.displayName || user.username}</span>
-          <button type="button" onClick={() => void handleSignOut()}>
+          <button type="button" disabled={signingOut} onClick={() => void handleSignOut()}>
             Sign out
           </button>
         </div>
@@ -2793,9 +2901,9 @@ function App() {
             variant="bulk"
             canManage={canOperate}
             pendingTargetCount={pendingPowerPlatformIds.size}
-            onClear={resetPowerPlatformSelection}
+            onClear={() => { if (ownsAgentScope(principalKey)) resetPowerPlatformSelection(); }}
             initialJobId={requestedQuarantineJobId}
-            onJobChange={job => setRequestedQuarantineJobId(job.id)}
+            onJobChange={job => { if (ownsAgentScope(principalKey)) setRequestedQuarantineJobId(job.id); }}
           /> : null}
 
           {loadingBulkRefSearch ? (
@@ -2855,7 +2963,7 @@ function App() {
         )
       ) : visibleActiveView === "power-platform" ? (
         hasRole(user, "AgentControl.Viewer")
-          ? <InventoryExplorer key={`${principalKey}:${powerPlatformDataRevision}`} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
+          ? <InventoryExplorer key={`${principalKey}:${powerPlatformDataRevision}`} dataRevision={powerPlatformDataRevision} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
           : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
       ) : visibleActiveView === "users" ? (
         <CopilotUsersView
@@ -2929,7 +3037,7 @@ function App() {
       ) : visibleActiveView === "security" ? (
         <DefenderHuntingView key={principalKey} />
       ) : visibleActiveView === "jobs" ? (
-        <JobsView key={principalKey} user={user} />
+        <JobsView key={principalKey} user={user} onChanged={() => void dataSyncPanelRef.current?.refresh()} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
       {loadingAgentDetailId ? (
@@ -2949,10 +3057,10 @@ function App() {
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
           inventoryRevision={unifiedAgentDetailPage?.sourcePage?.revision}
           onUsageChanged={() => {
-            if (sessionOwnerRef.current === principalKey) requestCurrentAgentReload();
+            if (ownsAgentScope(principalKey)) requestCurrentAgentReload();
           }}
           onPeopleChanged={() => {
-            if (sessionOwnerRef.current === principalKey) requestCurrentAgentReload();
+            if (ownsAgentScope(principalKey)) requestCurrentAgentReload();
           }}
           dataRevision={officialUsageDashboardRevision}
           environmentNames={agentEnvironmentNames}
@@ -2978,6 +3086,7 @@ function App() {
             if (inlinePackageConfirmation) setBulkConfirmation(undefined);
           }}
           onInspectPackage={item => {
+            if (!isCurrentAgentScope()) return;
             setAgentPackageSelection({ owner: principalKey, recordId: selectedUnifiedAgent.id, packageId: item.id });
             void handleViewAgentDetails(item);
           }}
@@ -3500,6 +3609,10 @@ function errorMessage(error: unknown) {
   }
 
   return "An unexpected error occurred.";
+}
+
+function isAccessDenied(error: unknown) {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
 }
 
 export default App;

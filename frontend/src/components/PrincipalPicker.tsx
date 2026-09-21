@@ -23,37 +23,37 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
   useEffect(() => {
     const normalized = query.trim();
 
-    if (normalized.length < 2) {
+    if (disabled || normalized.length < 2) {
       return;
     }
 
-    let cancelled = false;
+    const controller = new AbortController();
     const timerId = window.setTimeout(async () => {
       setLoading(true);
       setError(undefined);
 
       try {
-        const response = await searchDirectoryPrincipals(normalized, 40);
-        if (!cancelled) {
+        const response = await searchDirectoryPrincipals(normalized, 40, { signal: controller.signal });
+        if (!controller.signal.aborted) {
           setResults(response.value);
         }
       } catch (requestError) {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setResults([]);
           setError(errorMessage(requestError));
         }
       } finally {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setLoading(false);
         }
       }
     }, 300);
 
     return () => {
-      cancelled = true;
+      controller.abort();
       window.clearTimeout(timerId);
     };
-  }, [query]);
+  }, [disabled, query]);
 
   const selectedKeys = new Set(selected.map(principalKey));
   const visibleResults = results.filter(
@@ -107,7 +107,7 @@ export function PrincipalPicker({ selected, onChange, disabled = false }: Princi
         role="group"
         aria-label="Directory results"
       >
-        {loading ? <p role="status">Searching directory...</p> : null}
+        {loading && !disabled ? <p role="status">Searching directory...</p> : null}
         {error ? <p className="inline-error">{error}</p> : null}
         {!loading && !error && query.trim().length < 2 ? (
           <p>Enter at least two characters.</p>

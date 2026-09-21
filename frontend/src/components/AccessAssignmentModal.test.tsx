@@ -113,12 +113,13 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
 
   it("does not make no users wait for an in-flight directory lookup", async () => {
     const request = pendingDirectoryLookup();
-    vi.spyOn(api, "resolveDirectoryPrincipals").mockReturnValue(request.promise);
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals").mockReturnValue(request.promise);
     const { props } = renderAccessModal(true);
 
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
     fireEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
     expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm and apply" }));
@@ -153,7 +154,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
 
     expect(resolve).not.toHaveBeenCalled();
     setDirectoryAllowed(true);
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
     expect(screen.getByText("Resolving current assignments...")).toBeVisible();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
 
@@ -179,7 +180,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
     expect(screen.getByText("0 selected")).toBeVisible();
     expect(screen.queryByText("Assigned user")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
   });
 
   it("ignores a cancelled lookup and waits for the replacement lookup", async () => {
@@ -191,6 +192,7 @@ describe("AccessAssignmentModal scope-dependent directory resolution", () => {
     const { setDirectoryAllowed } = renderAccessModal(true);
 
     setDirectoryAllowed(false);
+    expect(resolve.mock.calls[0][1]?.signal?.aborted).toBe(true);
     await act(async () => first.resolve({ value: resolved }));
     setDirectoryAllowed(true);
     expect(resolve).toHaveBeenCalledTimes(2);
@@ -232,7 +234,7 @@ describe("AccessAssignmentModal draft stability", () => {
     const { setProps } = renderAccessModal(true);
 
     setProps({ initialPrincipals: principals.map(principal => ({ ...principal })) });
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
 
     await act(async () => request.resolve({ value: resolved }));
     expect(screen.getByText("Assigned user")).toBeVisible();
@@ -251,7 +253,7 @@ describe("AccessAssignmentModal draft stability", () => {
     expect(screen.getByText("0 selected")).toBeVisible();
     expect(screen.queryByText("Assigned user")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(principals, { signal: expect.any(AbortSignal) });
   });
 
   it("keeps the confirmed draft when initial props are refreshed", async () => {
@@ -278,7 +280,7 @@ describe("AccessAssignmentModal draft stability", () => {
     await waitFor(() => expect(props.onSubmit).toHaveBeenCalledExactlyOnceWith({
       target: "availability", mode: "replace", scope: "specific", principals: [second],
     }));
-    expect(resolve).toHaveBeenCalledExactlyOnceWith(initial);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(initial, { signal: expect.any(AbortSignal) });
   });
 
   it("loads a new initial state on reopening, not during the current edit", async () => {

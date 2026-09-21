@@ -1,4 +1,3 @@
-import { StrictMode, type ReactNode } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
@@ -55,17 +54,20 @@ it("loads decisions then runs one bounded automatic check", async () => {
 });
 
 it("does not duplicate automatic checks under StrictMode remounting", async () => {
-  const fetchMock = vi.fn(async (url: string) => {
-    void url;
-    return Response.json({ value: [available()] });
-  });
+  const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+    async () => Response.json({ value: [available()] }),
+  );
   vi.stubGlobal("fetch", fetchMock);
 
-  renderHook(() => useCapabilities(user), {
-    wrapper: ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode>,
-  });
+  const { result } = renderHook(() => useCapabilities(user), { reactStrictMode: true });
 
   await waitFor(() => expect(fetchMock.mock.calls.filter(call => String(call[0]).endsWith("/check"))).toHaveLength(1));
+  const reads = fetchMock.mock.calls.filter(([url]) => url === "/api/capabilities");
+  expect(reads).toHaveLength(2);
+  expect(reads[0][1]?.signal?.aborted).toBe(true);
+  expect(reads[1][1]?.signal?.aborted).toBe(false);
+  await waitFor(() => expect(result.current.pending).toBe(false));
+  expect(result.current.views).toHaveLength(1);
 });
 
 it.each(["fresh", "unchecked"] as const)("defers the initial provider check for %s evidence until a hidden page becomes visible", async evidence => {
@@ -276,6 +278,64 @@ it("does not resurrect saved decisions when the same principal signs in again", 
   rerender({ principal: user });
   expect(result.current.views).toEqual([]);
   expect(result.current.loading).toBe(true);
+});
+
+it("fences capability evidence when the same principal's session epoch changes", async () => {
+  let resolveOldCheck!: (response: Response) => void;
+  let reads = 0;
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+    if (url === "/api/capabilities") {
+      if (++reads > 1) return new Promise<Response>(() => undefined);
+      return Response.json({ value: [available()] });
+    }
+    return new Promise<Response>(resolve => { resolveOldCheck = resolve; });
+  }));
+  const { result, rerender } = renderHook(
+    ({ epoch }) => useCapabilities(user, epoch),
+    { initialProps: { epoch: 0 } },
+  );
+  await waitFor(() => expect(result.current.pending).toBe(true));
+  rerender({ epoch: 1 });
+  expect(result.current.views).toEqual([]);
+  expect(result.current.loading).toBe(true);
+  await act(async () => resolveOldCheck(Response.json({ value: [available()] })));
+  expect(result.current.views).toEqual([]);
+  expect(reads).toBe(2);
+});
+
+it.each([
+  ["automatic check", 401],
+  ["automatic check", 403],
+  ["catalog reload", 401],
+  ["catalog reload", 403],
+  ["reload check", 401],
+  ["reload check", 403],
+] as const)("discards permission evidence after a denied %s (%s) until an explicit recovery", async (phase, status) => {
+  let deny = phase === "automatic check";
+  const fetchMock = vi.fn(async (url: string) => {
+    const deniedEndpoint = phase === "catalog reload" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check");
+    return deny && deniedEndpoint
+      ? Response.json({ code: status === 401 ? "interaction_required" : "forbidden", detail: "Current capability access was denied." }, { status })
+      : Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(result.current.pending).toBe(false));
+  if (phase !== "automatic check") {
+    expect(result.current.views).toHaveLength(1);
+    deny = true;
+    await act(async () => result.current.reload());
+  }
+  expect(result.current.views).toEqual([]);
+  expect(result.current.error).toMatch(/denied/i);
+  const requests = fetchMock.mock.calls.length;
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(fetchMock).toHaveBeenCalledTimes(requests);
+  deny = false;
+  await act(async () => result.current.reload());
+  expect(result.current.views).toHaveLength(1);
+  expect(result.current.error).toBeUndefined();
 });
 
 it("aborts an in-flight automatic check on logout", async () => {

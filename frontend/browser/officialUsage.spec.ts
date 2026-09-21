@@ -452,6 +452,17 @@ test("uses one agent table for response rankings, reach, date filters and a snap
   await page.getByLabel("Order agents by").selectOption("activeUsers-desc");
   await expect.poll(() => agentRequests.at(-1)?.get("sortBy")).toBe("activeUsers");
   await expect(table.locator("tbody tr").first()).toContainText("Synthetic agent 0");
+  await page.getByRole("button", { name: "Next agents", exact: true }).click();
+  await expect(page.getByLabel("Agent usage pages")).toContainText("26-50 of 103 agents");
+  const activeUsersSort = table.getByRole("button", { name: "Sort by Active users" });
+  await expect(activeUsersSort.locator("xpath=..")).toHaveAttribute("aria-sort", "descending");
+  await activeUsersSort.focus();
+  await activeUsersSort.press("Enter");
+  await expect.poll(() => agentRequests.at(-1)?.get("sortDirection")).toBe("asc");
+  expect(agentRequests.at(-1)?.get("offset")).toBe("0");
+  await expect(page.getByLabel("Order agents by")).toHaveValue("activeUsers-asc");
+  await expect(table.getByRole("button", { name: "Sort by Active users" })).toBeFocused();
+  await expect(table.getByRole("columnheader", { name: "Active users" })).toHaveAttribute("aria-sort", "ascending");
   await page.getByText("Last-activity filters", { exact: true }).click();
   await page.getByLabel("Agent last activity on or after (UTC)").fill("2026-09-11");
   await expect(table.locator("tbody tr")).toHaveCount(1);
@@ -466,6 +477,9 @@ test("uses one agent table for response rankings, reach, date filters and a snap
   await page.getByLabel("Search agents").fill("Prompt");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.getByRole("button", { name: "Prompt Coach", exact: true })).toBeVisible();
+  await table.getByRole("button", { name: "Sort by Agent", exact: true }).click();
+  await expect(page.getByLabel("Order agents by")).toHaveValue("agentName-asc");
+  await expect(table.getByRole("columnheader", { name: "Agent", exact: true })).toHaveAttribute("aria-sort", "ascending");
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export agents CSV" }).click();
   const file = await download;
@@ -476,6 +490,8 @@ test("uses one agent table for response rankings, reach, date filters and a snap
   expect(exportRequests.at(-1)?.get("setId")).toBe(setId);
   expect(exportRequests.at(-1)?.get("search")).toBe("Prompt");
   expect(exportRequests.at(-1)?.get("creatorType")).toBe("Agent built by Microsoft");
+  expect(exportRequests.at(-1)?.get("sortBy")).toBe("agentName");
+  expect(exportRequests.at(-1)?.get("sortDirection")).toBe("asc");
   expect(exportRequests.at(-1)?.has("limit")).toBe(false);
   expect(exportRequests.at(-1)?.has("offset")).toBe(false);
   expect(userRequests).toEqual([]);
@@ -531,4 +547,73 @@ test("keeps retained-set confirmation inside import management and refreshes rep
   await expect(modal.getByRole("heading", { name: "Manage retained reports", exact: true })).toBeFocused();
   await modal.getByRole("button", { name: "Close", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Selected report deleted", exact: true })).toBeVisible();
+});
+
+for (const leaveManagement of [false, true]) {
+  test(`preserves the user's new focus when a closed deletion finishes ${leaveManagement ? "outside" : "inside"} management`, async ({ page }) => {
+    await mockUsage(page, { active: true });
+    let releaseConfirmation!: () => void;
+    const confirmationGate = new Promise<void>(resolve => { releaseConfirmation = resolve; });
+    await page.route("**/api/official-usage/confirmations/*", async route => {
+      expect(route.request().method()).toBe("POST");
+      await confirmationGate;
+      await route.fallback();
+    });
+    try {
+      await page.goto("/official-usage?view=snapshot");
+      await page.getByRole("button", { name: "Import reports", exact: true }).click();
+      await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+      const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
+      await modal.getByRole("button", { name: /Delete retained set for/ }).click();
+      const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
+      const submitted = page.waitForRequest("**/api/official-usage/confirmations/*");
+      await confirmation.getByRole("button", { name: "Confirm", exact: true }).click();
+      await submitted;
+      await expect(confirmation.getByRole("button", { name: "Confirm", exact: true })).toBeDisabled();
+      await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(confirmation).toHaveCount(0);
+      await expect(modal.getByRole("heading", { name: "Manage retained reports", exact: true })).toBeFocused();
+      if (leaveManagement) await modal.getByRole("button", { name: "Close", exact: true }).click();
+      const newControl = leaveManagement
+        ? page.getByRole("button", { name: "Snapshot details", exact: true })
+        : modal.getByRole("button", { name: "Manage reports", exact: true });
+      await newControl.click();
+      await expect(newControl).toBeFocused();
+      const completed = page.waitForResponse("**/api/official-usage/confirmations/*");
+      releaseConfirmation();
+      await completed;
+      if (leaveManagement) {
+        await expect(page.getByRole("heading", { name: "Selected report deleted", exact: true })).toBeVisible();
+        await expect(modal).toBeHidden();
+      } else {
+        await expect(modal.getByText(/retained set was deleted/)).toBeVisible();
+        await expect(modal.getByRole("button", { name: /Delete retained set for/ })).toHaveCount(0);
+      }
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      await expect(newControl).toBeFocused();
+    } finally {
+      releaseConfirmation();
+    }
+  });
+}
+
+test("keeps a failed confirmation's error and dismissal accessible inside the native dialog", async ({ page }) => {
+  await mockUsage(page, { active: true });
+  await page.route("**/api/official-usage/confirmations/*", route => route.fulfill({
+    status: 409, json: { code: "confirmation_expired", detail: "The reviewed deletion expired. Review the set again." },
+  }));
+  await page.goto("/official-usage?view=snapshot");
+  await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  const opener = modal.getByRole("button", { name: /Delete retained set for/ });
+  await opener.click();
+  const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
+  await confirmation.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expect(confirmation.getByRole("alert")).toContainText("The reviewed deletion expired.");
+  await expect(confirmation.getByRole("button", { name: "Cancel", exact: true })).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(confirmation).toHaveCount(0);
+  await expect(opener).toBeFocused();
+  await expect(modal.getByRole("alert")).toContainText("The reviewed deletion expired.");
 });

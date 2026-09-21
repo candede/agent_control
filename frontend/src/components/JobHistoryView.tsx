@@ -1,11 +1,14 @@
-import { useRef, useState } from "react";
-import { ArrowDown, ArrowUp, History, RefreshCw } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { History, RefreshCw } from "lucide-react";
+import type { SortingState } from "@tanstack/react-table";
 import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../api/client";
+import { useListTable, type ListColumn } from "../listTable";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { ListTableHead } from "./ListTableHead";
 import { WorkbenchDialog } from "./WorkbenchDialog";
 import {
   compareJobDates, formatJobInstant, jobActionAvailable, jobActionId, jobActionLabel,
-  jobDuration, jobKey, jobOutcome, jobPhase, jobRecordDate, jobResultExplanation,
+  jobDuration, jobKey, jobOutcome, jobPhase, jobRecordDate, jobResultCount, jobResultExplanation,
   jobResultLabel, jobSourceHref, jobSourceLabels, jobSourceLinkLabel, jobStatusLabel,
   type JobOperation,
 } from "./jobPresentation";
@@ -14,6 +17,7 @@ import "./jobs.css";
 const historyPageSize = 15;
 const currentPageSize = 10;
 const operations = ["resume", "cancel", "reconcile"] as const;
+const defaultHistorySorting: SortingState = [{ id: "created", desc: true }];
 
 export function JobHistoryView({ state, error, loading, busy, pollingPaused, onRefresh, onAction, onOpenSyncRun }: {
   state?: WorkbenchJobsResponse;
@@ -29,7 +33,7 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
   const [source, setSource] = useState("all");
   const [search, setSearch] = useState("");
   const [outcome, setOutcome] = useState("all");
-  const [newestFirst, setNewestFirst] = useState(true);
+  const [historySorting, setHistorySorting] = useState<SortingState>(defaultHistorySorting);
   const [historyPage, setHistoryPage] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
   const [selectedKey, setSelectedKey] = useState<string>();
@@ -39,8 +43,9 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
     && (!query || [job.label, job.target, job.id, jobSourceLabels[job.source]].some(value => value.toLowerCase().includes(query)))) ?? [];
   const current = filtered.filter(job => jobPhase(job) !== "history").sort((left, right) =>
     Number(jobPhase(left) === "waiting") - Number(jobPhase(right) === "waiting") || compareJobDates(left, right));
-  const history = filtered.filter(job => jobPhase(job) === "history" && (outcome === "all" || jobOutcome(job) === outcome))
-    .sort((left, right) => compareJobDates(left, right, newestFirst));
+  const history = filtered.filter(job =>
+    jobPhase(job) === "history" && (outcome === "all" || jobOutcome(job) === outcome))
+    .sort((left, right) => compareJobDates(left, right));
   const currentIndex = Math.min(currentPage, Math.max(0, Math.ceil(current.length / currentPageSize) - 1));
   const historyIndex = Math.min(historyPage, Math.max(0, Math.ceil(history.length / historyPageSize) - 1));
   const unavailable = state?.unavailableSources ?? [];
@@ -96,7 +101,7 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
             </div>
           </div>
           {current.length ? <>
-            <JobTable jobs={current.slice(currentIndex * currentPageSize, (currentIndex + 1) * currentPageSize)} current onSelect={job => setSelectedKey(jobKey(job))} />
+            <JobTable jobs={current} current page={currentIndex} pageSize={currentPageSize} onSelect={job => setSelectedKey(jobKey(job))} />
             {current.length > currentPageSize ? <JobPagination page={currentIndex} pageSize={currentPageSize} count={current.length} label="current jobs" onChange={setCurrentPage} /> : null}
           </> : null}
         </section>
@@ -119,8 +124,9 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
             </label>
           </div>
           {history.length ? <>
-            <JobTable jobs={history.slice(historyIndex * historyPageSize, (historyIndex + 1) * historyPageSize)} onSelect={job => setSelectedKey(jobKey(job))}
-              newestFirst={newestFirst} onSort={() => { setNewestFirst(!newestFirst); setHistoryPage(0); }} />
+            <JobTable jobs={history} page={historyIndex} pageSize={historyPageSize} sorting={historySorting}
+              onSortingChange={next => { setHistorySorting(next); setHistoryPage(0); }}
+              onSelect={job => setSelectedKey(jobKey(job))} />
             <JobPagination page={historyIndex} pageSize={historyPageSize} count={history.length} label="history" onChange={setHistoryPage} />
           </> : <p className="jobs-empty">{hasFilters || outcome !== "all" ? "No recent history matches these filters." : "No finished or stopped jobs in the loaded records."}</p>}
         </section>
@@ -191,31 +197,62 @@ function JobStatus({ job }: { job: WorkbenchJobSummary }) {
   return <span className={`job-outcome job-outcome-${phase === "history" ? jobOutcome(job) : phase}`}>{jobStatusLabel(job)}</span>;
 }
 
-function JobTable({ jobs, current = false, newestFirst = true, onSort, onSelect }: {
+function JobTable({ jobs, current = false, page, pageSize, sorting = [], onSortingChange = () => {}, onSelect }: {
   jobs: WorkbenchJobSummary[];
   current?: boolean;
-  newestFirst?: boolean;
-  onSort?: () => void;
+  page: number;
+  pageSize: number;
+  sorting?: SortingState;
+  onSortingChange?: (sorting: SortingState) => void;
   onSelect: (job: WorkbenchJobSummary) => void;
 }) {
+  const columns = useMemo<ListColumn<WorkbenchJobSummary>[]>(() => [
+    {
+      id: "job", header: "Job / scope",
+      accessorFn: job => `${job.label}\u0000${job.target}\u0000${jobSourceLabels[job.source]}`,
+      enableSorting: !current,
+    },
+    {
+      id: "outcome", header: current ? "Status" : "Outcome",
+      accessorFn: job => `${jobStatusLabel(job)}\u0000${jobOutcome(job)}`,
+      enableSorting: !current,
+    },
+    {
+      id: "created", header: current ? "Last updated" : "Created",
+      accessorFn: job => current ? Date.parse(job.updatedAt) : jobRecordDate(job).value ? jobRecordDate(job).timestamp : undefined,
+      enableSorting: !current,
+      sortDescFirst: true,
+    },
+    {
+      id: "result", header: current ? "Progress" : "Result",
+      accessorFn: jobResultCount,
+      enableSorting: !current,
+    },
+    ...current ? [] : [{
+      id: "duration", header: "Duration",
+      accessorFn: (job: WorkbenchJobSummary) => jobDurationMilliseconds(job),
+      sortDescFirst: true,
+    }],
+  ], [current]);
+  const table = useListTable({
+    data: jobs,
+    columns,
+    sorting,
+    getRowId: jobKey,
+    onSortingChange: update => onSortingChange(typeof update === "function" ? update(sorting) : update),
+  });
+  const rows = table.getRowModel().rows.slice(page * pageSize, (page + 1) * pageSize);
   return <div className="job-table-shell">
     <p className="jobs-table-hint">Scroll horizontally for dates and counts. Select a job name for details.</p>
     <div className="jobs-table-scroll" role="region" aria-label={current ? "Scrollable current jobs" : "Scrollable job history"} tabIndex={0}>
       <table className={`job-history-table${current ? " job-current-table" : ""}`} aria-label={current ? "Current jobs" : "Job history"}>
-        <thead><tr>
-          <th scope="col" className="job-table-name">Job / scope</th>
-          <th scope="col" className="job-table-outcome">{current ? "Status" : "Outcome"}</th>
-          <th scope="col" className="job-table-date" aria-sort={!current ? newestFirst ? "descending" : "ascending" : undefined}>
-            {current ? "Last updated" : <button type="button" className="jobs-text-button" aria-label={`Order history ${newestFirst ? "oldest" : "newest"} first`} onClick={onSort}>
-              Created {newestFirst ? <ArrowDown size={14} aria-hidden="true" /> : <ArrowUp size={14} aria-hidden="true" />}
-            </button>}
-          </th>
-          <th scope="col" className="job-table-result">{current ? "Progress" : "Result"}</th>
-          {!current ? <th scope="col" title="Recorded time from start to finish, including waits and retries">Duration</th> : null}
-        </tr></thead>
-        <tbody>{jobs.map(job => {
+        <ListTableHead table={table}
+          classes={{ job: "job-table-name", outcome: "job-table-outcome", created: "job-table-date", result: "job-table-result" }}
+          titles={{ duration: "Recorded time from start to finish, including waits and retries" }} />
+        <tbody>{rows.map(row => {
+          const job = row.original;
           const date = jobRecordDate(job);
-          return <tr key={jobKey(job)}>
+          return <tr key={row.id}>
             <th scope="row">
               <button type="button" className="job-title-button" aria-label={`View details for ${job.label}, job ${job.id}`} onClick={() => onSelect(job)}>{job.label}</button>
               <small>{jobSourceLabels[job.source]}</small>
@@ -231,6 +268,13 @@ function JobTable({ jobs, current = false, newestFirst = true, onSort, onSelect 
       </table>
     </div>
   </div>;
+}
+
+function jobDurationMilliseconds(job: WorkbenchJobSummary) {
+  if (!job.startedAt || !job.completedAt) return undefined;
+  const started = Date.parse(job.startedAt);
+  const completed = Date.parse(job.completedAt);
+  return Number.isFinite(started) && Number.isFinite(completed) && completed >= started ? completed - started : undefined;
 }
 
 function JobPagination({ page, pageSize, count, label, onChange }: {

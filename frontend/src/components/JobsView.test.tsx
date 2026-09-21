@@ -4,19 +4,21 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
-import type { CapabilityView } from "../api/client";
+import type { CapabilityView, WorkbenchJobsResponse } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { JobsView } from "./JobsView";
+import { SavedQueryProvider } from "./SavedQueryProvider";
+import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
 mockNativeDialogs();
 
-function render(ui: ReactNode) {
+function render(ui: ReactNode, options?: { reactStrictMode?: boolean }) {
   const wrap = (children: ReactNode) => <CapabilityContext value={capabilityContext}>
     <WorkbenchActionProvider value={workbenchActions}>{children}</WorkbenchActionProvider>
   </CapabilityContext>;
-  const result = rtlRender(wrap(ui));
+  const result = rtlRender(wrap(ui), options);
   return { ...result, rerender: (next: ReactNode) => result.rerender(wrap(next)) };
 }
 
@@ -91,6 +93,33 @@ describe("JobsView", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith("/api/workbench/jobs", expect.objectContaining({ credentials: "include", signal: expect.any(AbortSignal) }));
     expect(screen.getByText("request-1", { selector: "code" }).parentElement).toHaveTextContent("Status request request-1");
+  });
+
+  it("deduplicates shared jobs readers through real Strict Mode replay and one consumer unmount", async () => {
+    const client = createSavedQueryClient();
+    let resolveRead!: (value: Response) => void;
+    fetchMock.mockImplementation(() => new Promise(resolve => { resolveRead = resolve; }));
+    const content = (showJobs: boolean) => <SavedQueryProvider client={client}>
+      {showJobs ? <JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} /> : null}
+      <JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} scope="sync" />
+    </SavedQueryProvider>;
+    const view = render(content(true), { reactStrictMode: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const firstSignal = fetchMock.mock.calls[0][1].signal as AbortSignal;
+    const sharedSignal = fetchMock.mock.calls[1][1].signal as AbortSignal;
+    expect(firstSignal.aborted).toBe(true);
+    view.rerender(content(false));
+    expect(sharedSignal.aborted).toBe(false);
+    await act(async () => {
+      resolveRead(Response.json({ ...emptyProjection, value: [{
+        id: "shared-run", source: "data-sync", label: "Shared saved sync", target: "Saved sources",
+        status: "completed", total: 1, completed: 1, partial: false, canResume: false, canCancel: false,
+        canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=shared-run",
+      }] }));
+    });
+    expect(await screen.findByText("Shared saved sync")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("does not replace refreshed sync history with an aborted older response", async () => {
@@ -244,6 +273,7 @@ describe("JobsView", () => {
 
   it("keeps polling an admitted data-sync run after the retry response is lost", async () => {
     vi.useFakeTimers();
+    const onChanged = vi.fn();
     let projectionLoads = 0;
     const projection = (otherStatus: "running" | "succeeded") => ({
       ...emptyProjection,
@@ -280,6 +310,7 @@ describe("JobsView", () => {
         },
       ],
     });
+
     fetchMock.mockImplementation(async (input: string) => {
       if (input === "/api/workbench/jobs") {
         projectionLoads += 1;
@@ -288,7 +319,7 @@ describe("JobsView", () => {
       if (input === "/api/data-sync/runs/sync-job/retry") throw new Error("Retry response lost");
       throw new Error(`Unexpected request ${input}`);
     });
-    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} onChanged={onChanged} />);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -313,7 +344,183 @@ describe("JobsView", () => {
     expect(otherJob).not.toBeNull();
     expect(otherJob).toHaveTextContent("Complete");
     expect(screen.getByRole("alert")).toHaveTextContent("The server could not be reached.");
+    expect(onChanged).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/data-sync/runs/sync-job/retry")).toHaveLength(1);
+  });
+
+  it("never joins post-mutation revalidation to a GET admitted before the mutation", async () => {
+    const active = {
+      id: "running-job", source: "package-refresh", label: "Running refresh", target: "Saved package inventory",
+      status: "running", total: 10, completed: 2, partial: false, canResume: false, canCancel: true,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?refreshJob=running-job",
+    };
+    let releaseOld!: (response: Response) => void;
+    let jobsReads = 0;
+    fetchMock.mockImplementation((input: string) => {
+      if (input === "/api/workbench/jobs") {
+        jobsReads += 1;
+        if (jobsReads === 1) return Promise.resolve(Response.json({ ...emptyProjection, value: [active] }));
+        if (jobsReads === 2) return new Promise<Response>(resolve => { releaseOld = resolve; });
+        return Promise.resolve(Response.json({
+          ...emptyProjection,
+          value: [{ ...active, status: "cancelled", canCancel: false }],
+        }));
+      }
+      if (input === "/api/agents/refresh-jobs/running-job/cancel") {
+        return Promise.resolve(Response.json({ id: active.id, status: "cancelled" }));
+      }
+      return Promise.reject(new Error(`Unexpected request ${input}`));
+    });
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+    const details = await openJob(active.id);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(jobsReads).toBe(2));
+    const staleSignal = fetchMock.mock.calls.filter(([path]) => path === "/api/workbench/jobs")[1][1].signal as AbortSignal;
+
+    await userEvent.click(details.getByRole("button", { name: "Cancel refresh" }));
+
+    await waitFor(() => expect(jobsReads).toBe(3));
+    expect(staleSignal.aborted).toBe(true);
+    expect(details.getByText("Cancelled")).toBeVisible();
+    releaseOld(Response.json({ ...emptyProjection, value: [active] }));
+    await waitFor(() => expect(details.getByText("Cancelled")).toBeVisible());
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/agents/refresh-jobs/running-job/cancel")).toHaveLength(1);
+  });
+
+  it("keeps recovery busy until fresh post-action metadata arrives", async () => {
+    const active = {
+      id: "running-job", source: "package-refresh", label: "Running refresh", target: "Saved package inventory",
+      status: "running", total: 10, completed: 2, partial: false, canResume: false, canCancel: true,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?refreshJob=running-job",
+    };
+    let resolveStatus!: (value: Response) => void;
+    fetchMock.mockResolvedValueOnce(Response.json({ ...emptyProjection, value: [active] }))
+      .mockResolvedValueOnce(Response.json({ id: active.id, status: "cancelled" }))
+      .mockReturnValueOnce(new Promise(resolve => { resolveStatus = resolve; }));
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
+    const details = await openJob(active.id);
+    await userEvent.click(details.getByRole("button", { name: "Cancel refresh" }));
+    expect(await details.findByRole("button", { name: "Cancelling..." })).toBeDisabled();
+    await act(async () => {
+      resolveStatus(Response.json({ ...emptyProjection, value: [{ ...active, status: "cancelled", canCancel: false }] }));
+    });
+    expect(details.getByText("Cancelled")).toBeVisible();
+    expect(details.queryByRole("button", { name: "Cancel refresh" })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/agents/refresh-jobs/running-job/cancel")).toHaveLength(1);
+  });
+
+  it.each([401, 403])("does not automatically restore denied mutation metadata after %s", async status => {
+    const onChanged = vi.fn();
+    const active = {
+      id: "denied-job", source: "data-sync", label: "Private retained sync", target: "Saved sources",
+      status: "partial", total: 3, completed: 1, partial: true, canResume: true, canCancel: false,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=denied-job",
+    };
+    let reads = 0;
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/api/workbench/jobs") {
+        reads += 1;
+        return Response.json({ ...emptyProjection, value: [active] });
+      }
+      return Response.json({ type: "about:blank", status, code: "forbidden", detail: "This sync is no longer authorized." },
+        { status, headers: { "Content-Type": "application/problem+json" } });
+    });
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} onChanged={onChanged} />);
+    const details = await openJob(active.id);
+    await userEvent.click(details.getByRole("button", { name: "Retry incomplete" }));
+    expect(await details.findByRole("alert")).toHaveTextContent("This sync is no longer authorized.");
+    expect(details.queryByText(active.id, { exact: true })).not.toBeInTheDocument();
+    expect(details.queryByRole("button", { name: "Retry incomplete" })).not.toBeInTheDocument();
+    expect(reads).toBe(1);
+    expect(onChanged).not.toHaveBeenCalled();
+    await userEvent.click(details.getByRole("button", { name: "Close job details" }));
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(await screen.findByText(active.label)).toBeVisible();
+    expect(reads).toBe(2);
+  });
+
+  it("leaves a shared pre-action observer running while using a fresh post-action read", async () => {
+    const client = createSavedQueryClient();
+    const active = {
+      id: "running-job", source: "package-refresh", label: "Running refresh", target: "Saved package inventory",
+      status: "running", total: 10, completed: 2, partial: false, canResume: false, canCancel: true,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?refreshJob=running-job",
+    };
+    let resolveOld!: (value: Response) => void;
+    let reads = 0;
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path !== "/api/workbench/jobs") return Response.json({ id: active.id, status: "cancelled" });
+      reads += 1;
+      if (reads === 1) return Response.json({ ...emptyProjection, value: [active] });
+      if (reads === 2) return new Promise<Response>(resolve => { resolveOld = resolve; });
+      return Response.json({ ...emptyProjection, value: [{ ...active, status: "cancelled", canCancel: false }] });
+    });
+    render(<SavedQueryProvider client={client}><JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} /></SavedQueryProvider>);
+    const details = await openJob(active.id);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    const query = client.getQueryCache().getAll().find(query => query.state.fetchStatus === "fetching")!;
+    const peer = new AbortController();
+    const peerRead = readSavedQuery<WorkbenchJobsResponse>(client, query.queryKey.slice(1), () => Promise.reject(new Error("Expected deduplication")), peer.signal);
+    const oldSignal = fetchMock.mock.calls.filter(([path]) => path === "/api/workbench/jobs")[1][1].signal as AbortSignal;
+    await userEvent.click(details.getByRole("button", { name: "Cancel refresh" }));
+    await waitFor(() => expect(reads).toBe(3));
+    expect(oldSignal.aborted).toBe(false);
+    expect(details.getByText("Cancelled")).toBeVisible();
+    await act(async () => {
+      resolveOld(Response.json({ ...emptyProjection, value: [active] }));
+      await peerRead;
+    });
+    expect(details.getByText("Cancelled")).toBeVisible();
+  });
+
+  it("does not collide independent consumers' mutation revisions with an older post-action read", async () => {
+    const client = createSavedQueryClient();
+    const jobs = ["alpha", "beta"].map(id => ({
+      id, source: "package-refresh", label: `${id} refresh`, target: "Saved package inventory",
+      status: "running", total: 10, completed: 2, partial: false, canResume: false, canCancel: true,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: `/sync?refreshJob=${id}`,
+    }));
+    const cancelled = (ids: string[]) => ({
+      ...emptyProjection,
+      value: jobs.map(job => ids.includes(job.id) ? { ...job, status: "cancelled", canCancel: false } : job),
+    });
+    let resolveFirstFollowUp!: (value: Response) => void;
+    let reads = 0;
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path !== "/api/workbench/jobs") return Response.json({ status: "cancelled" });
+      reads += 1;
+      if (reads === 1) return Response.json(cancelled([]));
+      if (reads === 2) return new Promise<Response>(resolve => { resolveFirstFollowUp = resolve; });
+      return Response.json(cancelled(["alpha", "beta"]));
+    });
+    const content = <SavedQueryProvider client={client}><JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} /></SavedQueryProvider>;
+    const first = render(content);
+    const second = render(content);
+    const firstView = within(first.container);
+    const secondView = within(second.container);
+    await firstView.findByRole("button", { name: "View details for alpha refresh, job alpha" });
+    await secondView.findByRole("button", { name: "View details for beta refresh, job beta" });
+    expect(reads).toBe(1);
+
+    await userEvent.click(firstView.getByRole("button", { name: "View details for alpha refresh, job alpha" }));
+    const firstDetails = within(firstView.getByRole("dialog", { name: "Job details" }));
+    await userEvent.click(firstDetails.getByRole("button", { name: "Cancel refresh" }));
+    await waitFor(() => expect(reads).toBe(2));
+    const firstFollowUpSignal = fetchMock.mock.calls.filter(([path]) => path === "/api/workbench/jobs")[1][1].signal as AbortSignal;
+
+    await userEvent.click(secondView.getByRole("button", { name: "View details for beta refresh, job beta" }));
+    const secondDetails = within(secondView.getByRole("dialog", { name: "Job details" }));
+    await userEvent.click(secondDetails.getByRole("button", { name: "Cancel refresh" }));
+    await waitFor(() => expect(reads).toBe(3));
+    expect(secondDetails.getByText("Cancelled")).toBeVisible();
+    expect(firstDetails.getByRole("button", { name: "Cancelling..." })).toBeDisabled();
+    expect(firstFollowUpSignal.aborted).toBe(false);
+
+    await act(async () => { resolveFirstFollowUp(Response.json(cancelled(["alpha"]))); });
+    expect(firstDetails.getByText("Cancelled")).toBeVisible();
+    expect(secondDetails.getByText("Cancelled")).toBeVisible();
+    expect(secondDetails.queryByRole("button", { name: "Cancel refresh" })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([, init]) => init.method === "POST")).toHaveLength(2);
   });
 
   it("filters authorized jobs by their human-readable source", async () => {

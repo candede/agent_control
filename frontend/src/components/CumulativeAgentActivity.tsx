@@ -1,7 +1,10 @@
-import { useState } from "react";
-import { type OfficialUsageOverviewQuery } from "../api/client";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { SortingState } from "@tanstack/react-table";
+import { type OfficialUsageOverviewQuery, type OfficialUsageOverviewView } from "../api/client";
+import { restoreTableSortFocus, useListTable, type ListColumn } from "../listTable";
 import { useOfficialUsageOverview } from "../useOfficialUsageOverview";
 import { usageDate, usagePageLabel } from "../usageInsights";
+import { ListTableHead } from "./ListTableHead";
 import "./cumulativeUsage.css";
 
 const pageSize = 25;
@@ -9,7 +12,9 @@ const orders = [
   { value: "recent", label: "Latest reported activity", sortBy: "lastActivity", sortDirection: "desc" },
   { value: "oldest", label: "Oldest reported activity", sortBy: "lastActivity", sortDirection: "asc" },
   { value: "name", label: "Agent name (A-Z)", sortBy: "agentName", sortDirection: "asc" },
+  { value: "name-desc", label: "Agent name (Z-A)", sortBy: "agentName", sortDirection: "desc" },
 ] as const;
+type OverviewAgent = OfficialUsageOverviewView["agents"]["value"][number];
 
 export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {}, onQueryChange }: {
   revision: number;
@@ -18,9 +23,19 @@ export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {
   onQueryChange?: (query: OfficialUsageOverviewQuery) => void;
 }) {
   const [query, setQuery] = useState(initialQuery);
+  const tableRegion = useRef<HTMLDivElement>(null);
+  const pendingSortFocus = useRef<string | undefined>(undefined);
   const order = orders.find(item => item.sortBy === (query.sortBy ?? "lastActivity")
     && item.sortDirection === (query.sortDirection ?? "desc")) ?? orders[0];
   const { data, loading, error, retry } = useOfficialUsageOverview({ ...query, limit: pageSize }, revision);
+  const sorting: SortingState = [{ id: order.sortBy, desc: order.sortDirection === "desc" }];
+  const columns = useMemo<ListColumn<OverviewAgent>[]>(() => [
+    { id: "agentName", header: "Agent", accessorFn: agent => agent.agentName || agent.agentId },
+    { id: "creatorTypes", header: "Creator types", enableSorting: false },
+    { id: "usageEvidence", header: "Usage evidence", enableSorting: false },
+    { id: "lastActivity", header: "Latest observed activity", accessorFn: agent => agent.lastActivityDateUtc ?? undefined, sortDescFirst: true },
+    { id: "source", header: "Source", enableSorting: false },
+  ], []);
   function update(next: OfficialUsageOverviewQuery) {
     setQuery(next);
     onQueryChange?.(next);
@@ -29,6 +44,28 @@ export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {
     update({ ...next, offset: 0 });
   }
   const filtered = Boolean(query.search || query.startDate || query.endDate);
+  const table = useListTable({
+    data: data?.agents.value ?? [],
+    columns,
+    sorting,
+    manualSorting: true,
+    getRowId: agent => agent.agentId,
+    onSortingChange: updater => {
+      const next = typeof updater === "function" ? updater(sorting) : updater;
+      const selected = next[0];
+      if (!selected || (selected.id !== "agentName" && selected.id !== "lastActivity")) return;
+      pendingSortFocus.current = selected.id;
+      change({ ...query, sortBy: selected.id, sortDirection: selected.desc ? "desc" : "asc" });
+    },
+  });
+
+  useEffect(() => {
+    if (!data || loading || !pendingSortFocus.current) return;
+    const column = columns.find(item => item.id === pendingSortFocus.current);
+    const label = typeof column?.header === "string" ? column.header : undefined;
+    restoreTableSortFocus(tableRegion.current, label);
+    pendingSortFocus.current = undefined;
+  }, [columns, data, loading]);
 
   return <section className="cumulative-agent-activity" aria-label="Cumulative agent activity" aria-busy={loading}>
     <p className="usage-scope-note">All retained imports, not just the latest bundle. Exact agent IDs are deduplicated across Agents and Users &amp; agents exports.
@@ -63,16 +100,19 @@ export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {
     {loading ? <p role="status">Loading retained agent activity...</p> : null}
     {data ? <>
       {!data.summary.retainedSets ? <div className="usage-empty-state"><h3>No retained reports</h3><p>Import the three companion exports to begin collecting activity history. Missing reports do not mean zero tenant usage.</p></div>
-        : data.agents.value.length ? <div className="table-shell cumulative-agent-table" role="region" aria-label="Retained agent activity rows" tabIndex={0}>
-          <table><thead><tr><th scope="col">Agent</th><th scope="col">Creator types</th><th scope="col">Usage evidence</th><th scope="col">Latest observed activity</th><th scope="col">Source</th></tr></thead>
-            <tbody>{data.agents.value.map(agent => <tr key={agent.agentId}>
+        : data.agents.value.length ? <div ref={tableRegion} className="table-shell cumulative-agent-table" role="region" aria-label="Retained agent activity rows" tabIndex={0}>
+          <table><ListTableHead table={table} />
+            <tbody>{table.getRowModel().rows.map(row => {
+              const agent = row.original;
+              return <tr key={row.id}>
               <th scope="row">{agent.agentName || agent.agentId}<small>{agent.agentId}</small></th>
               <td>{agent.creatorTypes.join(", ") || "Not reported"}</td>
               <td>{agent.hasResponses ? "Positive responses reported" : "No positive-response evidence"}<small>{agent.observationCount.toLocaleString()} source observations</small></td>
               <td>{usageDate(agent.lastActivityDateUtc ?? undefined)}</td>
               <td><button type="button" className="secondary" onClick={() => onSnapshot(agent.latestSetId)}
                 aria-label={`View source snapshot for ${agent.agentName || agent.agentId}`}>View source snapshot</button><small>Latest matching import: {usageDate(agent.latestAcceptedAt)}</small></td>
-            </tr>)}</tbody>
+            </tr>;
+            })}</tbody>
           </table>
         </div> : <div className="usage-empty-state"><h3>No retained agents on this page</h3><p>Change the activity filters or return to the first page. Missing evidence is not zero activity.</p></div>}
       <nav className="pagination-controls" aria-label="Retained agent pages">

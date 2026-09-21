@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { X } from "lucide-react";
+import type { SortingState } from "@tanstack/react-table";
 import {
   ApiError,
   getCopilotUsageUsers,
@@ -8,15 +9,32 @@ import {
   type CopilotUsageUser,
   type CopilotUsageUsersResponse,
 } from "../api/client";
+import { useListTable, type ListColumn } from "../listTable";
+import { useSavedRead } from "../savedQueries";
 import type { UsersRouteState } from "../workbenchRouting";
+import { ListTableHead } from "./ListTableHead";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportedUserAgents } from "./ReportedUserAgents";
 import "./copilotUsers.css";
 
 type Cohort = "all" | "attention" | "unknown";
-type Sort = "responses-desc" | "responses-asc" | "name" | "activity";
 type ReadState = { key: object; status: "ready" } | { key: object; status: "failed"; error: string; accessDenied?: boolean };
 const pageSize = 50;
+const defaultLicenseSorting: SortingState = [{ id: "responses", desc: true }];
+const licenseSorts = [
+  ["responses-desc", "Most agent responses", "responses", true],
+  ["responses-asc", "Fewest agent responses", "responses", false],
+  ["name", "Name A–Z", "user", false],
+  ["name-desc", "Name Z–A", "user", true],
+  ["license-asc", "License A–Z", "license", false],
+  ["license-desc", "License Z–A", "license", true],
+  ["agents-desc", "Most reported agents used", "agentsUsed", true],
+  ["agents-asc", "Fewest reported agents used", "agentsUsed", false],
+  ["activity", "Latest agent-report activity", "activity", true],
+  ["activity-asc", "Oldest agent-report activity", "activity", false],
+  ["follow-up-asc", "Follow-up A–Z", "followUp", false],
+  ["follow-up-desc", "Follow-up Z–A", "followUp", true],
+] as const;
 const appFields = [
   ["Copilot Chat", "copilotChatLastActivityDate"],
   ["Teams", "microsoftTeamsCopilotLastActivityDate"],
@@ -44,6 +62,7 @@ export function CopilotUsersView({
   const [selectedUser, setSelectedUser] = useState<{ id: string; threshold: number; key: object }>();
   const activityViewButton = useRef<HTMLButtonElement>(null);
   const directoryRequest = useRef<AbortController | null>(null);
+  const readSaved = useSavedRead();
   const readKey = useMemo(() => ({ dataRevision, reload }), [dataRevision, reload]);
   const scopedRead = read?.key === readKey ? read : undefined;
   const loading = !scopedRead;
@@ -64,7 +83,7 @@ export function CopilotUsersView({
   useEffect(() => {
     const controller = new AbortController();
     directoryRequest.current = controller;
-    void getCopilotUsageUsers({ signal: controller.signal }).then(result => {
+    void readSaved(["copilot-usage-users", dataRevision, reload], signal => getCopilotUsageUsers({ signal }), controller.signal).then(result => {
       if (!controller.signal.aborted) {
         setData(result);
         setRead({ key: readKey, status: "ready" });
@@ -79,7 +98,7 @@ export function CopilotUsersView({
       }
     });
     return () => controller.abort();
-  }, [readKey]);
+  }, [dataRevision, readKey, readSaved, reload]);
 
   return (
     <section className="copilot-users" aria-label="Users and adoption" aria-busy={loading && currentRoute.view === "licenses"}>
@@ -120,7 +139,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
 }) {
   const [search, setSearch] = useState("");
   const [cohort, setCohort] = useState<Cohort>("all");
-  const [sort, setSort] = useState<Sort>("responses-desc");
+  const [sorting, setSorting] = useState<SortingState>(defaultLicenseSorting);
   const [threshold, setThreshold] = useState(5);
   const [page, setPage] = useState(0);
   const directoryKnown = data.sources.directory.state === "available";
@@ -141,19 +160,39 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
       if (cohort === "attention") return directoryCurrent && needsAttention(user, threshold, agentUsageFresh, appActivityFresh);
       if (cohort === "unknown") return responses(user) === null;
       return true;
-    }).sort((a, b) => {
-      if (sort === "name") return name(a).localeCompare(name(b)) || a.directory.objectId.localeCompare(b.directory.objectId);
-      if (sort === "activity") return (b.importedUsage?.userLastActivityDateUtc ?? "").localeCompare(a.importedUsage?.userLastActivityDateUtc ?? "") || name(a).localeCompare(name(b));
-      const left = responses(a);
-      const right = responses(b);
-      if (left === null && right !== null) return 1;
-      if (right === null && left !== null) return -1;
-      return (sort === "responses-asc" ? 1 : -1) * ((left ?? 0) - (right ?? 0)) || name(a).localeCompare(name(b));
     });
-  }, [agentUsageFresh, appActivityFresh, cohort, data.users, directoryCurrent, search, sort, threshold]);
+  }, [agentUsageFresh, appActivityFresh, cohort, data.users, directoryCurrent, search, threshold]);
+  const columns = useMemo<ListColumn<CopilotUsageUser>[]>(() => [
+    { id: "user", header: "User", accessorFn: name },
+    { id: "license", header: "License", accessorFn: licenseLabel },
+    { id: "responses", header: "Agent responses", accessorFn: user => responses(user) ?? undefined, sortDescFirst: true },
+    {
+      id: "agentsUsed", header: "Agents used",
+      accessorFn: user => user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : undefined,
+      sortDescFirst: true,
+    },
+    { id: "activity", header: "Agent-report last activity", accessorFn: user => user.importedUsage?.userLastActivityDateUtc, sortDescFirst: true },
+    {
+      id: "followUp", header: "Follow-up",
+      accessorFn: user => directoryCurrent
+        ? recommendation(user, threshold, agentUsageFresh, appActivityFresh).label
+        : "Verify license inventory",
+    },
+  ], [agentUsageFresh, appActivityFresh, directoryCurrent, threshold]);
+  const table = useListTable({
+    data: filtered,
+    columns,
+    sorting,
+    getRowId: user => user.directory.objectId,
+    onSortingChange: update => {
+      setSorting(previous => typeof update === "function" ? update(previous) : update);
+      setPage(0);
+    },
+  });
+  const sortedRows = table.getRowModel().rows;
   const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
-  const visible = filtered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
 
   function selectCohort(next: Cohort) {
     setCohort(next);
@@ -200,12 +239,13 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
 
     <div className="copilot-users-toolbar" aria-label="Licensed user filters">
       <label><span>Search users or agents</span><input type="search" placeholder="Name, email, company, department or agent" value={search} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
-      <label><span>Order by</span><select value={sort} onChange={event => {
-        const value = event.target.value;
-        if (value === "responses-desc" || value === "responses-asc" || value === "activity" || value === "name") { setSort(value); setPage(0); }
-      }}>
-        <option value="responses-desc">Most agent responses</option><option value="responses-asc">Fewest agent responses</option><option value="activity">Latest agent-report activity</option><option value="name">Name</option>
-      </select></label>
+      <label><span>Order by</span><select value={licenseSorts.find(([, , id, desc]) => id === sorting[0]?.id && desc === sorting[0]?.desc)?.[0]} onChange={event => {
+        const next = licenseSorts.find(([value]) => value === event.target.value);
+        if (next) {
+          setSorting([{ id: next[2], desc: next[3] }]);
+          setPage(0);
+        }
+      }}>{licenseSorts.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       {cohort === "attention" ? <label><span>Low agent usage threshold</span><select value={threshold} onChange={event => { setThreshold(Number(event.target.value)); setPage(0); }}>
         {[5, 10, 20, 50].map(value => <option key={value} value={value}>{value} responses or fewer</option>)}
       </select></label> : null}
@@ -214,10 +254,11 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
 
     {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="Licensed users" tabIndex={0}>
       <table className="copilot-users-table">
-        <thead><tr><th scope="col">User</th><th scope="col">License</th><th scope="col">Agent responses</th><th scope="col">Agents used</th><th scope="col">Agent-report last activity</th><th scope="col">Follow-up</th></tr></thead>
-        <tbody>{visible.map(user => {
+        <ListTableHead table={table} />
+        <tbody>{visible.map(row => {
+          const user = row.original;
           const followUp = directoryCurrent ? recommendation(user, threshold, agentUsageFresh, appActivityFresh) : { label: "Verify license inventory", tone: "unknown" };
-          return <tr key={user.directory.objectId}>
+          return <tr key={row.id}>
             <td><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => onInspectUser(user, threshold)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</td>
             <td><span className={`copilot-user-badge ${directoryCurrent ? licenseIssue(user) ? "attention" : "" : "unknown"}`}>{directoryCurrent ? licenseLabel(user) : `Last saved: ${licenseLabel(user)}`}</span></td>
             <td data-numeric>{formatCount(responses(user))}{!agentUsageFresh && responses(user) !== null ? <small>Historical report</small> : null}</td>
@@ -267,23 +308,46 @@ function UnlinkedReportIdentities({ identities, onViewReportedUser }: {
 }) {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
+  const [sorting, setSorting] = useState<SortingState>([{ id: "identity", desc: false }]);
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return identities.filter(row => !query || [row.importedUsage.displayName, row.importedUsage.username]
       .some(value => value.toLowerCase().includes(query)));
   }, [identities, search]);
+  const columns = useMemo<ListColumn<CopilotUsageUsersResponse["unresolvedImportedIdentities"][number]>[]>(() => [
+    { id: "identity", header: "Reported identity", accessorFn: row => row.importedUsage.displayName || row.importedUsage.username },
+    {
+      id: "responses", header: "Responses (Users report)",
+      accessorFn: row => row.importedUsage.missingUserReport ? undefined : row.importedUsage.reportedResponsesReceived,
+      sortDescFirst: true,
+    },
+    { id: "license", header: "Current license", enableSorting: false },
+    { id: "activity", header: "Reported activity", enableSorting: false },
+  ], []);
+  const table = useListTable({
+    data: filtered,
+    columns,
+    sorting,
+    getRowId: row => JSON.stringify([row.importedUsage.datasetScope, row.importedUsage.username]),
+    onSortingChange: update => {
+      setSorting(previous => typeof update === "function" ? update(previous) : update);
+      setPage(0);
+    },
+  });
+  const sortedRows = table.getRowModel().rows;
   const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
-  const visible = filtered.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
   return <details className="copilot-users-provenance">
     <summary>Unlinked report identities ({identities.length.toLocaleString()})</summary>
     <p>These report identities cannot be linked uniquely to a currently licensed directory user. They may be concealed, renamed or no longer licensed; no license status is inferred. Every identity is available below.</p>
     <div className="copilot-users-toolbar"><label><span>Search unlinked report identities</span><input type="search" value={search} maxLength={256} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label></div>
     {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="Unlinked report identities" tabIndex={0}>
-      <table className="copilot-users-table"><thead><tr><th scope="col">Reported identity</th><th scope="col">Responses (Users report)</th><th scope="col">Current license</th><th scope="col">Reported activity</th></tr></thead>
-        <tbody>{visible.map(row => {
+      <table className="copilot-users-table"><ListTableHead table={table} />
+        <tbody>{visible.map(tableRow => {
+          const row = tableRow.original;
           const reportSetId = row.importedUsage.datasetScope.reportSetId;
-          return <tr key={JSON.stringify([row.importedUsage.datasetScope, row.importedUsage.username])}>
+          return <tr key={tableRow.id}>
             <td>{row.importedUsage.displayName || row.importedUsage.username}<small>{row.importedUsage.username}</small></td>
             <td>{row.importedUsage.missingUserReport ? "Unknown" : row.importedUsage.reportedResponsesReceived.toLocaleString()}</td>
             <td>Unknown</td>

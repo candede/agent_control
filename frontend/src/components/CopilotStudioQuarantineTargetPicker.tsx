@@ -1,6 +1,7 @@
 import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Eye, RefreshCw, X } from "lucide-react";
-import { getQuarantineTargets, type QuarantineTargetCandidate, type QuarantineTargetPage } from "../api/client";
+import { ApiError, getQuarantineTargets, type QuarantineTargetCandidate, type QuarantineTargetPage } from "../api/client";
+import { useSavedRead } from "../savedQueries";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { parsePowerPlatformRoute } from "../workbenchRouting";
 
@@ -17,8 +18,10 @@ export function CopilotStudioQuarantineTargetPicker({ initialJobId }: { initialJ
   const [detailSelection, setDetailSelection] = useState<{ snapshotId: string; target: QuarantineTargetCandidate }>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [accessDenied, setAccessDenied] = useState(false);
   const deferredSearch = useDeferredValue(search.trim());
   const requestId = useRef(0);
+  const readSaved = useSavedRead();
   const selected = selection && selection.snapshotId === page?.snapshot?.id ? selection.targets : noTargets;
   const detail = detailSelection && detailSelection.snapshotId === page?.snapshot?.id ? detailSelection.target : undefined;
 
@@ -30,24 +33,44 @@ export function CopilotStudioQuarantineTargetPicker({ initialJobId }: { initialJ
 
   useEffect(() => {
     const currentRequest = ++requestId.current;
+    const controller = new AbortController();
+    let correctingOffset = false;
+    const query = { ...(deferredSearch ? { search: deferredSearch } : {}), limit: pageSize, offset };
     void Promise.resolve().then(() => {
-      if (requestId.current !== currentRequest) return;
+      if (controller.signal.aborted || requestId.current !== currentRequest) return;
       setLoading(true);
       setError(undefined);
-      return getQuarantineTargets({ ...(deferredSearch ? { search: deferredSearch } : {}), limit: pageSize, offset });
+      return readSaved(["quarantine-targets", query, reload], signal =>
+        getQuarantineTargets(query, { signal }), controller.signal);
     }).then(result => {
       if (!result) return;
-      if (requestId.current !== currentRequest) return;
+      if (controller.signal.aborted || requestId.current !== currentRequest) return;
       const lastOffset = Math.max(Math.ceil(result.count / pageSize) - 1, 0) * pageSize;
-      if (offset > lastOffset) setOffset(lastOffset);
+      if (offset > lastOffset) {
+        correctingOffset = true;
+        setPage(undefined);
+        setOffset(lastOffset);
+        return;
+      }
       setPage(result);
+      setAccessDenied(false);
     }).catch(requestError => {
-      if (requestId.current === currentRequest) setError(errorMessage(requestError));
+      if (controller.signal.aborted || requestId.current !== currentRequest) return;
+      if (requestError instanceof ApiError && (requestError.status === 401 || requestError.status === 403)) {
+        setAccessDenied(true);
+        setPage(undefined);
+        setSelection(undefined);
+        setDetailSelection(undefined);
+      }
+      setError(errorMessage(requestError));
     }).finally(() => {
-      if (requestId.current === currentRequest) setLoading(false);
+      if (!controller.signal.aborted && !correctingOffset && requestId.current === currentRequest) setLoading(false);
     });
-    return () => { if (requestId.current === currentRequest) requestId.current += 1; };
-  }, [deferredSearch, offset, reload]);
+    return () => {
+      controller.abort();
+      if (requestId.current === currentRequest) requestId.current += 1;
+    };
+  }, [deferredSearch, offset, readSaved, reload]);
 
   function toggle(target: QuarantineTargetCandidate) {
     const currentSnapshotId = page?.snapshot?.id;
@@ -81,8 +104,8 @@ export function CopilotStudioQuarantineTargetPicker({ initialJobId }: { initialJ
     </section>
     {error ? <p className="error-banner" role="alert">{error}</p> : null}
     {page?.snapshot ? <div className="inventory-source-note"><strong>Saved target source</strong><span>Observed {formatDate(page.snapshot.observedAt)}. Direct status is checked separately and never overwrites this inventory observation.</span></div> : null}
-    <CopilotStudioQuarantineControls snapshot={page?.snapshot ?? null} targets={[...selected.values()]} variant="bulk" canManage onClear={clearSelection} initialJobId={routeJobId} />
-    {loading && !page ? <div className="screen-state">Loading saved quarantine targets...</div> : !page?.snapshot ? <div className="empty-state"><h2>No current saved targets</h2><p>Run an explicit Copilot Studio inventory refresh for this same account before control targets are available.</p></div> : page.value.length === 0 ? <div className="empty-state"><h2>No matching targets</h2><p>The current saved snapshot contains no matching Copilot Studio control targets.</p></div> : <>
+    {!accessDenied ? <CopilotStudioQuarantineControls snapshot={page?.snapshot ?? null} targets={[...selected.values()]} variant="bulk" canManage onClear={clearSelection} initialJobId={routeJobId} /> : null}
+    {loading && !page ? <div className="screen-state">Loading saved quarantine targets...</div> : !page && error ? null : !page?.snapshot ? <div className="empty-state"><h2>No current saved targets</h2><p>Run an explicit Copilot Studio inventory refresh for this same account before control targets are available.</p></div> : page.value.length === 0 ? <div className="empty-state"><h2>No matching targets</h2><p>The current saved snapshot contains no matching Copilot Studio control targets.</p></div> : <>
       <div className="inventory-pagination"><span>{page.count ? `${offset + 1}-${Math.min(offset + pageSize, page.count)} of ${page.count}` : "0 targets"}</span><div><button type="button" className="icon-button" aria-label="Previous quarantine target page" disabled={offset === 0 || loading} onClick={() => setOffset(value => Math.max(0, value - pageSize))}><ChevronLeft aria-hidden="true" /></button><span>Page {pageNumber} of {pageCount}</span><button type="button" className="icon-button" aria-label="Next quarantine target page" disabled={offset + pageSize >= page.count || loading} onClick={() => setOffset(value => value + pageSize)}><ChevronRight aria-hidden="true" /></button></div></div>
       <div className="table-shell inventory-table quarantine-target-table"><table><thead><tr><th className="inventory-select"><span className="sr-only">Select targets</span></th><th>Agent</th><th>Native environment</th><th>Native CDS bot</th><th>Saved state</th><th>Package control</th><th>Eligibility</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{page.value.map(target => { const chosen = selected.has(target.nativeId); return <tr key={target.nativeId}><td className="inventory-select"><input type="checkbox" aria-label={`Select ${target.displayName} for quarantine control`} checked={chosen} disabled={!target.quarantineEligibility.eligible || (!chosen && selected.size >= 25)} title={target.quarantineEligibility.reason} onChange={() => toggle(target)} /></td><td><strong>{target.displayName}</strong><small>{target.nativeId}</small></td><td>{target.environmentId ?? "Unavailable"}</td><td>{target.botId ?? "Unavailable"}</td><td>{savedState(target)}</td><td>Not linked; independent</td><td>{target.quarantineEligibility.eligible ? "Exact target" : target.quarantineEligibility.reason ?? "Unavailable"}</td><td><button type="button" className="icon-button" aria-label={`Inspect direct status for ${target.displayName}`} title="Inspect direct quarantine status" disabled={!target.quarantineEligibility.eligible} onClick={() => inspect(target)}><Eye aria-hidden="true" /></button></td></tr>; })}</tbody></table></div>
     </>}

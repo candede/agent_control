@@ -493,7 +493,7 @@ test("sync history rewrites legacy sync-run links and opens retained details in 
   const table = history.getByRole("table", { name: "Sync run history" });
   await expect(table).toBeVisible();
   await expect(table.getByRole("row")).toHaveCount(2);
-  await expect(table.getByRole("button")).toHaveCount(0);
+  await expect(table.getByRole("button", { name: /Retry|Cancel|Resume/ })).toHaveCount(0);
   await history.scrollIntoViewIfNeeded();
   await history.screenshot({ path: info.outputPath("sync-history-table.png") });
   const link = history.getByRole("link", { name: /View details for Retained initial sync/ });

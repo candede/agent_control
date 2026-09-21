@@ -21,6 +21,7 @@ import {
   type UnifiedAgentRecord,
 } from "./api/client";
 import { storePackageSelection } from "./packageSelectionSession";
+import * as savedQueries from "./savedQueries";
 import { mockNativeDialogs } from "./test/dialog";
 import { copilotUsageFixture } from "./test/copilotUsageFixture";
 import { usageAggregateFixture, usageAgentDetailFixture, usageOverviewFixture, usageUsersFixture } from "./test/usageInsightsFixture";
@@ -301,6 +302,426 @@ describe("App session revalidation", () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it.each(["package-summaries", "inventory-refresh-jobs", "official-usage-aggregate", "package-detail"] as const)(
+    "does not reattach a post-action %s read to another observer's pre-action request",
+    async resource => {
+      const usage = resource === "official-usage-aggregate";
+      const detail = resource === "package-detail";
+      window.history.replaceState({}, "", usage ? "/official-usage?view=snapshot" : detail ? "/agents" : "/sync");
+      const client = savedQueries.createSavedQueryClient();
+      const admittedKeys = new Map<string, readonly unknown[]>();
+      const unsubscribe = client.getQueryCache().subscribe(event => {
+        const name = event.query.queryKey[1];
+        if (event.type === "added" && typeof name === "string" && !admittedKeys.has(name)) {
+          admittedKeys.set(name, event.query.queryKey);
+        }
+      });
+      vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      if (detail) {
+        await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+      }
+      await waitFor(() => expect(admittedKeys.has(resource)).toBe(true));
+      await waitFor(() => expect(client.isFetching({ queryKey: ["saved", resource] })).toBe(0));
+      const key = admittedKeys.get(resource)!;
+      const retained = deferredResponse();
+      const controller = new AbortController();
+      let retainedSignal: AbortSignal | undefined;
+      const peer = savedQueries.readSavedQuery(client, key.slice(1), signal => {
+        retainedSignal = signal;
+        return retained.promise.then(response => response.json());
+      }, controller.signal).then(value => ({ value }), error => ({ error }));
+      const path = detail ? `/api/agents/${agent.id}` : resource === "package-summaries" ? "/api/agents"
+        : usage ? "/api/official-usage/aggregate" : "/api/inventory/refresh-jobs";
+      const reads = () => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === path).length;
+      const before = reads();
+      try {
+        if (usage) {
+          await userEvent.click(screen.getByRole("button", { name: "Snapshot details" }));
+        } else {
+          if (detail) await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+          await userEvent.click(await screen.findByText("View diagnostics"));
+          await userEvent.click(screen.getByRole("button", { name: "Verify saved inventory" }));
+          if (detail) {
+            await waitFor(() => expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled());
+            await userEvent.click(screen.getByRole("button", { name: "Browse agents" }));
+            await userEvent.click(await screen.findByRole("button", { name: `View details for ${agent.displayName}` }));
+          }
+        }
+        await waitFor(() => expect(reads()).toBe(before + 1));
+        expect(retainedSignal?.aborted).toBe(false);
+        const oldData = usage ? usageAggregateFixture() : detail ? agent
+          : resource === "package-summaries" ? packagePage : { value: [], lastAttemptAt: null, lastSuccessAt: null };
+        await act(async () => retained.resolve(Response.json(oldData)));
+        expect(await peer).toEqual({ value: oldData });
+      } finally {
+        controller.abort();
+        unsubscribe();
+        await peer;
+      }
+    },
+  );
+
+  it("passes completed Power Platform sync revisions through remounts without rejoining a retained read", async () => {
+    window.history.replaceState({}, "", "/power-platform");
+    const client = savedQueries.createSavedQueryClient();
+    const resourceKeys = new Map<string, readonly unknown[]>();
+    const unsubscribe = client.getQueryCache().subscribe(event => {
+      if (event.type === "added" && event.query.queryKey[1] === "inventory-resources") {
+        resourceKeys.set(event.query.queryHash, event.query.queryKey);
+      }
+    });
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const resourcePage = { value: [], count: 0, typeCounts: [], snapshot: null };
+    let completed = false;
+    let stateReads = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input.startsWith("/api/inventory/resources")) return Response.json(resourcePage);
+      if (input.startsWith("/api/inventory/snapshots")) return Response.json({ value: [] });
+      if (input === "/api/data-sync/state") {
+        stateReads += 1;
+        return Response.json({
+          onboardingRequired: false, usageImportRequired: false, run: null,
+          sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
+            source, status: "succeeded", jobId: null, count: completed && source === "power_platform" ? 2 : 1,
+            lastSuccessAt: completed && source === "power_platform" ? "2026-09-15T09:00:00.000Z" : "2026-09-15T08:00:00.000Z",
+            updatedAt: "2026-09-15T08:00:00.000Z", message: "", canRetry: false,
+          })),
+        });
+      }
+      if (input === "/api/workbench/jobs") return Response.json({
+        value: [{
+          id: "power-platform-sync", source: "data-sync", label: "Power Platform sync", target: "Power Platform source",
+          status: "partial", total: 1, completed: 0, partial: true,
+          canResume: true, canCancel: false, canReconcile: false,
+          updatedAt: "2026-09-15T08:00:00.000Z", href: "/sync?syncRun=power-platform-sync",
+        }],
+        unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "jobs-projection",
+      });
+      if (input === "/api/data-sync/runs/power-platform-sync/retry") {
+        completed = true;
+        return Response.json({ id: "power-platform-sync" });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await waitFor(() => {
+      expect(resourceKeys.size).toBe(1);
+      expect(client.isFetching({ queryKey: ["saved", "inventory-resources"] })).toBe(0);
+      expect(stateReads).toBe(1);
+    });
+    const retained = deferredResponse();
+    const controller = new AbortController();
+    let retainedSignal: AbortSignal | undefined;
+    const peer = savedQueries.readSavedQuery(client, [...resourceKeys.values()][0].slice(1), signal => {
+      retainedSignal = signal;
+      return retained.promise.then(response => response.json());
+    }, controller.signal).then(value => ({ value }), error => ({ error }));
+    const resourceReads = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/inventory/resources")).length;
+    const before = resourceReads();
+    const beforeCalls = transport.fetchMock.mock.calls.length;
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "Jobs" }));
+      await userEvent.click(await screen.findByRole("button", { name: name => name.endsWith(", job power-platform-sync") }));
+      const details = within(screen.getByRole("dialog", { name: "Job details" }));
+      await userEvent.click(details.getByRole("button", { name: "Retry incomplete" }));
+      await waitFor(() => expect(stateReads).toBe(2));
+      await userEvent.click(details.getAllByRole("button", { name: /close/i })[0]);
+      await userEvent.click(screen.getByRole("button", { name: "Power Platform" }));
+      await waitFor(() => expect(resourceReads()).toBe(before + 1));
+      expect([...resourceKeys.values()].map(key => key.at(-1))).toEqual([
+        expect.objectContaining({ dataRevision: 0 }),
+        expect.objectContaining({ dataRevision: 1 }),
+      ]);
+      expect(retainedSignal?.aborted).toBe(false);
+      await act(async () => retained.resolve(Response.json(resourcePage)));
+      expect(await peer).toEqual({ value: resourcePage });
+      expect(transport.fetchMock.mock.calls.slice(beforeCalls)
+        .filter(([, init]) => init?.method && init.method !== "GET")
+        .map(([input]) => input)).toEqual(["/api/data-sync/runs/power-platform-sync/retry"]);
+    } finally {
+      controller.abort();
+      unsubscribe();
+      await peer;
+    }
+  });
+
+  it("does not reopen a signed-out workbench from a superseded StrictMode bootstrap", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const firstSetup = deferredResponse();
+    let setupReads = 0;
+    let firstSignal: AbortSignal | null | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/auth/status" && ++setupReads === 1) {
+        firstSignal = init?.signal;
+        return firstSetup.promise;
+      }
+      if (input === "/api/auth/logout") return new Response(null, { status: 204 });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />, { reactStrictMode: true });
+    await screen.findByText(agent.displayName);
+    expect(setupReads).toBe(2);
+    expect(firstSignal?.aborted).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByRole("link", { name: "Sign in with Entra ID" });
+    await act(async () => firstSetup.resolve(Response.json({ authConfigured: true })));
+    expect(screen.getByRole("link", { name: "Sign in with Entra ID" })).toBeInTheDocument();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(firstSignal?.aborted).toBe(true);
+    expect(transport.meCalls()).toBe(1);
+  });
+
+  it("reloads capability evidence for a batched same-principal session revalidation", async () => {
+    window.history.replaceState({}, "", "/permissions");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let catalogReads = 0;
+    const pending = deferredResponse();
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/capabilities" && ++catalogReads > 1) return pending.promise;
+      if (input.startsWith("/api/capabilities/check")) return base("/api/capabilities", init);
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText("Provider check succeeded");
+    await revalidateTransportSession(transport);
+    expect(catalogReads).toBe(2);
+    expect(screen.queryByText("Provider check succeeded")).not.toBeInTheDocument();
+    await act(async () => pending.resolve(Response.json({ value: [] })));
+  });
+
+  it.each(["unified inventory", "package summaries", "refresh history"] as const)(
+    "purges saved agent data on a denied %s read and fences outstanding successes",
+    async deniedSource => {
+      const client = savedQueries.createSavedQueryClient();
+      let agentOwner: unknown;
+      const unsubscribe = client.getQueryCache().subscribe(event => {
+        if (event.query.queryKey[1] === "package-summaries") agentOwner = event.query.queryKey[2];
+      });
+      vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      let deny = false;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (deny) {
+          const pathname = new URL(input, "http://localhost").pathname;
+          const deniedPath = deniedSource === "unified inventory" ? "/api/agent-inventory"
+            : deniedSource === "package summaries" ? "/api/agents" : "/api/inventory/refresh-jobs";
+          if (pathname === deniedPath) return Response.json({ code: "forbidden", detail: "Saved agent access denied." }, { status: 403 });
+          if (pathname === "/api/agent-inventory") return pending.promise;
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+      const peerKey = deniedSource === "refresh history"
+        ? ["inventory-refresh-jobs", { dataRevision: 0, reload: "independent-owner" }]
+        : ["official-usage-overview", "independent-owner"];
+      const cached = { records: ["retained report"] };
+      client.setQueryData(["saved", ...peerKey], cached);
+      const peerResponse = deferredResponse();
+      const peerController = new AbortController();
+      let peerSignal: AbortSignal | undefined;
+      const peer = savedQueries.readSavedQuery(client, peerKey, signal => {
+        peerSignal = signal;
+        return peerResponse.promise.then(response => response.json());
+      }, peerController.signal).then(value => ({ value }), error => ({ error }));
+      expect(agentOwner).toEqual(expect.any(String));
+      const agentKey = [deniedSource === "package summaries" ? "unified-agent-detail" : "package-detail", agentOwner, agent.id, 0];
+      client.setQueryData(["saved", ...agentKey], { private: true });
+      const agentResponse = deferredResponse();
+      const agentController = new AbortController();
+      let agentSignal: AbortSignal | undefined;
+      const agentPeer = savedQueries.readSavedQuery(client, agentKey, signal => {
+        agentSignal = signal;
+        return agentResponse.promise.then(response => response.json());
+      }, agentController.signal).then(value => ({ value }), error => ({ error }));
+      const unrelatedReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+        ["/api/capabilities", "/api/workbench/metadata", "/api/data-sync/state"].includes(input)).length;
+      const before = unrelatedReads();
+      try {
+        deny = true;
+        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+        await screen.findByText(/Saved agent access denied/);
+        expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+        expect(peerSignal?.aborted).toBe(false);
+        expect(client.getQueryData(["saved", ...peerKey])).toEqual(cached);
+        expect(agentSignal?.aborted).toBe(true);
+        expect(await agentPeer).toMatchObject({ error: { code: "request_aborted" } });
+        expect(client.getQueryData(["saved", ...agentKey])).toBeUndefined();
+        expect(unrelatedReads()).toBe(before);
+        await act(async () => {
+          pending.resolve(Response.json(unifiedPage));
+          peerResponse.resolve(Response.json(cached));
+          agentResponse.resolve(Response.json({ private: true }));
+        });
+        expect(await peer).toEqual({ value: cached });
+        expect(client.getQueryData(["saved", ...agentKey])).toBeUndefined();
+        expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+        expect(transport.meCalls()).toBe(1);
+        deny = false;
+        await userEvent.click(await screen.findByRole("button", { name: "Reload saved agent inventory" }));
+        await screen.findByText(agent.displayName);
+      } finally {
+        pending.resolve(Response.json(unifiedPage));
+        peerController.abort();
+        agentController.abort();
+        unsubscribe();
+        await peer;
+        await agentPeer;
+      }
+    },
+  );
+
+  it("retains the loaded report summary when an unrelated saved agent read is forbidden", async () => {
+    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const denied = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) =>
+      new URL(input, "http://localhost").pathname === "/api/agents" ? denied.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const summary = await screen.findByRole("region", { name: "Usage summary" });
+    await act(async () => denied.resolve(Response.json({
+      code: "forbidden", detail: "Saved agent access denied.",
+    }, { status: 403 })));
+    await screen.findByText(/Saved agent access denied/);
+    expect(screen.getByRole("region", { name: "Usage summary" })).toBe(summary);
+    expect(transport.meCalls()).toBe(1);
+  });
+
+  it("preserves an open Sync workflow when a concurrent saved agent read is forbidden", async () => {
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const denied = deferredResponse();
+    let deny = false;
+    transport.fetchMock.mockImplementation((input, init) =>
+      deny && new URL(input, "http://localhost").pathname === "/api/agents" ? denied.promise : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByText("View diagnostics"));
+    const verify = screen.getByRole("button", { name: "Verify saved inventory" });
+    await waitFor(() => expect(verify).toBeEnabled());
+    deny = true;
+    await userEvent.click(verify);
+    await userEvent.click(screen.getByRole("button", { name: "Reset saved data..." }));
+    const dialog = screen.getByRole("dialog", { name: "Reset saved data" });
+    const acknowledged = within(dialog).getByRole("checkbox");
+    await userEvent.click(acknowledged);
+    await act(async () => denied.resolve(Response.json({
+      code: "forbidden", detail: "Saved agent access denied.",
+    }, { status: 403 })));
+    await screen.findAllByText(/Saved agent access denied/);
+    expect(screen.getByRole("dialog", { name: "Reset saved data" })).toBe(dialog);
+    expect(acknowledged).toBeChecked();
+    expect(transport.fetchMock.mock.calls.some(([input, init]) =>
+      input === "/api/data-sync/runs" && init?.method === "POST")).toBe(false);
+  });
+
+  it.each(["success", "failure"] as const)("fences a late agent export %s after scoped denial and recovery", async outcome => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const previousExport = deferredResponse();
+    const currentExport = deferredResponse();
+    let deny = false;
+    let exports = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const path = new URL(input, "http://localhost").pathname;
+      if (path === "/api/agent-inventory/export.csv") return ++exports === 1 ? previousExport.promise : currentExport.promise;
+      if (deny && path === "/api/agents") return Promise.resolve(Response.json({
+        code: "forbidden", detail: "Saved agent access denied.",
+      }, { status: 403 }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const startExport = async () => {
+      const button = screen.getByRole("button", { name: "Export agent inventory CSV" });
+      await waitFor(() => expect(button).toBeEnabled());
+      await userEvent.click(button);
+      await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
+    };
+    try {
+      await startExport();
+      await waitFor(() => expect(exports).toBe(1));
+      deny = true;
+      fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+      await screen.findByText(/Saved agent access denied/);
+      deny = false;
+      await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+      await screen.findByText(agent.displayName);
+      await startExport();
+      await waitFor(() => expect(exports).toBe(2));
+      await act(async () => previousExport.resolve(outcome === "success"
+        ? new Response("superseded private CSV")
+        : Response.json({ detail: "Superseded export failure" }, { status: 503 })));
+      expect(download.filenames).toEqual([]);
+      expect(screen.queryByText("Superseded export failure")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Exporting agent inventory CSV" })).toBeDisabled();
+      await act(async () => currentExport.resolve(new Response("current CSV")));
+      await waitFor(() => expect(download.filenames).toEqual(["agents.csv"]));
+      expect(transport.meCalls()).toBe(1);
+    } finally {
+      previousExport.resolve(new Response("superseded private CSV"));
+      currentExport.resolve(new Response("current CSV"));
+    }
+  });
+
+  it.each([
+    { status: 401, code: undefined },
+    { status: 403, code: undefined },
+    { status: 401, code: "unauthorized" },
+    { status: 403, code: "missing_internal_role" },
+  ])("purges the workbench and all peers for a global $status denial ($code)", async ({ status, code }) => {
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const transport = appTransport({ revalidatedRoles: [], deferRevalidation: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let deny = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (deny && input === "/api/agents") return code
+        ? Response.json({ code }, { status }) : new Response("Unreadable denial", { status });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const key = ["official-usage-overview", "independent-owner"];
+    client.setQueryData(["saved", ...key], { records: ["private report"] });
+    const pending = deferredResponse();
+    const controller = new AbortController();
+    let signal: AbortSignal | undefined;
+    const peer = savedQueries.readSavedQuery(client, key, currentSignal => {
+      signal = currentSignal;
+      return pending.promise.then(response => response.json());
+    }, controller.signal).then(value => ({ value }), error => ({ error }));
+    deny = true;
+    await act(async () => { await expect(getAgents()).rejects.toMatchObject({ status, code: code ?? "request_failed" }); });
+    expect(signal?.aborted).toBe(true);
+    expect(await peer).toMatchObject({ error: { code: "request_aborted" } });
+    expect(client.getQueryData(["saved", ...key])).toBeUndefined();
+    pending.resolve(Response.json({ records: ["late private report"] }));
+    controller.abort();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    await act(async () => transport.releaseRevalidation());
+    await screen.findByRole("heading", { name: "Permissions" });
   });
 
   it("collects missing identities once and replaces duplicate source rows with one agent", async () => {
@@ -3126,6 +3547,57 @@ describe("App session revalidation", () => {
     expect(exactCalls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
   });
 
+  it.each(["current", "historical"] as const)("hides a superseded %s snapshot summary until the new revision loads", async scope => {
+    const data = usageAggregateFixture();
+    window.history.replaceState({}, "", scope === "current"
+      ? "/official-usage?view=snapshot" : `/official-usage?snapshot=${data.activeSet!.id}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let reads = 0;
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (input.startsWith("/api/official-usage/aggregate?")) {
+        return ++reads === 2 ? pending.promise : Promise.resolve(Response.json(data));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("region", { name: "Usage summary" })).toHaveTextContent("270");
+    await userEvent.click(screen.getByRole("button", { name: "Snapshot details" }));
+    await waitFor(() => expect(reads).toBe(2));
+    expect(screen.queryByRole("region", { name: "Usage summary" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
+    await act(async () => pending.resolve(Response.json({
+      code: "service_unavailable", detail: "New snapshot revision unavailable.",
+    }, { status: 503 })));
+    expect(await screen.findByRole("alert")).toHaveTextContent("New snapshot revision unavailable.");
+    expect(screen.queryByRole("region", { name: "Usage summary" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Showing the last loaded data for retained set/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry report" }));
+    expect(await screen.findByRole("region", { name: "Usage summary" })).toHaveTextContent("270");
+  });
+
+  it("keeps the same-revision snapshot summary when an ordinary filter read fails", async () => {
+    window.history.replaceState({}, "", "/official-usage?view=snapshot");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      return url.pathname === "/api/official-usage/aggregate" && url.searchParams.has("search")
+        ? Promise.resolve(Response.json({ code: "service_unavailable", detail: "Filter read unavailable." }, { status: 503 }))
+        : base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("region", { name: "Usage summary" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "Researcher" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("Filter read unavailable.");
+    expect(screen.getByRole("region", { name: "Usage summary" })).toHaveTextContent("270");
+    expect(screen.getByText(/The last loaded summary is shown/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
+  });
+
   it("keeps response totals snapshot-specific while inventory and cumulative activity have separate scopes", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -3347,6 +3819,48 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
   });
 
+  it.each(["accepted", "uncertain"] as const)("refreshes the hidden saved-sync workspace after %s retry and cancel from the full Jobs view", async outcome => {
+    window.history.replaceState({}, "", "/jobs");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/workbench/jobs") return Response.json({
+        value: [{
+          id: "sync-from-jobs", source: "data-sync", label: "Retained partial sync", target: "4 saved-data sources",
+          status: "partial", total: 4, completed: 2, partial: true,
+          canResume: true, canCancel: true, canReconcile: false,
+          updatedAt: "2026-09-15T08:00:00.000Z", href: "/sync?syncRun=sync-from-jobs",
+        }],
+        unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "jobs-projection",
+      });
+      if (input === "/api/data-sync/runs/sync-from-jobs/retry" || input === "/api/data-sync/runs/sync-from-jobs/cancel") {
+        return outcome === "uncertain"
+          ? Response.json({ code: "service_unavailable", detail: "Command outcome is unknown." }, { status: 503 })
+          : Response.json({ id: "sync-from-jobs" });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: name => name.endsWith(", job sync-from-jobs") }));
+    const details = within(screen.getByRole("dialog", { name: "Job details" }));
+    const stateReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/state").length;
+    await waitFor(() => expect(stateReads()).toBe(1));
+    expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
+    const before = transport.fetchMock.mock.calls.length;
+    await userEvent.click(details.getByRole("button", { name: "Retry incomplete" }));
+    await waitFor(() => expect(stateReads()).toBe(2));
+    await waitFor(() => expect(details.getByRole("button", { name: "Cancel run" })).toBeEnabled());
+    await userEvent.click(details.getByRole("button", { name: "Cancel run" }));
+    await waitFor(() => expect(stateReads()).toBe(3));
+    expect(transport.fetchMock.mock.calls.slice(before)
+      .filter(([, init]) => init?.method && init.method !== "GET")
+      .map(([input]) => input)).toEqual([
+      "/api/data-sync/runs/sync-from-jobs/retry",
+      "/api/data-sync/runs/sync-from-jobs/cancel",
+    ]);
+  });
+
   it("prepares each bulk access target before requesting the server confirmation", async () => {
     const transport = accessEditorTransport();
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -3366,14 +3880,18 @@ describe("App session revalidation", () => {
     expect(calls.some(([path]) => String(path).endsWith("/access"))).toBe(false);
   });
 
-  it.each(["navigation", "session revalidation"] as const)(
+  it.each(["navigation", "session revalidation", "scoped agent denial"] as const)(
     "discards a delayed bulk preview after %s",
     async scenario => {
       const transport = accessEditorTransport();
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
       let preview: Response | undefined;
+      let deny = false;
       transport.fetchMock.mockImplementation(async (input, init) => {
+        if (deny && new URL(input, "http://localhost").pathname === "/api/agents") {
+          return Response.json({ code: "forbidden", detail: "Saved agent access denied." }, { status: 403 });
+        }
         if (input === "/api/agents/mutation-preview") {
           preview = await base(input, init);
           return pending.promise;
@@ -3387,6 +3905,13 @@ describe("App session revalidation", () => {
       await waitFor(() => expect(preview).toBeDefined());
       if (scenario === "navigation") {
         await userEvent.click(screen.getByRole("button", { name: "Permissions" }));
+      } else if (scenario === "scoped agent denial") {
+        deny = true;
+        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+        await screen.findByText(/Saved agent access denied/);
+        deny = false;
+        await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+        await screen.findByText(agent.displayName);
       } else {
         await revalidateTransportSession(transport.session);
       }
@@ -3417,15 +3942,23 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("dialog", { name: /^unblock package/i })).toBeInTheDocument();
   });
 
-  it.each(["single", "bulk"] as const)(
-    "does not track a delayed %s mutation response in a revalidated session",
-    async scope => {
+  it.each([
+    ["single", "session revalidation"], ["bulk", "session revalidation"],
+    ["single", "scoped agent denial"], ["bulk", "scoped agent denial"],
+  ] as const)(
+    "does not track a delayed %s mutation response after %s",
+    async (scope, boundary) => {
       const transport = accessEditorTransport();
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
       const endpoint = scope === "single" ? `/api/agents/${agent.id}/block` : "/api/agents/block";
-      transport.fetchMock.mockImplementation(async (input, init) =>
-        input === endpoint ? pending.promise : base(input, init));
+      let deny = false;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (deny && new URL(input, "http://localhost").pathname === "/api/agents") {
+          return Response.json({ code: "forbidden", detail: "Saved agent access denied." }, { status: 403 });
+        }
+        return input === endpoint ? pending.promise : base(input, init);
+      });
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
       if (scope === "single") {
@@ -3436,23 +3969,38 @@ describe("App session revalidation", () => {
       }
       await userEvent.click(await screen.findByRole("button", { name: "Confirm block" }));
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === endpoint)).toBe(true));
-      await revalidateTransportSession(transport.session);
+      if (boundary === "session revalidation") await revalidateTransportSession(transport.session);
+      else {
+        deny = true;
+        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+        await screen.findByText(/Saved agent access denied/);
+        deny = false;
+        await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+        await screen.findByText(agent.displayName);
+      }
       await act(async () => pending.resolve(Response.json(waitingBulkJob())));
       expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
       expect(screen.queryByRole("region", { name: "Job controls" })).not.toBeInTheDocument();
     },
   );
 
-  it.each(["resume", "cancel", "reconcile"] as const)(
-    "discards a delayed package-job %s response after session revalidation",
-    async operation => {
+  it.each([
+    ["resume", "session revalidation"], ["cancel", "session revalidation"], ["reconcile", "session revalidation"],
+    ["resume", "scoped agent denial"], ["cancel", "scoped agent denial"], ["reconcile", "scoped agent denial"],
+  ] as const)(
+    "discards a delayed package-job %s response after %s",
+    async (operation, boundary) => {
       const transport = accessEditorTransport();
       const base = transport.fetchMock.getMockImplementation()!;
       const pending = deferredResponse();
       const job = waitingBulkJob();
       const endpoint = `/api/agents/bulk-jobs/${job.id}/${operation}`;
       window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+      let deny = false;
       transport.fetchMock.mockImplementation(async (input, init) => {
+        if (deny && new URL(input, "http://localhost").pathname === "/api/agents") {
+          return Response.json({ code: "forbidden", detail: "Saved agent access denied." }, { status: 403 });
+        }
         if (input === endpoint) return pending.promise;
         if (input === `/api/agents/bulk-jobs/${job.id}`) return Response.json(job);
         return base(input, init);
@@ -3466,7 +4014,15 @@ describe("App session revalidation", () => {
       await waitFor(() => expect(button).toBeEnabled());
       await userEvent.click(button);
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => path === endpoint)).toBe(true));
-      await revalidateTransportSession(transport.session);
+      if (boundary === "session revalidation") await revalidateTransportSession(transport.session);
+      else {
+        deny = true;
+        fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
+        await screen.findByText(/Saved agent access denied/);
+        deny = false;
+        await userEvent.click(screen.getByRole("button", { name: "Reload saved agent inventory" }));
+        await screen.findByText(agent.displayName);
+      }
       await act(async () => pending.resolve(Response.json({
         ...job, reconciliation: { attempted: 1, failed: 0, errors: [] },
       })));

@@ -7,6 +7,7 @@ import {
   type OfficialUsageHistoryView,
   type OfficialUsageReportKind,
 } from "../api/client";
+import { useSavedRead } from "../savedQueries";
 import "./officialUsage.css";
 
 const pageSize = 25;
@@ -24,6 +25,7 @@ export function OfficialUsageHistoryPanel({
   const [offset, setOffset] = useState(0);
   const [reload, setReload] = useState(0);
   const [read, setRead] = useState<{ key: string; error?: string }>();
+  const readSaved = useSavedRead();
   const readKey = JSON.stringify([offset, reload, revision]);
   const scopedRead = read?.key === readKey ? read : undefined;
   const loading = !scopedRead;
@@ -32,7 +34,9 @@ export function OfficialUsageHistoryPanel({
 
   useEffect(() => {
     const controller = new AbortController();
-    void getOfficialUsageHistory({ limit: pageSize, offset }, { signal: controller.signal })
+    const query = { limit: pageSize, offset };
+    void readSaved(["official-usage-history", query, revision, reload],
+      signal => getOfficialUsageHistory(query, { signal }), controller.signal)
       .then(next => {
         if (controller.signal.aborted) return;
         setHistory(next);
@@ -47,7 +51,7 @@ export function OfficialUsageHistoryPanel({
         setRead({ key: readKey, error: reason instanceof Error ? reason.message : "Official usage history is unavailable." });
       });
     return () => controller.abort();
-  }, [offset, readKey]);
+  }, [offset, readKey, readSaved, reload, revision]);
 
   const selected = selectedSetId
     ? displayedHistory?.bundles.value.find(bundle => bundle.id === selectedSetId)
