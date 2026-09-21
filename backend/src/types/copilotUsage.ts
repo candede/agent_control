@@ -22,25 +22,25 @@ export type CopilotUsageSourceSummary = {
   };
 };
 
-export type CopilotLicenseState = "assigned" | "enabled" | "disabled" | "error";
+export type CopilotServiceState = "enabled" | "warning" | "disabled" | "suspended" | "locked_out" | "unknown";
+export type CopilotServiceSummaryState = CopilotServiceState | "partially_enabled";
 
-export type CopilotLicenseAssignment = {
-  skuId: string;
-  skuPartNumber: string;
-  state: CopilotLicenseState;
-  disabledPlanIds: string[];
-  assignmentStates: Array<{
-    state: "Active" | "ActiveWithError" | "Disabled" | "Error";
-    error: string | null;
-    assignedByGroup: string | null;
-  }>;
-};
+export function isCopilotServiceSummaryState(value: unknown): value is CopilotServiceSummaryState {
+  return typeof value === "string"
+    && ["enabled", "warning", "disabled", "suspended", "locked_out", "unknown", "partially_enabled"].includes(value);
+}
+
+export function isCopilotServiceActive(state: CopilotServiceSummaryState): boolean {
+  return state === "enabled" || state === "warning" || state === "partially_enabled";
+}
 
 export type CopilotServicePlan = {
   servicePlanId: string;
   service: string;
+  displayName: string;
+  state: CopilotServiceState;
   assignedDateTime: string | null;
-  capabilityStatus: "Enabled" | "Warning" | "Suspended" | "Deleted" | "LockedOut";
+  capabilityStatus: "Enabled" | "Warning" | "Suspended" | "Deleted" | "LockedOut" | null;
 };
 
 export type CopilotDirectoryIdentity = {
@@ -73,12 +73,14 @@ export type CopilotUsageAttention =
   | "agent_usage_unknown"
   | "app_activity_inactive"
   | "app_activity_unknown"
-  | "license_error"
-  | "license_disabled";
+  | "copilot_service_disabled"
+  | "copilot_service_unknown"
+  | "copilot_service_partial"
+  | "copilot_service_warning";
 
 export type CopilotUsageUser = {
   directory: CopilotDirectoryIdentity;
-  licenses: CopilotLicenseAssignment[];
+  copilotServiceState: CopilotServiceSummaryState;
   servicePlans: CopilotServicePlan[];
   importedUsage: OfficialUsageUserSummary | null;
   appActivity: CopilotAppActivity | null;

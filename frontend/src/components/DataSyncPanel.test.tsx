@@ -217,6 +217,9 @@ describe("DataSyncPanel", () => {
     const users = screen.getByText("Users", { selector: "strong" }).closest("article");
     expect(users).not.toBeNull();
     expect(within(users!).getByText("0")).toBeVisible();
+    expect(within(users!).getByText("paid M365 Copilot license users")).toBeVisible();
+    expect(users).toHaveTextContent("Paid M365 Copilot license assignments, app activity, and referenced agent people");
+    expect(users).toHaveTextContent("not tenant headcount");
   });
 
   it("lets viewers run read syncs but reserves report upload for admins without blocking the workbench", async () => {
@@ -292,6 +295,40 @@ describe("DataSyncPanel", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
     expect(api.cancel).toHaveBeenCalledWith(waiting.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("groups run details and cancellation in the footer and shows the pending cancellation state", async () => {
+    const sources = sourceIds.map(id => source(id, "succeeded", { count: 42 }));
+    const active = run("running", [source("users", "running", { count: 1_500 })], { mode: "incremental" });
+    const cancelled = run("cancelled", [source("users", "cancelled", { count: 1_500 })], { mode: "incremental" });
+    api.getState.mockResolvedValue(syncState({ run: active, sources }));
+    let resolveCancellation!: (value: DataSyncRun) => void;
+    api.cancel.mockReturnValue(new Promise<DataSyncRun>(resolve => { resolveCancellation = resolve; }));
+    const onRequestedRunChange = vi.fn();
+    renderPanel({ onRequestedRunChange });
+
+    const footer = await screen.findByRole("group", { name: "Current sync actions" });
+    expect(footer).toHaveTextContent("Sync continues when you switch tabs.");
+    await userEvent.click(within(footer).getByRole("button", { name: "View run details" }));
+    expect(onRequestedRunChange).toHaveBeenCalledWith(active.id);
+    expect(api.cancel).not.toHaveBeenCalled();
+
+    const cancel = within(footer).getByRole("button", { name: "Cancel run" });
+    expect(cancel).toHaveClass("secondary", "data-sync-cancel");
+    expect(cancel).toHaveAttribute("aria-busy", "false");
+    await userEvent.click(cancel);
+    const pending = within(footer).getByRole("button", { name: "Cancelling..." });
+    expect(pending).toBeDisabled();
+    expect(pending).toHaveAttribute("aria-busy", "true");
+    expect(pending.querySelector("svg")).toHaveClass("data-sync-spinning");
+    await userEvent.click(pending);
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith(active.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+
+    api.getState.mockResolvedValue(syncState({ run: cancelled, sources }));
+    await act(async () => resolveCancellation(cancelled));
+    expect(await screen.findByText("Sync cancelled")).toBeVisible();
+    expect(screen.queryByRole("group", { name: "Current sync actions" })).not.toBeInTheDocument();
+    expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
   });
 
   it.each([

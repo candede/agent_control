@@ -9,8 +9,8 @@ export const syncSourceDetails: Record<DataSyncSourceId, {
 }> = {
   users: {
     label: "Users",
-    description: "Copilot licenses, app activity, and referenced people",
-    unit: "licensed users",
+    description: "Paid M365 Copilot license assignments, app activity, and referenced agent people; count is paid-license users, not tenant headcount",
+    unit: "paid M365 Copilot license users",
   },
   graph_packages: {
     label: "Graph packages",

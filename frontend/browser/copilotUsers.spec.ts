@@ -43,10 +43,10 @@ async function mockReportedUsers(page: Page, published = usageInsightsPublished)
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
-test("all licensed accounts remain searchable beyond two thousand while the table is paged", async ({ page }) => {
+test("all paid license assignments remain searchable beyond four thousand while the table is paged", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   const fixture = structuredClone(copilotUsageFixture);
-  fixture.users = Array.from({ length: 2_053 }, (_, index) =>
+  fixture.users = Array.from({ length: 4_053 }, (_, index) =>
     licensedUser(index + 1, `Person${String(index).padStart(4, "0")}`, index < 10 ? 100 - index : null));
   fixture.counts.licensedUsers = fixture.users.length;
   let snapshots = 0;
@@ -55,17 +55,21 @@ test("all licensed accounts remain searchable beyond two thousand while the tabl
     return route.fulfill({ json: fixture });
   });
   await page.goto("/users");
-  const table = page.getByRole("region", { name: "Licensed users", exact: true });
+  const table = page.getByRole("region", { name: "Paid M365 Copilot license assignments", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(50);
-  await expect(page.getByLabel("Licensed user summary")).toContainText("2,053");
-  await expect(page.getByText(/base licenses and free Copilot Chat alone are not counted/)).toBeVisible();
+  await expect(page.getByLabel("M365 Copilot license summary")).toContainText("4,053");
+  await expect(page.getByText(/Basic Copilot Chat access and usage are not counted/)).toBeVisible();
+  const scope = page.getByRole("region", { name: "Paid license scope and coverage" });
+  await expect(scope).toContainText("4,053 paid-license users in the saved roster");
+  await expect(scope).toContainText("Not all tenant accounts");
+  await expect(scope).toContainText("all matching Graph pages and count checks completed");
   const initialSnapshots = snapshots;
   expect(initialSnapshots).toBeGreaterThan(0);
   await page.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(page.getByLabel("Licensed user pages")).toContainText("51-100 of 2,053");
+  await expect(page.getByLabel("Paid license assignment pages")).toContainText("51-100 of 4,053");
   const responsesHeading = table.getByRole("button", { name: "Sort by Agent responses", exact: true });
   await responsesHeading.click();
-  await expect(page.getByLabel("Licensed user pages")).toContainText("1-50 of 2,053");
+  await expect(page.getByLabel("Paid license assignment pages")).toContainText("1-50 of 4,053");
   await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "ascending");
   await expect(table.locator("tbody tr").first()).toContainText("Person0009");
   await expect(table.locator("tbody tr").nth(10)).toContainText("Unknown");
@@ -75,20 +79,20 @@ test("all licensed accounts remain searchable beyond two thousand while the tabl
   await expect(table.locator("tbody tr").first()).toContainText("Person0000");
   await expect(table.getByRole("columnheader", { name: "Agent responses", exact: true })).toHaveAttribute("aria-sort", "descending");
   await expect(page.getByLabel("Order by")).toHaveValue("responses-desc");
-  await page.getByRole("searchbox", { name: "Search users or agents" }).fill("person2052");
+  await page.getByRole("searchbox", { name: "Search users or agents" }).fill("person4052");
   await expect(table.locator("tbody tr")).toHaveCount(1);
-  await expect(table.locator("tbody tr")).toContainText("Person2052");
+  await expect(table.locator("tbody tr")).toContainText("Person4052");
   await expect(table.locator("tbody tr")).toContainText("Unknown");
-  await expect(page.getByLabel("Licensed user summary")).toContainText("2,053");
+  await expect(page.getByLabel("M365 Copilot license summary")).toContainText("4,053");
   expect(snapshots).toBe(initialSnapshots);
   expect(unexpected).toEqual([]);
 });
 
-test("licensed users lead with useful data and support ranked employee drilldown", async ({ page }, info) => {
+test("paid license assignments lead with useful data and support ranked employee drilldown", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.goto("/users");
   await expect(page.getByRole("button", { name: "Drew", exact: true })).toBeVisible();
-  const table = page.getByRole("region", { name: "Licensed users", exact: true });
+  const table = page.getByRole("region", { name: "Paid M365 Copilot license assignments", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(4);
   await expect(page.getByText("Microsoft 365 admin center Copilot Agents usage exports")).not.toBeVisible();
   await expect(page.locator(".capability-health")).toContainText("Permissions:");
@@ -105,7 +109,7 @@ test("licensed users lead with useful data and support ranked employee drilldown
   await expect(table.locator("tbody tr").first()).toContainText("Ada");
   const results = await new AxeBuilder({ page }).include(".copilot-users").analyze();
   expect(results.violations).toEqual([]);
-  await page.screenshot({ path: info.outputPath("licensed-users.png"), fullPage: true });
+  await page.screenshot({ path: info.outputPath("copilot-paid-license-users.png"), fullPage: true });
 
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const detail = page.getByRole("dialog", { name: "Ada", exact: true });
@@ -124,7 +128,63 @@ test("licensed users lead with useful data and support ranked employee drilldown
   expect(unexpected).toEqual([]);
 });
 
-test("license details focus reported agent activity on the same Users page", async ({ page }) => {
+test("paid assignments remain visible when paid features are inactive and active cohorts are explicit", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  const fixture = structuredClone(copilotUsageFixture);
+  fixture.users[1].copilotServiceState = fixture.users[1].servicePlans[0].state = "disabled";
+  fixture.users[2].copilotServiceState = fixture.users[2].servicePlans[0].state = "warning";
+  fixture.users[3].copilotServiceState = "partially_enabled";
+  fixture.users[3].servicePlans.push({
+    servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS",
+    displayName: "Microsoft 365 Copilot in Microsoft Teams", state: "unknown",
+    assignedDateTime: null, capabilityStatus: null,
+  });
+  fixture.counts.licensedUsers = 3;
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  await page.goto("/users");
+  const table = page.getByRole("region", { name: "Paid M365 Copilot license assignments", exact: true });
+  await expect(page.getByRole("button", { name: "All paid licenses", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(table.getByText("Paid license assigned", { exact: true })).toHaveCount(4);
+  await expect(table.getByRole("row", { name: /Ben/ })).toContainText("Paid features: Not enabled");
+  await expect(table.getByText(/^(Basic|Disabled|Copilot Disabled)$/)).toHaveCount(0);
+  await expect(page.getByText("Active M365 Copilot licensed users", { exact: true }).locator("..")).toContainText("3");
+  await page.getByRole("button", { name: "Active paid licenses", exact: true }).click();
+  await expect(table.locator("tbody tr")).toHaveCount(3);
+  await expect(table.getByRole("row", { name: /Ben/ })).toHaveCount(0);
+  await expect(table.getByRole("row", { name: /Cleo/ })).toContainText("Active (grace period)");
+  await expect(table.getByRole("row", { name: /Drew/ })).toContainText("Partially active");
+  await page.getByRole("button", { name: "All paid licenses", exact: true }).click();
+  await page.getByRole("button", { name: "Ben", exact: true }).click();
+  const detail = page.getByRole("dialog", { name: "Ben", exact: true });
+  await expect(detail.getByText("Paid license assigned", { exact: true })).toBeVisible();
+  await expect(detail.getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toContainText("Not enabled");
+  await expect(detail.getByText(/Raw capability status:/)).not.toBeVisible();
+  await expect(detail.getByText(/Basic Copilot Chat access is not assessed here/)).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Ben", exact: true })).toBeFocused();
+  expect(unexpected).toEqual([]);
+});
+
+test("retained paid-license data never claims current verified coverage or active assignments", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  const fixture = structuredClone(copilotUsageFixture);
+  fixture.sources.directory.state = "partial";
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  await page.goto("/users");
+  const scope = page.getByRole("region", { name: "Paid license scope and coverage" });
+  await expect(scope).toContainText("Last saved roster: 4 paid-license users");
+  await expect(scope).toContainText("Current paid-license coverage is unverified");
+  await expect(scope).not.toContainText("all matching Graph pages and count checks completed");
+  await expect(page.getByText("Active M365 Copilot licensed users", { exact: true }).locator("..")).toContainText("Unknown");
+  const table = page.getByRole("region", { name: "Paid M365 Copilot license assignments", exact: true });
+  await expect(table.getByText("Last saved: Paid license assigned", { exact: true })).toHaveCount(4);
+  await page.getByRole("button", { name: "Active paid licenses", exact: true }).click();
+  await expect(table).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Verify the directory to see current paid licenses" })).toBeVisible();
+  expect(unexpected).toEqual([]);
+});
+
+test("service details focus reported agent activity on the same Users page", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await mockReportedUsers(page);
   const directory = structuredClone(copilotUsageFixture);
@@ -140,12 +200,12 @@ test("license details focus reported agent activity on the same Users page", asy
   await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toBeFocused();
   const table = page.getByRole("region", { name: "Reported users", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(3);
-  await expect(table.getByRole("row", { name: /Concealed report user/ })).toContainText("Unknown");
+  await expect(table.getByRole("row", { name: /Concealed report user/ })).toContainText("License not verified");
   await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });
 
-test("report permission recovery is visible without hiding licensed employees", async ({ page }) => {
+test("report permission recovery is visible without hiding service assignments", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   const fixture = structuredClone(copilotUsageFixture);
   fixture.sources.appActivity = {
@@ -154,7 +214,7 @@ test("report permission recovery is visible without hiding licensed employees", 
   };
   await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
   await page.goto("/users");
-  const table = page.getByRole("region", { name: "Licensed users", exact: true });
+  const table = page.getByRole("region", { name: "Paid M365 Copilot license assignments", exact: true });
   await expect(table.locator("tbody tr")).toHaveCount(4);
   const notice = page.getByText(/Office app activity unavailable/);
   await expect(notice).toBeVisible();
@@ -197,7 +257,7 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
   await expect(table.getByRole("columnheader")).toHaveCount(6);
   await expect(page.getByLabel("Reported user pages")).toContainText("1-50 of 2,053");
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(table.getByRole("row", { name: /Person0000/ })).toContainText("Unknown");
+  await expect(table.getByRole("row", { name: /Person0000/ })).toContainText("License not verified");
   await page.getByRole("button", { name: "Next users", exact: true }).click();
   await expect(page.getByLabel("Reported user pages")).toContainText("51-100 of 2,053");
   await page.getByRole("searchbox", { name: "Search reported users or agents" }).fill("Specialist2052");

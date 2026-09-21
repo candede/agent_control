@@ -92,7 +92,7 @@ describe("reported user activity", () => {
     const table = await screen.findByRole("region", { name: "Reported users" });
     expect(within(table).getAllByRole("columnheader")).toHaveLength(6);
     expect(reportedRows()).toHaveLength(4);
-    expect(within(table).getByRole("row", { name: /Concealed report user/ })).toHaveTextContent("Unknown");
+    expect(within(table).getByRole("row", { name: /Concealed report user/ })).toHaveTextContent("License not verified");
     expect(within(table).getByRole("row", { name: /Ben/ })).toHaveTextContent("0");
     expect(within(table).queryByText(/Sep 12/)).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -100,6 +100,76 @@ describe("reported user activity", () => {
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText(/Microsoft 365 admin center Copilot Agents usage exports/)).not.toBeVisible();
     expect(screen.queryByText(/Top users by responses|Least active users/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["enabled", "Active", ""],
+    ["warning", "Active (grace period)", "attention"],
+    ["disabled", "Not enabled", "attention"],
+    ["suspended", "Suspended", "attention"],
+    ["locked_out", "Locked out", "attention"],
+    ["unknown", "Unverified", "unknown"],
+    ["partially_enabled", "Partially active", "attention"],
+  ] as const)("distinguishes the paid license assignment from %s paid features in activity rows and details", async (state, label, tone) => {
+    const directory = directoryFixture();
+    const ada = directory.users[0];
+    ada.copilotServiceState = state;
+    ada.servicePlans[0].state = state === "partially_enabled" ? "enabled" : state;
+    if (state === "partially_enabled") {
+      ada.servicePlans.push({
+        servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS",
+        displayName: "Microsoft 365 Copilot in Microsoft Teams", state: "unknown",
+        assignedDateTime: null, capabilityStatus: null,
+      });
+    }
+    renderActivity(initialRoute, directory);
+    const table = await screen.findByRole("region", { name: "Reported users" });
+    expect(within(table).getByRole("columnheader", { name: "M365 Copilot license" })).toBeVisible();
+    const serviceCell = within(within(table).getByRole("row", { name: /Ada/ })).getAllByRole("cell")[2];
+    expect(serviceCell).toHaveTextContent("Paid license assigned");
+    expect(serviceCell).toHaveTextContent(`Paid features: ${label}`);
+    expect(serviceCell).not.toHaveTextContent(/Basic|Disabled|License not verified/);
+    expect(within(serviceCell).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
+    const detail = (await openUser("Ada")).dialog;
+    const summary = within(detail).getByText("M365 Copilot license").parentElement!;
+    expect(summary).toHaveTextContent("Paid license assigned");
+    expect(within(summary).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
+    const services = within(detail).getByRole("list", { name: "Paid feature states" });
+    expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
+    expect(within(services).getByText(state === "partially_enabled" ? "Active" : label)).toBeVisible();
+    if (state === "partially_enabled") {
+      expect(within(services).getByText("Microsoft 365 Copilot in Microsoft Teams").parentElement).toHaveTextContent("Unverified");
+    }
+    const rawCapability = within(detail).getAllByText(/^Raw capability status:/)[0];
+    expect(rawCapability).not.toBeVisible();
+    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
+    expect(rawCapability).toHaveTextContent("Raw capability status: Enabled");
+    expect(rawCapability).toBeVisible();
+    expect(within(summary).getByText(label)).toBeVisible();
+    expect(within(services).getByText(state === "partially_enabled" ? "Active" : label)).toBeVisible();
+  });
+
+  it("keeps account disablement separate and ignores injected legacy package state in activity details", async () => {
+    const directory = directoryFixture();
+    directory.users[0].directory.accountEnabled = false;
+    Object.assign(directory.users[0], {
+      licenses: [{
+        skuId: "legacy-package-id", skuPartNumber: "Microsoft_365_E7", state: "disabled",
+        disabledPlanIds: ["legacy-disabled-plan-id"],
+        assignmentStates: [{ state: "Error", error: "legacy-package-error", assignedByGroup: "legacy-group-id" }],
+      }],
+    });
+    renderActivity(initialRoute, directory);
+    const table = await screen.findByRole("region", { name: "Reported users" });
+    const row = within(table).getByRole("row", { name: /Ada/ });
+    expect(row).toHaveTextContent("Account disabled");
+    expect(within(row).getAllByRole("cell")[2]).toHaveTextContent("Paid license assignedPaid features: Active");
+    const detail = (await openUser("Ada")).dialog;
+    expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Active");
+    expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
+    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
+    expect(within(detail).getByText(/Service-plan ID:/)).toBeVisible();
+    expect(document.body).not.toHaveTextContent(/E7|SKU|legacy-package|legacy-disabled|legacy-group|Group assignment|Direct assignment|Disabled plans/i);
   });
 
   it("opens details only on explicit action and restores keyboard focus on close or Escape", async () => {
@@ -181,22 +251,29 @@ describe("reported user activity", () => {
     expect(within(detail).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("Not reported");
   });
 
-  it.each(["set", "users-version", "bridge-version", "case", "ambiguous", "unavailable", "partial"])(
-    "does not claim a current license for a %s directory link", async scenario => {
+  it.each(["set", "missing-set", "users-version", "bridge-version", "case", "ambiguous", "unmatched", "unavailable", "partial", "stale"])(
+    "keeps licensing unverified for a %s directory link without inferring basic or unlicensed access", async scenario => {
       const directory = directoryFixture();
       const ada = directory.users[0];
       if (scenario === "set") ada.importedUsage!.datasetScope.reportSetId = "older-set";
+      if (scenario === "missing-set") ada.importedUsage!.datasetScope.reportSetId = null;
       if (scenario === "users-version") ada.importedUsage!.datasetScope.usersVersionId = "older-users";
       if (scenario === "bridge-version") ada.importedUsage!.datasetScope.userAgentsVersionId = "older-bridge";
       if (scenario === "case") ada.importedUsage!.username = "ADA@example.invalid";
       if (scenario === "ambiguous") directory.users.push({ ...ada, directory: { ...ada.directory, objectId: "other-directory-user" } });
+      if (scenario === "unmatched") ada.importedUsage = null;
       if (scenario === "unavailable") directory.sources.directory.state = "unavailable";
       if (scenario === "partial") directory.sources.directory.state = "partial";
+      if (scenario === "stale") directory.sources.directory.state = "stale";
       renderActivity(initialRoute, directory);
       const table = await screen.findByRole("region", { name: "Reported users" });
-      expect(within(table).getByRole("row", { name: /Ada/ })).toHaveTextContent("Unknown");
+      const row = within(table).getByRole("row", { name: /Ada/ });
+      expect(row).toHaveTextContent("License not verified");
+      expect(row).not.toHaveTextContent(/Paid license assigned|Basic|Disabled|Unlicensed/);
       const detail = (await openUser("Ada")).dialog;
-      expect(within(detail).getByText("Current license").parentElement).toHaveTextContent("Unknown");
+      expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("License not verified");
+      expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|Paid license assigned)$/)).not.toBeInTheDocument();
+      expect(within(detail).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
     },
   );
 
@@ -213,7 +290,7 @@ describe("reported user activity", () => {
     expect(within(table).getByText("ada@example.invalid", { exact: true })).toBeVisible();
     expect(within(table).getByText("ADA@example.invalid", { exact: true })).toBeVisible();
     expect(reportedRows()).toHaveLength(2);
-    expect(reportedRows().every(row => row.textContent?.includes("Unknown"))).toBe(true);
+    expect(reportedRows().every(row => row.textContent?.includes("License not verified"))).toBe(true);
   });
 
   it("searches over 2,000 report users before paging, including agents not on the current page", async () => {

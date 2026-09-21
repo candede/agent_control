@@ -8,13 +8,14 @@ import { fixturePassword, testDatabase } from "./testDatabase.js";
 const scope = { tenantId: "sync-persistence-tenant", principalId: "sync-reader" };
 
 describe("data sync persistence integration", () => {
-  it("upgrades the clean-full constraint for automatic sources without changing legacy intent or migration checksums", async () => {
+  it("upgrades schema 35's clean-full constraint for automatic sources without changing legacy intent or migration checksums", async () => {
     const fixture = await testDatabase(false);
     try {
       await bootstrap(fixture.operator, fixturePassword);
-      await migrate(fixture.operator, migrations.slice(0, -1));
+      await migrate(fixture.operator, migrations.filter(step => step.version <= 35));
       await grantRuntime(fixture.operator);
       const prior = (await fixture.operator.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows;
+      expect(prior.at(-1)?.version).toBe(35);
       const legacySources = ["users", "graph_packages", "power_platform", "usage_reports"];
       const legacy = await fixture.operator.query<{ id: string }>(`INSERT INTO data_sync_runs
         (id,tenant_id,principal_id,mode,source_ids,request_hash,status,completed_at,clear_saved_data)

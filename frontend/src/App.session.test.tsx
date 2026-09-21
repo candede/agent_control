@@ -1742,7 +1742,7 @@ describe("App session revalidation", () => {
     expect(await screen.findByRole("link", { name: "Sign in with Entra ID" })).toHaveAttribute("href", "/api/auth/login");
     expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("link")).toHaveLength(1);
     expect(screen.getByText("Understand and manage your organization's AI agents in one place.")).toBeInTheDocument();
-    expect(screen.getByText(/Discover agents across Microsoft 365 and Copilot Studio, explore Copilot usage and license insights, and investigate activity/)).toBeInTheDocument();
+    expect(screen.getByText(/Discover agents across Microsoft 365 and Copilot Studio, explore Copilot usage and service insights, and investigate activity/)).toBeInTheDocument();
     expect(screen.getByText(/Make informed decisions about adoption and access, with the controls to take action/)).toBeInTheDocument();
     expect(screen.queryByText(/outstanding delegated permissions|Consent does not run investigations/)).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/capabilities"))).toBe(false);

@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import type { SavedAgentPerson, UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { AgentPeopleRepository } from "../db/agentPeople.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
+import { isCopilotServiceSummaryState } from "../types/copilotUsage.js";
 
 export class SavedAgentPeopleService {
   constructor(
@@ -64,7 +65,8 @@ export function directoryPeople(source: SavedCopilotUsageSource<unknown>): Map<s
   if (source.rowCount !== source.value.length) throw invalidDirectory();
   const people = new Map<string, SavedAgentPerson>();
   for (const row of source.value) {
-    if (!isObject(row) || !isObject(row.identity) || !Array.isArray(row.licenses) || !Array.isArray(row.servicePlans)) throw invalidDirectory();
+    if (!isObject(row) || !isObject(row.identity) || !Array.isArray(row.servicePlans)
+      || row.serviceEvidenceVersion !== 1 || !isCopilotServiceSummaryState(row.copilotServiceState)) throw invalidDirectory();
     const identity = row.identity;
     const { displayName, userPrincipalName } = identity;
     const id = objectId(identity.objectId);

@@ -20,7 +20,7 @@ function directoryUser(id = firstId, displayName: string | null = "Saved Person"
       objectId: id, displayName, userPrincipalName: "saved#EXT#@example.onmicrosoft.com",
       accountEnabled: true, userType: "Guest", employeeType: null, department: null, companyName: null,
     },
-    licenses: [], servicePlans: [],
+    serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
   };
 }
 
@@ -146,7 +146,9 @@ describe("saved directory agent people", () => {
     { value: [{ ...directoryUser(), identity: { ...directoryUser().identity, objectId: "not-a-guid" } }] },
     { value: [{ ...directoryUser(), identity: { ...directoryUser().identity, userPrincipalName: "" } }] },
     { value: [{ ...directoryUser(), identity: { ...directoryUser().identity, displayName: 1 } }] },
-    { value: [{ ...directoryUser(), licenses: null }] },
+    { value: [{ ...directoryUser(), copilotServiceState: null }] },
+    { value: [{ ...directoryUser(), copilotServiceState: "assigned" }] },
+    { value: [{ identity: directoryUser().identity, licenses: [], servicePlans: [] }] },
     { value: [directoryUser(), directoryUser(firstId.toUpperCase())], rowCount: 2 },
     { rowCount: 2 },
     { observedAt: null },
@@ -176,6 +178,56 @@ describe("saved directory agent people", () => {
 });
 
 describe("saved directory repository query", () => {
+  it.each([
+    { snapshot: { serviceEvidenceVersion: 1, users: [] }, users: [] },
+    { snapshot: { serviceEvidenceVersion: 1, users: [directoryUser()] }, users: [directoryUser()] },
+  ])("reads only current service snapshots, including verified empty ones: %#", async ({ snapshot, users }) => {
+    const database = new pg.Pool();
+    vi.spyOn(database, "query").mockResolvedValue({
+      rows: [{
+        source_id: "directory", attempt_status: "available", observed_at: new Date(observedAt),
+        snapshot_data: snapshot, row_count: users.length,
+      }], rowCount: 1, command: "SELECT", oid: 0, fields: [],
+    });
+    const saved = await new DataSyncRepository(database).getDirectorySource(scope);
+    expect(saved).toMatchObject({ value: users, rowCount: users.length });
+    expect((await new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => saved) }).project(scope, [record()]))[0].people?.owner?.displayName)
+      .toBe(users.length ? "Saved Person" : undefined);
+    await database.end();
+  });
+
+  it.each([
+    [], [directoryUser()], {}, { serviceEvidenceVersion: 2, users: [] }, { serviceEvidenceVersion: 1, users: null },
+    { serviceEvidenceVersion: 1, users: [{ identity: directoryUser().identity, licenses: [], servicePlans: [] }] },
+    { serviceEvidenceVersion: 1, users: [{ ...directoryUser(), copilotServiceState: "assigned" }] },
+  ])(
+    "rejects unsupported saved service envelopes explicitly: %j", async snapshot => {
+      const database = new pg.Pool();
+      vi.spyOn(database, "query").mockResolvedValue({
+        rows: [{ source_id: "directory", snapshot_data: snapshot }], rowCount: 1, command: "SELECT", oid: 0, fields: [],
+      });
+      await expect(new DataSyncRepository(database).getDirectorySource(scope))
+        .rejects.toMatchObject({ code: "copilot_usage_snapshot_invalid" });
+      await database.end();
+    },
+  );
+
+  it("persists a versioned Copilot service snapshot without changing its user row count", async () => {
+    const database = new pg.Pool();
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockResolvedValue(client);
+    const query = vi.spyOn(client, "query").mockResolvedValue({ rows: [], rowCount: 0, command: "INSERT", oid: 0, fields: [] });
+    const users = [directoryUser()];
+    await new DataSyncRepository(database).publishDirectory(scope, users, observedAt, "Saved Copilot services.");
+    const insert = query.mock.calls.find(call => String(call[0]).includes("INSERT INTO copilot_usage_snapshots"));
+    expect(insert).toBeDefined();
+    expect(insert?.[1]?.[5]).toBe(1);
+    expect(JSON.parse(String(insert?.[1]?.[4]))).toEqual({ serviceEvidenceVersion: 1, users });
+    expect(query.mock.calls.some(call => call[0] === "COMMIT")).toBe(true);
+    expect(client.release).toHaveBeenCalledOnce();
+    await database.end();
+  });
+
   it("uses only the exact scoped current unexpired directory pointer on the supplied snapshot client", async () => {
     const database = new pg.Pool();
     const unexpected = vi.spyOn(database, "query").mockRejectedValue(new Error("Do not use a different database."));

@@ -77,6 +77,14 @@ async function mockSync(page: Page, firstState: DataSyncState, retainedRuns: Dat
       ...state, onboardingRequired: false, sources,
       run: { ...state.run, status: "completed", completedAt: "2026-09-15T10:01:00.000Z", sources: completed },
     };
+  }, cancel() {
+    if (!state.run) throw new Error("Expected a sync run before cancellation.");
+    state = {
+      ...state,
+      run: { ...state.run, status: "cancelled", completedAt: "2026-09-15T10:01:00.000Z",
+        sources: state.run.sources.map(source => source.status === "running" ? { ...source, status: "cancelled" } : source) },
+    };
+    return state.run;
   } };
 }
 
@@ -220,6 +228,70 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   expect(errors).toEqual([]);
 });
 
+test("current sync has an aligned, keyboard-accessible cancellation footer with pending feedback", async ({ page }, info) => {
+  const state = completedState();
+  const users = state.sources.find(source => source.source === "users");
+  if (!state.run || !users) throw new Error("Expected a saved Users source and run.");
+  state.run = {
+    ...state.run, mode: "incremental", status: "running", completedAt: null,
+    sources: [{ ...users, status: "running", count: 1_500, message: "Reading paid-license users from the filtered directory." }],
+  };
+  const fixture = await mockSync(page, state);
+  let finishCancellation!: () => void;
+  const cancellation = new Promise<void>(resolve => { finishCancellation = resolve; });
+  let requests = 0;
+  await page.route(`**/api/data-sync/runs/${state.run.id}/cancel`, async route => {
+    expect(route.request().method()).toBe("POST");
+    requests += 1;
+    await cancellation;
+    await route.fulfill({ json: fixture.cancel() });
+  });
+  await page.goto("/sync");
+  const panel = page.getByRole("region", { name: "Data sync", exact: true });
+  const footer = panel.getByRole("group", { name: "Current sync actions" });
+  const details = footer.getByRole("button", { name: "View run details" });
+  const cancel = footer.getByRole("button", { name: "Cancel run" });
+  await expect(cancel).toBeVisible();
+  await expect(cancel.locator(".lucide-circle-stop")).toHaveCount(1);
+  const bounds = await cancel.boundingBox();
+  const footerBounds = await footer.boundingBox();
+  expect(bounds!.height).toBeGreaterThanOrEqual(40);
+  expect(bounds!.x).toBeGreaterThanOrEqual(footerBounds!.x);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(footerBounds!.x + footerBounds!.width + 1);
+  expect(await cancel.evaluate(element => getComputedStyle(element).borderRadius))
+    .toBe(await panel.getByRole("button", { name: "Check status" }).evaluate(element => getComputedStyle(element).borderRadius));
+  if (info.project.name === "desktop") {
+    const detailsBounds = await details.boundingBox();
+    expect(Math.abs(bounds!.y + bounds!.height / 2 - detailsBounds!.y - detailsBounds!.height / 2)).toBeLessThan(2);
+    expect(bounds!.x).toBeGreaterThan(detailsBounds!.x + detailsBounds!.width);
+    expect(footerBounds!.height).toBeLessThan(70);
+  }
+  await expectAccessibleSyncPage(page);
+  await cancel.hover();
+  await page.screenshot({ path: info.outputPath("sync-cancel-footer.png") });
+  await details.focus();
+  await page.keyboard.press("Tab");
+  await expect(cancel).toBeFocused();
+  await page.screenshot({ path: info.outputPath("sync-cancel-focus.png") });
+  try {
+    await cancel.click();
+    const pending = footer.getByRole("button", { name: "Cancelling..." });
+    await expect(pending).toBeDisabled();
+    await expect(pending).toHaveAttribute("aria-busy", "true");
+    await expect(pending.locator(".data-sync-spinning")).toHaveCount(1);
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await expect(pending.locator(".data-sync-spinning")).toHaveCSS("animation-name", "none");
+    await page.screenshot({ path: info.outputPath("sync-cancel-pending.png") });
+  } finally {
+    finishCancellation();
+  }
+  await expect(panel.getByText("Sync cancelled", { exact: true })).toBeVisible();
+  await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
+  await expect(footer).toHaveCount(0);
+  expect(requests).toBe(1);
+  expect(fixture.unexpected).toEqual([]);
+});
+
 test("a completed saved run opens without setup and progress clutter", async ({ page }, info) => {
   const fixture = await mockSync(page, completedState());
   await page.goto("/users");
@@ -266,6 +338,9 @@ for (const attempts of ["completed", "mixed"] as const) {
     await page.goto("/sync");
     const workspace = page.getByRole("region", { name: "Workspace data", exact: true });
     await expect(workspace.getByText("3,973", { exact: true })).toBeVisible();
+    const users = workspace.getByRole("article", { name: "Users", exact: true });
+    await expect(users.getByText("paid M365 Copilot license users", { exact: true })).toBeVisible();
+    await expect(users).toContainText("count is paid-license users, not tenant headcount");
     if (attempts === "mixed") await expect(workspace.getByText("Permission required", { exact: true })).toBeVisible();
 
     const widths = info.project.name === "desktop" ? [1440, 1280, 1001, 1000, 768, 601] : [360, 390, 600];

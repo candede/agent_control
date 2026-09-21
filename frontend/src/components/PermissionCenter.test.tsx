@@ -169,6 +169,7 @@ describe("Permission Center", () => {
     </CapabilityContext>);
     expect(screen.getByRole("button", { name: "0 provider-verified / 0 local / 2 ready to try / 0 degraded / 0 blocked" })).toBeVisible();
     expect(within(screen.getByRole("table")).getAllByText("Ready to try", { exact: true })).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "View details for M365 Copilot licenses" })).toBeVisible();
     for (const view of views) {
       const details = await openDetails(view.definition.displayName);
       expect(details.getByText("Ready to try; Microsoft validates permission on the actual operation")).toBeVisible();

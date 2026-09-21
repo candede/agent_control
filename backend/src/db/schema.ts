@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type pg from "pg";
 import { officialUsageHistoryMigrationSql } from "./officialUsageHistorySchema.js";
-import { dataSyncMigrationSql } from "./dataSyncSchema.js";
+import { copilotServiceSnapshotResetMigrationSql, dataSyncMigrationSql } from "./dataSyncSchema.js";
 import { dataSyncAutomaticSourcesMigrationSql, dataSyncCleanupMigrationSql } from "./dataSyncCleanupSchema.js";
 import { unifiedAgentRegistryMigrationSql } from "./unifiedAgentRegistrySchema.js";
 import { inventoryVerificationMigrationSql } from "./inventoryVerificationSchema.js";
@@ -1694,6 +1694,7 @@ END $$;
   { version: 34, sql: agentUsageMigrationSql },
   { version: 35, sql: agentPeopleMigrationSql },
   { version: 36, sql: dataSyncAutomaticSourcesMigrationSql },
+  { version: 37, sql: copilotServiceSnapshotResetMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {

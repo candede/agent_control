@@ -12,6 +12,7 @@ import {
   type StartDataSyncInput,
 } from "../types/dataSync.js";
 import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
+import { isCopilotServiceSummaryState } from "../types/copilotUsage.js";
 import { pool, transaction } from "./pool.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
@@ -28,6 +29,11 @@ export type SavedCopilotUsageSource<T> = {
   rowCount: number | null;
   observedAt: string | null;
   value: T | null;
+};
+
+type CopilotDirectorySnapshot = {
+  serviceEvidenceVersion: 1;
+  users: readonly CopilotDirectoryUser[];
 };
 
 type RunRow = {
@@ -390,7 +396,7 @@ export class DataSyncRepository {
   }
 
   async publishDirectory(scope: DataSyncScope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string, publication?: UserSourcePublication) {
-    return this.publishUserSource(scope, "directory", value, value.length, observedAt, message, publication);
+    return this.publishUserSource(scope, "directory", { serviceEvidenceVersion: 1, users: value }, value.length, observedAt, message, publication);
   }
 
   async publishAppActivity(scope: DataSyncScope, value: CopilotReportResult, observedAt: string, message: string, publication?: UserSourcePublication) {
@@ -452,7 +458,7 @@ export class DataSyncRepository {
   private async publishUserSource(
     scope: DataSyncScope,
     sourceId: CopilotUsageSnapshotSource,
-    value: readonly CopilotDirectoryUser[] | CopilotReportResult,
+    value: CopilotDirectorySnapshot | CopilotReportResult,
     rowCount: number,
     observedAt: string,
     message: string,
@@ -532,6 +538,19 @@ function projectSource(row: SourceRow): DataSyncSourceStatus {
 }
 
 function projectSavedSource<T>(source: CopilotUsageSnapshotSource, row: SavedSourceRow | undefined): SavedCopilotUsageSource<T> {
+  let value: unknown = row?.snapshot_data ?? null;
+  if (source === "directory" && value !== null) {
+    if (typeof value === "object" && "serviceEvidenceVersion" in value && value.serviceEvidenceVersion === 1
+      && "users" in value && Array.isArray(value.users)
+      && value.users.every((user: unknown) => user !== null && typeof user === "object" && !Array.isArray(user)
+        && "serviceEvidenceVersion" in user && user.serviceEvidenceVersion === 1
+        && "copilotServiceState" in user && isCopilotServiceSummaryState(user.copilotServiceState)
+        && "servicePlans" in user && Array.isArray(user.servicePlans))) {
+      value = value.users;
+    } else {
+      throw new AppError(409, "copilot_usage_snapshot_invalid", "Saved Copilot service data has an unsupported format. Refresh Users before retrying.");
+    }
+  }
   return {
     source,
     attemptStatus: row?.attempt_status ?? null,
@@ -540,7 +559,7 @@ function projectSavedSource<T>(source: CopilotUsageSnapshotSource, row: SavedSou
     lastSuccessAt: row?.last_success_at?.toISOString() ?? null,
     rowCount: row?.row_count ?? null,
     observedAt: row?.observed_at?.toISOString() ?? null,
-    value: row?.snapshot_data as T | null ?? null,
+    value: value as T | null,
   };
 }
 

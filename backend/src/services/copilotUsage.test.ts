@@ -23,7 +23,7 @@ const user: AuthenticatedUser = {
 describe("CopilotUsageService", () => {
   it("blocks restored provider-disabled user collection before token or Graph access", async () => {
     const graph = {
-      listLicensedUsers: vi.fn(),
+      listCopilotUsers: vi.fn(),
       listAppActivity: vi.fn(),
     } as unknown as CopilotUsageGraphClient;
     const delegatedToken = vi.fn();
@@ -37,7 +37,7 @@ describe("CopilotUsageService", () => {
     });
     await expect(value.refreshUsers(user, undefined, { publication })).rejects.toMatchObject({ code: "provider_requalification_required" });
     expect(delegatedToken).not.toHaveBeenCalled();
-    expect(graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(graph.listCopilotUsers).not.toHaveBeenCalled();
     expect(graph.listAppActivity).not.toHaveBeenCalled();
   });
 
@@ -45,7 +45,7 @@ describe("CopilotUsageService", () => {
     let published = emptyPublished();
     const directory = [directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")];
     const graph = {
-      listLicensedUsers: vi.fn(async () => { throw new Error("GET must not call Graph"); }),
+      listCopilotUsers: vi.fn(async () => { throw new Error("GET must not call Graph"); }),
       listAppActivity: vi.fn(async () => { throw new Error("GET must not call Graph"); }),
     } as unknown as CopilotUsageGraphClient;
     const usageStore = memoryUsageStore(directory, { users: [], reportRefreshDate: null });
@@ -64,40 +64,127 @@ describe("CopilotUsageService", () => {
       [],
     );
     expect((await value.users(user)).users[0].importedUsage).toMatchObject({ reportedResponsesReceived: 7 });
-    expect(graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(graph.listCopilotUsers).not.toHaveBeenCalled();
     expect(graph.listAppActivity).not.toHaveBeenCalled();
   });
 
-  it("returns null organization fields for older saved snapshots without changing their licensed cohort", async () => {
-    const savedUser = directoryUser("11111111-1111-4111-8111-111111111111", "legacy@example.com");
-    const legacy = JSON.parse(JSON.stringify([savedUser], (key, value: unknown) => key === "companyName" ? undefined : value)) as CopilotDirectoryUser[];
-    const missingOrganization = JSON.parse(JSON.stringify([savedUser], (key, value: unknown) => ["companyName", "department"].includes(key) ? undefined : value)) as CopilotDirectoryUser[];
-    for (const directory of [legacy, missingOrganization]) {
-      const graph = { listLicensedUsers: vi.fn(), listAppActivity: vi.fn() } as unknown as CopilotUsageGraphClient;
-      const value = new CopilotUsageService({} as pg.Pool, {
-        graph,
-        usageStore: memoryUsageStore(directory),
-        now: () => now,
-        loadPublished: vi.fn(async () => emptyPublished()),
+  it("counts active paid M365 Copilot licenses separately from all paid assignments and basic Chat", async () => {
+    const states = ["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"] as const;
+    const directory = states.map((state, index) => {
+      const row = directoryUser(`11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, `${state}@example.com`);
+      row.copilotServiceState = state;
+      if (state === "partially_enabled") row.servicePlans.push({
+        servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347",
+        service: "M365_COPILOT_TEAMS", displayName: "Microsoft 365 Copilot in Microsoft Teams",
+        state: "disabled", capabilityStatus: "Deleted", assignedDateTime: null,
       });
-      const result = await value.users(user);
-      expect(result.counts.licensedUsers).toBe(1);
-      expect(result.users).toHaveLength(1);
-      expect(JSON.parse(JSON.stringify(result.users[0].directory))).toMatchObject({
-        companyName: null,
-        department: directory === legacy ? "Engineering" : null,
+      else row.servicePlans[0].state = state;
+      return row;
+    });
+    const harness = refreshHarness(directory);
+    const result = await harness.value.users(user);
+    expect(result.counts.licensedUsers).toBe(3);
+    expect(result.users).toHaveLength(7);
+    expect(result.users.find(value => value.copilotServiceState === "disabled")?.attention).toContain("copilot_service_disabled");
+    expect(result.users.find(value => value.copilotServiceState === "unknown")?.attention).toContain("copilot_service_unknown");
+    expect(result.users.find(value => value.copilotServiceState === "partially_enabled")?.attention).toContain("copilot_service_partial");
+    expect(result.users.find(value => value.copilotServiceState === "warning")?.attention).toContain("copilot_service_warning");
+    expect(JSON.stringify(result.users)).not.toMatch(/skuId|skuPartNumber|assignmentStates|licenses/);
+    expect(result.sources.directory.message).toContain("7 users with paid M365 Copilot license assignments");
+    expect(result.sources.directory.message).toContain("not the total number of tenant accounts");
+    expect(result.notices).toContain("Active M365 Copilot licensed users counts paid-license users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.");
+    expect(result.notices.some(notice => notice.includes("Basic access and usage are not measured here"))).toBe(true);
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+  });
+
+  it("does not include report-only activity in paid-license counts or infer basic access from an unmatched identity", async () => {
+    const result = await service({
+      directory: [directoryUser("11111111-1111-4111-8111-111111111111", "paid@example.com")],
+      report: { users: [appUser("reported-only@example.com", "2026-09-12")], reportRefreshDate: "2026-09-13" },
+      published: importedPublished([
+        { username: "paid@example.com", displayName: "Paid", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+        { username: "reported-only@example.com", displayName: "Reported only", numberOfAgentsUsed: 2, agentResponsesReceived: 500 },
+      ], []),
+    }).users(user);
+    expect(result.users).toHaveLength(1);
+    expect(result.users[0].directory.userPrincipalName).toBe("paid@example.com");
+    expect(result.counts).toMatchObject({ licensedUsers: 1, measuredActivityUsers: 0, unresolvedImportedIdentities: 1 });
+    expect(result.users[0].appActivity).toBeNull();
+    expect(result.unresolvedImportedIdentities).toEqual([expect.objectContaining({
+      normalizedUserPrincipalName: "reported-only@example.com",
+      reason: "no_exact_directory_match",
+      importedUsage: expect.objectContaining({ reportedResponsesReceived: 500 }),
+    })]);
+  });
+
+  it("starts with no retained users after a cache reset and rebuilds both sources through Users sync", async () => {
+    const current = directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com");
+    const harness = refreshHarness();
+    const result = await harness.value.users(user);
+    expect(result.sources.directory.state).toBe("unavailable");
+    expect(result.snapshot?.state).toBe("not_synced");
+    expect(result.counts.licensedUsers).toBeNull();
+    expect(result.users).toEqual([]);
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+
+    harness.graph.listCopilotUsers.mockResolvedValueOnce([current]);
+    expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
+      .toMatchObject({
+        status: "succeeded", count: 1,
+        message: "Saved paid M365 Copilot license and app-activity sources. Paid-license users: 1. All matching directory pages were verified. This is not the tenant headcount or a count of basic Copilot Chat users.",
       });
-      expect(result.users[0].licenses).toEqual(savedUser.licenses);
-      expect(directory[0].identity).not.toHaveProperty("companyName");
-      expect(graph.listLicensedUsers).not.toHaveBeenCalled();
-      expect(graph.listAppActivity).not.toHaveBeenCalled();
-    }
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
+    expect(harness.graph.listAppActivity).toHaveBeenCalledOnce();
+    const refreshed = await harness.value.users(user);
+    expect(refreshed.sources.directory.state).toBe("available");
+    expect(refreshed.counts.licensedUsers).toBe(1);
+    expect(refreshed.users[0].copilotServiceState).toBe("enabled");
+  });
+
+  it("surfaces a failed resync's permission error without reviving deleted users", async () => {
+    const harness = refreshHarness();
+    harness.graph.listCopilotUsers.mockRejectedValueOnce(new AppError(403, "Authorization_RequestDenied", "Access denied"));
+    await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true });
+    const result = await harness.value.users(user);
+    expect(result.sources.directory).toMatchObject({
+      state: "unavailable", message: expect.stringContaining("User.Read.All and LicenseAssignment.Read.All"),
+    });
+    expect(result.counts.licensedUsers).toBeNull();
+    expect(result.users).toEqual([]);
+  });
+
+  it("reports a verified zero only after a fresh successful empty Users sync", async () => {
+    const harness = refreshHarness();
+    const before = await harness.value.users(user);
+    expect(before.sources.directory.state).toBe("unavailable");
+    expect(before.counts.licensedUsers).toBeNull();
+    expect(before.users).toEqual([]);
+    await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true });
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
+    const after = await harness.value.users(user);
+    expect(after.sources.directory.state).toBe("available");
+    expect(after.counts.licensedUsers).toBe(0);
+  });
+
+  it.each([null, "Engineering"])("preserves nullable organization attributes from a current service snapshot: %s", async department => {
+    const savedUser = directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com");
+    savedUser.identity.companyName = null;
+    savedUser.identity.department = department;
+    const harness = refreshHarness([savedUser]);
+    const result = await harness.value.users(user);
+    expect(result.counts.licensedUsers).toBe(1);
+    expect(result.users).toHaveLength(1);
+    expect(result.users[0].directory).toEqual(savedUser.identity);
+    expect(result.users[0].copilotServiceState).toEqual(savedUser.copilotServiceState);
+    expect(result.users[0].servicePlans).toEqual(savedUser.servicePlans);
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+    expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
   });
 
   it("publishes and reads licensed organization metadata unchanged through the saved directory snapshot", async () => {
     const directory = [directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")];
     const graph = {
-      listLicensedUsers: vi.fn(async () => directory),
+      listCopilotUsers: vi.fn(async () => directory),
       listAppActivity: vi.fn(async () => ({ users: [], reportRefreshDate: null })),
     } as unknown as CopilotUsageGraphClient;
     const usageStore = memoryUsageStore();
@@ -118,7 +205,7 @@ describe("CopilotUsageService", () => {
       now.toISOString(), expect.any(String), publication,
     );
     expect((await value.users(user)).users[0].directory).toEqual(directory[0].identity);
-    expect(graph.listLicensedUsers).toHaveBeenCalledOnce();
+    expect(graph.listCopilotUsers).toHaveBeenCalledOnce();
   });
 
   it("forwards awaited count-only directory progress before publishing the completed snapshot", async () => {
@@ -130,7 +217,7 @@ describe("CopilotUsageService", () => {
     const progress = vi.fn(async (_count: number) => {
       expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
     });
-    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+    harness.graph.listCopilotUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
       await onProgress?.(1);
       await onProgress?.(2);
       return directory;
@@ -138,7 +225,7 @@ describe("CopilotUsageService", () => {
     const signal = new AbortController().signal;
     expect(await harness.value.refreshUsers(user, signal, { publication, onDirectoryProgress: progress }))
       .toMatchObject({ status: "succeeded", count: 2 });
-    expect(harness.graph.listLicensedUsers).toHaveBeenCalledWith("directory-token", signal, expect.any(Function));
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledWith("directory-token", signal, expect.any(Function));
     expect(progress.mock.calls).toEqual([[1], [2]]);
     expect(harness.usageStore.publishDirectory).toHaveBeenCalledOnce();
   });
@@ -150,7 +237,7 @@ describe("CopilotUsageService", () => {
       directoryUser("33333333-3333-4333-8333-333333333333", "saved-three@example.com"),
     ];
     const harness = refreshHarness(saved);
-    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+    harness.graph.listCopilotUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
       if (observedCount !== null) await onProgress?.(observedCount);
       throw new AppError(502, "provider_error", "Directory page unavailable.");
     });
@@ -169,7 +256,7 @@ describe("CopilotUsageService", () => {
     const progress = vi.fn();
     expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true, onDirectoryProgress: progress }))
       .toMatchObject({ status: "partial", count: null });
-    expect(harness.graph.listLicensedUsers).not.toHaveBeenCalled();
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
     expect(progress).not.toHaveBeenCalled();
     expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
       .toMatchObject({ status: "succeeded", count: 1 });
@@ -180,7 +267,7 @@ describe("CopilotUsageService", () => {
     new AppError(409, "data_sync_publication_superseded", "Attempt ownership changed."),
   ])("surfaces progress callback errors rather than swallowing them as provider failures: %s", async error => {
     const harness = refreshHarness();
-    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+    harness.graph.listCopilotUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
       await onProgress?.(1);
       return [];
     });
@@ -195,7 +282,7 @@ describe("CopilotUsageService", () => {
     const harness = refreshHarness();
     const controller = new AbortController();
     const error = new Error("User collection cancelled.");
-    harness.graph.listLicensedUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
+    harness.graph.listCopilotUsers.mockImplementationOnce(async (_token, _signal, onProgress) => {
       await onProgress?.(1);
       return [];
     });
@@ -235,8 +322,8 @@ describe("CopilotUsageService", () => {
     expect(JSON.stringify(result)).not.toContain("Private provider details");
   });
 
-  it("retains more than 2,000 licensed accounts when only ten have imported usage", async () => {
-    const directory = Array.from({ length: 2_011 }, (_, index) => directoryUser(
+  it("retains all 30,001 paid-license accounts in the saved API response when only ten have imported usage", async () => {
+    const directory = Array.from({ length: 30_001 }, (_, index) => directoryUser(
       `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, `person${index}@example.com`,
     ));
     const result = await service({
@@ -246,11 +333,11 @@ describe("CopilotUsageService", () => {
         numberOfAgentsUsed: 1, agentResponsesReceived: 2,
       })), []),
     }).users(user);
-    expect(result.users).toHaveLength(2_011);
-    expect(result.counts.licensedUsers).toBe(2_011);
+    expect(result.users).toHaveLength(30_001);
+    expect(result.counts.licensedUsers).toBe(30_001);
     expect(result.users.filter(entry => entry.importedUsage !== null)).toHaveLength(10);
-    expect(result.users.filter(entry => entry.importedUsage === null)).toHaveLength(2_001);
-    expect(result.sources.directory.message).toContain("2011");
+    expect(result.users.filter(entry => entry.importedUsage === null)).toHaveLength(29_991);
+    expect(result.sources.directory.message).toContain("30001");
   });
 
   it("keeps an incomplete license count unknown and explains how to retry", async () => {
@@ -487,7 +574,7 @@ function service(options: {
   published: PublishedOfficialUsage;
 }) {
   const graph = {
-    listLicensedUsers: vi.fn(async () => {
+    listCopilotUsers: vi.fn(async () => {
       if (options.directoryError) throw options.directoryError;
       return options.directory ?? [];
     }),
@@ -518,7 +605,7 @@ function service(options: {
 function refreshHarness(directory?: CopilotDirectoryUser[]) {
   const usageStore = memoryUsageStore(directory);
   const graph = {
-    listLicensedUsers: vi.fn<CopilotUsageGraphClient["listLicensedUsers"]>().mockResolvedValue([]),
+    listCopilotUsers: vi.fn<CopilotUsageGraphClient["listCopilotUsers"]>().mockResolvedValue([]),
     listAppActivity: vi.fn<CopilotUsageGraphClient["listAppActivity"]>().mockResolvedValue({ users: [], reportRefreshDate: null }),
   };
   const value = new CopilotUsageService({} as pg.Pool, {
@@ -588,17 +675,14 @@ function savedSource<T>(
 
 function directoryUser(objectId: string, userPrincipalName: string, displayName = userPrincipalName): CopilotDirectoryUser {
   return {
+    serviceEvidenceVersion: 1,
     identity: { objectId, userPrincipalName, displayName, accountEnabled: true, userType: "Member", employeeType: "Employee", companyName: "Contoso Health", department: "Engineering" },
-    licenses: [{
-      skuId: "639dec6b-bb19-468b-871c-c5c441c4b0cb",
-      skuPartNumber: "Microsoft_365_Copilot",
-      state: "enabled",
-      disabledPlanIds: [],
-      assignmentStates: [{ state: "Active", error: null, assignedByGroup: null }],
-    }],
+    copilotServiceState: "enabled",
     servicePlans: [{
       servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97",
       service: "M365_COPILOT_APPS",
+      displayName: "Microsoft 365 Copilot in Productivity Apps",
+      state: "enabled",
       assignedDateTime: "2026-01-01T00:00:00Z",
       capabilityStatus: "Enabled",
     }],

@@ -147,3 +147,18 @@ CREATE TRIGGER immutable_copilot_usage_snapshot
   BEFORE UPDATE ON copilot_usage_snapshots
   FOR EACH ROW EXECUTE FUNCTION protect_copilot_usage_snapshot();
 `;
+
+export const copilotServiceSnapshotResetMigrationSql = `
+DELETE FROM copilot_usage_source_state WHERE source_id IN ('directory','app_activity');
+DELETE FROM copilot_usage_snapshots WHERE source_id IN ('directory','app_activity');
+DELETE FROM data_sync_success_markers WHERE source_id='users';
+
+ALTER TABLE copilot_usage_snapshots ADD CONSTRAINT copilot_directory_service_format CHECK (
+  source_id<>'directory' OR COALESCE(
+    jsonb_typeof(snapshot_data)='object'
+    AND snapshot_data @> '{"serviceEvidenceVersion":1}'::jsonb
+    AND jsonb_typeof(snapshot_data->'users')='array',
+    false
+  )
+);
+`;

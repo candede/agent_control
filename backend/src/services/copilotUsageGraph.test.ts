@@ -1,19 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
-import { CopilotUsageGraphClient, buildCopilotReportUrl, buildLicensedUsersUrl, buildSubscribedSkusUrl } from "./copilotUsageGraph.js";
+import { CopilotUsageGraphClient, buildCopilotReportUrl, buildCopilotUsersUrl, buildSubscribedSkusUrl } from "./copilotUsageGraph.js";
 import type { FetchLike } from "./graphPackages.js";
 
 const skuId = "639dec6b-bb19-468b-871c-c5c441c4b0cb";
+const appsPlanId = "a62f8878-de10-42f3-b68f-6149a25ceb97";
+const teamsPlanId = "b95945de-b3bd-46db-8437-f2beb6ea2347";
+const chatPlanId = "3f30311c-6b1e-48a4-ab79-725b469da960";
 const knownSkus = [
   { skuId, skuPartNumber: "Microsoft_365_Copilot" },
   { skuId: "a809996b-059e-42e2-9866-db24b99a9782", skuPartNumber: "M365_Copilot" },
   { skuId: "ad9c22b3-52d7-4e7e-973c-88121ea96436", skuPartNumber: "Microsoft_365_Copilot_EDU" },
-].map(sku => ({ ...sku, appliesTo: "User", servicePlans: [] }));
+].map(sku => ({ ...sku, appliesTo: "User", servicePlans: [{ servicePlanId: appsPlanId }] }));
 const knownSkuIds = knownSkus.map(sku => sku.skuId);
-const appsPlanId = "a62f8878-de10-42f3-b68f-6149a25ceb97";
 
 describe("CopilotUsageGraphClient", () => {
   it("uses separate single-SKU predicates with the required advanced-query count", () => {
-    const url = new URL(buildLicensedUsersUrl(knownSkuIds));
+    const url = new URL(buildCopilotUsersUrl(knownSkuIds));
     expect(url.searchParams.get("$filter")).toBe([
       `assignedLicenses/any(value:value/skuId eq ${skuId})`,
       "assignedLicenses/any(value:value/skuId eq a809996b-059e-42e2-9866-db24b99a9782)",
@@ -23,8 +25,9 @@ describe("CopilotUsageGraphClient", () => {
     expect(url.searchParams.get("$top")).toBe("100");
     expect(url.searchParams.get("$select")?.split(",")).toEqual([
       "id", "userPrincipalName", "displayName", "accountEnabled", "employeeType", "companyName", "department",
-      "userType", "assignedLicenses", "assignedPlans", "licenseAssignmentStates",
+      "userType", "assignedLicenses", "assignedPlans",
     ]);
+    expect(new URL(buildSubscribedSkusUrl()).searchParams.get("$select")).not.toContain("skuPartNumber");
   });
 
   it.each([
@@ -42,7 +45,7 @@ describe("CopilotUsageGraphClient", () => {
         department,
       }],
     }));
-    const users = await new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("directory-token");
+    const users = await new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("directory-token");
     expect(users).toHaveLength(1);
     expect(users[0].identity).toMatchObject({ companyName: expectedCompany, department: expectedDepartment });
   });
@@ -56,17 +59,17 @@ describe("CopilotUsageGraphClient", () => {
           [field]: value,
         }],
       }));
-      await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("directory-token"))
+      await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("directory-token"))
         .rejects.toMatchObject({ code: "provider_schema" });
     }
   });
 
   it("loads every directory and report page and preserves missing dates as unknown", async () => {
-    const userNext = `${buildLicensedUsersUrl(knownSkuIds)}&$skiptoken=user-next`;
+    const userNext = `${buildCopilotUsersUrl(knownSkuIds)}&$skiptoken=user-next`;
     const fetcher = vi.fn<FetchLike>(async input => {
       const url = String(input);
       if (url === buildSubscribedSkusUrl()) return Response.json({ value: knownSkus });
-      if (url === buildLicensedUsersUrl(knownSkuIds)) return Response.json({
+      if (url === buildCopilotUsersUrl(knownSkuIds)) return Response.json({
         value: [graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active")],
         "@odata.count": 2,
         "@odata.nextLink": userNext,
@@ -90,26 +93,26 @@ describe("CopilotUsageGraphClient", () => {
     const client = new CopilotUsageGraphClient(fetcher);
 
     const [users, report] = await Promise.all([
-      client.listLicensedUsers("directory-token"),
+      client.listCopilotUsers("directory-token"),
       client.listAppActivity("reports-token"),
     ]);
 
     expect(users).toHaveLength(2);
     expect(users[1].identity.userType).toBe("Guest");
     expect(users[1].identity.accountEnabled).toBe(false);
-    expect(users.map(user => user.licenses[0].state)).toEqual(["enabled", "disabled"]);
-    expect(users.map(user => user.licenses[0].skuPartNumber)).toEqual(["Microsoft_365_Copilot", "M365_Copilot"]);
+    expect(users.map(user => user.copilotServiceState)).toEqual(["enabled", "disabled"]);
     expect(users[0]).toMatchObject({
-      licenses: [expect.objectContaining({ state: "enabled" })],
-      servicePlans: [expect.objectContaining({ capabilityStatus: "Warning" })],
+      serviceEvidenceVersion: 1,
+      servicePlans: [expect.objectContaining({ state: "enabled", capabilityStatus: "Enabled" })],
     });
+    expect(users[0]).not.toHaveProperty("licenses");
     expect(report.users).toHaveLength(2);
     expect(report.users[1].activity.lastActivityDate).toBeNull();
     expect(report.reportRefreshDate).toBe("2026-09-13");
     expect(fetcher).toHaveBeenCalledTimes(4);
-    expect(fetcher.mock.calls.find(call => String(call[0]) === buildLicensedUsersUrl(knownSkuIds))?.[1]?.headers)
+    expect(fetcher.mock.calls.find(call => String(call[0]) === buildCopilotUsersUrl(knownSkuIds))?.[1]?.headers)
       .toMatchObject({ Authorization: "Bearer directory-token" });
-    for (const url of [buildLicensedUsersUrl(knownSkuIds), userNext]) {
+    for (const url of [buildCopilotUsersUrl(knownSkuIds), userNext]) {
       const call = fetcher.mock.calls.find(call => String(call[0]) === url);
       expect(new Headers(call?.[1]?.headers).get("ConsistencyLevel")).toBe("eventual");
     }
@@ -128,7 +131,7 @@ describe("CopilotUsageGraphClient", () => {
       "@odata.nextLink": "https://attacker.invalid/v1.0/users?$skiptoken=secret",
     }));
     const client = new CopilotUsageGraphClient(withCatalog(fetcher));
-    await expect(client.listLicensedUsers("secret-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
+    await expect(client.listCopilotUsers("secret-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
@@ -139,8 +142,8 @@ describe("CopilotUsageGraphClient", () => {
       appliesTo: "User",
       servicePlans: [{ servicePlanId: appsPlanId }],
     }));
-    const firstUrl = buildLicensedUsersUrl(catalog.slice(0, 20).map(sku => sku.skuId));
-    const lastUrl = buildLicensedUsersUrl([catalog[20].skuId]);
+    const firstUrl = buildCopilotUsersUrl(catalog.slice(0, 20).map(sku => sku.skuId));
+    const lastUrl = buildCopilotUsersUrl([catalog[20].skuId]);
     const nextUrl = `${firstUrl}&$skiptoken=next`;
     const shared = graphUser("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "shared@example.com", "Active", catalog[0].skuId);
     shared.assignedLicenses.push({ skuId: catalog[20].skuId, disabledPlans: [] });
@@ -158,7 +161,7 @@ describe("CopilotUsageGraphClient", () => {
       throw new Error("Unexpected directory page.");
     });
     const progress = vi.fn(async (_observedCount: number) => undefined);
-    expect(await new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", undefined, progress)).toHaveLength(3);
+    expect(await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token", undefined, progress)).toHaveLength(3);
     expect(progress.mock.calls).toEqual([[1], [2], [3]]);
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
@@ -169,14 +172,14 @@ describe("CopilotUsageGraphClient", () => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json({
       value: [graphUser("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "one@example.com", "Active")],
       "@odata.count": 2,
-      "@odata.nextLink": `${buildLicensedUsersUrl(knownSkuIds)}&$skiptoken=next`,
+      "@odata.nextLink": `${buildCopilotUsersUrl(knownSkuIds)}&$skiptoken=next`,
     }));
     const progress = vi.fn(async (_observedCount: number) => {
       await Promise.resolve();
       if (failure === "cancellation") controller.abort(error);
       else throw error;
     });
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token", controller.signal, progress))
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token", controller.signal, progress))
       .rejects.toBe(error);
     expect(progress.mock.calls).toEqual([[1]]);
     expect(fetcher).toHaveBeenCalledOnce();
@@ -186,7 +189,7 @@ describe("CopilotUsageGraphClient", () => {
     const controller = new AbortController();
     controller.abort();
     const fetcher = vi.fn<FetchLike>();
-    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", controller.signal))
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token", controller.signal))
       .rejects.toMatchObject({ name: "AbortError" });
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -196,7 +199,7 @@ describe("CopilotUsageGraphClient", () => {
       ? Response.json({ value: noSku ? [] : knownSkus })
       : Response.json({ value: [], "@odata.count": 0 }));
     const progress = vi.fn();
-    expect(await new CopilotUsageGraphClient(fetcher).listLicensedUsers("token", undefined, progress)).toEqual([]);
+    expect(await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token", undefined, progress)).toEqual([]);
     expect(progress.mock.calls).toEqual([[0]]);
   });
 
@@ -292,9 +295,9 @@ describe("CopilotUsageGraphClient", () => {
       graphUser(id, "one@example.com", "Active"),
       graphUser(id.toUpperCase(), "one@example.com", "Active"),
     ] }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token")).resolves.toHaveLength(1);
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token")).resolves.toHaveLength(1);
     fetcher.mockResolvedValue(Response.json({ "@odata.count": 1, value: [graphUser("not-an-object-id", "one@example.com", "Active")] }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it("excludes base licenses, free Chat, Studio-only plans and company subscriptions even with Copilot names", async () => {
@@ -309,15 +312,170 @@ describe("CopilotUsageGraphClient", () => {
         { ...knownSkus[0], appliesTo: "Company", servicePlans: [{ servicePlanId: appsPlanId }] },
       ],
     }));
-    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token")).resolves.toEqual([]);
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token")).resolves.toEqual([]);
     expect(fetcher).toHaveBeenCalledOnce();
-    expect(buildLicensedUsersUrl(knownSkuIds)).not.toMatch(/contains|COPILOT/i);
+    expect(buildCopilotUsersUrl(knownSkuIds)).not.toMatch(/contains|COPILOT/i);
+  });
+
+  it.each([
+    ...knownSkus.map(sku => ({ skuId: sku.skuId, skuPartNumber: sku.skuPartNumber })),
+    { skuId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", skuPartNumber: "MICROSOFT_365_E7" },
+    { skuId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", skuPartNumber: "Future_product" },
+    { skuId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", skuPartNumber: undefined },
+  ])("detects paid Copilot services without a product-name or SKU allowlist: $skuPartNumber", async sku => {
+    const row = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active", sku.skuId);
+    const fetcher = directoryWithCatalog(row, [{
+      ...sku, appliesTo: "User", servicePlans: [{ servicePlanId: appsPlanId }],
+    }]);
+    const users = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token");
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({
+      serviceEvidenceVersion: 1, copilotServiceState: "enabled",
+      servicePlans: [{
+        servicePlanId: appsPlanId, service: "M365_COPILOT_APPS",
+        displayName: "Microsoft 365 Copilot in Productivity Apps", state: "enabled", capabilityStatus: "Enabled",
+      }],
+    });
+    expect(JSON.stringify(users)).not.toMatch(/skuId|skuPartNumber|licenseAssignmentStates|MICROSOFT_365_E7/);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not recognize a familiar Copilot SKU without a paid Copilot service plan", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: knownSkus.map(sku => ({ ...sku, servicePlans: [] })),
+    }));
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token")).resolves.toEqual([]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Enabled", "Warning", "Deleted", "Suspended", "LockedOut", null])(
+    "reports Copilot disabled despite an active group-assigned package and capability %s",
+    async capabilityStatus => {
+      const bundleId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+      const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active", bundleId);
+      const row = {
+        ...original,
+        assignedLicenses: [{ skuId: bundleId, disabledPlans: [appsPlanId.toUpperCase()] }],
+        assignedPlans: capabilityStatus ? [{ ...original.assignedPlans[0], capabilityStatus }] : [],
+        licenseAssignmentStates: [{
+          skuId: bundleId, state: "Active", error: null,
+          assignedByGroup: "22222222-2222-4222-8222-222222222222", disabledPlans: [appsPlanId],
+        }],
+      };
+      const fetcher = directoryWithCatalog(row, [{
+        skuId: bundleId, skuPartNumber: "MICROSOFT_365_E7", appliesTo: "User",
+        servicePlans: [{ servicePlanId: appsPlanId }],
+      }]);
+      const [user] = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token");
+      expect(user.copilotServiceState).toBe("disabled");
+      expect(user.servicePlans[0]).toMatchObject({ state: "disabled", capabilityStatus });
+      expect(JSON.stringify(user)).not.toMatch(/MICROSOFT_365_E7|assignmentStates|disabledPlanIds/);
+    },
+  );
+
+  it.each([
+    { capabilityStatus: "Enabled", expected: "enabled" },
+    { capabilityStatus: "Warning", expected: "warning" },
+    { capabilityStatus: "Deleted", expected: "disabled" },
+    { capabilityStatus: "Suspended", expected: "suspended" },
+    { capabilityStatus: "LockedOut", expected: "locked_out" },
+    { capabilityStatus: null, expected: "unknown" },
+  ])("uses the individual Copilot capability $capabilityStatus, not package state", async ({ capabilityStatus, expected }) => {
+    const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "ActiveWithError");
+    const row = {
+      ...original,
+      assignedLicenses: [{ skuId, disabledPlans: ["cccccccc-cccc-4ccc-8ccc-cccccccccccc"] }],
+      assignedPlans: capabilityStatus ? [{ ...original.assignedPlans[0], capabilityStatus }] : [],
+      licenseAssignmentStates: [{ skuId, state: "ActiveWithError", error: "UnrelatedPackageServiceError" }],
+    };
+    const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row)).listCopilotUsers("token");
+    expect(user.copilotServiceState).toBe(expected);
+    expect(user.servicePlans[0]).toMatchObject({ state: expected, capabilityStatus });
+  });
+
+  it.each([
+    { bundleDisabled: true, standaloneDisabled: false, expected: "enabled" },
+    { bundleDisabled: false, standaloneDisabled: true, expected: "enabled" },
+    { bundleDisabled: true, standaloneDisabled: true, expected: "disabled" },
+  ])("resolves effective Copilot enablement across current assignments: %j", async ({ bundleDisabled, standaloneDisabled, expected }) => {
+    const bundleId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const row = {
+      ...graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active"),
+      assignedLicenses: [
+        { skuId: bundleId, disabledPlans: bundleDisabled ? [appsPlanId] : [] },
+        { skuId, disabledPlans: standaloneDisabled ? [appsPlanId] : [] },
+      ],
+      licenseAssignmentStates: [
+        { skuId: bundleId, state: "Active", assignedByGroup: "22222222-2222-4222-8222-222222222222" },
+        { skuId, state: "Active", assignedByGroup: null },
+      ],
+    };
+    const fetcher = directoryWithCatalog(row, [
+      knownSkus[0],
+      { skuId: bundleId, appliesTo: "User", servicePlans: [{ servicePlanId: appsPlanId }] },
+    ]);
+    const [user] = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token");
+    expect(user.copilotServiceState).toBe(expected);
+    expect(user.servicePlans).toHaveLength(1);
+  });
+
+  it.each([teamsPlanId, chatPlanId])("recognizes the paid Copilot service %s without an Apps plan or E7 product", async servicePlanId => {
+    const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+    const row = { ...original, assignedPlans: [{ ...original.assignedPlans[0], servicePlanId }] };
+    const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row, [{
+      skuId, appliesTo: "User", servicePlans: [{ servicePlanId }],
+    }])).listCopilotUsers("token");
+    expect(user.copilotServiceState).toBe("enabled");
+    expect(user.servicePlans).toEqual([expect.objectContaining({ servicePlanId, state: "enabled" })]);
+  });
+
+  it("reports individual Copilot components and partial enablement without promoting a disabled Apps plan", async () => {
+    const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+    const row = {
+      ...original,
+      assignedLicenses: [{ skuId, disabledPlans: [appsPlanId] }],
+      assignedPlans: [
+        { ...original.assignedPlans[0], capabilityStatus: "Deleted" },
+        { ...original.assignedPlans[0], servicePlanId: teamsPlanId },
+      ],
+    };
+    const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row, [{
+      skuId, appliesTo: "User", servicePlans: [appsPlanId, teamsPlanId, chatPlanId].map(servicePlanId => ({ servicePlanId })),
+    }])).listCopilotUsers("token");
+    expect(user.copilotServiceState).toBe("partially_enabled");
+    expect(user.servicePlans.map(plan => [plan.servicePlanId, plan.state])).toEqual([
+      [appsPlanId, "disabled"], [teamsPlanId, "enabled"], [chatPlanId, "unknown"],
+    ]);
+  });
+
+  it.each([
+    { secondStatus: "Enabled", expected: "enabled", capabilityStatus: "Enabled" },
+    { secondStatus: "Warning", expected: "enabled", capabilityStatus: "Enabled" },
+    { secondStatus: "Deleted", expected: "unknown", capabilityStatus: null },
+  ])("does not guess an active service from conflicting historical capabilities: $secondStatus", async ({ secondStatus, expected, capabilityStatus }) => {
+    const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+    const row = { ...original, assignedPlans: [
+      original.assignedPlans[0], { ...original.assignedPlans[0], capabilityStatus: secondStatus },
+    ] };
+    const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row)).listCopilotUsers("token");
+    expect(user.copilotServiceState).toBe(expected);
+    expect(user.servicePlans).toEqual([expect.objectContaining({ state: expected, capabilityStatus })]);
+  });
+
+  it("retains the latest service assignment instant when duplicate observations use different time offsets", async () => {
+    const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+    const row = { ...original, assignedPlans: [
+      { ...original.assignedPlans[0], assignedDateTime: "2026-01-01T00:30:00Z" },
+      { ...original.assignedPlans[0], assignedDateTime: "2026-01-01T01:00:00+01:00" },
+    ] };
+    const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row)).listCopilotUsers("token");
+    expect(user.servicePlans).toEqual([expect.objectContaining({ state: "enabled", assignedDateTime: "2026-01-01T00:30:00Z" })]);
   });
 
   it("loads all 2,167 assignments when enterprise directory pages exceed the generic 2 MB limit", async () => {
     const bundleId = "15f2e9fc-b782-4f73-bf51-81d8b7fff6f4";
     const catalogNext = "https://graph.microsoft.com/v1.0/subscribedSkus?$skiptoken=next";
-    const directoryUrl = buildLicensedUsersUrl([skuId, bundleId]);
+    const directoryUrl = buildCopilotUsersUrl([skuId, bundleId]);
     const rows = Array.from({ length: 2_167 }, (_, index) => graphUser(
       `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
       `person${index}@example.com`, index === 10 ? "Disabled" : "Active", index < 10 ? skuId : bundleId,
@@ -349,12 +507,14 @@ describe("CopilotUsageGraphClient", () => {
     });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
-      const users = await new CopilotUsageGraphClient(fetcher).listLicensedUsers("private-token");
+      const users = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("private-token");
       expect(users).toHaveLength(2_167);
-      expect(users.filter(user => user.licenses[0].skuId === bundleId)).toHaveLength(2_157);
-      expect(users[10].licenses[0]).toMatchObject({
-        skuPartNumber: "Microsoft_Copilot_for_Sales", state: "disabled", disabledPlanIds: [appsPlanId],
+      expect(users.every(user => user.servicePlans.some(plan => plan.servicePlanId === appsPlanId))).toBe(true);
+      expect(users[10]).toMatchObject({
+        copilotServiceState: "disabled",
+        servicePlans: [expect.objectContaining({ servicePlanId: appsPlanId, state: "disabled" })],
       });
+      expect(JSON.stringify(users)).not.toMatch(/skuId|skuPartNumber|Microsoft_Copilot_for_Sales/);
       expect(fetcher).toHaveBeenCalledTimes(24);
       expect(log).toHaveBeenCalledWith(expect.stringContaining('"count":2167'));
       expect(JSON.stringify(log.mock.calls)).not.toMatch(/person0@|private-token|skiptoken/);
@@ -363,15 +523,90 @@ describe("CopilotUsageGraphClient", () => {
     }
   });
 
-  it("rejects an apparent ten-user result when Graph reports a larger cohort", async () => {
+  it.each([3_993, 30_001])("collects all %i paid-license assignments in bulk, not one request per user", async total => {
+    const directoryUrl = buildCopilotUsersUrl([skuId]);
+    const progress = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const url = String(input);
+      if (url === buildSubscribedSkusUrl()) return Response.json({ value: [knownSkus[0]] });
+      const target = new URL(url);
+      expect(target.pathname).toBe("/v1.0/users");
+      expect(target.searchParams.get("$filter")).toBe(`assignedLicenses/any(value:value/skuId eq ${skuId})`);
+      const offset = Number(target.searchParams.get("$skiptoken") ?? 0);
+      const size = Number(target.searchParams.get("$top"));
+      expect(size).toBe(100);
+      return Response.json({
+        value: Array.from({ length: Math.min(size, total - offset) }, (_, index) => {
+          const ordinal = offset + index;
+          return graphUser(
+            `11111111-1111-4111-8111-${String(ordinal).padStart(12, "0")}`,
+            `person${ordinal}@example.com`,
+            ordinal === total - 1 ? "Disabled" : "Active",
+          );
+        }),
+        ...(offset === 0 ? { "@odata.count": total } : {}),
+        ...(offset + size < total ? { "@odata.nextLink": `${directoryUrl}&$skiptoken=${offset + size}` } : {}),
+      });
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const users = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("private-token", undefined, progress);
+      expect(users).toHaveLength(total);
+      expect(new Set(users.map(user => user.identity.objectId)).size).toBe(total);
+      expect(users.at(-1)).toMatchObject({
+        identity: { userPrincipalName: `person${total - 1}@example.com` },
+        copilotServiceState: "disabled",
+      });
+      expect(fetcher).toHaveBeenCalledTimes(1 + Math.ceil(total / 100));
+      expect(progress).toHaveBeenCalledTimes(Math.ceil(total / 100));
+      expect(progress).toHaveBeenLastCalledWith(total);
+      for (const [, init] of fetcher.mock.calls.slice(1)) {
+        expect(new Headers(init?.headers).get("ConsistencyLevel")).toBe("eventual");
+      }
+      expect(log).toHaveBeenCalledWith(expect.stringContaining(`"count":${total}`));
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(/person0@|private-token|skiptoken/);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("rejects a 3,993-user result if Graph reports 30,000 matching paid-license users", async () => {
     const fetcher = vi.fn(async () => Response.json({
-      "@odata.count": 2_011,
-      value: Array.from({ length: 10 }, (_, index) => graphUser(
+      "@odata.count": 30_000,
+      value: Array.from({ length: 3_993 }, (_, index) => graphUser(
         `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, `person${index}@example.com`, "Active",
       )),
     }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token"))
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
       .rejects.toMatchObject({ code: "provider_count_mismatch" });
+  });
+
+  it.each([
+    { endpoint: "directory", pageLimit: 1_000 },
+    { endpoint: "catalog", pageLimit: 200 },
+  ])("retains a bounded $pageLimit-page budget for $endpoint continuations", async ({ endpoint, pageLimit }) => {
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const next = new URL(String(input));
+      next.searchParams.set("$skiptoken", String(Number(next.searchParams.get("$skiptoken") ?? 0) + 1));
+      return Response.json({ value: [], "@odata.count": 1, "@odata.nextLink": next.toString() });
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const client = new CopilotUsageGraphClient(endpoint === "directory" ? withCatalog(fetcher) : fetcher);
+      await expect(client.listCopilotUsers("token")).rejects.toMatchObject({ code: "provider_result_limit" });
+      expect(fetcher).toHaveBeenCalledTimes(pageLimit);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("rejects a cohort beyond the existing 100,000-row limit before reading continuation pages", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({
+      value: [], "@odata.count": 100_001, "@odata.nextLink": `${buildCopilotUsersUrl(knownSkuIds)}&$skiptoken=next`,
+    }));
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
+      .rejects.toMatchObject({ code: "provider_result_limit" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -386,7 +621,7 @@ describe("CopilotUsageGraphClient", () => {
     const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const client = new CopilotUsageGraphClient(source === "directory" ? withCatalog(fetcher) : fetcher);
-      await expect(client.listLicensedUsers("private-token")).rejects.toMatchObject({ code: "provider_response_size_limit" });
+      await expect(client.listCopilotUsers("private-token")).rejects.toMatchObject({ code: "provider_response_size_limit" });
       expect(cancel).toHaveBeenCalledOnce();
       expect(fetcher).toHaveBeenCalledOnce();
       expect(log).toHaveBeenCalledOnce();
@@ -402,13 +637,13 @@ describe("CopilotUsageGraphClient", () => {
 
   it.each([undefined, -1, 1.5, "2001", null])("rejects a missing or invalid Graph total: %s", async count => {
     const fetcher = vi.fn(async () => Response.json({ value: [], "@odata.count": count }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token"))
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it("does not silently fall back to three SKUs when catalog access fails", async () => {
     const fetcher = vi.fn(async () => Response.json({ error: { code: "Authorization_RequestDenied" } }, { status: 403 }));
-    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token")).rejects.toMatchObject({ status: 403 });
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token")).rejects.toMatchObject({ status: 403 });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
@@ -416,12 +651,12 @@ describe("CopilotUsageGraphClient", () => {
     { value: null },
     { value: [{ ...knownSkus[0], servicePlans: null }] },
     { value: [{ ...knownSkus[0], servicePlans: [{ servicePlanId: "invalid" }] }] },
-    { value: [{ ...knownSkus[0], skuPartNumber: "" }] },
+    { value: [{ ...knownSkus[0], skuId: "" }] },
     { value: [{ ...knownSkus[0], appliesTo: null }] },
-    { value: [knownSkus[0], { ...knownSkus[0], skuPartNumber: "Conflicting" }] },
+    { value: [knownSkus[0], { ...knownSkus[0], servicePlans: [{ servicePlanId: teamsPlanId }] }] },
   ])("rejects malformed or conflicting catalog data instead of returning a smaller cohort", async body => {
     const fetcher = vi.fn(async () => Response.json(body));
-    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
@@ -429,7 +664,7 @@ describe("CopilotUsageGraphClient", () => {
     const row = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
     row.assignedLicenses = [];
     const fetcher = vi.fn(async () => Response.json({ value: [row], "@odata.count": 1 }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it.each([
@@ -438,7 +673,7 @@ describe("CopilotUsageGraphClient", () => {
     buildSubscribedSkusUrl(),
   ])("rejects invalid or repeated catalog continuation: %s", async nextLink => {
     const fetcher = vi.fn(async () => Response.json({ value: knownSkus, "@odata.nextLink": nextLink }));
-    await expect(new CopilotUsageGraphClient(fetcher).listLicensedUsers("token"))
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token"))
       .rejects.toMatchObject({ code: nextLink === buildSubscribedSkusUrl() ? "provider_schema" : "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
@@ -450,7 +685,7 @@ describe("CopilotUsageGraphClient", () => {
         "@odata.count": 2, "@odata.nextLink": "https://graph.microsoft.com/v1.0/users?$skiptoken=next",
       }))
       .mockResolvedValueOnce(Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token")).rejects.toMatchObject({ status: 503 });
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token")).rejects.toMatchObject({ status: 503 });
   });
 
   it("bounds dynamic SKU filters and counts a multi-licensed employee only once across batches", async () => {
@@ -467,16 +702,17 @@ describe("CopilotUsageGraphClient", () => {
       if (String(input) === buildSubscribedSkusUrl()) return Response.json({ value: skus });
       return Response.json({ value: [row], "@odata.count": 1 });
     });
-    const users = await new CopilotUsageGraphClient(fetcher).listLicensedUsers("token");
+    const users = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("token");
     expect(users).toHaveLength(1);
-    expect(users[0].licenses).toHaveLength(21);
+    expect(users[0].servicePlans).toHaveLength(1);
+    expect(users[0].copilotServiceState).toBe("enabled");
     expect(fetcher.mock.calls.map(call => String(call[0]))).toEqual([
       buildSubscribedSkusUrl(),
-      buildLicensedUsersUrl(skus.slice(0, 20).map(sku => sku.skuId)),
-      buildLicensedUsersUrl(skus.slice(20).map(sku => sku.skuId)),
+      buildCopilotUsersUrl(skus.slice(0, 20).map(sku => sku.skuId)),
+      buildCopilotUsersUrl(skus.slice(20).map(sku => sku.skuId)),
     ]);
-    expect(() => buildLicensedUsersUrl([])).toThrow();
-    expect(() => buildLicensedUsersUrl(skus.map(sku => sku.skuId))).toThrow();
+    expect(() => buildCopilotUsersUrl([])).toThrow();
+    expect(() => buildCopilotUsersUrl(skus.map(sku => sku.skuId))).toThrow();
   });
 
   it("rejects non-v1 CSV report schemas instead of guessing columns", async () => {
@@ -557,7 +793,7 @@ describe("CopilotUsageGraphClient", () => {
     const fetcher = vi.fn(async () => Response.json({ "@odata.count": 1, value: [
       graphUser("11111111-1111-7111-1111-111111111111", "one@example.com", "Active"),
     ] }));
-    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listLicensedUsers("token")).resolves.toHaveLength(1);
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token")).resolves.toHaveLength(1);
   });
 });
 
@@ -565,6 +801,12 @@ function withCatalog(fetcher: FetchLike): FetchLike {
   return (input, init) => String(input) === buildSubscribedSkusUrl()
     ? Promise.resolve(Response.json({ value: knownSkus }))
     : fetcher(input, init);
+}
+
+function directoryWithCatalog(row: unknown, catalog: unknown[] = knownSkus) {
+  return vi.fn<FetchLike>(async input => String(input) === buildSubscribedSkusUrl()
+    ? Response.json({ value: catalog })
+    : Response.json({ value: [row], "@odata.count": 1 }));
 }
 
 function graphUser(id: string, upn: string, state: string, assignedSkuId = skuId) {
@@ -577,8 +819,8 @@ function graphUser(id: string, upn: string, state: string, assignedSkuId = skuId
     companyName: "Contoso Health",
     department: "Engineering",
     userType: "Member",
-    assignedLicenses: [{ skuId: assignedSkuId, disabledPlans: [] as string[] }],
-    assignedPlans: [{ servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97", service: "M365_COPILOT_APPS", assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Warning" }],
+    assignedLicenses: [{ skuId: assignedSkuId, disabledPlans: state === "Disabled" ? [appsPlanId] : [] as string[] }],
+    assignedPlans: [{ servicePlanId: appsPlanId, service: "M365_COPILOT_APPS", assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: state === "Disabled" ? "Deleted" : "Enabled" }],
     licenseAssignmentStates: [{ skuId: assignedSkuId, state, error: "None", assignedByGroup: null }],
   };
 }

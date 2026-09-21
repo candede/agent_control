@@ -11,12 +11,12 @@ import {
   Check,
   CircleCheck,
   CircleAlert,
+  CircleStop,
   Clock3,
   Database,
   LoaderCircle,
   RefreshCw,
   RotateCcw,
-  Square,
   Upload,
 } from "lucide-react";
 import {
@@ -500,9 +500,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         ) : null}
         {isProgressing(run) ? (
           <WorkbenchActionGate actionId="data-sync.cancel">
-            <button type="button" className="secondary" disabled={Boolean(busy)}
+            <button type="button" className="secondary data-sync-cancel" disabled={Boolean(busy)} aria-busy={busy === "cancel"}
               onClick={() => void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }))}>
-              <Square size={14} aria-hidden="true" />{busy === "cancel" ? "Cancelling..." : "Cancel run"}
+              {busy === "cancel"
+                ? <LoaderCircle size={16} className="data-sync-spinning" aria-hidden="true" />
+                : <CircleStop size={16} aria-hidden="true" />}
+              {busy === "cancel" ? "Cancelling..." : "Cancel run"}
             </button>
           </WorkbenchActionGate>
         ) : null}
@@ -544,11 +547,13 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
               !isComplete(currentRun) && currentRun.status !== "cancelled" ? (
                 <section className="data-sync-activity" aria-label="Current sync">
                   <SyncProgress run={currentRun} />
-                  {runActions(currentRun, pollingPaused)}
-                  <p className="data-sync-run-meta">
-                    Sync continues when you switch tabs.
-                    {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
-                  </p>
+                  <div className="data-sync-activity-footer" role="group" aria-label="Current sync actions">
+                    <p className="data-sync-run-meta">
+                      Sync continues when you switch tabs.
+                      {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
+                    </p>
+                    {runActions(currentRun, pollingPaused)}
+                  </div>
                 </section>
               ) : (
                 <div className="data-sync-last-run" role="status">

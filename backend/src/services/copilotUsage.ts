@@ -19,7 +19,7 @@ import type {
   CopilotUsageUser,
   CopilotUsageUsersResponse,
 } from "../types/copilotUsage.js";
-import { copilotUsagePeriod } from "../types/copilotUsage.js";
+import { copilotUsagePeriod, isCopilotServiceActive } from "../types/copilotUsage.js";
 import type { OfficialUsageUserSummary, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { DataSyncSourceState } from "../types/dataSync.js";
@@ -162,7 +162,7 @@ export class CopilotUsageService {
             scope,
             value,
             loaded.fetchedAt,
-            `Saved ${value.length} normalized Microsoft 365 Copilot directory and license records.`,
+            `Saved paid M365 Copilot license assignments and paid-feature evidence for ${value.length} users, not all tenant accounts.`,
             publication,
           );
         } else {
@@ -206,7 +206,7 @@ export class CopilotUsageService {
     try {
       const token = await this.currentDelegatedToken(dataScope(user), "graph.licenses.read");
       signal?.throwIfAborted();
-      const value = await this.dependencies.graph.listLicensedUsers(token, signal, async count => {
+      const value = await this.dependencies.graph.listCopilotUsers(token, signal, async count => {
         try {
           await onProgress(count);
         } catch (error) {
@@ -291,7 +291,7 @@ export function composeCopilotUsageUsers(input: {
       return buildUser(directoryUser, importedUsage, activity, importedMetricsFresh, appMetricsFresh);
     }).sort(compareUsers);
     let directorySource = directory.ok
-      ? source("available", `Loaded ${directoryUsers.length} Microsoft 365 Copilot users from the tenant license catalog, including qualifying bundles. All directory pages were checked against Microsoft Graph totals.`, directory.fetchedAt)
+      ? source("available", `Loaded ${directoryUsers.length} users with paid M365 Copilot license assignments. Microsoft Graph filters matching assignments across the tenant in bulk; all matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
       : unavailableSource(directory.message);
     let appSource = appActivity.ok
       ? appActivitySource(appActivity, appMatching.size)
@@ -305,6 +305,7 @@ export function composeCopilotUsageUsers(input: {
       directorySource = savedSourceSummary(input.saved.directory, directorySource);
       appSource = savedSourceSummary(input.saved.appActivity, appSource);
     }
+    const directoryCurrent = directorySource.state === "available";
     return {
       generatedAt,
       readOnly: true,
@@ -316,14 +317,14 @@ export function composeCopilotUsageUsers(input: {
         importedAgentUsage: importedSource,
       },
       counts: {
-        licensedUsers: directory.ok ? users.length : null,
-        measuredActivityUsers: directory.ok && metricsAvailable
+        licensedUsers: directoryCurrent ? users.filter(value => isCopilotServiceActive(value.copilotServiceState)).length : null,
+        measuredActivityUsers: directoryCurrent && metricsAvailable
           ? users.filter(value => hasMeasuredActivity(value, importedMetricsFresh, appMetricsFresh)).length
           : null,
-        needsAttentionUsers: directory.ok
+        needsAttentionUsers: directoryCurrent
           ? users.filter(value => value.attention.some(reason => !["agent_usage_unknown", "app_activity_unknown"].includes(reason))).length
           : null,
-        unknownMetricsUsers: directory.ok
+        unknownMetricsUsers: directoryCurrent
           ? users.filter(value => value.attention.includes("agent_usage_unknown") || value.attention.includes("app_activity_unknown")).length
           : null,
         unresolvedImportedIdentities: matching.unresolved.length,
@@ -332,7 +333,9 @@ export function composeCopilotUsageUsers(input: {
       unresolvedImportedIdentities: matching.unresolved,
       notices: [
         "This dashboard is read-only and never changes license assignments.",
-        "Licensed users means current Microsoft 365 Copilot assignments, including bundles with the Copilot productivity-app entitlement; it is not the total of Microsoft 365 or Office 365 base licenses.",
+        "Active M365 Copilot licensed users counts paid-license users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.",
+        "This roster includes paid M365 Copilot license assignments even when their paid features are not enabled or remain unverified. A paid-license assignment alone does not establish that its paid features are active.",
+        "Paid-feature states do not describe basic Copilot Chat availability. Users without a paid M365 Copilot license, or with paid features not enabled, may still have basic Copilot Chat access subject to tenant policy. Basic access and usage are not measured here.",
         "Zero or low imported agent responses describe Copilot Agents usage only, not total Microsoft 365 Copilot use.",
         "Missing source data remains unknown and is never converted to zero or an unlicensed state.",
         "Microsoft report rows can include users licensed during the prior 180 days; only exact matches in the current directory license cohort are shown.",
@@ -350,7 +353,7 @@ function userRefreshResult(saved: {
     return {
       status: "succeeded",
       count: saved.directory.rowCount,
-      message: `Saved normalized directory/license and app-activity sources${saved.directory.rowCount === null ? "." : ` for ${saved.directory.rowCount} licensed users.`}`,
+      message: `Saved paid M365 Copilot license and app-activity sources.${saved.directory.rowCount === null ? "" : ` Paid-license users: ${saved.directory.rowCount}.`} All matching directory pages were verified. This is not the tenant headcount or a count of basic Copilot Chat users.`,
     };
   }
   if (values.some(value => value.value !== null)) {
@@ -547,15 +550,13 @@ function buildUser(
   if (!appMetricsFresh || !appActivity) attention.push("app_activity_unknown");
   else if (!appActivity.lastActivityDate) attention.push("app_activity_unknown");
   else if (!hasRecentAppActivity(appActivity)) attention.push("app_activity_inactive");
-  if (directory.licenses.some(license => license.state === "error")) attention.push("license_error");
-  if (directory.licenses.some(license => license.state === "disabled")) attention.push("license_disabled");
+  if (directory.copilotServiceState === "unknown") attention.push("copilot_service_unknown");
+  else if (directory.copilotServiceState === "partially_enabled") attention.push("copilot_service_partial");
+  else if (directory.copilotServiceState === "warning") attention.push("copilot_service_warning");
+  else if (!isCopilotServiceActive(directory.copilotServiceState)) attention.push("copilot_service_disabled");
   return {
-    directory: {
-      ...directory.identity,
-      companyName: directory.identity.companyName ?? null,
-      department: directory.identity.department ?? null,
-    },
-    licenses: directory.licenses,
+    directory: directory.identity,
+    copilotServiceState: directory.copilotServiceState,
     servicePlans: directory.servicePlans,
     importedUsage,
     appActivity,

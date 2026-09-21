@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
+import { copilotServicePlanDefinitions, resolveCopilotServicePlan } from "../services/copilotServicePlans.js";
 import { DataSyncRepository } from "./dataSync.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -180,6 +181,35 @@ describe.sequential("Data sync repository", () => {
     expect((await repository.getDirectorySource({ ...owner, principalId: "other-reader" })).value).toBeNull();
   });
 
+  it("persists and reloads all 30,001 paid-license users with all three paid features within the snapshot byte bound", async () => {
+    const owner = { ...scope, principalId: "large-paid-license-roster" };
+    const servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
+      servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
+    ));
+    const users = Array.from({ length: 30_001 }, (_, index) => {
+      const user = directoryUser(`person${index}@example.com`);
+      user.identity.displayName = `Person ${index}`;
+      user.identity.companyName = "Contoso Health";
+      user.copilotServiceState = "enabled";
+      user.servicePlans = servicePlans;
+      return user;
+    });
+    const bytes = Buffer.byteLength(JSON.stringify({ serviceEvidenceVersion: 1, users }));
+    expect(bytes).toBeGreaterThan(30 * 1024 * 1024);
+    expect(bytes).toBeLessThan(32 * 1024 * 1024);
+    await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved all matching paid-license users.");
+
+    const saved = await new DataSyncRepository(fixture.runtime).getDirectorySource(owner);
+    expect(saved).toMatchObject({ attemptStatus: "available", rowCount: 30_001 });
+    expect(saved.value).toHaveLength(30_001);
+    expect(saved.value?.at(-1)).toEqual(users.at(-1));
+    expect(saved.value?.every(user => user.servicePlans.length === 3)).toBe(true);
+    const storage = await fixture.runtime.query<{ bytes: number }>(`SELECT octet_length(snapshot_data::text) AS bytes
+      FROM copilot_usage_snapshots WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory' AND is_current`,
+    [owner.tenantId, owner.principalId]);
+    expect(storage.rows[0].bytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+  });
+
   it("retries only incomplete top-level sources and retains every child association", async () => {
     const run = (await repository.getLatestRun(scope))!;
     await repository.updateSource(scope, run.id, "graph_packages", {
@@ -264,7 +294,8 @@ function directoryUser(userPrincipalName: string): CopilotDirectoryUser {
       department: "Engineering",
       companyName: null,
     },
-    licenses: [],
+    serviceEvidenceVersion: 1,
+    copilotServiceState: "unknown",
     servicePlans: [],
   };
 }

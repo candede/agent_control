@@ -166,9 +166,9 @@ describe("UnifiedAgentsService", () => {
     const directory = [
       { objectId: ownerA.toUpperCase(), displayName: "Zebra Person", userPrincipalName: "zebra@example.com" },
       { objectId: ownerB, displayName: "Alpha Person", userPrincipalName: "alpha@example.com" },
-    ].map(identity => ({
+    ].map((identity): CopilotDirectoryUser => ({
       identity: { ...identity, accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null },
-      licenses: [], servicePlans: [],
+      serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
     }));
     const resources = [resource(environmentA), resource(environmentB, "native-only")].map((value, index) => ({
       ...value, createdBy: directory[index].identity.objectId,

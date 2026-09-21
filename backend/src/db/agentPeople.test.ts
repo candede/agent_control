@@ -28,7 +28,7 @@ beforeAll(async () => {
 afterAll(async () => { await fixture?.close(); });
 
 describe("agent people persistence", () => {
-  it("upgrades schema 34 without changing existing snapshots or historical migration checksums", async () => {
+  it("upgrades schema 34 with a user-cache reset and unchanged historical migration checksums", async () => {
     const upgrade = await testDatabase(false);
     try {
       await bootstrap(upgrade.operator, fixturePassword);
@@ -42,9 +42,9 @@ describe("agent people persistence", () => {
       await grantRuntime(upgrade.operator);
       await verifySchema(upgrade.runtime);
       expect((await upgrade.operator.query("SELECT version,checksum FROM schema_migrations WHERE version<=34 ORDER BY version")).rows).toEqual(checksums);
-      expect((await upgrade.runtime.query("SELECT id FROM copilot_usage_snapshots WHERE id=$1", [snapshot])).rowCount).toBe(1);
+      expect((await upgrade.runtime.query("SELECT id FROM copilot_usage_snapshots WHERE id=$1", [snapshot])).rowCount).toBe(0);
       await new AgentPeopleRepository(upgrade.runtime).save(scope, [observation()], context);
-      expect((await saved.getDirectorySource(scope)).value).toEqual([]);
+      expect((await saved.getDirectorySource(scope)).value).toBeNull();
     } finally {
       await upgrade.close();
     }

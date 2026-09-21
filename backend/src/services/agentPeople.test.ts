@@ -82,7 +82,8 @@ describe("persistent agent people resolution", () => {
       source: "directory", observedAt, rowCount: 1, attemptStatus: "available", attemptedAt: observedAt,
       lastSuccessAt: observedAt, message: "Fixture",
       value: [{ identity: { objectId: id, displayName: "Licensed", userPrincipalName: "licensed@example.invalid",
-        accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null }, licenses: [], servicePlans: [] }],
+        accountEnabled: true, userType: "Member", employeeType: null, department: null, companyName: null },
+      serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [] }],
     });
     const publication = { runId: randomUUID(), jobId: randomUUID() };
     await value.service.refreshReferences(value.user, new AbortController().signal, publication, { incompleteOnly: false });

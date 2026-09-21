@@ -30,7 +30,7 @@ function directoryUser(displayName = "Saved Person", objectId = personId): Copil
   return {
     identity: { objectId, displayName, userPrincipalName: "saved#EXT#@example.onmicrosoft.com",
       accountEnabled: true, userType: "Guest", employeeType: null, department: null, companyName: null },
-    licenses: [], servicePlans: [],
+    serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
   };
 }
 

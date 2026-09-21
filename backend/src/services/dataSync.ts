@@ -284,20 +284,20 @@ export class DataSyncService {
     };
     try {
       await this.dependencies.repository.attachJob(scope, runId, "users", jobId);
-      await progress("Reading normalized directory/license and app-activity sources.");
+      await progress("Reading paid M365 Copilot license assignments and app-activity sources, not all tenant accounts.");
       let result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
         incompleteOnly, publication: { runId, jobId },
         onDirectoryProgress: async count => {
           observedCount = count;
-          await progress(`Read ${count} distinct licensed users. Directory/license and app-activity collection is in progress.`, count);
+          await progress(`Read ${count} paid-license users from Microsoft's filtered directory. Paid-feature verification and app-activity collection are in progress.`, count);
         },
       });
       signal.throwIfAborted();
       if (inventoryReady) {
-        await progress("Directory/license and app-activity collection finished. Waiting for Power Platform inventory before resolving agent people.");
+        await progress("Paid-license and app-activity collection finished. Waiting for Power Platform inventory before resolving agent people.");
         await inventoryReady;
       }
-      await progress("Directory/license and app-activity collection finished. Resolving agent people from saved inventory references.");
+      await progress("Paid-license and app-activity collection finished. Resolving agent people from saved inventory references.");
       try {
         const people = await this.dependencies.agentPeople.refreshReferences(user, signal, { runId, jobId }, { incompleteOnly });
         result = {

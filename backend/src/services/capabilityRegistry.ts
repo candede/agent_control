@@ -72,11 +72,11 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "provider_read", adapterRegistered: true, description: "Bounded directory lookup through the existing adapter." },
   },
   {
-    id: "graph.licenses.read", displayName: "Copilot license assignments", purpose: "Read current Microsoft 365 Copilot license assignments and user service-plan status.",
+    id: "graph.licenses.read", displayName: "M365 Copilot licenses", purpose: "Read paid Microsoft 365 Copilot license assignments and their paid-feature states, separately from basic Copilot Chat access.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
     permissions: ["User.Read.All", "LicenseAssignment.Read.All"], providerRoles: ["Directory Readers", "Global Reader"], licenses: [], configuration: ["Delegated consent"],
     sources: ["https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0", "https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0"], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "graph.licenses.read",
-    probe: { kind: "on_demand", adapterRegistered: true, description: "The explicit dashboard load validates the bounded license inventory request. Microsoft authorizes the delegated request when it runs." },
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Explicit Users sync reads paid-license assignments and paid-feature evidence in filtered directory pages, not one request per user. Microsoft authorizes the delegated request when it runs." },
   },
   {
     id: "powerPlatform.inventory.read", displayName: "Power Platform inventory", purpose: "Read tenant Power Platform resource inventory on explicit request.",

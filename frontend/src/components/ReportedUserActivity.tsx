@@ -16,6 +16,7 @@ import { useSavedRead } from "../savedQueries";
 import type { UsersRouteState } from "../workbenchRouting";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate, usagePageLabel } from "../usageInsights";
 import { ListTableHead } from "./ListTableHead";
+import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { ReportedUserDetail } from "./ReportedUserDetail";
 import "./reportedUsers.css";
 
@@ -115,7 +116,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
       accessorFn: user => user.missingUserReport ? undefined : user.reportedAgentsUsed,
       sortDescFirst: true,
     },
-    { id: "license", header: "Current license", enableSorting: false },
+    { id: "license", header: "M365 Copilot license", enableSorting: false },
     { id: "lastActivity", header: "User last activity (Users report)", accessorFn: user => user.userLastActivityDateUtc, sortDescFirst: true },
     { id: "details", header: "Details", enableSorting: false },
   ], []);
@@ -194,7 +195,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   }
 
   return <section className="reported-users" aria-label="Reported activity" aria-busy={!scoped}>
-    <p className="reported-users-intro">All imported report identities, including concealed, unlinked and bridge-only users. Rankings measure agent responses, not all Copilot activity or license utilization.</p>
+    <p className="reported-users-intro">All imported report identities, including concealed, unlinked and bridge-only users—not just paid-license users. Rankings measure agent responses, not all Copilot activity or basic Chat usage.</p>
     <div className="copilot-users-toolbar reported-users-toolbar">
       <label><span>Search reported users or agents</span><input ref={searchInput} type="search" maxLength={256} placeholder="User, agent name, ID or creator" value={search}
         onChange={event => onRouteChange({ ...route, search: event.target.value, page: 0 }, true)} /></label>
@@ -262,17 +263,18 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         <p>{usageAvailabilityLabel(data.availability)}. Use Official usage in the top navigation to select or import reports. Missing reports are not zero activity.</p>
       </div> : <>
         {!hasRelationships ? <p className="reported-users-note">The Users &amp; agents companion is missing. Relationships are unknown, not zero.</p> : null}
-        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. Current licenses require a unique exact link to this report snapshot.</p>
+        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. Paid licenses require a unique exact directory link to this report snapshot; otherwise, License not verified.</p>
         {data.users.value.length ? <div ref={reportedTable} className="copilot-users-table-shell" role="region" aria-label="Reported users" tabIndex={0}>
           <table className="copilot-users-table reported-users-table">
             <ListTableHead table={table} />
             <tbody>{table.getRowModel().rows.map(row => {
               const user = row.original;
+              const directoryUser = directoryMatches.get(reportUserKey(user));
               return <tr key={row.id}>
-              <th scope="row">{user.displayName || user.username}<small>{user.username}</small></th>
+              <th scope="row">{user.displayName || user.username}<small>{user.username}</small>{directoryUser?.directory.accountEnabled === false ? <small>Account disabled</small> : null}</th>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedResponsesReceived)}{user.hasReportMismatch ? <small>Report totals differ</small> : null}</td>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</td>
-              <td>{licenseLabel(directoryMatches.get(reportUserKey(user)))}</td>
+              <td><CopilotLicenseStatus user={directoryUser} /></td>
               <td>{usageDate(user.userLastActivityDateUtc)}</td>
               <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key, username: user.username })}>View details</button></td>
             </tr>;
@@ -281,7 +283,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         </div> : <div className="reported-users-empty">
           <h3>{data.users.count ? "No reported users on this page" : data.counts.users ? "No reported users match" : "No reported user identities"}</h3>
           <p>{data.counts.users ? "Try another search or clear filters. Missing relationships do not establish inactivity."
-            : "This snapshot contains no Users or Users & agents identities. Report availability and directory license coverage are independent."}</p>
+            : "This snapshot contains no Users or Users & agents identities. Report availability and paid license coverage are independent."}</p>
           {page > 0 ? <button type="button" className="secondary" onClick={() => onRouteChange({ ...route, page: 0 })}>First user page</button> : null}
         </div>}
         <div className="copilot-users-pagination" aria-label="Reported user pages">
@@ -297,13 +299,13 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         {data.lineages.map(lineage => <p key={lineage.kind}>{lineage.kind === "userAgents" ? "Users & agents" : lineage.kind === "users" ? "Users" : "Agents"} version: {lineage.versionId}. {lineage.sourceFreshness === "unknown" ? "Source refresh time not supplied; import time does not establish freshness." : ""}</p>)}
         {data.activeSet?.reportingPeriod.provenance === "activity_range" ? <p>Observed activity dates do not establish a complete reporting window.</p> : null}
         <p>{directoryData?.sources.directory.state === "available"
-          ? `License inventory observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current assignments do not prove a license was held during the reporting period.`
-          : "Current license inventory is unverified or unavailable. Report identities remain visible; Unknown does not mean unlicensed."}</p>
+          ? `Paid licenses observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current assignments do not prove activity or entitlement during the reporting period.`
+          : "Current paid license inventory is unverified or unavailable. Report identities remain visible; License not verified does not mean basic, unlicensed or disabled."}</p>
         <p>Concealed identities and case-distinct names are report-scoped. Directory assignments require an existing unique exact saved link with the same report set, Users version and Users &amp; agents version.</p>
         <p>{data.decisionNotice} Collection and connection recovery are available through Sync and Permissions in the top navigation.</p>
         <p>CSV filters select matching people, not individual exported relationships. Every agent relationship of each matching user is exported, not only this page or the selected agent. Repeated all-agent Users-report totals are not additive across relationship rows.</p>
       </details>
-      {selected ? <ReportedUserDetail key={reportUserKey(selected)} user={selected} currentLicense={licenseLabel(directoryMatches.get(reportUserKey(selected)))}
+      {selected ? <ReportedUserDetail key={reportUserKey(selected)} user={selected} directoryUser={directoryMatches.get(reportUserKey(selected))}
         hasRelationships={hasRelationships} filters={data.filters} returnFocusTo={searchInput} onClose={() => setSelectedUser(undefined)}
         onFocusAgent={(id, setId) => {
           setSelectedUser(undefined);
@@ -317,13 +319,6 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
 
 function reportUserKey(user: OfficialUsageUserSummary) {
   return JSON.stringify([user.username, user.datasetScope.reportSetId, user.datasetScope.usersVersionId, user.datasetScope.userAgentsVersionId]);
-}
-
-function licenseLabel(user: CopilotUsageUser | null | undefined) {
-  if (!user) return "Unknown";
-  if (user.licenses.some(license => license.state === "error")) return "Assignment issue";
-  if (user.licenses.length && user.licenses.every(license => license.state === "disabled")) return "Assigned, disabled";
-  return "Assigned";
 }
 
 function isAccessDenied(failure: unknown) {

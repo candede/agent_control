@@ -296,7 +296,7 @@ describe("access API client", () => {
     ]);
   });
 
-  it("loads the licensed usage snapshot with a cancellable read-only request", async () => {
+  it("loads the Copilot service usage snapshot with a cancellable read-only request", async () => {
     const fetchMock = mockJsonResponse({ users: [] });
     const controller = new AbortController();
     await getCopilotUsageUsers({ signal: controller.signal });

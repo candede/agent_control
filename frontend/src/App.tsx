@@ -2500,7 +2500,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           </p>
           <p>
             Discover agents across Microsoft 365 and Copilot Studio, explore
-            Copilot usage and license insights, and investigate activity. Make
+            Copilot usage and service insights, and investigate activity. Make
             informed decisions about adoption and access, with the controls to
             take action.
           </p>

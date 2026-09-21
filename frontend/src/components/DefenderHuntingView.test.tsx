@@ -170,7 +170,7 @@ describe("DefenderHuntingView", () => {
   it("submits an explicit fixed template with typed filters and no KQL or workspace field", async () => {
     vi.mocked(submitDefenderHunt).mockResolvedValue(job());
     renderView();
-    await screen.findByRole("heading", { name: "Defender and Agent 365 hunting" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     expect(submitDefenderHunt).toHaveBeenCalledWith("delegated", expect.objectContaining({ templateId: "agents_inventory", operations: [], agentIds: [], blueprintIds: [], actorObjectIds: [] }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
@@ -213,7 +213,8 @@ describe("DefenderHuntingView", () => {
         reload: vi.fn(async () => undefined), openPermissions: vi.fn(), views: [],
       }}><DefenderHuntingView /></CapabilityContext>);
 
-      const authorization = await screen.findByLabelText("Authorization");
+      await screen.findByText("No hunting history");
+      const authorization = screen.getByLabelText("Authorization");
       expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
       fireEvent.change(authorization, { target: { value: "application" } });
       fireEvent.change(screen.getByLabelText("Agent IDs"), { target: { value: "application-agent" } });
@@ -351,7 +352,7 @@ describe("DefenderHuntingView", () => {
     vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
     vi.mocked(submitDefenderHunt).mockReturnValue(new Promise(resolve => { resolveSearch = resolve; }));
     renderView();
-    await screen.findByText("Delegated authorization permits an explicit bounded hunt.");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     fireEvent.change(screen.getByLabelText("Agent IDs"), { target: { value: "agent-after-search" } });
@@ -848,17 +849,42 @@ describe("DefenderHuntingView", () => {
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
-  it("opens a retained prior successful result from a failed newer attempt", async () => {
+  it.each(["ready", "pending"] as const)("opens a retained prior successful result from a failed newer attempt (%s saved reads)", async savedReads => {
     const prior = job();
     const failed = job({ id: "55555555-5555-4555-8555-555555555555", status: "inconclusive", snapshotId: null,
       priorSuccessfulJobId: prior.id, complete: false, errorCode: "provider_error" });
+    const history = { value: [], count: 0, limit: 20, offset: 0 };
+    let finishCatalog!: (value: DefenderHuntingCatalog) => void;
+    let finishHistory!: (value: Awaited<ReturnType<typeof getDefenderHuntingJobs>>) => void;
+    if (savedReads === "pending") {
+      vi.mocked(getDefenderHuntingCatalog).mockReturnValueOnce(new Promise(resolve => { finishCatalog = resolve; }));
+      vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce(history)
+        .mockReturnValueOnce(new Promise(resolve => { finishHistory = resolve; }));
+    }
     vi.mocked(submitDefenderHunt).mockResolvedValue(failed);
     vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(prior, "Retained prior agent"));
     renderView();
-    fireEvent.click(await screen.findByRole("button", { name: "Run hunt" }));
-    fireEvent.click(await screen.findByRole("button", { name: /View prior successful result/ }));
+    const search = screen.getByRole("button", { name: "Run hunt" });
+    if (savedReads === "pending") {
+      expect(search).toBeDisabled();
+      fireEvent.click(search);
+      expect(submitDefenderHunt).not.toHaveBeenCalled();
+      await act(async () => finishCatalog(catalog));
+    }
+    await waitFor(() => expect(search).toBeEnabled());
+    fireEvent.click(search);
+    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
+    const viewPrior = await screen.findByRole("button", { name: /View prior successful result/ });
+    if (savedReads === "pending") {
+      expect(viewPrior).toBeDisabled();
+      fireEvent.click(viewPrior);
+      expect(getDefenderHuntingRows).not.toHaveBeenCalled();
+      await act(async () => finishHistory(history));
+    }
+    await waitFor(() => expect(viewPrior).toBeEnabled());
+    fireEvent.click(viewPrior);
     expect(await screen.findByText("Retained prior agent")).toBeVisible();
-    expect(getDefenderHuntingRows).toHaveBeenCalledWith(
+    expect(getDefenderHuntingRows).toHaveBeenCalledExactlyOnceWith(
       prior.id,
       100,
       0,
