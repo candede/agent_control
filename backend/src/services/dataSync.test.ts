@@ -73,7 +73,7 @@ describe("DataSyncService", () => {
     harness.powerPlatform.start.mockReturnValueOnce(pending.promise);
     harness.copilotUsage.refreshUsers.mockImplementationOnce(async (_user, _signal, options) => {
       await options.onDirectoryProgress?.(7);
-      return { status: "succeeded", count: 7, message: "Saved seven licensed users." };
+      return { status: "succeeded", count: 7, message: "Saved seven checked directory users." };
     });
     await harness.service.start(user, { mode: "full" });
     await vi.waitFor(() => expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled());
@@ -262,7 +262,7 @@ describe("DataSyncService", () => {
     harness.agentPeople.refreshReferences.mockReturnValueOnce(resolving.promise);
     await harness.service.start(user, { mode: "incremental", sources: ["users"] });
     await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({
-      status: "running", count: 12, message: expect.stringContaining("12 paid-license users from Microsoft's filtered directory"),
+      status: "running", count: 12, message: expect.stringContaining("Checked 12 directory users assigned Copilot-capable products"),
     }));
     reading.resolve({ status: "succeeded", count: 12, message: "Saved directory/license and app-activity sources." });
     await vi.waitFor(() => expect(harness.agentPeople.refreshReferences).toHaveBeenCalled());

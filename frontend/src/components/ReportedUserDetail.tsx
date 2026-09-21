@@ -56,7 +56,7 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
     <details className="copilot-users-provenance">
       <summary>Identity and report coverage</summary>
       <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}.</p>
-      <p>Concealed and case-distinct identities are scoped to this report, not matched by display name. Current paid license assignments are shown only for a unique, exact saved directory link to these report versions; they do not establish activity or entitlement during the reporting period. License not verified does not mean basic or unlicensed.</p>
+      <p>Concealed and case-distinct identities are scoped to this report, not matched by display name. Current license status requires a unique, exact saved directory link to these report versions and effective paid-feature state. Current entitlement does not establish activity or coverage during the reporting period. License not verified does not mean basic or unlicensed.</p>
       <p>{hasRelationships ? `${user.rows.length.toLocaleString()} reported agent relationships.` : "Users & agents companion missing: relationships are unknown, not zero."}</p>
     </details>
   </dialog>;

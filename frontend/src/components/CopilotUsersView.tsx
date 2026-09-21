@@ -21,7 +21,7 @@ import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportedUserAgents } from "./ReportedUserAgents";
 import "./copilotUsers.css";
 
-type Cohort = "all" | "active" | "attention" | "unknown";
+type Cohort = "licensed" | "all" | "attention" | "unknown";
 type ReadState = { key: object; status: "ready" } | { key: object; status: "failed"; error: string; accessDenied?: boolean };
 const pageSize = 50;
 const defaultLicenseSorting: SortingState = [{ id: "responses", desc: true }];
@@ -110,7 +110,7 @@ export function CopilotUsersView({
         <div>
           <h2>Users & adoption</h2>
           <p>{currentRoute.view === "licenses"
-            ? "Paid M365 Copilot licenses and adoption. Basic Copilot Chat access and usage are not counted."
+            ? "Effective paid M365 Copilot licenses and adoption."
             : "All imported report identities and agent activity, independent of verified paid M365 Copilot licensing."}</p>
         </div>
         <div className="copilot-users-header-actions">
@@ -122,8 +122,8 @@ export function CopilotUsersView({
       </header>
       {error ? <div className="error-banner" role="alert">{error} Use Permissions in the top navigation for connection recovery.
         {" "}<button type="button" className="secondary" onClick={() => setReload(value => value + 1)}>Retry saved users</button></div> : null}
-      {loading && currentRoute.view === "licenses" ? <p role="status">Loading saved paid Copilot license assignments and usage snapshots...</p> : null}
-      {data && !currentData ? <p className="copilot-users-notice" role="status">Showing the last saved user snapshot. Current paid license assignments and adoption recommendations are unverified until saved users reload.</p> : null}
+      {loading && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}
+      {data && !currentData ? <p className="copilot-users-notice" role="status">Showing the last saved user snapshot. Current licensing and adoption recommendations are unverified until saved users reload.</p> : null}
       {currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} directoryData={currentData}
         onAccessDenied={message => { directoryRequest.current?.abort(); setData(undefined); setRead({ key: readKey, status: "failed", error: message, accessDenied: true }); }} /> : null
         : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, key: selectionKey })}
@@ -142,7 +142,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
   onViewReportedUser: (username: string, reportSetId: string) => void;
 }) {
   const [search, setSearch] = useState("");
-  const [cohort, setCohort] = useState<Cohort>("all");
+  const [cohort, setCohort] = useState<Cohort>("licensed");
   const [sorting, setSorting] = useState<SortingState>(defaultLicenseSorting);
   const [threshold, setThreshold] = useState(5);
   const [page, setPage] = useState(0);
@@ -150,23 +150,23 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
   const directoryCurrent = current && directoryKnown;
   const agentUsageFresh = current && data.sources.importedAgentUsage.state === "available";
   const appActivityFresh = current && data.sources.appActivity.state === "available";
-  const attention = data.users.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh)).length;
-  const measured = data.users.filter(user => responses(user) !== null).length;
-  const unknown = data.users.length - measured;
+  const licensedUsers = useMemo(() => data.users.filter(user => isCopilotServiceActive(user.copilotServiceState)), [data.users]);
+  const attention = licensedUsers.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh)).length;
+  const measured = licensedUsers.filter(user => responses(user) !== null).length;
+  const unknown = licensedUsers.length - measured;
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
-    return data.users.filter(user => {
+    return (cohort === "all" ? data.users : licensedUsers).filter(user => {
       if (query && ![
         user.directory.displayName, user.directory.userPrincipalName, user.directory.objectId,
         user.directory.companyName, user.directory.department,
         ...(user.importedUsage?.rows.flatMap(row => [row.displayAgentName, row.creatorType]) ?? []),
       ].some(value => value?.toLowerCase().includes(query))) return false;
-      if (cohort === "active") return directoryCurrent && isCopilotServiceActive(user.copilotServiceState);
       if (cohort === "attention") return directoryCurrent && needsAttention(user, threshold, agentUsageFresh, appActivityFresh);
       if (cohort === "unknown") return responses(user) === null;
       return true;
     });
-  }, [agentUsageFresh, appActivityFresh, cohort, data.users, directoryCurrent, search, threshold]);
+  }, [agentUsageFresh, appActivityFresh, cohort, data.users, directoryCurrent, licensedUsers, search, threshold]);
   const columns = useMemo<ListColumn<CopilotUsageUser>[]>(() => [
     { id: "user", header: "User", accessorFn: name },
     { id: "license", header: "M365 Copilot license", accessorFn: user => copilotServicePresentation(user.copilotServiceState).label },
@@ -198,6 +198,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
   const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
   const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const noLicensedUsers = cohort === "licensed" && licensedUsers.length === 0 && !search.trim();
 
   function selectCohort(next: Cohort) {
     setCohort(next);
@@ -208,27 +209,27 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
     <section className={`copilot-users-snapshot copilot-users-scope${directoryCurrent ? "" : " unverified"}`} aria-label="Paid license scope and coverage">
       <div>
         <strong>{directoryCurrent
-          ? `${data.users.length.toLocaleString()} paid-license users in the saved roster`
-          : data.users.length ? `Last saved roster: ${data.users.length.toLocaleString()} paid-license users` : "Paid-license user count unverified"}</strong>
+          ? `${data.users.length.toLocaleString()} directory users checked (not tenant headcount)`
+          : data.users.length ? `Last saved: ${data.users.length.toLocaleString()} directory users checked` : "Directory coverage unverified"}</strong>
         {data.snapshot ? <span>Last successful sync: {data.snapshot.lastSuccessAt ? formatDateTime(data.snapshot.lastSuccessAt) : "never"}.</span> : null}
       </div>
       {data.snapshot?.state === "not_synced" ? <p>No saved user data. Run Users Sync.</p>
         : data.snapshot?.state === "partial" ? <p>Saved user snapshot is partial.</p> : null}
       <p>{directoryCurrent
-        ? "Not all tenant accounts: server-side filtering spans the tenant; all matching Graph pages and count checks completed for this saved directory sync."
-        : "Not all tenant accounts. Current paid-license coverage is unverified; run Users Sync to verify the last saved roster."}</p>
-      <p>Basic Copilot Chat may remain available without a paid license or when paid features are not enabled. This snapshot does not measure basic access or usage.</p>
+        ? "Containing bundles identify candidates, not entitlement. All matching Graph pages and count checks completed across the tenant for this saved sync."
+        : "Current licensing and coverage are unverified. The saved candidate roster is not tenant headcount or proof of paid entitlement."}</p>
+      <p>Basic Copilot Chat may be available without a paid license, subject to policy. Basic access and usage are not measured.</p>
     </section>
     <div className="copilot-user-metrics" aria-label="M365 Copilot license summary">
       <Metric label="Active M365 Copilot licensed users" value={directoryCurrent ? data.counts.licensedUsers : null} hint="Verified paid access, not recent usage" />
-      <Metric label="Using agents" value={directoryCurrent && agentUsageFresh ? data.users.filter(user => (responses(user) ?? 0) > 0).length : null} hint="Paid-license users with agent responses" />
-      <Metric label="Needs attention" value={directoryCurrent ? attention : null} hint="Paid-license users needing follow-up" />
-      <Metric label="Agent usage unknown" value={directoryCurrent ? unknown : null} hint="Paid-license users; not proof of inactivity" />
+      <Metric label="Using agents" value={directoryCurrent && agentUsageFresh ? licensedUsers.filter(user => (responses(user) ?? 0) > 0).length : null} hint="Licensed users with agent responses" />
+      <Metric label="Needs attention" value={directoryCurrent ? attention : null} hint="Licensed users needing follow-up" />
+      <Metric label="Agent usage unknown" value={directoryCurrent ? unknown : null} hint="Licensed users; not proof of inactivity" />
     </div>
 
     {!directoryKnown ? <div className="copilot-users-notice" role="status"><p>Current paid license inventory is unverified. {data.sources.directory.message} Use Sync or Permissions in the top navigation to refresh or reconnect.</p></div> : null}
     {data.sources.importedAgentUsage.state !== "available" ? <div className="copilot-users-notice" role="status">
-      <p>{data.sources.importedAgentUsage.state === "stale" ? "Agent usage is out of date. Historical totals are shown, but are not used for low-usage recommendations." : "Agent usage is not available yet. Paid license assignments remain listed; missing usage is not zero."}</p>
+      <p>{data.sources.importedAgentUsage.state === "stale" ? "Agent usage is out of date. Historical totals are shown, but are not used for low-usage recommendations." : "Agent usage is not available yet. Saved license status remains visible; missing usage is not zero."}</p>
       <p>Use Official usage in the top navigation to manage agent reports.</p>
     </div> : null}
     {data.sources.appActivity.state === "unavailable" ? <div className="copilot-users-notice" role="status">
@@ -236,16 +237,16 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
       <p>Use Permissions in the top navigation to review the connection.</p>
     </div> : data.sources.appActivity.state === "stale" ? <p><small>Office app activity is out of date. Last-known dates remain visible in user details.</small></p> : null}
 
-    <div className="copilot-users-tabs" role="group" aria-label="Paid license cohorts">
+    <div className="copilot-users-tabs" role="group" aria-label="Copilot user cohorts">
       {([
-        ["all", "All paid licenses"],
-        ["active", "Active paid licenses"],
+        ["licensed", "Licensed users"],
         ["attention", "Needs attention"],
         ["unknown", "Usage unknown"],
+        ["all", "All checked users"],
       ] as const).map(([value, label]) => <button key={value} type="button" className="secondary" aria-pressed={cohort === value} onClick={() => selectCohort(value)}>{label}</button>)}
     </div>
 
-    <div className="copilot-users-toolbar" aria-label="Paid license filters">
+    <div className="copilot-users-toolbar" aria-label="Copilot user filters">
       <label><span>Search users or agents</span><input type="search" placeholder="Name, email, company, department or agent" value={search} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
       <label><span>Order by</span><select value={licenseSorts.find(([, , id, desc]) => id === sorting[0]?.id && desc === sorting[0]?.desc)?.[0]} onChange={event => {
         const next = licenseSorts.find(([value]) => value === event.target.value);
@@ -258,9 +259,11 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
         {[5, 10, 20, 50].map(value => <option key={value} value={value}>{value} responses or fewer</option>)}
       </select></label> : null}
     </div>
-    <p><small>{directoryCurrent ? `${filtered.length.toLocaleString()} paid-license users shown` : "Current paid-license count unavailable; any listed assignments are last saved"}{data.sources.importedAgentUsage.period.startDate && data.sources.importedAgentUsage.period.endDate ? ` | Agent report: ${data.sources.importedAgentUsage.period.startDate} to ${data.sources.importedAgentUsage.period.endDate}` : ""}. Rankings use agent responses, not total Copilot utilization.</small></p>
+    <p><small>{directoryCurrent
+      ? `${filtered.length.toLocaleString()} ${cohort === "all" ? "checked" : "licensed"} users shown`
+      : `Last saved: ${filtered.length.toLocaleString()} ${cohort === "all" ? "checked" : "previously licensed"} users shown; current licensing unverified`}{data.sources.importedAgentUsage.period.startDate && data.sources.importedAgentUsage.period.endDate ? ` | Agent report: ${data.sources.importedAgentUsage.period.startDate} to ${data.sources.importedAgentUsage.period.endDate}` : ""}. Rankings use agent responses, not total Copilot utilization.</small></p>
 
-    {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="Paid M365 Copilot license assignments" tabIndex={0}>
+    {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
       <table className="copilot-users-table">
         <ListTableHead table={table} />
         <tbody>{visible.map(row => {
@@ -277,12 +280,14 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
         })}</tbody>
       </table>
     </div> : <div className="copilot-users-empty">
-      <h3>{directoryCurrent ? data.users.length ? "No users match" : "No paid Microsoft 365 Copilot license assignments found" : "Verify the directory to see current paid licenses"}</h3>
-      <p>{directoryCurrent ? data.users.length ? "Try a different cohort or search." : "Basic Copilot Chat and Copilot Studio alone are not paid Microsoft 365 Copilot license assignments." : "Imported identities are retained below, but their paid licenses have not been verified."}</p>
-      {search || cohort !== "all" ? <button className="secondary" type="button" onClick={() => { setSearch(""); selectCohort("all"); }}>Reset filters</button> : null}
+      <h3>{directoryCurrent ? noLicensedUsers ? "No active M365 Copilot licenses found" : "No users match" : "No last-saved users in this cohort"}</h3>
+      <p>{directoryCurrent
+        ? noLicensedUsers ? "No candidate has verified active paid features. All checked users includes inactive and unverified states." : "Try a different cohort or search."
+        : "Current licensing is unverified. All checked users includes any retained diagnostic records."}</p>
+      {search || cohort !== "licensed" ? <button className="secondary" type="button" onClick={() => { setSearch(""); selectCohort("licensed"); }}>Reset filters</button> : null}
     </div>}
 
-    {filtered.length > pageSize ? <div className="copilot-users-pagination" aria-label="Paid license assignment pages">
+    {filtered.length > pageSize ? <div className="copilot-users-pagination" aria-label="Copilot user pages">
       <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
       <span>{currentPage * pageSize + 1}-{Math.min((currentPage + 1) * pageSize, filtered.length)} of {filtered.length.toLocaleString()}</span>
       <button type="button" className="secondary" disabled={currentPage >= lastPage} onClick={() => setPage(currentPage + 1)}>Next</button>
@@ -293,12 +298,13 @@ function CopilotUsersDashboard({ data, current, onInspectUser, onViewReportedUse
       {data.snapshot ? <p>Directory observed: {data.snapshot.directoryObservedAt ? formatDateTime(data.snapshot.directoryObservedAt) : "never"}.
         {" "}App activity observed: {data.snapshot.appActivityObservedAt ? formatDateTime(data.snapshot.appActivityObservedAt) : "never"}.</p> : null}
       <dl>{([
-        ["Paid M365 Copilot license assignments", data.sources.directory],
+        ["Checked directory users", data.sources.directory],
         ["Agent activity", data.sources.importedAgentUsage],
         ["Office app activity", data.sources.appActivity],
       ] as const).map(([label, source]) => <div key={label}><dt>{label}: {sourceLabel(source)}</dt><dd>{source.message}</dd><dd>Checked: {formatDate(source.fetchedAt)}{source.reportRefreshDate ? ` | Report refreshed: ${formatDate(source.reportRefreshDate)}` : ""}{source.reportVersion ? ` | Version: ${source.reportVersion}` : ""}</dd>{source.period.startDate || source.period.endDate ? <dd>Range: {source.period.startDate ?? "Unknown"} to {source.period.endDate ?? "Unknown"}</dd> : null}</div>)}</dl>
-      <p>{directoryCurrent ? `${measured.toLocaleString()} paid-license users have matched agent response totals.` : "Current paid-license coverage cannot be determined until the directory inventory is available."} Identities are matched by exact identifiers, never by display name; renamed, hidden or unmatched users stay unresolved.</p>
-      <p>App reports can lag by 48 hours and show last-known dates, not counts of prompts or daily activity. A current paid license assignment does not prove activity or entitlement throughout the usage period.</p>
+      <p>{directoryCurrent ? `${measured.toLocaleString()} licensed users have matched agent response totals.` : "Current licensing cannot be determined until the directory inventory is available."} Identities are matched by exact identifiers, never by display name; renamed, hidden or unmatched users stay unresolved.</p>
+      <p>All checked users retains bundle-discovery candidates for diagnostics, including inactive and unverified paid features. Only verified active paid features establish current M365 Copilot licensing.</p>
+      <p>App reports can lag by 48 hours and show last-known dates, not counts of prompts or daily activity. Current paid entitlement does not prove activity or coverage throughout the usage period.</p>
       <p>Low agent usage is a coaching signal, not a recommendation to remove a paid license. Review Office app activity and the employee&apos;s context first. No assignments are changed.</p>
       {data.notices.map(notice => <p key={notice}>{notice}</p>)}
     </details>
@@ -348,7 +354,7 @@ function UnlinkedReportIdentities({ identities, onViewReportedUser }: {
   const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
   return <details className="copilot-users-provenance">
     <summary>Unlinked report identities ({identities.length.toLocaleString()})</summary>
-    <p>These report identities cannot be linked uniquely to a saved directory user with a paid license assignment. They may be concealed, renamed or no longer assigned; neither licensing nor basic Chat access is inferred. Every identity is available below.</p>
+    <p>These report identities cannot be linked uniquely to a checked directory user. They may be concealed, renamed or outside the saved candidate roster; neither licensing nor basic Chat access is inferred. Every identity is available below.</p>
     <div className="copilot-users-toolbar"><label><span>Search unlinked report identities</span><input type="search" value={search} maxLength={256} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label></div>
     {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="Unlinked report identities" tabIndex={0}>
       <table className="copilot-users-table"><ListTableHead table={table} />
@@ -408,7 +414,7 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
       <div className="copilot-user-metric">
         <span>M365 Copilot license</span>
         <CopilotLicenseStatus user={user} current={directoryCurrent} />
-        <small>{directoryCurrent ? "Assignment is not evidence of activity or historical entitlement" : "Last saved assignment; current license and paid features unverified"}</small>
+        <small>{directoryCurrent ? "Current entitlement is not evidence of activity or historical coverage" : "Last saved evidence; current license and paid features unverified"}</small>
       </div>
       <Metric label="Agent responses" value={responses(user)} hint={fresh ? "Imported Users report total" : "Historical or missing report"} />
       <Metric label="Agents used" value={imported && !imported.missingUserReport ? imported.reportedAgentsUsed : null} hint="Imported Users report total" />

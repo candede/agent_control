@@ -4,8 +4,15 @@ import { AppError } from "../errors.js";
 import type { PublishedOfficialUsage, UserAgentUsageRow, UserUsageRow } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotUsageService } from "./copilotUsage.js";
-import type { CopilotDirectoryUser, CopilotReportResult, CopilotUsageGraphClient } from "./copilotUsageGraph.js";
+import {
+  buildCopilotUsersUrl,
+  buildSubscribedSkusUrl,
+  CopilotUsageGraphClient,
+  type CopilotDirectoryUser,
+  type CopilotReportResult,
+} from "./copilotUsageGraph.js";
 import type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../db/dataSync.js";
+import type { FetchLike } from "./graphPackages.js";
 
 const now = new Date("2026-09-13T01:00:00.000Z");
 const publication = {
@@ -68,7 +75,7 @@ describe("CopilotUsageService", () => {
     expect(graph.listAppActivity).not.toHaveBeenCalled();
   });
 
-  it("counts active paid M365 Copilot licenses separately from all paid assignments and basic Chat", async () => {
+  it("counts active paid M365 Copilot licenses separately from product-assignment candidates and basic Chat", async () => {
     const states = ["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"] as const;
     const directory = states.map((state, index) => {
       const row = directoryUser(`11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, `${state}@example.com`);
@@ -83,18 +90,163 @@ describe("CopilotUsageService", () => {
     });
     const harness = refreshHarness(directory);
     const result = await harness.value.users(user);
-    expect(result.counts.licensedUsers).toBe(3);
+    expect(result.counts).toMatchObject({
+      licensedUsers: 3,
+      measuredActivityUsers: null,
+      needsAttentionUsers: 2,
+      unknownMetricsUsers: 3,
+    });
     expect(result.users).toHaveLength(7);
     expect(result.users.find(value => value.copilotServiceState === "disabled")?.attention).toContain("copilot_service_disabled");
     expect(result.users.find(value => value.copilotServiceState === "unknown")?.attention).toContain("copilot_service_unknown");
     expect(result.users.find(value => value.copilotServiceState === "partially_enabled")?.attention).toContain("copilot_service_partial");
     expect(result.users.find(value => value.copilotServiceState === "warning")?.attention).toContain("copilot_service_warning");
     expect(JSON.stringify(result.users)).not.toMatch(/skuId|skuPartNumber|assignmentStates|licenses/);
-    expect(result.sources.directory.message).toContain("7 users with paid M365 Copilot license assignments");
+    expect(result.sources.directory.message).toContain("Checked 7 directory users assigned products that can include paid M365 Copilot");
     expect(result.sources.directory.message).toContain("not the total number of tenant accounts");
-    expect(result.notices).toContain("Active M365 Copilot licensed users counts paid-license users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.");
+    expect(result.notices).toContain("Active M365 Copilot licensed users counts only users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.");
     expect(result.notices.some(notice => notice.includes("Basic access and usage are not measured here"))).toBe(true);
     expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+  });
+
+  it("excludes inactive and unverified candidates from every paid-license adoption count without discarding their reported activity", async () => {
+    const directory = [
+      directoryUser("11111111-1111-4111-8111-111111111111", "licensed-measured@example.com"),
+      directoryUser("22222222-2222-4222-8222-222222222222", "licensed-unknown-usage@example.com"),
+      directoryUser("33333333-3333-4333-8333-333333333333", "copilot-disabled-in-bundle@example.com"),
+      directoryUser("44444444-4444-4444-8444-444444444444", "entitlement-unverified@example.com"),
+    ];
+    directory[2].copilotServiceState = directory[2].servicePlans[0].state = "disabled";
+    directory[3].copilotServiceState = directory[3].servicePlans[0].state = "unknown";
+    directory[3].servicePlans[0].capabilityStatus = null;
+    const result = await service({
+      directory,
+      report: {
+        users: [
+          appUser("licensed-measured@example.com", "2026-09-12"),
+          appUser("copilot-disabled-in-bundle@example.com", "2026-09-12"),
+        ],
+        reportRefreshDate: "2026-09-13",
+      },
+      published: importedPublished([
+        { username: "licensed-measured@example.com", displayName: "Licensed", numberOfAgentsUsed: 1, agentResponsesReceived: 20 },
+        { username: "copilot-disabled-in-bundle@example.com", displayName: "Bundle only", numberOfAgentsUsed: 2, agentResponsesReceived: 1_000 },
+        { username: "entitlement-unverified@example.com", displayName: "Unverified", numberOfAgentsUsed: 3, agentResponsesReceived: 2_000 },
+      ], []),
+    }).users(user);
+
+    expect(result.counts).toEqual({
+      licensedUsers: 2,
+      measuredActivityUsers: 1,
+      needsAttentionUsers: 0,
+      unknownMetricsUsers: 1,
+      unresolvedImportedIdentities: 0,
+    });
+    expect(result.users).toHaveLength(4);
+    expect(result.users.find(entry => entry.directory.userPrincipalName === "copilot-disabled-in-bundle@example.com"))
+      .toMatchObject({
+        copilotServiceState: "disabled",
+        servicePlans: [expect.objectContaining({ state: "disabled", capabilityStatus: "Enabled" })],
+        importedUsage: { reportedResponsesReceived: 1_000 },
+        appActivity: { lastActivityDate: "2026-09-12" },
+        attention: expect.arrayContaining(["copilot_service_disabled"]),
+      });
+  });
+
+  it("keeps 3,993 checked E7 candidates distinct from 2,206 effectively licensed users through bulk discovery and saved reads", async () => {
+    const bundleId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const plans = [
+      { servicePlanId: "a62f8878-de10-42f3-b68f-6149a25ceb97", service: "M365_COPILOT_APPS" },
+      { servicePlanId: "b95945de-b3bd-46db-8437-f2beb6ea2347", service: "M365_COPILOT_TEAMS" },
+      { servicePlanId: "3f30311c-6b1e-48a4-ab79-725b469da960", service: "M365_COPILOT_BUSINESS_CHAT" },
+    ];
+    const planIds = plans.map(plan => plan.servicePlanId);
+    const candidates = Array.from({ length: 3_993 }, (_, index) => ({
+      id: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
+      userPrincipalName: `bundle-user-${index}@example.com`,
+      assignedLicenses: [{ skuId: bundleId, disabledPlans: index < 2_206 ? [] : planIds }],
+      assignedPlans: plans.map(plan => ({
+        ...plan, capabilityStatus: "Enabled", assignedDateTime: "2026-09-12T00:00:00Z",
+      })),
+    }));
+    const usersUrl = buildCopilotUsersUrl([bundleId]);
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const url = new URL(String(input));
+      if (url.href === buildSubscribedSkusUrl()) return Response.json({
+        value: [{
+          skuId: bundleId, skuPartNumber: "MICROSOFT_365_E7", appliesTo: "User",
+          servicePlans: planIds.map(servicePlanId => ({ servicePlanId })),
+        }],
+      });
+      if (url.pathname !== "/v1.0/users") throw new Error("Unexpected Graph request in the bulk entitlement regression.");
+      const start = Number(url.searchParams.get("$skiptoken") ?? "0");
+      const end = start + 100;
+      return Response.json({
+        "@odata.count": candidates.length,
+        value: candidates.slice(start, end),
+        ...(end < candidates.length ? { "@odata.nextLink": `${usersUrl}&$skiptoken=${end}` } : {}),
+      });
+    });
+    const client = new CopilotUsageGraphClient(fetcher);
+    const harness = refreshHarness();
+    harness.graph.listCopilotUsers.mockImplementation((...args) => client.listCopilotUsers(...args));
+
+    const refresh = await harness.value.refreshUsers(user, undefined, { publication });
+    const result = await harness.value.users(user);
+    expect(result.users).toHaveLength(3_993);
+    expect(result.counts).toMatchObject({
+      licensedUsers: 2_206,
+      measuredActivityUsers: null,
+      needsAttentionUsers: 0,
+      unknownMetricsUsers: 2_206,
+    });
+    expect(result.users.find(entry => entry.directory.userPrincipalName === "bundle-user-2206@example.com"))
+      .toMatchObject({
+        copilotServiceState: "disabled",
+        servicePlans: planIds.map(servicePlanId => expect.objectContaining({
+          servicePlanId, state: "disabled", capabilityStatus: "Enabled",
+        })),
+      });
+    expect(refresh).toMatchObject({ status: "succeeded", count: 3_993 });
+    expect(refresh.message).toContain("Directory users checked: 3993. Active M365 Copilot licensed users: 2206.");
+    expect(fetcher).toHaveBeenCalledTimes(41);
+    await harness.value.users(user);
+    expect(fetcher).toHaveBeenCalledTimes(41);
+  });
+
+  it("reports zero active licenses without hiding a checked bundle user whose Copilot is not enabled", async () => {
+    const candidate = directoryUser("11111111-1111-4111-8111-111111111111", "bundle-only@example.com");
+    candidate.copilotServiceState = candidate.servicePlans[0].state = "disabled";
+    const harness = refreshHarness();
+    harness.graph.listCopilotUsers.mockResolvedValueOnce([candidate]);
+    const refresh = await harness.value.refreshUsers(user, undefined, { publication });
+    const result = await harness.value.users(user);
+
+    expect(refresh).toMatchObject({ status: "succeeded", count: 1 });
+    expect(refresh.message).toContain("Directory users checked: 1. Active M365 Copilot licensed users: 0.");
+    expect(result.sources.directory.state).toBe("available");
+    expect(result.counts).toMatchObject({ licensedUsers: 0, needsAttentionUsers: 0, unknownMetricsUsers: 0 });
+    expect(result.users).toHaveLength(1);
+    expect(result.users[0].copilotServiceState).toBe("disabled");
+  });
+
+  it("withholds every current paid-license metric when a failed refresh retains mixed last-saved candidates", async () => {
+    const directory = [
+      directoryUser("11111111-1111-4111-8111-111111111111", "last-saved-active@example.com"),
+      directoryUser("22222222-2222-4222-8222-222222222222", "last-saved-inactive@example.com"),
+    ];
+    directory[1].copilotServiceState = directory[1].servicePlans[0].state = "disabled";
+    const harness = refreshHarness(directory);
+    harness.graph.listCopilotUsers.mockRejectedValueOnce(new AppError(403, "Authorization_RequestDenied", "Access denied"));
+
+    expect(await harness.value.refreshUsers(user, undefined, { publication })).toMatchObject({ status: "partial" });
+    const result = await harness.value.users(user);
+    expect(result.sources.directory.state).toBe("partial");
+    expect(result.sources.directory.message).toContain("Retained saved data");
+    expect(result.counts).toMatchObject({
+      licensedUsers: null, measuredActivityUsers: null, needsAttentionUsers: null, unknownMetricsUsers: null,
+    });
+    expect(result.users).toHaveLength(2);
   });
 
   it("does not include report-only activity in paid-license counts or infer basic access from an unmatched identity", async () => {
@@ -131,7 +283,7 @@ describe("CopilotUsageService", () => {
     expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
       .toMatchObject({
         status: "succeeded", count: 1,
-        message: "Saved paid M365 Copilot license and app-activity sources. Paid-license users: 1. All matching directory pages were verified. This is not the tenant headcount or a count of basic Copilot Chat users.",
+        message: "Saved M365 Copilot feature evidence and app-activity sources. Directory users checked: 1. Active M365 Copilot licensed users: 1. All matching directory pages were verified. Checked users are not the tenant headcount or a count of basic Copilot Chat users.",
       });
     expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
     expect(harness.graph.listAppActivity).toHaveBeenCalledOnce();

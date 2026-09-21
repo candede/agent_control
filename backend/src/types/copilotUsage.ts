@@ -112,12 +112,14 @@ export type CopilotUsageUsersResponse = {
     importedAgentUsage: CopilotUsageSourceSummary;
   };
   counts: {
+    // Licensing and adoption metrics use only verified active paid features.
     licensedUsers: number | null;
     measuredActivityUsers: number | null;
     needsAttentionUsers: number | null;
     unknownMetricsUsers: number | null;
     unresolvedImportedIdentities: number;
   };
+  // Includes inactive/unverified product candidates for diagnostics and exact identity joins.
   users: CopilotUsageUser[];
   unresolvedImportedIdentities: CopilotUsageUnresolvedImportedIdentity[];
   notices: string[];

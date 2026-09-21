@@ -7,7 +7,7 @@ export function CopilotServiceDetails({ servicePlans, current }: {
 }) {
   return <section aria-label="Microsoft 365 Copilot paid features">
     <h3>Microsoft 365 Copilot paid features</h3>
-    <p>A paid license can remain assigned when paid features are not enabled. Basic Copilot Chat access is not assessed here.</p>
+    <p>A containing bundle alone does not establish paid Copilot entitlement; at least one paid feature must be active. Basic Chat access can depend on policy; access and usage are not measured here.</p>
     {!current ? <p>Last saved paid-feature evidence. Current paid-feature status is unverified until Users Sync.</p> : null}
     {servicePlans.length ? <>
       <ul className="copilot-service-plans" aria-label="Paid feature states">

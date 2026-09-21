@@ -135,7 +135,7 @@ describe("CopilotUsageGraphClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it("reports distinct licensed-user progress across pages and overlapping SKU batches without inventing a total", async () => {
+  it("reports distinct candidate progress across pages and overlapping SKU batches without inventing a total", async () => {
     const catalog = Array.from({ length: 21 }, (_, index) => ({
       skuId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`,
       skuPartNumber: `Copilot_bundle_${index}`,
@@ -523,7 +523,7 @@ describe("CopilotUsageGraphClient", () => {
     }
   });
 
-  it.each([3_993, 30_001])("collects all %i paid-license assignments in bulk, not one request per user", async total => {
+  it.each([3_993, 30_001])("collects all %i product-assignment candidates in bulk, not one request per user", async total => {
     const directoryUrl = buildCopilotUsersUrl([skuId]);
     const progress = vi.fn();
     const fetcher = vi.fn<FetchLike>(async input => {
@@ -570,7 +570,7 @@ describe("CopilotUsageGraphClient", () => {
     }
   });
 
-  it("rejects a 3,993-user result if Graph reports 30,000 matching paid-license users", async () => {
+  it("rejects a 3,993-user result if Graph reports 30,000 matching product-assignment candidates", async () => {
     const fetcher = vi.fn(async () => Response.json({
       "@odata.count": 30_000,
       value: Array.from({ length: 3_993 }, (_, index) => graphUser(

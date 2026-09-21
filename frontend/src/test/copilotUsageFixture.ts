@@ -58,7 +58,7 @@ export const copilotUsageFixture: CopilotUsageUsersResponse = {
   },
   sources: {
     directory: {
-      state: "available", message: "Current paid Microsoft 365 Copilot license assignments.",
+      state: "available", message: "Directory candidates checked for effective paid M365 Copilot entitlement.",
       fetchedAt: "2026-09-12T10:00:00.000Z", reportRefreshDate: null, reportVersion: null,
       period: { value: null, startDate: null, endDate: null },
     },

@@ -217,9 +217,9 @@ describe("DataSyncPanel", () => {
     const users = screen.getByText("Users", { selector: "strong" }).closest("article");
     expect(users).not.toBeNull();
     expect(within(users!).getByText("0")).toBeVisible();
-    expect(within(users!).getByText("paid M365 Copilot license users")).toBeVisible();
-    expect(users).toHaveTextContent("Paid M365 Copilot license assignments, app activity, and referenced agent people");
-    expect(users).toHaveTextContent("not tenant headcount");
+    expect(within(users!).getByText("directory users checked")).toBeVisible();
+    expect(users).toHaveTextContent("M365 Copilot candidate checks, app activity, and referenced agent people");
+    expect(users).toHaveTextContent("not licensed users or tenant headcount");
   });
 
   it("lets viewers run read syncs but reserves report upload for admins without blocking the workbench", async () => {
@@ -715,7 +715,7 @@ describe("DataSyncPanel", () => {
       source("usage_reports", "succeeded", { count: 1_061, lastSuccessAt: "2026-09-12T10:00:00.000Z" }),
     ];
     const current = run("running", [source("users", "running", {
-      count: 17, message: "Reading distinct licensed users.",
+      count: 17, message: "Checking distinct Copilot candidates.",
     })], { mode: "incremental" });
     api.getState.mockResolvedValue(syncState({ onboardingRequired: false, usageImportRequired: false, sources: saved }));
     api.start.mockResolvedValue(current);

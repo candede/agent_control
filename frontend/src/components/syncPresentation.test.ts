@@ -24,7 +24,7 @@ describe("sync presentation", () => {
   });
 
   const sourceLabels: Record<DataSyncSourceId, { label: string; unit: string }> = {
-    users: { label: "Users", unit: "paid M365 Copilot license users" },
+    users: { label: "Users", unit: "directory users checked" },
     graph_packages: { label: "Graph packages", unit: "packages" },
     power_platform: { label: "Power Platform", unit: "resources" },
     usage_reports: { label: "CSV usage reports", unit: "report rows" },
@@ -34,11 +34,11 @@ describe("sync presentation", () => {
     expect(syncSourceDetails[source].description.trim()).not.toBe("");
   });
 
-  it("explains Users counts as paid license assignments rather than tenant headcount or referenced people", () => {
+  it("explains Users counts as checked candidates rather than licensed users, tenant headcount or referenced people", () => {
     expect(syncSourceDetails.users.description).toBe(
-      "Paid M365 Copilot license assignments, app activity, and referenced agent people; count is paid-license users, not tenant headcount",
+      "M365 Copilot candidate checks, app activity, and referenced agent people; count is directory users checked, not licensed users or tenant headcount",
     );
-    expect(`3,993 ${syncSourceDetails.users.unit}`).toBe("3,993 paid M365 Copilot license users");
+    expect(`3,993 ${syncSourceDetails.users.unit}`).toBe("3,993 directory users checked");
     expect(automaticSyncSources).toEqual(["users", "graph_packages", "power_platform"]);
   });
 

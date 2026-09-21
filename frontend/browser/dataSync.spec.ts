@@ -234,7 +234,7 @@ test("current sync has an aligned, keyboard-accessible cancellation footer with 
   if (!state.run || !users) throw new Error("Expected a saved Users source and run.");
   state.run = {
     ...state.run, mode: "incremental", status: "running", completedAt: null,
-    sources: [{ ...users, status: "running", count: 1_500, message: "Reading paid-license users from the filtered directory." }],
+    sources: [{ ...users, status: "running", count: 1_500, message: "Checking Copilot candidates from the filtered directory." }],
   };
   const fixture = await mockSync(page, state);
   let finishCancellation!: () => void;
@@ -339,8 +339,8 @@ for (const attempts of ["completed", "mixed"] as const) {
     const workspace = page.getByRole("region", { name: "Workspace data", exact: true });
     await expect(workspace.getByText("3,973", { exact: true })).toBeVisible();
     const users = workspace.getByRole("article", { name: "Users", exact: true });
-    await expect(users.getByText("paid M365 Copilot license users", { exact: true })).toBeVisible();
-    await expect(users).toContainText("count is paid-license users, not tenant headcount");
+    await expect(users.getByText("directory users checked", { exact: true })).toBeVisible();
+    await expect(users).toContainText("count is directory users checked, not licensed users or tenant headcount");
     if (attempts === "mixed") await expect(workspace.getByText("Permission required", { exact: true })).toBeVisible();
 
     const widths = info.project.name === "desktop" ? [1440, 1280, 1001, 1000, 768, 601] : [360, 390, 600];
@@ -591,7 +591,7 @@ test("run details contain keyboard focus, restore the opener, and respect reduce
     sources: state.sources.filter(source => source.source === "users" || source.source === "graph_packages").map(source => ({
       ...source, status: source.source === "users" ? "running" : "queued",
       count: source.source === "users" ? 17 : 999,
-      message: source.source === "users" ? "Reading distinct licensed users." : "Waiting for collection.",
+      message: source.source === "users" ? "Checking distinct Copilot candidates." : "Waiting for collection.",
     })),
   };
   const fixture = await mockSync(page, state);

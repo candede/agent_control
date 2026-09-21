@@ -195,7 +195,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   }
 
   return <section className="reported-users" aria-label="Reported activity" aria-busy={!scoped}>
-    <p className="reported-users-intro">All imported report identities, including concealed, unlinked and bridge-only users—not just paid-license users. Rankings measure agent responses, not all Copilot activity or basic Chat usage.</p>
+    <p className="reported-users-intro">All imported report identities, including concealed, unlinked and bridge-only users—not just M365 Copilot licensed users. Rankings measure agent responses, not all Copilot activity or basic Chat usage.</p>
     <div className="copilot-users-toolbar reported-users-toolbar">
       <label><span>Search reported users or agents</span><input ref={searchInput} type="search" maxLength={256} placeholder="User, agent name, ID or creator" value={search}
         onChange={event => onRouteChange({ ...route, search: event.target.value, page: 0 }, true)} /></label>
@@ -263,7 +263,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         <p>{usageAvailabilityLabel(data.availability)}. Use Official usage in the top navigation to select or import reports. Missing reports are not zero activity.</p>
       </div> : <>
         {!hasRelationships ? <p className="reported-users-note">The Users &amp; agents companion is missing. Relationships are unknown, not zero.</p> : null}
-        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. Paid licenses require a unique exact directory link to this report snapshot; otherwise, License not verified.</p>
+        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. License status requires a unique exact directory link and verified paid-feature state; bundle assignment alone is not entitlement.</p>
         {data.users.value.length ? <div ref={reportedTable} className="copilot-users-table-shell" role="region" aria-label="Reported users" tabIndex={0}>
           <table className="copilot-users-table reported-users-table">
             <ListTableHead table={table} />
@@ -299,9 +299,9 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         {data.lineages.map(lineage => <p key={lineage.kind}>{lineage.kind === "userAgents" ? "Users & agents" : lineage.kind === "users" ? "Users" : "Agents"} version: {lineage.versionId}. {lineage.sourceFreshness === "unknown" ? "Source refresh time not supplied; import time does not establish freshness." : ""}</p>)}
         {data.activeSet?.reportingPeriod.provenance === "activity_range" ? <p>Observed activity dates do not establish a complete reporting window.</p> : null}
         <p>{directoryData?.sources.directory.state === "available"
-          ? `Paid licenses observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current assignments do not prove activity or entitlement during the reporting period.`
+          ? `Paid-feature states observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current entitlement does not prove activity or coverage during the reporting period.`
           : "Current paid license inventory is unverified or unavailable. Report identities remain visible; License not verified does not mean basic, unlicensed or disabled."}</p>
-        <p>Concealed identities and case-distinct names are report-scoped. Directory assignments require an existing unique exact saved link with the same report set, Users version and Users &amp; agents version.</p>
+        <p>Concealed identities and case-distinct names are report-scoped. Directory evidence requires an existing unique exact saved link with the same report set, Users version and Users &amp; agents version.</p>
         <p>{data.decisionNotice} Collection and connection recovery are available through Sync and Permissions in the top navigation.</p>
         <p>CSV filters select matching people, not individual exported relationships. Every agent relationship of each matching user is exported, not only this page or the selected agent. Repeated all-agent Users-report totals are not additive across relationship rows.</p>
       </details>

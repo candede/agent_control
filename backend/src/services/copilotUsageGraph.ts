@@ -69,6 +69,7 @@ type GraphCollection<T> = {
 
 type GraphEndpoint = "directory" | "catalog" | "report";
 
+// Product-filtered candidate; the service evidence determines effective paid entitlement.
 export type CopilotDirectoryUser = {
   serviceEvidenceVersion: 1;
   identity: CopilotDirectoryIdentity;
@@ -126,7 +127,7 @@ export class CopilotUsageGraphClient {
         for (const value of page.value) {
           const user = parseDirectoryUser(value, skus, batchIds);
           if (!user) {
-            throw providerSchema("Directory returned a user outside the requested license cohort.");
+            throw providerSchema("Directory returned a user outside the requested product-assignment filter.");
           }
           const existing = users.get(user.identity.objectId);
           if (existing && JSON.stringify(existing) !== JSON.stringify(user)) {

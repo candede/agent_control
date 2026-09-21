@@ -57,6 +57,7 @@ type Loaded<T> =
 
 export type CopilotUsageRefreshResult = {
   status: Extract<DataSyncSourceState, "succeeded" | "partial" | "waiting_authorization" | "permission_required" | "failed">;
+  // Checked directory candidates, not effectively licensed users.
   count: number | null;
   message: string;
 };
@@ -162,7 +163,7 @@ export class CopilotUsageService {
             scope,
             value,
             loaded.fetchedAt,
-            `Saved paid M365 Copilot license assignments and paid-feature evidence for ${value.length} users, not all tenant accounts.`,
+            `Saved paid M365 Copilot feature evidence for ${value.length} checked directory users. Containing product assignments alone do not establish Copilot entitlement; this is not the tenant headcount.`,
             publication,
           );
         } else {
@@ -290,8 +291,9 @@ export function composeCopilotUsageUsers(input: {
       const activity = appMatching.get(directoryUser.identity.objectId) ?? null;
       return buildUser(directoryUser, importedUsage, activity, importedMetricsFresh, appMetricsFresh);
     }).sort(compareUsers);
+    const licensedUsers = users.filter(value => isCopilotServiceActive(value.copilotServiceState));
     let directorySource = directory.ok
-      ? source("available", `Loaded ${directoryUsers.length} users with paid M365 Copilot license assignments. Microsoft Graph filters matching assignments across the tenant in bulk; all matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
+      ? source("available", `Checked ${directoryUsers.length} directory users assigned products that can include paid M365 Copilot. Product assignment alone does not establish a Copilot license. Microsoft Graph filters these candidates across the tenant in bulk; all matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
       : unavailableSource(directory.message);
     let appSource = appActivity.ok
       ? appActivitySource(appActivity, appMatching.size)
@@ -317,15 +319,15 @@ export function composeCopilotUsageUsers(input: {
         importedAgentUsage: importedSource,
       },
       counts: {
-        licensedUsers: directoryCurrent ? users.filter(value => isCopilotServiceActive(value.copilotServiceState)).length : null,
+        licensedUsers: directoryCurrent ? licensedUsers.length : null,
         measuredActivityUsers: directoryCurrent && metricsAvailable
-          ? users.filter(value => hasMeasuredActivity(value, importedMetricsFresh, appMetricsFresh)).length
+          ? licensedUsers.filter(value => hasMeasuredActivity(value, importedMetricsFresh, appMetricsFresh)).length
           : null,
         needsAttentionUsers: directoryCurrent
-          ? users.filter(value => value.attention.some(reason => !["agent_usage_unknown", "app_activity_unknown"].includes(reason))).length
+          ? licensedUsers.filter(value => value.attention.some(reason => !["agent_usage_unknown", "app_activity_unknown"].includes(reason))).length
           : null,
         unknownMetricsUsers: directoryCurrent
-          ? users.filter(value => value.attention.includes("agent_usage_unknown") || value.attention.includes("app_activity_unknown")).length
+          ? licensedUsers.filter(value => value.attention.includes("agent_usage_unknown") || value.attention.includes("app_activity_unknown")).length
           : null,
         unresolvedImportedIdentities: matching.unresolved.length,
       },
@@ -333,12 +335,12 @@ export function composeCopilotUsageUsers(input: {
       unresolvedImportedIdentities: matching.unresolved,
       notices: [
         "This dashboard is read-only and never changes license assignments.",
-        "Active M365 Copilot licensed users counts paid-license users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.",
-        "This roster includes paid M365 Copilot license assignments even when their paid features are not enabled or remain unverified. A paid-license assignment alone does not establish that its paid features are active.",
+        "Active M365 Copilot licensed users counts only users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.",
+        "The checked directory roster includes candidates from products containing paid Copilot features, including bundles with Copilot disabled. SKU assignment alone is not M365 Copilot entitlement. Licensed-user labels and adoption counts require verified active paid features.",
         "Paid-feature states do not describe basic Copilot Chat availability. Users without a paid M365 Copilot license, or with paid features not enabled, may still have basic Copilot Chat access subject to tenant policy. Basic access and usage are not measured here.",
         "Zero or low imported agent responses describe Copilot Agents usage only, not total Microsoft 365 Copilot use.",
         "Missing source data remains unknown and is never converted to zero or an unlicensed state.",
-        "Microsoft report rows can include users licensed during the prior 180 days; only exact matches in the current directory license cohort are shown.",
+        "Microsoft report rows can include users licensed during the prior 180 days; only exact matches within the checked directory roster are joined. Reported activity does not establish current paid Copilot entitlement.",
         "Inactive app attention means no D30 activity date was observed; blank or delayed Office telemetry is not proof that Copilot was never used.",
       ],
     };
@@ -350,10 +352,11 @@ function userRefreshResult(saved: {
 }, observedCount: number | null): CopilotUsageRefreshResult {
   const values = [saved.directory, saved.appActivity];
   if (values.every(value => value.attemptStatus === "available")) {
+    const licensedCount = saved.directory.value?.filter(value => isCopilotServiceActive(value.copilotServiceState)).length;
     return {
       status: "succeeded",
       count: saved.directory.rowCount,
-      message: `Saved paid M365 Copilot license and app-activity sources.${saved.directory.rowCount === null ? "" : ` Paid-license users: ${saved.directory.rowCount}.`} All matching directory pages were verified. This is not the tenant headcount or a count of basic Copilot Chat users.`,
+      message: `Saved M365 Copilot feature evidence and app-activity sources.${saved.directory.rowCount === null ? "" : ` Directory users checked: ${saved.directory.rowCount}.`}${licensedCount === undefined ? "" : ` Active M365 Copilot licensed users: ${licensedCount}.`} All matching directory pages were verified. Checked users are not the tenant headcount or a count of basic Copilot Chat users.`,
     };
   }
   if (values.some(value => value.value !== null)) {

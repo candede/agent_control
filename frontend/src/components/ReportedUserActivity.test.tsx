@@ -103,14 +103,14 @@ describe("reported user activity", () => {
   });
 
   it.each([
-    ["enabled", "Active", ""],
-    ["warning", "Active (grace period)", "attention"],
-    ["disabled", "Not enabled", "attention"],
-    ["suspended", "Suspended", "attention"],
-    ["locked_out", "Locked out", "attention"],
-    ["unknown", "Unverified", "unknown"],
-    ["partially_enabled", "Partially active", "attention"],
-  ] as const)("distinguishes the paid license assignment from %s paid features in activity rows and details", async (state, label, tone) => {
+    ["enabled", "Active", "", "M365 Copilot licensed"],
+    ["warning", "Active (grace period)", "attention", "M365 Copilot licensed"],
+    ["disabled", "Not enabled", "attention", "No active M365 Copilot license"],
+    ["suspended", "Suspended", "attention", "No active M365 Copilot license"],
+    ["locked_out", "Locked out", "attention", "No active M365 Copilot license"],
+    ["unknown", "Unverified", "unknown", "License not verified"],
+    ["partially_enabled", "Partially active", "attention", "M365 Copilot licensed"],
+  ] as const)("classifies effective licensing from %s paid features in activity rows and details", async (state, label, tone, license) => {
     const directory = directoryFixture();
     const ada = directory.users[0];
     ada.copilotServiceState = state;
@@ -126,13 +126,15 @@ describe("reported user activity", () => {
     const table = await screen.findByRole("region", { name: "Reported users" });
     expect(within(table).getByRole("columnheader", { name: "M365 Copilot license" })).toBeVisible();
     const serviceCell = within(within(table).getByRole("row", { name: /Ada/ })).getAllByRole("cell")[2];
-    expect(serviceCell).toHaveTextContent("Paid license assigned");
+    expect(serviceCell).toHaveTextContent(license);
     expect(serviceCell).toHaveTextContent(`Paid features: ${label}`);
-    expect(serviceCell).not.toHaveTextContent(/Basic|Disabled|License not verified/);
+    expect(serviceCell).not.toHaveTextContent(/Basic|Disabled|Paid license assigned/);
+    if (license !== "M365 Copilot licensed") expect(within(serviceCell).queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
     expect(within(serviceCell).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
     const detail = (await openUser("Ada")).dialog;
     const summary = within(detail).getByText("M365 Copilot license").parentElement!;
-    expect(summary).toHaveTextContent("Paid license assigned");
+    expect(summary).toHaveTextContent(license);
+    if (license !== "M365 Copilot licensed") expect(within(summary).queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
     expect(within(summary).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
@@ -163,7 +165,7 @@ describe("reported user activity", () => {
     const table = await screen.findByRole("region", { name: "Reported users" });
     const row = within(table).getByRole("row", { name: /Ada/ });
     expect(row).toHaveTextContent("Account disabled");
-    expect(within(row).getAllByRole("cell")[2]).toHaveTextContent("Paid license assignedPaid features: Active");
+    expect(within(row).getAllByRole("cell")[2]).toHaveTextContent("M365 Copilot licensedPaid features: Active");
     const detail = (await openUser("Ada")).dialog;
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Active");
     expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
@@ -269,10 +271,10 @@ describe("reported user activity", () => {
       const table = await screen.findByRole("region", { name: "Reported users" });
       const row = within(table).getByRole("row", { name: /Ada/ });
       expect(row).toHaveTextContent("License not verified");
-      expect(row).not.toHaveTextContent(/Paid license assigned|Basic|Disabled|Unlicensed/);
+      expect(row).not.toHaveTextContent(/M365 Copilot licensed|No active M365 Copilot license|Basic|Disabled|Unlicensed/);
       const detail = (await openUser("Ada")).dialog;
       expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("License not verified");
-      expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|Paid license assigned)$/)).not.toBeInTheDocument();
+      expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|M365 Copilot licensed|No active M365 Copilot license)$/)).not.toBeInTheDocument();
       expect(within(detail).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
     },
   );
