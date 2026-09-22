@@ -8,6 +8,7 @@ import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy } from "./graphPackages.js";
+import { createRefreshExecutionSignal } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
 type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
@@ -127,12 +128,14 @@ export class PackageInventoryService {
       }
       throw error;
     }
-    const executionSignal = AbortSignal.any([signal, AbortSignal.timeout(
-      current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
-        : current.requestedIds.length > 1 ? identityRefreshExecutionDeadlineMs : refreshExecutionDeadlineMs,
-    )]);
-    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, executionSignal))
-      .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
+    const executionDeadlineMs = current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
+      : current.requestedIds.length > 1 ? identityRefreshExecutionDeadlineMs : refreshExecutionDeadlineMs;
+    const execution = createRefreshExecutionSignal(signal, executionDeadlineMs);
+    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal))
+      .finally(() => {
+        execution.dispose();
+        if (this.active.get(id)?.operation === operation) this.active.delete(id);
+      });
     this.active.set(id, { actor, controller, operation });
     void operation.catch(error => {
       operationalLog("error", "package_refresh_status_failed", { jobId: id, ...graphErrorTelemetry(error) });

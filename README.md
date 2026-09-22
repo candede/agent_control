@@ -69,7 +69,7 @@ Saved user/license and app-activity reads remain tenant/principal-private. Curre
 
 Host prerequisites: PowerShell 7, company-approved Docker Engine/Desktop with Compose v2 or newer, and a browser. Node, npm, Vite, PostgreSQL, tests and browser automation run **inside Docker**. Initial onboarding also requires an approved single-tenant Entra application's tenant ID, client ID and client secret. No Azure subscription or Key Vault is required for local deployment.
 
-Local deployment does **not** load a repository `.env` file. [deploy-local.ps1](deploy-local.ps1) accepts the commands `start` (the default), `stop`, and `edit-config`, positionally or via `-Command` / `-Action`, plus `-Project` (default `agent-control`). On first start or when settings are missing, a wizard collects the tenant ID, client ID, hidden client secret and local port (default `3001`). Configuration is saved in the fixed repository-root `.local/<lowercase-project>/` directory; custom state locations are not supported. Configured starts reuse saved settings, including the port and optional public URL, without prompting. The script regenerates `compose.env` for Docker Compose; do not edit that generated file.
+Local deployment does **not** load a repository `.env` file. [deploy-local.ps1](deploy-local.ps1) accepts the commands `start` (the default), `stop`, and `edit-config`, positionally or via `-Command` / `-Action`, plus `-Project` (default `agent-control`). After software preflight, first start or missing settings trigger a wizard for the tenant ID, client ID, hidden client secret and local port (default `3001`). Configuration is saved in the fixed repository-root `.local/<lowercase-project>/` directory; custom state locations are not supported. Configured starts reuse saved settings, including the port and optional public URL, without prompting. The script regenerates `compose.env` for Docker Compose; do not edit that generated file.
 
 From the repository root:
 
@@ -79,7 +79,9 @@ pwsh ./deploy-local.ps1 start
 pwsh ./deploy-local.ps1
 ```
 
-Open **http://localhost:3001**, or `http://localhost:<saved-port>` when configured differently, unless a public URL is saved; in that case open the public URL. Use this single canonical origin, not a second `127.0.0.1` browser origin. Every `start` runs the existing full deployment workflow: it builds operator/runtime images, starts PostgreSQL, waits up to 90 seconds, runs serialized bootstrap/migrations and the full test baseline in disposable containers, then waits for healthy app/database/schema responses. Failure returns nonzero without resetting data or announcing success. Two long-running services remain: `app` and `postgres`.
+Open **http://localhost:3001**, or `http://localhost:<saved-port>` when configured differently, unless a public URL is saved; in that case open the public URL. Use this single canonical origin, not a second `127.0.0.1` browser origin. Every `start` first builds the operator and qualifies the software in a uniquely named, disposable Compose project. Its PostgreSQL uses memory-only fixture data, synthetic passwords, no application secrets and no external network. Backend/frontend tests, backend typecheck, frontend lint and the production build must pass, and fixture cleanup must succeed, before the runtime image is built or deployment enters maintenance. Only then does deployment stop/drain the app, start the retained PostgreSQL service, apply serialized forward migrations and start the app, waiting up to 90 seconds for readiness. A software/build failure leaves the existing app, database and maintenance state unchanged. Failure returns nonzero without resetting data or announcing deployment success. Two long-running services remain: `app` and `postgres`.
+
+The final summary reports the automated check results and local app readiness.
 
 - Default project: `agent-control`; volume: `agent-control_data`; network: `agent-control_default`.
 - The app listens on all interfaces **inside** its container but publishes only on loopback at the saved host port (default `127.0.0.1:3001`). PostgreSQL has no published host port. The project bridge permits normal outbound DNS/HTTPS for Entra/Graph.
@@ -163,7 +165,7 @@ State is always the ignored repository-root `.local/<lowercase-project>/` direct
 
 Secrets are file mounts, never image layers, build arguments or logged values. The runtime receives no admin password or operator code and has a read-only root filesystem, dropped capabilities and no Docker socket. It uses the host UID/GID locally to read restricted bind-mounted files.
 
-Managed Compose interpolation variables (`LOCAL_STATE_DIR`, `APP_PORT`, `APP_UID`, `APP_GID`, `APP_IMAGE`, `TENANT_ID`, `CLIENT_ID`, `FRONTEND_ORIGIN`, `REDIRECT_URI`, and `TRUST_PROXY`) are removed from the shell environment for managed Compose calls and restored afterward, preserving unset versus empty values. Exported values cannot override the selected project's saved configuration through those variables. Empty values must not be used to clear these overrides: Compose treats an empty `LOCAL_STATE_DIR` as an override and incorrectly resolves secrets under `/secrets/`. If an older script failed with that mount path, rerun `start` with the corrected script and the same `-Project`; retain the existing state directory and volume.
+Managed Compose interpolation variables (`LOCAL_STATE_DIR`, `LOCAL_TEST_IMAGE`, `APP_PORT`, `APP_UID`, `APP_GID`, `APP_IMAGE`, `TENANT_ID`, `CLIENT_ID`, `FRONTEND_ORIGIN`, `REDIRECT_URI`, and `TRUST_PROXY`) are removed from the shell environment for managed Compose calls and restored afterward, preserving unset versus empty values. `LOCAL_TEST_IMAGE` selects the operator image only in the temporary fixture environment. Exported values cannot override the selected project's saved configuration through those variables. Empty values must not be used to clear these overrides: Compose treats an empty `LOCAL_STATE_DIR` as an override and incorrectly resolves secrets under `/secrets/`. If an older script failed with that mount path, rerun `start` with the corrected script and the same `-Project`; retain the existing state directory and volume.
 
 With an existing volume, missing or corrupt DB/session secrets **stop deployment**. Restore their original bytes from the same installation's protected state backup; do not generate replacements. A valid-looking but incorrect password also fails actual authentication. Database/session credential rotation is a coordinated operator action, not a deploy side effect. Create another project for another tenant; coordinate origin changes with the Entra callback registration.
 
@@ -175,7 +177,7 @@ pwsh ./deploy-local.ps1 start
 pwsh ./deploy-local.ps1 edit-config
 ```
 
-Add the same `-Project` used at installation. `stop` leaves data and secrets intact; `start` always builds, migrates, tests and starts, using the saved port. After a failed build, the previous runtime is unchanged unless a preceding configuration edit already stopped it. After a migration/test/start failure, maintenance remains closed; fix the reported target/configuration/schema problem and rerun `start`. Never remove the volume as a recovery shortcut. Health remains separate from provider availability.
+Add the same `-Project` used at installation. `stop` leaves data and secrets intact; `start` always qualifies software with isolated tests before entering maintenance, then migrates and starts using the saved port. After a failed software check, fixture cleanup or image build, the previous runtime and maintenance state are unchanged; a preceding configuration edit may already have stopped the app. After a migration/app-start failure, maintenance remains closed; fix the reported target/configuration/schema problem and rerun `start`. Never remove the volume as a recovery shortcut. Health remains separate from provider availability.
 
 Advanced testing, retention, backup, restore, reopen and destructive reset use existing **operator-only PowerShell helpers**, not arguments to `deploy-local.ps1`. See [the operator helper setup](docs/operations.md#operator-only-local-helpers), [retention](docs/operations.md#retention), and [backup/restore](docs/operations.md#backup-and-isolated-restore). There is no separate maintenance executable.
 
@@ -408,7 +410,15 @@ Defender hunting needs no separate delegated approve/run qualification ritual. A
 
 ## Container Validation
 
-`-Action Test` builds the operator, creates a separately named `agentcontrol_test_*` PostgreSQL database, runs the following baseline and drops only guarded fixture databases. It never uses rollback-only isolation against demo data:
+The internal `Test` helper builds the operator and runs the same software gate as deployment without requiring an initialized installation or tenant credentials:
+
+```powershell
+. ./scripts/local-deployment.ps1
+$context = New-LocalContext -Root $PWD.Path -Project agent-control
+Invoke-LocalDeployment $context 'Test'
+```
+
+This is not a public `deploy-local.ps1 -Action Test` command. Each run uses a new `agent-control-check-<random-id>` Compose project with the existing `test-db`/`test-postgres` isolation pattern. The database has memory-only storage and no external network, host port, retained application volume or mounted application secrets. The aggregate runner additionally creates an owned `agentcontrol_test_*` control database. It runs the following labeled steps and removes only its own temporary database, containers and fixture configuration on success or failure; it never uses rollback-only isolation against application data:
 
 ```text
 npm run test --workspace backend
@@ -418,7 +428,9 @@ npm run lint --workspace frontend
 npm run build
 ```
 
-These commands are invoked inside Docker by [backend/scripts/test-all.ts](backend/scripts/test-all.ts).
+These commands are invoked inside Docker by [backend/scripts/test-all.ts](backend/scripts/test-all.ts) and [softwareChecks.ts](backend/scripts/softwareChecks.ts). The first failure stops subsequent steps and reports the command and its exit status, signal, spawn/timeout error or cleanup cause. A cleanup failure also fails qualification. The runner rejects application database settings and file-backed credential overrides; do not run it through the application's credential-mounted operator invocation.
+
+Both Vitest configurations use supported `silent: "passed-only"` reporting. Expected 4xx/5xx logs from passing error-path tests are quiet, while failed-test output, test names, assertion diagnostics and unhandled errors remain visible. No assertions are weakened. For a focused diagnostic rerun inside the isolated test container, append `--silent=false` to the test command.
 
 For non-database checks, the opt-in Compose `test` service uses the canonical Dockerfile's `test` target, without runtime secrets, network access, or application dependencies. It defaults to backend type checking and is limited to two CPUs and 2 GiB RAM. Source directories are mounted read-only for focused reruns; rebuild after changing dependencies, configuration, or other image inputs.
 

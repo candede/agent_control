@@ -18,6 +18,6 @@ try {
     }
     Invoke-LocalDeployment -Context $context -Action $operation
 } catch {
-    Write-Error "Local operation failed: $($_.Exception.Message) Existing data has not been reset."
+    Write-Error "Local operation failed: $($_.Exception.Message) Review the failed phase above. Data was not reset automatically."
     exit 1
 }

@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
@@ -372,9 +373,12 @@ describe("Power Platform inventory refresh service", () => {
     }
   });
 
-  it.each(["cancel", "logout", "shutdown", "deadline"] as const)(
-    "preserves the %s outcome when pending publication authorization rejects later",
-    async interruption => {
+  it.each(
+    (["cancel", "logout", "shutdown", "deadline"] as const).flatMap(interruption =>
+      (["resolves", "rejects"] as const).map(settlement => ({ interruption, settlement }))),
+  )(
+    "preserves the $interruption outcome when pending publication authorization $settlement later",
+    async ({ interruption, settlement }) => {
       const { service, dependencies, repository, job } = fixture();
       const pending = deferred<AuthenticatedUser>();
       const deadline = new AbortController();
@@ -386,12 +390,14 @@ describe("Power Platform inventory refresh service", () => {
       if (interruption === "cancel") await service.cancel(user, job.id);
       else if (interruption === "logout") await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
       else if (interruption === "shutdown") draining = service.drain();
-      else deadline.abort(new DOMException("Execution deadline", "TimeoutError"));
-      pending.reject(interruption === "deadline"
+      deadline.abort(new DOMException("Execution deadline", "TimeoutError"));
+      if (settlement === "resolves") pending.resolve(user);
+      else pending.reject(interruption === "deadline"
         ? new AppError(401, "interaction_required", "Late authorization failure.")
         : new Error("Late authorization transport failure."));
       await (draining ?? service.drain());
       expect(repository.publish).not.toHaveBeenCalled();
+      expect(getEventListeners(deadline.signal, "abort")).toHaveLength(0);
       if (interruption === "deadline") {
         expect(repository.markFailed).toHaveBeenCalledWith(
           { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id,

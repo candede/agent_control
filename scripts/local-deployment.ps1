@@ -4,15 +4,15 @@ function Invoke-DockerCommand {
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
             }
         }
-        if ($Capture) { $result = @(& docker @Arguments); if ($LASTEXITCODE -ne 0) { throw 'Docker command failed. Check engine, build, target and health status.' }; return ($result -join "`n") }
+        if ($Capture) { $result = @(& docker @Arguments); if ($LASTEXITCODE -ne 0) { throw "Docker $($Arguments[0]) failed (exit code $LASTEXITCODE). See the Docker diagnostics above." }; return ($result -join "`n") }
         & docker @Arguments
-        if ($LASTEXITCODE -ne 0) { throw 'Docker command failed. Check engine, build, target and health status.' }
+        if ($LASTEXITCODE -ne 0) { throw "Docker $($Arguments[0]) failed (exit code $LASTEXITCODE). See the Docker diagnostics above." }
     } finally {
         foreach ($name in $savedEnvironment.Keys) {
             if ($null -eq $savedEnvironment[$name]) {
@@ -339,6 +339,44 @@ function Invoke-LocalOperator {
     Invoke-DockerCommand ($arguments + @($Context.Operator) + $Command)
 }
 
+function Invoke-LocalSoftwareChecks {
+    param($Context)
+    $id = [Guid]::NewGuid().ToString('N')
+    $project = "agent-control-check-$id"
+    $scratchParent = Join-Path $Context.Root 'artifacts/test-scratch'
+    $scratch = Join-Path $scratchParent $project
+    [IO.Directory]::CreateDirectory($scratchParent) | Out-Null
+    New-Item -ItemType Directory -Path $scratch -ErrorAction Stop | Out-Null
+    $compose = @('compose','--project-directory',$Context.Root,'--env-file',(Join-Path $scratch 'compose.env'),
+        '-f',(Join-Path $Context.Root 'compose.yaml'),'-p',$project,'--profile','test-db')
+    $failures = [Collections.Generic.List[Exception]]::new()
+    $started = $false
+    Write-Host '[AUTOMATED CHECKS] Qualifying software before maintenance, app shutdown or application database migration.'
+    Write-Host "Using isolated project $project with disposable PostgreSQL, synthetic credentials and no external network."
+    try {
+        Protect-LocalPath $scratch -Directory
+        Write-LocalText (Join-Path $scratch 'compose.env') "LOCAL_STATE_DIR='$scratch'`nLOCAL_TEST_IMAGE=$($Context.Operator)`n"
+        $started = $true
+        Invoke-DockerCommand ($compose + @('up','-d','--no-build','--wait','--wait-timeout','90','test-postgres'))
+        Invoke-DockerCommand ($compose + @('run','--rm','--no-deps','--entrypoint','node','test-db','node_modules/tsx/dist/cli.mjs','backend/scripts/test-all.ts'))
+    } catch {
+        $failures.Add($_.Exception)
+    } finally {
+        if ($started) {
+            try { Invoke-DockerCommand ($compose + @('down','--volumes','--remove-orphans')) }
+            catch {
+                $failures.Add([InvalidOperationException]::new("Cleanup failed for isolated Compose project '$project': $($_.Exception.Message) Inspect only containers labeled com.docker.compose.project=$project.",$_.Exception))
+            }
+        }
+        try { Remove-Item -LiteralPath $scratch -Recurse -Force }
+        catch { $failures.Add([InvalidOperationException]::new("Could not remove owned fixture directory '$scratch': $($_.Exception.Message)",$_.Exception)) }
+    }
+    if ($failures.Count) {
+        Write-Host '[AUTOMATED CHECKS] FAILED. The existing app, maintenance state and application database were not changed.'
+        throw [AggregateException]::new('Isolated software qualification failed. Resolve the reported test, command or cleanup failure before retrying.',$failures)
+    }
+}
+
 function Get-LocalHealth {
     param([string]$Url)
     $ready = Invoke-RestMethod "$Url/api/ready" -TimeoutSec 10
@@ -385,7 +423,15 @@ function Invoke-LocalDeployment {
         Remove-Item -LiteralPath $Context.State -Recurse -Force
         return
     }
-    if ($Action -notin @('Deploy','EditConfig') -and -not $existing) { throw 'Expected project volume is missing. Stop for recovery; use start for a new installation.' }
+    if ($Action -notin @('Deploy','EditConfig','Test') -and -not $existing) { throw 'Expected project volume is missing. Stop for recovery; use start for a new installation.' }
+    if ($Action -in @('Deploy','Test')) {
+        Write-Host '[AUTOMATED CHECKS] Building the operator/test image; the existing application remains untouched.'
+        Invoke-DockerCommand @('build','--target','operator','-t',$Context.Operator,$Context.Root)
+        Invoke-LocalSoftwareChecks $Context
+        if ($Action -eq 'Test') { return }
+        Write-Host '[DEPLOYMENT] Software checks passed. Building the runtime image before entering maintenance.'
+        Invoke-DockerCommand @('build','--target','runtime','-t',$Context.Image,$Context.Root)
+    }
     Initialize-LocalState $Context $existing -Onboard:($Action -in @('Deploy','Start')) -Edit:($Action -eq 'EditConfig')
     if ($Action -eq 'EditConfig') { return }
     $marker = Join-Path $Context.State 'control/maintenance'
@@ -394,19 +440,14 @@ function Invoke-LocalDeployment {
         Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130'))
         return
     }
-    if ($Action -in @('Deploy','Test')) {
-        Invoke-DockerCommand @('build','--target','operator','-t',$Context.Operator,$Context.Root)
-    }
     if ($Action -eq 'Deploy') {
-        Invoke-DockerCommand @('build','--target','runtime','-t',$Context.Image,$Context.Root)
+        Write-Host '[DEPLOYMENT] Entering maintenance, draining the app and applying forward database migrations.'
         [IO.File]::WriteAllText($marker,'maintenance')
         Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
         Assert-LocalPort $Context.Port
         Invoke-DockerCommand ($Context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
         Invoke-LocalOperator $Context @('backend/scripts/database.ts','migrate')
-        Invoke-LocalOperator $Context @('backend/scripts/test-all.ts')
     }
-    if ($Action -eq 'Test') { Invoke-LocalOperator $Context @('backend/scripts/test-all.ts'); return }
     if ($Action -eq 'Retain') {
         $expected="$($Context.Project)/agentcontrol"
         if ($ConfirmCleanup -cne $expected) { throw "Retention cleanup denied. Exact confirmation required: $expected" }
@@ -451,7 +492,10 @@ function Invoke-LocalDeployment {
         [IO.File]::WriteAllText($marker,'maintenance')
         throw
     }
-    Write-Host "Healthy local app: $($Context.Url)"
+    Write-Host 'Deployment verification summary'
+    if ($Action -eq 'Deploy') { Write-Host '[AUTOMATED CHECKS] PASSED: backend/frontend tests, backend typecheck, frontend lint and production build, using isolated fixtures.' }
+    else { Write-Host '[AUTOMATED CHECKS] NOT RUN: this internal Start action only starts the existing images.' }
+    Write-Host "[LOCAL READINESS] PASSED: $($Context.Url) (database/schema readiness and sign-in configuration)."
     if ($Context.PublicUrl -cne $Context.Url) {
         Write-Host "Open $($Context.PublicUrl) to sign in. Local health is verified; tunnel reachability is not checked."
         Show-LocalTunnelGuidance $Context.Port

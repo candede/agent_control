@@ -17,13 +17,16 @@ services:
   test-db:
     <<: *test
     profiles: [test-db]
+    image: ${LOCAL_TEST_IMAGE:-agent-control-test:local}
     command: [npm, run, test, --workspace, backend]
     network_mode: service:test-postgres
     cpus: 1.5
     mem_limit: 1536m
     environment:
       TMPDIR: /app
+      AGENT_CONTROL_ISOLATED_TESTS: "1"
       PGHOST: 127.0.0.1
+      PGPORT: "5432"
       PGDATABASE: agentcontrol_test_control
       PGUSER: agentcontrol_admin
       PGPASSWORD: isolated-fixture-admin-password-never-production-01

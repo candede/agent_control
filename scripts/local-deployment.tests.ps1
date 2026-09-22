@@ -16,6 +16,9 @@ $script:CheckProjectEnvironment=$false
 $script:Prompts=[Collections.Generic.List[string]]::new()
 $script:Answers=[Collections.Generic.Queue[string]]::new()
 $script:WizardTrace=[Collections.Generic.List[string]]::new()
+$script:FixtureCalls=[Collections.Generic.List[object]]::new()
+$script:MonitoredMarker=''
+$script:MarkerCalls=[Collections.Generic.List[object]]::new()
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
     $script:WizardTrace.Add("PROMPT: $Prompt")
@@ -36,10 +39,21 @@ function Get-Command {
 function Invoke-TestDocker {
     param([string[]]$Arguments,[switch]$Capture)
     $line=$Arguments -join '|'; $script:Calls.Add($line)
+    if ($script:MonitoredMarker) {
+        $script:MarkerCalls.Add(@{command=$line;maintenance=(Test-Path -LiteralPath $script:MonitoredMarker)})
+    }
     if ($script:CheckProjectEnvironment -and $Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
-        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             if ($null -ne [Environment]::GetEnvironmentVariable($name)) { throw "Shell environment overrode project setting $name." }
         }
+    }
+    $projectIndex=[Array]::IndexOf($Arguments,'-p')
+    if ($projectIndex -ge 0 -and $Arguments[$projectIndex+1] -match '^agent-control-check-[a-f0-9]{32}$') {
+        $environmentFile=$Arguments[[Array]::IndexOf($Arguments,'--env-file')+1]
+        $script:FixtureCalls.Add(@{
+            command=$line;project=$Arguments[$projectIndex+1];file=$environmentFile
+            environment=[IO.File]::ReadAllText($environmentFile)
+        })
     }
     if ($script:Failure -and $line -match $script:Failure) { throw 'Simulated Docker failure (redacted).' }
     if ($Arguments[0] -eq 'info') { return '29.7.2' }
@@ -68,6 +82,12 @@ function Get-LocalHealth {
 }
 function Assert-True { param([bool]$Condition,[string]$Message) if (-not $Condition) { throw $Message }; $script:Checks++ }
 function Assert-Fails { param([scriptblock]$Command,[string]$Pattern) try { & $Command; throw 'Expected failure did not occur' } catch { Assert-True ($_.Exception.Message -match $Pattern) "Unexpected failure: $($_.Exception.Message)" } }
+function Get-UniqueCallIndex {
+    param([string[]]$Calls,[string]$Pattern)
+    $indices=@(for ($index=0; $index -lt $Calls.Count; $index++) { if ($Calls[$index] -match $Pattern) { $index } })
+    Assert-True ($indices.Count -eq 1) "Expected exactly one command matching $Pattern."
+    return $indices[0]
+}
 function New-FixtureContext {
     param([string]$Name,[int]$Port=14391)
     $fixture=New-LocalContext $testRoot $Name
@@ -162,7 +182,7 @@ try {
     Assert-True (($script:Calls -join "`n") -notlike "*$before*") 'Secret leaked to command arguments.'
     Assert-True (-not ($script:Calls -join "`n").Contains($clientSecret)) 'Entra secret leaked to command arguments.'
     Assert-True (($script:Calls -join "`n").Contains($testRoot)) 'Paths containing spaces were not preserved.'
-    Assert-True (-not (($script:Calls -join "`n") -match 'down\|--volumes')) 'Normal deployment reset the volume.'
+    Assert-True (-not (($script:Calls -join "`n") -match '\|-p\|fixture-project\|down\|--volumes')) 'Normal deployment reset the application volume.'
     Assert-Fails { Invoke-LocalDeployment $context 'Retain' } 'cleanup denied'
     Invoke-LocalDeployment $context 'Retain' -ConfirmCleanup 'fixture-project/agentcontrol' -DryRun 6>$null
     Assert-True (($script:Calls -join "`n") -match 'database.ts\|retain\|confirmed\|1000\|dry-run') 'Dry-run cleanup was not explicit and bounded.'
@@ -402,7 +422,7 @@ try {
 
     $shellValues=@{}
     try {
-        foreach ($name in @('LOCAL_STATE_DIR','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             $shellValues[$name]=[Environment]::GetEnvironmentVariable($name)
         }
         $script:CheckProjectEnvironment=$true
@@ -541,6 +561,93 @@ try {
     Assert-Fails { . $entryPath -Port 3001 } 'parameter.*Port'
     Assert-Fails { . $entryPath -StateRoot $testRoot } 'parameter.*StateRoot'
     Assert-Fails { . $entryPath -Action Reset } 'ValidateSet|validation|not belong'
+
+    $qualification=New-FixtureContext 'preflight-retained'
+    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    Initialize-LocalState $qualification $false -Onboard 6>$null
+    $script:Volumes.Add($qualification.Volume) | Out-Null
+    $snapshot=Get-ConfigSnapshot $qualification
+    $script:MonitoredMarker=Join-Path $qualification.State 'control/maintenance'
+    $pendingReauthentication=Join-Path $qualification.State 'control/reauthenticate'
+    [IO.File]::WriteAllText($pendingReauthentication,'pending-before-software-checks')
+    try {
+        foreach ($hadMaintenance in @($false,$true)) {
+            foreach ($failurePattern in @('^build\|--target\|operator\|','\|--wait-timeout\|90\|test-postgres$','backend/scripts/test-all\.ts$','\|down\|--volumes','^build\|--target\|runtime\|')) {
+                if ($hadMaintenance) { [IO.File]::WriteAllText($script:MonitoredMarker,'prior-maintenance-state') }
+                elseif (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
+                $callOffset=$script:Calls.Count
+                $fixtureOffset=$script:FixtureCalls.Count
+                $messages=[Collections.Generic.List[string]]::new()
+                $script:Failure=$failurePattern
+                Assert-Fails { Invoke-LocalDeployment $qualification 'Deploy' 6>&1 | ForEach-Object { $messages.Add([string]$_) } } 'Simulated'
+                $script:Failure=''
+                Assert-ConfigUnchanged $qualification $snapshot
+                Assert-True ((Test-Path -LiteralPath $script:MonitoredMarker) -eq $hadMaintenance) 'Preflight failure changed maintenance admissions.'
+                if ($hadMaintenance) {
+                    Assert-True ([IO.File]::ReadAllText($script:MonitoredMarker) -ceq 'prior-maintenance-state') 'Preflight failure overwrote the existing maintenance marker.'
+                }
+                Assert-True ([IO.File]::ReadAllText($pendingReauthentication) -ceq 'pending-before-software-checks') 'Preflight failure consumed pending reauthentication.'
+                $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
+                Assert-True (-not (($deploymentCalls -join "`n") -match '\|stop\||backend/scripts/database\.ts|\|--wait-timeout\|90\|(?:app|postgres)$|DELETE FROM')) 'Preflight failure stopped the app or touched its database.'
+                Assert-True (-not (($messages -join "`n") -match 'Deployment verification summary|\[LOCAL READINESS\] PASSED')) 'Preflight failure announced deployment readiness.'
+                $preflightCalls=@($script:FixtureCalls | Select-Object -Skip $fixtureOffset)
+                $expectedCleanup=if ($failurePattern -match 'operator') { 0 } else { 1 }
+                Assert-True (@($preflightCalls | Where-Object { $_.command -match '\|down\|--volumes\|--remove-orphans$' }).Count -eq $expectedCleanup) "Fixture cleanup count differed from $expectedCleanup after $failurePattern."
+                foreach ($call in $preflightCalls) {
+                    Assert-True ($call.project -cne $qualification.Project -and $call.command.Contains('|--profile|test-db|')) 'Fixture commands targeted the application project.'
+                    Assert-True (-not $call.environment.Contains($qualification.State)) 'Fixture environment mounted the retained application state.'
+                    foreach ($value in @($tenant,$client,$clientSecret,[IO.File]::ReadAllText((Join-Path $qualification.State 'secrets/postgres-admin')))) {
+                        Assert-True (-not $call.environment.Contains($value)) 'Fixture environment contained an application identity or secret.'
+                    }
+                    Assert-True ($call.environment.Contains("LOCAL_TEST_IMAGE=$($qualification.Operator)")) 'Fixture run did not select the qualified operator image.'
+                    Assert-True (-not (Test-Path -LiteralPath $call.file)) 'Owned fixture configuration survived cleanup.'
+                }
+            }
+        }
+        Remove-Item -LiteralPath $script:MonitoredMarker
+        $callOffset=$script:Calls.Count
+        $script:MarkerCalls.Clear()
+        $messages=Invoke-LocalDeployment $qualification 'Deploy' 6>&1
+        $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
+        $tests=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/test-all\.ts$'
+        $cleanup=Get-UniqueCallIndex $deploymentCalls '\|down\|--volumes\|--remove-orphans$'
+        $runtime=Get-UniqueCallIndex $deploymentCalls '^build\|--target\|runtime\|'
+        $stop=Get-UniqueCallIndex $deploymentCalls '\|stop\|--timeout\|130\|app$'
+        $migration=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|migrate$'
+        $start=Get-UniqueCallIndex $deploymentCalls '\|--wait-timeout\|90\|app$'
+        Assert-True ($tests -lt $cleanup -and $cleanup -lt $runtime -and $runtime -lt $stop -and $stop -lt $migration -and $migration -lt $start) 'Software checks and cleanup must finish before runtime build, shutdown, migration and app start.'
+        Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'backend/scripts/test-all\.ts$|^build\|' -and $_.maintenance }).Count -eq 0) 'Maintenance began before software/build qualification finished.'
+        Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match '\|stop\|--timeout\|130\|app$' -and $_.maintenance }).Count -eq 1) 'Deployment did not close admissions before stopping the app.'
+        foreach ($expected in @('[AUTOMATED CHECKS] PASSED','[LOCAL READINESS] PASSED')) {
+            Assert-True (($messages -join "`n").Contains($expected)) "Deployment summary omitted $expected."
+        }
+        Assert-True (-not (($messages -join "`n") -match 'MICROSOFT ACCESS|review Permissions')) 'Deployment summary included an unnecessary Microsoft access status or Permissions follow-up.'
+        Assert-ConfigUnchanged $qualification $snapshot
+        $messages=Invoke-LocalDeployment $qualification 'Start' 6>&1
+        Assert-True (($messages -join "`n").Contains('[AUTOMATED CHECKS] NOT RUN')) 'Existing-image Start falsely reported automated checks.'
+
+        $script:Failure='backend/scripts/test-all\.ts$|\|down\|--volumes'
+        try {
+            Invoke-LocalSoftwareChecks $qualification 6>$null
+            throw 'Expected both the test and cleanup failures.'
+        } catch {
+            Assert-True ($_.Exception -is [AggregateException] -and $_.Exception.InnerExceptions.Count -eq 2) 'Cleanup failure hid the original software failure.'
+            Assert-True ($_.Exception.Message.Contains('Cleanup failed for isolated Compose project')) 'Cleanup failure did not identify its owned project.'
+        }
+        $script:Failure=''
+    } finally {
+        $script:Failure=''
+        $script:MonitoredMarker=''
+    }
+
+    $uninstalled=New-LocalContext $testRoot 'software-only-project'
+    $promptCount=$script:Prompts.Count
+    $callOffset=$script:Calls.Count
+    Invoke-LocalDeployment $uninstalled 'Test' 6>$null
+    Assert-True (-not (Test-Path -LiteralPath $uninstalled.State)) 'Software-only tests initialized application state or secrets.'
+    Assert-True ($script:Prompts.Count -eq $promptCount) 'Software-only tests prompted for tenant credentials.'
+    Assert-True (-not (($script:Calls | Select-Object -Skip $callOffset) -join "`n").Contains('|-p|software-only-project|')) 'Software-only tests invoked the application Compose project.'
+    Assert-True (($script:FixtureCalls.project | Select-Object -Unique).Count -gt 1) 'Separate preflights reused a test project.'
 
     $backups=Join-Path $context.State 'backups'
     $originalCulture=[Threading.Thread]::CurrentThread.CurrentCulture

@@ -8,6 +8,7 @@ import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import { capabilities } from "./capabilities.js";
 import { inventoryQueryTypes, inventoryRoleScope } from "./inventoryRoleScope.js";
 import { PowerPlatformResourceQueryClient, powerPlatformInventoryQueryDeadlineMs } from "./powerPlatformResourceQuery.js";
+import { createRefreshExecutionSignal } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
 type InventoryRefreshDependencies = {
@@ -113,10 +114,13 @@ export class PowerPlatformInventoryService {
         jobId: id, durationMs: Math.round(performance.now() - startedAt),
         requestedTypeCount: current.requestedTypes.length, environmentScoped: Boolean(current.environmentScope),
       });
-      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(refreshExecutionDeadlineMs)]);
+      const execution = createRefreshExecutionSignal(controller.signal, refreshExecutionDeadlineMs);
       stage = "dispatch";
-      const operation = withTelemetryContext({ jobId: id }, () => this.run(scope, current, id, token, signal))
-        .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
+      const operation = withTelemetryContext({ jobId: id }, () => this.run(scope, current, id, token, execution.signal))
+        .finally(() => {
+          execution.dispose();
+          if (this.active.get(id)?.operation === operation) this.active.delete(id);
+        });
       this.active.set(id, { scope, controller, operation });
       dispatched = true;
       void operation.catch(error => {

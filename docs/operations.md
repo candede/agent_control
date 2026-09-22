@@ -13,7 +13,7 @@ This runbook operates the single Express/React application and PostgreSQL databa
    pwsh ./deploy-local.ps1 start -Project agent-control-phase01
    ```
 
-   `start` is also the default when omitted and runs the full build/migrate/test/start deployment for both new and retained installations. If settings are incomplete, complete the terminal wizard for tenant ID, client ID, hidden client secret and port (default `3001`); configured starts reuse all saved values, including the port. See [deployment setup](deployment-setup.md) for configuration and unattended-run prerequisites.
+   `start` is also the default when omitted and runs the full isolated-test/build/migrate/start deployment for both new and retained installations. Software checks and fixture cleanup finish before maintenance, app shutdown or application database changes. If settings are incomplete, complete the subsequent terminal wizard for tenant ID, client ID, hidden client secret and port (default `3001`); configured starts reuse all saved values, including the port. See [deployment setup](deployment-setup.md) for configuration and unattended-run prerequisites.
 
 5. Sign in. Sign-in requests outstanding consent for all implemented delegated capabilities, including package changes. Existing installations should sign in again after redeployment to request newly included scopes. See `docs/deployment-setup.md` for tenant-wide consent and separate provider-role requirements. For an assigned Viewer/Admin session, Permission Center loads the capability catalog and immediately runs one bounded session-scoped delegated check, including token-only checks for Admin writes; consent return follows the same flow. Evidence expiry schedules one visible-tab check, while hidden tabs wait for visibility/focus. Interactive consent, MFA or Conditional Access still requires user action. Consent-required Entra errors are distinguished from expired/revoked authorization; a generic `invalid_grant` is not proof of expiry. The top-level **Check status** action is optional failure recovery, not an onboarding prerequisite. Request consent is shown for detected missing permission, not merely an untried operation. Never repair missing consent by editing capability evidence.
 6. After an app-role change or removal, require a fresh login and use the approved restart/session-invalidation cutoff. Verify removed, unassigned, and legacy-only claims are denied; never rely on auto-promotion.
@@ -45,11 +45,17 @@ $context = New-LocalContext -Root $PWD.Path -Project agent-control-phase01
 
 The helper reads this project's saved configuration, including its port, from the fixed `.local/agent-control-phase01/` directory. Run this setup in each new PowerShell session before the helper calls below, and recreate `$context` after a configuration edit. These are operator-only function calls, not a new maintenance executable. Their backup/restore, cleanup and reset switches belong to `Invoke-LocalDeployment`, never to `deploy-local.ps1`.
 
-To rebuild the operator image and run the aggregate test gate against an initialized installation:
+To rebuild the operator image and run the aggregate software gate without stopping the app or accessing its database/secrets:
 
 ```powershell
 Invoke-LocalDeployment $context 'Test'
 ```
+
+This helper also works before the selected project has an initialized installation. It uses a random, run-owned Compose project with network-disabled, memory-only PostgreSQL and synthetic fixture passwords. The first failing step or cleanup stops qualification with a nonzero error and its cause; only that run's temporary resources are removed. No maintenance or reauthentication markers are changed. Do not invoke the aggregate runner through the application's credential-mounted operator command.
+
+Expected 4xx/5xx logs from passing negative-path tests are suppressed by Vitest's `silent: "passed-only"` mode. Failed-test output, names and assertions remain visible, and unhandled errors still fail the run. For investigation, rerun a focused test in the isolated container with `--silent=false`.
+
+After public `start`, the summary reports **AUTOMATED CHECKS: PASSED** and **LOCAL READINESS: PASSED**. Local readiness covers database/schema health and sign-in configuration. The internal existing-image `Start` helper reports automated checks **NOT RUN**, because it does not execute the software gate.
 
 ## Status, safe diagnosis and provider incidents
 
@@ -222,7 +228,7 @@ Apply the current worktree and start with the same volume, network, secrets and 
 pwsh ./deploy-local.ps1 start -Project agent-control-phase01
 ```
 
-Public `start` maps to the existing internal `Deploy` workflow: it builds operator/runtime images, stops the app, starts PostgreSQL, applies checksum-verified forward migrations, runs the aggregate Docker gate, then starts the app and verifies readiness. It is not an existing-image-only shortcut. On migration failure, leave maintenance in place, preserve the database/backup, repair the forward migration or add a new migration, and rerun `start`. Do not edit an applied migration or start an older artifact against an incompatible schema.
+Public `start` maps to the internal `Deploy` workflow: it builds the operator, runs the aggregate Docker gate against a separate disposable PostgreSQL instance, cleans up that fixture, and builds the runtime image before entering maintenance. Only then does it stop/drain the app, start the retained PostgreSQL service, apply checksum-verified forward migrations, start the app and verify readiness. It is not an existing-image-only shortcut. On software, fixture-cleanup or build failure, the existing runtime/database/maintenance state is unchanged; fix the reported check before retrying. On migration failure, leave maintenance in place, preserve the database/backup, repair the forward migration or add a new migration, and rerun `start`. Do not edit an applied migration or start an older artifact against an incompatible schema.
 
 Run lifecycle checks sequentially, never concurrently:
 
