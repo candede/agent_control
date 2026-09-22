@@ -300,4 +300,53 @@ describe.sequential("official usage cumulative history", () => {
     await expect(repository.getPublished(restoreScope.tenantId, accepted.setId))
       .rejects.toMatchObject({ code: "official_usage_set_not_found" });
   });
+
+  it.each([
+    [0, 0, 0],
+    [0, 1, 1],
+    [1, 0, 0],
+  ])("counts only stored payloads with %i agent, %i user-agent and %i user rows", async (agents, userAgents, users) => {
+    const owner = {
+      tenantId: `tenant-official-history-empty-${agents}-${userAgents}-${users}`,
+      principalId: "history-empty",
+    };
+    const counts = { agents, userAgents, users };
+    const rowCount = agents + userAgents + users;
+    const imported = await importBundle({
+      owner,
+      changedKinds: {
+        agents: { count: agents },
+        userAgents: { count: userAgents },
+        users: { count: users },
+      },
+    });
+    const accepted = await imported.accept();
+
+    const view = await history.getHistory(owner.tenantId);
+    expect(view.summary).toMatchObject({
+      importCount: 1,
+      uniqueObservationCount: 3,
+      observationRowCount: rowCount,
+      uniquePayloadCount: rowCount,
+      repeatedRowsReused: 0,
+    });
+    expect(view.bundles.count).toBe(1);
+    expect(view.bundles.value).toHaveLength(1);
+    expect(view.bundles.value[0]).toMatchObject({
+      id: accepted.setId,
+      isActive: true,
+      observationCount: 3,
+      rowCount,
+      uniquePayloadCount: rowCount,
+      repeatedRowsReused: 0,
+    });
+    expect(view.bundles.value[0].observations).toHaveLength(3);
+    for (const observation of view.bundles.value[0].observations) {
+      expect(observation).toMatchObject({
+        rowCount: counts[observation.kind],
+        uniquePayloadCount: counts[observation.kind],
+        repeatedRowsReused: 0,
+      });
+    }
+  });
 });

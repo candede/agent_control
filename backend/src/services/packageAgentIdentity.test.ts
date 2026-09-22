@@ -105,6 +105,23 @@ describe("explicit package-to-agent identity", () => {
     }
   });
 
+  it("rejects source-native schema disagreements even when only one package matches inventory", () => {
+    const packages = ["cr123_agent", "cr123_other"].map((SchemaName, index) => ({
+      ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName } }),
+      id: `package-${index}`,
+    }));
+    const saved = resource({ identifiers: [], details: { schemaName: "cr123_agent" } });
+    const now = Date.parse("2026-09-16T12:00:00.000Z");
+    const observation = { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString() };
+    for (const ordered of [packages, [...packages].reverse()]) {
+      const links = resolvePackageAgentLinks("tenant-a", ordered, [saved]);
+      expect(links.map(link => link.status)).toEqual(["conflicting", "conflicting"]);
+      expect(withVerifiedControlIdentities([saved], links, Object.fromEntries(
+        packages.map(value => [value.id, observation]),
+      ), now)[0]).toBe(saved);
+    }
+  });
+
   it("allows absent and case-equivalent schema names across package representations", () => {
     const packages = [undefined, "", null, "cr123_agent", "CR123_AGENT", "cr123_agent"].map((SchemaName, index) => ({
       ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName }, AgentIdentityId: entraAgentId }),
@@ -315,6 +332,38 @@ describe("explicit package-to-agent identity", () => {
     expect(resolvePackageAgentLinks("tenant-a", [value], [saved])[0].status).toBe("ambiguous");
   });
 
+  it("retains environment-only metadata as a constraint on declarative manifest matching", () => {
+    const value = declarativePackage();
+    value.elementDetails!.push(packaged({ SourceIds: { EnvironmentId: otherId } }).elementDetails![0]);
+    const saved = declarativeResource();
+    expect(resolvePackageAgentLinks("tenant-a", [value], [saved])[0].status).toBe("unmatched");
+    const sameEnvironment = {
+      ...saved, environmentId: otherId,
+      identifiers: [{ kind: "environment_id" as const, value: otherId }],
+    };
+    expect(resolvePackageAgentLinks("tenant-a", [value], [saved, sameEnvironment])[0]).toMatchObject({
+      status: "matched", resource: { nativeId: cdsBotId, environmentId: otherId },
+    });
+  });
+
+  it("does not group declarative manifests across distinct declared environments without inventory", () => {
+    const packages = [environmentId, otherId].map((EnvironmentId, index) => {
+      const value = declarativePackage(`package-${index}`);
+      value.elementDetails!.push(packaged({
+        SourceIds: { EnvironmentId }, AgentIdentityId: entraAgentId,
+      }).elementDetails![0]);
+      return value;
+    });
+    for (const ordered of [packages, [...packages].reverse()]) {
+      const links = resolvePackageAgentLinks("tenant-a", ordered, []);
+      expect(links).toMatchObject(ordered.map(value => ({
+        packageId: value.id, status: "unmatched",
+        grouping: { environmentId: value.id === "package-0" ? environmentId : otherId },
+      })));
+      expect(new Set(links.map(link => link.status !== "matched" ? link.grouping?.key : undefined)).size).toBe(2);
+    }
+  });
+
   it("retains all package representations of one builder agent and groups them even without a PP observation", () => {
     const packages = [declarativePackage("package-b"), declarativePackage("package-a")];
     expect(resolvePackageAgentLinks("tenant-a", packages, [declarativeResource()]).map(link => link.status)).toEqual(["matched", "matched"]);
@@ -457,6 +506,114 @@ describe("explicit package-to-agent identity", () => {
     ]);
     expect(links.map(link => link.status)).toEqual(["matched", "matched", "ambiguous"]);
     expect(links[2]).not.toHaveProperty("grouping");
+  });
+
+  it.each(["entra_agent_id", "entra_app_id"] as const)(
+    "checks every resolved target before associating a custom-engine alias (%s)",
+    kind => {
+      const native = customEnginePackage("native", {
+        SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+      });
+      const secondary = customEnginePackage("secondary", kind === "entra_agent_id"
+        ? { SourceIds: { EnvironmentId: environmentId }, AgentIdentityId: otherId }
+        : { SourceIds: { EnvironmentId: environmentId, EntraApplicationId: otherId } });
+      const legacy = customEnginePackage("legacy");
+      for (const sameTarget of [false, true]) {
+        const saved = resource({
+          identifiers: [
+            { kind: "cds_bot_id", value: cdsBotId },
+            ...(sameTarget ? [{ kind, value: otherId }] : []),
+          ],
+          details: { schemaName: "cr_agent" },
+        });
+        const resources = sameTarget ? [saved] : [saved, resource({
+          nativeId: otherId, identifiers: [{ kind, value: otherId }],
+        })];
+        const packages = [native, secondary, legacy];
+        for (const values of [packages, [...packages].reverse()]) {
+          const links = resolvePackageAgentLinks("tenant-a", values, resources);
+          expect(links.find(link => link.packageId === native.id)).toMatchObject({
+            status: "matched", resource: { nativeId: cdsBotId, environmentId },
+          });
+          expect(links.find(link => link.packageId === secondary.id)).toMatchObject({
+            status: "matched", resource: { nativeId: sameTarget ? cdsBotId : otherId, environmentId },
+          });
+          const alias = links.find(link => link.packageId === legacy.id);
+          expect(alias?.status).toBe(sameTarget ? "matched" : "ambiguous");
+          expect(alias).not.toHaveProperty("grouping");
+          expect(alias).not.toHaveProperty("controlBotId");
+          if (sameTarget) expect(alias).toMatchObject({
+            evidence: [{ kind: "shared_custom_engine_bot_id", relatedPackageIds: [native.id] }],
+          });
+        }
+      }
+    },
+  );
+
+  it("does not promote a secondary identity match into a custom-engine native anchor", () => {
+    const secondary = customEnginePackage("secondary", {
+      SourceIds: { EnvironmentId: environmentId, EntraApplicationId: otherId },
+    });
+    const legacy = customEnginePackage("legacy");
+    const saved = resource({ identifiers: [{ kind: "entra_app_id", value: otherId }] });
+    expect(resolvePackageAgentLinks("tenant-a", [secondary, legacy], [saved])).toMatchObject([
+      { packageId: secondary.id, status: "matched" },
+      { packageId: legacy.id, status: "unmatched" },
+    ]);
+  });
+
+  it("keeps custom-engine aliases ambiguous when secondary matches alone identify different agents", () => {
+    const first = customEnginePackage("first", {
+      SourceIds: { EnvironmentId: environmentId, EntraApplicationId: cdsBotId },
+    });
+    const second = customEnginePackage("second", {
+      SourceIds: { EnvironmentId: environmentId, EntraApplicationId: otherId },
+    });
+    const legacy = customEnginePackage("legacy");
+    const packages = [first, second, legacy];
+    for (const values of [packages, [...packages].reverse()]) {
+      const links = resolvePackageAgentLinks("tenant-a", values, [
+        resource({ nativeId: cdsBotId, identifiers: [{ kind: "entra_app_id", value: cdsBotId }] }),
+        resource({ nativeId: otherId, identifiers: [{ kind: "entra_app_id", value: otherId }] }),
+      ]);
+      expect(links.find(link => link.packageId === first.id)?.status).toBe("matched");
+      expect(links.find(link => link.packageId === second.id)?.status).toBe("matched");
+      expect(links.find(link => link.packageId === legacy.id)?.status).toBe("ambiguous");
+    }
+  });
+
+  it.each([
+    { SourceIds: { EnvironmentId: otherId } },
+    { SourceIds: { SchemaName: "cr_other" } },
+  ])("does not discard partial native constraints when linking custom-engine representations (%j)", metadata => {
+    const native = customEnginePackage("native", {
+      SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+    });
+    const partial = customEnginePackage("partial", metadata);
+    for (const values of [[native, partial], [partial, native]]) {
+      const links = resolvePackageAgentLinks("tenant-a", values, [resource({ details: { schemaName: "cr_agent" } })]);
+      expect(links.find(link => link.packageId === native.id)?.status).toBe("matched");
+      expect(links.find(link => link.packageId === partial.id)).toMatchObject({ status: "ambiguous" });
+      expect(links.find(link => link.packageId === partial.id)).not.toHaveProperty("grouping");
+    }
+  });
+
+  it("checks a partial schema against the saved custom-engine anchor even if the anchor package omits it", () => {
+    const native = customEnginePackage("native", {
+      SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId },
+    });
+    const saved = resource({
+      identifiers: [{ kind: "cds_bot_id", value: cdsBotId }], details: { schemaName: "cr_agent" },
+    });
+    for (const SchemaName of ["CR_AGENT", "cr_other"]) {
+      const partial = customEnginePackage("partial", { SourceIds: { SchemaName } });
+      for (const values of [[native, partial], [partial, native]]) {
+        const links = resolvePackageAgentLinks("tenant-a", values, [saved]);
+        expect(links.find(link => link.packageId === native.id)?.status).toBe("matched");
+        expect(links.find(link => link.packageId === partial.id)?.status)
+          .toBe(SchemaName === "CR_AGENT" ? "matched" : "ambiguous");
+      }
+    }
   });
 
   it("requires agreement of the declared bot application in both package element types", () => {

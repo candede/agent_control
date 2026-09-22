@@ -7,6 +7,17 @@ import { inventoryProviderRoleIds } from "./inventoryRoleScope.js";
 import { PowerPlatformInventoryService } from "./powerPlatformInventory.js";
 import { withTelemetryContext } from "./telemetry.js";
 
+vi.mock("../db/pool.js", () => ({
+  pool: {},
+  secretValue: vi.fn(),
+  transaction: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
+}));
+vi.mock("connect-pg-simple", () => ({
+  default: () => class {
+    constructor() { throw new Error("Unit tests must not construct a session store."); }
+  },
+}));
+
 const user: AuthenticatedUser = {
   tenantId: "tenant-a", homeAccountId: "principal-a", displayName: "Reader", username: "reader@example.invalid",
   roles: ["AgentControl.Viewer"], providerRoleIds: [inventoryProviderRoleIds.globalReader],
@@ -14,8 +25,9 @@ const user: AuthenticatedUser = {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(done => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function fixture(overrides: Record<string, unknown> = {}) {
@@ -120,6 +132,9 @@ describe("Power Platform inventory refresh service", () => {
     for (const event of ["inventory_refresh_started", "inventory_refresh_progress", "inventory_refresh_succeeded"]) {
       expect(entries).toContainEqual(expect.objectContaining({ event, requestId: "request-a", jobId: job.id, route: "/inventory/refresh-jobs" }));
     }
+    expect(entries).toContainEqual(expect.objectContaining({
+      event: "inventory_refresh_succeeded", queriedTypeCount: 1,
+    }));
     expect(repository.recordProgress).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, 1, 0, 0);
     expect(JSON.stringify(entries)).not.toContain(user.homeAccountId);
     expect(JSON.stringify(entries)).not.toContain(user.username);
@@ -174,14 +189,12 @@ describe("Power Platform inventory refresh service", () => {
   });
 
   it("turns interrupted work into explicit reauthorization and drains all active refreshes", async () => {
-    const held = deferred<never>();
     const first = fixture();
     first.dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true })));
     await first.service.start(user, first.job.id);
     await first.service.drain();
     expect(first.repository.markWaitingAuthorization).toHaveBeenCalledTimes(1);
     expect(first.repository.publish).not.toHaveBeenCalled();
-    held.resolve(undefined as never);
   });
 
   it("lets Admin inherit Viewer authority and fences publication after all roles are lost", async () => {
@@ -206,22 +219,276 @@ describe("Power Platform inventory refresh service", () => {
     await expect(direct.service.cancel({ ...user, roles: [] }, direct.job.id)).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 
+  it.each(["uppercase", "lowercase"] as const)("matches mixed-case UUID resume and cancellation after %s admission", async casing => {
+    const { service, dependencies, job, repository } = fixture();
+    job.id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let querySignal: AbortSignal | undefined;
+    dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) => {
+      querySignal = options.signal;
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }));
+    const startId = casing === "uppercase" ? job.id.toUpperCase() : job.id;
+    const otherId = casing === "uppercase" ? job.id : job.id.toUpperCase();
+    await service.start(user, startId);
+    try {
+      await expect(service.start(user, otherId)).rejects.toMatchObject({ code: "inventory_job_state" });
+      await service.cancel(user, otherId);
+      expect(querySignal?.aborted).toBe(true);
+      expect(querySignal?.reason).toMatchObject({ code: "read_job_cancelled" });
+      expect(dependencies.query).toHaveBeenCalledOnce();
+      expect(repository.markRunning).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, job.id);
+    } finally {
+      await service.drain();
+    }
+  });
+
   it("bounds global refresh execution and recovers capacity after principal cancellation", async () => {
-    const held = deferred<void>();
     const bounded = fixture({ getJob: vi.fn(async (_scope, id) => ({ ...fixture().job, id })) });
     bounded.dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) => {
       options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
-      void held.promise;
     }));
     const ids = [1, 2, 3, 4, 5].map(value => `11111111-1111-1111-1111-11111111111${value}`);
     for (const id of ids.slice(0, 4)) await bounded.service.start(user, id);
     await expect(bounded.service.start(user, ids[4])).rejects.toMatchObject({ code: "inventory_capacity" });
     await bounded.service.waitForPrincipalAuthorization({ tenantId: "tenant-a", principalId: "principal-a" });
-    await bounded.service.drain();
+    await vi.waitFor(() => expect(bounded.repository.markWaitingAuthorization).toHaveBeenCalledTimes(4));
+    await Promise.resolve();
     expect(bounded.repository.markWaitingAuthorization).toHaveBeenCalledTimes(4);
     await expect(bounded.service.start(user, ids[4])).resolves.toBeDefined();
     await bounded.service.drain();
-    held.resolve();
+  });
+
+  it("does not consume admission capacity when tenant scope is missing", async () => {
+    const { service, dependencies, job } = fixture();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(service.start({ ...user, tenantId: undefined }, job.id)).rejects.toMatchObject({ code: "unauthorized" });
+    }
+    await expect(service.start(user, job.id)).resolves.toBeDefined();
+    await service.drain();
+    expect(dependencies.query).toHaveBeenCalledOnce();
+  });
+
+  it("counts each job once while its running-job response is pending", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const response = deferred<typeof job>();
+    repository.getJob.mockResolvedValueOnce(job).mockReturnValueOnce(response.promise);
+    dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) =>
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true })));
+    const starting = service.start(user, job.id);
+    await vi.waitFor(() => expect(dependencies.query).toHaveBeenCalledOnce());
+    try {
+      for (let index = 2; index <= 4; index += 1) {
+        await expect(service.start(user, `11111111-1111-1111-1111-11111111111${index}`)).resolves.toBeDefined();
+      }
+      await expect(service.start(user, "11111111-1111-1111-1111-111111111115")).rejects.toMatchObject({ code: "inventory_capacity" });
+    } finally {
+      response.resolve(job);
+      await starting;
+      await service.drain();
+    }
+  });
+
+  it.each(["getJob", "revalidateUser", "requireAvailable", "delegatedToken", "markRunning"] as const)(
+    "stops admission paused at %s when its principal signs out",
+    async stage => {
+      const { service, repository, dependencies, job } = fixture();
+      const pending = deferred<void>();
+      if (stage === "getJob") repository.getJob.mockImplementationOnce(async () => { await pending.promise; return job; });
+      if (stage === "revalidateUser") dependencies.revalidateUser.mockImplementationOnce(async () => { await pending.promise; return user; });
+      if (stage === "requireAvailable") dependencies.requireAvailable.mockImplementationOnce(async () => { await pending.promise; });
+      if (stage === "delegatedToken") dependencies.delegatedToken.mockImplementationOnce(async () => { await pending.promise; return "opaque-token"; });
+      if (stage === "markRunning") repository.markRunning.mockImplementationOnce(async () => { await pending.promise; return true; });
+      const boundary = stage === "getJob" || stage === "markRunning" ? repository[stage] : dependencies[stage];
+      const starting = service.start(user, job.id);
+      const stopped = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
+      await vi.waitFor(() => expect(boundary).toHaveBeenCalledOnce());
+      await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+      pending.resolve();
+      await stopped;
+      await service.drain();
+      expect(dependencies.query).not.toHaveBeenCalled();
+      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(stage === "markRunning" ? 1 : 0);
+    },
+  );
+
+  it("drains pending admission before shutdown completes and rejects further starts", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<AuthenticatedUser>();
+    dependencies.revalidateUser.mockReturnValueOnce(pending.promise);
+    const starting = service.start(user, job.id);
+    const stopped = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledOnce());
+    const drained = vi.fn();
+    const draining = service.drain().then(drained);
+    await Promise.resolve();
+    await Promise.resolve();
+    const returnedEarly = drained.mock.calls.length > 0;
+    pending.resolve(user);
+    await stopped;
+    await draining;
+    expect(returnedEarly).toBe(false);
+    expect(repository.markRunning).not.toHaveBeenCalled();
+    expect(dependencies.query).not.toHaveBeenCalled();
+    await expect(service.start(user, job.id)).rejects.toMatchObject({ code: "inventory_shutdown" });
+  });
+
+  it("rejects duplicate admission without reserving another execution", async () => {
+    const { service, dependencies, job } = fixture();
+    const pending = deferred<AuthenticatedUser>();
+    dependencies.revalidateUser.mockReturnValueOnce(pending.promise);
+    const starting = service.start(user, job.id);
+    try {
+      await expect(service.start(user, job.id)).rejects.toMatchObject({ code: "inventory_job_state" });
+    } finally {
+      pending.resolve(user);
+      await starting;
+      await service.drain();
+    }
+    expect(dependencies.query).toHaveBeenCalledOnce();
+  });
+
+  it.each(["starting", "running"] as const)("conceals a %s job from other principals and tenants", async phase => {
+    const { service, dependencies, repository, job } = fixture();
+    job.id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const pending = deferred<AuthenticatedUser>();
+    if (phase === "starting") dependencies.revalidateUser.mockReturnValueOnce(pending.promise);
+    dependencies.query.mockImplementation((_token, _types, options) => new Promise((_resolve, reject) =>
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true })));
+    const starting = service.start(user, job.id);
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledOnce());
+    if (phase === "running") await starting;
+    try {
+      const reads = repository.getJob.mock.calls.length;
+      for (const other of [{ ...user, homeAccountId: "other-principal" }, { ...user, tenantId: "other-tenant" }]) {
+        await expect(service.start(other, job.id.toUpperCase())).rejects.toMatchObject({ status: 404, code: "not_found" });
+      }
+      expect(repository.getJob).toHaveBeenCalledTimes(reads);
+      expect(dependencies.revalidateUser).toHaveBeenCalledOnce();
+    } finally {
+      pending.resolve(user);
+      await starting;
+      await service.drain();
+    }
+  });
+
+  it.each(["cancel", "logout", "shutdown", "deadline"] as const)(
+    "preserves the %s outcome when pending publication authorization rejects later",
+    async interruption => {
+      const { service, dependencies, repository, job } = fixture();
+      const pending = deferred<AuthenticatedUser>();
+      const deadline = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      dependencies.revalidateUser.mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
+      await service.start(user, job.id);
+      await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2));
+      let draining: Promise<void> | undefined;
+      if (interruption === "cancel") await service.cancel(user, job.id);
+      else if (interruption === "logout") await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+      else if (interruption === "shutdown") draining = service.drain();
+      else deadline.abort(new DOMException("Execution deadline", "TimeoutError"));
+      pending.reject(interruption === "deadline"
+        ? new AppError(401, "interaction_required", "Late authorization failure.")
+        : new Error("Late authorization transport failure."));
+      await (draining ?? service.drain());
+      expect(repository.publish).not.toHaveBeenCalled();
+      if (interruption === "deadline") {
+        expect(repository.markFailed).toHaveBeenCalledWith(
+          { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id,
+          "provider_timeout", expect.stringContaining("150-second execution limit"),
+        );
+        expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+      } else {
+        expect(repository.markFailed).not.toHaveBeenCalled();
+        expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(interruption === "cancel" ? 0 : 1);
+        expect(repository.cancel).toHaveBeenCalledTimes(interruption === "cancel" ? 2 : 0);
+      }
+    },
+  );
+
+  it.each(["cancel", "logout"] as const)("drains pending admission already stopped by %s", async action => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<boolean>();
+    repository.markRunning.mockReturnValueOnce(pending.promise);
+    const starting = service.start(user, job.id);
+    const stopped = expect(starting).rejects.toMatchObject({
+      code: action === "cancel" ? "read_job_cancelled" : "interaction_required",
+    });
+    await vi.waitFor(() => expect(repository.markRunning).toHaveBeenCalledOnce());
+    if (action === "cancel") await service.cancel(user, job.id);
+    else await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+    const draining = service.drain();
+    pending.resolve(true);
+    await stopped;
+    await draining;
+    expect(dependencies.query).not.toHaveBeenCalled();
+    expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(action === "logout" ? 1 : 0);
+    expect(repository.cancel).toHaveBeenCalledTimes(action === "cancel" ? 2 : 0);
+  });
+
+  it("does not deadlock logout with pending startup authorization", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const scopedUser = { ...user, homeAccountId: "inventory-start-lock" };
+    const pending = deferred<AuthenticatedUser>();
+    dependencies.revalidateUser.mockReturnValueOnce(pending.promise);
+    const starting = service.start(scopedUser, job.id);
+    const stopped = expect(starting).rejects.toMatchObject({ status: 401 });
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledOnce());
+    await revokeAccountSessionMutations(user.tenantId!, scopedUser.homeAccountId, async () => {
+      pending.resolve(scopedUser);
+      await Promise.resolve();
+      await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: scopedUser.homeAccountId });
+    });
+    await stopped;
+    await service.drain();
+    expect(repository.markRunning).not.toHaveBeenCalled();
+    expect(dependencies.query).not.toHaveBeenCalled();
+  });
+
+  it("observes sanitized background persistence failure without a drain", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const failure = new Error("private database failure detail");
+    dependencies.query.mockRejectedValue(new AppError(502, "provider_error", "Provider failed."));
+    repository.markFailed.mockRejectedValueOnce(failure);
+    await withTelemetryContext({ requestId: "request-status-failed" }, () => service.start(user, job.id));
+    await vi.waitFor(() => expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .toContainEqual(expect.objectContaining({
+        event: "inventory_refresh_status_failed", requestId: "request-status-failed", jobId: job.id, errorCode: "internal_error",
+      })));
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(failure.message);
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
+  it("reports background persistence failures to an in-flight drain", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<void>();
+    const failure = new Error("private database failure detail");
+    dependencies.query.mockRejectedValue(new AppError(502, "provider_error", "Provider failed."));
+    repository.markFailed.mockReturnValueOnce(pending.promise);
+    await service.start(user, job.id);
+    await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledOnce());
+    const drained = expect(service.drain()).rejects.toBe(failure);
+    pending.reject(failure);
+    await drained;
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('"event":"inventory_refresh_status_failed"'));
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(failure.message);
+  });
+
+  it("still reports persistence failure when shutdown wins over a late authorization rejection", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<AuthenticatedUser>();
+    const failure = new Error("private authorization-wait persistence failure");
+    dependencies.revalidateUser.mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
+    repository.markWaitingAuthorization.mockRejectedValueOnce(failure);
+    await service.start(user, job.id);
+    await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2));
+    const drained = expect(service.drain()).rejects.toBe(failure);
+    pending.reject(new Error("Late authorization transport failure."));
+    await drained;
+    expect(repository.markFailed).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('"event":"inventory_refresh_status_failed"'));
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(failure.message);
   });
 
   it("does not deadlock logout with pending publication authorization or publish a cancelled scan", async () => {

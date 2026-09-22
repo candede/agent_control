@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { assessCanaryRestoration } from "../db/packageMutationQualifications.js";
+import { assessCanaryRestoration, packageCanaryMutation } from "../db/packageMutationQualifications.js";
 import { AppError } from "../errors.js";
 import { verifyPackageMutationConverged, type GraphPackagesClient, type PackageMutationOptions, type PackageReadOptions, type PackageReadbackOptions } from "./graphPackages.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
@@ -23,6 +23,7 @@ export async function restorePackageMutationCanary(provider: RestorationProvider
   if (input.action === "reassign") {
     throw new AppError(409, "canary_restoration_unsupported", "Reassignment cannot be restored because Microsoft Graph does not expose a verifiable owner state.");
   }
+  packageCanaryMutation(input);
 
   const correlationId = input.correlationId ?? randomUUID();
   const signal = AbortSignal.any([...(input.signal ? [input.signal] : []), AbortSignal.timeout(30_000)]);
@@ -39,20 +40,20 @@ export async function restorePackageMutationCanary(provider: RestorationProvider
     throw new AppError(409, "canary_restoration_conflict", assessment.message);
   }
 
-  if (input.prestate.kind === "block") {
-    if (input.prestate.isBlocked) await provider.blockPackage(input.accessToken, input.targetId, mutationOptions);
-    else await provider.unblockPackage(input.accessToken, input.targetId, mutationOptions);
-  } else {
-    if (current.kind !== "access") throw new AppError(409, "canary_restoration_conflict", "The current package state does not match the qualified canary type.");
-    await provider.patchPackageAccess(input.accessToken, input.targetId, restoredAccessPayload(input.prestate, current, input.action), mutationOptions);
-  }
-
   try {
+    if (input.prestate.kind === "block") {
+      if (input.prestate.isBlocked) await provider.blockPackage(input.accessToken, input.targetId, mutationOptions);
+      else await provider.unblockPackage(input.accessToken, input.targetId, mutationOptions);
+    } else {
+      if (current.kind !== "access") throw new AppError(409, "canary_restoration_conflict", "The current package state does not match the qualified canary type.");
+      await provider.patchPackageAccess(input.accessToken, input.targetId, restoredAccessPayload(input.prestate, current, input.action), mutationOptions);
+    }
+
     const readback = await verifyPackageMutationConverged(provider, input.accessToken, input.targetId, input.action, input.prestate, { ...input.readback, ...readOptions });
     signal.throwIfAborted();
     return { status: "restored" as const, correlationId, readbackCount: readback.readbackCount };
   } catch (error) {
-    throw new AppError(409, "canary_restoration_inconclusive", "The restoration write was accepted but provider read-back did not converge to the qualified prestate. Do not retry automatically.", error instanceof AppError ? error.details : undefined);
+    throw new AppError(409, "canary_restoration_inconclusive", "The restoration write was attempted but its outcome was not verified against the qualified prestate. Do not retry automatically.", error instanceof AppError ? error.details : undefined);
   }
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseCsv } from "csv-parse/sync";
 import pg from "pg";
 import { AppError } from "../errors.js";
@@ -158,6 +158,13 @@ function dependencies(options: {
 }
 
 describe("UnifiedAgentsService", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-16T12:00:00.000Z"));
+  });
+
+  afterEach(() => vi.useRealTimers());
+
   it.each((["owner", "createdBy"] as const).flatMap(sortBy =>
     (["asc", "desc"] as const).map(sortDirection => ({ sortBy, sortDirection })),
   ))("enriches linked and native people before $sortBy $sortDirection sort, search, paging and CSV while retaining source IDs", async query => {
@@ -689,7 +696,7 @@ describe("UnifiedAgentsService", () => {
     await expect(service.forExport({ tenantId, principalId: "viewer" }, inventoryRevision)).rejects.toMatchObject({ code: "snapshot_unavailable" });
   });
 
-  it("merges production-shaped source records before counts and paging while keeping identical names separate", async () => {
+  it.each(["fresh", "stale"] as const)("merges production-shaped source records with %s control evidence before counts and paging while keeping identical names separate", async freshness => {
     const published = {
       ...packageValue("package-a", "Clinical Treatment Plan"),
       identityDetailsCollected: true as const,
@@ -708,7 +715,7 @@ describe("UnifiedAgentsService", () => {
     const service = new UnifiedAgentsService(dependencies({
       packages: [published, { ...published, id: "package-b" }, packageValue("unproven", published.displayName)],
       resources: [observed, { ...resource(environmentB, botA), displayName: published.displayName }],
-      observedAt: new Date().toISOString(),
+      observedAt: new Date(Date.now() - (freshness === "stale" ? 25 * 60 * 60_000 : 0)).toISOString(),
     }));
     const full = await service.list({ tenantId, principalId: "viewer" });
     expect(full).toMatchObject({
@@ -717,7 +724,10 @@ describe("UnifiedAgentsService", () => {
     });
     const merged = full.value.find(value => value.presence === "both")!;
     expect(merged.packages.map(value => value.id)).toEqual(["package-a", "package-b"]);
-    expect(merged.powerPlatformResource?.identifiers).toContainEqual({ kind: "cds_bot_id", value: botA });
+    const controlIdentity = { kind: "cds_bot_id", value: botA };
+    if (freshness === "fresh") expect(merged.powerPlatformResource?.identifiers).toContainEqual(controlIdentity);
+    else expect(merged.powerPlatformResource?.identifiers).not.toContainEqual(controlIdentity);
+    expect(observed.identifiers).not.toContainEqual(controlIdentity);
     expect(merged.packages[0]).not.toHaveProperty("identityDetailsCollected");
     expect(merged.packages[0]).not.toHaveProperty("elementDetails");
     const paged = await service.list({ tenantId, principalId: "viewer" }, { limit: 1, offset: 1 });
@@ -729,7 +739,7 @@ describe("UnifiedAgentsService", () => {
     expect(filtered).toMatchObject({ count: 0, identityCollection: { checkedPackages: 2, pendingPackages: 1 } });
   });
 
-  it("keeps schema-conflicting package representations separate before counts and pagination", async () => {
+  it.each(["typed_bot", "schema_native"] as const)("keeps schema conflicts separate before counts and pagination (%s)", async matchKind => {
     const packages = ["cr123_agent", "cr123_other"].map((SchemaName, index) => ({
       ...packageValue(`package-${index}`, "Same displayed name"),
       elementDetails: [{
@@ -739,7 +749,10 @@ describe("UnifiedAgentsService", () => {
         }) }],
       }],
     }));
-    const service = new UnifiedAgentsService(dependencies({ packages, resources: [resource(environmentA)] }));
+    const saved = matchKind === "typed_bot" ? resource(environmentA) : {
+      ...resource(environmentA, botA), identifiers: [], details: { schemaName: "cr123_agent" },
+    };
+    const service = new UnifiedAgentsService(dependencies({ packages, resources: [saved] }));
     const full = await service.list({ tenantId, principalId: "viewer" });
     expect(full).toMatchObject({
       count: 3,
@@ -751,6 +764,67 @@ describe("UnifiedAgentsService", () => {
     expect(paged.count).toBe(3);
     expect(paged.summary).toEqual(full.summary);
     expect(paged.value).toHaveLength(1);
+  });
+
+  it("keeps source-only declarative manifests in their declared environments before filtering and counts", async () => {
+    const packages = [environmentA, environmentB].map((EnvironmentId, index) => ({
+      ...packageValue(`package-${index}`, "Same displayed name"),
+      manifestId: botA, elementTypes: ["DeclarativeCopilots"],
+      elementDetails: [{
+        elementType: "AgentMetadatas",
+        elements: [{ id: "metadata", definition: JSON.stringify({ SourceIds: { EnvironmentId } }) }],
+      }],
+    }));
+    for (const ordered of [packages, [...packages].reverse()]) {
+      const service = new UnifiedAgentsService(dependencies({ packages: ordered, powerPlatformSnapshot: null }));
+      const scope = { tenantId, principalId: "viewer" };
+      const full = await service.list(scope);
+      expect(full).toMatchObject({ count: 2, summary: { total: 2, graphOnly: 2, linked: 0 } });
+      expect(full.value.map(value => value.environmentId).sort()).toEqual([environmentA, environmentB].sort());
+      const filtered = await service.list(scope, { environmentId: environmentB });
+      expect(filtered.count).toBe(1);
+      expect(filtered.value[0].packages.map(value => value.id)).toEqual(["package-1"]);
+    }
+  });
+
+  it("keeps ambiguous custom-engine aliases separate from all independently matched agents", async () => {
+    const botApplicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const packages = [
+      { id: "native", metadata: { SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } } },
+      { id: "secondary", metadata: { SourceIds: { EnvironmentId: environmentA, EntraApplicationId: botApplicationId } } },
+      { id: "legacy", metadata: {} },
+    ].map(({ id, metadata }) => ({
+      ...packageValue(id, "Same displayed name"),
+      elementDetails: [
+        { elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }] },
+        { elementType: "Bots", elements: [{ id: "bot", definition: JSON.stringify({ botId: botApplicationId }) }] },
+        { elementType: "CustomEngineCopilots", elements: [{ id: "engine", definition: JSON.stringify({ type: "bot", id: botApplicationId }) }] },
+      ],
+    }));
+    const secondary: PowerPlatformResource = {
+      ...resource(environmentA, "other-native"),
+      identifiers: [{ kind: "entra_app_id", value: botApplicationId }],
+    };
+    for (const ordered of [packages, [...packages].reverse()]) {
+      const service = new UnifiedAgentsService(dependencies({
+        packages: ordered, resources: [resource(environmentA), secondary],
+      }));
+      const scope = { tenantId, principalId: "viewer" };
+      const full = await service.list(scope);
+      expect(full).toMatchObject({
+        count: 3, summary: { total: 3, linked: 2, graphOnly: 1, ambiguous: 1 },
+        verification: { representedSourceCount: 5, uniqueSourceCount: 5, checks: { identityLinks: false, sourceMemberships: true } },
+      });
+      const exact = await service.list(scope, { recordId: "graph_packages:legacy" });
+      expect(exact.value).toMatchObject([{
+        presence: "graph_packages", packages: [{ id: "legacy" }],
+        powerPlatformResource: null, identity: { state: "ambiguous" },
+      }]);
+      const paged = await service.list(scope, { limit: 1, offset: 1 });
+      expect(paged.count).toBe(3);
+      expect(paged.summary).toEqual(full.summary);
+      expect(paged.value).toHaveLength(1);
+    }
   });
 
   it("returns all authorized environment and authoring choices independently of filtering and pagination", async () => {
@@ -924,7 +998,7 @@ describe("UnifiedAgentsService", () => {
     const result = await new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" }, { operationIdPrefix: "a5331a93", limit: 1 });
     expect(result.count).toBe(1);
     expect(result.value[0]).toMatchObject({ presence: "both", packages: [{ id: "grouped-a" }, { id: "matched" }] });
-    expect(deps.operationPackageIds).toHaveBeenCalledWith({ tenantId, principalId: "viewer" }, ["grouped-a", "matched", "not-matched"], "a5331a93");
+    expect(deps.operationPackageIds).toHaveBeenCalledWith({ tenantId, principalId: "viewer" }, ["grouped-a", "matched", "not-matched"], "a5331a93", undefined);
     deps.operationPackageIds = vi.fn(async () => []);
     expect(await new UnifiedAgentsService(deps).list({ tenantId, principalId: "viewer" }, { operationIdPrefix: "unmatched" })).toMatchObject({
       count: 0,

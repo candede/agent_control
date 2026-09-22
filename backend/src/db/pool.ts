@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import pg, { type PoolClient, type PoolConfig } from "pg";
+import { operationalLog } from "../services/telemetry.js";
 
 export function secretValue(name: string) {
   const filename = process.env[`${name}_FILE`];
@@ -30,7 +31,7 @@ export function databaseSettings(): PoolConfig {
 }
 
 export const pool = new pg.Pool(databaseSettings());
-pool.on("error", () => console.error(JSON.stringify({ event: "database_pool_error" })));
+pool.on("error", () => operationalLog("error", "database_pool_error"));
 
 export async function transaction<T>(database: pg.Pool, work: (client: PoolClient) => Promise<T>, signal?: AbortSignal) {
   const client = await database.connect();

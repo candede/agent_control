@@ -62,7 +62,9 @@ export async function runCopilotStudioQuarantineJob(
   authorize: QuarantineAuthorizer = authorizeQuarantine,
   externalSignal?: AbortSignal,
 ) {
+  requireProviderAdmissions();
   if (!await repository.get(scope, id)) throw new AppError(404, "not_found", "Quarantine job was not found.");
+  requireProviderAdmissions();
   let authorization: QuarantineAuthorization;
   try { authorization = await authorize(scope); }
   catch (error) { await repository.waitForAuthorization(scope, id); throw error; }
@@ -70,6 +72,7 @@ export async function runCopilotStudioQuarantineJob(
   if (!lease) return;
   try {
     for (let index = 0; index < 25 && !maintenanceActive(); index += 1) {
+      requireProviderAdmissions();
       try { authorization = await authorize(scope); }
       catch {
         await repository.waitForAuthorization(scope, id);
@@ -86,7 +89,10 @@ export async function runCopilotStudioQuarantineJob(
           const target = { environmentId: item.environment_id, botId: item.bot_id };
           const options = { correlationId: item.correlation_id!, signal };
           await repository.assertDispatchReady(lease, item, authorization.authority);
+          requireProviderAdmissions();
+          signal.throwIfAborted();
           const before = await provider.getStatus(authorization.accessToken, target, options);
+          requireProviderAdmissions();
           if (before.isBotQuarantined === item.requested_state) {
             await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorize, signal);
             return;
@@ -96,26 +102,40 @@ export async function runCopilotStudioQuarantineJob(
           const dispatchAuthorization = await authorize(scope);
           requireAuthority(job, dispatchAuthorization.authority);
           await repository.assertDispatchReady(lease, item, dispatchAuthorization.authority);
+          requireProviderAdmissions();
+          signal.throwIfAborted();
           const immediate = await provider.getStatus(dispatchAuthorization.accessToken, target, options);
           if (immediate.isBotQuarantined === item.requested_state) {
             signal.throwIfAborted();
-            await commitAccountSessionValidation(validation, () => repository.finishItem(lease, item, "skipped", { observed: immediate, readbackCount: 1 }));
+            await commitAccountSessionValidation(validation, async () => {
+              requireProviderAdmissions();
+              signal.throwIfAborted();
+              await repository.finishItem(lease, item, "skipped", { observed: immediate, readbackCount: 1 });
+            });
             return;
           }
           requireFrozenPrestate(item, immediate);
           signal.throwIfAborted();
           await commitAccountSessionValidation(validation, async () => {
+            requireProviderAdmissions();
             signal.throwIfAborted();
             await repository.markSent(lease, item, dispatchAuthorization.authority);
           });
           sent = true;
+          requireProviderAdmissions();
+          signal.throwIfAborted();
           await provider.setQuarantine(dispatchAuthorization.accessToken, target, item.requested_state, options);
-          const verified = await verifyCopilotStudioQuarantineConverged(provider, dispatchAuthorization.accessToken, target, item.requested_state, options);
+          const verified = await verifyCopilotStudioQuarantineConverged({
+            getStatus: (...args) => {
+              requireProviderAdmissions();
+              return provider.getStatus(...args);
+            },
+          }, dispatchAuthorization.accessToken, target, item.requested_state, options);
           await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorize, signal);
         });
       } catch (error) {
         if (error instanceof AppError && error.code === "lease_lost") throw error;
-        if (!sent && isAuthorizationFailure(error)) {
+        if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error))) {
           await repository.pauseItemForAuthorization(lease, item);
           return;
         }
@@ -130,6 +150,7 @@ export async function runCopilotStudioQuarantineJob(
           message: sent ? "Provider write outcome is inconclusive; use GET reconciliation and never replay this item." : "The quarantine item stopped before provider dispatch.",
           ...failure,
         });
+        if (isAdmissionFailure(error)) return;
       }
     }
   } finally {
@@ -145,10 +166,12 @@ export async function reconcileCopilotStudioQuarantineJob(
   provider: Pick<CopilotStudioQuarantineClient, "getStatus"> = new CopilotStudioQuarantineClient(),
   authorize: QuarantineAuthorizer = authorizeQuarantine,
 ) {
+  requireProviderAdmissions();
   const context = await repository.reconciliationItems(scope, id);
   if (!context) throw new AppError(404, "not_found", "Quarantine job was not found.");
   const errors: Array<{ resourceNativeId: string; message: string }> = [];
   for (const item of context.items) {
+    requireProviderAdmissions();
     try {
       const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
       const authorization = await authorize(scope);
@@ -156,11 +179,14 @@ export async function reconcileCopilotStudioQuarantineJob(
       const signal = AbortSignal.timeout(reconciliationDeadlineMs);
       await repository.withReconciliationLock(scope, item, async () => {
         await repository.assertReconciliationTarget(scope, item, context.job.is_canary);
+        requireProviderAdmissions();
         const observed = await provider.getStatus(authorization.accessToken, { environmentId: item.environment_id, botId: item.bot_id }, { correlationId: item.correlation_id ?? randomUUID(), signal });
+        requireProviderAdmissions();
         const publishAuthorization = await authorize(scope);
         requireAuthority(context.job, publishAuthorization.authority);
         signal.throwIfAborted();
         await commitAccountSessionValidation(validation, async () => {
+          requireProviderAdmissions();
           signal.throwIfAborted();
           if (observed.isBotQuarantined === item.requested_state) {
             await repository.recordReconciliation(scope, context.job, item, "verified_applied", observed, "Provider GET reconciliation verified that the confirmed quarantine mutation was applied.");
@@ -175,8 +201,10 @@ export async function reconcileCopilotStudioQuarantineJob(
       errors.push({ resourceNativeId: item.resource_native_id, message: "GET reconciliation could not be completed; no provider state was published." });
     }
   }
+  requireProviderAdmissions();
   const finalAuthorization = await authorize(scope);
   requireAuthority(context.job, finalAuthorization.authority);
+  requireProviderAdmissions();
   return { ...(await repository.get(scope, id))!, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
 }
 
@@ -227,11 +255,13 @@ async function finishAuthorized(
   authorize: QuarantineAuthorizer,
   signal: AbortSignal,
 ) {
+  requireProviderAdmissions();
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   const authorization = await authorize(scope);
   requireAuthority(job, authorization.authority);
   signal.throwIfAborted();
   await commitAccountSessionValidation(validation, async () => {
+    requireProviderAdmissions();
     signal.throwIfAborted();
     await repository.finishItem(lease, item, outcome, evidence);
   });
@@ -268,6 +298,11 @@ function isAuthorizationFailure(error: unknown) {
   return error instanceof AppError && (error.status === 401 || error.status === 403 || ["interaction_required", "authorization_expired", "missing_permission", "missing_internal_role", "missing_role", "capability_unavailable", "unauthorized", "quarantine_authority_changed"].includes(error.code));
 }
 
+function isAdmissionFailure(error: unknown) {
+  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
+}
+
 function isDeadlineExceeded(error: unknown) {
-  return error instanceof Error && error.name === "TimeoutError";
+  return error instanceof Error && error.name === "TimeoutError"
+    || error instanceof AppError && error.code === "provider_timeout";
 }

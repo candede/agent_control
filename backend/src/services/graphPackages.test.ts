@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
 import type {
   CopilotPackageDetail,
@@ -16,6 +17,9 @@ import {
   verifyPackageAccessApplied,
   type FetchLike,
 } from "./graphPackages.js";
+import { allowlistedPackage } from "./packageObservation.js";
+
+vi.mock("node:timers/promises", { spy: true });
 
 describe("GraphPackagesClient", () => {
   it("builds the Copilot agents list URL with the required filter", () => {
@@ -162,8 +166,15 @@ describe("GraphPackagesClient", () => {
   it("categorizes network failures without exposing their messages or retrying a mutation", async () => {
     const fetcher = vi.fn(async () => { throw new TypeError("private-url private-token"); });
     const client = new GraphPackagesClient(fetcher, { delay: async () => undefined });
-    await expect(client.checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_network_error" });
-    await expect(client.blockPackage("token", "P_1")).rejects.toMatchObject({ code: "provider_network_error" });
+    const safeError = {
+      status: 502,
+      code: "provider_network_error",
+      message: "Microsoft Graph could not be reached.",
+      details: undefined,
+    };
+    await expect(client.checkCatalogAccess("token")).rejects.toMatchObject(safeError);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    await expect(client.blockPackage("token", "P_1")).rejects.toMatchObject(safeError);
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
@@ -381,6 +392,35 @@ describe("GraphPackagesClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("cancels the default convergence timer when readback is aborted", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "Cancelled");
+    const timer = vi.mocked(delay);
+    timer.mockClear();
+    const client = {
+      getPackageDetails: vi.fn(async () => allowlistedPackage({
+        id: "P_1", displayName: "First", isBlocked: false,
+      })),
+    };
+    const verification = verifyPackageMutationConverged(
+      client, "token", "P_1", "block", { kind: "block", isBlocked: true },
+      { signal: controller.signal },
+    );
+    const assertion = expect(verification).rejects.toBe(reason);
+    try {
+      await vi.waitFor(() => expect(timer).toHaveBeenCalledOnce());
+      expect(timer).toHaveBeenCalledWith(500, undefined, { signal: controller.signal });
+      const timerAssertion = expect(timer.mock.results[0].value).rejects.toMatchObject({ name: "AbortError" });
+      controller.abort(reason);
+      await assertion;
+      await timerAssertion;
+      expect(client.getPackageDetails).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort(reason);
+      await assertion;
+    }
+  });
+
   it("replaces the selected collection and preserves the other collection", async () => {
     const fetcher = vi.fn<FetchLike>(async (_url, init) =>
       init?.method === "PATCH"
@@ -436,7 +476,7 @@ describe("GraphPackagesClient", () => {
       patchPackageAccess = vi.fn();
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -444,7 +484,7 @@ describe("GraphPackagesClient", () => {
           allowedUsersAndGroups: [
             { resourceType: "group", resourceId: "old-group" },
           ],
-        };
+        });
       }
     }
 
@@ -466,7 +506,7 @@ describe("GraphPackagesClient", () => {
       patchPackageAccess = vi.fn();
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -474,7 +514,7 @@ describe("GraphPackagesClient", () => {
             { resourceType: "user", resourceId: "user-1" },
             { resourceType: "group", resourceId: "group-1" },
           ],
-        };
+        });
       }
     }
 
@@ -502,7 +542,7 @@ describe("GraphPackagesClient", () => {
       patches: Array<Record<string, PackageAccessEntity[]>> = [];
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -512,7 +552,7 @@ describe("GraphPackagesClient", () => {
           acquireUsersAndGroups: [
             { resourceType: "group", resourceId: "group-1" },
           ],
-        };
+        });
       }
 
       override async patchPackageAccess(
@@ -562,7 +602,7 @@ describe("GraphPackagesClient", () => {
       patchPackageAccess = vi.fn();
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -570,7 +610,7 @@ describe("GraphPackagesClient", () => {
           allowedUsersAndGroups: [
             { resourceType: "group", resourceId: "group-existing" },
           ],
-        };
+        });
       }
     }
 
@@ -591,14 +631,14 @@ describe("GraphPackagesClient", () => {
       patchPackageAccess = vi.fn();
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
           availableTo: "allowedForSome",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
-        };
+        });
       }
     }
 
@@ -621,14 +661,14 @@ describe("GraphPackagesClient", () => {
       patchPackageAccess = vi.fn();
 
       override async getPackageDetails(): Promise<CopilotPackageDetail> {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
           availableTo: "all",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
-        };
+        });
       }
     }
 
@@ -650,13 +690,13 @@ describe("GraphPackagesClient", () => {
   it("rejects a PATCH that Graph accepts without changing effective access", () => {
     expect(() =>
       verifyPackageAccessApplied(
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
           availableTo: "all",
           allowedUsersAndGroups: [],
-        },
+        }),
         {
           target: "availability",
           mode: "replace",
@@ -664,13 +704,13 @@ describe("GraphPackagesClient", () => {
           principals: [],
         },
         [],
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
           deployedTo: "none",
           acquireUsersAndGroups: [],
-        },
+        }),
       ),
     ).toThrow("Effective access is still All users");
   });
@@ -678,7 +718,7 @@ describe("GraphPackagesClient", () => {
   it("rejects a PATCH when Graph reports the scope but not the principals", () => {
     expect(() =>
       verifyPackageAccessApplied(
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -686,7 +726,7 @@ describe("GraphPackagesClient", () => {
           allowedUsersAndGroups: [
             { resourceType: "group", resourceId: "different-group" },
           ],
-        },
+        }),
         {
           target: "availability",
           mode: "replace",
@@ -694,13 +734,13 @@ describe("GraphPackagesClient", () => {
           principals: [{ resourceType: "group", resourceId: "group-1" }],
         },
         [{ resourceType: "group", resourceId: "group-1" }],
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
           deployedTo: "none",
           acquireUsersAndGroups: [],
-        },
+        }),
       ),
     ).toThrow("did not apply the requested Specific users or groups");
   });
@@ -708,7 +748,7 @@ describe("GraphPackagesClient", () => {
   it("rejects a PATCH that changes the unselected access setting", () => {
     expect(() =>
       verifyPackageAccessApplied(
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -716,7 +756,7 @@ describe("GraphPackagesClient", () => {
           deployedTo: "none",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
-        },
+        }),
         {
           target: "availability",
           mode: "replace",
@@ -724,7 +764,7 @@ describe("GraphPackagesClient", () => {
           principals: [],
         },
         [],
-        {
+        allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
@@ -732,7 +772,7 @@ describe("GraphPackagesClient", () => {
           deployedTo: "all",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
-        },
+        }),
       ),
     ).toThrow("changed the unselected Installed for access setting");
   });
@@ -740,11 +780,11 @@ describe("GraphPackagesClient", () => {
   it("rejects add mode when the current access scope is ambiguous", async () => {
     class FakeClient extends GraphPackagesClient {
       override async getPackageDetails() {
-        return {
+        return allowlistedPackage({
           id: "P_1",
           displayName: "First",
           isBlocked: false,
-        };
+        });
       }
     }
 
@@ -767,7 +807,7 @@ describe("GraphPackagesClient", () => {
           { id: "P_1", displayName: "Already assigned", isBlocked: false },
           { id: "P_2", displayName: "Updates", isBlocked: false },
           { id: "P_3", displayName: "Fails", isBlocked: false },
-        ];
+        ].map(allowlistedPackage);
       }
 
       override async getPackageDetails(
@@ -778,7 +818,7 @@ describe("GraphPackagesClient", () => {
           throw new AppError(403, "Authorization_RequestDenied", "denied");
         }
 
-        return {
+        return allowlistedPackage({
           id,
           displayName: id,
           isBlocked: false,
@@ -789,7 +829,7 @@ describe("GraphPackagesClient", () => {
             id === "P_1" || this.updatedIds.has(id)
               ? [{ resourceType: "group", resourceId: "group-1" }]
               : [],
-        };
+        });
       }
 
       override async patchPackageAccess(_accessToken: string, id: string) {
@@ -844,7 +884,7 @@ describe("GraphPackagesClient", () => {
           { id: "P_1", displayName: "Ready", isBlocked: false },
           { id: "P_2", displayName: "Already blocked", isBlocked: true },
           { id: "P_3", displayName: "Fails", isBlocked: false },
-        ];
+        ].map(allowlistedPackage);
       }
 
       override async blockPackage(_accessToken: string, id: string) {
@@ -884,7 +924,7 @@ describe("GraphPackagesClient", () => {
   it("reports bulk package starts before package results", async () => {
     class FakeClient extends GraphPackagesClient {
       override async listCopilotAgents() {
-        return [{ id: "P_1", displayName: "Ready", isBlocked: false }];
+        return [allowlistedPackage({ id: "P_1", displayName: "Ready", isBlocked: false })];
       }
 
       override async blockPackage() {}
@@ -911,7 +951,7 @@ describe("GraphPackagesClient", () => {
         return [
           { id: "P_1", displayName: "Ready", isBlocked: false },
           { id: "P_2", displayName: "Already blocked", isBlocked: true },
-        ];
+        ].map(allowlistedPackage);
       }
 
       override async blockPackage() {}
@@ -945,7 +985,7 @@ describe("GraphPackagesClient", () => {
   it("falls back to the default concurrency for invalid values", async () => {
     class FakeClient extends GraphPackagesClient {
       override async listCopilotAgents() {
-        return [{ id: "P_1", displayName: "Ready", isBlocked: false }];
+        return [allowlistedPackage({ id: "P_1", displayName: "Ready", isBlocked: false })];
       }
 
       override async blockPackage() {}
@@ -985,7 +1025,7 @@ describe("GraphPackagesClient", () => {
           { id: "P_1", displayName: "Ready", isBlocked: false },
           { id: "P_2", displayName: "Already blocked", isBlocked: true },
           { id: "P_3", displayName: "Not selected", isBlocked: false },
-        ];
+        ].map(allowlistedPackage);
       }
 
       override async blockPackage(_accessToken: string, id: string) {
@@ -1017,12 +1057,12 @@ describe("GraphPackagesClient", () => {
           throw new Error("detail unavailable");
         }
 
-        return {
+        return allowlistedPackage({
           id,
           displayName: id === "P_1" ? "First" : "Third",
           isBlocked: false,
           sensitivity: "Unspecified",
-        };
+        });
       }
     }
 

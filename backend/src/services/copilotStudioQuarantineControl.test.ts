@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { createQuarantineConfirmation } from "../db/copilotStudioQuarantine.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
+import type { QuarantineJob } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotStudioQuarantineControlService } from "./copilotStudioQuarantineControl.js";
 
@@ -14,7 +17,7 @@ const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".re
 
 function service(cached = false, currentUser = user) {
   const repository = {
-    existingSubmission: vi.fn(async () => undefined), latestObservation: vi.fn(async () => cached ? direct : undefined), recordObservation: vi.fn(async () => direct),
+    existingSubmission: vi.fn<() => Promise<Pick<QuarantineJob, "id" | "status"> | undefined>>(async () => undefined), latestObservation: vi.fn(async () => cached ? direct : undefined), recordObservation: vi.fn(async () => direct),
     isQualified: vi.fn(async () => false), submit: vi.fn(),
   };
   const inventory = { resolveQuarantineTargets: vi.fn(async () => [target]) };
@@ -91,7 +94,7 @@ describe("Copilot Studio quarantine control", () => {
     expect(repository.submit).not.toHaveBeenCalled();
     expect(dependencies.launch).not.toHaveBeenCalled();
 
-    repository.submit.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", isCanary: false });
+    repository.submit.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", status: "queued", isCanary: false });
     await expect(value.submit(user, input)).resolves.toMatchObject({ isCanary: false });
     expect(inventory.resolveQuarantineTargets).toHaveBeenLastCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, target.snapshotId, [target.resourceNativeId]);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.manage", user);
@@ -109,7 +112,7 @@ describe("Copilot Studio quarantine control", () => {
 
   it("returns an immutable idempotent receipt before inventory or provider access", async () => {
     const { value, repository, inventory, provider, dependencies } = service(false);
-    const receipt = { id: "55555555-5555-4555-8555-555555555555", status: "succeeded" };
+    const receipt: Pick<QuarantineJob, "id" | "status"> = { id: "55555555-5555-4555-8555-555555555555", status: "succeeded" };
     repository.existingSubmission.mockResolvedValue(receipt);
     await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
       confirmationHash: "e".repeat(64), idempotencyKey: "durable-retry" })).resolves.toBe(receipt);
@@ -118,4 +121,137 @@ describe("Copilot Studio quarantine control", () => {
     expect(dependencies.authorityContext).not.toHaveBeenCalled();
     expect(dependencies.launch).not.toHaveBeenCalled();
   });
+
+  it("revalidates cached-status submissions before creating a durable job", async () => {
+    const { value, repository, provider, dependencies } = service(true);
+    dependencies.requireAvailable.mockRejectedValueOnce(new AppError(403, "capability_unavailable", "Admin authority was revoked."));
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "cached-revoked" })).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(dependencies.revalidateUser).toHaveBeenCalledWith(user.homeAccountId);
+    expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.manage", user);
+    expect(provider.getStatus).not.toHaveBeenCalled();
+    expect(repository.submit).not.toHaveBeenCalled();
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ...user, tenantId: "another-tenant" },
+    { ...user, homeAccountId: "another-principal" },
+  ])("rejects a changed cached-status submission actor: %j", async currentUser => {
+    const { value, repository, dependencies } = service(true, currentUser);
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "changed-actor" })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(repository.submit).not.toHaveBeenCalled();
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("keeps preview and submission bound to the same revalidated actor", async () => {
+    const current = { ...user, displayName: "Current Operator", username: "current@example.invalid" };
+    const { value, repository, dependencies } = service(true, current);
+    repository.submit.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", status: "queued" });
+    const preview = await value.preview(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId] });
+    expect(preview.summary.actor).toEqual({ id: current.homeAccountId, displayName: current.displayName, username: current.username });
+    await value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: preview.confirmationHash, idempotencyKey: "current-actor" });
+    expect(dependencies.authorityContext).toHaveBeenCalledWith(current);
+    expect(repository.submit).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, expect.objectContaining({
+      actor: { tenantId: current.tenantId, homeAccountId: current.homeAccountId, displayName: current.displayName, username: current.username },
+    }));
+    expect(createQuarantineConfirmation(repository.submit.mock.calls[0][1]).confirmationHash).toBe(preview.confirmationHash);
+  });
+
+  it.each([true, false])("fences submission after logout and re-login with cached status=%s", async cached => {
+    const current = { ...user, homeAccountId: `revoked-submit-${cached}` };
+    const { value, repository, dependencies } = service(cached, current);
+    repository.submit.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", status: "queued" });
+    dependencies.authorityContext.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return authority;
+    });
+    await expect(value.submit(current, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "revoked-submit" })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(repository.submit).not.toHaveBeenCalled();
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("captures the submission session before the first asynchronous receipt lookup", async () => {
+    const current = { ...user, homeAccountId: "revoked-receipt-lookup" };
+    const { value, repository, dependencies } = service(true, current);
+    repository.submit.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", status: "queued" });
+    repository.existingSubmission.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return undefined;
+    });
+    await expect(value.submit(current, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "revoked-lookup" })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(repository.submit).not.toHaveBeenCalled();
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("retries dispatch of an existing queued receipt after worker capacity recovers", async () => {
+    const { value, repository, inventory, provider, dependencies } = service(true);
+    const receipt: Pick<QuarantineJob, "id" | "status"> = { id: "55555555-5555-4555-8555-555555555555", status: "queued" };
+    repository.submit.mockResolvedValue(receipt);
+    dependencies.launch.mockImplementationOnce(() => { throw new AppError(429, "workers_busy", "Workers are busy."); });
+    const input = { action: "quarantine" as const, snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "queued-retry" };
+    await expect(value.submit(user, input)).rejects.toMatchObject({ code: "workers_busy" });
+    repository.existingSubmission.mockResolvedValue(receipt);
+    await expect(value.submit(user, input)).resolves.toBe(receipt);
+    expect(dependencies.launch).toHaveBeenCalledTimes(2);
+    expect(dependencies.launch).toHaveBeenLastCalledWith(receipt.id, { tenantId: user.tenantId, principalId: user.homeAccountId });
+    expect(repository.submit).toHaveBeenCalledTimes(1);
+    expect(inventory.resolveQuarantineTargets).toHaveBeenCalledTimes(1);
+    expect(provider.getStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("keeps a queued canary receipt on its approval-controlled execution path, concurrent=%s", async concurrent => {
+    const { value, repository, dependencies } = service(true);
+    const receipt: Pick<QuarantineJob, "id" | "status" | "isCanary"> = {
+      id: "55555555-5555-4555-8555-555555555555", status: "queued", isCanary: true,
+    };
+    if (concurrent) repository.submit.mockResolvedValue(receipt);
+    else repository.existingSubmission.mockResolvedValue(receipt);
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "canary-receipt" })).resolves.toBe(receipt);
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("does not launch a queued retry after its session changes during authorization", async () => {
+    const current = { ...user, homeAccountId: "revoked-queued-retry" };
+    const { value, repository, dependencies } = service(true, current);
+    repository.existingSubmission.mockResolvedValue({ id: "55555555-5555-4555-8555-555555555555", status: "queued" });
+    dependencies.requireAvailable.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return undefined;
+    });
+    await expect(value.submit(current, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "revoked-retry" })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(dependencies.launch).not.toHaveBeenCalled();
+    expect(repository.submit).not.toHaveBeenCalled();
+  });
+
+  it("does not relaunch a terminal receipt won by a concurrent submission", async () => {
+    const { value, repository, dependencies } = service(true);
+    const receipt: Pick<QuarantineJob, "id" | "status"> = { id: "55555555-5555-4555-8555-555555555555", status: "succeeded" };
+    repository.submit.mockResolvedValue(receipt);
+    await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "concurrent-receipt" })).resolves.toBe(receipt);
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it.each(["running", "waiting_authorization", "succeeded", "failed", "cancelled", "partial", "inconclusive"] as const)(
+    "does not relaunch an existing %s receipt", async status => {
+      const { value, repository, dependencies } = service();
+      const receipt: Pick<QuarantineJob, "id" | "status"> = { id: "55555555-5555-4555-8555-555555555555", status };
+      repository.existingSubmission.mockResolvedValue(receipt);
+      await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+        confirmationHash: "e".repeat(64), idempotencyKey: "nonqueued-retry" })).resolves.toBe(receipt);
+      expect(dependencies.launch).not.toHaveBeenCalled();
+      expect(repository.submit).not.toHaveBeenCalled();
+    },
+  );
 });

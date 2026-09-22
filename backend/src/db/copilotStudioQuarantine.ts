@@ -352,8 +352,7 @@ export class CopilotStudioQuarantineRepository {
 
   async waitForAuthorization(scope: QuarantineScope, id?: string) {
     await this.database.query(`UPDATE copilot_quarantine_jobs SET status='waiting_authorization',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()
-      WHERE tenant_id=$1 AND principal_id=$2 AND ($3::uuid IS NULL OR id=$3) AND status IN ('queued','running')
-        AND NOT EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=copilot_quarantine_jobs.id AND status='running' AND sent_at IS NOT NULL)`,
+      WHERE tenant_id=$1 AND principal_id=$2 AND ($3::uuid IS NULL OR id=$3) AND status='queued' AND lease_owner IS NULL`,
     [scope.tenantId, scope.principalId, id ?? null]);
   }
 

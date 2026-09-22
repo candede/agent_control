@@ -111,7 +111,7 @@ export class CopilotUsageGraphClient {
         visited.add(nextUrl);
         const page = await this.request<GraphCollection<GraphUser>>(nextUrl, accessToken, "directory", signal);
         signal?.throwIfAborted();
-        if (!Array.isArray(page.value)) throw providerSchema("Directory users response has an invalid collection.");
+        if (!page || !Array.isArray(page.value)) throw providerSchema("Directory users response has an invalid collection.");
         if (expectedCount === undefined) {
           if (typeof page["@odata.count"] !== "number" || !Number.isSafeInteger(page["@odata.count"]) || page["@odata.count"] < 0) {
             throw providerSchema("Directory users response is missing a valid total count.");
@@ -159,7 +159,7 @@ export class CopilotUsageGraphClient {
   }
 
   private async listCopilotSkus(accessToken: string, signal?: AbortSignal): Promise<Map<string, string[]>> {
-    const skus = new Map<string, string[]>();
+    const catalog = new Map<string, string[]>();
     const visited = new Set<string>();
     let observedRows = 0;
     let nextUrl: string | undefined = buildSubscribedSkusUrl();
@@ -169,20 +169,20 @@ export class CopilotUsageGraphClient {
       visited.add(nextUrl);
       const page = await this.request<GraphCollection<unknown>>(nextUrl, accessToken, "catalog", signal);
       signal?.throwIfAborted();
-      if (!Array.isArray(page.value)) throw providerSchema("Tenant license catalog has an invalid collection.");
+      if (!page || !Array.isArray(page.value)) throw providerSchema("Tenant license catalog has an invalid collection.");
       observedRows += page.value.length;
       if (observedRows > maximumSkus) throw providerLimit("Tenant license catalog exceeded the result limit.");
       for (const value of page.value) {
         const sku = parseSubscribedSku(value);
-        if (!sku) continue;
-        const previous = skus.get(sku.skuId);
+        const previous = catalog.get(sku.skuId);
         if (previous && JSON.stringify(previous) !== JSON.stringify(sku.servicePlanIds)) {
           throw providerSchema("Tenant license catalog contains conflicting Copilot service plans.");
         }
-        skus.set(sku.skuId, sku.servicePlanIds);
+        catalog.set(sku.skuId, sku.servicePlanIds);
       }
       nextUrl = parseNextLink(page["@odata.nextLink"], "catalog");
     }
+    const skus = new Map([...catalog].filter(([, servicePlanIds]) => servicePlanIds.length > 0));
     operationalLog("info", "copilot_license_catalog", {
       observedCount: observedRows, catalogScopedCount: skus.size, pages: visited.size,
     });
@@ -228,6 +228,7 @@ export class CopilotUsageGraphClient {
     validateGraphUrl(url, "report");
     const timeout = AbortSignal.timeout(requestTimeoutMs);
     const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    requestSignal.throwIfAborted();
     let response = await this.fetcher(url, {
       method: "GET",
       redirect: "manual",
@@ -235,7 +236,8 @@ export class CopilotUsageGraphClient {
       headers: { Authorization: `Bearer ${accessToken}`, Accept: "text/csv, application/octet-stream" },
     });
     if (response.status >= 300 && response.status < 400) {
-      await response.body?.cancel();
+      void response.body?.cancel().catch(() => undefined);
+      requestSignal.throwIfAborted();
       if (response.status !== 302) throw invalidReportDownloadLink();
       const downloadUrl = validateReportDownloadUrl(response.headers.get("location"));
       // The signed download URL is its own credential; never forward the Graph token.
@@ -246,7 +248,8 @@ export class CopilotUsageGraphClient {
         headers: { Accept: "text/csv, application/octet-stream" },
       });
       if (!response.ok) {
-        await response.body?.cancel();
+        void response.body?.cancel().catch(() => undefined);
+        requestSignal.throwIfAborted();
         if (response.status >= 300 && response.status < 400) throw invalidReportDownloadLink();
         throw new AppError(502, "report_download_failed", "Microsoft report download failed; refresh usage to request a new download.");
       }
@@ -334,9 +337,7 @@ function parseSubscribedSku(value: unknown) {
     return requiredUuid(plan.servicePlanId, "Tenant license service plan ID");
   });
   const servicePlanIds = [...new Set(planIds.filter(id => copilotServicePlanDefinitions.has(id)))].sort();
-  return sku.appliesTo === "User" && servicePlanIds.length > 0
-    ? { skuId, servicePlanIds }
-    : null;
+  return { skuId, servicePlanIds: sku.appliesTo === "User" ? servicePlanIds : [] };
 }
 
 function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly string[]>, batchIds: readonly string[]): CopilotDirectoryUser | null {

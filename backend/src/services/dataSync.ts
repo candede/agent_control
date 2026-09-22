@@ -45,12 +45,21 @@ type TrackedChild = {
   jobId: string;
 };
 
+type RunAdmission = {
+  scope: DataSyncScope;
+  runId?: string;
+  controller: AbortController;
+  operation: Promise<DataSyncRun>;
+};
+
 const maximumActiveRuns = 4;
 const childPollIntervalMs = 250;
 
 export class DataSyncService {
   private readonly active = new Map<string, ActiveRun>();
-  private starting = 0;
+  private readonly admissions = new Set<RunAdmission>();
+  private readonly cancelling = new Set<string>();
+  private draining = false;
 
   constructor(
     database: pg.Pool = pool,
@@ -90,37 +99,29 @@ export class DataSyncService {
 
   async start(user: AuthenticatedUser, input: StartDataSyncInput): Promise<DataSyncRun> {
     requireViewer(user);
-    if (this.active.size + this.starting >= maximumActiveRuns) {
-      throw new AppError(429, "data_sync_capacity", "At most four data sync runs can execute at once.");
-    }
-    this.starting += 1;
-    try {
-      const scope = dataScope(user);
+    return this.admit(user, undefined, async (scope, signal) => {
       const submitted = await this.dependencies.repository.submit(scope, input);
+      signal.throwIfAborted();
       let run = await this.reconcileUsage(scope, submitted.run);
+      signal.throwIfAborted();
       if (submitted.created && run.sources.some(source => executableSource(source))) {
         this.launch(user, scope, run.id, run.sources.filter(executableSource).map(source => source.source), false);
         run = (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
       }
+      signal.throwIfAborted();
       return run;
-    } finally {
-      this.starting -= 1;
-    }
+    });
   }
 
   async retry(user: AuthenticatedUser, id: string, sources?: readonly DataSyncSourceId[]): Promise<DataSyncRun> {
     requireViewer(user);
     validateRunId(id);
-    if (this.active.has(id)) throw new AppError(409, "data_sync_active", "The data sync run is already executing.");
-    if (this.active.size + this.starting >= maximumActiveRuns) {
-      throw new AppError(429, "data_sync_capacity", "At most four data sync runs can execute at once.");
-    }
-    this.starting += 1;
-    try {
-      const scope = dataScope(user);
+    return this.admit(user, id, async (scope, signal) => {
       const current = await this.dependencies.repository.getRun(scope, id);
+      signal.throwIfAborted();
       if (!current) throw new AppError(404, "not_found", "Data sync run was not found.");
       const reconciled = await this.reconcileRun(user, scope, current, await this.dependencies.officialUsage.getPublished(scope.tenantId));
+      signal.throwIfAborted();
       const candidates = reconciled.sources.filter(source => source.canRetry).map(source => source.source);
       const requested = sources ?? candidates;
       if (!requested.length) throw new AppError(409, "data_sync_nothing_to_retry", "This data sync run has no incomplete sources to retry.");
@@ -129,32 +130,44 @@ export class DataSyncService {
       }
       const cancelFailures = await this.cancelChildJobs(user, reconciled, requested);
       if (cancelFailures.length) throw cancelFailures[0];
+      signal.throwIfAborted();
       const selected = await this.dependencies.repository.retry(scope, id, requested);
+      signal.throwIfAborted();
       this.launch(user, scope, id, selected.filter(source => source !== "usage_reports"), true);
-      return (await this.dependencies.repository.getRun(scope, id))!;
-    } finally {
-      this.starting -= 1;
-    }
+      const run = (await this.dependencies.repository.getRun(scope, id))!;
+      signal.throwIfAborted();
+      return run;
+    });
   }
 
   async cancel(user: AuthenticatedUser, id: string): Promise<DataSyncRun> {
     requireViewer(user);
     validateRunId(id);
     const scope = dataScope(user);
-    const before = await this.dependencies.repository.getRun(scope, id);
-    if (!before) throw new AppError(404, "not_found", "Data sync run was not found.");
-    const active = this.active.get(id);
-    const tracker = active ?? childTracker(id, scope, user);
-    active?.controller.abort(new AppError(409, "read_job_cancelled", "Data sync was cancelled."));
-    const cancelled = await this.dependencies.repository.cancel(scope, id);
-    this.trackPersistedChildren(tracker, before);
-    await this.cleanupTrackedChildren(tracker);
-    if (active) await active.operation;
-    const current = await this.dependencies.repository.getRun(scope, id);
-    if (current) this.trackPersistedChildren(tracker, current);
-    await this.cleanupTrackedChildren(tracker);
-    this.throwIfCleanupFailed(id, tracker);
-    return current ?? cancelled;
+    if (this.cancelling.has(id)) throw new AppError(409, "data_sync_active", "The data sync run is already stopping.");
+    this.cancelling.add(id);
+    try {
+      const before = await this.dependencies.repository.getRun(scope, id);
+      if (!before) throw new AppError(404, "not_found", "Data sync run was not found.");
+      const reason = new AppError(409, "read_job_cancelled", "Data sync was cancelled.");
+      const admissions = this.stopAdmissions(reason, scope, id);
+      if (admissions) await admissions;
+      const active = this.active.get(id);
+      const tracker = active ?? childTracker(id, scope, user);
+      active?.controller.abort(reason);
+      const cancelled = await this.dependencies.repository.cancel(scope, id);
+      this.trackPersistedChildren(tracker, before);
+      await this.cleanupTrackedChildren(tracker);
+      const [operation] = await Promise.allSettled(active ? [active.operation] : []);
+      const current = await this.dependencies.repository.getRun(scope, id);
+      if (current) this.trackPersistedChildren(tracker, current);
+      await this.cleanupTrackedChildren(tracker);
+      this.throwIfCleanupFailed(id, tracker);
+      if (operation?.status === "rejected") throw operation.reason;
+      return current ?? cancelled;
+    } finally {
+      this.cancelling.delete(id);
+    }
   }
 
   async recover() {
@@ -164,42 +177,92 @@ export class DataSyncService {
   }
 
   async drain() {
+    this.draining = true;
+    const admissions = this.stopAdmissions(new AppError(401, "interaction_required", "Application shutdown requires explicit data sync authorization."));
     const active = [...this.active.values()];
     for (const run of active) {
       run.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit data sync authorization."));
-      await this.dependencies.repository.pausePrincipal(run.scope, "Application shutdown requires explicit resume with current authorization.");
     }
-    const results = await Promise.allSettled(active.map(run => run.operation));
-    const failure = results.find(result => result.status === "rejected");
+    const results = await Promise.allSettled([
+      admissions,
+      ...active.map(run => this.dependencies.repository.pausePrincipal(run.scope, "Application shutdown requires explicit resume with current authorization.")),
+      ...active.map(run => run.operation),
+    ]);
+    const cleanup = await this.cleanupRuns(active);
+    const failure = [...results, ...cleanup].find(result => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
-    for (const run of active) {
-      const current = await this.dependencies.repository.getRun(run.scope, run.runId);
-      if (current) this.trackPersistedChildren(run, current);
-      await this.cleanupTrackedChildren(run);
-      this.throwIfCleanupFailed(run.runId, run);
-    }
   }
 
   async waitForPrincipalAuthorization(scope: DataSyncScope) {
+    const admissions = this.stopAdmissions(new AppError(401, "interaction_required", "The signed-in account changed during data sync."), scope);
     const active = [...this.active.values()].filter(run =>
       run.scope.tenantId === scope.tenantId && run.scope.principalId === scope.principalId);
     for (const run of active) {
       run.controller.abort(new AppError(401, "interaction_required", "The signed-in account changed during data sync."));
     }
     const results = await Promise.allSettled([
+      admissions,
       this.dependencies.packages.waitForPrincipalAuthorization(scope),
       this.dependencies.powerPlatform.waitForPrincipalAuthorization(scope),
       this.dependencies.repository.pausePrincipal(scope, "Sign-out requires explicit resume with current authorization."),
     ]);
     const operations = await Promise.allSettled(active.map(run => run.operation));
-    for (const run of active) {
+    const cleanup = await this.cleanupRuns(active);
+    const failure = [...results, ...operations, ...cleanup].find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+  }
+
+  private admit(
+    user: AuthenticatedUser,
+    runId: string | undefined,
+    operation: (scope: DataSyncScope, signal: AbortSignal) => Promise<DataSyncRun>,
+  ) {
+    if (this.draining) throw new AppError(503, "data_sync_shutdown", "Data sync is stopping for application shutdown.");
+    if (runId && (this.active.has(runId) || this.cancelling.has(runId)
+      || [...this.admissions].some(admission => admission.runId === runId))) {
+      throw new AppError(409, "data_sync_active", "The data sync run is already executing or stopping.");
+    }
+    if (this.active.size + this.admissions.size >= maximumActiveRuns) {
+      throw new AppError(429, "data_sync_capacity", "At most four data sync runs can execute at once.");
+    }
+    const scope = dataScope(user);
+    const controller = new AbortController();
+    const admission: RunAdmission = {
+      scope, runId, controller,
+      operation: Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return operation(scope, controller.signal);
+      }).catch(async error => {
+        if (controller.signal.aborted) {
+          await this.dependencies.repository.pausePrincipal(scope, "Interrupted admission requires explicit resume with current authorization.");
+        }
+        throw error;
+      }).finally(() => this.admissions.delete(admission)),
+    };
+    this.admissions.add(admission);
+    return admission.operation;
+  }
+
+  private stopAdmissions(reason: AppError, scope?: DataSyncScope, runId?: string) {
+    const admissions = [...this.admissions].filter(admission =>
+      (!scope || admission.scope.tenantId === scope.tenantId && admission.scope.principalId === scope.principalId)
+      && (!runId || !admission.runId || admission.runId === runId));
+    if (!admissions.length) return;
+    for (const admission of admissions) admission.controller.abort(reason);
+    return Promise.allSettled(admissions.map(admission => admission.operation)).then(results => {
+      const failure = results.find((result, index) =>
+        result.status === "rejected" && result.reason !== admissions[index].controller.signal.reason);
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+  }
+
+  private cleanupRuns(runs: readonly ActiveRun[]) {
+    return Promise.allSettled(runs.map(async run => {
       const current = await this.dependencies.repository.getRun(run.scope, run.runId);
       if (current) this.trackPersistedChildren(run, current);
       await this.cleanupTrackedChildren(run);
       this.throwIfCleanupFailed(run.runId, run);
-    }
-    const failure = [...results, ...operations].find(result => result.status === "rejected");
-    if (failure?.status === "rejected") throw failure.reason;
+    }));
   }
 
   private launch(
@@ -240,6 +303,9 @@ export class DataSyncService {
         if (this.active.get(runId)?.operation === operation) this.active.delete(runId);
       });
     activeRun.operation = operation;
+    void operation.catch(error => {
+      operationalLog("error", "data_sync_worker_status_failed", { runId, ...errorTelemetry(error) });
+    });
   }
 
   private async run(
@@ -253,12 +319,14 @@ export class DataSyncService {
   ) {
     const inventoryReady = sources.includes("power_platform")
       ? this.runPowerPlatform(user, scope, runId, signal, activeRun) : undefined;
-    await Promise.all(sources.map(source => {
+    const results = await Promise.allSettled(sources.map(source => {
       if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal, inventoryReady);
       if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   private async runUsers(
@@ -536,11 +604,7 @@ export class DataSyncService {
     const children = [...tracker.children.entries()].filter(([key]) => !selectedKeys || selectedKeys.has(key));
     await Promise.all(children.map(async ([key, child]) => {
       try {
-        if (child.source === "graph_packages") {
-          await this.dependencies.packages.cancel(tracker.user, child.jobId, "delegated");
-        } else {
-          await this.dependencies.powerPlatform.cancel(tracker.user, child.jobId);
-        }
+        await this.cancelChild(tracker.user, child);
         tracker.cleanupFailures.delete(key);
       } catch (error) {
         tracker.cleanupFailures.set(key, error);
@@ -567,11 +631,25 @@ export class DataSyncService {
     const operations: Promise<unknown>[] = [];
     for (const source of run.sources) {
       if (!source.jobId || source.status === "succeeded" || (selectedSources && !selectedSources.includes(source.source))) continue;
-      if (source.source === "graph_packages") operations.push(this.dependencies.packages.cancel(user, source.jobId, "delegated"));
-      if (source.source === "power_platform") operations.push(this.dependencies.powerPlatform.cancel(user, source.jobId));
+      if (source.source === "graph_packages" || source.source === "power_platform") {
+        operations.push(this.cancelChild(user, { source: source.source, jobId: source.jobId }));
+      }
     }
     const results = await Promise.allSettled(operations);
     return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
+  }
+
+  private async cancelChild(user: AuthenticatedUser, child: TrackedChild) {
+    try {
+      if (child.source === "graph_packages") {
+        await this.dependencies.packages.cancel(user, child.jobId, "delegated");
+      } else {
+        await this.dependencies.powerPlatform.cancel(user, child.jobId);
+      }
+    } catch (error) {
+      if (!(error instanceof AppError) || error.status !== 404) throw error;
+      operationalLog("info", "data_sync_child_unavailable", { source: child.source, count: 1 });
+    }
   }
 }
 

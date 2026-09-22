@@ -140,7 +140,9 @@ function overviewSql(sortBy: "agentName" | "lastActivity", sortDirection: "asc" 
       SELECT * FROM evidence
       WHERE ($2::text IS NULL OR activity_date >= $2)
         AND ($3::text IS NULL OR activity_date <= $3)
-        AND ($4::text IS NULL OR strpos(lower(agent_id),lower($4))>0 OR strpos(lower(agent_name),lower($4))>0)
+        -- Use the database locale for case conversion, not the bytewise identity collation.
+        AND ($4::text IS NULL OR strpos(lower(agent_id COLLATE "default"),lower($4))>0
+          OR strpos(lower(agent_name COLLATE "default"),lower($4))>0)
     ), matching_agents AS MATERIALIZED (
       SELECT agent_id,
         array_agg(DISTINCT creator_type ORDER BY creator_type) AS creator_types,

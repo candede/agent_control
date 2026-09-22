@@ -139,7 +139,7 @@ describe("capability decisions", () => {
 
   it("allows implemented Admin actions immediately without inventing provider or canary evidence", async () => {
     const { value, probes, repository } = service();
-    const admin = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     for (const id of ["graph.package.access.manage", "graph.package.block.manage", "powerPlatform.quarantine.manage"] as const) {
       const decision = await value.requireAvailable(id, admin);
       expect(decision).toMatchObject({ status: "available", authorized: true, fresh: true, verification: "on_demand", previewQualification: "not_required" });
@@ -160,7 +160,7 @@ describe("capability decisions", () => {
 
   it.each(["graph.package.access.manage", "graph.package.block.manage", "powerPlatform.quarantine.manage"] as const)(
     "checks %s consent without performing a provider operation and preserves real failures until recovery", async id => {
-      const admin = { ...reader, roles: ["AgentControl.Admin"] as const };
+      const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
       const delegatedToken = vi.fn(async () => "delegated-token");
       const { value, probes, repository } = service(new MemoryRepository(), { delegatedToken });
       expect(await value.decision(id, admin)).toMatchObject({ verification: "on_demand" });
@@ -196,7 +196,7 @@ describe("capability decisions", () => {
   );
 
   it("automatically checks Admin write scopes, reuses successful token evidence, and retries missing consent", async () => {
-    const admin = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     let consented = false;
     const delegatedToken = vi.fn(async (_accountId: string, id: CapabilityId) => {
       if (!consented && id.startsWith("graph.package.") && id.endsWith(".manage")) {
@@ -227,7 +227,7 @@ describe("capability decisions", () => {
 
   it("publishes verification only for successful current evidence, not absent, failed, expired, or disabled checks", async () => {
     const { value, repository } = service();
-    const administrator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     for (const id of ["graph.package.read.delegated", "purview.audit.search.delegated", "powerPlatform.quarantine.read",
       "graph.package.read.application", "graph.package.reassign.manage"] as const) {
       expect((await value.decision(id, administrator)).verification).toBeUndefined();
@@ -329,7 +329,7 @@ describe("capability decisions", () => {
 
   it("lets Admin inherit Viewer authority without sharing another principal's evidence", async () => {
     const { value } = service();
-    const administrator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     expect((await value.decision("graph.package.read.delegated", administrator)).status).toBe("unknown");
     await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({ status: "available" });
     expect((await value.decision("graph.package.read.delegated", { ...reader, homeAccountId: "reader-b" })).status).toBe("unknown");
@@ -406,16 +406,30 @@ describe("capability decisions", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it("accepts a bounded inventory access sample when the tenant total exceeds the refresh ceiling", async () => {
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 5_001, count: 1, resultTruncated: 1, skipToken: "next",
+      data: [{ tenantId: "tenant", name: "environment-a", type: "microsoft.powerplatform/environments", properties: {} }],
+    }));
+    const client = new PowerPlatformResourceQueryClient(fetcher);
+    const { value } = service(new MemoryRepository(), { inventoryProbe: token => client.checkAccess(token) });
+
+    expect(await value.refresh("powerPlatform.inventory.read", reader)).toMatchObject({
+      status: "available", authorized: true, verification: "provider",
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("activates the inventory read adapter without pretending it qualifies preview writes", async () => {
     const { value } = service();
     expect((await value.refresh("powerPlatform.inventory.read", reader)).status).toBe("available");
-    const operator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const operator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     expect(await value.refresh("graph.package.block.manage", operator)).toMatchObject({ status: "available", verification: "token", previewQualification: "not_required" });
   });
 
   it("defers quarantine authorization to Microsoft instead of optional ID-token role claims", async () => {
     const { value, probes } = service();
-    const operator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const operator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const viewer = { ...reader, providerRoleIds: ["00000000-0000-0000-0000-000000000000"] };
     expect(await value.refresh("powerPlatform.quarantine.read", viewer)).toMatchObject({ status: "available", authorized: true });
     expect((await value.decision("powerPlatform.quarantine.manage", viewer)).status).toBe("missing_internal_role");
@@ -444,7 +458,7 @@ describe("capability decisions", () => {
   });
 
   it("read-through checks Admin quarantine readiness without running a provider mutation or canary", async () => {
-    const administrator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const { value, probes } = service();
 
     await expect(value.requireAvailable("powerPlatform.quarantine.manage", administrator)).resolves.toMatchObject({
@@ -459,7 +473,7 @@ describe("capability decisions", () => {
   });
 
   it("records token-only readiness without creating a Purview query", async () => {
-    const securityReader = { ...reader, roles: ["AgentControl.Viewer"] as const };
+    const securityReader: AuthenticatedUser = { ...reader, roles: ["AgentControl.Viewer"] };
     const { value, probes, repository } = service();
 
     await expect(value.refresh("purview.audit.search.delegated", securityReader)).resolves.toMatchObject({
@@ -476,7 +490,7 @@ describe("capability decisions", () => {
   });
 
   it("does not turn application qualification into token-only readiness", async () => {
-    const operator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const operator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const { value, probes, repository } = service();
     repository.configurations.set("purview.audit.search.application", { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
 
@@ -525,7 +539,7 @@ describe("capability decisions", () => {
   it("coalesces read probes but does not skip Admin token checks when a Viewer check is already running", async () => {
     const held = deferred<unknown>();
     const { value, probes } = service(new MemoryRepository(), { packageProbe: vi.fn(() => held.promise) });
-    const administrator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const viewerCheck = value.check(reader);
     const adminCheck = value.check(administrator);
     await vi.waitFor(() => expect(probes.packageProbe).toHaveBeenCalledTimes(1));
@@ -681,16 +695,53 @@ describe("capability decisions", () => {
     {
       name: "Audit",
       applicationId: "purview.audit.search.application" as const,
-      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated") =>
-        value.recordAuditQualificationEvidence(`purview.audit.search.${mode}`, reader, "available", {}),
+      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated", configurationRevision?: number, status: CapabilityEvidence["status"] = "available") =>
+        value.recordAuditQualificationEvidence(`purview.audit.search.${mode}`, reader, status, {}, configurationRevision),
     },
     {
       name: "Hunting",
       applicationId: "defender.hunting.application" as const,
-      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated") =>
-        value.recordHuntingQualificationEvidence(`defender.hunting.${mode}`, reader, "available", {}),
+      record: (value: CapabilityService, mode: "delegated" | "application" = "delegated", configurationRevision?: number, status: CapabilityEvidence["status"] = "available") =>
+        value.recordHuntingQualificationEvidence(`defender.hunting.${mode}`, reader, status, {}, configurationRevision),
     },
   ])("$name evidence invalidation", ({ applicationId, record }) => {
+    it.each([undefined, 1])("rejects application evidence without a matching approved revision (%s)", async revision => {
+      const { value, repository } = service();
+      repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+      for (const status of ["available", "provider_error"] as const) {
+        await expect(record(value, "application", revision, status)).rejects.toMatchObject({ code: "qualification_superseded" });
+      }
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+      expect(repository.evidenceRows.size).toBe(0);
+      await expect(value.decision(applicationId, reader)).resolves.toMatchObject({ status: "unknown", authorized: false });
+    });
+
+    it("records application evidence only for the still-enabled approved revision", async () => {
+      const { value, repository } = service();
+      repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+      await expect(record(value, "application", 2)).resolves.toMatchObject({ status: "available", verification: "provider" });
+      expect(repository.recordEvidence).toHaveBeenCalledWith(expect.objectContaining({ configurationRevision: 2 }),
+        "available", { verification: "provider" }, expect.any(Number));
+      for (const configuration of [{ enabled: false, sharedDataScope: true }, { enabled: true, sharedDataScope: false }]) {
+        repository.configurations.set(applicationId, { ...configuration, previewQualified: false, revision: 2 });
+        await expect(record(value, "application", 2)).rejects.toMatchObject({ code: "qualification_superseded" });
+      }
+      expect(repository.recordEvidence).toHaveBeenCalledOnce();
+    });
+
+    it("does not replace current evidence with a late result from a previous application configuration", async () => {
+      const { value, repository } = service();
+      const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
+      const approved = await value.configureApplication(applicationId, admin, true, true);
+      const current = await value.configureApplication(applicationId, admin, true, true);
+      await record(value, "application", current.revision);
+      for (const status of ["available", "provider_error"] as const) {
+        await expect(record(value, "application", approved.revision, status)).rejects.toMatchObject({ code: "qualification_superseded" });
+      }
+      expect(repository.recordEvidence).toHaveBeenCalledOnce();
+      await expect(value.decision(applicationId, reader)).resolves.toMatchObject({ status: "available", verification: "provider" });
+    });
+
     it("does not adopt a newer principal generation during configuration lookup", async () => {
       const { value, repository } = service();
       const held = deferred<CapabilityConfiguration>();
@@ -711,7 +762,7 @@ describe("capability decisions", () => {
       repository.configurations.set(applicationId, configuration);
       const held = deferred<CapabilityConfiguration>();
       repository.configuration.mockImplementationOnce(() => held.promise);
-      const pending = record(value, "application");
+      const pending = record(value, "application", 2);
       await vi.waitFor(() => expect(repository.configuration).toHaveBeenCalledOnce());
       await value.configureApplication(applicationId, { ...reader, roles: ["AgentControl.Admin"] }, false, false);
       held.resolve(configuration);
@@ -816,7 +867,7 @@ describe("capability decisions", () => {
     const { value, probes } = service(repository, { packageProbe: vi.fn(() => held.promise) });
     const refresh = value.refresh("graph.package.read.application", reader);
     await vi.waitFor(() => expect(probes.packageProbe).toHaveBeenCalledTimes(1));
-    const administrator = { ...reader, roles: ["AgentControl.Admin"] as const };
+    const administrator: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     const configured = value.configureApplication("graph.package.read.application", administrator, false, false);
     held.resolve([]);
     await configured;

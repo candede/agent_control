@@ -48,5 +48,5 @@ export function requireProviderAdmissions() {
 }
 
 export function providerWorkEnabled() {
-  return loadedState.mode === "normal" && loadedState.providerWorkEnabled;
+  return !maintenanceActive() && loadedState.mode === "normal" && loadedState.providerWorkEnabled;
 }

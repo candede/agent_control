@@ -17,6 +17,7 @@ import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState } from "./packageMutationState.js";
 import { AuditLog } from "./auditLog.js";
 import { DataSyncRepository } from "../db/dataSync.js";
+import { loadOperationalState } from "./operationalState.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: JobRepository;
@@ -166,7 +167,7 @@ describe("Durable bulk execution", () => {
     expect(await saved.packages.get(owner, "readback-package")).toBeUndefined();
     const reconciled = await reconcileBulkJob(job.id, owner, jobs, provider, async () => "synthetic-token");
     expect(reconciled).toMatchObject({ status: "succeeded", reconciliation: { attempted: 1, failed: 0 } });
-    expect((await saved.packages.get(owner, "readback-package"))?.package.isBlocked).toBe(true);
+    expect(await saved.packages.get(owner, "readback-package")).toMatchObject({ package: { isBlocked: true } });
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 
@@ -250,7 +251,7 @@ describe("Durable bulk execution", () => {
         ? { status: "succeeded", succeeded: 1, reconciliation: { attempted: 1, failed: 0 } }
         : { status: "partial", inconclusive: 1, results: [{ reconciliationStatus: "verified_not_applied", retryEligible: true }], reconciliation: { attempted: 1, failed: 0 } });
       expect(await readUnifiedInventoryRevision(scope, fixture.runtime)).not.toBe(previousRevision);
-      expect((await new PackageInventoryRepository(fixture.runtime).get(scope, "package-1"))?.package.isBlocked).toBe(applied);
+      expect(await new PackageInventoryRepository(fixture.runtime).get(scope, "package-1")).toMatchObject({ package: { isBlocked: applied } });
     }
   });
 
@@ -276,6 +277,73 @@ describe("Durable bulk execution", () => {
     const cancelled = await reconcileBulkJob(cancelledJob.id, scope, jobs, provider, readCount);
     expect(cancelled).toMatchObject({ reconciliation: { attempted: 1, failed: 1 }, results: [{ reconciliationStatus: "required" }] });
   });
+
+  it.each(["maintenance", "provider_requalification_required"] as const)(
+    "stops reconciliation at every admission boundary when %s applies",
+    async errorCode => {
+      for (const stage of ["start", "authorization", "lock", "readback", "publication", "next-item"] as const) {
+        const owner = { ...scope, principalId: randomUUID() };
+        const targets = stage === "next-item" ? ["package-1", "package-2"] : ["package-1"];
+        const job = await jobs.submit(owner, confirmedInput({
+          ...input(), actor: { ...input().actor, homeAccountId: owner.principalId },
+          targets: targets.map(id => ({ id, displayName: id, prestate: { kind: "block", isBlocked: false } })),
+        }));
+        const provider = new GraphPackagesClient(async (url, request) => request?.method === "POST"
+          ? Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 })
+          : Response.json({ id: decodeURIComponent(new URL(url).pathname.split("/").at(-1)!), displayName: "Fixture", isBlocked: false }),
+        { maxAttempts: 1 });
+        await runBulkJob(job.id, owner, false, jobs, provider, async () => "ephemeral-token");
+        const revision = await readUnifiedInventoryRevision(owner, fixture.runtime);
+        const closeAdmissions = async () => {
+          if (errorCode === "maintenance") vi.stubEnv("MAINTENANCE_MODE", "true");
+          else {
+            await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=false WHERE singleton=true");
+            await loadOperationalState(fixture.runtime);
+          }
+        };
+        const read = provider.getPackageDetails.bind(provider);
+        const reads = vi.spyOn(provider, "getPackageDetails").mockImplementation(async (...args) => {
+          const details = await read(...args);
+          if (stage === "readback") await closeAdmissions();
+          return details;
+        });
+        const lock = jobs.withReconciliationLock.bind(jobs);
+        vi.spyOn(jobs, "withReconciliationLock").mockImplementation((owner, item, operation) => lock(owner, item, async () => {
+          if (stage === "lock") await closeAdmissions();
+          return operation();
+        }));
+        const record = jobs.recordReconciliation.bind(jobs);
+        const publications = vi.spyOn(jobs, "recordReconciliation").mockImplementation(async (...args) => {
+          await record(...args);
+          if (stage === "next-item") await closeAdmissions();
+        });
+        let authorizations = 0;
+        const authorize = vi.fn(async () => {
+          authorizations += 1;
+          if (stage === "authorization" && authorizations === 1 || stage === "publication" && authorizations === 2) await closeAdmissions();
+          return "ephemeral-token";
+        });
+        try {
+          if (stage === "start") await closeAdmissions();
+          await expect(reconcileBulkJob(job.id, owner, jobs, provider, authorize), stage).rejects.toMatchObject({ code: errorCode });
+          expect(publications, stage).toHaveBeenCalledTimes(stage === "next-item" ? 1 : 0);
+          expect(reads, stage).toHaveBeenCalledTimes(["readback", "publication", "next-item"].includes(stage) ? 1 : 0);
+          expect(authorize, stage).toHaveBeenCalledTimes(stage === "start" ? 0 : ["publication", "next-item"].includes(stage) ? 2 : 1);
+          const current = await jobs.get(job.id, owner);
+          expect(current?.results.filter(item => item.reconciliationStatus === "required"), stage).toHaveLength(1);
+          if (stage !== "next-item") expect(await readUnifiedInventoryRevision(owner, fixture.runtime), stage).toBe(revision);
+        } finally {
+          vi.unstubAllEnvs();
+          await fixture.operator.query("UPDATE operational_state SET provider_work_enabled=true WHERE singleton=true");
+          await loadOperationalState(fixture.runtime);
+          vi.restoreAllMocks();
+        }
+        const resumed = await reconcileBulkJob(job.id, owner, jobs, provider, async () => "ephemeral-token");
+        expect(resumed.reconciliation, stage).toMatchObject({ attempted: 1, failed: 0 });
+      }
+    },
+  );
+
   it("requires a current credential before claiming recovered work", async () => {
     const job = await jobs.submit(scope, input());
     await jobs.recover(scope.tenantId, true);

@@ -167,6 +167,22 @@ describe.sequential("Data sync repository", () => {
     expect(saved.appActivity).toMatchObject({ attemptStatus: "available", rowCount: 0, value: report });
   });
 
+  it("withholds expired user snapshots even when the last attempt succeeded", async () => {
+    const owner = { ...scope, principalId: "expired-user-sources" };
+    const observedAt = new Date().toISOString();
+    const directoryId = await repository.publishDirectory(owner, [], observedAt, "Saved an empty directory.");
+    const reportId = await repository.publishAppActivity(owner, { users: [], reportRefreshDate: null }, observedAt, "Saved an empty report.");
+    await fixture.operator.query(`UPDATE copilot_usage_snapshots SET expires_at=clock_timestamp()-interval '1 second'
+      WHERE id=ANY($1::uuid[])`, [[directoryId, reportId]]);
+
+    const saved = await repository.getUserSources(owner);
+    for (const source of [saved.directory, saved.appActivity]) {
+      expect(source).toMatchObject({
+        attemptStatus: "available", lastSuccessAt: observedAt, rowCount: 0, value: null, observedAt: null,
+      });
+    }
+  });
+
   it("persists company and department in the licensed-user snapshot across repository instances", async () => {
     const owner = { ...scope, principalId: "organization-reader" };
     const user = directoryUser("organization@example.invalid");

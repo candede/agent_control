@@ -35,6 +35,9 @@ const defaultDependencies: PackageRefreshDependencies = {
 
 type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
 type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void> };
+type StartingRefresh = Omit<ActiveRefresh, "operation"> & {
+  operation: Promise<NonNullable<Awaited<ReturnType<PackageInventoryRepository["getJob"]>>>>;
+};
 const maximumActiveRefreshes = 4;
 const refreshExecutionDeadlineMs = 45_000;
 const identityRefreshExecutionDeadlineMs = 120_000;
@@ -43,7 +46,8 @@ const exactReadConcurrency = 4;
 
 export class PackageInventoryService {
   private readonly active = new Map<string, ActiveRefresh>();
-  private starting = 0;
+  private readonly starting = new Map<string, StartingRefresh>();
+  private draining = false;
 
   constructor(
     private readonly repository = new PackageInventoryRepository(),
@@ -58,41 +62,82 @@ export class PackageInventoryService {
   }
 
   async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
-    if (this.active.size + this.starting >= maximumActiveRefreshes) throw new AppError(429, "package_refresh_capacity", "At most four package refreshes can run at once.");
-    this.starting += 1;
     const actor = actorScope(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
+    id = id.toLowerCase();
+    if (this.draining) throw new AppError(503, "package_refresh_shutdown", "Package refreshes are stopping for application shutdown.");
+    const reserved = this.active.get(id) ?? this.starting.get(id);
+    if (reserved) {
+      if (reserved.actor.tenantId !== actor.tenantId || reserved.actor.principalId !== actor.principalId) {
+        throw new AppError(404, "not_found", "Package refresh job was not found.");
+      }
+      throw new AppError(409, "package_refresh_state", "Package refresh is already starting or running.");
+    }
+    if (new Set([...this.active.keys(), ...this.starting.keys()]).size >= maximumActiveRefreshes) {
+      throw new AppError(429, "package_refresh_capacity", "At most four package refreshes can run at once.");
+    }
+    const controller = new AbortController();
+    const starting: StartingRefresh = {
+      actor, controller,
+      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller))
+        .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
+    };
+    this.starting.set(id, starting);
+    return starting.operation;
+  }
+
+  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController) {
+    const signal = controller.signal;
+    signal.throwIfAborted();
+    const current = await this.repository.getJob(scope, id);
+    signal.throwIfAborted();
+    if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
+    if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
+    requireRefreshRole(user);
+    let token = "";
+    let markedRunning = false;
     try {
-      const current = await this.repository.getJob(scope, id);
-      if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
-      if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
-      requireRefreshRole(user);
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const freshUser = await this.dependencies.revalidateUser(actor.principalId);
-      let token = "";
+      signal.throwIfAborted();
       await commitAccountSessionValidation(validation, async () => {
+        signal.throwIfAborted();
         requireSamePrincipal(actor, freshUser);
         requireRefreshRole(freshUser);
         const capabilityId = capabilityForMode(tokenMode);
         if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+        signal.throwIfAborted();
         await this.dependencies.requireAvailable(capabilityId, freshUser);
+        signal.throwIfAborted();
         token = tokenMode === "delegated"
           ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
           : await this.dependencies.applicationToken(capabilityId);
-        if (!await this.repository.markRunning(scope, id)) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
+        signal.throwIfAborted();
+        markedRunning = await this.repository.markRunning(scope, id);
+        if (!markedRunning) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
       });
-      const controller = new AbortController();
-      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(
-        current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
-          : current.requestedIds.length > 1 ? identityRefreshExecutionDeadlineMs : refreshExecutionDeadlineMs,
-      )]);
-      const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, signal))
-        .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
-      this.active.set(id, { actor, controller, operation });
-      return (await this.repository.getJob(scope, id))!;
-    } finally {
-      this.starting -= 1;
+      signal.throwIfAborted();
+    } catch (error) {
+      if (markedRunning && signal.aborted) {
+        if (signal.reason instanceof AppError && signal.reason.code === "read_job_cancelled") {
+          await this.repository.cancel(scope, id, actor.principalId);
+        } else {
+          await this.repository.markWaitingAuthorization(scope, id);
+        }
+      }
+      throw error;
     }
+    const executionSignal = AbortSignal.any([signal, AbortSignal.timeout(
+      current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
+        : current.requestedIds.length > 1 ? identityRefreshExecutionDeadlineMs : refreshExecutionDeadlineMs,
+    )]);
+    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, executionSignal))
+      .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
+    this.active.set(id, { actor, controller, operation });
+    void operation.catch(error => {
+      operationalLog("error", "package_refresh_status_failed", { jobId: id, ...graphErrorTelemetry(error) });
+    });
+    return (await this.repository.getJob(scope, id))!;
   }
 
   async get(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
@@ -104,10 +149,13 @@ export class PackageInventoryService {
   async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
     requireRefreshRole(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
+    id = id.toLowerCase();
     const job = await this.repository.getJob(scope, id);
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
     const cancelled = await this.repository.cancel(scope, id, user.homeAccountId);
-    this.active.get(id)?.controller.abort(new AppError(409, "read_job_cancelled", "Package refresh was cancelled."));
+    const reason = new AppError(409, "read_job_cancelled", "Package refresh was cancelled.");
+    this.starting.get(id)?.controller.abort(reason);
+    this.active.get(id)?.controller.abort(reason);
     return cancelled!;
   }
 
@@ -116,15 +164,18 @@ export class PackageInventoryService {
   }
 
   async drain() {
-    const active = [...this.active.values()];
-    for (const refresh of active) refresh.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit package refresh authorization."));
-    const results = await Promise.allSettled(active.map(refresh => refresh.operation));
-    const failure = results.find(result => result.status === "rejected");
+    this.draining = true;
+    const refreshes = [...this.starting.values(), ...this.active.values()];
+    const reason = new AppError(401, "interaction_required", "Application shutdown requires explicit package refresh authorization.");
+    for (const refresh of refreshes) refresh.controller.abort(reason);
+    const results = await Promise.allSettled(refreshes.map(refresh => refresh.operation));
+    const failure = results.find((result, index) => result.status === "rejected"
+      && result.reason !== refreshes[index].controller.signal.reason);
     if (failure?.status === "rejected") throw failure.reason;
   }
 
   async waitForPrincipalAuthorization(scope: PackageDataScope) {
-    for (const refresh of this.active.values()) {
+    for (const refresh of [...this.starting.values(), ...this.active.values()]) {
       if (refresh.actor.tenantId === scope.tenantId && refresh.actor.principalId === scope.principalId) {
         refresh.controller.abort(new AppError(401, "interaction_required", "The signed-in account changed during package refresh."));
       }
@@ -159,24 +210,25 @@ export class PackageInventoryService {
         durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
+      const failure = signal.aborted ? signal.reason : error;
       operationalLog("warn", "package_refresh_execution_failed", {
-        stage, ...graphErrorTelemetry(error), durationMs: Math.round(performance.now() - startedAt),
+        stage, ...graphErrorTelemetry(failure), durationMs: Math.round(performance.now() - startedAt),
       });
-      if (error instanceof AppError && error.code === "read_job_cancelled") {
+      if (failure instanceof AppError && failure.code === "read_job_cancelled") {
         await this.repository.cancel(scope, id, actor.principalId);
         return;
       }
-      if (isAuthorizationFailure(error)) {
+      if (isAuthorizationFailure(failure)) {
         await this.repository.markWaitingAuthorization(scope, id);
         return;
       }
       const timedOut = signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError";
-      const diagnostics = graphResponseDiagnostics(error);
+      const diagnostics = graphResponseDiagnostics(failure);
       const code = timedOut ? "package_refresh_timeout" : diagnostics ? `graph_http_${diagnostics.status}`
-        : error instanceof AppError ? error.code : "provider_error";
+        : failure instanceof AppError ? failure.code : "provider_error";
       await this.repository.markFailed(scope, id, code,
-        timedOut ? "Agent identity collection reached its bounded execution deadline. The previous complete inventory is unchanged; retry from Sync." : safeFailureMessage(error));
-      operationalLog("error", "package_refresh_failed", { stage, ...graphErrorTelemetry(error), errorCode: code });
+        timedOut ? "Agent identity collection reached its bounded execution deadline. The previous complete inventory is unchanged; retry from Sync." : safeFailureMessage(failure));
+      operationalLog("error", "package_refresh_failed", { stage, ...graphErrorTelemetry(failure), errorCode: code });
     }
   }
 }

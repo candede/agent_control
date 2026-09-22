@@ -137,10 +137,10 @@ export class CapabilityService {
     };
   }
 
-  async recordAuditQualificationEvidence(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
+  async recordAuditQualificationEvidence(capabilityId: "purview.audit.search.delegated" | "purview.audit.search.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number) {
     const definition = requiredDefinition(capabilityId);
     if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live lifecycle qualification.");
-    return this.recordQualificationEvidence(definition, user, status, details);
+    return this.recordQualificationEvidence(definition, user, status, details, approvedConfigurationRevision);
   }
 
   async huntingQualificationContext(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser) {
@@ -154,10 +154,10 @@ export class CapabilityService {
       configurationRevision: configuration.revision };
   }
 
-  async recordHuntingQualificationEvidence(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
+  async recordHuntingQualificationEvidence(capabilityId: "defender.hunting.delegated" | "defender.hunting.application", user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number) {
     const definition = requiredDefinition(capabilityId);
     if (definition.probe.kind !== "live_qualification") throw new AppError(400, "invalid_qualification", "This capability does not use live hunting qualification.");
-    return this.recordQualificationEvidence(definition, user, status, details);
+    return this.recordQualificationEvidence(definition, user, status, details, approvedConfigurationRevision);
   }
 
   async packageQualificationIdentity(action: AuditAction, user: AuthenticatedUser) {
@@ -296,9 +296,13 @@ export class CapabilityService {
     return configuration;
   }
 
-  private async recordQualificationEvidence(definition: CapabilityDefinition, user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>) {
+  private async recordQualificationEvidence(definition: CapabilityDefinition, user: AuthenticatedUser, status: CapabilityStatus, details: Record<string, unknown>, approvedConfigurationRevision?: number) {
     const generation = this.generation(definition.id, user);
     const configuration = await this.currentConfiguration(definition, user, generation);
+    if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope
+      || configuration.revision !== approvedConfigurationRevision)) {
+      throw new AppError(409, "qualification_superseded", "Application qualification evidence no longer matches the approved configuration.");
+    }
     const key = this.evidenceKey(definition, user, configuration);
     await this.mutate(async () => {
       this.requireGeneration(definition.id, user, generation);

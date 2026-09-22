@@ -126,9 +126,13 @@ export class PowerPlatformResourceQueryClient {
         }
 
         const page = await this.requestPage(accessToken, requestedTypes, skipToken, signal, environmentId, defaultPageSize, logContext);
+        signal.throwIfAborted();
         metadata = pageTelemetry(page);
         stage = "validation";
         const parsed = parsePage(page, requestedTypes, environmentId, expectedTenantId, resources.length);
+        if (parsed.totalRecords > maximumRows) throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", {
+          reason: "invalid_total", field: "totalRecords", actualType: "number",
+        });
         pages += 1;
         totalRecords ??= parsed.totalRecords;
         if (parsed.totalRecords !== totalRecords) throw new InventorySchemaError("Power Platform inventory changed totalRecords during paging.", { reason: "changed_total", field: "totalRecords" });
@@ -153,6 +157,7 @@ export class PowerPlatformResourceQueryClient {
         });
         stage = "record_progress";
         await options.onProgress?.({ pages, observedCount: resources.length, totalRecords });
+        signal.throwIfAborted();
         completedPages = pages;
         completedCount = resources.length;
       } while (skipToken);
@@ -167,13 +172,14 @@ export class PowerPlatformResourceQueryClient {
       });
       return { resources, queriedTypes: requestedTypes, environmentScope: environmentId ?? null, totalRecords, pages, unknownFieldCount };
     } catch (error) {
-      const failure = isTimeoutError(error) ? new AppError(504, "provider_timeout", deadlineSignal.aborted
+      const cause = signal.aborted ? signal.reason : error;
+      const failure = isTimeoutError(cause) ? new AppError(504, "provider_timeout", deadlineSignal.aborted && cause === deadlineSignal.reason
         ? `Power Platform inventory exceeded the ${powerPlatformInventoryQueryDeadlineMs / 1_000}-second enumeration limit. No incomplete snapshot was saved. Retry the refresh or select a narrower scope.`
-        : "Power Platform inventory page request timed out before complete enumeration. No incomplete snapshot was saved. Retry the refresh.") : error;
+        : "Power Platform inventory page request timed out before complete enumeration. No incomplete snapshot was saved. Retry the refresh.") : cause;
       operationalLog("error", "inventory_query_failed", {
         ...logContext, ...metadata, stage, pages: completedPages, observedCount: completedCount,
         durationMs: Math.round(performance.now() - startedAt), ...errorTelemetry(failure, "provider_error"),
-        ...(error instanceof InventorySchemaError ? error.diagnostics : {}),
+        ...(cause instanceof InventorySchemaError ? cause.diagnostics : {}),
       });
       throw failure;
     }
@@ -182,19 +188,23 @@ export class PowerPlatformResourceQueryClient {
   async checkAccess(accessToken: string, signal?: AbortSignal) {
     const requestedTypes = ["microsoft.powerplatform/environments"] as const;
     const logContext: QueryLogContext = { provider: "power_platform", source: "capability_check", page: 1 };
+    const deadlineSignal = AbortSignal.timeout(10_000);
+    const checkSignal = signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
     let metadata: ReturnType<typeof pageTelemetry> = {};
     try {
-      const page = await this.requestPage(accessToken, requestedTypes, undefined, signal ?? AbortSignal.timeout(10_000), undefined, 1, logContext);
+      const page = await this.requestPage(accessToken, requestedTypes, undefined, checkSignal, undefined, 1, logContext);
+      checkSignal.throwIfAborted();
       metadata = pageTelemetry(page);
       const parsed = parsePage(page, requestedTypes);
       if (parsed.resources.length > 1) throw new InventorySchemaError("Power Platform access check returned an oversized page.", { reason: "oversized_access_check", field: "count" });
       operationalLog("info", "inventory_access_check_completed", { ...logContext, ...metadata });
     } catch (error) {
+      const failure = checkSignal.aborted ? checkSignal.reason : error;
       operationalLog("warn", "inventory_query_failed", {
-        ...logContext, ...metadata, ...errorTelemetry(error, "provider_error"),
-        ...(error instanceof InventorySchemaError ? error.diagnostics : {}),
+        ...logContext, ...metadata, ...errorTelemetry(failure, "provider_error"),
+        ...(failure instanceof InventorySchemaError ? failure.diagnostics : {}),
       });
-      throw error;
+      throw failure;
     }
   }
 
@@ -256,7 +266,7 @@ export class PowerPlatformResourceQueryClient {
         providerCorrelationId: response.headers.get("x-ms-correlation-request-id"),
       });
       if (response.redirected || response.url && new URL(response.url).origin !== new URL(resourceQueryEndpoint).origin) {
-        await disposeResponse(response);
+        disposeResponse(response);
         throw new AppError(502, "invalid_provider_link", "Power Platform inventory refused a redirected or foreign-origin response.");
       }
       if (response.ok) {
@@ -269,12 +279,12 @@ export class PowerPlatformResourceQueryClient {
           });
           if (signal.aborted) throw signal.reason;
           if (error instanceof AppError || attempt === this.retryPolicy.maxAttempts) throw error;
-          await disposeResponse(response);
+          disposeResponse(response);
           await retry(Math.min(this.retryPolicy.baseDelayMs * attempt, this.retryPolicy.maximumDelayMs), "response_body");
           continue;
         }
       }
-      await disposeResponse(response);
+      disposeResponse(response);
       if (attempt === this.retryPolicy.maxAttempts || (response.status !== 429 && response.status < 500)) {
         throw new AppError(response.status, "provider_error", "Power Platform inventory query failed.");
       }
@@ -337,7 +347,7 @@ function parsePage(page: unknown, requestedTypes: readonly PowerPlatformResource
   if (!isRecord(page)) {
     throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_page", actualType: valueType(page) });
   }
-  if (!Number.isSafeInteger(page.totalRecords) || (page.totalRecords as number) < 0 || (page.totalRecords as number) > maximumRows) {
+  if (!Number.isSafeInteger(page.totalRecords) || (page.totalRecords as number) < 0) {
     throw new InventorySchemaError("Power Platform inventory returned an invalid page shape.", { reason: "invalid_total", field: "totalRecords", actualType: valueType(page.totalRecords) });
   }
   if (!Number.isSafeInteger(page.count) || (page.count as number) < 0 || (page.count as number) > defaultPageSize) {
@@ -693,8 +703,8 @@ function retryAfterMs(value: string | null, fallbackMs: number, maximumMs: numbe
   return Math.min(Math.max(fallbackMs, 0), maximumMs);
 }
 
-async function disposeResponse(response: Response) {
-  try { await response.body?.cancel(); } catch { /* The failed provider stream is already unusable. */ }
+function disposeResponse(response: Response) {
+  try { void response.body?.cancel().catch(() => undefined); } catch { /* The failed provider stream is already unusable. */ }
 }
 
 function safeCount(value: unknown) {

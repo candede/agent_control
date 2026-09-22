@@ -648,6 +648,64 @@ describe("CopilotUsageGraphClient", () => {
   });
 
   it.each([
+    ["catalog", false], ["catalog", true], ["directory", false], ["directory", true],
+  ] as const)("rejects a null %s collection as a provider schema error (continuation: %s)", async (source, continuation) => {
+    const fetcher = vi.fn<FetchLike>();
+    if (continuation) {
+      const url = source === "catalog" ? buildSubscribedSkusUrl() : buildCopilotUsersUrl(knownSkuIds);
+      fetcher.mockResolvedValueOnce(Response.json({
+        value: source === "catalog" ? knownSkus : [],
+        "@odata.count": 0,
+        "@odata.nextLink": `${url}&$skiptoken=next`,
+      }));
+    }
+    fetcher.mockResolvedValueOnce(Response.json(null));
+    const client = new CopilotUsageGraphClient(source === "directory" ? withCatalog(fetcher) : fetcher);
+    await expect(client.listCopilotUsers("token")).rejects.toMatchObject({ status: 502, code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledTimes(continuation ? 2 : 1);
+  });
+
+  it.each([
+    ["no paid plans", { ...knownSkus[0], servicePlans: [] }],
+    ["company scope", { ...knownSkus[0], appliesTo: "Company" }],
+  ] as const)("rejects conflicting catalog eligibility with %s before querying users", async (_label, excluded) => {
+    for (const reverse of [false, true]) {
+      for (const paged of [false, true]) {
+        const rows = reverse ? [excluded, knownSkus[0]] : [knownSkus[0], excluded];
+        const fetcher = vi.fn<FetchLike>();
+        if (paged) {
+          fetcher.mockResolvedValueOnce(Response.json({
+            value: [rows[0]], "@odata.nextLink": `${buildSubscribedSkusUrl()}&$skiptoken=next`,
+          }));
+          fetcher.mockResolvedValueOnce(Response.json({ value: [rows[1]] }));
+        } else {
+          fetcher.mockResolvedValueOnce(Response.json({ value: rows }));
+        }
+        fetcher.mockResolvedValue(Response.json({ value: [], "@odata.count": 0 }));
+        await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token"))
+          .rejects.toMatchObject({ status: 502, code: "provider_schema" });
+        expect(fetcher).toHaveBeenCalledTimes(paged ? 2 : 1);
+      }
+    }
+  });
+
+  it("accepts equivalent catalog duplicates while excluding products without user-scoped paid plans", async () => {
+    const excluded = { ...knownSkus[0], skuId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", servicePlans: [] };
+    const company = { ...knownSkus[0], skuId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", appliesTo: "Company" };
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(Response.json({
+        value: [knownSkus[0], excluded, company], "@odata.nextLink": `${buildSubscribedSkusUrl()}&$skiptoken=next`,
+      }))
+      .mockResolvedValueOnce(Response.json({
+        value: [{ ...knownSkus[0], servicePlans: [...knownSkus[0].servicePlans, ...knownSkus[0].servicePlans] }, excluded, company],
+      }))
+      .mockResolvedValueOnce(Response.json({ value: [], "@odata.count": 0 }));
+    await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token")).resolves.toEqual([]);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(String(fetcher.mock.calls[2][0])).toBe(buildCopilotUsersUrl([knownSkus[0].skuId]));
+  });
+
+  it.each([
     { value: null },
     { value: [{ ...knownSkus[0], servicePlans: null }] },
     { value: [{ ...knownSkus[0], servicePlans: [{ servicePlanId: "invalid" }] }] },
@@ -766,14 +824,15 @@ describe("CopilotUsageGraphClient", () => {
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
-  it("still validates required dates and row width when extra CSV columns are present", async () => {
-    const [headers, row] = reportCsv([reportUser("one@example.com", "2026-02-31")]).split("\n");
-    const fetcher = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response(`${headers},Extra\n${row},value`))
-      .mockResolvedValueOnce(new Response(`${headers},Extra\n${row}`));
-    const client = new CopilotUsageGraphClient(fetcher);
-    await expect(client.listAppActivity("token")).rejects.toMatchObject({ code: "provider_schema" });
-    await expect(client.listAppActivity("token")).rejects.toMatchObject({ code: "provider_schema" });
+  it.each([
+    { reason: "invalid date", date: "2026-02-31", additionalValues: ",value" },
+    { reason: "missing column", date: "2026-09-12", additionalValues: "" },
+    { reason: "extra column", date: "2026-09-12", additionalValues: ",value,unexpected" },
+  ])("rejects $reason when extra CSV columns are present", async ({ date, additionalValues }) => {
+    const [headers, row] = reportCsv([reportUser("one@example.com", date)]).split("\n");
+    const fetcher = vi.fn(async () => new Response(`${headers},Extra\n${row}${additionalValues}`));
+    await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token"))
+      .rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it("keeps a valid header-only report empty with unknown refresh metadata", async () => {

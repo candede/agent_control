@@ -40,6 +40,96 @@ describe("exact inventory identity resolution", () => {
     });
   });
 
+  it("recognizes any source blueprint as parentage without implying equivalence", () => {
+    const source = identity({
+      sourceSystem: "defender_hunting",
+      identifiers: [
+        { kind: "entra_blueprint_id", value: "blueprint-a" },
+        { kind: "entra_blueprint_id", value: "blueprint-z" },
+      ],
+    });
+    const candidate = identity({ identifiers: [{ kind: "entra_blueprint_id", value: "blueprint-z" }] });
+    expect(resolveExactInventoryIdentity(source, [candidate])).toEqual({
+      status: "unresolved", reason: "no_documented_cross_source_relation",
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate], {
+      blueprintParentAcrossSources: true,
+      documentedCrossSourceKinds: ["entra_blueprint_id"],
+    })).toEqual({ status: "unresolved", reason: "blueprint_is_parent_not_equivalence" });
+    expect(resolveExactInventoryIdentity({ ...source, sourceSystem: "power_platform" }, [candidate])).toEqual({
+      status: "unresolved", reason: "blueprint_is_parent_not_equivalence",
+    });
+  });
+
+  it.each([
+    { tenantCaseDiffers: true, blueprintCaseDiffers: false },
+    { tenantCaseDiffers: false, blueprintCaseDiffers: true },
+    { tenantCaseDiffers: true, blueprintCaseDiffers: true },
+  ])("normalizes UUIDs consistently for blueprint parentage: %j", ({ tenantCaseDiffers, blueprintCaseDiffers }) => {
+    const tenantId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const blueprintId = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB";
+    const source = identity({ tenantId, identifiers: [{ kind: "entra_blueprint_id", value: blueprintId }] });
+    const candidate = identity({
+      tenantId: tenantCaseDiffers ? tenantId.toLowerCase() : tenantId,
+      identifiers: [{ kind: "entra_blueprint_id", value: blueprintCaseDiffers ? blueprintId.toLowerCase() : blueprintId }],
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate])).toEqual({
+      status: "unresolved", reason: "blueprint_is_parent_not_equivalence",
+    });
+    expect(resolveExactInventoryIdentity(source, [{ ...candidate, tenantId: "another-tenant" }])).toEqual({
+      status: "unresolved", reason: "no_documented_exact_identifier",
+    });
+  });
+
+  it("does not fold opaque blueprint or tenant IDs when reporting parentage", () => {
+    const source = identity({ identifiers: [{ kind: "entra_blueprint_id", value: "Blueprint-A" }] });
+    expect(resolveExactInventoryIdentity(source, [identity({
+      identifiers: [{ kind: "entra_blueprint_id", value: "blueprint-a" }],
+    })])).toEqual({ status: "unresolved", reason: "no_documented_exact_identifier" });
+    expect(resolveExactInventoryIdentity(source, [{ ...source, tenantId: "Tenant-A" }])).toEqual({
+      status: "unresolved", reason: "no_documented_exact_identifier",
+    });
+  });
+
+  it("requires documented cross-source kinds even when tenant UUID casing differs", () => {
+    const tenantId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const source = identity({
+      tenantId, sourceSystem: "defender_hunting",
+      identifiers: [{ kind: "entra_agent_id", value: "agent-a" }],
+    });
+    const candidate = identity({
+      tenantId: tenantId.toLowerCase(), identifiers: [{ kind: "entra_agent_id", value: "agent-a" }],
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate])).toEqual({
+      status: "unresolved", reason: "no_documented_cross_source_relation",
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate], { documentedCrossSourceKinds: ["entra_app_id"] })).toEqual({
+      status: "unresolved", reason: "no_documented_cross_source_relation",
+    });
+    expect(resolveExactInventoryIdentity(source, [candidate], { documentedCrossSourceKinds: ["entra_agent_id"] })).toEqual({
+      status: "resolved",
+      candidate: {
+        nativeId: candidate.nativeId, tenantId: candidate.tenantId, environmentId: candidate.environmentId,
+        sourceSystem: candidate.sourceSystem, resourceType: candidate.resourceType,
+      },
+      matchedKind: "entra_agent_id",
+    });
+  });
+
+  it("bounds ambiguous candidates while retaining the complete unique count", () => {
+    const candidates = Array.from({ length: 21 }, (_, index) => identity({ nativeId: `agent-${String(index).padStart(2, "0")}` }));
+    const full = resolveExactInventoryIdentity(identity(), candidates.slice(0, 20));
+    expect(full).toMatchObject({ status: "ambiguous", candidates: expect.any(Array) });
+    if (full.status !== "ambiguous") throw new Error("Expected ambiguous exact candidates.");
+    expect(full.candidates).toHaveLength(20);
+    expect(full).not.toHaveProperty("candidateCount");
+    expect(full).not.toHaveProperty("candidatesTruncated");
+    const truncated = resolveExactInventoryIdentity(identity(), [...candidates, structuredClone(candidates[0])].reverse());
+    expect(truncated).toEqual({
+      ...full, candidateCount: 21, candidatesTruncated: true,
+    });
+  });
+
   it("retains typed package identifiers without treating package app IDs as Entra app IDs", () => {
     const packaged = packageInventoryIdentity("tenant-a", {
       id: "package-a",
@@ -48,6 +138,13 @@ describe("exact inventory identity resolution", () => {
       appId: "same-guid",
       manifestId: "manifest-a",
       assetId: "asset-a",
+      sourceSystem: "graph_packages",
+      authoringTool: null,
+      creatorType: "unknown",
+      agentKind: "copilot_package",
+      lifecycle: "unknown",
+      identityConfidence: "exact_native",
+      provenance: {},
     });
     expect(packaged.identifiers.map(identifier => identifier.kind)).toEqual(["asset_id", "manifest_id", "package_app_id", "package_id"]);
     expect(resolveExactInventoryIdentity(packaged, [identity({ identifiers: [{ kind: "entra_app_id", value: "same-guid" }] })])).toEqual({

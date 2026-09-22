@@ -4,9 +4,9 @@ import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal
 import { config } from "../config.js";
 import { createJobConfirmation, type JobIntentInput } from "../db/jobs.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageListQuery } from "../db/packageInventory.js";
-import { PackageMutationQualificationRepository } from "../db/packageMutationQualifications.js";
+import { packageCanaryMutation, PackageMutationQualificationRepository } from "../db/packageMutationQualifications.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { bulkJobs, launchBulkJob, reconcileBulkJob, requireWorkerCapacity, runTrackedBulkJob } from "../services/bulkJobs.js";
 import { capabilities } from "../services/capabilities.js";
@@ -16,6 +16,7 @@ import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
 import { packageInventory } from "../services/packageInventory.js";
 import { capturePackageMutationState } from "../services/packageMutationState.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
+import { operationalLog } from "../services/telemetry.js";
 import type { CopilotPackageDetail, PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 import type { AuditAction } from "../types/audit.js";
 import { isAuditOperationPrefix } from "../types/audit.js";
@@ -201,7 +202,11 @@ policyRoute(agentsRouter, "post", "/agents/mutation-canaries/:id/execute", { acc
     });
   } catch {
     const completion = await canaryFailureCompletion(owner, originalJobId, restorationJobId);
-    await mutationQualifications.completeCycle(operator, claimed.original.id, claimed.restoration.id, completion).catch(() => undefined);
+    await mutationQualifications.completeCycle(operator, claimed.original.id, claimed.restoration.id, completion).catch(error => {
+      operationalLog("error", "package_canary_completion_failed", {
+        jobId: restorationJobId ?? originalJobId, outcome: "requires_review", ...errorTelemetry(error),
+      });
+    });
     throw new AppError(409, "canary_cycle_incomplete", completion.status === "restoration_conflict"
       ? "The original canary effect was verified, but exact restoration was not; stop for operator review."
       : "The full canary cycle was not verified, so no qualification was published.",
@@ -522,14 +527,15 @@ function canaryRecordView(record: Awaited<ReturnType<PackageMutationQualificatio
   };
 }
 
-async function submitCanaryJob(
+export async function submitCanaryJob(
   operator: Awaited<ReturnType<typeof revalidateAuthenticatedUser>>,
-  approval: Awaited<ReturnType<PackageMutationQualificationRepository["getApproved"]>> & {},
+  approval: Pick<NonNullable<Awaited<ReturnType<PackageMutationQualificationRepository["getApproved"]>>>, "id" | "targetId" | "action" | "prestate" | "poststate">,
   cycleId: string,
   stage: "original" | "restoration",
 ) {
   const intent: JobIntentInput = {
     action: approval.action,
+    accessUpdate: packageCanaryMutation(approval).accessUpdate,
     targets: [{ id: approval.targetId, displayName: "Approved package canary", prestate: approval.prestate }],
     actor: operator,
     requestPath: `/api/agents/mutation-canaries/${cycleId}/execute/${stage}`,
@@ -565,9 +571,22 @@ async function revalidateCanaryAdmin(scope: ReturnType<typeof requestScope>) {
   return user;
 }
 
-async function canaryFailureCompletion(scope: ReturnType<typeof requestScope>, originalJobId?: string, restorationJobId?: string) {
-  const original = originalJobId ? await bulkJobs.get(originalJobId, scope) : undefined;
-  const restoration = restorationJobId ? await bulkJobs.get(restorationJobId, scope) : undefined;
+export async function canaryFailureCompletion(scope: ReturnType<typeof requestScope>, originalJobId?: string, restorationJobId?: string) {
+  let original: Awaited<ReturnType<typeof bulkJobs.get>>;
+  let restoration: Awaited<ReturnType<typeof bulkJobs.get>>;
+  try {
+    original = originalJobId ? await bulkJobs.get(originalJobId, scope) : undefined;
+    restoration = restorationJobId ? await bulkJobs.get(restorationJobId, scope) : undefined;
+  } catch (error) {
+    operationalLog("error", "package_canary_result_unavailable", {
+      jobId: restorationJobId ?? originalJobId, outcome: "requires_review", ...errorTelemetry(error),
+    });
+    return { status: "inconclusive" as const, errorCode: "canary_result_unavailable" };
+  }
+  if (originalJobId && (!original || original.status === "running")
+    || restorationJobId && (!restoration || restoration.status === "running")) {
+    return { status: "inconclusive" as const, errorCode: "canary_result_unavailable" };
+  }
   if (original?.status === "succeeded" && restoration?.status !== "succeeded") {
     return restoration?.inconclusive ? { status: "inconclusive" as const, errorCode: "canary_restoration_inconclusive" }
       : { status: "restoration_conflict" as const, errorCode: "canary_restoration_unverified" };

@@ -13,7 +13,7 @@ export type PackageAgentMetadata = {
 
 export type PackageAgentMetadataObservation =
   | { status: "available"; identity: PackageAgentMetadata; elementIds: string[] }
-  | { status: "unmatched" | "conflicting"; reason: string; invalidMetadata?: true };
+  | { status: "unmatched" | "conflicting"; reason: string; invalidMetadata?: true; identity?: PackageAgentMetadata };
 
 const guidPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const environmentPattern = /^(?:Default-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
@@ -114,7 +114,7 @@ export function readPackageAgentMetadata(value: CopilotPackageDetail): PackageAg
   }
   if (!elementCount) return malformedIdentity("empty_metadata");
   if (!identity.cdsBotId && !identity.manifestId && !identity.entraApplicationId && !identity.graphAgentIds.length) {
-    return { status: "unmatched", reason: "Package metadata does not supply a source-native agent identity." };
+    return { status: "unmatched", identity, reason: "Package metadata does not supply a source-native agent identity." };
   }
   identity.graphAgentIds.sort();
   return { status: "available", identity, elementIds: [...elementIds].sort() };

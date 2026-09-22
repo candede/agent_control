@@ -4,7 +4,7 @@ import { AppError } from "../errors.js";
 import { GraphPackagesClient, graphError, graphErrorTelemetry, packageInventoryReadPolicy, type FetchLike } from "./graphPackages.js";
 import { scanPackages } from "./packageInventory.js";
 
-const throttledResponse = (headers?: HeadersInit, status = 424) => Response.json({
+const throttledResponse = (headers?: ResponseInit["headers"], status = 424) => Response.json({
   error: { code: "UnknownError", message: "Too many requests private-token person@example.invalid" },
 }, { status, headers });
 const packageResponse = (id = "package") => Response.json({ id, displayName: id, isBlocked: false });
@@ -15,6 +15,7 @@ describe("Graph inventory read budget", () => {
     const error = await graphError(throttledResponse());
     expect(error.details).toMatchObject({ httpStatus: 424, providerErrorCode: "UnknownError", throttled: true });
     expect(graphErrorTelemetry(error)).toMatchObject({ errorCode: "graph_http_424", status: 424, outcome: "throttled" });
+    expect(error.message).toBe("Microsoft Graph request failed with status 424.");
     expect(JSON.stringify(error)).not.toMatch(/private-token|person@/);
   });
 
@@ -137,18 +138,16 @@ describe("Graph inventory read budget", () => {
 
   it("passes cancellation to the backoff timer rather than leaving it alive after the read ends", async () => {
     const controller = new AbortController();
-    const started = Promise.withResolvers<void>();
     const timerRejected = vi.fn();
     const wait = vi.fn((ms: number, signal?: AbortSignal) => {
       const timer = delay(ms, undefined, { signal });
       void timer.catch(timerRejected);
-      started.resolve();
       return timer;
     });
     const client = new GraphPackagesClient(async () => throttledResponse(), { delay: wait });
     const result = client.getPackageDetails("token", "package", { signal: controller.signal });
     const assertion = expect(result).rejects.toMatchObject({ code: "read_job_cancelled" });
-    await started.promise;
+    await vi.waitFor(() => expect(wait).toHaveBeenCalledOnce());
     controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
     await assertion;
     expect(wait).toHaveBeenCalledWith(30_000, controller.signal);

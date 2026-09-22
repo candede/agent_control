@@ -310,7 +310,8 @@ function normalizedAbort(signal: AbortSignal) {
 function isUtcDateTime(value: unknown): value is string {
   return typeof value === "string"
     && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$/.test(value)
-    && !Number.isNaN(Date.parse(value));
+    && !Number.isNaN(Date.parse(value))
+    && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

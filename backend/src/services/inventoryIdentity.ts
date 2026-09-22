@@ -70,11 +70,12 @@ export function resolveExactInventoryIdentity(source: InventoryIdentityRecord, c
   blueprintParentAcrossSources?: boolean;
 } = {}): IdentityResolution {
   const sourceIdentifiers = sortIdentifiers(source.identifiers);
-  const sourceBlueprint = sourceIdentifiers.find(identifier => identifier.kind === "entra_blueprint_id");
+  const sourceBlueprints = new Set(sourceIdentifiers.filter(identifier => identifier.kind === "entra_blueprint_id")
+    .map(identifier => normalizeNativeIdentity(identifier.value)));
   const documentedCrossSourceKinds = new Set(options.documentedCrossSourceKinds ?? []);
-  const orderedCandidates = [...candidates].sort((left, right) => ordinal(identityKey(left), identityKey(right)));
+  const orderedCandidates = candidates.filter(candidate => normalizeNativeIdentity(candidate.tenantId) === normalizeNativeIdentity(source.tenantId))
+    .sort((left, right) => ordinal(identityKey(left), identityKey(right)));
   const matches = orderedCandidates.flatMap(candidate => {
-    if (normalizeNativeIdentity(candidate.tenantId) !== normalizeNativeIdentity(source.tenantId)) return [];
     for (const sourceIdentifier of sourceIdentifiers) {
       if (!equivalentKinds.has(sourceIdentifier.kind)) continue;
       if (candidate.sourceSystem !== source.sourceSystem && !documentedCrossSourceKinds.has(sourceIdentifier.kind)) continue;
@@ -91,12 +92,11 @@ export function resolveExactInventoryIdentity(source: InventoryIdentityRecord, c
   const unique = [...new Map(matches.map(match => [identityKey(match.candidate), match])).values()];
   if (unique.length === 1) return { status: "resolved", candidate: identityScope(unique[0].candidate), matchedKind: unique[0].kind };
   if (unique.length > 1) return { status: "ambiguous", reason: "multiple_exact_candidates", candidates: unique.slice(0, 20).map(match => identityScope(match.candidate)), ...(unique.length > 20 ? { candidateCount: unique.length, candidatesTruncated: true as const } : {}) };
-  if (sourceBlueprint && orderedCandidates.some(candidate => candidate.tenantId === source.tenantId
-    && (candidate.sourceSystem === source.sourceSystem || options.blueprintParentAcrossSources)
-    && candidate.identifiers.some(identifier => identifier.kind === "entra_blueprint_id" && identifier.value === sourceBlueprint.value))) {
+  if (orderedCandidates.some(candidate => (candidate.sourceSystem === source.sourceSystem || options.blueprintParentAcrossSources)
+    && candidate.identifiers.some(identifier => identifier.kind === "entra_blueprint_id" && sourceBlueprints.has(normalizeNativeIdentity(identifier.value))))) {
     return { status: "unresolved", reason: "blueprint_is_parent_not_equivalence" };
   }
-  if (orderedCandidates.some(candidate => candidate.tenantId === source.tenantId && candidate.sourceSystem !== source.sourceSystem)) return { status: "unresolved", reason: "no_documented_cross_source_relation" };
+  if (orderedCandidates.some(candidate => candidate.sourceSystem !== source.sourceSystem)) return { status: "unresolved", reason: "no_documented_cross_source_relation" };
   return { status: "unresolved", reason: "no_documented_exact_identifier" };
 }
 

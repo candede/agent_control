@@ -26,7 +26,9 @@ describe("capability documentation artifacts", () => {
     expect(inventory).toContain("Inventory date: 2026-09-08");
     for (const definition of capabilityDefinitions) {
       expect(inventory.split(`\`${definition.id}\``)).toHaveLength(2);
-      for (const source of definition.sources) expect(inventory).toContain(source);
+      const row = inventory.split("\n").find(line => line.startsWith(`| \`${definition.id}\` |`));
+      expect(row, definition.id).toBeDefined();
+      for (const source of definition.sources) expect(row, definition.id).toContain(`](${source})`);
     }
   });
 

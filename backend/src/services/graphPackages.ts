@@ -442,7 +442,7 @@ export async function verifyPackageMutationConverged(
 ) {
   const maxAttempts = Math.min(Math.max(Math.trunc(options.maxAttempts ?? 4), 1), 20);
   const delayMs = Math.min(Math.max(Math.trunc(options.delayMs ?? 500), 0), 5_000);
-  const wait = options.delay ?? delay;
+  const wait = options.delay ?? defaultRetryPolicy.delay;
   let lastState: PackageMutationState | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const details = await client.getPackageDetails(accessToken, id, options);

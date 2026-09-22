@@ -90,10 +90,22 @@ export class CopilotUsageService {
     ]);
     const directory = saved.directory.value && saved.directory.observedAt
       ? { ok: true as const, value: saved.directory.value, fetchedAt: saved.directory.observedAt }
-      : { ok: false as const, message: saved.directory.message ?? "Directory and license data has not been synced for this account.", status: saved.directory.attemptStatus === "permission_required" ? "permission_required" as const : saved.directory.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const };
+      : {
+        ok: false as const,
+        message: saved.directory.attemptStatus === "available"
+          ? "Saved directory and license data has expired or is no longer available. Refresh Users sync."
+          : saved.directory.message ?? "Directory and license data has not been synced for this account.",
+        status: saved.directory.attemptStatus === "permission_required" ? "permission_required" as const : saved.directory.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const,
+      };
     const appActivity = saved.appActivity.value && saved.appActivity.observedAt
       ? { ok: true as const, value: saved.appActivity.value, fetchedAt: saved.appActivity.observedAt }
-      : { ok: false as const, message: saved.appActivity.message ?? "Microsoft 365 Copilot app activity has not been synced for this account.", status: saved.appActivity.attemptStatus === "permission_required" ? "permission_required" as const : saved.appActivity.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const };
+      : {
+        ok: false as const,
+        message: saved.appActivity.attemptStatus === "available"
+          ? "Saved Microsoft 365 Copilot app activity has expired or is no longer available. Refresh Users sync."
+          : saved.appActivity.message ?? "Microsoft 365 Copilot app activity has not been synced for this account.",
+        status: saved.appActivity.attemptStatus === "permission_required" ? "permission_required" as const : saved.appActivity.attemptStatus === "waiting_authorization" ? "waiting_authorization" as const : "failed" as const,
+      };
     return composeCopilotUsageUsers({
       generatedAt,
       directory,
@@ -114,8 +126,8 @@ export class CopilotUsageService {
     signal?.throwIfAborted();
     const requested: CopilotUsageSnapshotSource[] = options.incompleteOnly
       ? [
-        ...(before.directory.attemptStatus === "available" ? [] : ["directory" as const]),
-        ...(before.appActivity.attemptStatus === "available" ? [] : ["app_activity" as const]),
+        ...(hasAvailableUserSource(before.directory) ? [] : ["directory" as const]),
+        ...(hasAvailableUserSource(before.appActivity) ? [] : ["app_activity" as const]),
       ]
       : ["directory", "app_activity"];
     if (!requested.length) {
@@ -133,7 +145,7 @@ export class CopilotUsageService {
     signal?.throwIfAborted();
     const after = await this.dependencies.usageStore.getUserSources(scope);
     signal?.throwIfAborted();
-    return userRefreshResult(after, requested.includes("directory") && after.directory.attemptStatus === "available"
+    return userRefreshResult(after, requested.includes("directory") && hasAvailableUserSource(after.directory)
       ? after.directory.rowCount : observedCount);
   }
 
@@ -285,7 +297,7 @@ export function composeCopilotUsageUsers(input: {
     const matching = matchImportedUsage(directoryUsers, importedView?.users.value ?? [], directory.ok);
     const appMatching = matchAppActivity(directoryUsers, appActivity.ok ? appActivity.value.users : []);
     const importedMetricsFresh = Boolean(importedView && importedView.availability === "active");
-    const appMetricsFresh = Boolean(appActivity.ok && isFreshAppReport(appActivity));
+    const appMetricsFresh = Boolean(appActivity.ok && isFreshAppReport(appActivity, new Date(generatedAt)));
     const users = directoryUsers.map(directoryUser => {
       const importedUsage = matching.byObjectId.get(directoryUser.identity.objectId) ?? null;
       const activity = appMatching.get(directoryUser.identity.objectId) ?? null;
@@ -296,7 +308,7 @@ export function composeCopilotUsageUsers(input: {
       ? source("available", `Checked ${directoryUsers.length} directory users assigned products that can include paid M365 Copilot. Product assignment alone does not establish a Copilot license. Microsoft Graph filters these candidates across the tenant in bulk; all matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
       : unavailableSource(directory.message);
     let appSource = appActivity.ok
-      ? appActivitySource(appActivity, appMatching.size)
+      ? appActivitySource(appActivity, appMatching.size, appMetricsFresh)
       : unavailableSource(appActivity.message, copilotUsagePeriod, "v1");
     const importedSource = imported.ok
       ? importedUsageSource(imported.value)
@@ -346,12 +358,16 @@ export function composeCopilotUsageUsers(input: {
     };
 }
 
+function hasAvailableUserSource(saved: SavedCopilotUsageSource<unknown>) {
+  return saved.attemptStatus === "available" && saved.value !== null && saved.observedAt !== null;
+}
+
 function userRefreshResult(saved: {
   directory: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
   appActivity: SavedCopilotUsageSource<CopilotReportResult>;
 }, observedCount: number | null): CopilotUsageRefreshResult {
   const values = [saved.directory, saved.appActivity];
-  if (values.every(value => value.attemptStatus === "available")) {
+  if (values.every(hasAvailableUserSource)) {
     const licensedCount = saved.directory.value?.filter(value => isCopilotServiceActive(value.copilotServiceState)).length;
     return {
       status: "succeeded",
@@ -360,7 +376,7 @@ function userRefreshResult(saved: {
     };
   }
   if (values.some(value => value.value !== null)) {
-    const incomplete = values.filter(value => value.attemptStatus !== "available").map(value => value.source);
+    const incomplete = values.filter(value => !hasAvailableUserSource(value)).map(value => value.source);
     return {
       status: "partial",
       count: observedCount,
@@ -398,7 +414,7 @@ function snapshotMetadata(saved: {
   const success = values.map(value => value.lastSuccessAt).filter((value): value is string => value !== null).sort();
   const state = observed.length === 0
     ? "not_synced"
-    : values.every(value => value.value !== null && value.attemptStatus === "available")
+    : values.every(hasAvailableUserSource)
       ? "available"
       : "partial";
   return {
@@ -604,9 +620,9 @@ function unavailableSource(message: string, periodValue: string | null = null, r
   return source("unavailable", message, null, periodValue, null, null, null, reportVersion);
 }
 
-function appActivitySource(result: Extract<Loaded<CopilotReportResult>, { ok: true }>, matchedCount: number) {
+function appActivitySource(result: Extract<Loaded<CopilotReportResult>, { ok: true }>, matchedCount: number, fresh: boolean) {
   const unmatched = result.value.users.length - matchedCount;
-  const stale = result.value.reportRefreshDate !== null && !isFreshAppReport(result);
+  const stale = result.value.reportRefreshDate !== null && !fresh;
   const incomplete = result.value.reportRefreshDate === null;
   const state = stale ? "stale" as const : unmatched > 0 || incomplete ? "partial" as const : "available" as const;
   const message = stale
@@ -619,9 +635,9 @@ function appActivitySource(result: Extract<Loaded<CopilotReportResult>, { ok: tr
   return source(state, message, result.fetchedAt, copilotUsagePeriod, null, null, result.value.reportRefreshDate, "v1");
 }
 
-function isFreshAppReport(result: Extract<Loaded<CopilotReportResult>, { ok: true }>) {
+function isFreshAppReport(result: Extract<Loaded<CopilotReportResult>, { ok: true }>, now: Date) {
   return result.value.reportRefreshDate !== null
-    && civilDateAgeDays(result.value.reportRefreshDate, new Date(result.fetchedAt)) <= appReportStaleAfterDays;
+    && civilDateAgeDays(result.value.reportRefreshDate, now) <= appReportStaleAfterDays;
 }
 
 function importedUsageSource(view: OfficialUsageUserView) {

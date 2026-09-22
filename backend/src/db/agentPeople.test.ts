@@ -85,6 +85,15 @@ describe("agent people persistence", () => {
     });
     await repository.save(scope, [first], context);
     expect((await repository.read(scope, [id]))[0].status).toBe("not_found");
+    for (const delay of [1_000, 2_000]) {
+      const retriedAt = new Date(Date.parse(missingAt) + delay).toISOString();
+      await repository.save(scope, [observation({ status: "lookup_failed", displayName: null, userPrincipalName: null,
+        checkedAt: retriedAt, errorCode: "provider_timeout" })], context);
+      expect((await repository.read(scope, [id]))[0]).toMatchObject({
+        status: "lookup_failed", displayName: null, userPrincipalName: null,
+        observedAt: missingAt, lastConclusiveAt: missingAt, checkedAt: retriedAt, errorCode: "provider_timeout",
+      });
+    }
   });
 
   it("uses bounded status-specific expiry and drops expired cache from reads and revisions", async () => {

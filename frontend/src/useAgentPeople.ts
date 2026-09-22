@@ -45,12 +45,13 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
   const [persisted, setPersisted] = useState<{ key: string; value: SavedPeople }>();
   const attemptCount = attempt?.key === evidenceKey ? attempt.count : 0;
   const saved = canRead ? record.people : undefined;
-  const returned = canRead && persisted?.key === evidenceKey ? persisted.value : undefined;
+  const returned = canRead && persisted?.key === evidenceKey ? persisted : undefined;
+  const current = returned ? returned.value : saved;
   const people: Partial<Record<PersonField, AgentPerson>> = {};
   for (const field of personFields) {
     const id = identifiers[field];
     if (!id) continue;
-    const candidate = returned?.[field] ?? saved?.[field];
+    const candidate = current?.[field];
     const person = candidate?.objectId.toLowerCase() === id.toLowerCase() ? candidate : undefined;
     people[field] = {
       id, invalidId: !isDirectoryObjectId(id),
@@ -65,7 +66,7 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
     };
   }
   const needsLookup = Object.values(people).some(person =>
-    !person.invalidId && (person.status === "unverified" || person.expired));
+    !person.invalidId && (person.status === "unverified" && !returned || person.expired));
   const canRetry = canLookup && Object.values(people).some(person =>
     !person.invalidId && (person.status !== "resolved" || person.expired));
   const requestKey = JSON.stringify([evidenceKey, attemptCount, ...personFields.map(field => Boolean(people[field]?.expired))]);

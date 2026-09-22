@@ -81,4 +81,15 @@ describe("bounded package identity projection", () => {
     expect(warning).toHaveBeenCalledOnce();
     expect(JSON.stringify(warning.mock.calls)).not.toContain('{"SourceIds":');
   });
+
+  it("retains partial environment and schema constraints without treating them as a native agent identity", () => {
+    const value = allowlistedPackage(input(JSON.stringify({
+      SourceIds: { EnvironmentId: environmentId.toUpperCase(), SchemaName: "CR_AGENT" },
+    })));
+    expect(readPackageAgentMetadata(value)).toEqual({
+      status: "unmatched",
+      identity: { environmentId, schemaName: "cr_agent", graphAgentIds: [] },
+      reason: "Package metadata does not supply a source-native agent identity.",
+    });
+  });
 });

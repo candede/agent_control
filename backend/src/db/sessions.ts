@@ -4,13 +4,14 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
+import { operationalLog } from "../services/telemetry.js";
 import type { AppRole } from "../types/capability.js";
 
 const PgSessionStore = connectPgSimple(session);
 
 export function createSessionStore(database: pg.Pool, tenantId: string) {
   const store = new PgSessionStore({ pool: database, tableName: "sessions", createTableIfMissing: false,
-    pruneSessionInterval: false, errorLog: () => console.error(JSON.stringify({ event: "session_store_error" })) });
+    pruneSessionInterval: false, errorLog: () => operationalLog("error", "session_store_error") });
   const get = store.get.bind(store);
   const set = store.set.bind(store);
   store.get = (id, callback) => get(id, (error, data) => callback(error, data?.tenantId === tenantId ? data : null));

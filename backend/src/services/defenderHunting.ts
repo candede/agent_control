@@ -41,7 +41,8 @@ const defaultDependencies: Dependencies = {
   runQuery: graphHunting.runQuery.bind(graphHunting),
 };
 
-type ActiveHunt = { actor: { tenantId: string; principalId: string }; controller: AbortController; started: Promise<DefenderHuntingJob>; operation: Promise<void> };
+type ActiveHunt = { actor: { tenantId: string; principalId: string }; tokenMode: DefenderHuntingTokenMode;
+  controller: AbortController; started: Promise<DefenderHuntingJob>; operation: Promise<void> };
 const maximumActiveHunts = 4;
 const activationDeadlineMs = 60_000;
 
@@ -93,16 +94,22 @@ export class DefenderHuntingService {
     requireViewer(user);
     const actor = actorScope(user);
     const existing = this.active.get(id);
-    if (existing && existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId) return existing.started;
+    if (existing) {
+      return existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId && existing.tokenMode === tokenMode
+        ? existing.started : this.currentJobForStart(user, id, tokenMode);
+    }
     if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(activationDeadlineMs)]);
     const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal);
     const started = prepared.then(value => value.job);
     let operation: Promise<void>;
-    operation = prepared.then(value => value.run?.()).then(() => undefined).catch(() => undefined)
+    operation = prepared.then(value => value.run?.(), () => undefined).catch(error => {
+      operationalLog("error", "hunting_worker_failed", { jobId: id,
+        errorCode: error instanceof AppError ? error.code : "hunting_worker_failed" });
+    })
       .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
-    this.active.set(id, { actor, controller, started, operation });
+    this.active.set(id, { actor, tokenMode, controller, started, operation });
     return started;
   }
 
@@ -188,8 +195,14 @@ export class DefenderHuntingService {
     if (!current || current.authorizationPrincipalId !== user.homeAccountId || current.tokenMode !== tokenMode) throw new AppError(404, "not_found", "Hunting job was not found.");
     if (current.status !== "waiting_authorization") return { job: current };
     const scope = scopeFromResult(user, tokenMode, current.resultScope);
-    const execution = await abortable(this.repository.begin(scope, id), signal);
-    signal.throwIfAborted();
+    // Activation commits durable ownership; settle it before handling cancellation.
+    const execution = await this.repository.begin(scope, id);
+    if (signal.aborted) {
+      try { await this.repository.markWaitingAuthorization(scope, id, execution); } catch (error) {
+        if (!(error instanceof AppError && error.code === "hunting_execution_lost")) throw error;
+      }
+      signal.throwIfAborted();
+    }
     return { job: execution.job, run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal) };
   }
 
@@ -202,6 +215,8 @@ export class DefenderHuntingService {
   private async run(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope, current: DefenderHuntingJob,
     execution: DefenderHuntingExecution, signal: AbortSignal, cancellationSignal: AbortSignal) {
     let auditEvent: Awaited<ReturnType<ReturnType<typeof getAuditLog>["startEvent"]>> | undefined;
+    let providerRequestAuthorized = false;
+    let providerCompleted = false;
     try {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal);
@@ -221,9 +236,18 @@ export class DefenderHuntingService {
         metadata: { source: "microsoft_defender_hunting", template: current.filters.templateId, mode: current.tokenMode, correlationId: current.localRequestId } }), signal);
       const result = await this.dependencies.runQuery(token, current.filters, {
         signal, correlationId: current.localRequestId, tenantId: actor.tenantId,
-        beforeRequest: () => this.repository.authorizeProviderRequest(scope, current.id, execution),
+        beforeRequest: async () => {
+          const requestValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+          await this.validateCurrentAuthority(actor, scope, current, signal);
+          await abortable(commitAccountSessionValidation(requestValidation, async () => {
+            signal.throwIfAborted();
+            await this.repository.authorizeProviderRequest(scope, current.id, execution);
+          }), signal);
+          providerRequestAuthorized = true;
+        },
         onResponse: providerRequestId => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId),
       });
+      providerCompleted = true;
       signal.throwIfAborted();
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
       const publicationValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
@@ -247,7 +271,11 @@ export class DefenderHuntingService {
         metadata: { source: "microsoft_defender_hunting", template: current.filters.templateId, mode: current.tokenMode,
           correlationId: current.localRequestId, rowCount: job.storedRowCount, requestCount: job.providerRequestCount } });
     } catch (error) {
-      if (error instanceof AppError && error.code === "hunting_execution_lost") return;
+      if (error instanceof AppError && error.code === "hunting_execution_lost") {
+        if (auditEvent) await this.dependencies.auditLog(actor).completeEvent(auditEvent.id, {
+          status: signal.aborted ? "cancelled" : "inconclusive", errorCode: error.code });
+        return;
+      }
       if (signal.aborted || isLocalAuthorizationFailure(error)) {
         try { await this.repository.markWaitingAuthorization(scope, current.id, execution); } catch (markError) {
           if (!(markError instanceof AppError && markError.code === "hunting_execution_lost")) throw markError;
@@ -259,13 +287,18 @@ export class DefenderHuntingService {
       const inconclusive = error instanceof AppError && ["provider_schema", "provider_error", "provider_throttled", "invalid_provider_link", "hunting_access_denied",
         "hunting_provider_request_limit", "hunting_job_expired"].includes(error.code);
       const failed = await this.repository.fail(scope, current.id, execution, error instanceof AppError ? error.code : "provider_error", safeFailureMessage(error), inconclusive);
-      if (scope.tokenMode === "delegated") {
+      if (scope.tokenMode === "delegated" && providerRequestAuthorized && !providerCompleted
+        && error instanceof AppError && ["missing_permission", "unsupported", "provider_schema", "provider_error",
+          "provider_throttled", "invalid_provider_link", "hunting_access_denied"].includes(error.code)) {
         try {
-          const evidenceUser = await this.dependencies.revalidateUser(actor.principalId);
-          await this.dependencies.recordProviderEvidence(capabilityForMode(scope.tokenMode), evidenceUser, providerEvidenceStatus(error), {
-            category: error instanceof AppError ? error.code : "provider_error",
+          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
+          signal.throwIfAborted();
+          requireSamePrincipal(actor, evidenceUser);
+          requireViewer(evidenceUser);
+          await abortable(this.dependencies.recordProviderEvidence(capabilityForMode(scope.tokenMode), evidenceUser, providerEvidenceStatus(error), {
+            category: error.code,
             providerRequestId: failed?.providerRequestId ?? null,
-          });
+          }), signal);
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: capabilityForMode(scope.tokenMode), outcome: "provider_failure" });
         }

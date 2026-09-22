@@ -19,12 +19,11 @@ export class SavedAgentPeopleService {
       record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
       record.powerPlatformResource?.details.lastModifiedBy,
     ]).filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id)).map(id => id.toLowerCase()))];
-    for (const cached of await this.cache.read(scope, ids, database)) {
+    for (const { lastConclusiveAt, ...cached } of await this.cache.read(scope, ids, database)) {
       const saved = people.get(cached.objectId);
       if (saved && Date.parse(saved.observedAt) > Date.parse(cached.checkedAt ?? cached.observedAt)) continue;
       const identity = cached.status === "lookup_failed" && saved
-        && (!cached.displayName && !cached.userPrincipalName
-          || Date.parse(saved.observedAt) > Date.parse(cached.observedAt)) ? saved : cached;
+        && (lastConclusiveAt === null || Date.parse(saved.observedAt) > Date.parse(lastConclusiveAt)) ? saved : cached;
       people.set(cached.objectId, { ...identity, status: cached.status, checkedAt: cached.checkedAt,
         expiresAt: cached.expiresAt, ...(cached.errorCode ? { errorCode: cached.errorCode } : {}) });
     }

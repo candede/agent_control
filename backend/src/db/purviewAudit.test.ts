@@ -198,20 +198,22 @@ describe.sequential("Purview audit repository", () => {
     expect(await repository.getJob(scope, activationCap.id)).toMatchObject({ status: "inconclusive", errorCode: "audit_activation_limit", canResume: false });
   });
 
-  it("sets remote continuation only when inconclusive work may actually still run", async () => {
-    const unsent = await submitAndBegin("failure-unsent");
-    await repository.fail(scope, unsent.id, unsent.execution, "provider_schema", "schema", true);
-    expect(await repository.getJob(scope, unsent.id)).toMatchObject({ status: "inconclusive", remoteWorkMayContinue: false });
+  it.each([false, true])("sets remote continuation from provider state for inconclusive=%s", async inconclusive => {
+    const status = inconclusive ? "inconclusive" : "failed";
+    const unsent = await submitAndBegin(`failure-unsent-${status}`);
+    await repository.fail(scope, unsent.id, unsent.execution, "provider_schema", "schema", inconclusive);
+    expect(await repository.getJob(scope, unsent.id)).toMatchObject({ status, remoteWorkMayContinue: false });
 
-    const attempted = await submitAndBegin("failure-attempted");
+    const attempted = await submitAndBegin(`failure-attempted-${status}`);
     await repository.authorizeProviderRequest(scope, attempted.id, attempted.execution);
-    await repository.fail(scope, attempted.id, attempted.execution, "provider_error", "network", true);
-    expect(await repository.getJob(scope, attempted.id)).toMatchObject({ status: "inconclusive", remoteWorkMayContinue: true });
+    await repository.fail(scope, attempted.id, attempted.execution, "provider_throttled", "throttled", inconclusive);
+    expect(await repository.getJob(scope, attempted.id)).toMatchObject({ status, remoteWorkMayContinue: true });
 
-    const terminal = await submitAndBegin("failure-terminal-provider");
+    const terminal = await submitAndBegin(`failure-terminal-provider-${status}`);
+    await repository.authorizeProviderRequest(scope, terminal.id, terminal.execution);
     await repository.recordProviderQuery(scope, terminal.id, terminal.execution, "provider-terminal", "failed");
-    await repository.fail(scope, terminal.id, terminal.execution, "provider_query_failed", "failed", true);
-    expect(await repository.getJob(scope, terminal.id)).toMatchObject({ status: "inconclusive", remoteWorkMayContinue: false });
+    await repository.fail(scope, terminal.id, terminal.execution, "provider_query_failed", "failed", inconclusive);
+    expect(await repository.getJob(scope, terminal.id)).toMatchObject({ status, remoteWorkMayContinue: false });
   });
 
   it("does not inspect private inventory when the current read lacks explicit Reader identity scope", async () => {

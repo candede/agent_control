@@ -74,9 +74,34 @@ describe("CopilotStudioQuarantineClient", () => {
     [{}],
     [{ isBotQuarantined: 0, lastUpdateTimeUtc: providerStatus.lastUpdateTimeUtc }],
     [{ isBotQuarantined: false, lastUpdateTimeUtc: "yesterday" }],
+    [{ isBotQuarantined: false, lastUpdateTimeUtc: "2026-02-29T19:00:00Z" }],
+    [{ isBotQuarantined: false, lastUpdateTimeUtc: "2026-02-30T19:00:00.1234567Z" }],
+    [{ isBotQuarantined: false, lastUpdateTimeUtc: "2026-04-31T19:00:00Z" }],
+    [{ isBotQuarantined: false, lastUpdateTimeUtc: "1900-02-29T19:00:00Z" }],
+    [{ isBotQuarantined: false, lastUpdateTimeUtc: "2026-09-09T24:00:00Z" }],
   ])("rejects an invalid provider status schema", async (body) => {
-    const client = new CopilotStudioQuarantineClient(async () => Response.json(body));
-    await expect(client.getStatus("token", target)).rejects.toMatchObject({ code: "provider_schema" });
+    const fetcher = vi.fn(async () => Response.json(body));
+    const client = new CopilotStudioQuarantineClient(fetcher);
+    await expect(client.getStatus("token", target)).rejects.toMatchObject({ status: 502, code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "2024-02-29T19:00:00Z",
+    "2000-02-29T19:00:00.1Z",
+    "2400-02-29T19:00:00.1234567Z",
+    "2026-09-09T19:00:00.123Z",
+    "0001-01-01T00:00:00Z",
+  ])("preserves the exact valid provider timestamp %s", async lastUpdateTimeUtc => {
+    const client = new CopilotStudioQuarantineClient(async () => Response.json({ ...providerStatus, lastUpdateTimeUtc }));
+    await expect(client.getStatus("token", target)).resolves.toMatchObject({ lastUpdateTimeUtc });
+  });
+
+  it("rejects impossible mutation timestamps without retrying the write", async () => {
+    const fetcher = vi.fn(async () => Response.json({ isBotQuarantined: true, lastUpdateTimeUtc: "2026-02-30T19:00:00Z" }));
+    await expect(new CopilotStudioQuarantineClient(fetcher).setQuarantine("token", target, true, { correlationId: "correlation-write" }))
+      .rejects.toMatchObject({ status: 502, code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("retries throttled GET reads using the bounded Retry-After delay", async () => {

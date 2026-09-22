@@ -2,11 +2,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Request, RequestHandler } from "express";
 
 const allowedFields = new Set([
-  "requestId", "jobId", "capabilityId", "provider", "outcome", "status",
+  "requestId", "runId", "jobId", "capabilityId", "provider", "outcome", "status",
   "durationMs", "ageMs", "attempt", "count", "mode", "source", "schemaVersion",
   "route", "errorCode", "errorKind", "stage", "page", "pages", "observedCount",
   "totalRecords", "returnedCount", "dataCount", "hasContinuation", "resultTruncated",
-  "omittedFieldCount", "requestedTypeCount", "environmentScoped", "pageSize",
+  "omittedFieldCount", "requestedTypeCount", "queriedTypeCount", "environmentScoped", "pageSize",
   "pageLimit", "rowLimit", "deadlineMs", "retryDelayMs", "providerRequestId",
   "providerCorrelationId", "resourceType", "field", "actualType", "length",
   "maximumLength", "resourceIndex", "firstSeenPage", "reason", "catalogScopedCount",

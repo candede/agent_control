@@ -163,7 +163,8 @@ export class PackageInventoryRepository {
         return existing.rows[0].id;
       }
       const outstanding = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM package_refresh_jobs
-        WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`, [scope.tenantId, scope.principalId]);
+        WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running')
+          AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [scope.tenantId, scope.principalId]);
       if (outstanding.rows[0].count >= 5) {
         throw new AppError(429, "job_limit", "At most five unfinished package refreshes are allowed per principal.");
       }

@@ -46,8 +46,9 @@ export class CopilotStudioQuarantineControlService {
     const scope = controlScope(user, "AgentControl.Admin");
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
     const frozen = (await this.observe(user, targets, Boolean(input.forceStatus), "powerPlatform.quarantine.manage")).map(value => ({ ...value.target, directStatus: value.directStatus }));
-    const authority = await this.dependencies.authorityContext(user);
-    const confirmation = createQuarantineConfirmation({ action: input.action, targets: frozen, actor: userActor(user), authority, requestPath: "/api/quarantine/jobs" });
+    const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
+    const authority = await this.dependencies.authorityContext(current);
+    const confirmation = createQuarantineConfirmation({ action: input.action, targets: frozen, actor: userActor(current), authority, requestPath: "/api/quarantine/jobs" });
     return {
       confirmationHash: confirmation.confirmationHash,
       summary: confirmation.summary,
@@ -57,21 +58,29 @@ export class CopilotStudioQuarantineControlService {
 
   async submit(user: AuthenticatedUser, input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; confirmationHash: string; idempotencyKey: string }) {
     const scope = controlScope(user, "AgentControl.Admin");
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const existing = await this.repository.existingSubmission(scope, input);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.status === "queued" && !existing.isCanary) {
+        await this.authorize(scope, "powerPlatform.quarantine.manage");
+        await commitAccountSessionValidation(validation, async () => this.dependencies.launch(existing.id, scope));
+      }
+      return existing;
+    }
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
     const frozen = (await this.observe(user, targets, false, "powerPlatform.quarantine.manage")).map(value => ({ ...value.target, directStatus: value.directStatus }));
-    const authority = await this.dependencies.authorityContext(user);
-    const job = await this.repository.submit(scope, {
+    const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
+    const authority = await this.dependencies.authorityContext(current);
+    const job = await commitAccountSessionValidation(validation, () => this.repository.submit(scope, {
       action: input.action,
       targets: frozen,
-      actor: userActor(user),
+      actor: userActor(current),
       authority,
       requestPath: "/api/quarantine/jobs",
       idempotencyKey: input.idempotencyKey,
       confirmationHash: input.confirmationHash,
-    });
-    this.dependencies.launch(job.id, scope);
+    }));
+    if (job.status === "queued" && !job.isCanary) this.dependencies.launch(job.id, scope);
     return job;
   }
 

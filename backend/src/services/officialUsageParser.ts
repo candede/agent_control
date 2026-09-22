@@ -102,6 +102,8 @@ export function parseOfficialUsageReport(
       max_record_size: limits.maxFieldBytes * 16,
       relax_column_count: false,
       skip_empty_lines: true,
+      // Read the header and one excess row so oversized reports fail without parsing their remainder.
+      to: limits.maxRows + 2,
       trim: true,
     }) as string[][];
   } catch {
@@ -146,7 +148,8 @@ export function parseOfficialUsageReport(
   }
   const rows = records.map(parseUserRow);
   validateUnique(rows, row => row.username, "username");
-  safeSum(rows.flatMap(row => [row.numberOfAgentsUsed, row.agentResponsesReceived]));
+  safeSum(rows.map(row => row.numberOfAgentsUsed));
+  safeSum(rows.map(row => row.agentResponsesReceived));
   return { ...reportBase(schema, metadata, rows), kind: schema, rows };
 }
 
@@ -192,7 +195,7 @@ function parseAgentRow(record: Record<string, string>, index: number): AgentUsag
   const activeUsersLicensed = requiredCount(record, "active users (licensed)", index);
   const activeUsersUnlicensed = requiredCount(record, "active users (unlicensed)", index);
   return {
-    agentId: requiredText(record, "agent id", index, 512),
+    agentId: requiredAgentId(record, index),
     agentName: optionalText(record, "agent name", index, 512),
     creatorType: optionalText(record, "creator type", index, 128),
     activeUsersLicensed,
@@ -204,7 +207,7 @@ function parseAgentRow(record: Record<string, string>, index: number): AgentUsag
 
 function parseUserAgentRow(record: Record<string, string>, index: number): UserAgentUsageRow {
   return {
-    agentId: requiredText(record, "agent id", index, 512),
+    agentId: requiredAgentId(record, index),
     agentName: optionalText(record, "agent name", index, 512),
     creatorType: optionalText(record, "creator type", index, 128),
     username: requiredText(record, "username", index, 512),
@@ -239,6 +242,14 @@ function requiredText(record: Record<string, string>, field: string, index: numb
   const value = optionalText(record, field, index, maxLength);
   if (!value) {
     throw rowError(index, "missing_required_value", `is missing ${field}`);
+  }
+  return value;
+}
+
+function requiredAgentId(record: Record<string, string>, index: number) {
+  const value = requiredText(record, "agent id", index, 512);
+  if (/[\r\n]/.test(value)) {
+    throw rowError(index, "invalid_identifier", "has an invalid agent id value");
   }
   return value;
 }
@@ -412,5 +423,8 @@ function isValidUtcDate(year: number, month: number, day: number) {
 }
 
 function monthIndex(value: string) {
-  return ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(value.slice(0, 3).toLowerCase());
+  const month = value.toLowerCase();
+  if (month === "sept") return 8;
+  return ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+    .findIndex(name => month === name || month === name.slice(0, 3));
 }

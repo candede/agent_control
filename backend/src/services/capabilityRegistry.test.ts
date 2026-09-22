@@ -7,7 +7,9 @@ describe("capability registry", () => {
     expect(capabilityDefinitions.map(definition => definition.id)).toEqual(capabilityIds);
     expect(new Set(capabilityDefinitions.map(definition => definition.id)).size).toBe(16);
     for (const definition of capabilityDefinitions) {
+      expect(definition.sources, definition.id).not.toHaveLength(0);
       expect(definition.sources.every(source => source.startsWith("https://learn.microsoft.com/"))).toBe(true);
+      expect(definition.internalRoles, definition.id).not.toHaveLength(0);
       expect(definition.internalRoles.every(role => appRoles.includes(role))).toBe(true);
       expect(definition.probe.adapterRegistered || definition.probe.kind === "not_registered").toBe(true);
     }

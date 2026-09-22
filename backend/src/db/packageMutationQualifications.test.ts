@@ -6,7 +6,8 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { runBulkJob } from "../services/bulkJobs.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
-import { assessCanaryRestoration, PackageMutationQualificationRepository } from "./packageMutationQualifications.js";
+import { assessCanaryRestoration, packageCanaryMutation, PackageMutationQualificationRepository } from "./packageMutationQualifications.js";
+import type { PackageAccessMutationState } from "../services/packageMutationState.js";
 import { migrations, verifySchema } from "./schema.js";
 import { transaction } from "./pool.js";
 
@@ -111,6 +112,36 @@ describe("Package mutation qualifications", () => {
     })).rejects.toMatchObject({ code: "invalid_qualification_state" });
   });
 
+  it.each(["update-availability", "update-installation"] as const)("retains inverse %s approvals and publishes both verified cycle stages", async action => {
+    const accessPrestate: PackageAccessMutationState = {
+      kind: "access", availableTo: "some", deployedTo: "some",
+      allowedUsersAndGroups: [{ resourceType: "user", resourceId: "11111111-1111-4111-8111-111111111111" }],
+      acquireUsersAndGroups: [{ resourceType: "group", resourceId: "22222222-2222-4222-8222-222222222222" }],
+    };
+    const accessPoststate: PackageAccessMutationState = action === "update-availability"
+      ? { ...accessPrestate, availableTo: "none", allowedUsersAndGroups: [] }
+      : { ...accessPrestate, deployedTo: "none", acquireUsersAndGroups: [] };
+    const input = { ...qualificationInput(), targetId: `access-cycle-${action}`, action, prestate: accessPrestate, poststate: accessPoststate };
+    const superseded = await qualifications.createApproved(administrator, input);
+    const restoration = await qualifications.createApproved(administrator, { ...input, prestate: accessPoststate, poststate: accessPrestate });
+    expect(await qualifications.getApproved(operator, superseded.id)).toBeDefined();
+    const original = await qualifications.createApproved(administrator, input);
+    expect(await qualifications.getApproved(operator, superseded.id)).toBeUndefined();
+    expect(await qualifications.getApproved(operator, restoration.id)).toBeDefined();
+    const completed = await executeClaimedCycle(await qualifications.claimCycle(operator, original.id, restoration.id, identity(), identity()));
+    expect(completed).toMatchObject({
+      original: { status: "qualified", action, cycleStage: "original", prestate: accessPrestate, poststate: accessPoststate },
+      restoration: { status: "qualified", action, cycleStage: "restoration", prestate: accessPoststate, poststate: accessPrestate },
+    });
+    expect(await qualifications.current("tenant-1", action, "a".repeat(64), 7)).toMatchObject({ status: "qualified", targetId: input.targetId });
+    const replacementOriginal = await qualifications.createApproved(administrator, input);
+    const replacementRestoration = await qualifications.createApproved(administrator, { ...input, prestate: accessPoststate, poststate: accessPrestate });
+    await executeClaimedCycle(await qualifications.claimCycle(operator, replacementOriginal.id, replacementRestoration.id, identity(), identity()));
+    const records = (await qualifications.list(administrator, 100)).value.filter(record => record.action === action && record.targetId === input.targetId);
+    expect(records.filter(record => record.status === "qualified")).toHaveLength(2);
+    expect(records.filter(record => record.id === original.id || record.id === restoration.id).map(record => record.status)).toEqual(["expired", "expired"]);
+  });
+
   it("invalidates an approved intent when its contract or configuration changes", async () => {
     const approvals = await createApprovals("invalidated");
     await expect(qualifications.claimCycle(operator, approvals.original.id, approvals.restoration.id, { ...identity(), configurationRevision: 8 }, identity())).rejects.toMatchObject({ code: "qualification_invalidated" });
@@ -168,17 +199,30 @@ async function createApprovals(targetId: string) {
 }
 
 async function executeClaimedCycle(claimed: Awaited<ReturnType<PackageMutationQualificationRepository["claimCycle"]>>) {
-  let blocked = false;
+  let state = {
+    id: claimed.original.targetId, displayName: "Canary", isBlocked: false,
+    ...claimed.original.prestate,
+  };
   const provider = new GraphPackagesClient(async (url, request) => {
     if (request?.method === "POST") {
-      blocked = new URL(url).pathname.endsWith("/block");
+      state.isBlocked = new URL(url).pathname.endsWith("/block");
       return new Response(null, { status: 204 });
     }
-    return Response.json({ id: claimed.original.targetId, displayName: "Canary", isBlocked: blocked });
+    if (request?.method === "PATCH") {
+      const payload = JSON.parse(String(request.body));
+      state = {
+        ...state, ...payload,
+        availableTo: payload.allowedUsersAndGroups.length ? "some" : "none",
+        deployedTo: payload.acquireUsersAndGroups.length ? "some" : "none",
+      };
+      return new Response(null, { status: 204 });
+    }
+    return Response.json(state);
   });
   for (const approval of [claimed.original, claimed.restoration]) {
     const intent: JobIntentInput = {
       action: approval.action,
+      accessUpdate: packageCanaryMutation(approval).accessUpdate,
       targets: [{ id: approval.targetId, displayName: "Canary", prestate: approval.prestate }],
       actor: operator,
       requestPath: `/fixture/canary/${approval.cycleStage}`,

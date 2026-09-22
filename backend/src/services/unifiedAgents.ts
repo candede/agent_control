@@ -41,7 +41,7 @@ import {
 } from "./packageAgentIdentity.js";
 import { powerPlatformAgentKey } from "./inventoryIdentity.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
-import { getAuditLog } from "./auditLog.js";
+import { AuditLog } from "./auditLog.js";
 import { agentColumnValue, matchesAgentView, packageAuthoringTool, summarizeAgentAvailability, type AgentColumnValue } from "../types/agentPresentation.js";
 import { agentUsage, combineAgentInventoryRevision } from "./agentUsage.js";
 import { savedAgentPeople } from "./savedAgentPeople.js";
@@ -50,7 +50,7 @@ export type UnifiedAgentDependencies = {
   packages: Pick<PackageInventoryRepository, "readUnifiedSource">;
   powerPlatform: Pick<PowerPlatformInventoryRepository, "readUnifiedSource">;
   resolveLinks: typeof resolvePackageAgentLinks;
-  operationPackageIds: (scope: PackageDataScope, ids: readonly string[], prefix: string) => Promise<string[]>;
+  operationPackageIds: (scope: PackageDataScope, ids: readonly string[], prefix: string, database?: pg.PoolClient) => Promise<string[]>;
   registry?: Pick<UnifiedAgentRegistry, "withSnapshot" | "reconcile">;
   readRevision: typeof readUnifiedInventoryRevision;
   usage: Pick<typeof agentUsage, "project" | "revision">;
@@ -61,7 +61,7 @@ const defaultDependencies: UnifiedAgentDependencies = {
   packages: new PackageInventoryRepository(),
   powerPlatform: new PowerPlatformInventoryRepository(),
   resolveLinks: resolvePackageAgentLinks,
-  operationPackageIds: (scope, ids, prefix) => getAuditLog(scope).matchingOperationPackageIds(ids, prefix),
+  operationPackageIds: (scope, ids, prefix, database) => new AuditLog(scope, database).matchingOperationPackageIds(ids, prefix),
   registry: new UnifiedAgentRegistry(),
   readRevision: readUnifiedInventoryRevision,
   usage: agentUsage,
@@ -197,7 +197,7 @@ export class UnifiedAgentsService {
     const byLabel = (left: { value: string; label: string }, right: { value: string; label: string }) =>
       left.label.localeCompare(right.label) || left.value.localeCompare(right.value);
     const referenceIds = query.operationIdPrefix
-      ? new Set(await this.dependencies.operationPackageIds(scope, usablePackages.map(value => value.id), query.operationIdPrefix))
+      ? new Set(await this.dependencies.operationPackageIds(scope, usablePackages.map(value => value.id), query.operationIdPrefix, database))
       : undefined;
     const filtered = records.filter(record => (!selected || selected.has(record)) && matches(record, query)
       && (!referenceIds || record.packages.some(value => referenceIds.has(value.id))));

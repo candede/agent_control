@@ -359,12 +359,13 @@ export class PurviewAuditRepository {
   async fail(scope: PurviewAuditScope, id: string, execution: PurviewAuditExecution, code: string, message: string, inconclusive = false) {
     const status = inconclusive ? "inconclusive" : "failed";
     await transaction(this.database, async client => {
-      await this.fence(client, scope, id, execution);
+      const job = await this.fence(client, scope, id, execution);
+      const remoteWorkMayContinue = job.attempted_at !== null && (job.provider_status === null || ["notStarted", "running"].includes(job.provider_status));
       await client.query(`UPDATE purview_audit_jobs SET status=$4,error_code=$5,message=$6,
-        remote_work_may_continue=$7 AND attempted_at IS NOT NULL AND (provider_status IS NULL OR provider_status IN ('notStarted','running')),
+        remote_work_may_continue=$7,
         finished_at=clock_timestamp(),updated_at=clock_timestamp(),execution_owner=NULL
         WHERE id=$1 AND tenant_id=$2 AND result_scope_id=$3 AND execution_owner=$8 AND execution_version=$9`,
-      [id, scope.tenantId, scope.resultScope.scopeId, status, safeCode(code), message.slice(0, 1024), inconclusive, execution.owner, execution.version]);
+      [id, scope.tenantId, scope.resultScope.scopeId, status, safeCode(code), message.slice(0, 1024), remoteWorkMayContinue, execution.owner, execution.version]);
       await client.query(`UPDATE purview_audit_qualifications SET status=$3,error_code=$4,finished_at=clock_timestamp(),updated_at=clock_timestamp()
         WHERE tenant_id=$1 AND job_id=$2 AND status IN ('approved','running')`, [scope.tenantId, id, status, safeCode(code)]);
     });

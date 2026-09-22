@@ -15,6 +15,10 @@ export type AgentPersonObservation = {
   errorCode?: string;
 };
 
+export type CachedAgentPerson = SavedAgentPerson & {
+  lastConclusiveAt: string | null;
+};
+
 type CacheRow = {
   object_id: string;
   status: AgentPersonObservation["status"];
@@ -53,7 +57,7 @@ export class AgentPeopleRepository {
     return result.rows.map(row => row.id).filter(isDirectoryObjectId);
   }
 
-  async read(scope: DataSyncScope, ids: readonly string[], database: Pick<pg.Pool, "query"> = this.database): Promise<SavedAgentPerson[]> {
+  async read(scope: DataSyncScope, ids: readonly string[], database: Pick<pg.Pool, "query"> = this.database): Promise<CachedAgentPerson[]> {
     validateScope(scope);
     const requested = validIds(ids);
     if (!requested.length) return [];
@@ -65,6 +69,7 @@ export class AgentPeopleRepository {
       objectId: row.object_id, status: row.status, displayName: row.display_name,
       userPrincipalName: row.user_principal_name, observedAt: (row.resolved_at ?? row.checked_at).toISOString(),
       checkedAt: row.checked_at.toISOString(), expiresAt: row.expires_at.toISOString(),
+      lastConclusiveAt: (row.status === "not_found" ? row.checked_at : row.resolved_at)?.toISOString() ?? null,
       ...(row.error_code ? { errorCode: row.error_code } : {}),
     }));
   }
@@ -96,6 +101,7 @@ export class AgentPeopleRepository {
       if (count.rows[0].count + ids.length > 100_000) throw new AppError(413, "agent_people_limit", "The saved people cache exceeded its identity limit.");
       for (const value of observations) {
         const days = value.status === "resolved" ? 7 : value.status === "not_found" ? 1 : 1 / 96;
+        // Preserve a previous 404's time through failed retries so older roster labels cannot return.
         await client.query(`INSERT INTO agent_people_cache(tenant_id,principal_id,object_id,revision,status,
             display_name,user_principal_name,checked_at,resolved_at,expires_at,error_code)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,CASE WHEN $5='resolved' THEN $8::timestamptz ELSE NULL END,
@@ -105,7 +111,9 @@ export class AgentPeopleRepository {
             expires_at=EXCLUDED.expires_at,error_code=EXCLUDED.error_code,
             display_name=CASE WHEN EXCLUDED.status='lookup_failed' THEN agent_people_cache.display_name ELSE EXCLUDED.display_name END,
             user_principal_name=CASE WHEN EXCLUDED.status='lookup_failed' THEN agent_people_cache.user_principal_name ELSE EXCLUDED.user_principal_name END,
-            resolved_at=CASE WHEN EXCLUDED.status='lookup_failed' THEN agent_people_cache.resolved_at ELSE EXCLUDED.resolved_at END
+            resolved_at=CASE WHEN EXCLUDED.status='lookup_failed' THEN
+              CASE WHEN agent_people_cache.status='not_found' THEN agent_people_cache.checked_at ELSE agent_people_cache.resolved_at END
+              ELSE EXCLUDED.resolved_at END
           WHERE agent_people_cache.checked_at<=EXCLUDED.checked_at`,
         [scope.tenantId, scope.principalId, value.objectId.toLowerCase(), randomUUID(), value.status,
           value.displayName, value.userPrincipalName, value.checkedAt, days, value.errorCode ?? null]);

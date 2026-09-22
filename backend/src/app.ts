@@ -89,10 +89,11 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   });
   policyRoute(app, "get", "/api/diagnostics", { access: "authenticated", dataClass: "operational_metadata", roles: ["AgentControl.Admin"] }, async (_request, response) => {
     const state = await readOperationalState(database);
+    const maintenance = maintenanceActive() || state.mode !== "normal";
     response.json({
       authConfigured,
-      maintenance: maintenanceActive() || state.mode !== "normal",
-      providerWorkEnabled: providerWorkEnabled() && state.providerWorkEnabled,
+      maintenance,
+      providerWorkEnabled: !maintenance && providerWorkEnabled() && state.providerWorkEnabled,
       schemaVersion: migrations.length,
       limits: { databasePool: 4, requestBodyBytes: 524_288, exportDeadlineSeconds: 15 },
     });

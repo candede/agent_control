@@ -76,12 +76,55 @@ describe("parseOfficialUsageReport", () => {
     },
   );
 
+  it.each([
+    ["Jan", "January"], ["Feb", "February"], ["Mar", "March"], ["Apr", "April"],
+    ["May", "May"], ["Jun", "June"], ["Jul", "July"], ["Aug", "August"],
+    ["Sep", "September"], ["Oct", "October"], ["Nov", "November"], ["Dec", "December"],
+  ])("recognizes only complete English month names and abbreviations for %s", (short, full) => {
+    const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].indexOf(short) + 1;
+    for (const date of [`${short.toUpperCase()}. 6, 2026`, `6 ${full.toLowerCase()} 2026`]) {
+      const report = parseOfficialUsageReport(bytes(userAgentCsv(date)));
+      expect(report.rows[0].lastActivityDateUtc).toBe(`2026-${String(month).padStart(2, "0")}-06T00:00:00.000Z`);
+    }
+  });
+
+  it.each(["Sept 6, 2026", "6 Sept. 2026"])("supports the English September abbreviation %s", date => {
+    expect(parseOfficialUsageReport(bytes(userAgentCsv(date))).rows[0].lastActivityDateUtc)
+      .toBe("2026-09-06T00:00:00.000Z");
+  });
+
+  it.each(["Junk 6, 2026", "6 Jultypo 2026", "Marching 6, 2026", "6 Septemberish 2026"])(
+    "rejects invalid month names instead of accepting a prefix in %s",
+    date => {
+      expect(() => parseOfficialUsageReport(bytes(userAgentCsv(date))))
+        .toThrowError(expect.objectContaining({ code: "invalid_date" }));
+    },
+  );
+
   it("handles UTF-8 BOM, quoted commas, escaped quotes and embedded newlines", () => {
     const report = parseOfficialUsageReport(
       bytes(`\uFEFF${userAgentCsv("2026-07-06", "Research, \"\"North\"\"\nassistant")}`),
       metadata,
     );
-    expect(report.rows[0].agentName).toBe('Research, "North"\nassistant');
+    expect(report.rows[0]).toMatchObject({ agentName: 'Research, "North"\nassistant' });
+  });
+
+  it.each(["\n", "\r", "\r\n"])("rejects embedded line breaks in agent IDs (%j) before staging unreachable identities", newline => {
+    for (const csv of [
+      [
+        "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)",
+        `"agent${newline}1",Assistant,Declarative,1,0,42,2026-07-06`,
+      ].join("\n"),
+      userAgentCsv("2026-07-06").replace("agent-1", `"agent${newline}1"`),
+    ]) {
+      expect(() => parseOfficialUsageReport(bytes(csv)))
+        .toThrowError(expect.objectContaining({ code: "invalid_identifier" }));
+    }
+  });
+
+  it.each(["Report/% Agent?x=1#[]&:=+", "a".repeat(512)])("preserves supported opaque agent IDs (%s)", agentId => {
+    const report = parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06").replace("agent-1", agentId)));
+    expect(report.rows[0]).toMatchObject({ agentId });
   });
 
   it("labels operator assertions while keeping source freshness unknown", () => {
@@ -129,6 +172,32 @@ describe("parseOfficialUsageReport", () => {
     },
   );
 
+  it("validates Users metric totals independently without adding agents to responses", () => {
+    const report = parseOfficialUsageReport(bytes([
+      "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)",
+      "first,First,1,9007199254740990,2026-07-06",
+      "second,Second,9007199254740990,1,2026-07-06",
+    ].join("\n")));
+    expect(report.kind).toBe("users");
+    expect(report.rows).toMatchObject([
+      { numberOfAgentsUsed: 1, agentResponsesReceived: 9007199254740990 },
+      { numberOfAgentsUsed: 9007199254740990, agentResponsesReceived: 1 },
+    ]);
+  });
+
+  it.each([
+    ["9007199254740991,0", "1,0"],
+    ["0,9007199254740991", "0,1"],
+  ])("rejects overflow within either Users metric total (%s)", (first, second) => {
+    const csv = [
+      "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)",
+      `first,First,${first},2026-07-06`,
+      `second,Second,${second},2026-07-06`,
+    ].join("\n");
+    expect(() => parseOfficialUsageReport(bytes(csv)))
+      .toThrowError(expect.objectContaining({ code: "numeric_overflow" }));
+  });
+
   it("rejects caller claims of source metadata because supported CSVs contain no metadata columns", () => {
     expect(() => parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06")), {
       ...metadata,
@@ -161,6 +230,29 @@ describe("parseOfficialUsageReport", () => {
       maxRows: 1,
       maxFieldBytes: 128,
     })).toThrowError(expect.objectContaining({ code: "row_limit_exceeded" }));
+  });
+
+  it("stops CSV parsing at the first excess row instead of parsing the remaining records", () => {
+    const csv = [
+      userAgentCsv("2026-07-06"),
+      "agent-2,Other,Declarative,other@example.com,1,2026-07-06",
+      '"unterminated trailing record',
+    ].join("\n");
+    expect(() => parseOfficialUsageReport(bytes(csv), undefined, {
+      maxBytes: 10_000,
+      maxRows: 1,
+      maxFieldBytes: 128,
+    })).toThrowError(expect.objectContaining({ code: "row_limit_exceeded" }));
+  });
+
+  it("counts CSV records rather than physical lines at the exact row limit", () => {
+    const report = parseOfficialUsageReport(bytes(`\n${userAgentCsv("2026-07-06", "Research\nassistant")}\n\n`), undefined, {
+      maxBytes: 10_000,
+      maxRows: 1,
+      maxFieldBytes: 128,
+    });
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]).toMatchObject({ agentName: "Research\nassistant" });
   });
 
   it("requires exact documented periods and unambiguous real timestamps", () => {

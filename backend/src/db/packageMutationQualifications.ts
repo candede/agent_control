@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import type { AuditAction } from "../types/audit.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole } from "../types/capability.js";
+import type { PackageAccessEntity, PackageAccessUpdate } from "../types/copilotPackage.js";
 import { canonicalAccessEntities, packageMutationStatesEqual, type PackageMutationState } from "../services/packageMutationState.js";
 import { pool, transaction } from "./pool.js";
 
@@ -64,7 +65,10 @@ export class PackageMutationQualificationRepository {
         WHERE tenant_id=$1 AND target_id=$2 AND action=$3 AND auth_mode='delegated' AND status='restoring' LIMIT 1`, [tenantId, prepared.targetId, prepared.action]);
       if (active.rowCount) throw new AppError(409, "restoration_in_progress", "This exact canary target already has an in-progress restoration attempt.");
       await client.query(`UPDATE package_mutation_qualifications SET status='expired'
-        WHERE tenant_id=$1 AND target_id=$2 AND action=$3 AND auth_mode='delegated' AND status='approved'`, [tenantId, prepared.targetId, prepared.action]);
+        WHERE tenant_id=$1 AND target_id=$2 AND action=$3 AND auth_mode='delegated' AND status='approved'
+          AND NOT (workflow_version=3 AND expires_at>clock_timestamp() AND prestate=$4::jsonb AND poststate=$5::jsonb
+            AND contract_revision=$6 AND configuration_revision=$7)`,
+      [tenantId, prepared.targetId, prepared.action, prepared.poststate, prepared.prestate, prepared.contractRevision, prepared.configurationRevision]);
       const { rows } = await client.query<QualificationRow>(`INSERT INTO package_mutation_qualifications
         (id,tenant_id,target_id,target_type,action,approved_by,approved_by_principal_id,contract_revision,configuration_revision,auth_mode,prestate,poststate,restoration_criteria,status,expires_at,workflow_version)
         VALUES($1,$2,$3,'copilot_package',$4,$5,$6,$7,$8,'delegated',$9,$10,$11,'approved',clock_timestamp()+interval '30 minutes',3) RETURNING *`,
@@ -96,6 +100,8 @@ export class PackageMutationQualificationRepository {
         return { kind: "invalidated" as const };
       }
       if (!isExactInverse(original, restoration)) return { kind: "mismatch" as const };
+      packageCanaryMutation(original);
+      packageCanaryMutation(restoration);
       const claimed = await client.query<QualificationRow>(`UPDATE package_mutation_qualifications qualification SET
         status='restoring',actor_principal_id=$2,actor_name=$3,correlation_id=gen_random_uuid(),attempted_at=clock_timestamp(),expires_at=clock_timestamp()+interval '30 days',
         paired_qualification_id=CASE WHEN id=$4 THEN $5::uuid ELSE $4::uuid END,
@@ -197,8 +203,8 @@ export function assessCanaryRestoration(prestate: PackageMutationState, poststat
     return { status: "restore" as const, touchedFields: { isBlocked: prestate.isBlocked } };
   }
   if (prestate.kind === "access" && poststate.kind === "access" && current.kind === "access") {
-    const availabilityChanged = prestate.availableTo !== poststate.availableTo || !sameJson(prestate.allowedUsersAndGroups, poststate.allowedUsersAndGroups);
-    const installationChanged = prestate.deployedTo !== poststate.deployedTo || !sameJson(prestate.acquireUsersAndGroups, poststate.acquireUsersAndGroups);
+    const availabilityChanged = prestate.availableTo !== poststate.availableTo || !samePrincipals(prestate.allowedUsersAndGroups, poststate.allowedUsersAndGroups);
+    const installationChanged = prestate.deployedTo !== poststate.deployedTo || !samePrincipals(prestate.acquireUsersAndGroups, poststate.acquireUsersAndGroups);
     if (availabilityChanged === installationChanged) return { status: "conflict" as const, message: "A reversible access canary must touch exactly one access target." };
     return availabilityChanged
       ? { status: "restore" as const, touchedFields: { allowedUsersAndGroups: prestate.allowedUsersAndGroups }, preservedFields: { acquireUsersAndGroups: current.acquireUsersAndGroups } }
@@ -215,24 +221,41 @@ function validateAndProjectInput(input: QualificationInput) {
   const poststate = projectMutationState(input.poststate);
   const prepared = { ...input, targetId: input.targetId.trim(), prestate, poststate };
   const restoration = assessCanaryRestoration(prestate, poststate, poststate);
-  const expectedTouchedField = expectedCanaryTouchedField(prepared);
+  const { touchedField } = packageCanaryMutation(prepared);
   if (restoration.status !== "restore") throw new AppError(400, "invalid_qualification_state", "Qualification must prove one action-matched reversible transition.");
-  return { ...prepared, restorationCriteria: { touchedFields: [expectedTouchedField], requireCurrentEqualsPoststate: true } as RestorationCriteria };
+  return { ...prepared, restorationCriteria: { touchedFields: [touchedField], requireCurrentEqualsPoststate: true } as RestorationCriteria };
 }
 
-function expectedCanaryTouchedField(input: PreparedQualificationInput) {
+export function packageCanaryMutation(input: Pick<PreparedQualificationInput, "action" | "prestate" | "poststate">): {
+  touchedField: RestorationCriteria["touchedFields"][0];
+  accessUpdate?: PackageAccessUpdate;
+} {
   const { prestate, poststate } = input;
   if (input.action === "block" || input.action === "unblock") {
     if (prestate.kind !== "block" || poststate.kind !== "block" || prestate.isBlocked === poststate.isBlocked
       || poststate.isBlocked !== (input.action === "block")) return invalidCanaryAction();
-    return "isBlocked";
+    return { touchedField: "isBlocked" };
   }
   if (input.action === "reassign" || prestate.kind !== "access" || poststate.kind !== "access") return invalidCanaryAction();
-  const availabilityChanged = prestate.availableTo !== poststate.availableTo || !sameJson(prestate.allowedUsersAndGroups, poststate.allowedUsersAndGroups);
-  const installationChanged = prestate.deployedTo !== poststate.deployedTo || !sameJson(prestate.acquireUsersAndGroups, poststate.acquireUsersAndGroups);
-  if (input.action === "update-availability" && availabilityChanged && !installationChanged) return "allowedUsersAndGroups";
-  if (input.action === "update-installation" && installationChanged && !availabilityChanged) return "acquireUsersAndGroups";
-  return invalidCanaryAction();
+  const availabilityChanged = prestate.availableTo !== poststate.availableTo || !samePrincipals(prestate.allowedUsersAndGroups, poststate.allowedUsersAndGroups);
+  const installationChanged = prestate.deployedTo !== poststate.deployedTo || !samePrincipals(prestate.acquireUsersAndGroups, poststate.acquireUsersAndGroups);
+  if (!(input.action === "update-availability" && availabilityChanged && !installationChanged)
+    && !(input.action === "update-installation" && installationChanged && !availabilityChanged)) return invalidCanaryAction();
+
+  const target = input.action === "update-availability" ? "availability" : "installation";
+  const touchedField = target === "availability" ? "allowedUsersAndGroups" : "acquireUsersAndGroups";
+  const scopeField = target === "availability" ? "availableTo" : "deployedTo";
+  for (const state of [prestate, poststate]) {
+    const scope = state[scopeField];
+    const principalCount = state[touchedField].length;
+    if (!(scope === "none" && principalCount === 0 || scope === "some" && principalCount > 0)) {
+      throw new AppError(400, "invalid_qualification_state", "Both canary directions must use a writable access scope: none with no principals, or some with principals. All-users access cannot be restored by the documented write contract.");
+    }
+  }
+  const accessUpdate: PackageAccessUpdate = poststate[scopeField] === "none"
+    ? { target, mode: "replace", scope: "none", principals: [] }
+    : { target, mode: "replace", scope: "specific", principals: canonicalAccessEntities(poststate[touchedField]) };
+  return { touchedField, accessUpdate };
 }
 
 function invalidCanaryAction(): never {
@@ -352,6 +375,6 @@ async function requireVerifiedCycleJobs(client: pg.PoolClient, original: Qualifi
   }
 }
 
-function sameJson(left: unknown, right: unknown) {
-  return JSON.stringify(left) === JSON.stringify(right);
+function samePrincipals(left: PackageAccessEntity[], right: PackageAccessEntity[]) {
+  return JSON.stringify(canonicalAccessEntities(left)) === JSON.stringify(canonicalAccessEntities(right));
 }

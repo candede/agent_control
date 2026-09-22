@@ -55,7 +55,7 @@ const defaultDependencies: AuditDependencies = {
   random: Math.random,
 };
 
-type ActiveSearch = { actor: { tenantId: string; principalId: string }; controller: AbortController; started: Promise<PurviewAuditJob>; operation: Promise<void> };
+type ActiveSearch = { actor: { tenantId: string; principalId: string }; tokenMode: PurviewAuditTokenMode; controller: AbortController; started: Promise<PurviewAuditJob>; operation: Promise<void> };
 const maximumActiveSearches = 4;
 const activationDeadlineMs = 60_000;
 const maximumPollsPerActivation = 6;
@@ -115,9 +115,13 @@ export class PurviewAuditService {
 
   start(user: AuthenticatedUser, id: string, tokenMode: PurviewAuditTokenMode): Promise<PurviewAuditJob> {
     requireViewer(user);
+    id = id.toLowerCase();
     const actor = actorScope(user);
     const existing = this.active.get(id);
-    if (existing && existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId) return existing.started;
+    if (existing) {
+      if (existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId && existing.tokenMode === tokenMode) return existing.started;
+      return this.currentJobForStart(user, id, tokenMode);
+    }
     if (this.active.size >= maximumActiveSearches) return this.currentJobForStart(user, id, tokenMode);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(activationDeadlineMs)]);
@@ -126,7 +130,7 @@ export class PurviewAuditService {
     let operation: Promise<void>;
     operation = prepared.then(value => value.run?.()).then(() => undefined).catch(() => undefined)
       .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
-    this.active.set(id, { actor, controller, started, operation });
+    this.active.set(id, { actor, tokenMode, controller, started, operation });
     return started;
   }
 
@@ -139,8 +143,19 @@ export class PurviewAuditService {
     const qualification = current.qualificationId
       ? await abortable(this.repository.getQualification(actor.tenantId, current.qualificationId), signal)
       : undefined;
-    const activation = await abortable(this.repository.begin(scope, id), signal);
-    signal.throwIfAborted();
+    const reservation = this.repository.begin(scope, id);
+    const activation = await abortable(reservation, signal).catch(error => {
+      if (signal.aborted) {
+        // Release even if the transaction commits after the caller observed cancellation.
+        void reservation.then(reserved => this.repository.markWaitingAuthorization(scope, id, reserved), () => undefined)
+          .catch(releaseError => {
+            if (!(releaseError instanceof AppError && releaseError.code === "audit_execution_lost")) {
+              operationalLog("warn", "audit_activation_release_failed", { jobId: id });
+            }
+          });
+      }
+      throw error;
+    });
     return { job: activation.job, run: () => this.run(actor, scope, activation.job, qualification, activation.action, activation, signal, cancellationSignal) };
   }
 
@@ -176,18 +191,21 @@ export class PurviewAuditService {
 
   async cancel(user: AuthenticatedUser, id: string) {
     requireViewer(user);
+    id = id.toLowerCase();
     const readScope = await this.readScope(user);
     if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
+    const job = await this.repository.cancel(readScope, id);
     this.active.get(id)?.controller.abort(new AppError(409, "audit_cancelled", "Audit Search was cancelled locally."));
-    return this.repository.cancel(readScope, id);
+    return job;
   }
 
   async delete(user: AuthenticatedUser, id: string) {
     requireViewer(user);
+    id = id.toLowerCase();
     const readScope = await this.readScope(user);
     if (!await this.repository.getJob(readScope, id)) throw new AppError(404, "not_found", "Audit Search job was not found.");
-    this.active.get(id)?.controller.abort(new AppError(409, "audit_cancelled", "Audit Search local cache was deleted."));
     await this.repository.delete(readScope, id);
+    this.active.get(id)?.controller.abort(new AppError(409, "audit_cancelled", "Audit Search local cache was deleted."));
   }
 
   recover() {
@@ -239,6 +257,7 @@ export class PurviewAuditService {
         onResponse: (providerRequestId: string | null) => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId),
       };
       let query: PurviewProviderQuery | undefined;
+      let pollCount = 0;
       if (action === "create") {
         try {
           query = await this.dependencies.createQuery(token, current.displayName, current.filters, providerOptions);
@@ -257,26 +276,23 @@ export class PurviewAuditService {
       } else {
         if (!current.providerQueryId) throw new AppError(409, "audit_job_state", "Audit Search lost its provider query identity.");
         query = await this.dependencies.getQuery(token, current.providerQueryId, providerOptions);
+        pollCount += 1;
         requireBoundQuery(query, current, current.providerQueryId);
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
 
-      if (qualification && action !== "poll") {
-        const providerQueryId = query.id;
-        query = await this.dependencies.getQuery(token, providerQueryId, providerOptions);
-        requireBoundQuery(query, current, providerQueryId);
-        await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
-      }
-
-      for (let poll = 0; query.status !== "succeeded" && poll < maximumPollsPerActivation; poll += 1) {
+      let qualificationPollRequired = Boolean(qualification && action !== "poll");
+      while (query.status !== "succeeded" || qualificationPollRequired) {
         if (["failed", "cancelled", "unknownFutureValue"].includes(query.status)) throw new AppError(502, "provider_query_failed", `Microsoft Graph Audit Search ended with status ${query.status}.`);
-        await this.dependencies.wait(1_000 + Math.floor(this.dependencies.random() * 2_000), signal);
+        if (pollCount >= maximumPollsPerActivation) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
+        if (!qualificationPollRequired) await this.dependencies.wait(1_000 + Math.floor(this.dependencies.random() * 2_000), signal);
+        qualificationPollRequired = false;
         const providerQueryId = query.id;
         query = await this.dependencies.getQuery(token, providerQueryId, providerOptions);
+        pollCount += 1;
         requireBoundQuery(query, current, providerQueryId);
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
-      if (query.status !== "succeeded") { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
       const result = await this.dependencies.listRecords(token, query.id, actor.tenantId, providerOptions);
       throwIfCancelled(signal);
       if (signal.aborted) {
@@ -297,7 +313,8 @@ export class PurviewAuditService {
         (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
       if (evidenceCapabilityId && job.status === "succeeded") {
         try {
-          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available", { providerRequestId: job.providerRequestId }), publicationSignal);
+          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available",
+            { providerRequestId: job.providerRequestId }, qualification?.configurationRevision), publicationSignal);
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_success" });
         }
@@ -318,7 +335,7 @@ export class PurviewAuditService {
           const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), evidenceSignal);
           await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, evidenceUser, qualificationEvidenceStatus(error), {
             category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
-          }), evidenceSignal);
+          }, qualification?.configurationRevision), evidenceSignal);
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_failure" });
         }

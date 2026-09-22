@@ -42,7 +42,7 @@ export function buildBoundedCsv(
   if (Date.now() >= budget.deadlineAt) throw publicationError(false);
   if (byteCount > budget.maximumBytes) throw new AppError(413, "export_byte_limit", "The export header exceeds its byte limit.");
   for (const row of rows) {
-    if (Date.now() > budget.deadlineAt) throw new AppError(408, "export_deadline", "The export exceeded its processing deadline.");
+    if (Date.now() >= budget.deadlineAt) throw new AppError(408, "export_deadline", "The export exceeded its processing deadline.");
     rowCount += 1;
     if (rowCount > budget.maximumRows) throw new AppError(413, "export_row_limit", `The export exceeds the ${budget.maximumRows.toLocaleString("en-US")} row limit.`);
     const chunk = Buffer.from(`${columns.map(column => csvValue(row[column])).join(",")}\r\n`, "utf8");
@@ -50,7 +50,9 @@ export function buildBoundedCsv(
     if (byteCount > budget.maximumBytes) throw new AppError(413, "export_byte_limit", `The export exceeds the ${budget.maximumBytes.toLocaleString("en-US")} byte limit.`);
     chunks.push(chunk);
   }
-  return { buffer: Buffer.concat(chunks, byteCount), rowCount, byteCount };
+  const buffer = Buffer.concat(chunks, byteCount);
+  if (Date.now() >= budget.deadlineAt) throw new AppError(408, "export_deadline", "The export exceeded its processing deadline.");
+  return { buffer, rowCount, byteCount };
 }
 
 export async function publishBoundedCsv(
@@ -75,11 +77,15 @@ export async function publishBoundedCsv(
   response.once("error", disconnect);
   try {
     if (request.aborted || response.destroyed) disconnect();
-    if (Date.now() >= options.deadlineAt) cancellation.abort(publicationError(false));
+    const assertActive = () => {
+      // A ready promise or synchronous write can finish before an overdue timer runs.
+      if (Date.now() >= options.deadlineAt) cancellation.abort(publicationError(false));
+      signal.throwIfAborted();
+    };
     const validate = async () => {
-      signal.throwIfAborted();
+      assertActive();
       await abortableRead(options.validate(), signal);
-      signal.throwIfAborted();
+      assertActive();
     };
     await validate();
     for (let offset = 0; offset < csv.byteLength; offset += chunkBytes) {
@@ -89,6 +95,7 @@ export async function publishBoundedCsv(
         await options.beforeEnd?.();
         if (options.beforeEnd) await validate();
       }
+      assertActive();
       if (offset === 0) {
         response.setHeader("Content-Type", "text/csv; charset=utf-8");
         response.setHeader("Content-Disposition", `attachment; filename=${filename}`);
@@ -99,7 +106,9 @@ export async function publishBoundedCsv(
         await waitForDrain(response, signal);
       }
     }
+    assertActive();
     await endResponse(response, signal);
+    assertActive();
   } finally {
     clearTimeout(deadline);
     request.removeListener("aborted", disconnect);

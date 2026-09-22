@@ -18,7 +18,7 @@ function query(status: PurviewProviderQuery["status"] = "running"): PurviewProvi
   return { id: "provider-1", status, ...createProviderQueryBody(marker, filters) };
 }
 
-function response(value: unknown, status = 200, headers?: HeadersInit) {
+function response(value: unknown, status = 200, headers?: Record<string, string>) {
   return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
@@ -102,8 +102,8 @@ describe("Graph Audit Search selected v1.0 contract", () => {
   });
 
   it("creates once and accepts only a direct query object", async () => {
-    const fetcher = vi.fn(async () => response(query("notStarted"), 201));
-    const client = new GraphAuditSearchClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
+    const fetcher = vi.fn<typeof fetch>(async () => response(query("notStarted"), 201));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
     await expect(client.createQuery("token", marker, filters)).resolves.toMatchObject({ id: "provider-1", serviceFilter: "Copilot" });
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual(createProviderQueryBody(marker, filters));
@@ -121,14 +121,51 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     await expect(recordsClient.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_error" });
   });
 
-  it("never retries an ambiguous create and reconciles by exact marker and filters", async () => {
+  it("never retries an ambiguous create", async () => {
     const fetcher = vi.fn(async () => { throw new TypeError("socket reset"); });
     const client = new GraphAuditSearchClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(client.createQuery("token", marker, filters)).rejects.toMatchObject({ code: "audit_create_inconclusive" });
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(providerQueryMatches(query(), marker, filters)).toBe(true);
-    expect(providerQueryMatches({ ...query(), operationFilters: [...query().operationFilters].reverse() }, marker, filters)).toBe(true);
-    expect(providerQueryMatches({ ...query(), operationFilters: ["Other"] }, marker, filters)).toBe(false);
+  });
+
+  it("reconciles by exact marker and filters regardless of list order", () => {
+    const approvedFilters: PurviewAuditFilters = {
+      ...filters, presetId: "copilot_studio_admin", operations: ["BotCreate", "BotDelete"],
+      userPrincipalNames: ["alice@example.invalid", "bob@example.invalid"],
+      ipAddresses: ["192.0.2.1", "192.0.2.2"],
+      objectIds: ["bot-1", "bot-2"],
+      administrativeUnitIds: ["66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"],
+    };
+    const providerQuery: PurviewProviderQuery = {
+      id: "provider-1", status: "running", ...createProviderQueryBody(marker, approvedFilters),
+    };
+    expect(validatePurviewAuditFilters(approvedFilters, { now })).toEqual(approvedFilters);
+    expect(providerQueryMatches(providerQuery, marker, approvedFilters)).toBe(true);
+    expect(providerQueryMatches({
+      ...providerQuery,
+      operationFilters: [...providerQuery.operationFilters].reverse(),
+      userPrincipalNameFilters: [...providerQuery.userPrincipalNameFilters].reverse(),
+      ipAddressFilters: [...providerQuery.ipAddressFilters].reverse(),
+      objectIdFilters: [...providerQuery.objectIdFilters].reverse(),
+      administrativeUnitIdFilters: [...providerQuery.administrativeUnitIdFilters].reverse(),
+    }, marker, approvedFilters)).toBe(true);
+
+    const mismatches: Partial<PurviewProviderQuery>[] = [
+      { displayName: `${marker}-other` },
+      { filterStartDateTime: "2026-09-09T10:00:00.000Z" },
+      { filterEndDateTime: "2026-09-09T11:59:00.000Z" },
+      { serviceFilter: "Copilot" },
+      { recordTypeFilters: ["copilotInteraction"] },
+      { operationFilters: ["BotCreate", "BotPublish"] },
+      { operationFilters: ["BotCreate"] },
+      { userPrincipalNameFilters: ["alice@example.invalid", "other@example.invalid"] },
+      { ipAddressFilters: ["192.0.2.1", "192.0.2.3"] },
+      { objectIdFilters: ["bot-1", "bot-3"] },
+      { administrativeUnitIdFilters: ["66666666-6666-4666-8666-666666666666", tenantId] },
+    ];
+    for (const mismatch of mismatches) {
+      expect(providerQueryMatches({ ...providerQuery, ...mismatch }, marker, approvedFilters), JSON.stringify(mismatch)).toBe(false);
+    }
   });
 
   it("treats a failed 201 response stream as an inconclusive create without another POST", async () => {
@@ -149,14 +186,14 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     await expect(pluralClient.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
-  it("uses numeric and HTTP-date Retry-After only for idempotent reads and cancels retry bodies", async () => {
+  it.each(["2", "Wed, 09 Sep 2026 12:00:02 GMT"])("uses Retry-After %s for idempotent reads and cancels retry bodies", async retryAfter => {
     const wait = vi.fn(async () => undefined);
     const beforeRequest = vi.fn(async () => undefined);
     const onResponse = vi.fn(async () => undefined);
     const cancel = vi.fn(async () => undefined);
     const retryBody = new ReadableStream({ cancel });
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(new Response(retryBody, { status: 429, headers: { "retry-after": "Wed, 09 Sep 2026 12:00:02 GMT", date: "Wed, 09 Sep 2026 12:00:00 GMT", "request-id": "request-1" } }))
+      .mockResolvedValueOnce(new Response(retryBody, { status: 429, headers: { "retry-after": retryAfter, date: "Wed, 09 Sep 2026 12:00:00 GMT", "request-id": "request-1" } }))
       .mockResolvedValueOnce(response(query("succeeded"), 200, { "request-id": "request-2" }));
     const client = new GraphAuditSearchClient({ fetch: fetcher as typeof fetch, wait, random: () => 0, now: () => 0 });
     await expect(client.getQuery("token", "provider-1", { beforeRequest, onResponse })).resolves.toMatchObject({ status: "succeeded" });
@@ -174,6 +211,53 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     await expect(client.getQuery("token", "provider-1")).rejects.toMatchObject({ code: "provider_throttled" });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(wait).not.toHaveBeenCalled();
+  });
+
+  it.each([201, 302, 401, 403, 429, 503])("cancels every rejected read response body for status %s", async status => {
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), { status }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.getQuery("token", "provider-1")).rejects.toBeInstanceOf(AppError);
+    expect(cancel).toHaveBeenCalledTimes(fetcher.mock.calls.length);
+  });
+
+  it("cancels a rejected create response without retrying the POST", async () => {
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), { status: 200 }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.createQuery("token", marker, filters)).rejects.toMatchObject({ code: "provider_error" });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["beforeRequest", "onResponse"] as const)("does not retry unexpected %s failures as network errors", async hook => {
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel })));
+    const wait = vi.fn();
+    const callback = vi.fn(async () => { throw new TypeError("local bookkeeping failed"); });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait, random: () => 0 });
+    await expect(client.getQuery("token", "provider-1", { [hook]: callback })).rejects.toMatchObject({ status: 500, code: "internal_error" });
+    expect(callback).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
+    expect(cancel).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it.each(["beforeRequest", "onResponse"] as const)("bounds stalled %s callbacks by the attempt deadline", async hook => {
+    const cancel = vi.fn(async () => undefined);
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 5 });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await expect(Promise.race([
+        client.getQuery("token", "provider-1", { [hook]: () => new Promise<void>(() => undefined) }),
+        new Promise(resolve => { timer = setTimeout(() => resolve("attempt deadline ignored"), 200); }),
+      ])).rejects.toMatchObject({ code: "provider_error" });
+      expect(fetcher).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
+      expect(cancel).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
+    } finally {
+      clearTimeout(timer);
+    }
   });
 
   it("cancels an unread response when durable response recording rejects it", async () => {
@@ -299,10 +383,77 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_schema" });
   });
 
+  it("matches tenant UUIDs and deduplicates native UUIDs without case sensitivity", async () => {
+    const tenant = "abcdefab-abcd-abcd-abcd-abcdefabcdef";
+    const nativeId = "abcdefab-abcd-4bcd-8bcd-abcdefabcdef";
+    const first = { ...recordWithDynamicProperties({ ID: nativeId, OrganizationId: tenant }), organizationId: tenant.toUpperCase() };
+    const second = { ...recordWithDynamicProperties({ ID: nativeId.toUpperCase(), OrganizationId: tenant.toUpperCase() }), id: "wrapper-2", organizationId: tenant };
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [first, second] })), wait: vi.fn(), random: () => 0 });
+    const result = await client.listRecords("token", "provider-1", tenant.toUpperCase());
+    expect(result).toMatchObject({ complete: true, providerRowCount: 2, storedRowCount: 1 });
+    expect(result.records[0]?.nativeEventId).toBe(nativeId);
+  });
+
+  it("rejects conflicting native rows even when their UUID casing differs", async () => {
+    const id = "abcdefab-abcd-4bcd-8bcd-abcdefabcdef";
+    const first = recordWithDynamicProperties({ ID: id });
+    const second = { ...recordWithDynamicProperties({ ID: id.toUpperCase() }), id: "wrapper-2", operation: "Other" };
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [first, second] })), wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each(["create", "get", "list", "records"] as const)("classifies malformed %s timestamps as provider schema failures", async operation => {
+    const malformedQuery = { ...query(), filterStartDateTime: "2026-02-30T11:00:00.000Z" };
+    const value = operation === "records" ? { value: [record({ createdDateTime: "not-a-timestamp" })] }
+      : operation === "list" ? { value: [malformedQuery] } : malformedQuery;
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response(value, operation === "create" ? 201 : 200)), wait: vi.fn(), random: () => 0 });
+    const result = operation === "create" ? client.createQuery("token", marker, filters)
+      : operation === "get" ? client.getQuery("token", "provider-1")
+        : operation === "list" ? client.listQueries("token") : client.listRecords("token", "provider-1", tenantId);
+    await expect(result).rejects.toMatchObject({ status: 502, code: "provider_schema" });
+  });
+
   it("returns truthful partial coverage at a bounded page limit", async () => {
     const pages = Array.from({ length: 20 }, (_, index) => response({ value: [], "@odata.nextLink": `https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=${index + 1}` }));
     const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => pages.shift()!) as typeof fetch, wait: vi.fn(), random: () => 0 });
-    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({ complete: false, pageCount: 20, nextLink: expect.any(String) });
+    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({ complete: false, pageCount: 20, nextLink: expect.any(String), partialReason: "audit_page_limit" });
+  });
+
+  it.each([true, false])("reports the exact row boundary only when more records remain: %s", async more => {
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      return response({ value: Array.from({ length: 1000 }, () => record()),
+        ...(page < 5 || more ? { "@odata.nextLink": `https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=${page}` } : {}) });
+    });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({
+      complete: !more, providerRowCount: 5000, storedRowCount: 1, pageCount: 5, partialReason: more ? "audit_row_limit" : null,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([true, false])("reports the exact byte boundary only when more records remain: %s", async more => {
+    let page = 0;
+    const fetcher = vi.fn(async () => {
+      page += 1;
+      const value = { value: [], ...(page < 4 || more ? { "@odata.nextLink": `https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=${page}` } : {}) };
+      return new Response(JSON.stringify(value).padEnd(2_000_000, " "));
+    });
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId)).resolves.toMatchObject({
+      complete: !more, byteCount: 8_000_000, pageCount: 4, partialReason: more ? "audit_byte_limit" : null,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["beforeRequest", "onResponse"] as const)("does not publish partial rows after a local %s failure", async hook => {
+    const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next";
+    const callback = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValue(new TypeError("database failure"));
+    const fetcher = vi.fn(async () => response({ value: [record()], "@odata.nextLink": nextLink }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId, { [hook]: callback })).rejects.toMatchObject({ code: "internal_error" });
+    expect(callback).toHaveBeenCalledTimes(2);
   });
 
   it("preserves records as partial when a later page fails", async () => {
@@ -379,6 +530,35 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     const client = new GraphAuditSearchClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(client.listQueries("token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["", "provider_schema"],
+    ["not-a-url", "invalid_provider_link"],
+    ["https://example.invalid/queries", "invalid_provider_link"],
+    ["repeated", "provider_schema"],
+  ])("validates continuation %s before returning bounded query or record results", async (link, code) => {
+    const base = "https://graph.microsoft.com/v1.0/security/auditLog/queries";
+    const queryFetcher = vi.fn(async () => response({ value: [], "@odata.nextLink": link === "repeated" ? base : link }));
+    const queries = new GraphAuditSearchClient({ fetch: queryFetcher, wait: vi.fn(), random: () => 0 });
+    await expect(queries.listQueries("token", { maximumPages: 1 })).rejects.toMatchObject({ code });
+    expect(queryFetcher).toHaveBeenCalledOnce();
+
+    let page = 0;
+    const recordFetcher = vi.fn(async () => {
+      page += 1;
+      return response({ value: [], "@odata.nextLink": page < 20 ? `${base}/provider-1/records?$skiptoken=${page}` : link === "repeated" ? `${base}/provider-1/records?$skiptoken=19` : link });
+    });
+    const records = new GraphAuditSearchClient({ fetch: recordFetcher, wait: vi.fn(), random: () => 0 });
+    await expect(records.listRecords("token", "provider-1", tenantId)).rejects.toMatchObject({ code });
+    expect(recordFetcher).toHaveBeenCalledTimes(20);
+  });
+
+  it("rejects an empty record continuation instead of fabricating a partial result", async () => {
+    const fetcher = vi.fn();
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    await expect(client.listRecords("token", "provider-1", tenantId, { startUrl: "" })).rejects.toMatchObject({ code: "invalid_provider_link" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("enforces recent UTC structured filters and blocks injected fields", () => {

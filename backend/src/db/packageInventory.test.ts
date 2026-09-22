@@ -39,6 +39,26 @@ async function running(idempotencyKey: string, requestedIds?: string[]) {
 }
 
 describe.sequential("Package inventory repository", () => {
+  it("does not let retained dispatch-expired jobs exhaust fresh admission", async () => {
+    const expiredScope = { tenantId: "tenant-package-deadline", principalId: "reader-package-deadline" };
+    const input = { authorizationPrincipalId: expiredScope.principalId, tokenMode: "delegated" as const };
+    const expiredJobs = [];
+    for (let index = 0; index < 5; index += 1) {
+      expiredJobs.push(await repository.submit(expiredScope, { ...input, idempotencyKey: `expired-${index}` }));
+    }
+    await fixture.runtime.query(`UPDATE package_refresh_jobs SET deadline_at=clock_timestamp()-interval '1 second'
+      WHERE tenant_id=$1 AND principal_id=$2`, [expiredScope.tenantId, expiredScope.principalId]);
+    expect(await repository.markRunning(expiredScope, expiredJobs[0].id)).toBe(false);
+
+    for (let index = 0; index < 5; index += 1) {
+      await expect(repository.submit(expiredScope, { ...input, idempotencyKey: `fresh-${index}` }))
+        .resolves.toMatchObject({ status: "waiting_authorization" });
+    }
+    await expect(repository.submit(expiredScope, { ...input, idempotencyKey: "fresh-over-limit" }))
+      .rejects.toMatchObject({ code: "job_limit" });
+    expect(await repository.getJob(expiredScope, expiredJobs[0].id)).toBeDefined();
+  });
+
   it("cancels only the requesting principal's unfinished read job", async () => {
     const job = await repository.submit(scope, {
       authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cancel",

@@ -4,6 +4,7 @@ import { AgentPeopleRepository } from "../db/agentPeople.js";
 import { DataSyncRepository, type SavedCopilotUsageSource } from "../db/dataSync.js";
 import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
+import { agentColumnValue } from "../types/agentPresentation.js";
 import { SavedAgentPeopleService } from "./savedAgentPeople.js";
 
 const scope = { tenantId: "people-tenant", principalId: "people-reader" };
@@ -12,7 +13,9 @@ const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const observedAt = "2026-09-15T10:00:00.000Z";
 
 afterEach(() => vi.restoreAllMocks());
-beforeEach(() => vi.spyOn(AgentPeopleRepository.prototype, "read").mockResolvedValue([]));
+beforeEach(() => {
+  vi.spyOn(AgentPeopleRepository.prototype, "read").mockResolvedValue([]);
+});
 
 function directoryUser(id = firstId, displayName: string | null = "Saved Person"): CopilotDirectoryUser {
   return {
@@ -52,8 +55,8 @@ describe("saved directory agent people", () => {
     const cache = new AgentPeopleRepository();
     vi.mocked(cache.read).mockResolvedValue([
       { objectId: firstId, status: "not_found", displayName: null, userPrincipalName: null,
-        observedAt: "2026-09-16T10:00:00.000Z", checkedAt: "2026-09-16T10:00:00.000Z" },
-      { objectId: secondId, status: "resolved", displayName: "Unlicensed Creator", userPrincipalName: null, observedAt },
+        observedAt: "2026-09-16T10:00:00.000Z", checkedAt: "2026-09-16T10:00:00.000Z", lastConclusiveAt: "2026-09-16T10:00:00.000Z" },
+      { objectId: secondId, status: "resolved", displayName: "Unlicensed Creator", userPrincipalName: null, observedAt, lastConclusiveAt: observedAt },
     ]);
     const service = new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => source()) }, cache);
     const [value] = await service.project(scope, [record(firstId, secondId)]);
@@ -66,7 +69,7 @@ describe("saved directory agent people", () => {
     vi.mocked(cache.read).mockResolvedValue([
       { objectId: firstId, status: "lookup_failed", displayName: hasPrevious ? "Old name" : null, userPrincipalName: null,
         observedAt: hasPrevious ? "2026-09-14T10:00:00.000Z" : "2026-09-16T10:00:00.000Z", checkedAt: "2026-09-16T10:00:00.000Z",
-        errorCode: "provider_timeout" },
+        lastConclusiveAt: hasPrevious ? "2026-09-14T10:00:00.000Z" : null, errorCode: "provider_timeout" },
     ]);
     const service = new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => source()) }, cache);
     expect((await service.project(scope, [record()]))[0].people?.owner).toMatchObject({
@@ -84,6 +87,7 @@ describe("saved directory agent people", () => {
     const result = await service.project(scope, [native, linked], client);
     const person = { objectId: firstId, displayName: "Saved Person", userPrincipalName: "saved#EXT#@example.onmicrosoft.com", observedAt };
     expect(getDirectorySource).toHaveBeenCalledExactlyOnceWith(scope, client);
+    expect(AgentPeopleRepository.prototype.read).toHaveBeenCalledExactlyOnceWith(scope, [firstId], client);
     for (const value of result) {
       expect(value.people).toEqual({ owner: person, createdBy: person, lastModifiedBy: person });
       expect(value.people?.owner).toBe(value.people?.createdBy);
@@ -245,5 +249,72 @@ describe("saved directory repository query", () => {
     ]) expect(sql).toContain(condition);
     expect(unexpected).not.toHaveBeenCalled();
     await database.end();
+  });
+});
+
+describe("saved agent people cache precedence", () => {
+  it("retains the prior not-found check time when a failed lookup replaces the cache result", async () => {
+    const database = new pg.Pool();
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockResolvedValue(client);
+    const empty = { rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] };
+    const query = vi.spyOn(client, "query").mockResolvedValue(empty)
+      .mockResolvedValueOnce(empty)
+      .mockResolvedValueOnce(empty)
+      .mockResolvedValueOnce({ ...empty, rows: [{ generation: "initial" }], rowCount: 1 })
+      .mockResolvedValueOnce({ ...empty, rows: [{ count: 0 }], rowCount: 1 });
+    try {
+      await new AgentPeopleRepository(database).save(scope, [{
+        objectId: firstId, status: "lookup_failed", displayName: null, userPrincipalName: null,
+        checkedAt: observedAt, errorCode: "provider_timeout",
+      }], { generation: "initial" });
+      const insert = query.mock.calls.find(call => String(call[0]).includes("INSERT INTO agent_people_cache"));
+      expect(insert).toBeDefined();
+      expect(String(insert?.[0])).toContain(`resolved_at=CASE WHEN EXCLUDED.status='lookup_failed' THEN
+              CASE WHEN agent_people_cache.status='not_found' THEN agent_people_cache.checked_at ELSE agent_people_cache.resolved_at END`);
+      expect(query).toHaveBeenLastCalledWith("COMMIT");
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      await database.end();
+    }
+  });
+
+  it.each([
+    { lastConclusiveAt: null, expectedName: "Saved Person", expectedObservedAt: observedAt },
+    { lastConclusiveAt: "2026-09-14T10:00:00.000Z", expectedName: "Saved Person", expectedObservedAt: observedAt },
+    { lastConclusiveAt: observedAt, expectedName: null, expectedObservedAt: observedAt },
+    { lastConclusiveAt: "2026-09-16T10:00:00.000Z", expectedName: null, expectedObservedAt: "2026-09-16T10:00:00.000Z" },
+    { lastConclusiveAt: "2026-09-18T10:00:00.000Z", expectedName: null, expectedObservedAt: "2026-09-18T10:00:00.000Z" },
+  ])("does not resurrect older labels after a conclusive nameless observation at $lastConclusiveAt", async ({
+    lastConclusiveAt, expectedName, expectedObservedAt,
+  }) => {
+    vi.mocked(AgentPeopleRepository.prototype.read).mockRestore();
+    const database = new pg.Pool();
+    const checkedAt = "2026-09-18T10:00:00.000Z";
+    const expiresAt = "2026-09-18T10:15:00.000Z";
+    const query = vi.spyOn(database, "query").mockResolvedValue({
+      rows: [{
+        object_id: firstId, status: "lookup_failed", display_name: null, user_principal_name: null,
+        checked_at: new Date(checkedAt), resolved_at: lastConclusiveAt ? new Date(lastConclusiveAt) : null,
+        expires_at: new Date(expiresAt), error_code: "provider_timeout",
+      }], rowCount: 1, command: "SELECT", oid: 0, fields: [],
+    });
+    try {
+      const service = new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => source()) },
+        new AgentPeopleRepository(database));
+      const [value] = await service.project(scope, [record()]);
+      expect(value.people?.owner).toEqual({
+        objectId: firstId, status: "lookup_failed", displayName: expectedName,
+        userPrincipalName: expectedName ? directoryUser().identity.userPrincipalName : null,
+        observedAt: expectedObservedAt, checkedAt, expiresAt, errorCode: "provider_timeout",
+      });
+      for (const field of ["owner", "createdBy"] as const) {
+        expect(agentColumnValue(value, field)).toBe(expectedName
+          ? `${expectedName} (${directoryUser().identity.userPrincipalName}) (lookup failed)` : `${firstId} (lookup failed)`);
+      }
+      expect(query).toHaveBeenCalledExactlyOnceWith(expect.any(String), [scope.tenantId, scope.principalId, [firstId]]);
+    } finally {
+      await database.end();
+    }
   });
 });

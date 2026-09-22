@@ -78,7 +78,7 @@ export class DirectoryPrincipalsClient {
       ),
     ]);
 
-    if (!Array.isArray(users.value) || !Array.isArray(groups.value) || users.value.length > maxSearchLimit || groups.value.length > maxSearchLimit) {
+    if (!users || !groups || !Array.isArray(users.value) || !Array.isArray(groups.value) || users.value.length > maxSearchLimit || groups.value.length > maxSearchLimit) {
       throw new AppError(502, "provider_schema", "Directory collection is invalid or oversized.");
     }
     [...users.value, ...groups.value].forEach(validatePrincipal);
@@ -106,20 +106,22 @@ export class DirectoryPrincipalsClient {
       );
     }
 
+    const controller = new AbortController();
+    const batchSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     return mapWithConcurrency(
       unique,
       resolveConcurrency,
       async (entity): Promise<DirectoryPrincipal> => {
-        signal?.throwIfAborted();
-        if (entity.resourceType === "user") {
-          return this.resolveUser(accessToken, entity.resourceId, signal);
+        batchSignal.throwIfAborted();
+        try {
+          if (entity.resourceType === "user") {
+            return await this.resolveUser(accessToken, entity.resourceId, batchSignal);
+          }
+          return await this.resolveGroup(accessToken, entity.resourceId, batchSignal);
+        } catch (error) {
+          controller.abort(error);
+          throw error;
         }
-
-        if (entity.resourceType === "group") {
-          return this.resolveGroup(accessToken, entity.resourceId, signal);
-        }
-
-        return fallbackPrincipal(entity);
       },
     );
   }
@@ -132,9 +134,11 @@ export class DirectoryPrincipalsClient {
         {},
         signal,
       );
-      requireResolvedIdentity(user.id, id);
-      return mapUser(user);
+      const principal = mapUser(user);
+      requireResolvedIdentity(principal.resourceId, id);
+      return principal;
     } catch (error) {
+      signal?.throwIfAborted();
       if (error instanceof AppError && error.status === 404) {
         return fallbackPrincipal({ resourceType: "user", resourceId: id });
       }
@@ -150,9 +154,11 @@ export class DirectoryPrincipalsClient {
         {},
         signal,
       );
-      requireResolvedIdentity(group.id, id);
-      return mapGroup(group);
+      const principal = mapGroup(group);
+      requireResolvedIdentity(principal.resourceId, id);
+      return principal;
     } catch (error) {
+      signal?.throwIfAborted();
       if (error instanceof AppError && error.status === 404) {
         return fallbackPrincipal({ resourceType: "group", resourceId: id });
       }
@@ -167,8 +173,10 @@ export class DirectoryPrincipalsClient {
     signal?: AbortSignal,
   ) {
     validateDirectoryUrl(url);
+    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+    requestSignal.throwIfAborted();
     const response = await this.fetcher(url, {
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+      signal: requestSignal,
       redirect: "error",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -178,10 +186,10 @@ export class DirectoryPrincipalsClient {
     });
 
     if (!response.ok) {
-      throw await graphError(response);
+      throw await graphError(response, requestSignal);
     }
 
-    return boundedProviderJson<T>(response);
+    return boundedProviderJson<T>(response, requestSignal);
   }
 }
 
@@ -271,6 +279,7 @@ function validatePrincipal(value: GraphUser | GraphGroup) {
   }
   const group = value as GraphGroup;
   if (group.groupTypes !== undefined && (!Array.isArray(group.groupTypes) || group.groupTypes.length > 20 || group.groupTypes.some(type => typeof type !== "string"))) throw new AppError(502, "provider_schema", "Directory group type is invalid.");
+  if (group.securityEnabled !== undefined && group.securityEnabled !== null && typeof group.securityEnabled !== "boolean") throw new AppError(502, "provider_schema", "Directory group security flag is invalid.");
 }
 
 function escapeSearchTerm(value: string) {

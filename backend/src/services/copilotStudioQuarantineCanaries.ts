@@ -4,13 +4,14 @@ import { CopilotStudioQuarantineCanaryRepository, type QuarantineCanaryApproval 
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority, QuarantineJob } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { CopilotStudioQuarantineClient } from "./copilotStudioQuarantine.js";
 import { runTrackedCopilotStudioQuarantineJob } from "./copilotStudioQuarantineJobs.js";
+import { operationalLog } from "./telemetry.js";
 
 type CanaryDependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
@@ -57,11 +58,14 @@ export class CopilotStudioQuarantineCanaryService {
 
     let originalJob: QuarantineJob | undefined;
     let restorationJob: QuarantineJob | undefined;
+    let executionUnverified = false;
     try {
       const originalStatus = approvalPrestate(claimed.original);
       originalJob = await this.submitCanaryJob(initial.user, claimed.original, originalStatus, originalId, "original");
+      executionUnverified = true;
       await runTrackedCopilotStudioQuarantineJob(originalJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.original.id, originalJob.id));
       originalJob = await this.jobs.get(scope, originalJob.id);
+      executionUnverified = !originalJob;
       const originalResult = requireVerifiedCanaryJob(originalJob, "canary_original_unverified");
 
       const restorationStatus: CopilotStudioQuarantineStatus = {
@@ -73,8 +77,10 @@ export class CopilotStudioQuarantineCanaryService {
         correlationId: originalResult.correlationId!,
       };
       restorationJob = await this.submitCanaryJob(initial.user, claimed.restoration, restorationStatus, originalId, "restoration");
+      executionUnverified = true;
       await runTrackedCopilotStudioQuarantineJob(restorationJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.restoration.id, restorationJob.id));
       restorationJob = await this.jobs.get(scope, restorationJob.id);
+      executionUnverified = !restorationJob;
       requireVerifiedCanaryJob(restorationJob, "canary_restoration_unverified");
 
       const publicationValidation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
@@ -85,8 +91,12 @@ export class CopilotStudioQuarantineCanaryService {
       });
       return { ...completed, jobs: { original: originalJob, restoration: restorationJob }, qualification: { qualified: true, expiresInDays: 30 } };
     } catch (error) {
-      const completion = canaryFailure(originalJob, restorationJob, error);
-      await this.canaries.completeCycle(initial.user, claimed.original.id, claimed.restoration.id, completion).catch(() => undefined);
+      const completion = canaryFailure(originalJob, restorationJob, error, executionUnverified);
+      await this.canaries.completeCycle(initial.user, claimed.original.id, claimed.restoration.id, completion).catch(completionError => {
+        operationalLog("error", "quarantine_canary_completion_failed", {
+          jobId: restorationJob?.id ?? originalJob?.id, outcome: "requires_review", ...errorTelemetry(completionError),
+        });
+      });
       throw error;
     }
   }
@@ -141,10 +151,10 @@ function requireVerifiedCanaryJob(job: QuarantineJob | undefined, code: string) 
   return result;
 }
 
-function canaryFailure(original: QuarantineJob | undefined, restoration: QuarantineJob | undefined, error: unknown) {
+function canaryFailure(original: QuarantineJob | undefined, restoration: QuarantineJob | undefined, error: unknown, executionUnverified: boolean) {
   const code = error instanceof AppError ? error.code : "provider_error";
   if (restoration?.results.some(result => result.errorCode === "quarantine_prestate_conflict")) return { status: "conflict" as const, errorCode: code };
-  if (original?.results.some(result => result.status === "inconclusive") || restoration?.results.some(result => result.status === "inconclusive")
+  if (executionUnverified || original?.results.some(result => result.status === "inconclusive") || restoration?.results.some(result => result.status === "inconclusive")
     || original?.results[0]?.status === "succeeded" && restoration?.results[0]?.status !== "succeeded") return { status: "inconclusive" as const, errorCode: code };
   return { status: "failed" as const, errorCode: code };
 }

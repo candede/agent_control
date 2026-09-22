@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Request, Response } from "express";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { pool } from "../db/pool.js";
 import { httpTelemetry, observeDatabasePool, operationalLog, safeTelemetry, withTelemetryContext } from "./telemetry.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -13,6 +14,28 @@ describe("operational telemetry", () => {
       requestId: "request-1", status: 429, token: "secret", cookie: "secret",
       source: "official_usage", providerBody: { sensitive: true }, outcome: "failed",
     })).toEqual({ requestId: "request-1", status: 429, source: "official_usage", outcome: "failed" });
+  });
+
+  it("retains queried-type counts without allowing resource types or unbounded values", () => {
+    expect(safeTelemetry({ queriedTypeCount: 2, queriedTypes: ["must-not-log"] }))
+      .toEqual({ queriedTypeCount: 2 });
+    for (const value of [Infinity, -Infinity, NaN, null, {}, [], "a".repeat(129), "private\nvalue"]) {
+      expect(safeTelemetry({ queriedTypeCount: value })).toEqual({});
+    }
+  });
+
+  it("retains data-sync run correlation without relaxing metadata bounds", () => {
+    const runId = "11111111-1111-1111-1111-111111111111";
+    expect(safeTelemetry({ runId, token: "never-log" })).toEqual({ runId });
+    for (const value of ["a".repeat(129), "run\nprivate", "run\rprivate", "run\0private", {}, null]) {
+      expect(safeTelemetry({ runId: value })).toEqual({});
+    }
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    operationalLog("error", "data_sync_worker_status_failed", { runId, errorCode: "internal_error", token: "never-log" });
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+      timestamp: expect.any(String), level: "error", event: "data_sync_worker_status_failed",
+      runId, errorCode: "internal_error",
+    });
   });
 
   it("never serializes unknown sensitive fields", () => {
@@ -124,6 +147,19 @@ describe("operational telemetry", () => {
       expect(bicep,`${event} is not filtered by a managed alert`).toContain(`"${event}"`);
       expect(readFileSync(join(root,filename),"utf8"),`${event} has no runtime producer`).toContain(`"${event}"`);
     }
+    for (const event of ["database_pool_error", "session_store_error"]) {
+      expect(readFileSync(join(root, producers[event]), "utf8"))
+        .toContain(`operationalLog("error", "${event}")`);
+    }
+  });
+
+  it("emits structured database errors without connection or exception details", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    pool.emit("error", new Error("never-log-connection-details"));
+    expect(log).toHaveBeenCalledOnce();
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+      timestamp: expect.any(String), level: "error", event: "database_pool_error",
+    });
   });
 
   it("emits the pool-pressure observation only when the finite pool has waiters", () => {

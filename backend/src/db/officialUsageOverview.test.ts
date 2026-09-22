@@ -270,6 +270,23 @@ describe.sequential("cumulative official agent/activity overview SQL", () => {
     expect((await overview.getOverview(owner.tenantId, { startDate: "2026-08-01" })).agents).toMatchObject({ count: 0, value: [] });
   });
 
+  it("searches non-ASCII names and IDs case-insensitively without merging case-distinct identities", async () => {
+    const owner = scope();
+    await importBundle(owner, {
+      agents: [
+        { id: "ПАКЕТ", name: "ÉQUIPE %_ Nord", date: "2026-07-15" },
+        { id: "пакет", name: "équipe %_ Sud", date: "2026-07-15" },
+        { id: "other", name: "Other", date: "2026-07-15" },
+      ],
+    });
+    for (const search of ["пакет", "ПАКЕТ", "équipe", "ÉQUIPE", "%_"]) {
+      const view = await overview.getOverview(owner.tenantId, { search });
+      expect(view.summary.reportedAgents).toBe(3);
+      expect(view.agents.count, search).toBe(2);
+      expect(view.agents.value.map(agent => agent.agentId), search).toEqual(["ПАКЕТ", "пакет"]);
+    }
+  });
+
   it("selects deterministic newest accepted source snapshots even when acceptance times tie", async () => {
     const owner = scope();
     const first = await importBundle(owner, { agents: [{ id: "shared", name: "First", date: "2026-07-01" }] });

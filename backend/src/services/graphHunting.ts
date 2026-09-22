@@ -75,61 +75,71 @@ export class GraphHuntingClient {
   async runQuery(token: string, filters: DefenderHuntingFilters, options: QueryOptions = {}): Promise<DefenderHuntingQueryResult> {
     const request = createHuntingRequest(filters);
     const startedAt = this.now();
-    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
-      const remainingBudget = maximumRequestBudgetMs - (this.now() - startedAt);
-      if (remainingBudget <= 0) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
-      const timeout = AbortSignal.timeout(Math.max(1, Math.min(this.dependencies.requestTimeoutMs ?? 10_000, remainingBudget)));
-      const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-      try {
-        if (signal.aborted) throw signal.reason;
-        await options.beforeRequest?.();
-        if (signal.aborted) throw signal.reason;
-        const response = await abortable(this.dependencies.fetch(endpoint, {
-          method: "POST",
-          redirect: "manual",
-          signal,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/json",
-            "Content-Type": "application/json; charset=utf-8",
-            ...(options.correlationId ? { "client-request-id": options.correlationId, "return-client-request-id": "true" } : {}),
-          },
-          body: JSON.stringify(request),
-        }), signal);
+    const deadline = AbortSignal.timeout(maximumRequestBudgetMs);
+    const querySignal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+    try {
+      for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+        const remainingBudget = maximumRequestBudgetMs - (this.now() - startedAt);
+        if (remainingBudget <= 0) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+        const timeout = AbortSignal.timeout(Math.max(1, Math.min(this.dependencies.requestTimeoutMs ?? 10_000, remainingBudget)));
+        const signal = AbortSignal.any([querySignal, timeout]);
+        let response: Response | undefined;
+        let retryTransportFailure = false;
         try {
-          await options.onResponse?.(providerRequestId(response));
-        } catch (error) {
-          await disposeResponse(response);
-          throw error;
-        }
-        if (response.status >= 300 && response.status < 400) {
-          await disposeResponse(response);
-          throw new AppError(502, "invalid_provider_link", "Microsoft Graph hunting returned an unexpected redirect.");
-        }
-        if (response.status === 200) {
-          const text = await boundedProviderText(response, maximumResponseBytes, signal);
-          return parseHuntingResponse(parseJson(text), filters, options.tenantId, Buffer.byteLength(text));
-        }
-        if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
-          const waitMs = retryDelay(response, attempt, this.dependencies.random());
-          if (waitMs < maximumRequestBudgetMs - (this.now() - startedAt)) {
-            await disposeResponse(response);
-            await this.dependencies.wait(waitMs, options.signal);
-            continue;
+          signal.throwIfAborted();
+          await abortable(Promise.resolve(options.beforeRequest?.()), signal);
+          signal.throwIfAborted();
+          retryTransportFailure = true;
+          response = await abortable<Response>(this.dependencies.fetch(endpoint, {
+            method: "POST",
+            redirect: "manual",
+            signal,
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: "application/json",
+              "Content-Type": "application/json; charset=utf-8",
+              ...(options.correlationId ? { "client-request-id": options.correlationId, "return-client-request-id": "true" } : {}),
+            },
+            body: JSON.stringify(request),
+          }).then(value => {
+            if (signal.aborted) { disposeResponse(value); throw signal.reason; }
+            return value;
+          }), signal);
+          retryTransportFailure = false;
+          await abortable(Promise.resolve(options.onResponse?.(providerRequestId(response))), signal);
+          signal.throwIfAborted();
+          if (response.status >= 300 && response.status < 400) {
+            throw new AppError(502, "invalid_provider_link", "Microsoft Graph hunting returned an unexpected redirect.");
           }
+          if (response.status === 200) {
+            const text = await abortable(boundedProviderText(response, maximumResponseBytes, signal), signal);
+            return parseHuntingResponse(parseJson(text), filters, options.tenantId, Buffer.byteLength(text));
+          }
+          if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
+            const waitMs = retryDelay(response, attempt, this.dependencies.random());
+            if (waitMs < maximumRequestBudgetMs - (this.now() - startedAt)) {
+              disposeResponse(response);
+              response = undefined;
+              await abortable(this.dependencies.wait(waitMs, querySignal), querySignal);
+              continue;
+            }
+          }
+          throw providerFailure(response);
+        } catch (error) {
+          if (signal.aborted) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+          if (error instanceof AppError || !retryTransportFailure) throw error;
+          if (attempt === maximumAttempts) throw new AppError(502, "provider_error", "Microsoft Graph hunting failed within its bounded retry budget.");
+          const waitMs = Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(this.dependencies.random() * 250), 5_000);
+          if (waitMs >= maximumRequestBudgetMs - (this.now() - startedAt)) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget before retry.");
+          await abortable(this.dependencies.wait(waitMs, querySignal), querySignal);
+        } finally {
+          if (response) disposeResponse(response);
         }
-        const failure = providerFailure(response);
-        await disposeResponse(response);
-        throw failure;
-      } catch (error) {
-        if (options.signal?.aborted) throw options.signal.reason;
-        if (error instanceof AppError) throw error;
-        if (signal.aborted) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
-        if (attempt === maximumAttempts) throw new AppError(502, "provider_error", "Microsoft Graph hunting failed within its bounded retry budget.");
-        const waitMs = Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(this.dependencies.random() * 250), 5_000);
-        if (waitMs >= maximumRequestBudgetMs - (this.now() - startedAt)) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget before retry.");
-        await this.dependencies.wait(waitMs, options.signal);
       }
+    } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
+      if (querySignal.aborted) throw new AppError(502, "provider_error", "Microsoft Graph hunting exhausted its request time budget.");
+      throw error;
     }
     throw new AppError(502, "provider_error", "Microsoft Graph hunting failed.");
   }
@@ -211,7 +221,7 @@ const activityProjectionValid = [dateShape("Timestamp"), ...activityDirectFields
 function inventoryQuery(filters: DefenderHuntingFilters) {
   const predicates = [
     inPredicate("AgentId", filters.agentIds),
-    inPredicate("EntraBlueprintId", filters.blueprintIds),
+    inPredicate("EntraBlueprintId", filters.blueprintIds, true),
   ].filter(Boolean);
   return [
     "AgentsInfo",
@@ -232,8 +242,8 @@ function activityQuery(filters: DefenderHuntingFilters) {
   const predicates = [
     inPredicate("ActionType", filters.operations),
     anyInPredicate(["tostring(Event.TargetAgentId)", "tostring(Event.AgentId)", 'iff(ActionType=="InvokeAgent",tostring(Event.PlatformTargetAgentId),tostring(Event.PlatformAgentId))'], filters.agentIds),
-    anyInPredicate(["tostring(Event.TargetAgentBlueprintID)", "tostring(Event.AgentBlueprintId)"], filters.blueprintIds),
-    inPredicate("AccountObjectId", filters.actorObjectIds),
+    anyInPredicate(["tostring(Event.TargetAgentBlueprintID)", "tostring(Event.AgentBlueprintId)"], filters.blueprintIds, true),
+    inPredicate("AccountObjectId", filters.actorObjectIds, true),
   ].filter(Boolean);
   return [
     "CloudAppEvents",
@@ -410,11 +420,12 @@ function parseActivityRow(value: Record<string, unknown>): DefenderAgentActivity
 
 function validateReturnedRow(row: DefenderHuntingRow, filters: DefenderHuntingFilters, tenantId?: string) {
   const timestamp = Date.parse(row.sourceTable === "AgentsInfo" ? row.observationTime : row.timestamp);
+  const selectedBlueprintIds = filters.blueprintIds.map(value => value.toLowerCase());
   if (timestamp < Date.parse(filters.startDateTime) || timestamp > Date.parse(filters.endDateTime)) throw scopeMismatch();
   if (row.sourceTable === "AgentsInfo") {
     if (filters.templateId !== "agents_inventory"
       || filters.agentIds.length && !filters.agentIds.includes(row.agentId)
-      || filters.blueprintIds.length && (!row.entraBlueprintId || !filters.blueprintIds.includes(row.entraBlueprintId))) throw scopeMismatch();
+      || selectedBlueprintIds.length && (!row.entraBlueprintId || !selectedBlueprintIds.includes(row.entraBlueprintId))) throw scopeMismatch();
     return;
   }
   const expectedOperations = row.actionType === "InvokeAgent" ? ["invoke_agent"]
@@ -426,20 +437,20 @@ function validateReturnedRow(row: DefenderHuntingRow, filters: DefenderHuntingFi
     || !row.operation || !expectedOperations.includes(row.operation)
     || tenantId && row.organizationId && row.organizationId !== tenantId.toLowerCase()
     || filters.agentIds.length && !agentIds.some(value => filters.agentIds.includes(value))
-    || filters.blueprintIds.length && !blueprintIds.some(value => filters.blueprintIds.includes(value))
-    || filters.actorObjectIds.length && (!row.actorAccountObjectId || !filters.actorObjectIds.includes(row.actorAccountObjectId))) throw scopeMismatch();
+    || selectedBlueprintIds.length && !blueprintIds.some(value => selectedBlueprintIds.includes(value))
+    || filters.actorObjectIds.length && !filters.actorObjectIds.some(value => value.toLowerCase() === row.actorAccountObjectId)) throw scopeMismatch();
 }
 
 function scopeMismatch() {
   return new AppError(502, "provider_scope_mismatch", "Microsoft Graph returned a hunting row outside the exact requested scope.");
 }
 
-function inPredicate(field: string, values: string[]) {
-  return values.length ? `${field} in (${values.map(kqlString).join(",")})` : "";
+function inPredicate(field: string, values: string[], caseInsensitive = false) {
+  return values.length ? `${field} in${caseInsensitive ? "~" : ""} (${values.map(kqlString).join(",")})` : "";
 }
 
-function anyInPredicate(fields: string[], values: string[]) {
-  return values.length ? `(${fields.map(field => inPredicate(field, values)).join(" or ")})` : "";
+function anyInPredicate(fields: string[], values: string[], caseInsensitive = false) {
+  return values.length ? `(${fields.map(field => inPredicate(field, values, caseInsensitive)).join(" or ")})` : "";
 }
 
 function timePredicate(filters: DefenderHuntingFilters) {
@@ -545,7 +556,11 @@ function utcInstant(value: unknown, name: string) {
   if (typeof value !== "string" || value.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) || !Number.isFinite(Date.parse(value))) {
     throw new AppError(400, "invalid_hunting_range", `${name} must be a valid UTC instant.`);
   }
-  return new Date(value).toISOString();
+  const normalized = new Date(value).toISOString();
+  if (normalized.slice(0, 19) !== value.slice(0, 19)) {
+    throw new AppError(400, "invalid_hunting_range", `${name} must be a valid UTC instant.`);
+  }
+  return normalized;
 }
 
 function uuid(value: string) {
@@ -599,8 +614,8 @@ function retryDelay(response: Response, attempt: number, random: number) {
   return Math.min(1_000 * (2 ** (attempt - 1)) + Math.floor(random * 250), 5_000);
 }
 
-async function disposeResponse(response: Response) {
-  try { await response.body?.cancel(); }
+function disposeResponse(response: Response) {
+  try { void response.body?.cancel().catch(() => undefined); }
   catch { /* response disposal is best effort */ }
 }
 

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import type { StartAuditEvent } from "../types/audit.js";
 import { auditMetadata, AuditLog } from "./auditLog.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -42,11 +43,24 @@ describe("PostgreSQL audit projection", () => {
   it("filters before counts, pagination and reads", async () => {
     const otherPrincipal = new AuditLog({ ...scope, principalId: "other" }, fixture.runtime);
     const otherTenant = new AuditLog({ ...scope, tenantId: "other" }, fixture.runtime);
-    expect(await otherPrincipal.listEvents()).toEqual([]);
-    expect(await otherTenant.countEvents()).toBe(0);
-    const events = await audit.listEvents();
-    expect(await otherPrincipal.getEvent(events[0].id)).toBeUndefined();
-    expect(await audit.listEvents({ limit: 1, offset: 1 })).toHaveLength(1);
+    const input: StartAuditEvent = { operationId: "pagination-match", scope: "single", action: "block", targetBlockedState: true, agentId: "pagination-package", actor, requestPath: "/api/agents/pagination-package/block" };
+    const older = await audit.startEvent({ ...input, startedAt: "2026-01-01T00:00:00Z" });
+    const newer = await audit.startEvent({ ...input, startedAt: "2026-01-02T00:00:00Z" });
+    await audit.startEvent({ ...input, operationId: "pagination-unmatched", startedAt: "2026-01-03T00:00:00Z" });
+    const principalEvent = await otherPrincipal.startEvent({ ...input, actor: { ...actor, homeAccountId: "other" }, startedAt: "2026-01-04T00:00:00Z" });
+    const tenantEvent = await otherTenant.startEvent({ ...input, actor: { ...actor, tenantId: "other" }, startedAt: "2026-01-05T00:00:00Z" });
+    const query = { operationIdPrefix: input.operationId };
+    expect(await audit.countEvents({ ...query, limit: 1, offset: 1 })).toBe(2);
+    expect((await audit.listEvents({ ...query, limit: 1 })).map(event => event.id)).toEqual([newer.id]);
+    expect((await audit.listEvents({ ...query, limit: 1, offset: 1 })).map(event => event.id)).toEqual([older.id]);
+    expect(await audit.listEvents({ ...query, limit: 1, offset: 2 })).toEqual([]);
+    expect((await otherPrincipal.listEvents(query)).map(event => event.id)).toEqual([principalEvent.id]);
+    expect(await otherTenant.countEvents(query)).toBe(1);
+    expect(await audit.getEvent(older.id)).toMatchObject({ id: older.id, operationId: input.operationId });
+    expect(await otherPrincipal.getEvent(older.id)).toBeUndefined();
+    expect(await otherTenant.getEvent(older.id)).toBeUndefined();
+    expect(await audit.getEvent(principalEvent.id)).toBeUndefined();
+    expect(await audit.getEvent(tenantEvent.id)).toBeUndefined();
     await expect(audit.startEvent({ operationId: "bad", scope: "single", action: "block", targetBlockedState: true, agentId: "package-1", actor: { ...actor, tenantId: "other" }, requestPath: "/bad" })).rejects.toThrow("scope");
   });
 

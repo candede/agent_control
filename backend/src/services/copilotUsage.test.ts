@@ -11,7 +11,7 @@ import {
   type CopilotDirectoryUser,
   type CopilotReportResult,
 } from "./copilotUsageGraph.js";
-import type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../db/dataSync.js";
+import type { CopilotUsageSnapshotSource, DataSyncRepository, SavedCopilotUsageSource } from "../db/dataSync.js";
 import type { FetchLike } from "./graphPackages.js";
 
 const now = new Date("2026-09-13T01:00:00.000Z");
@@ -316,6 +316,38 @@ describe("CopilotUsageService", () => {
     const after = await harness.value.users(user);
     expect(after.sources.directory.state).toBe("available");
     expect(after.counts.licensedUsers).toBe(0);
+  });
+
+  it.each(["directory", "appActivity", "both"] as const)("recollects expired snapshots on an incomplete-only retry: %s", async expired => {
+    const harness = refreshHarness([directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")]);
+    const saved = await harness.usageStore.getUserSources();
+    saved.appActivity = savedSource("app_activity", { users: [], reportRefreshDate: null });
+    if (expired !== "appActivity") saved.directory = { ...saved.directory, value: null, observedAt: null };
+    if (expired !== "directory") saved.appActivity = { ...saved.appActivity, value: null, observedAt: null };
+    const preserved = expired === "directory" ? saved.appActivity : saved.directory;
+    const unavailable = await harness.value.users(user);
+    if (expired !== "appActivity") expect(unavailable.sources.directory).toMatchObject({
+      state: "unavailable", message: expect.stringContaining("expired or is no longer available"),
+    });
+    if (expired !== "directory") expect(unavailable.sources.appActivity).toMatchObject({
+      state: "unavailable", message: expect.stringContaining("expired or is no longer available"),
+    });
+
+    expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
+      .toMatchObject({ status: "succeeded", count: expired === "appActivity" ? 1 : 0 });
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledTimes(expired === "appActivity" ? 0 : 1);
+    expect(harness.graph.listAppActivity).toHaveBeenCalledTimes(expired === "directory" ? 0 : 1);
+    expect(saved.directory.value).not.toBeNull();
+    expect(saved.appActivity.value).not.toBeNull();
+    if (expired === "directory") expect(saved.appActivity).toBe(preserved);
+    if (expired === "appActivity") expect(saved.directory).toBe(preserved);
+
+    harness.graph.listCopilotUsers.mockClear();
+    harness.graph.listAppActivity.mockClear();
+    expect(await harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
+      .toMatchObject({ status: "succeeded" });
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+    expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
   });
 
   it.each([null, "Engineering"])("preserves nullable organization attributes from a current service snapshot: %s", async department => {
@@ -716,6 +748,50 @@ describe("CopilotUsageService", () => {
     expect(result.users[0].attention).not.toContain("app_activity_inactive");
     expect(result.counts.measuredActivityUsers).toBe(0);
   });
+
+  it.each([false, true])("ages saved app activity on reads independently of fresh imported usage: %s", async withImport => {
+    const directory = [
+      directoryUser("11111111-1111-4111-8111-111111111111", "active@example.com"),
+      directoryUser("22222222-2222-4222-8222-222222222222", "inactive@example.com"),
+    ];
+    const report = {
+      users: [appUser("active@example.com", "2026-09-12"), appUser("inactive@example.com", "2026-07-01")],
+      reportRefreshDate: "2026-09-13",
+    };
+    let readAt = now;
+    const harness = refreshHarness(directory);
+    const value = new CopilotUsageService({} as pg.Pool, {
+      usageStore: memoryUsageStore(directory, report),
+      graph: harness.graph as unknown as CopilotUsageGraphClient,
+      now: () => readAt,
+      loadPublished: vi.fn(async () => withImport ? importedPublished([
+        { username: "inactive@example.com", displayName: "Imported", numberOfAgentsUsed: 1, agentResponsesReceived: 10 },
+      ], []) : emptyPublished()),
+    });
+
+    const fresh = await value.users(user);
+    expect(fresh.sources.appActivity.state).toBe("available");
+    expect(fresh.counts.measuredActivityUsers).toBe(withImport ? 2 : 1);
+    expect(fresh.counts.needsAttentionUsers).toBe(1);
+    readAt = new Date("2026-09-17T23:59:59.998Z");
+    expect((await value.users(user)).sources.appActivity.state).toBe("available");
+    readAt = new Date("2026-09-17T23:59:59.999Z");
+    const stale = await value.users(user);
+    expect(stale.generatedAt).toBe(readAt.toISOString());
+    expect(stale.sources.appActivity).toMatchObject({
+      state: "stale", fetchedAt: now.toISOString(), reportRefreshDate: report.reportRefreshDate,
+    });
+    expect(stale.snapshot).toEqual(fresh.snapshot);
+    expect(stale.users.map(row => row.appActivity)).toEqual(fresh.users.map(row => row.appActivity));
+    expect(stale.users.every(row => row.attention.includes("app_activity_unknown"))).toBe(true);
+    expect(stale.users.every(row => !row.attention.includes("app_activity_inactive"))).toBe(true);
+    expect(stale.counts).toMatchObject({
+      licensedUsers: 2, measuredActivityUsers: withImport ? 1 : null, needsAttentionUsers: 0, unknownMetricsUsers: 2,
+    });
+    if (withImport) expect(stale.sources.importedAgentUsage.state).toBe("available");
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+    expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
+  });
 });
 
 function service(options: {
@@ -786,23 +862,24 @@ function memoryUsageStore(
   };
   return {
     getUserSources: vi.fn(async () => sources),
-    publishDirectory: vi.fn(async (_scope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string) => {
+    publishDirectory: vi.fn<DataSyncRepository["publishDirectory"]>(async (_scope, value, observedAt, message) => {
       sources.directory = savedSource("directory", JSON.parse(JSON.stringify(value)) as CopilotDirectoryUser[], observedAt, message);
       return "11111111-1111-4111-8111-111111111111";
     }),
-    publishAppActivity: vi.fn(async (_scope, value: CopilotReportResult, observedAt: string, message: string) => {
+    publishAppActivity: vi.fn<DataSyncRepository["publishAppActivity"]>(async (_scope, value, observedAt, message) => {
       sources.appActivity = savedSource("app_activity", value, observedAt, message);
       return "22222222-2222-4222-8222-222222222222";
     }),
-    recordUserSourceFailure: vi.fn(async (
+    recordUserSourceFailure: vi.fn<DataSyncRepository["recordUserSourceFailure"]>(async (
       _scope,
-      sourceId: CopilotUsageSnapshotSource,
-      status: Exclude<CopilotUsageAttemptStatus, "available">,
-      message: string,
-      attemptedAt: string,
+      sourceId,
+      status,
+      message,
+      attemptedAt,
     ) => {
-      const key = sourceId === "directory" ? "directory" : "appActivity";
-      sources[key] = { ...sources[key], attemptStatus: status, message, attemptedAt };
+      const failure = { attemptStatus: status, message, attemptedAt };
+      if (sourceId === "directory") sources.directory = { ...sources.directory, ...failure };
+      else sources.appActivity = { ...sources.appActivity, ...failure };
     }),
   };
 }

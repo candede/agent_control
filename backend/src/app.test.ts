@@ -1825,11 +1825,26 @@ describe.sequential("packaged API/session contracts", () => {
     try {
       expect((await request("/api/agents/package-1/block",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(preview)})).status).toBe(503);
       expect((await request("/api/health")).status).toBe(200);
+      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: true, providerWorkEnabled: false });
     } finally { delete process.env.MAINTENANCE_MODE; }
-    await fixture.operator.query("UPDATE operational_state SET mode='maintenance',provider_work_enabled=false");
-    expect((await request("/api/ready")).status).toBe(503);
-    expect((await request("/api/health")).status).toBe(200);
-    await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=true");
+    vi.stubEnv("MAINTENANCE_FILE", `${process.execPath}/maintenance`);
+    try {
+      expect((await request("/api/ready")).status).toBe(503);
+      expect((await request("/api/agents/package-1/block",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(preview)})).status).toBe(503);
+      expect((await request("/api/health")).status).toBe(200);
+      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: true, providerWorkEnabled: false });
+    } finally { vi.unstubAllEnvs(); }
+    try {
+      await fixture.operator.query("UPDATE operational_state SET mode='maintenance',provider_work_enabled=true");
+      expect((await request("/api/ready")).status).toBe(503);
+      expect((await request("/api/health")).status).toBe(200);
+      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: true, providerWorkEnabled: false });
+      await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=false");
+      expect((await request("/api/ready")).status).toBe(200);
+      expect(await (await request("/api/diagnostics")).json()).toMatchObject({ maintenance: false, providerWorkEnabled: false });
+    } finally {
+      await fixture.operator.query("UPDATE operational_state SET mode='normal',provider_work_enabled=true");
+    }
     await fixture.operator.query("UPDATE schema_migrations SET checksum='modified' WHERE version=2");
     expect((await request("/api/ready")).status).toBe(503);
     expect(await (await request("/api/health")).json()).toEqual({ok:true});

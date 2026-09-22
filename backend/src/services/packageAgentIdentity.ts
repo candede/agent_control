@@ -73,7 +73,7 @@ export function resolvePackageAgentLinks(
     if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
       return { packageId: value.id, ...observation };
     }
-    const identity = observation.status === "available" ? observation.identity : undefined;
+    const identity = observation.identity;
     if (identity) identities.set(value.id, identity);
     const elementIds = observation.status === "available" ? observation.elementIds : [];
     const declarativeElements = value.elementDetails?.filter(group => isPackageElementType(group.elementType, "DeclarativeCopilots"))
@@ -89,7 +89,7 @@ export function resolvePackageAgentLinks(
     const grouping = identity?.environmentId && identity.cdsBotId
       ? { key: identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId), environmentId: identity.environmentId }
       : manifestId && !identity?.cdsBotId
-        ? { key: identityKey("", "declarative_manifest", manifestId), environmentId: identity?.environmentId ?? null }
+        ? { key: identityKey(identity?.environmentId ?? "", "declarative_manifest", manifestId), environmentId: identity?.environmentId ?? null }
         : undefined;
     const possibleCandidates = new Set<PowerPlatformResource>();
     const addCandidates = (key: string) => {
@@ -199,33 +199,46 @@ export function resolvePackageAgentLinks(
     };
   });
   const grouped = new Map<string, { bots: Set<string>; schemas: Set<string> }>();
-  const groupKey = (resolution: PackageAgentLinkResolution) => resolution.status === "matched"
-    ? powerPlatformAgentKey(resolution.resource.environmentId, resolution.resource.nativeId)
-    : resolution.status === "unmatched" ? resolution.grouping?.key : undefined;
-  for (const resolution of resolutions) {
-    const key = groupKey(resolution);
+  const groupKeys = (resolution: PackageAgentLinkResolution) => {
     const identity = identities.get(resolution.packageId);
-    if (!key || !identity) continue;
-    const group = grouped.get(key) ?? { bots: new Set<string>(), schemas: new Set<string>() };
-    if (identity.cdsBotId) group.bots.add(identity.cdsBotId);
-    if (identity.schemaName) group.schemas.add(identity.schemaName);
-    grouped.set(key, group);
+    const resolvedKey = resolution.status === "matched"
+      ? powerPlatformAgentKey(resolution.resource.environmentId, resolution.resource.nativeId)
+      : resolution.status === "unmatched" ? resolution.grouping?.key : undefined;
+    const nativeKey = identity?.environmentId && identity.cdsBotId
+      ? identityKey(identity.environmentId, "cds_bot_id", identity.cdsBotId) : undefined;
+    return [...new Set([resolvedKey, nativeKey].filter((key): key is string => key !== undefined))];
+  };
+  for (const resolution of resolutions) {
+    const identity = identities.get(resolution.packageId);
+    if (!identity) continue;
+    for (const key of groupKeys(resolution)) {
+      const group = grouped.get(key) ?? { bots: new Set<string>(), schemas: new Set<string>() };
+      if (identity.cdsBotId) group.bots.add(identity.cdsBotId);
+      if (identity.schemaName) group.schemas.add(identity.schemaName);
+      grouped.set(key, group);
+    }
   }
   const validated: PackageAgentLinkResolution[] = resolutions.map(resolution => {
-    const key = groupKey(resolution);
-    const group = key ? grouped.get(key) : undefined;
-    return group && (group.bots.size > 1 || group.schemas.size > 1)
+    const conflicting = groupKeys(resolution).some(key => {
+      const group = grouped.get(key);
+      return group && (group.bots.size > 1 || group.schemas.size > 1);
+    });
+    return conflicting
       ? { packageId: resolution.packageId, status: "conflicting", reason: "Package representations disagree about this agent's native identities or schema name; no link was created." }
       : resolution;
   });
-  return linkCustomEngineRepresentations(packages, identities, validated);
+  return linkCustomEngineRepresentations(packages, identities, validated, candidates);
 }
 
 function linkCustomEngineRepresentations(
   packages: readonly CopilotPackageDetail[],
   identities: ReadonlyMap<string, PackageAgentMetadata>,
   resolutions: readonly PackageAgentLinkResolution[],
+  resources: readonly PowerPlatformResource[],
 ): PackageAgentLinkResolution[] {
+  const resourceSchemas = new Map(resources.map(resource => [
+    powerPlatformAgentKey(resource.environmentId, resource.nativeId), normalizedSchemaName(resource.details.schemaName),
+  ]));
   const groups = new Map<string, Array<{ packageId: string; elementIds: string[] }>>();
   for (const value of packages) {
     const bot = readPackageCustomEngineBotIdentity(value);
@@ -242,17 +255,21 @@ function linkCustomEngineRepresentations(
       return resolution.status === "conflicting" || resolution.status === "ambiguous"
         || resolution.status === "unmatched" && resolution.invalidMetadata;
     })) continue;
-    const anchors = members.flatMap(member => {
+    const matched = members.flatMap(member => {
       const resolution = result.get(member.packageId)!;
-      return resolution.status === "matched" && resolution.evidence.some(evidence =>
-        evidence.kind === "environment_cds_bot_id" || evidence.kind === "environment_schema_native_id",
-      ) ? [resolution] : [];
+      return resolution.status === "matched" ? [resolution] : [];
     });
-    const targets = new Set(anchors.map(anchor => powerPlatformAgentKey(anchor.resource.environmentId, anchor.resource.nativeId)));
+    const anchors = matched.filter(resolution => resolution.evidence.some(evidence =>
+      evidence.kind === "environment_cds_bot_id" || evidence.kind === "environment_schema_native_id",
+    ));
+    const targets = new Set(matched.map(resolution => powerPlatformAgentKey(resolution.resource.environmentId, resolution.resource.nativeId)));
     const nativeIdentities = members.flatMap(member => identities.get(member.packageId) ?? []);
     const environments = new Set(nativeIdentities.flatMap(identity => identity.environmentId ?? []));
     const bots = new Set(nativeIdentities.flatMap(identity => identity.cdsBotId ?? []));
-    const schemas = new Set(nativeIdentities.flatMap(identity => identity.schemaName ?? []));
+    const schemas = new Set([
+      ...nativeIdentities.flatMap(identity => identity.schemaName ?? []),
+      ...[...targets].flatMap(target => resourceSchemas.get(target) ?? []),
+    ]);
     if (targets.size > 1 || environments.size > 1 || bots.size > 1 || schemas.size > 1) {
       for (const member of members) {
         const resolution = result.get(member.packageId)!;

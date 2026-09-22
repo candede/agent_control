@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
+import { AppError } from "../errors.js";
 import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus } from "../types/dataSync.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { CopilotUsageRefreshResult, CopilotUsageService } from "./copilotUsage.js";
@@ -392,21 +393,49 @@ describe("DataSyncService", () => {
     expect(harness.repository.pausePrincipal).toHaveBeenCalled();
   });
 
-  it("cancels the prior waiting child before launching a retry attempt", async () => {
-    const harness = serviceHarness();
-    const graph = harness.run.sources.find(source => source.source === "graph_packages")!;
-    graph.status = "permission_required";
-    graph.canRetry = true;
-    graph.jobId = randomUUID();
-    harness.repository.retry.mockImplementation(async () => {
-      graph.status = "queued";
-      graph.jobId = null;
-      return ["graph_packages"];
-    });
-    await harness.service.retry(user, harness.run.id, ["graph_packages"]);
-    expect(harness.packages.cancel).toHaveBeenCalledWith(user, expect.any(String), "delegated");
-    await vi.waitFor(() => expect(harness.packages.submit).toHaveBeenCalled());
-  });
+  it.each(["graph_packages", "power_platform"] as const)(
+    "waits for the prior %s child cancellation before admitting and launching a retry",
+    async sourceId => {
+      const harness = serviceHarness();
+      const source = harness.run.sources.find(value => value.source === sourceId)!;
+      const previousJobId = randomUUID();
+      Object.assign(source, { status: "permission_required", canRetry: true, jobId: previousJobId });
+      const cancelled = deferred<void>();
+      const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+      if (sourceId === "graph_packages") {
+        harness.packages.cancel.mockImplementationOnce(async (_user, id) => {
+          await cancelled.promise;
+          return packageJob(id, "cancelled", 0);
+        });
+      } else {
+        harness.powerPlatform.cancel.mockImplementationOnce(async (_user, id) => {
+          await cancelled.promise;
+          return powerPlatformJob(id, "cancelled", 0);
+        });
+      }
+      harness.repository.retry.mockImplementation(async () => {
+        Object.assign(source, { status: "queued", canRetry: false, jobId: null });
+        return [sourceId];
+      });
+      const retry = harness.service.retry(user, harness.run.id, [sourceId]);
+      try {
+        await vi.waitFor(() => expect(provider.cancel).toHaveBeenCalledWith(
+          user, previousJobId, ...(sourceId === "graph_packages" ? ["delegated" as const] : []),
+        ));
+        expect(harness.repository.retry).not.toHaveBeenCalled();
+        expect(harness.packages.submit).not.toHaveBeenCalled();
+        expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+      } finally {
+        cancelled.resolve();
+        await retry;
+      }
+      expect(harness.repository.retry).toHaveBeenCalledWith(
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, harness.run.id, [sourceId],
+      );
+      await vi.waitFor(() => expect(source.status).toBe("succeeded"));
+      expect(provider.submit).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each(["graph_packages", "power_platform"] as const)(
     "cancels a %s child returned after parent cancellation without starting or losing it",
@@ -538,6 +567,279 @@ describe("DataSyncService", () => {
       details: { childJobCount: 1 },
     });
   });
+
+  it.each([
+    ["start", "sign-out"], ["start", "shutdown"], ["retry", "sign-out"], ["retry", "shutdown"],
+  ] as const)("joins a pending %s admission on %s", async (action, stopping) => {
+    const harness = serviceHarness();
+    const gate = deferred<void>();
+    const source = harness.run.sources[0];
+    harness.run.sources = [source];
+    if (action === "start") {
+      const submit = harness.repository.submit.getMockImplementation()!;
+      harness.repository.submit.mockImplementation(async (...args) => {
+        await gate.promise;
+        return submit(...args);
+      });
+    } else {
+      Object.assign(source, { status: "failed", canRetry: true });
+      harness.run.status = "partial";
+      harness.repository.retry.mockImplementation(async () => {
+        await gate.promise;
+        Object.assign(source, { status: "queued", canRetry: false });
+        harness.run.status = "running";
+        return ["users"];
+      });
+    }
+    harness.repository.pausePrincipal.mockImplementation(async () => {
+      if (["queued", "running"].includes(source.status)) {
+        Object.assign(source, { status: "waiting_authorization", canRetry: true });
+        harness.run.status = "waiting";
+      }
+      return 1;
+    });
+    const request = (action === "start"
+      ? harness.service.start(user, { mode: "incremental", sources: ["users"] })
+      : harness.service.retry(user, harness.run.id, ["users"])).then(
+      value => ({ value, error: undefined }), error => ({ value: undefined, error }),
+    );
+    await vi.waitFor(() => expect(harness.repository[action === "start" ? "submit" : "retry"]).toHaveBeenCalled());
+    let stopped = false;
+    const stop = (stopping === "sign-out"
+      ? harness.service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId })
+      : harness.service.drain()).then(() => { stopped = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(stopped).toBe(false);
+    } finally {
+      gate.resolve();
+      await request;
+      await stop;
+    }
+    expect((await request).error).toMatchObject({ code: "interaction_required" });
+    expect(source).toMatchObject({ status: "waiting_authorization", canRetry: true });
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    if (stopping === "shutdown") {
+      await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "data_sync_shutdown" });
+      await expect(harness.service.retry(user, harness.run.id, ["users"])).rejects.toMatchObject({ code: "data_sync_shutdown" });
+    } else {
+      await harness.service.retry(user, harness.run.id, ["users"]);
+      await vi.waitFor(() => expect(source.status).toBe("succeeded"));
+    }
+  });
+
+  it("cancels a retry still waiting for durable admission before it can launch", async () => {
+    const harness = serviceHarness();
+    const source = harness.run.sources[0];
+    harness.run.sources = [source];
+    Object.assign(source, { status: "failed", canRetry: true });
+    harness.run.status = "partial";
+    const gate = deferred<void>();
+    harness.repository.retry.mockImplementation(async () => {
+      await gate.promise;
+      Object.assign(source, { status: "queued", canRetry: false });
+      harness.run.status = "running";
+      return ["users"];
+    });
+    const retry = harness.service.retry(user, harness.run.id, ["users"]).catch(error => error);
+    await vi.waitFor(() => expect(harness.repository.retry).toHaveBeenCalled());
+    let cancelled = false;
+    const cancellation = harness.service.cancel(user, harness.run.id).then(() => { cancelled = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(cancelled).toBe(false);
+    } finally {
+      gate.resolve();
+      await retry;
+      await cancellation;
+    }
+    expect(await retry).toMatchObject({ code: "read_job_cancelled" });
+    expect(harness.run.status).toBe("cancelled");
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+  });
+
+  it("reserves a retry before asynchronous reads so another source cannot be queued without a worker", async () => {
+    const harness = serviceHarness();
+    for (const source of harness.run.sources) Object.assign(source, { status: "failed", canRetry: true });
+    harness.run.status = "partial";
+    harness.repository.retry.mockImplementation(async (_scope, _id, sources: DataSyncSourceId[]) => {
+      for (const source of harness.run.sources) {
+        if (sources.includes(source.source)) Object.assign(source, { status: "queued", canRetry: false });
+      }
+      harness.run.status = "running";
+      return sources;
+    });
+    const gate = deferred<DataSyncRun>();
+    harness.repository.getRun.mockReturnValueOnce(gate.promise);
+    const retry = harness.service.retry(user, harness.run.id, ["graph_packages"]);
+    try {
+      await expect(harness.service.retry(user, harness.run.id, ["power_platform"])).rejects.toMatchObject({
+        code: "data_sync_active",
+      });
+      expect(harness.repository.retry).not.toHaveBeenCalled();
+    } finally {
+      gate.resolve(harness.run);
+      await retry;
+    }
+    await vi.waitFor(() => expect(harness.run.sources.find(source => source.source === "graph_packages")?.status).toBe("succeeded"));
+    expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["graph_packages", "retry"], ["graph_packages", "cancel"], ["power_platform", "retry"], ["power_platform", "cancel"],
+  ] as const)("allows a retained %s child to expire before %s", async (sourceId, action) => {
+    const harness = serviceHarness();
+    const source = harness.run.sources.find(value => value.source === sourceId)!;
+    harness.run.sources = [source];
+    Object.assign(source, { status: "waiting_authorization", jobId: randomUUID(), canRetry: true });
+    harness.run.status = "waiting";
+    const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+    provider.get.mockRejectedValue(new AppError(404, "not_found", "The retained child has expired."));
+    provider.cancel.mockRejectedValue(new AppError(404, "not_found", "The retained child has expired."));
+    harness.repository.retry.mockImplementation(async () => {
+      Object.assign(source, { status: "queued", jobId: null, canRetry: false });
+      harness.run.status = "running";
+      return [sourceId];
+    });
+    await harness.service[action](user, harness.run.id);
+    if (action === "retry") {
+      await vi.waitFor(() => expect(source.status).toBe("succeeded"));
+      expect(provider.submit).toHaveBeenCalledTimes(1);
+    } else {
+      expect(source.status).toBe("cancelled");
+      expect(provider.submit).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["graph_packages", "power_platform"] as const)("does not retry when %s child cancellation fails for a reason other than absence", async sourceId => {
+    const harness = serviceHarness();
+    const source = harness.run.sources.find(value => value.source === sourceId)!;
+    Object.assign(source, { status: "permission_required", jobId: randomUUID(), canRetry: true });
+    const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+    const failure = new AppError(503, "provider_error", "Child cancellation is unavailable.");
+    provider.cancel.mockRejectedValue(failure);
+    await expect(harness.service.retry(user, harness.run.id, [sourceId])).rejects.toBe(failure);
+    expect(harness.repository.retry).not.toHaveBeenCalled();
+    expect(provider.submit).not.toHaveBeenCalled();
+  });
+
+  it("leaves another principal's pending admission unaffected by sign-out", async () => {
+    const harness = serviceHarness();
+    const gate = deferred<void>();
+    const submit = harness.repository.submit.getMockImplementation()!;
+    harness.repository.submit.mockImplementationOnce(async (...args) => {
+      await gate.promise;
+      return submit(...args);
+    });
+    const request = harness.service.start(user, { mode: "initial", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalled());
+    await harness.service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: "another-viewer" });
+    gate.resolve();
+    await request;
+    await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("succeeded"));
+  });
+
+  it("surfaces interrupted-admission persistence failures during shutdown", async () => {
+    const harness = serviceHarness();
+    const gate = deferred<void>();
+    const submit = harness.repository.submit.getMockImplementation()!;
+    harness.repository.submit.mockImplementationOnce(async (...args) => {
+      await gate.promise;
+      return submit(...args);
+    });
+    const failure = new Error("Cannot persist waiting authorization.");
+    harness.repository.pausePrincipal.mockRejectedValue(failure);
+    const request = harness.service.start(user, { mode: "initial", sources: ["users"] }).catch(error => error);
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalled());
+    const drain = harness.service.drain();
+    const assertion = expect(drain).rejects.toBe(failure);
+    gate.resolve();
+    await assertion;
+    expect(await request).toBe(failure);
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+  });
+
+  it("bounds pending admissions and releases their capacity after failure", async () => {
+    const harness = serviceHarness();
+    const gate = deferred<void>();
+    const submit = harness.repository.submit.getMockImplementation()!;
+    harness.repository.submit.mockImplementation(async (...args) => {
+      await gate.promise;
+      return submit(...args);
+    });
+    const requests = Promise.allSettled(Array.from({ length: 4 }, () =>
+      harness.service.start(user, { mode: "initial", sources: ["users"] })));
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalledTimes(4));
+    await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "data_sync_capacity" });
+    const failure = new Error("Admission unavailable.");
+    gate.reject(failure);
+    expect(await requests).toEqual(Array.from({ length: 4 }, () => ({ status: "rejected", reason: failure })));
+    harness.repository.submit.mockImplementation(submit);
+    await harness.service.start(user, { mode: "initial", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("succeeded"));
+  });
+
+  it("cleans sibling jobs and surfaces failure when both source and worker status persistence fail", async () => {
+    const harness = serviceHarness();
+    const submitted = deferred<ReturnType<typeof powerPlatformJob>>();
+    harness.powerPlatform.submit.mockReturnValueOnce(submitted.promise);
+    const failure = new Error("Status persistence unavailable.");
+    harness.repository.attachJob.mockRejectedValueOnce(failure);
+    harness.repository.updateSource.mockRejectedValue(failure);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await harness.service.start(user, { mode: "initial", sources: ["users", "power_platform"] });
+      await vi.waitFor(() => expect(harness.repository.updateSource).toHaveBeenCalled());
+      const drain = harness.service.drain();
+      const assertion = expect(drain).rejects.toBe(failure);
+      submitted.resolve(powerPlatformJob(randomUUID(), "waiting_authorization", 0));
+      await assertion;
+      expect(harness.powerPlatform.start).not.toHaveBeenCalled();
+      expect(harness.powerPlatform.cancel).toHaveBeenCalled();
+      expect(log.mock.calls.map(([entry]) => JSON.parse(entry))).toEqual([
+        {
+          timestamp: expect.any(String), level: "error", event: "data_sync_worker_failed",
+          runId: harness.run.id, errorCode: "internal_error", errorKind: "unexpected",
+        },
+        {
+          timestamp: expect.any(String), level: "error", event: "data_sync_worker_status_failed",
+          runId: harness.run.id, errorCode: "internal_error", errorKind: "unexpected",
+        },
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("retains sibling work after a source status-write failure so cancellation still joins and cleans it", async () => {
+    const harness = serviceHarness();
+    const submitted = deferred<ReturnType<typeof powerPlatformJob>>();
+    harness.powerPlatform.submit.mockReturnValueOnce(submitted.promise);
+    harness.repository.attachJob.mockRejectedValueOnce(new Error("Users job write unavailable."));
+    const update = harness.repository.updateSource.getMockImplementation()!;
+    let failedWrite = false;
+    harness.repository.updateSource.mockImplementation(async (...args) => {
+      if (args[2] === "users" && args[3].status === "failed" && !failedWrite) {
+        failedWrite = true;
+        throw new Error("Users failure write unavailable.");
+      }
+      return update(...args);
+    });
+    await harness.service.start(user, { mode: "incremental", sources: ["users", "power_platform"] });
+    await vi.waitFor(() => expect(failedWrite).toBe(true));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    let cancelled = false;
+    const cancellation = harness.service.cancel(user, harness.run.id).then(() => { cancelled = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(cancelled).toBe(false);
+    } finally {
+      submitted.resolve(powerPlatformJob(randomUUID(), "waiting_authorization", 0));
+      await cancellation;
+    }
+    expect(harness.powerPlatform.start).not.toHaveBeenCalled();
+    expect(harness.powerPlatform.cancel).toHaveBeenCalled();
+  });
 });
 
 function serviceHarness() {
@@ -568,7 +870,7 @@ function serviceHarness() {
       if (!["running", "waiting"].includes(run.status) || current.status === "succeeded"
         || (update.jobId && current.jobId && update.jobId !== current.jobId)) return run;
       Object.assign(current, update, { updatedAt: new Date().toISOString() });
-      if (current.status === "succeeded") saveMarker(source, current.count, current.lastSuccessAt ?? current.updatedAt!);
+      if (update.status === "succeeded") saveMarker(source, current.count, current.lastSuccessAt ?? current.updatedAt!);
       const statuses = run.sources.map(value => value.status);
       run.status = statuses.some(status => ["queued", "running"].includes(status)) ? "running"
         : statuses.some(status => ["waiting_authorization", "permission_required", "awaiting_upload"].includes(status)) ? "waiting"
@@ -629,7 +931,7 @@ function serviceHarness() {
     agentPeople,
     officialUsage,
     wait: vi.fn(async () => undefined),
-  } as never);
+  });
   return { service, run, markers, repository, packages, powerPlatform, copilotUsage, agentPeople, officialUsage };
 }
 

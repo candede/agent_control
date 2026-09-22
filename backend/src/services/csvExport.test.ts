@@ -58,6 +58,105 @@ describe("bounded CSV publication", () => {
     })).toThrowError(expect.objectContaining({ code: "export_deadline" }));
   });
 
+  it.each(["row generation", "cell formatting", "iterator completion"])(
+    "rejects a build that reaches its deadline during %s",
+    phase => {
+      let now = Date.now();
+      const deadlineAt = now + 10_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      function* rows() {
+        if (phase === "row generation") now = deadlineAt;
+        yield { get id() {
+          if (phase === "cell formatting") now = deadlineAt;
+          return "1";
+        } };
+        if (phase === "iterator completion") now = deadlineAt;
+      }
+      try {
+        expect(() => buildBoundedCsv(["id"], rows(), {
+          maximumRows: 1, maximumBytes: 1_000, deadlineAt,
+        })).toThrowError(expect.objectContaining({ code: "export_deadline" }));
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it.each([1, 3])("rejects publication when validation %i reaches the deadline before the timer runs", async check => {
+    const { request, response } = transport();
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    let checks = 0;
+    const beforeEnd = vi.fn(async () => undefined);
+    try {
+      await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(2_048), {
+        deadlineAt,
+        chunkBytes: 1_024,
+        validate: async () => {
+          checks += 1;
+          if (checks === check) now = deadlineAt;
+        },
+        beforeEnd,
+      })).rejects.toMatchObject({ code: "export_deadline" });
+      expect(response.writes).toHaveLength(check === 1 ? 0 : 1);
+      expect(response.headers.size).toBe(check === 1 ? 0 : 4);
+      expect(response.writableEnded).toBe(false);
+      expect(beforeEnd).not.toHaveBeenCalled();
+      expect(request.listenerCount("aborted")).toBe(0);
+      expect(response.listenerCount("close")).toBe(0);
+      expect(response.listenerCount("error")).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("withholds the final chunk when audit completion reaches the deadline before the timer runs", async () => {
+    const { request, response } = transport();
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("private\r\n"), {
+        deadlineAt, validate: async () => undefined,
+        beforeEnd: async () => { now = deadlineAt; },
+      })).rejects.toMatchObject({ code: "export_deadline" });
+      expect(response.writes).toHaveLength(0);
+      expect(response.headers.size).toBe(0);
+      expect(response.writableEnded).toBe(false);
+      expect(request.listenerCount("aborted")).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(["write", "finish"])("rejects a final transport %s that reaches the deadline before the timer runs", async phase => {
+    const { request, response } = transport();
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const write = response.write.bind(response);
+    const end = response.end.bind(response);
+    response.write = value => {
+      if (phase === "write") now = deadlineAt;
+      return write(value);
+    };
+    response.end = () => {
+      if (phase === "finish") now = deadlineAt;
+      end();
+    };
+    try {
+      await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("id\r\n"), {
+        deadlineAt, validate: async () => undefined,
+      })).rejects.toMatchObject({ code: "export_deadline" });
+      expect(response.writes).toHaveLength(1);
+      expect(response.writableEnded).toBe(phase === "finish");
+      expect(request.listenerCount("aborted")).toBe(0);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("honors backpressure and removes lifecycle listeners after success", async () => {
     const { request, response } = transport();
     response.forceBackpressure = true;
@@ -132,7 +231,10 @@ describe("bounded CSV publication", () => {
     await expect(publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("private\r\n"), {
       deadlineAt: Date.now() + 1_000,
       validate: async () => { if (!valid) throw new AppError(409, "dataset_invalidated", "Source invalidated."); },
-      beforeEnd: async () => { valid = false; },
+      beforeEnd: async () => {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        valid = false;
+      },
     })).rejects.toMatchObject({ code: "dataset_invalidated" });
     expect(response.writes).toHaveLength(0);
   });

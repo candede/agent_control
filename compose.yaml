@@ -1,4 +1,54 @@
 services:
+  test: &test
+    profiles: [test]
+    image: agent-control-test:local
+    build:
+      context: .
+      target: test
+    command: [npm, run, typecheck, --workspace, backend]
+    network_mode: none
+    cpus: 2
+    mem_limit: 2g
+    environment:
+      TMPDIR: /app
+    volumes:
+      - ./backend/src:/app/backend/src:ro
+      - ./frontend/src:/app/frontend/src:ro
+  test-db:
+    <<: *test
+    profiles: [test-db]
+    command: [npm, run, test, --workspace, backend]
+    network_mode: service:test-postgres
+    cpus: 1.5
+    mem_limit: 1536m
+    environment:
+      TMPDIR: /app
+      PGHOST: 127.0.0.1
+      PGDATABASE: agentcontrol_test_control
+      PGUSER: agentcontrol_admin
+      PGPASSWORD: isolated-fixture-admin-password-never-production-01
+      APP_PGPASSWORD: isolated-fixture-password-never-production-01
+      PGSSLMODE: disable
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+  test-postgres:
+    profiles: [test-db]
+    image: postgres:17-bookworm
+    network_mode: none
+    cpus: 0.5
+    mem_limit: 512m
+    environment:
+      POSTGRES_DB: agentcontrol_test_control
+      POSTGRES_USER: agentcontrol_admin
+      POSTGRES_PASSWORD: isolated-fixture-admin-password-never-production-01
+    tmpfs:
+      - /var/lib/postgresql/data:size=256m
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U agentcontrol_admin -d agentcontrol_test_control"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
   postgres:
     image: postgres:17-bookworm
     environment:

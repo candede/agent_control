@@ -7,7 +7,10 @@ export class ProviderResponseLimitError extends AppError {
 }
 
 export async function boundedProviderText(response: Response, maximumBytes = 2_000_000, signal?: AbortSignal) {
-  if (!response.body) throw new AppError(502, "provider_schema", "Provider response was empty.");
+  if (!response.body) {
+    signal?.throwIfAborted();
+    throw new AppError(502, "provider_schema", "Provider response was empty.");
+  }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let length = 0;
@@ -25,14 +28,19 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
     signal?.addEventListener("abort", onAbort, { once: true });
     for (;;) {
       const chunk = await (signal ? Promise.race([reader.read(), aborted]) : reader.read());
+      signal?.throwIfAborted();
       if (chunk.done) break;
       length += chunk.value.byteLength;
       if (length > maximumBytes) {
-        await reader.cancel();
+        // Cleanup must neither delay the size failure nor replace it with a transport error.
+        void reader.cancel().catch(() => undefined);
         throw new ProviderResponseLimitError(maximumBytes, length);
       }
       chunks.push(chunk.value);
     }
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw error;
   } finally {
     signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
@@ -42,6 +50,7 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
 
 export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal, maximumBytes?: number): Promise<T> {
   const text = await boundedProviderText(response, maximumBytes, signal);
+  signal?.throwIfAborted();
   try { return JSON.parse(text) as T; }
   catch { throw new AppError(502, "provider_schema", "Provider response was not valid JSON."); }
 }

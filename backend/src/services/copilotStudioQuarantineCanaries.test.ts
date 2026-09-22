@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { CopilotStudioQuarantineCanaryRepository } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository } from "../db/copilotStudioQuarantine.js";
@@ -17,6 +17,7 @@ const target = { resourceNativeId: "native-agent", displayName: "Canary agent", 
 
 beforeAll(async () => { fixture = await testDatabase(); canaries = new CopilotStudioQuarantineCanaryRepository(fixture.runtime); jobs = new CopilotStudioQuarantineRepository(fixture.runtime); });
 afterAll(async () => { await fixture?.close(); });
+afterEach(() => { vi.restoreAllMocks(); });
 
 function users(tenantId: string) {
   const administrator: AuthenticatedUser = { tenantId, homeAccountId: randomUUID(), displayName: "Administrator", username: "admin@example.invalid", roles: ["AgentControl.Admin"] };
@@ -91,7 +92,10 @@ describe.sequential("Copilot Studio quarantine full-cycle canaries", () => {
     await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id)).rejects.toMatchObject({ code: "canary_restoration_unverified" });
     expect(fakeProvider.setQuarantine.mock.calls.map(call => call[2])).toEqual([true]);
     expect((await canaries.list(administrator)).value.filter(value => [approved.original.id, approved.restoration.id].includes(value.id)))
-      .toEqual(expect.arrayContaining([expect.objectContaining({ status: "conflict" }), expect.objectContaining({ status: "conflict" })]));
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: approved.original.id, status: "conflict" }),
+        expect.objectContaining({ id: approved.restoration.id, status: "conflict" }),
+      ]));
     expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
   });
 
@@ -102,6 +106,90 @@ describe.sequential("Copilot Studio quarantine full-cycle canaries", () => {
     const fakeProvider = provider(false, true);
     await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id))
       .rejects.toMatchObject({ code: "canary_cycle_unverified" });
+    expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
+  });
+
+  it.each([
+    ["original", "release"],
+    ["original", "readback"],
+    ["restoration", "release"],
+    ["restoration", "readback"],
+  ] as const)("keeps the cycle inconclusive when %s job %s fails after dispatch", async (stage, boundary) => {
+    const { administrator, operator } = users(`canary-${stage}-${boundary}`);
+    const approved = await approvals(administrator);
+    await seedOperatorInventory(operator);
+    const fakeProvider = provider();
+    const failure = new Error("Durable job evidence could not be returned");
+    const action = stage === "original" ? "quarantine" : "unquarantine";
+    if (boundary === "release") {
+      const release = jobs.release.bind(jobs);
+      let releases = 0;
+      vi.spyOn(jobs, "release").mockImplementation(async lease => {
+        await release(lease);
+        if (++releases === (stage === "original" ? 1 : 2)) throw failure;
+      });
+    } else {
+      const get = jobs.get.bind(jobs);
+      vi.spyOn(jobs, "get").mockImplementation(async (scope, id) => {
+        const result = await get(scope, id);
+        if (result?.action === action && result.status === "succeeded") throw failure;
+        return result;
+      });
+    }
+
+    await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id)).rejects.toBe(failure);
+
+    expect(fakeProvider.setQuarantine.mock.calls.map(call => call[2])).toEqual(stage === "original" ? [true] : [true, false]);
+    expect((await canaries.list(administrator)).value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: approved.original.id, status: "inconclusive" }),
+      expect.objectContaining({ id: approved.restoration.id, status: "inconclusive" }),
+    ]));
+    expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
+  });
+
+  it("retains a verified unsent failure without marking the cycle inconclusive", async () => {
+    const { administrator, operator } = users("canary-unsent-failure");
+    const approved = await approvals(administrator);
+    await seedOperatorInventory(operator);
+    const fakeProvider = provider();
+    fakeProvider.getStatus.mockRejectedValue(new Error("Provider status unavailable"));
+
+    await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id))
+      .rejects.toMatchObject({ code: "canary_original_unverified" });
+
+    expect(fakeProvider.setQuarantine).not.toHaveBeenCalled();
+    expect((await canaries.list(administrator)).value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: approved.original.id, status: "failed" }),
+      expect.objectContaining({ id: approved.restoration.id, status: "failed" }),
+    ]));
+    expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
+  });
+
+  it("logs failed cycle persistence without leaking details or replacing the execution error", async () => {
+    const { administrator, operator } = users("canary-completion-failure");
+    const approved = await approvals(administrator);
+    await seedOperatorInventory(operator);
+    const fakeProvider = provider();
+    const executionError = new Error("Execution failed with sensitive provider details");
+    const release = jobs.release.bind(jobs);
+    vi.spyOn(jobs, "release").mockImplementation(async lease => {
+      await release(lease);
+      throw executionError;
+    });
+    vi.spyOn(canaries, "completeCycle").mockRejectedValue(new Error("Database failed with sensitive connection details"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id)).rejects.toBe(executionError);
+
+    const original = (await canaries.list(administrator)).value.find(value => value.id === approved.original.id)!;
+    expect(original.status).toBe("claimed");
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+      level: "error", event: "quarantine_canary_completion_failed", jobId: original.jobId,
+      outcome: "requires_review", errorKind: "unexpected", errorCode: "internal_error",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("sensitive");
+    expect(fakeProvider.setQuarantine.mock.calls.map(call => call[2])).toEqual([true]);
     expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
   });
 });

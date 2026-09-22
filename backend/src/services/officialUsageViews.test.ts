@@ -354,7 +354,7 @@ describe("official usage views", () => {
 
   it("ignores old additive scalars and reports unknown per-agent totals without the identity bridge", () => {
     const source = published();
-    (source.reports.agents!.rows[0] as typeof source.reports.agents.rows[number] & { activeUsersTotal: number }).activeUsersTotal = 999;
+    Object.assign(source.reports.agents!.rows[0], { activeUsersTotal: 999 });
     const withBridge = buildOfficialUsageAggregateView(source, [], { staleAfterDays: 35 });
     expect(withBridge.agents.value.find(agent => agent.agentId === "usage-a")).toMatchObject({
       activeUsersLicensed: 2,

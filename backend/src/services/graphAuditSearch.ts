@@ -114,6 +114,7 @@ export class GraphAuditSearchClient {
       const { response } = attempt;
       if (response.status !== 200) throw providerFailure(response);
       const envelope = parseCollection(await responseJson(response, attempt.signal), "query");
+      validateNextLink(envelope.nextLink, queryPath, seen);
       result.push(...envelope.value.map(value => parseDirectQuery(value, "list")));
       next = envelope.nextLink;
     }
@@ -126,12 +127,14 @@ export class GraphAuditSearchClient {
     const wrapperIds = new Map<string, string>();
     const seenPages = new Set<string>();
     let next: string | null = options.startUrl ?? `${queryUrl(providerQueryId)}/records`;
+    const recordsPath = `${queryPath}/${encodeURIComponent(providerQueryId)}/records`;
+    validateGraphUrl(next, recordsPath, false);
     let pageCount = 0;
     let providerRowCount = 0;
     let byteCount = 0;
     let unknownFieldCount = 0;
     while (next && pageCount < purviewMaximumRecordPages && providerRowCount < purviewMaximumRecords && byteCount < purviewMaximumResultBytes) {
-      validateGraphUrl(next, `${queryPath}/${encodeURIComponent(providerQueryId)}/records`, false);
+      validateGraphUrl(next, recordsPath, false);
       if (seenPages.has(next)) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search records page link.");
       seenPages.add(next);
       let text: string;
@@ -151,6 +154,7 @@ export class GraphAuditSearchClient {
         return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, false, next, "audit_byte_limit");
       }
       const envelope = parseCollection(parseJson(text), "record");
+      validateNextLink(envelope.nextLink, recordsPath, seenPages);
       pageCount += 1;
       for (const value of envelope.value) {
         providerRowCount += 1;
@@ -177,7 +181,10 @@ export class GraphAuditSearchClient {
       }
       next = envelope.nextLink;
     }
-    return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, next === null, next, next === null ? null : "audit_page_limit");
+    const partialReason = next === null ? null
+      : providerRowCount >= purviewMaximumRecords ? "audit_row_limit"
+        : byteCount >= purviewMaximumResultBytes ? "audit_byte_limit" : "audit_page_limit";
+    return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, next === null, next, partialReason);
   }
 
   private async request(token: string, url: string, options: ProviderRequestOptions & { method: "GET" | "POST"; body?: string; retry: boolean; create?: boolean }) {
@@ -191,7 +198,7 @@ export class GraphAuditSearchClient {
       const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
       try {
         if (signal.aborted) throw signal.reason;
-        await options.beforeRequest?.();
+        await requestCallback(() => options.beforeRequest?.(), signal);
         if (signal.aborted) throw signal.reason;
         const response = await this.dependencies.fetch(url, {
           method: options.method,
@@ -206,12 +213,15 @@ export class GraphAuditSearchClient {
           body: options.body,
         });
         try {
-          await options.onResponse?.(responseRequestId(response));
+          await requestCallback(() => options.onResponse?.(responseRequestId(response)), signal);
         } catch (error) {
           await cancelResponse(response);
           throw error;
         }
-        if (isRedirect(response.status)) throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an unexpected redirect.");
+        if (isRedirect(response.status)) {
+          await cancelResponse(response);
+          throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an unexpected redirect.");
+        }
         if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
           const delay = retryDelay(response.headers.get("retry-after"), response.headers.get("date"), attempt, this.dependencies.random());
           if (delay >= maximumRequestBudgetMs - (this.now() - startedAt)) {
@@ -222,6 +232,7 @@ export class GraphAuditSearchClient {
           await this.dependencies.wait(delay, options.signal);
           continue;
         }
+        if (response.status !== (options.create ? 201 : 200)) await cancelResponse(response);
         return { response, signal };
       } catch (error) {
         if (options.signal?.aborted) throw options.signal.reason;
@@ -316,8 +327,8 @@ function parseDirectQuery(value: unknown, operation: "create" | "get" | "list"):
   return {
     id: boundedString(value.id, "id", 512),
     displayName: boundedString(value.displayName, "displayName", 256),
-    filterStartDateTime: utcInstant(value.filterStartDateTime, "filterStartDateTime"),
-    filterEndDateTime: utcInstant(value.filterEndDateTime, "filterEndDateTime"),
+    filterStartDateTime: providerUtcInstant(value.filterStartDateTime, "filterStartDateTime"),
+    filterEndDateTime: providerUtcInstant(value.filterEndDateTime, "filterEndDateTime"),
     serviceFilter: boundedString(value.serviceFilter, "serviceFilter", 128),
     recordTypeFilters: responseStringList(value.recordTypeFilters, "recordTypeFilters"),
     operationFilters: responseStringList(value.operationFilters, "operationFilters", 100),
@@ -347,20 +358,21 @@ function parseAuditRecord(value: unknown, expectedTenantId: string): PurviewAudi
   optionalInteger(dynamicProperties.Version, 1, 2_147_483_647);
   const wrapperTenant = boundedString(value.organizationId, "organizationId", 128);
   const auditTenant = optionalString(dynamicProperties.OrganizationId, 128);
-  if (wrapperTenant !== expectedTenantId || auditTenant && auditTenant !== expectedTenantId) throw new AppError(403, "scope_mismatch", "Microsoft Graph returned an audit record for another tenant.");
+  const tenantId = expectedTenantId.toLowerCase();
+  if (wrapperTenant.toLowerCase() !== tenantId || auditTenant && auditTenant.toLowerCase() !== tenantId) throw new AppError(403, "scope_mismatch", "Microsoft Graph returned an audit record for another tenant.");
   const unknownAuditData = Object.keys(auditData).filter(key => !auditDataKeys.has(key)).length;
   const unknownDynamicProperties = Object.keys(dynamicProperties).filter(key => !dynamicPropertyKeys.has(key)).length;
   const copilotEventData = optionalObject(dynamicProperties.CopilotEventData, "auditData.dynamicProperties.CopilotEventData");
   const unknownCopilotEventData = copilotEventData === null ? 0 : Object.keys(copilotEventData).filter(key => !copilotEventDataKeys.has(key)).length;
   const messagesValue = copilotEventData?.Messages;
   const messages = parseMessages(messagesValue);
-  const nativeEventId = optionalString(dynamicProperties.ID, 128);
+  const nativeEventId = optionalString(dynamicProperties.ID, 128)?.toLowerCase() ?? null;
   if (nativeEventId !== null && !uuid(nativeEventId)) throw new AppError(502, "provider_schema", "Microsoft Graph returned a malformed native audit event ID.");
   return {
     projectionVersion: 1,
     wrapperId: boundedString(value.id, "id", 512),
     nativeEventId,
-    eventDateTime: utcInstant(value.createdDateTime, "createdDateTime"),
+    eventDateTime: providerUtcInstant(value.createdDateTime, "createdDateTime"),
     auditLogRecordType: wrapperRecordType,
     operation: boundedString(value.operation, "operation", 256),
     service: boundedString(value.service, "service", 128),
@@ -408,7 +420,7 @@ function parseCollection(value: unknown, kind: "query" | "record") {
   if (Object.keys(value).some(key => !allowed.has(key))) throw new AppError(502, "provider_schema", "Microsoft Graph returned unknown collection envelope fields.");
   if (value.value.length > purviewMaximumRecords) throw new AppError(502, "provider_result_limit", "Microsoft Graph returned too many Audit Search rows in one page.");
   const nextLink = value["@odata.nextLink"];
-  if (nextLink !== undefined && (typeof nextLink !== "string" || nextLink.length > 4096)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search next link.");
+  if (nextLink !== undefined && (typeof nextLink !== "string" || !nextLink || nextLink.length > 4096)) throw new AppError(502, "provider_schema", "Microsoft Graph returned an invalid Audit Search next link.");
   return { value: value.value, nextLink: nextLink ?? null as string | null };
 }
 
@@ -436,9 +448,32 @@ function queryUrl(id: string) {
 }
 
 function validateGraphUrl(value: string, expectedPath: string, allowDescendants = true) {
-  const url = new URL(value);
-  const validPath = url.pathname === expectedPath || allowDescendants && url.pathname.startsWith(`${expectedPath}/`);
-  if (url.origin !== graphOrigin || url.username || url.password || url.hash || !validPath) throw new AppError(502, "invalid_provider_link", "Audit Search provider link is outside the selected Graph v1.0 contract.");
+  const url = URL.parse(value);
+  const validPath = url && (url.pathname === expectedPath || allowDescendants && url.pathname.startsWith(`${expectedPath}/`));
+  if (!url || url.origin !== graphOrigin || url.username || url.password || url.hash || !validPath) throw new AppError(502, "invalid_provider_link", "Audit Search provider link is outside the selected Graph v1.0 contract.");
+}
+
+function validateNextLink(value: string | null, expectedPath: string, seen: Set<string>) {
+  if (value === null) return;
+  validateGraphUrl(value, expectedPath, false);
+  if (seen.has(value)) throw new AppError(502, "provider_schema", "Microsoft Graph repeated an Audit Search page link.");
+}
+
+async function requestCallback(callback: () => Promise<void> | undefined, signal: AbortSignal) {
+  signal.throwIfAborted();
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([callback(), aborted]);
+  } catch (error) {
+    if (signal.aborted || error instanceof AppError) throw error;
+    throw new AppError(500, "internal_error", "Audit Search request bookkeeping failed.");
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function retryDelay(retryAfter: string | null, responseDate: string | null, attempt: number, random: number) {
@@ -453,7 +488,7 @@ function retryDelay(retryAfter: string | null, responseDate: string | null, atte
 
 async function cancelResponse(response: Response) {
   try { await response.body?.cancel(); }
-  catch { /* Retry remains bounded even when the provider body cannot be cancelled. */ }
+  catch { /* Preserve the request outcome when response disposal fails. */ }
 }
 
 function responseRequestId(response: Response) {
@@ -493,6 +528,11 @@ function utcInstant(value: unknown, field: string) {
   const normalizedInput = value.includes(".") ? value : value.replace("Z", ".000Z");
   if (instant !== normalizedInput) throw new AppError(400, "invalid_audit_range", `Audit Search ${field} must be an exact UTC timestamp.`);
   return instant;
+}
+
+function providerUtcInstant(value: unknown, field: string) {
+  try { return utcInstant(value, field); }
+  catch { throw new AppError(502, "provider_schema", `Microsoft Graph returned an invalid ${field}.`); }
 }
 
 function stringList(value: unknown, field: string, validate: (item: string) => boolean, maximumLength = 256, maximumItems = 20) {

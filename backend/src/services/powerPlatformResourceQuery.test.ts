@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import { withTelemetryContext } from "./telemetry.js";
@@ -55,6 +56,86 @@ describe("PowerPlatformResourceQueryClient", () => {
     await new PowerPlatformResourceQueryClient(fetcher).checkAccess("opaque-token");
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(JSON.parse(fetcher.mock.calls[0][1].body as string).Options.Top).toBe(1);
+  });
+
+  it.each([5_001, Number.MAX_SAFE_INTEGER])("checks access without enumerating or applying the refresh ceiling to %i total environments", async totalRecords => {
+    const fetcher = vi.fn(async (_input: string | URL, _init?: RequestInit) => Response.json({
+      totalRecords, count: 1, resultTruncated: 1, skipToken: "next",
+      data: [{ ...resource, type: "microsoft.powerplatform/environments" }],
+    }));
+    const client = new PowerPlatformResourceQueryClient(fetcher);
+
+    await expect(client.checkAccess("opaque-token")).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).Options).toEqual({ Top: 1, Skip: 0 });
+    await expect(client.query("opaque-token", ["microsoft.powerplatform/environments"]))
+      .rejects.toMatchObject({ code: "provider_schema", diagnostics: { reason: "invalid_total" } });
+  });
+
+  it("keeps the ten-second access-check deadline when a caller supplies a cancellation signal", async () => {
+    fakeDeadlineTimers();
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    const fetcher = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({ cancel })));
+    const client = new PowerPlatformResourceQueryClient(fetcher, { delay: async () => undefined });
+    const settled = vi.fn();
+    const pending = client.checkAccess("opaque-token", controller.signal)
+      .then(result => ({ result }), error => ({ error }));
+    void pending.then(settled);
+
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(settled).toHaveBeenCalledOnce();
+      expect(await pending).toMatchObject({ error: { name: "TimeoutError" } });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort(new Error("test cleanup"));
+      await pending;
+    }
+  });
+
+  it("preserves access-check cancellation during failed-response cleanup", async () => {
+    const controller = new AbortController();
+    const reason = new Error("access check cancelled");
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({
+      cancel() { controller.abort(reason); },
+    }), { status: 403 }));
+
+    await expect(new PowerPlatformResourceQueryClient(fetcher).checkAccess("opaque-token", controller.signal))
+      .rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["redirect", "denied", "retry"])("does not wait for stalled response cleanup on %s", async mode => {
+    const cleanup = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => cleanup.promise);
+    const response = new Response(new ReadableStream({ cancel }), { status: mode === "denied" ? 403 : 503 });
+    if (mode === "redirect") Object.defineProperty(response, "redirected", { value: true });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response)
+      .mockResolvedValueOnce(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
+    const pending = new PowerPlatformResourceQueryClient(fetcher, { delay: async () => undefined })
+      .checkAccess("opaque-token").then(() => "success", error => error);
+    try {
+      const result = await Promise.race([pending, setImmediate("still pending")]);
+      if (mode === "retry") expect(result).toBe("success");
+      else expect(result).toMatchObject({ code: mode === "redirect" ? "invalid_provider_link" : "provider_error" });
+      expect(fetcher).toHaveBeenCalledTimes(mode === "retry" ? 2 : 1);
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { cleanup.resolve(); await pending; }
+  });
+
+  it.each([
+    { totalRecords: -1, count: 0, resultTruncated: 0, data: [] },
+    { totalRecords: Number.MAX_SAFE_INTEGER + 1, count: 1, resultTruncated: 1, skipToken: "next", data: [{ ...resource, type: "microsoft.powerplatform/environments" }] },
+    { totalRecords: 2, count: 2, resultTruncated: 0, data: [{ ...resource, type: "microsoft.powerplatform/environments" }, { ...resource, name: "environment-b", type: "microsoft.powerplatform/environments" }] },
+  ])("still rejects malformed or oversized access-check pages: %j", async page => {
+    const fetcher = vi.fn(async () => Response.json(page));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).checkAccess("opaque-token"))
+      .rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("discards nested details that are not documented for the returned resource type", async () => {
@@ -356,6 +437,67 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(vi.mocked(console.error).mock.calls.map(([entry]) => JSON.parse(entry))).toContainEqual(expect.objectContaining({
       event: "inventory_query_failed", errorCode: "provider_timeout", errorKind: "timeout", durationMs: 120_000,
     }));
+  });
+
+  it("does not return a completed inventory after final progress recording exceeds the deadline", async () => {
+    fakeDeadlineTimers();
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [resource],
+    }));
+    const onProgress = vi.fn(() => new Promise<void>(resolve => setTimeout(resolve, 120_001)));
+    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress })
+      .then(result => ({ result }), error => ({ error }));
+
+    await vi.advanceTimersByTimeAsync(120_001);
+
+    expect(await pending).toMatchObject({
+      error: { status: 504, code: "provider_timeout", message: expect.stringContaining("120-second enumeration limit") },
+    });
+    expect(onProgress).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
+  });
+
+  it.each([false, true])("preserves cancellation during final progress recording (callback failure: %s)", async fails => {
+    const controller = new AbortController();
+    const reason = new Error("refresh cancelled");
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [resource],
+    }));
+    let finishProgress!: () => void;
+    const onProgress = vi.fn(async () => {
+      controller.abort(reason);
+      await new Promise<void>(resolve => { finishProgress = resolve; });
+      if (fails) throw new Error("progress recording failed");
+    });
+    const pending = new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, {
+      signal: controller.signal, onProgress,
+    }).then(result => ({ result }), error => ({ error }));
+    const settled = vi.fn();
+    void pending.then(settled);
+    await vi.waitFor(() => expect(onProgress).toHaveBeenCalledOnce());
+    expect(settled).not.toHaveBeenCalled();
+    finishProgress();
+
+    expect(await pending).toEqual({ error: reason });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
+  });
+
+  it("propagates progress recording failures when the query has not been cancelled", async () => {
+    const failure = new Error("progress recording failed");
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [resource],
+    }));
+    const onProgress = vi.fn().mockRejectedValue(failure);
+
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress }))
+      .rejects.toBe(failure);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.log).mock.calls.map(([entry]) => JSON.parse(entry)))
+      .not.toContainEqual(expect.objectContaining({ event: "inventory_query_completed" }));
   });
 
   it("applies the ten-second page limit while consuming a stalled response body", async () => {
@@ -664,8 +806,9 @@ describe("PowerPlatformResourceQueryClient", () => {
 
   it("honors external cancellation without retrying the provider request", async () => {
     const controller = new AbortController();
-    const fetcher = vi.fn(async (_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    const fetcher = vi.fn(async (_url: string | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
       controller.abort(new Error("shutdown"));
     }));
     const client = new PowerPlatformResourceQueryClient(fetcher);

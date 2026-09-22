@@ -1695,6 +1695,13 @@ END $$;
   { version: 35, sql: agentPeopleMigrationSql },
   { version: 36, sql: dataSyncAutomaticSourcesMigrationSql },
   { version: 37, sql: copilotServiceSnapshotResetMigrationSql },
+  { version: 38, sql: `
+DROP INDEX package_mutation_qualification_current;
+CREATE UNIQUE INDEX package_mutation_qualification_current ON package_mutation_qualifications(
+  tenant_id,action,contract_revision,configuration_revision,auth_mode,
+  (CASE WHEN action IN ('update-availability','update-installation') THEN cycle_stage ELSE '' END)
+) WHERE status='qualified';
+` },
 ] as const;
 
 export function migrationChecksum(sql: string) {

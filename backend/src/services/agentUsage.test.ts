@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentUsageRepository, type AgentUsageSnapshot, type AuthorizedAgentUsageSource, type StoredAgentUsageAssociation,
 } from "../db/agentUsage.js";
@@ -15,6 +15,7 @@ const firstId = "11111111-1111-4111-8111-111111111111";
 const secondId = "22222222-2222-4222-8222-222222222222";
 const setId = "33333333-3333-4333-8333-333333333333";
 const observedAt = "2026-09-18T00:00:00.000Z";
+const snapshotAt = "2026-09-19T00:00:00.000Z";
 const expiresAt = "2035-01-01T00:00:00.000Z";
 const observation = { id: firstId, snapshotId: firstId, observedAt, expiresAt, current: true as const };
 const reportBase = {
@@ -26,6 +27,10 @@ const reportBase = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("report-backed inventory usage", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(snapshotAt));
+  });
+
   it("returns explicit unavailable nulls for every record without an accepted report", () => {
     const fixture = data();
     fixture.snapshot.published = { ...fixture.snapshot.published, activeSet: null, reports: {}, retainedCompleteSets: 0, hasImportHistory: false };
@@ -368,7 +373,7 @@ function data(packageIds = ["Package-A", "Package-B", "Package-C"]) {
     retainedCompleteSets: 1, retainedIncompleteSets: 0, hasImportHistory: true, activeSelectionIncomplete: false,
   };
   const snapshot: AgentUsageSnapshot = { published, associations, associationRevision: "1",
-    now: new Date("2026-09-19T00:00:00Z"), expiresAt: null };
+    now: new Date(snapshotAt), expiresAt: null };
   return { records, sources, snapshot };
 }
 

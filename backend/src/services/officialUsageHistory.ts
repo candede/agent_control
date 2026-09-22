@@ -95,7 +95,8 @@ export class OfficialUsageHistoryService {
           report_set.created_at,report_set.expires_at,state.active_set_id,
           count(DISTINCT membership.version_id)::int AS observation_count,
           count(row.ordinal)::text AS row_count,
-          count(DISTINCT (row.kind,row.payload_hash))::text AS unique_payload_count,
+          count(DISTINCT (row.kind,row.payload_hash))
+            FILTER (WHERE row.ordinal IS NOT NULL)::text AS unique_payload_count,
           coalesce(array_agg(DISTINCT membership.kind ORDER BY membership.kind)
             FILTER (WHERE membership.kind IS NOT NULL),'{}') AS kinds
         FROM official_usage_sets report_set
