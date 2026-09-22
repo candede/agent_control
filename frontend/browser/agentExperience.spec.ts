@@ -4,6 +4,7 @@ import type { OfficialUsageHistoryView } from "../../backend/src/types/officialU
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { usageAggregateFixture, usageAgentDetailFixture, usageFixtureSetId, usageUsersFixture } from "../src/test/usageInsightsFixture";
 import { mockLayoutApi } from "./layoutFixtures";
+import { activeWithoutPaidUsersFixture } from "./userCohortFixtures";
 
 async function mockUsageReports(page: Page, unexpected: string[]) {
   await page.route(url => url.pathname === "/api/official-usage/aggregate", route => {
@@ -24,10 +25,11 @@ async function mockUsageReports(page: Page, unexpected: string[]) {
   await page.route(url => url.pathname === "/api/official-usage/users", route => {
     expect(route.request().method()).toBe("GET");
     const params = new URL(route.request().url()).searchParams;
+    expect(params.get("licenseCohort")).toBe("active_without_paid");
     if (params.has("setId") && params.get("setId") !== usageFixtureSetId) {
       return route.fulfill({ status: 404, json: { code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." } });
     }
-    return route.fulfill({ json: usageUsersFixture({
+    return route.fulfill({ json: activeWithoutPaidUsersFixture({
       staleAfterDays: 35, search: params.get("search") ?? undefined, agentId: params.get("agentId") ?? undefined,
       creatorType: params.get("creatorType") ?? undefined, responsesOnly: params.get("responsesOnly") === "true",
       startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
@@ -102,7 +104,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(dialog.getByLabel("Find a reported agent")).toHaveCount(0);
   await expect(dialog.getByText("Researcher", { exact: true })).toHaveCount(0);
   await expect(dialog.getByRole("region", { name: "Users of the reported agent" })).toHaveCount(0);
-  await expect(dialog.getByRole("link", { name: /reported user activity/i })).toHaveCount(0);
+  await expect(dialog.getByRole("link", { name: /active users without paid Copilot/i })).toHaveCount(0);
   expect(await dialog.boundingBox()).toEqual(bounds);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("agent-usage-users.png") });
@@ -132,40 +134,46 @@ test("Agents separates its compact overview from agent details and snapshot resp
   expect(unexpected).toEqual([]);
 });
 
-test("users can traverse reported activity, user details and exact agents without losing route state", async ({ page }, info) => {
+test("users can switch cohorts and traverse nonpaid activity without losing route state", async ({ page }, info) => {
   test.setTimeout(60_000);
   const unexpected = await mockLayoutApi(page);
   await mockUsageReports(page, unexpected);
   await page.goto("/users");
-  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
+  const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
+  await expect(cohort).toHaveValue("licenses");
+  await cohort.selectOption("activity");
   await expect(page).toHaveURL(/\/users\?view=activity$/);
-  const activity = page.getByRole("region", { name: "Reported users", exact: true });
-  await expect(activity.locator("tbody tr")).toHaveCount(4);
+  const activity = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
+  await expect(activity.locator("tbody tr")).toHaveCount(2);
   await expect(activity.getByRole("columnheader")).toHaveCount(6);
-  await expect(activity.getByRole("row", { name: /Concealed report user/ })).toContainText("Unknown");
-  await expect(activity.getByRole("row", { name: /Ben/ })).toContainText("0");
-  await expect(activity.getByRole("row", { name: /Cleo/ })).toContainText("Not reported");
+  await expect(activity.getByRole("row", { name: /Concealed report user|Ada|Ben|Cleo/ })).toHaveCount(0);
+  await expect(activity.getByRole("row", { name: /Emery/ })).toContainText("No active M365 Copilot license");
+  await expect(activity.getByRole("row", { name: /Finley/ })).toContainText("Not reported");
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("reported-user-activity.png"), fullPage: true });
-  await activity.getByRole("button", { name: "View reported details for Ada", exact: true }).click();
-  await page.getByRole("dialog", { name: "Ada" }).getByRole("button", { name: "Researcher", exact: true }).click();
+  await activity.getByRole("button", { name: "View reported details for Emery", exact: true }).click();
+  await page.getByRole("dialog", { name: "Emery" }).getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
   const selectedAgentUrl = new RegExp(`agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`);
   await expect(page).toHaveURL(selectedAgentUrl);
-  await expect(activity.locator("tbody tr")).toHaveCount(3);
-  await activity.getByRole("button", { name: "View reported details for Ada", exact: true }).click();
-  const user = page.getByRole("dialog", { name: "Ada" });
+  await expect(activity.locator("tbody tr")).toHaveCount(1);
+  await activity.getByRole("button", { name: "View reported details for Emery", exact: true }).click();
+  const user = page.getByRole("dialog", { name: "Emery" });
   await expect(user.getByText("Responses (Users report)", { exact: true })).toBeVisible();
-  await user.getByRole("button", { name: "Researcher", exact: true }).click();
+  await user.getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
   await expect(user).not.toBeVisible();
   await expect(page).toHaveURL(selectedAgentUrl);
   await page.goBack();
   await expect(page).toHaveURL(/\/users\?view=activity$/);
-  await expect(activity.locator("tbody tr")).toHaveCount(4);
+  await expect(activity.locator("tbody tr")).toHaveCount(2);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Reported activity", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(activity.locator("tbody tr")).toHaveCount(4);
+  await expect(cohort).toHaveValue("activity");
+  await expect(activity.locator("tbody tr")).toHaveCount(2);
+  await cohort.selectOption("licenses");
+  await expect(page).toHaveURL(/\/users$/);
+  await expect(page.getByRole("region", { name: "M365 Copilot license status", exact: true }).locator("tbody tr")).toHaveCount(4);
+  await expect(activity).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });
 
@@ -212,9 +220,9 @@ test("fresh activity links keep their search, page and snapshot separate from ot
     bundles: { value: [], count: 0, limit: 10, offset: 0 },
   };
   await page.route("**/api/official-usage/history*", route => route.fulfill({ json: history }));
-  const activityUrl = `/users?view=activity&q=Ada&snapshot=${usageFixtureSetId}&page=2`;
+  const activityUrl = `/users?view=activity&q=Emery&snapshot=${usageFixtureSetId}&page=2`;
   await page.goto(activityUrl);
-  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
+  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Emery");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
   await expect(page).toHaveURL(/\/agents$/);
@@ -225,6 +233,6 @@ test("fresh activity links keep their search, page and snapshot separate from ot
   await expect(page).toHaveURL(/\/official-usage$/);
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`${activityUrl.replace("?", "\\?")}$`));
-  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
+  await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Emery");
   expect(unexpected).toEqual([]);
 });

@@ -773,6 +773,533 @@ describe("CopilotUsageGraphClient", () => {
     expect(() => buildCopilotUsersUrl(skus.map(sku => sku.skuId))).toThrow();
   });
 
+  describe("exact reported identity verification", () => {
+    const objectId = "aaaaaaaa-aaaa-7aaa-1aaa-aaaaaaaaaaaa";
+    const otherId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const upn = "reported@example.com";
+
+    it("finishes the catalog and full product roster before verifying only missing report identities", async () => {
+      const catalogNext = `${buildSubscribedSkusUrl()}&$skiptoken=catalog`;
+      const productUrl = buildCopilotUsersUrl([skuId, otherId]);
+      const productNext = `${productUrl}&$skiptoken=products`;
+      const candidate = graphUser(objectId, "listed@example.com", "Active");
+      const unreported = graphUser(otherId, "unreported@example.com", "Disabled", otherId);
+      const reported = { ...graphUser("cccccccc-cccc-4ccc-8ccc-cccccccccccc", upn, "Active"), assignedLicenses: [] };
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const url = String(input);
+        if (url === buildSubscribedSkusUrl()) return Response.json({
+          value: [knownSkus[0]], "@odata.nextLink": catalogNext,
+        });
+        if (url === catalogNext) return Response.json({ value: [{ ...knownSkus[0], skuId: otherId }] });
+        if (url === productUrl) return Response.json({
+          value: [candidate], "@odata.count": 2, "@odata.nextLink": productNext,
+        });
+        if (url === productNext) return Response.json({ value: [unreported] });
+        expect(new URL(url).searchParams.get("$filter")).toBe(`userPrincipalName eq '${upn}'`);
+        return Response.json({ value: [reported], "@odata.count": 1 });
+      });
+      const progress = vi.fn();
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        const users = await new CopilotUsageGraphClient(fetcher).listCopilotUsers("private-token", undefined, progress, [
+          " LISTED@EXAMPLE.COM ", objectId.toUpperCase(), upn, ` ${upn.toUpperCase()} `, "concealed-report-label",
+        ]);
+        expect(users.map(user => user.identity.objectId)).toEqual([objectId, otherId, reported.id]);
+        expect(users.map(user => user.copilotServiceState)).toEqual(["enabled", "disabled", "disabled"]);
+        expect(users[2].servicePlans).toEqual([]);
+        expect(progress.mock.calls).toEqual([[1], [2], [3]]);
+        expect(fetcher.mock.calls.slice(0, 4).map(([url]) => String(url))).toEqual([
+          buildSubscribedSkusUrl(), catalogNext, productUrl, productNext,
+        ]);
+        expect(fetcher).toHaveBeenCalledTimes(5);
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(/example\.com|aaaa|bbbb|cccc|private-token|skiptoken|concealed-report-label/);
+        expect(log).toHaveBeenLastCalledWith(expect.stringContaining('"count":3'));
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it.each([
+      { label: "zero assignments and observations", assignments: [], observations: [], catalog: knownSkus },
+      { label: "only historical paid observations", assignments: [], observations: graphUser(objectId, upn, "Active").assignedPlans, catalog: knownSkus },
+      { label: "base or unrecognized plans", assignments: [{ skuId: otherId, disabledPlans: [] }], observations: [], catalog: [
+        ...knownSkus, { skuId: otherId, appliesTo: "User", servicePlans: [{ servicePlanId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }] },
+      ] },
+      { label: "company-scoped paid subscription", assignments: [{ skuId: otherId, disabledPlans: [] }], observations: [], catalog: [
+        ...knownSkus, { ...knownSkus[0], skuId: otherId, appliesTo: "Company" },
+      ] },
+      { label: "no qualifying catalog products", assignments: [{ skuId, disabledPlans: [] }], observations: [], catalog: [
+        { ...knownSkus[0], servicePlans: [] },
+      ] },
+      { label: "empty catalog", assignments: [], observations: [], catalog: [] },
+    ])("marks exact verified users disabled with no paid plans: $label", async ({ assignments, observations, catalog }) => {
+      const row = { ...graphUser(objectId, upn, "Active"), assignedLicenses: assignments, assignedPlans: observations };
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [row], "@odata.count": 1 }));
+      const progress = vi.fn();
+      const users = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher, catalog))
+        .listCopilotUsers("token", undefined, progress, [upn]);
+      expect(users).toEqual([expect.objectContaining({
+        serviceEvidenceVersion: 1, identity: expect.objectContaining({ objectId, userPrincipalName: upn }),
+        copilotServiceState: "disabled", servicePlans: [],
+      })]);
+      expect(progress.mock.calls).toEqual([[0], [1]]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { label: "unknown product", catalog: knownSkus, assignedSkuIds: [otherId] },
+      { label: "empty catalog", catalog: [], assignedSkuIds: [otherId] },
+      { label: "ordinary and unknown products", catalog: [
+        ...knownSkus, { ...knownSkus[0], skuId: otherId, servicePlans: [] },
+      ], assignedSkuIds: [otherId, "cccccccc-cccc-4ccc-8ccc-cccccccccccc"] },
+    ])("does not certify no paid service with an unresolvable current SKU: $label", async ({ catalog, assignedSkuIds }) => {
+      const row = {
+        ...graphUser(objectId, upn, "Active"),
+        assignedLicenses: assignedSkuIds.map(skuId => ({ skuId: skuId.toUpperCase(), disabledPlans: [] })),
+      };
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [row], "@odata.count": 1 }));
+      const users = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher, catalog))
+        .listCopilotUsers("token", undefined, undefined, [upn]);
+      expect(users).toEqual([expect.objectContaining({
+        serviceEvidenceVersion: 1, identity: expect.objectContaining({ objectId, userPrincipalName: upn }),
+        copilotServiceState: "unknown", servicePlans: [],
+      })]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { disabled: false, capabilityStatus: "Enabled", expected: "enabled", planState: "enabled" },
+      { disabled: false, capabilityStatus: "Warning", expected: "warning", planState: "warning" },
+      { disabled: true, capabilityStatus: "Enabled", expected: "unknown", planState: "disabled" },
+      { disabled: false, capabilityStatus: "Deleted", expected: "unknown", planState: "disabled" },
+      { disabled: false, capabilityStatus: "Suspended", expected: "unknown", planState: "suspended" },
+      { disabled: false, capabilityStatus: "LockedOut", expected: "unknown", planState: "locked_out" },
+      { disabled: false, capabilityStatus: null, expected: "unknown", planState: "unknown" },
+    ])("requires proven active paid evidence alongside an unresolvable current SKU: %j", async ({ disabled, capabilityStatus, expected, planState }) => {
+      const original = graphUser(objectId, upn, disabled ? "Disabled" : "Active");
+      const row = {
+        ...original,
+        assignedLicenses: [...original.assignedLicenses, { skuId: otherId, disabledPlans: [] }],
+        assignedPlans: capabilityStatus ? [{ ...original.assignedPlans[0], capabilityStatus }] : [],
+      };
+      for (const targeted of [false, true]) {
+        const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [row], "@odata.count": 1 }));
+        const client = new CopilotUsageGraphClient(targeted ? withEmptyDiscovery(fetcher) : withCatalog(fetcher));
+        const [user] = await client.listCopilotUsers("token", undefined, undefined, targeted ? [upn] : []);
+        expect(user.copilotServiceState).toBe(expected);
+        expect(user.servicePlans).toEqual([expect.objectContaining({
+          servicePlanId: appsPlanId, state: planState,
+        })]);
+        expect(fetcher).toHaveBeenCalledOnce();
+      }
+    });
+
+    it.each([
+      { disabled: false, statuses: ["Enabled"], expected: "enabled" },
+      { disabled: true, statuses: ["Enabled"], expected: "disabled" },
+      { disabled: true, statuses: [], expected: "disabled" },
+      { disabled: false, statuses: ["Deleted"], expected: "disabled" },
+      { disabled: false, statuses: ["Warning"], expected: "warning" },
+      { disabled: false, statuses: ["Suspended"], expected: "suspended" },
+      { disabled: false, statuses: ["LockedOut"], expected: "locked_out" },
+      { disabled: false, statuses: [], expected: "unknown" },
+      { disabled: false, statuses: ["Enabled", "Deleted"], expected: "unknown" },
+    ])("derives exact paid service state from current evidence, never roster absence: %j", async ({ disabled, statuses, expected }) => {
+      const original = graphUser(objectId, upn, disabled ? "Disabled" : "Active");
+      const row = { ...original, assignedPlans: statuses.map(capabilityStatus => ({ ...original.assignedPlans[0], capabilityStatus })) };
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [row], "@odata.count": 1 }));
+      const [user] = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher)).listCopilotUsers("token", undefined, undefined, [upn]);
+      expect(user.copilotServiceState).toBe(expected);
+      expect(user.servicePlans).toEqual([expect.objectContaining({ servicePlanId: appsPlanId, state: expected })]);
+    });
+
+    it("deduplicates normalized UPNs and object IDs across exact batches with distinct progress", async () => {
+      const row = graphUser(objectId, upn.toUpperCase(), "Active");
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [row], "@odata.count": 1 }));
+      const progress = vi.fn();
+      const identities = [upn, ` ${upn.toUpperCase()} `, ...Array.from({ length: 19 }, (_, index) => `missing${index}@example.com`),
+        objectId.toUpperCase(), objectId];
+      const users = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, progress, identities);
+      expect(users).toHaveLength(1);
+      expect(users[0].identity.objectId).toBe(objectId);
+      expect(progress.mock.calls).toEqual([[0], [1], [1]]);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      expect(new URL(String(fetcher.mock.calls[0][0])).searchParams.get("$filter")?.split(" or ")).toHaveLength(20);
+      expect(new URL(String(fetcher.mock.calls[1][0])).searchParams.get("$filter")).toBe(`id eq '${objectId}'`);
+    });
+
+    it("deduplicates UPN and ID aliases within one page without equating identity count to user count", async () => {
+      const row = graphUser(objectId, upn, "Active");
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({
+        value: [row, { ...row, id: objectId.toUpperCase() }], "@odata.count": 1,
+      }));
+      const users = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn, objectId.toUpperCase()]);
+      expect(users).toHaveLength(1);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it.each(["same page", "separate batches", "product discovery"] as const)("rejects conflicting records from %s", async source => {
+      const original = graphUser(objectId, "original@example.com", "Active");
+      const changed = { ...original, userPrincipalName: upn, displayName: "Changed" };
+      const fetcher = vi.fn<FetchLike>();
+      let identities = [objectId];
+      let client: CopilotUsageGraphClient;
+      if (source === "product discovery") {
+        fetcher.mockResolvedValueOnce(Response.json({ value: [original], "@odata.count": 1 }))
+          .mockResolvedValueOnce(Response.json({ value: [changed], "@odata.count": 1 }));
+        identities = [upn];
+        client = new CopilotUsageGraphClient(withCatalog(fetcher));
+      } else {
+        if (source === "same page") {
+          fetcher.mockResolvedValueOnce(Response.json({ value: [original, changed], "@odata.count": 1 }));
+        } else {
+          fetcher.mockResolvedValueOnce(Response.json({ value: [original], "@odata.count": 1 }))
+            .mockResolvedValueOnce(Response.json({ value: [changed], "@odata.count": 1 }));
+          identities = [original.userPrincipalName, ...Array.from({ length: 19 }, (_, index) => `missing${index}@example.com`), objectId];
+        }
+        client = new CopilotUsageGraphClient(withEmptyDiscovery(fetcher));
+      }
+      await expect(client.listCopilotUsers("token", undefined, undefined, identities))
+        .rejects.toMatchObject({ code: "provider_schema", message: "Directory returned conflicting duplicate user records." });
+      expect(fetcher).toHaveBeenCalledTimes(source === "same page" ? 1 : 2);
+    });
+
+    it("skips concealed or implausible identifiers without fabricating users or making an unfiltered query", async () => {
+      const fetcher = vi.fn<FetchLike>();
+      const identities = [
+        "", "   ", "concealed-identifier", objectId.replaceAll("-", ""), "not-a-uuid", "person", "Person Name",
+        "@example.com", "one@@example.com", "one@localhost", "one@-example.com", "one@example..com",
+        ".one@example.com", "one.@example.com", "one..two@example.com", "one two@example.com",
+        `${"x".repeat(65)}@example.com`, "x".repeat(321), "one@example.com\ninjected",
+        "person@example.com' or accountEnabled eq true", "x') or true or ('x@example.com",
+      ];
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, identities)).resolves.toEqual([]);
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it("leaves plausible but unresolvable UPNs and UUIDs unresolved instead of inferring non-paid users", async () => {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [], "@odata.count": 0 }));
+      const progress = vi.fn();
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, progress, [upn, objectId])).resolves.toEqual([]);
+      expect(progress.mock.calls).toEqual([[0], [0]]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it("escapes exact normalized UPN literals and uses the same bounded, authenticated read-only query fields", async () => {
+      const fetcher = vi.fn<FetchLike>(async (input, init) => {
+        const url = new URL(String(input));
+        const product = new URL(buildCopilotUsersUrl([skuId]));
+        expect(url.origin + url.pathname).toBe("https://graph.microsoft.com/v1.0/users");
+        expect(url.searchParams.get("$filter")).toBe(
+          `userPrincipalName eq 'o''brien+tag@example.com' or id eq '${objectId}' or userPrincipalName eq 'x%27%20or%20true@example.com'`,
+        );
+        for (const field of ["$select", "$count", "$top"]) expect(url.searchParams.get(field)).toBe(product.searchParams.get(field));
+        expect(init).toMatchObject({ method: "GET", redirect: "error" });
+        expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer private-token");
+        expect(new Headers(init?.headers).get("ConsistencyLevel")).toBe("eventual");
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        return Response.json({ value: [], "@odata.count": 0 });
+      });
+      await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher)).listCopilotUsers("private-token", undefined, undefined, [
+        " O'Brien+tag@EXAMPLE.COM ", objectId.toUpperCase(), "x%27%20or%20true@example.com",
+        "x@example.com' or accountEnabled eq true",
+      ]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it("bounds encoded exact query URLs as well as batch cardinality without dropping identities", async () => {
+      const domain = Array.from({ length: 4 }, () => "d".repeat(60)).join(".");
+      const identities = Array.from({ length: 41 }, (_, index) => `${"'".repeat(60)}${index}@${domain}`);
+      const filters: string[] = [];
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const url = String(input);
+        expect(url.length).toBeLessThanOrEqual(8_192);
+        const filter = new URL(url).searchParams.get("$filter")!;
+        expect(filter.split(" or ").length).toBeLessThanOrEqual(20);
+        filters.push(...filter.split(" or "));
+        return Response.json({ value: [], "@odata.count": 0 });
+      });
+      await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher)).listCopilotUsers("token", undefined, undefined, identities);
+      expect(filters).toEqual(identities.map(identity => `userPrincipalName eq '${identity.replace(/'/g, "''")}'`));
+      expect(fetcher.mock.calls.length).toBeGreaterThan(Math.ceil(identities.length / 20));
+    });
+
+    it("reads every exact page, validates unique counts and reports cumulative distinct progress", async () => {
+      const row = graphUser(objectId, upn, "Active");
+      const second = { ...graphUser(otherId, "second@example.com", "Active"), assignedLicenses: [], assignedPlans: [] };
+      const fetcher = vi.fn<FetchLike>()
+        .mockImplementationOnce(async input => Response.json({
+          value: [row], "@odata.count": 2, "@odata.nextLink": `${String(input)}&$skiptoken=next`,
+        }))
+        .mockResolvedValueOnce(Response.json({ value: [row, second], "@odata.count": 2 }));
+      const progress = vi.fn();
+      const users = await new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, progress, [upn, otherId]);
+      expect(users.map(user => user.copilotServiceState)).toEqual(["enabled", "disabled"]);
+      expect(progress.mock.calls).toEqual([[0], [1], [2]]);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([false, true])("rejects returned users not matching either requested UPN or ID (continuation: %s)", async continuation => {
+      const fetcher = vi.fn<FetchLike>();
+      if (continuation) fetcher.mockImplementationOnce(async input => Response.json({
+        value: [], "@odata.count": 1, "@odata.nextLink": `${String(input)}&$skiptoken=next`,
+      }));
+      fetcher.mockResolvedValueOnce(Response.json({
+        value: [graphUser(otherId, "unrequested@example.com", "Active")], "@odata.count": 1,
+      }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn, objectId]))
+        .rejects.toMatchObject({ code: "provider_schema", message: "Directory returned a user outside the requested exact-identity filter." });
+      expect(fetcher).toHaveBeenCalledTimes(continuation ? 2 : 1);
+    });
+
+    it.each([
+      { id: "not-an-object-id" },
+      { assignedLicenses: null },
+      { assignedLicenses: [{ skuId, disabledPlans: null }] },
+      { assignedPlans: null },
+      { assignedPlans: [{ servicePlanId: appsPlanId, service: "M365_COPILOT_APPS", capabilityStatus: "Invalid" }] },
+      { companyName: 42 },
+    ])("uses the same strict directory parsing for exact records: %#", async fields => {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({
+        value: [{ ...graphUser(objectId, upn, "Active"), ...fields }], "@odata.count": 1,
+      }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn])).rejects.toMatchObject({ code: "provider_schema" });
+    });
+
+    it.each([undefined, null, -1, 1.5, "1"])("rejects missing or invalid exact query counts: %s", async count => {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [], "@odata.count": count }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn])).rejects.toMatchObject({ code: "provider_schema" });
+    });
+
+    it.each([
+      { count: 1, values: [] },
+      { count: 0, values: [graphUser(objectId, upn, "Active")] },
+      { count: 2, values: [graphUser(objectId, upn, "Active"), graphUser(objectId, upn, "Active")] },
+      { count: 3, values: [] },
+    ])("rejects incomplete, duplicate-only, excessive or impossible exact counts: %#", async ({ count, values }) => {
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: values, "@odata.count": count }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn, objectId])).rejects.toMatchObject({ code: "provider_count_mismatch" });
+    });
+
+    it.each([0, "1", null, -1])("rejects changing or invalid continuation counts: %s", async count => {
+      const fetcher = vi.fn<FetchLike>()
+        .mockImplementationOnce(async input => Response.json({
+          value: [], "@odata.count": 1, "@odata.nextLink": `${String(input)}&$skiptoken=next`,
+        }))
+        .mockResolvedValueOnce(Response.json({ value: [graphUser(objectId, upn, "Active")], "@odata.count": count }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn])).rejects.toMatchObject({ code: "provider_schema" });
+    });
+
+    it.each([
+      { next: "https://attacker.invalid/v1.0/users", code: "invalid_provider_link" },
+      { next: `https://graph.microsoft.com/v1.0/users/${objectId}/licenseDetails`, code: "invalid_provider_link" },
+      { next: "https://graph.microsoft.com/v1.0/users", code: "provider_schema" },
+      { next: "https://graph.microsoft.com/v1.0/users?$filter=accountEnabled%20eq%20true", code: "provider_schema" },
+      { next: "repeat", code: "provider_schema" },
+      { next: "duplicate-filter", code: "provider_schema" },
+    ])("rejects unsafe or repeated exact continuations before sending credentials: $next", async ({ next, code }) => {
+      const fetcher = vi.fn<FetchLike>(async input => Response.json({
+        value: [], "@odata.count": 1,
+        "@odata.nextLink": next === "repeat" ? String(input)
+          : next === "duplicate-filter" ? `${String(input)}&$filter=accountEnabled%20eq%20true` : next,
+      }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("private-token", undefined, undefined, [upn])).rejects.toMatchObject({ code });
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it.each([403, 429, 503])("surfaces exact verification failures instead of returning partial or fabricated users: %i", async status => {
+      const fetcher = vi.fn<FetchLike>()
+        .mockImplementationOnce(async input => Response.json({
+          value: [graphUser(objectId, upn, "Active")], "@odata.count": 2, "@odata.nextLink": `${String(input)}&$skiptoken=next`,
+        }))
+        .mockResolvedValueOnce(Response.json({ error: { code: "ProviderFailure" } }, { status }));
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", undefined, undefined, [upn, otherId])).rejects.toMatchObject({ status });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["catalog", "discovery", "verification"] as const)("preserves cancellation during %s before starting more requests", async stage => {
+      const controller = new AbortController();
+      const error = new Error("Cancelled");
+      const fetcher = vi.fn<FetchLike>(async (input, init) => {
+        const url = new URL(String(input));
+        const current = String(input) === buildSubscribedSkusUrl() ? "catalog"
+          : url.searchParams.get("$filter")?.startsWith("assignedLicenses/any(") ? "discovery" : "verification";
+        if (stage === current) {
+          controller.abort(error);
+          expect(init?.signal?.aborted).toBe(true);
+        }
+        return Response.json(current === "catalog" ? { value: knownSkus } : { value: [], "@odata.count": 0 });
+      });
+      await expect(new CopilotUsageGraphClient(fetcher).listCopilotUsers("token", controller.signal, undefined, [upn])).rejects.toBe(error);
+      expect(fetcher).toHaveBeenCalledTimes(stage === "catalog" ? 1 : stage === "discovery" ? 2 : 3);
+    });
+
+    it.each(["cancellation", "persistence failure"] as const)("awaits exact page progress and propagates %s before continuing", async failure => {
+      const controller = new AbortController();
+      const error = new Error(failure);
+      const fetcher = vi.fn<FetchLike>(async input => Response.json({
+        value: [graphUser(objectId, upn, "Active")], "@odata.count": 2, "@odata.nextLink": `${String(input)}&$skiptoken=next`,
+      }));
+      const progress = vi.fn(async (count: number) => {
+        await Promise.resolve();
+        if (count === 0) return;
+        if (failure === "cancellation") controller.abort(error);
+        else throw error;
+      });
+      await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+        .listCopilotUsers("token", controller.signal, progress, [upn, otherId])).rejects.toBe(error);
+      expect(progress.mock.calls).toEqual([[0], [1]]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
+    it("bounds report input before provider work and logs only counts", async () => {
+      const fetcher = vi.fn<FetchLike>();
+      const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await expect(new CopilotUsageGraphClient(fetcher)
+          .listCopilotUsers("private-token", undefined, undefined, Array.from({ length: 100_001 }, () => upn)))
+          .rejects.toMatchObject({ code: "provider_result_limit" });
+        expect(fetcher).not.toHaveBeenCalled();
+        expect(log).toHaveBeenCalledOnce();
+        expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ count: 100_001, rowLimit: 100_000 });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(/private-token|example\.com/);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("verifies 30,000 reported identities after using the full 1,000-page product discovery budget", async () => {
+      const identities = Array.from({ length: 30_000 }, (_, index) => `reported${index}@example.com`);
+      const requestedIdentities: string[] = [];
+      const productUrl = buildCopilotUsersUrl(knownSkuIds);
+      const candidate = graphUser(otherId, "candidate@example.com", "Active");
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const url = new URL(String(input));
+        expect(url.origin + url.pathname).toBe("https://graph.microsoft.com/v1.0/users");
+        const filter = url.searchParams.get("$filter")!;
+        if (filter.startsWith("assignedLicenses/any(")) {
+          const page = Number(url.searchParams.get("$skiptoken") ?? 0);
+          return Response.json({
+            value: [candidate], "@odata.count": 1,
+            ...(page < 999 ? { "@odata.nextLink": `${productUrl}&$skiptoken=${page + 1}` } : {}),
+          });
+        }
+        const predicates = filter.split(" or ");
+        expect(predicates).toHaveLength(20);
+        const rows = predicates.map(predicate => {
+          expect(predicate).toMatch(/^userPrincipalName eq 'reported\d+@example\.com'$/);
+          const identity = predicate.slice("userPrincipalName eq '".length, -1);
+          requestedIdentities.push(identity);
+          const ordinal = identity.slice("reported".length, identity.indexOf("@"));
+          return {
+            ...graphUser(`11111111-1111-4111-8111-${ordinal.padStart(12, "0")}`, identity, "Active"),
+            assignedLicenses: [], assignedPlans: [],
+          };
+        });
+        return Response.json({ value: rows, "@odata.count": rows.length });
+      });
+      const progress = vi.fn();
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        const users = await new CopilotUsageGraphClient(withCatalog(fetcher))
+          .listCopilotUsers("private-token", undefined, progress, identities);
+        expect(users).toHaveLength(30_001);
+        expect(new Set(users.map(user => user.identity.objectId)).size).toBe(30_001);
+        expect(users.slice(1).map(user => user.identity.userPrincipalName)).toEqual(identities);
+        expect(users.slice(1).every(user => user.copilotServiceState === "disabled" && user.servicePlans.length === 0)).toBe(true);
+        expect(requestedIdentities).toEqual(identities);
+        expect(fetcher).toHaveBeenCalledTimes(1_000 + 1_500);
+        expect(progress).toHaveBeenCalledTimes(1_000 + 1_500);
+        expect(progress).toHaveBeenNthCalledWith(1_000, 1);
+        expect(progress).toHaveBeenLastCalledWith(30_001);
+        expect(JSON.parse(log.mock.calls.at(-1)![0])).toMatchObject({
+          event: "copilot_license_inventory", count: 30_001, pages: 2_500, observedCount: 31_000,
+        });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(/example\.com|private-token|skiptoken/);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("caps exact verification at 5,000 batch pages plus 1,000 continuation pages independently of discovery", async () => {
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const next = new URL(String(input));
+        next.searchParams.set("$skiptoken", String(Number(next.searchParams.get("$skiptoken") ?? 0) + 1));
+        return Response.json({ value: [], "@odata.count": 1, "@odata.nextLink": next.toString() });
+      });
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+          .listCopilotUsers("token", undefined, undefined, [upn])).rejects.toMatchObject({ code: "provider_result_limit" });
+        expect(fetcher).toHaveBeenCalledTimes(6_000);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("shares the 100,000 observed-row limit across discovery and exact verification, including duplicates", async () => {
+      const candidate = graphUser(otherId, "candidate@example.com", "Active");
+      const reported = graphUser(objectId, upn, "Active");
+      const productUrl = buildCopilotUsersUrl(knownSkuIds);
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const url = new URL(String(input));
+        if (!url.searchParams.get("$filter")?.startsWith("assignedLicenses/any(")) {
+          return Response.json({ value: [reported, reported], "@odata.count": 1 });
+        }
+        const page = Number(url.searchParams.get("$skiptoken") ?? 0);
+        return Response.json({
+          value: Array.from({ length: page === 9 ? 9_999 : 10_000 }, () => candidate),
+          "@odata.count": 1,
+          ...(page < 9 ? { "@odata.nextLink": `${productUrl}&$skiptoken=${page + 1}` } : {}),
+        });
+      });
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        await expect(new CopilotUsageGraphClient(withCatalog(fetcher))
+          .listCopilotUsers("token", undefined, undefined, [upn])).rejects.toMatchObject({ code: "provider_result_limit" });
+        expect(fetcher).toHaveBeenCalledTimes(11);
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("retains the exact response byte limit and value-free diagnostics", async () => {
+      const maximumBytes = 16 * 1024 * 1024;
+      const cancel = vi.fn();
+      const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new Uint8Array(maximumBytes + 1)); },
+        cancel,
+      })));
+      const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await expect(new CopilotUsageGraphClient(withEmptyDiscovery(fetcher))
+          .listCopilotUsers("private-token", undefined, undefined, [upn]))
+          .rejects.toMatchObject({ code: "provider_response_size_limit" });
+        expect(cancel).toHaveBeenCalledOnce();
+        expect(fetcher).toHaveBeenCalledOnce();
+        expect(log).toHaveBeenCalledOnce();
+        expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+          event: "copilot_license_response_size_limit", source: "directory", maximumLength: maximumBytes,
+        });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(/private-token|example\.com/);
+      } finally {
+        log.mockRestore();
+      }
+    });
+  });
+
   it("rejects non-v1 CSV report schemas instead of guessing columns", async () => {
     const fetcher = vi.fn(async () => new Response("User Principal Name,Last Activity Date\nperson@example.com,2026-09-12"));
     await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token"))
@@ -866,6 +1393,16 @@ function directoryWithCatalog(row: unknown, catalog: unknown[] = knownSkus) {
   return vi.fn<FetchLike>(async input => String(input) === buildSubscribedSkusUrl()
     ? Response.json({ value: catalog })
     : Response.json({ value: [row], "@odata.count": 1 }));
+}
+
+function withEmptyDiscovery(fetcher: FetchLike, catalog: unknown[] = knownSkus): FetchLike {
+  return (input, init) => {
+    if (String(input) === buildSubscribedSkusUrl()) return Promise.resolve(Response.json({ value: catalog }));
+    if (new URL(String(input)).searchParams.get("$filter")?.startsWith("assignedLicenses/any(")) {
+      return Promise.resolve(Response.json({ value: [], "@odata.count": 0 }));
+    }
+    return fetcher(input, init);
+  };
 }
 
 function graphUser(id: string, upn: string, state: string, assignedSkuId = skuId) {

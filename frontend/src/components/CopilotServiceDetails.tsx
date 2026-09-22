@@ -1,8 +1,9 @@
-import type { CopilotServicePlan } from "../api/client";
+import type { CopilotServicePlan, CopilotServiceSummaryState } from "../api/client";
 import { CopilotPaidFeatureStatus } from "./CopilotLicenseStatus";
 
-export function CopilotServiceDetails({ servicePlans, current }: {
+export function CopilotServiceDetails({ servicePlans, copilotServiceState, current }: {
   servicePlans: readonly CopilotServicePlan[];
+  copilotServiceState: CopilotServiceSummaryState;
   current: boolean;
 }) {
   return <section aria-label="Microsoft 365 Copilot paid features">
@@ -27,6 +28,8 @@ export function CopilotServiceDetails({ servicePlans, current }: {
         </li>)}</ul>
         <p>Raw capability status is supporting evidence, not the effective paid-feature state. A paid feature can remain not enabled even when raw evidence says Enabled. Warning is a usable grace period.</p>
       </details>
-    </> : <p>Paid-feature evidence not reported. Run Users Sync to verify paid features.</p>}
+    </> : copilotServiceState === "disabled"
+      ? <p>{current ? "No paid Copilot services are assigned." : "Last saved: no paid Copilot services were assigned."}</p>
+      : <p>Paid-feature evidence not reported. Run Users Sync to verify paid features.</p>}
   </section>;
 }

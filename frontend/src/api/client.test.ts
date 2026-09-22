@@ -212,6 +212,20 @@ describe("access API client", () => {
     expect(await blob.text()).toBe("selected-report-csv");
   });
 
+  it("serializes the nonpaid license cohort with pinned user CSV filters", async () => {
+    const fetchMock = vi.fn(async () => new Response("cohort-csv", { headers: { "Content-Type": "text/csv" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    await downloadOfficialUsageCsv("users", {
+      licenseCohort: "active_without_paid", setId: "saved-set", agentId: "report/agent", search: "A & B",
+      cohort: "zero", sortBy: "responses", sortDirection: "asc",
+    }, controller.signal);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "/api/official-usage/users.csv?licenseCohort=active_without_paid&setId=saved-set&agentId=report%2Fagent&search=A+%26+B&cohort=zero&sortBy=responses&sortDirection=asc",
+      { credentials: "include", signal: controller.signal, headers: { Accept: "text/csv" } },
+    );
+  });
+
   it.each([false, true])("preserves pinned Power Platform CSV filters with cancellation supplied: %s", async cancellable => {
     const fetchMock = vi.fn(async () => new Response("selected-inventory-csv", { headers: { "Content-Type": "text/csv" } }));
     vi.stubGlobal("fetch", fetchMock);
@@ -355,6 +369,7 @@ describe("access API client", () => {
 
     await getOfficialUsageUsers({
       setId: "11111111-1111-4111-8111-111111111111",
+      licenseCohort: "active_without_paid",
       search: "User + one",
       cohort: "low",
       lowResponseThreshold: 5,
@@ -367,7 +382,7 @@ describe("access API client", () => {
     });
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?setId=11111111-1111-4111-8111-111111111111&search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&licenseCohort=active_without_paid&search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
   });
 
   it("loads paginated cumulative official usage history without changing active selection", async () => {

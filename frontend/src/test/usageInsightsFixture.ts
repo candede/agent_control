@@ -1,6 +1,7 @@
 import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../../../backend/src/services/officialUsageViews";
 import type { OfficialUsageLineage, PublishedOfficialUsage } from "../../../backend/src/types/officialUsage";
-import type { OfficialUsageAgentDetailView, OfficialUsageOverviewQuery, OfficialUsageOverviewView } from "../api/client";
+import type { OfficialUsageAgentDetailView, OfficialUsageOverviewQuery, OfficialUsageOverviewView, OfficialUsageUserQuery } from "../api/client";
+import { licensedUser } from "./copilotUsageFixture";
 
 const period = { startDate: "2026-08-14", endDate: "2026-09-12", days: 30, provenance: "operator_asserted" as const };
 const acceptedAt = "2026-09-12T10:00:00.000Z";
@@ -60,6 +61,37 @@ export function usageAggregateFixture(query: Parameters<typeof buildOfficialUsag
 
 export function usageUsersFixture(query: Parameters<typeof buildOfficialUsageUserView>[1] = { staleAfterDays: 35 }) {
   return buildOfficialUsageUserView(structuredClone(usageInsightsPublished), { now: usageFixtureNow, ...query });
+}
+
+export function reportLicenseDirectory(published = usageInsightsPublished, paidUsernames: string[] = []) {
+  const identities = [...new Set([
+    ...published.reports.users?.rows.map(user => user.username) ?? [],
+    ...published.reports.userAgents?.rows.map(user => user.username) ?? [],
+  ])].filter(username => username !== "concealed-user");
+  const value = identities.map((username, index) => {
+    const user = licensedUser(index + 1, username, null);
+    const state = paidUsernames.includes(username) ? "enabled" as const : "disabled" as const;
+    return {
+      serviceEvidenceVersion: 1 as const,
+      identity: { ...user.directory, userPrincipalName: username },
+      copilotServiceState: state,
+      servicePlans: user.servicePlans.map(plan => ({ ...plan, state })),
+    };
+  });
+  return {
+    source: "directory" as const, attemptStatus: "available" as const, message: null,
+    attemptedAt: acceptedAt, lastSuccessAt: acceptedAt,
+    rowCount: value.length, observedAt: acceptedAt, value,
+  };
+}
+
+export function activeWithoutPaidUsersFixture(query: OfficialUsageUserQuery = {}) {
+  const published = structuredClone(usageInsightsPublished);
+  published.reports.userAgents!.rows.find(row => row.username === "ben@example.invalid")!.responsesSentToUsers = 3;
+  return buildOfficialUsageUserView(published, {
+    staleAfterDays: 35, now: usageFixtureNow, ...query, userSortBy: query.sortBy, licenseCohort: "active_without_paid",
+    licenseDirectory: reportLicenseDirectory(published, ["ada@example.invalid"]),
+  });
 }
 
 export function usageOverviewFixture(query: OfficialUsageOverviewQuery = {}): OfficialUsageOverviewView {

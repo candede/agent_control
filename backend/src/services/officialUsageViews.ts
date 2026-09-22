@@ -1,4 +1,6 @@
 import { AppError } from "../errors.js";
+import { isCopilotServiceActive, type CopilotDirectoryUser, type SavedCopilotUsageSource } from "../types/copilotUsage.js";
+import { hasReportedAgentActivity, matchImportedUsage } from "./copilotUsageIdentity.js";
 import type { CopilotPackage } from "../types/copilotPackage.js";
 import type {
   AcceptedOfficialUsageReports,
@@ -38,6 +40,8 @@ type ViewOptions = {
   endDate?: string;
   lowResponseThreshold?: number;
   cohort?: "all" | "zero" | "low" | "review";
+  licenseCohort?: "active_without_paid";
+  licenseDirectory?: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
   agentSortBy?: OfficialUsageAgentSort;
   userSortBy?: OfficialUsageUserSort;
   sortDirection?: "asc" | "desc";
@@ -175,7 +179,11 @@ export function buildOfficialUsageUserView(
 ): OfficialUsageUserView {
   const viewState = availability(published, options.staleAfterDays, options.now ?? new Date());
   const lowResponseThreshold = boundedThreshold(options.lowResponseThreshold, 5);
-  const summaries = buildUserSummaries(published.reports, published.activeSet?.id ?? null, lowResponseThreshold);
+  const allSummaries = buildUserSummaries(published.reports, published.activeSet?.id ?? null, lowResponseThreshold);
+  const licenseScope = options.licenseCohort === "active_without_paid"
+    ? activeUnpaidUsers(allSummaries, options.licenseDirectory)
+    : undefined;
+  const summaries = licenseScope?.users ?? allSummaries;
   const recencyAnchorDateUtc = latestDate(published.reports.users?.rows.map(row => row.lastActivityDateUtc) ?? []);
   const filteredSummaries = filterUserSummaries(summaries, options, recencyAnchorDateUtc);
   const sortBy = options.userSortBy ?? "responses";
@@ -192,6 +200,7 @@ export function buildOfficialUsageUserView(
     acceptedAgeDays: viewState.acceptedAgeDays,
     activeSet: published.activeSet,
     lineages: lineages(published.reports),
+    ...(licenseScope ? { licenseCoverage: licenseScope.coverage } : {}),
     filters: {
       creatorTypes: [...new Set(summaries.flatMap(summary => summary.creatorTypes))].sort(ordinal),
       ...(options.search?.trim() ? { search: options.search.trim() } : {}),
@@ -203,16 +212,19 @@ export function buildOfficialUsageUserView(
       ...(options.endDate ? { endDate: options.endDate } : {}),
       lowResponseThreshold,
       cohort: options.cohort ?? "all",
+      ...(options.licenseCohort ? { licenseCohort: options.licenseCohort } : {}),
       sortBy,
       sortDirection,
     },
     counts: {
       users: summaries.length,
       filteredUsers: filteredSummaries.length,
-      userRows: published.reports.users?.rows.length ?? 0,
+      userRows: licenseScope ? summaries.filter(summary => !summary.missingUserReport).length : published.reports.users?.rows.length ?? 0,
       accessRows,
       reportOnlyRows: accessRows,
-      totalResponsesReceived: published.reports.users ? sum(published.reports.users.rows, row => row.agentResponsesReceived) : null,
+      totalResponsesReceived: published.reports.users
+        ? licenseScope ? sum(summaries, summary => summary.reportedResponsesReceived) : sum(published.reports.users.rows, row => row.agentResponsesReceived)
+        : null,
       mismatchCount: summaries.filter(summary => summary.hasReportMismatch).length,
     },
     cohorts: {
@@ -224,7 +236,9 @@ export function buildOfficialUsageUserView(
       threshold: lowResponseThreshold,
     },
     recencyAnchorDateUtc,
-    decisionNotice: "Review candidates are based only on imported Copilot Agents response totals. Confirm actual license assignment and full Microsoft 365 Copilot activity before reassignment; this view makes no changes.",
+    decisionNotice: licenseScope
+      ? "Positive reported agent activity with no active paid M365 Copilot license in the latest successful Users sync. Unknown licensing is excluded; activity does not measure general basic Copilot Chat usage."
+      : "Review candidates are based only on imported Copilot Agents response totals. Confirm actual license assignment and full Microsoft 365 Copilot activity before reassignment; this view makes no changes.",
     topUsersByResponses: rankedUsers(filteredSummaries, "desc"),
     leastUsersByResponses: rankedUsers(filteredSummaries.filter(summary => !summary.missingUserReport), "asc"),
     users: {
@@ -233,6 +247,45 @@ export function buildOfficialUsageUserView(
       ...paging,
     },
   };
+}
+
+function activeUnpaidUsers(
+  summaries: readonly OfficialUsageUserSummary[],
+  directory: SavedCopilotUsageSource<CopilotDirectoryUser[]> | undefined,
+): { users: OfficialUsageUserSummary[]; coverage: NonNullable<OfficialUsageUserView["licenseCoverage"]> } {
+  const verifiedUsers = directory?.attemptStatus === "available" && directory.observedAt !== null ? directory.value : null;
+  const available = verifiedUsers !== null;
+  const directoryUsers = verifiedUsers ?? [];
+  const matches = matchImportedUsage(directoryUsers, summaries, available);
+  const linked = new Map(directoryUsers.flatMap(user => {
+    const summary = matches.byObjectId.get(user.identity.objectId);
+    return summary ? [[summary.username, user] as const] : [];
+  }));
+  const active = summaries.filter(hasReportedAgentActivity);
+  const coverage: NonNullable<OfficialUsageUserView["licenseCoverage"]> = {
+    state: available ? "available" : "unavailable",
+    observedAt: directory?.observedAt ?? null,
+    activeReportUsers: active.length,
+    paidUsers: 0,
+    unpaidUsers: 0,
+    unknownUsers: 0,
+    message: available ? null
+      : directory?.attemptStatus === "available" ? "Saved license data is missing or expired. Run Users sync."
+        : directory?.message ?? "Current license status is unavailable. Run Users sync.",
+  };
+  const users: OfficialUsageUserSummary[] = [];
+  for (const summary of active) {
+    const state = linked.get(summary.username)?.copilotServiceState;
+    if (state && isCopilotServiceActive(state)) {
+      coverage.paidUsers += 1;
+    } else if (state === "disabled" || state === "suspended" || state === "locked_out") {
+      coverage.unpaidUsers += 1;
+      users.push({ ...summary, licenseAssignmentStatus: "no_active_paid_license" });
+    } else {
+      coverage.unknownUsers += 1;
+    }
+  }
+  return { users, coverage };
 }
 
 function availability(published: PublishedOfficialUsage, staleAfterDays: number, now: Date): { value: OfficialUsageAvailability; periodAgeDays: number | null; acceptedAgeDays: number | null } {

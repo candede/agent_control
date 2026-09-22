@@ -72,6 +72,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   const { agentId, reportSetId, search, page } = route;
   const activeSort = sorts.find(item => item.sortBy === sorting[0]?.id && item.sortDirection === (sorting[0]?.desc ? "desc" : "asc")) ?? sorts[0];
   const query: OfficialUsageUserQuery = useMemo(() => ({
+    licenseCohort: "active_without_paid",
     agentId, setId: reportSetId, search: search.trim() || undefined,
     creatorType: applied.creatorType || undefined, activity: applied.activity, inactiveDays: 30,
     responsesOnly: applied.responsesOnly, startDate: applied.startDate || undefined, endDate: applied.endDate || undefined,
@@ -102,7 +103,8 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
   }, [directoryData]);
   const selected = selectedUser?.key === key ? data?.users.value.find(user => user.username === selectedUser.username) : undefined;
   const hasFilters = Boolean(search || agentId || JSON.stringify(applied) !== JSON.stringify(defaultFilters) || draftChanged);
-  const exportDisabled = !data?.activeSet || draftChanged || scopedExport?.status === "pending";
+  const coverageUnavailable = data?.licenseCoverage?.state === "unavailable";
+  const exportDisabled = !data?.activeSet || coverageUnavailable || draftChanged || scopedExport?.status === "pending";
   const focusedName = agentId ? data?.users.value.flatMap(user => user.rows).find(row => row.agentId === agentId)?.displayAgentName : undefined;
   const columns = useMemo<ListColumn<OfficialUsageUserSummary>[]>(() => [
     { id: "displayName", header: "Reported user", accessorFn: user => user.displayName || user.username },
@@ -174,6 +176,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
     const filters = data.filters;
     try {
       const blob = await downloadOfficialUsageCsv("users", {
+        licenseCohort: "active_without_paid",
         setId: data.activeSet.id, agentId: filters.agentId, search: filters.search,
         creatorType: filters.creatorType, activity: filters.activity, inactiveDays: 30,
         responsesOnly: filters.responsesOnly, startDate: filters.startDate, endDate: filters.endDate,
@@ -194,8 +197,8 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
     }
   }
 
-  return <section className="reported-users" aria-label="Reported activity" aria-busy={!scoped}>
-    <p className="reported-users-intro">All imported report identities, including concealed, unlinked and bridge-only users—not just M365 Copilot licensed users. Rankings measure agent responses, not all Copilot activity or basic Chat usage.</p>
+  return <section className="reported-users" aria-label="Non-paid user activity" aria-busy={!scoped}>
+    <p className="reported-users-intro">Verified non-paid users with positive report activity. Membership uses current saved licenses, not license history.</p>
     <div className="copilot-users-toolbar reported-users-toolbar">
       <label><span>Search reported users or agents</span><input ref={searchInput} type="search" maxLength={256} placeholder="User, agent name, ID or creator" value={search}
         onChange={event => onRouteChange({ ...route, search: event.target.value, page: 0 }, true)} /></label>
@@ -229,7 +232,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
           <label><span>Users-report response cohort</span><select value={draft.cohort} onChange={event => {
             const cohort = event.target.value;
             if (cohort === "all" || cohort === "zero" || cohort === "low" || cohort === "review") setDraft({ ...draft, cohort });
-          }}><option value="all">All reported users</option><option value="zero">Explicitly zero responses</option><option value="low">Low responses (1–threshold)</option><option value="review">Zero or low responses</option></select></label>
+          }}><option value="all">All active users without paid Copilot</option><option value="zero">Explicitly zero responses</option><option value="low">Low responses (1–threshold)</option><option value="review">Zero or low responses</option></select></label>
           <label><span>Low-response threshold</span><input type="number" min={1} max={100_000_000} step={1} value={draft.lowResponseThreshold} onChange={event => setDraft({ ...draft, lowResponseThreshold: event.target.value })} /></label>
           <label className="reported-users-checkbox"><input type="checkbox" checked={draft.responsesOnly} onChange={event => setDraft({ ...draft, responsesOnly: event.target.checked })} /><span>Require a response-producing relationship</span></label>
         </div>
@@ -247,7 +250,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
     </div> : null}
     {agentId ? <div className="reported-users-focus" aria-label="Selected report agent">
       <div><strong>{focusedName || agentId}</strong>{focusedName && focusedName !== agentId ? <small>{agentId}</small> : null}
-        <p>Users with an explicitly reported relationship to this exact agent. Table totals still cover all agents; open a user&apos;s details for this agent&apos;s responses.</p></div>
+        <p>Active users without paid Copilot with a reported relationship to this exact agent. Table totals still cover all agents; open a user&apos;s details for this agent&apos;s responses.</p></div>
       <button type="button" className="secondary" onClick={() => onRouteChange({ ...route, agentId: undefined, page: 0 })}>Show all agents</button>
     </div> : null}
     {reportSetId ? <p className="reported-users-snapshot">Viewing the exact retained report snapshot. <button type="button" className="secondary" onClick={() => onRouteChange({ ...route, reportSetId: undefined, page: 0 })}>Use current reports</button></p> : null}
@@ -256,15 +259,20 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
     {scopedExport?.status === "done" ? <p role="status">User CSV downloaded with all agent details for matching identities in the displayed report snapshot.</p> : null}
     {!scoped ? <p role="status">Loading reported user activity…</p> : null}
     {data ? <>
+      {coverageUnavailable ? <p className="copilot-users-notice" role="status">
+        License coverage is unavailable. {data.licenseCoverage?.message} Run Users sync from Sync in the top navigation, or use Permissions to recover the connection. CSV export is unavailable until license coverage recovers.
+      </p> : data.licenseCoverage && data.licenseCoverage.unknownUsers > 0 ? <p className="copilot-users-notice" role="status">
+        License status could not be verified for {data.licenseCoverage.unknownUsers.toLocaleString()} active report users. Run Users sync from Sync in the top navigation to verify their licenses.
+      </p> : null}
       <p className="reported-users-context"><strong>{usageAvailabilityLabel(data.availability)}</strong> · {usageCoverageLabel(data.activeSet)}</p>
       {data.availability === "stale" ? <p className="copilot-users-notice">Historical reports are out of date. Refresh reports before making adoption decisions.</p> : null}
       {!data.activeSet ? <div className="reported-users-empty">
         <h3>No selected user reports</h3>
         <p>{usageAvailabilityLabel(data.availability)}. Use Official usage in the top navigation to select or import reports. Missing reports are not zero activity.</p>
-      </div> : <>
+      </div> : coverageUnavailable ? null : <>
         {!hasRelationships ? <p className="reported-users-note">The Users &amp; agents companion is missing. Relationships are unknown, not zero.</p> : null}
-        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. License status requires a unique exact directory link and verified paid-feature state; bundle assignment alone is not entitlement.</p>
-        {data.users.value.length ? <div ref={reportedTable} className="copilot-users-table-shell" role="region" aria-label="Reported users" tabIndex={0}>
+        <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. License status is verified from current saved licenses regardless of report period; detailed directory evidence requires a unique exact report link.</p>
+        {data.users.value.length ? <div ref={reportedTable} className="copilot-users-table-shell" role="region" aria-label="Active users without paid Copilot" tabIndex={0}>
           <table className="copilot-users-table reported-users-table">
             <ListTableHead table={table} />
             <tbody>{table.getRowModel().rows.map(row => {
@@ -274,16 +282,16 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
               <th scope="row">{user.displayName || user.username}<small>{user.username}</small>{directoryUser?.directory.accountEnabled === false ? <small>Account disabled</small> : null}</th>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedResponsesReceived)}{user.hasReportMismatch ? <small>Report totals differ</small> : null}</td>
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</td>
-              <td><CopilotLicenseStatus user={directoryUser} /></td>
+              <td><CopilotLicenseStatus user={directoryUser} licenseAssignmentStatus={user.licenseAssignmentStatus} /></td>
               <td>{usageDate(user.userLastActivityDateUtc)}</td>
               <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key, username: user.username })}>View details</button></td>
             </tr>;
             })}</tbody>
           </table>
         </div> : <div className="reported-users-empty">
-          <h3>{data.users.count ? "No reported users on this page" : data.counts.users ? "No reported users match" : "No reported user identities"}</h3>
+          <h3>{data.users.count ? "No reported users on this page" : data.counts.users ? "No reported users match" : "No active users without paid Copilot"}</h3>
           <p>{data.counts.users ? "Try another search or clear filters. Missing relationships do not establish inactivity."
-            : "This snapshot contains no Users or Users & agents identities. Report availability and paid license coverage are independent."}</p>
+            : "No verified non-paid users have positive activity in this report snapshot. Paid users and users with unverified license status are excluded."}</p>
           {page > 0 ? <button type="button" className="secondary" onClick={() => onRouteChange({ ...route, page: 0 })}>First user page</button> : null}
         </div>}
         <div className="copilot-users-pagination" aria-label="Reported user pages">
@@ -295,12 +303,12 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
       <details className="copilot-users-provenance">
         <summary>Report sources and identity coverage</summary>
         <p>{data.authority}. Snapshot {data.activeSet?.id ?? "not selected"}; imported {usageDate(data.activeSet?.acceptedAt)}.</p>
-        <p>{data.counts.users.toLocaleString()} report identities; {data.counts.userRows.toLocaleString()} Users rows; {hasRelationships ? data.counts.accessRows.toLocaleString() : "Unknown"} Users &amp; agents relationships. All identities remain available independently of directory access.</p>
+        <p>{data.counts.users.toLocaleString()} cohort identities; {data.counts.userRows.toLocaleString()} Users rows; {hasRelationships ? data.counts.accessRows.toLocaleString() : "Unknown"} Users &amp; agents relationships. Only verified non-paid users with positive Users-report or Users &amp; agents activity are included.</p>
         {data.lineages.map(lineage => <p key={lineage.kind}>{lineage.kind === "userAgents" ? "Users & agents" : lineage.kind === "users" ? "Users" : "Agents"} version: {lineage.versionId}. {lineage.sourceFreshness === "unknown" ? "Source refresh time not supplied; import time does not establish freshness." : ""}</p>)}
         {data.activeSet?.reportingPeriod.provenance === "activity_range" ? <p>Observed activity dates do not establish a complete reporting window.</p> : null}
         <p>{directoryData?.sources.directory.state === "available"
           ? `Paid-feature states observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current entitlement does not prove activity or coverage during the reporting period.`
-          : "Current paid license inventory is unverified or unavailable. Report identities remain visible; License not verified does not mean basic, unlicensed or disabled."}</p>
+          : "Detailed license evidence requires the current saved directory snapshot and a unique exact report link. Missing detail evidence does not mean basic, unlicensed or disabled."}</p>
         <p>Concealed identities and case-distinct names are report-scoped. Directory evidence requires an existing unique exact saved link with the same report set, Users version and Users &amp; agents version.</p>
         <p>{data.decisionNotice} Collection and connection recovery are available through Sync and Permissions in the top navigation.</p>
         <p>CSV filters select matching people, not individual exported relationships. Every agent relationship of each matching user is exported, not only this page or the selected agent. Repeated all-agent Users-report totals are not additive across relationship rows.</p>
@@ -336,5 +344,5 @@ function appliedFilterLabel(filters: OfficialUsageUserQuery) {
     filters.cohort && filters.cohort !== "all" ? `Users-report cohort: ${filters.cohort} (low ≤ ${filters.lowResponseThreshold ?? 5})` : "",
     filters.responsesOnly ? "Response-producing relationships" : "",
   ].filter(Boolean);
-  return labels.length ? labels.join(" · ") : "All reported users";
+  return labels.length ? labels.join(" · ") : "All active users without paid Copilot";
 }

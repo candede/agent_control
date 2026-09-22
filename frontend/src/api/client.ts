@@ -891,6 +891,7 @@ export function getOfficialUsageAggregate(
 
 export type OfficialUsageUserQuery = {
   setId?: string;
+  licenseCohort?: "active_without_paid";
   agentId?: string;
   search?: string;
   creatorType?: string;

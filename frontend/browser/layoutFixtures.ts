@@ -185,7 +185,8 @@ const aggregate: OfficialUsageAggregateView = {
   },
 };
 const users: OfficialUsageUserView = {
-  ...lineage, filters: { creatorTypes: ["Your org"], activity: "all", responsesOnly: false, lowResponseThreshold: 5, cohort: "all", sortBy: "responses", sortDirection: "desc" },
+  ...lineage, filters: { creatorTypes: ["Your org"], activity: "all", responsesOnly: false, lowResponseThreshold: 5, cohort: "all", licenseCohort: "active_without_paid", sortBy: "responses", sortDirection: "desc" },
+  licenseCoverage: { state: "available", observedAt, activeReportUsers: 2, paidUsers: 0, unpaidUsers: 2, unknownUsers: 0, message: null },
   counts: { users: 2, filteredUsers: 2, userRows: 2, accessRows: 2, reportOnlyRows: 2, totalResponsesReceived: 200, mismatchCount: 0 },
   cohorts: { zeroResponses: 0, lowResponses: 0, reviewCandidates: 0, unknownUserMetrics: 0, missingBridgeRows: 0, threshold: 5 },
   recencyAnchorDateUtc: "2026-08-30",
@@ -202,7 +203,7 @@ const users: OfficialUsageUserView = {
       reportedResponsesReceived: 120 - index * 40, userLastActivityDateUtc: "2026-08-30",
       agentsAccessedTotal: 1, responseProducingAgentCount: 1, bridgeResponsesSentToUsers: 120 - index * 40,
       missingUserReport: false, hasReportMismatch: false, creatorTypes: ["Your org"],
-      reviewCohort: "outside_threshold", reviewCandidate: false, licenseAssignmentStatus: "unavailable",
+      reviewCohort: "outside_threshold", reviewCandidate: false, licenseAssignmentStatus: "no_active_paid_license",
       rows: [{
         agentId: topAgents[index].id, agentName: topAgents[index].name, displayAgentName: topAgents[index].name,
         creatorType: "Your org", username: `reader${index + 1}@example.invalid`, responsesSentToUsers: 120 - index * 40,
@@ -387,6 +388,10 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/official-usage/users" && new URL(route.request().url()).searchParams.get("licenseCohort") !== "active_without_paid") {
+      unexpectedRequests.push(`Missing active_without_paid cohort: ${route.request().url()}`);
+      return route.fulfill({ status: 400, json: { error: "Expected the active nonpaid cohort" } });
+    }
     if (path === "/api/official-usage/overview") {
       const params = new URL(route.request().url()).searchParams;
       return route.fulfill({ json: usageOverviewFixture({

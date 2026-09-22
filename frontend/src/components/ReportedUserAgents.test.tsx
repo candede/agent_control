@@ -13,13 +13,13 @@ function agentIds() {
 }
 
 describe("reported user's local agent table", () => {
-  it("filters and sorts all 1,005 relationships before paging, resets the page, and opens the exact ID and snapshot", async () => {
+  it.each([false, true])("filters and sorts all 1,005 relationships locally, with unpaid-cohort navigation enabled: %s", async navigable => {
     const user = usageUsersFixture().users.value[0];
     user.rows = Array.from({ length: 1_005 }, (_, index) => ({
       ...user.rows[0], agentId: `agent-${index}`, displayAgentName: `Agent ${index}`, responsesSentToUsers: index,
     }));
     const onFocusAgent = vi.fn();
-    render(<ReportedUserAgents user={user} onFocusAgent={onFocusAgent} />);
+    render(<ReportedUserAgents user={user} onFocusAgent={navigable ? onFocusAgent : undefined} />);
     expect(rows()).toHaveLength(50);
     expect(agentIds()[0]).toBe("agent-1004");
     await userEvent.click(screen.getByRole("button", { name: "Next agents" }));
@@ -37,8 +37,18 @@ describe("reported user's local agent table", () => {
     expect(agentIds()[0]).toBe("agent-1004");
     await userEvent.type(screen.getByRole("searchbox", { name: "Search this user's agents" }), "agent-1004");
     expect(rows()).toHaveLength(1);
-    await userEvent.click(screen.getByRole("button", { name: "Agent 1004" }));
-    expect(onFocusAgent).toHaveBeenCalledExactlyOnceWith("agent-1004", user.datasetScope.reportSetId);
+    if (navigable) {
+      const agent = screen.getByRole("button", { name: "Agent 1004: active users without paid Copilot" });
+      expect(agent).toHaveAttribute("title", "Show active users without paid Copilot for report agent agent-1004");
+      await userEvent.click(agent);
+      expect(onFocusAgent).toHaveBeenCalledExactlyOnceWith("agent-1004", user.datasetScope.reportSetId);
+    } else {
+      const agent = within(rows()[0]).getByText("Agent 1004");
+      expect(agent.closest("button, a")).toBeNull();
+      expect(within(rows()[0]).queryByRole("button")).not.toBeInTheDocument();
+      await userEvent.click(agent);
+      expect(onFocusAgent).not.toHaveBeenCalled();
+    }
   });
 
   it.each([
@@ -52,7 +62,7 @@ describe("reported user's local agent table", () => {
       { ...source, agentId: "agent-10", displayAgentName: "Agent10", creatorType: "Team10", lastActivityDateUtc: "2026-10-01T00:00:00.000Z" },
       { ...source, agentId: "agent-2", displayAgentName: "Agent2", creatorType: "Team2", lastActivityDateUtc: "2025-12-31T00:00:00.000Z" },
     ];
-    render(<ReportedUserAgents user={user} onFocusAgent={vi.fn()} />);
+    render(<ReportedUserAgents user={user} />);
     const heading = screen.getByRole("columnheader", { name: column });
     const button = within(heading).getByRole("button", { name: `Sort by ${column}` });
     await userEvent.click(button);
@@ -62,5 +72,17 @@ describe("reported user's local agent table", () => {
     expect(agentIds()).toEqual(startsDescending ? ascending : descending);
     expect(within(rows().at(-1)!).getAllByRole("cell")[1]).toHaveTextContent(/^Unknown$/);
     expect(within(rows().at(-1)!).getAllByRole("cell")[3]).toHaveTextContent("Not reported");
+  });
+
+  it("keeps agent names plain when an unpaid detail lacks a report snapshot", () => {
+    const user = usageUsersFixture().users.value[0];
+    user.datasetScope.reportSetId = null;
+    const onFocusAgent = vi.fn();
+    render(<ReportedUserAgents user={user} onFocusAgent={onFocusAgent} />);
+    for (const row of rows()) {
+      expect(within(row).queryByRole("button")).not.toBeInTheDocument();
+      expect(within(row).queryByRole("link")).not.toBeInTheDocument();
+    }
+    expect(onFocusAgent).not.toHaveBeenCalled();
   });
 });

@@ -44,11 +44,11 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
       <div><dt>Responses (Users report)</dt><dd>{usageCount(user.missingUserReport ? null : user.reportedResponsesReceived)}</dd></div>
       <div><dt>Agents used (Users report)</dt><dd>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</dd></div>
       <div><dt>User last activity (Users report)</dt><dd>{usageDate(user.userLastActivityDateUtc)}</dd></div>
-      <div><dt>M365 Copilot license</dt><dd><CopilotLicenseStatus user={directoryUser} /></dd></div>
+      <div><dt>M365 Copilot license</dt><dd><CopilotLicenseStatus user={directoryUser} licenseAssignmentStatus={user.licenseAssignmentStatus} /></dd></div>
       <div><dt>Directory account</dt><dd>{directoryUser?.directory.accountEnabled === false ? "Account disabled" : directoryUser?.directory.accountEnabled === true ? "Enabled" : "Unknown"}</dd></div>
       <div><dt>Responses (all Users &amp; agents rows)</dt><dd>{hasRelationships && user.rows.length ? usageCount(user.bridgeResponsesSentToUsers) : "Not reported"}</dd></div>
     </dl>
-    {directoryUser ? <CopilotServiceDetails servicePlans={directoryUser.servicePlans} current /> : null}
+    {directoryUser ? <CopilotServiceDetails servicePlans={directoryUser.servicePlans} copilotServiceState={directoryUser.copilotServiceState} current /> : null}
     <p className="reported-users-note">Users-report totals cover all agents, regardless of the selected relationship filters. The Users &amp; agents sum is independent evidence, not a replacement for a missing Users total.</p>
     {user.missingUserReport ? <p className="copilot-users-notice">This identity has no Users-report row. Its response total, agents used and user recency are unknown.</p>
       : user.hasReportMismatch ? <p className="copilot-users-notice">Report totals differ. The Users total and Users &amp; agents breakdown are shown separately, never added or reconciled by guessing.</p> : null}
@@ -56,7 +56,7 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
     <details className="copilot-users-provenance">
       <summary>Identity and report coverage</summary>
       <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}.</p>
-      <p>Concealed and case-distinct identities are scoped to this report, not matched by display name. Current license status requires a unique, exact saved directory link to these report versions and effective paid-feature state. Current entitlement does not establish activity or coverage during the reporting period. License not verified does not mean basic or unlicensed.</p>
+      <p>Cohort license status uses current saved licenses regardless of report period, not historical license assignments. Detailed directory and paid-feature evidence requires a unique, exact saved link to these report versions. Concealed and case-distinct identities are never matched by display name.</p>
       <p>{hasRelationships ? `${user.rows.length.toLocaleString()} reported agent relationships.` : "Users & agents companion missing: relationships are unknown, not zero."}</p>
     </details>
   </dialog>;

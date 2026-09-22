@@ -12,24 +12,18 @@ import {
   type StartDataSyncInput,
 } from "../types/dataSync.js";
 import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
-import { isCopilotServiceSummaryState } from "../types/copilotUsage.js";
+import {
+  isCopilotServiceSummaryState,
+  type CopilotUsageAttemptStatus,
+  type CopilotUsageSnapshotSource,
+  type SavedCopilotUsageSource,
+} from "../types/copilotUsage.js";
 import { pool, transaction } from "./pool.js";
 
-export type DataSyncScope = { tenantId: string; principalId: string };
-export type CopilotUsageSnapshotSource = "directory" | "app_activity";
-export type CopilotUsageAttemptStatus = "available" | "waiting_authorization" | "permission_required" | "failed";
-export type UserSourcePublication = { runId: string; jobId: string };
+export type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../types/copilotUsage.js";
 
-export type SavedCopilotUsageSource<T> = {
-  source: CopilotUsageSnapshotSource;
-  attemptStatus: CopilotUsageAttemptStatus | null;
-  message: string | null;
-  attemptedAt: string | null;
-  lastSuccessAt: string | null;
-  rowCount: number | null;
-  observedAt: string | null;
-  value: T | null;
-};
+export type DataSyncScope = { tenantId: string; principalId: string };
+export type UserSourcePublication = { runId: string; jobId: string };
 
 type CopilotDirectorySnapshot = {
   serviceEvidenceVersion: 1;

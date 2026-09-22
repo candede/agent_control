@@ -320,7 +320,7 @@ export type OfficialUsageUserSummary = {
   hasReportMismatch: boolean;
   reviewCohort: "zero_responses" | "low_responses" | "outside_threshold" | "unknown";
   reviewCandidate: boolean;
-  licenseAssignmentStatus: "unavailable";
+  licenseAssignmentStatus: "unavailable" | "no_active_paid_license";
   creatorTypes: string[];
   rows: OfficialUsageUserAgentRow[];
   searchableText: string;
@@ -339,6 +339,15 @@ export type OfficialUsageUserView = {
   acceptedAgeDays: number | null;
   activeSet: OfficialUsageSetSummary | null;
   lineages: OfficialUsageLineage[];
+  licenseCoverage?: {
+    state: "available" | "unavailable";
+    observedAt: string | null;
+    activeReportUsers: number;
+    paidUsers: number;
+    unpaidUsers: number;
+    unknownUsers: number;
+    message: string | null;
+  };
   filters: {
     creatorTypes: string[];
     search?: string;
@@ -350,6 +359,7 @@ export type OfficialUsageUserView = {
     endDate?: string;
     lowResponseThreshold: number;
     cohort: "all" | "zero" | "low" | "review";
+    licenseCohort?: "active_without_paid";
     sortBy: OfficialUsageUserSort;
     sortDirection: "asc" | "desc";
   };

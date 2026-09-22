@@ -263,7 +263,7 @@ describe("DataSyncService", () => {
     harness.agentPeople.refreshReferences.mockReturnValueOnce(resolving.promise);
     await harness.service.start(user, { mode: "incremental", sources: ["users"] });
     await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({
-      status: "running", count: 12, message: expect.stringContaining("Checked 12 directory users assigned Copilot-capable products"),
+      status: "running", count: 12, message: expect.stringContaining("Checked 12 directory users from Copilot-capable products and active report identities"),
     }));
     reading.resolve({ status: "succeeded", count: 12, message: "Saved directory/license and app-activity sources." });
     await vi.waitFor(() => expect(harness.agentPeople.refreshReferences).toHaveBeenCalled());

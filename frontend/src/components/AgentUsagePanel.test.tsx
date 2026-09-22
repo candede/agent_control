@@ -89,7 +89,7 @@ describe("AgentUsagePanel", () => {
     expect(screen.getByText(/Admin-supplied period: 2026-08-14 to 2026-09-12/)).toBeVisible();
     expect(screen.getByText(/Selected report snapshot:/)).toHaveTextContent(reportSetId);
     expect(screen.getByText("Report provenance")).toBeVisible();
-    const url = new URL(screen.getByRole("link", { name: "View reported users" }).getAttribute("href")!, "http://localhost");
+    const url = new URL(screen.getByRole("link", { name: "View active users without paid Copilot" }).getAttribute("href")!, "http://localhost");
     expect(url.searchParams.get("view")).toBe("activity");
     expect(url.searchParams.get("agent")).toBe(automaticUsagePackageId);
     expect(url.searchParams.get("snapshot")).toBe(reportSetId);
@@ -122,7 +122,7 @@ describe("AgentUsagePanel", () => {
     expect(screen.queryByText("360")).not.toBeInTheDocument();
     expect(screen.queryByText(automaticUsageReportName)).not.toBeInTheDocument();
     expect(screen.getByText("Out-of-date report")).toBeVisible();
-    expect(new URL(screen.getByRole("link", { name: "View reported users" }).getAttribute("href")!, "http://localhost").searchParams.get("snapshot")).toBe(olderId);
+    expect(new URL(screen.getByRole("link", { name: "View active users without paid Copilot" }).getAttribute("href")!, "http://localhost").searchParams.get("snapshot")).toBe(olderId);
     expectNoManualSetup();
   });
 
@@ -130,7 +130,7 @@ describe("AgentUsagePanel", () => {
     renderPanel({ record: automaticRecord, context: { ...context, availability } });
     expect(screen.getByText(/No complete usable usage report is selected/)).toBeVisible();
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "View reported users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "View active users without paid Copilot" })).not.toBeInTheDocument();
     expectNoManualSetup();
   });
 
@@ -144,7 +144,7 @@ describe("AgentUsagePanel", () => {
     update({ record: automaticRecord, context: { ...context, reportSet: { ...context.reportSet!, id: "different-report" } } });
     expect(screen.getByText(/saved usage belongs to a different report snapshot/)).toBeVisible();
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "View reported users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "View active users without paid Copilot" })).not.toBeInTheDocument();
     expectNoManualSetup();
   });
 
@@ -154,7 +154,7 @@ describe("AgentUsagePanel", () => {
     expect(screen.getByText(/Power Platform: native-1 - Environment: environment-1/)).toBeVisible();
     expect(screen.getByText(/Automatically matched:/)).toBeVisible();
     expect(screen.getAllByRole("button", { name: /Remove association/ })).toHaveLength(1);
-    const links = screen.getAllByRole("link", { name: "View reported users" }).map(link => new URL(link.getAttribute("href")!, "http://localhost"));
+    const links = screen.getAllByRole("link", { name: "View active users without paid Copilot" }).map(link => new URL(link.getAttribute("href")!, "http://localhost"));
     expect(links.map(url => url.searchParams.get("agent"))).toEqual([automaticUsagePackageId, association.reportAgentId]);
     expect(links.every(url => url.searchParams.get("snapshot") === reportSetId)).toBe(true);
     expectNoManualSetup();

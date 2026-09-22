@@ -24,7 +24,7 @@ import { storePackageSelection } from "./packageSelectionSession";
 import * as savedQueries from "./savedQueries";
 import { mockNativeDialogs } from "./test/dialog";
 import { copilotUsageFixture } from "./test/copilotUsageFixture";
-import { usageAggregateFixture, usageAgentDetailFixture, usageOverviewFixture, usageUsersFixture } from "./test/usageInsightsFixture";
+import { activeWithoutPaidUsersFixture, usageAggregateFixture, usageAgentDetailFixture, usageOverviewFixture } from "./test/usageInsightsFixture";
 import { createInventoryVerification, createUnifiedVerification } from "./test/inventoryVerification";
 
 mockNativeDialogs();
@@ -4418,7 +4418,8 @@ function appTransport({
     if (input.startsWith("/api/official-usage/aggregate")) return Response.json(usageAggregateFixture());
     if (input.startsWith("/api/official-usage/users")) {
       const params = new URL(input, "http://localhost").searchParams;
-      return Response.json(usageUsersFixture({ staleAfterDays: 35, agentId: params.get("agentId") ?? undefined }));
+      expect(params.get("licenseCohort")).toBe("active_without_paid");
+      return Response.json(activeWithoutPaidUsersFixture({ agentId: params.get("agentId") ?? undefined }));
     }
     if (input.startsWith("/api/official-usage/agents/")) {
       const agentId = decodeURIComponent(input.slice("/api/official-usage/agents/".length).split("?")[0]);

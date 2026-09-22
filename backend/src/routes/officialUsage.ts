@@ -4,6 +4,7 @@ import multer from "multer";
 import type pg from "pg";
 import { config } from "../config.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
+import { DataSyncRepository } from "../db/dataSync.js";
 import { PackageInventoryRepository } from "../db/packageInventory.js";
 import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
@@ -138,6 +139,7 @@ const csvUpload: RequestHandler = (request: UploadRequest, response, next) => {
 export function createOfficialUsageRouter(database: pg.Pool = pool) {
   const router = Router();
   const repository = new OfficialUsageRepository(database);
+  const userSources = new DataSyncRepository(database);
   const history = new OfficialUsageHistoryService(database);
   const overview = new OfficialUsageOverviewService(database);
   const packageRepository = new PackageInventoryRepository(database);
@@ -338,7 +340,10 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     const options = userViewOptions(request.query);
     response.json(buildOfficialUsageUserView(
       await repository.getPublished(scope.tenantId, querySetId(request.query)),
-      options,
+      {
+        ...options,
+        ...(options.licenseCohort ? { licenseDirectory: await userSources.getDirectorySource(scope) } : {}),
+      },
     ));
   });
 
@@ -354,16 +359,24 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
       load: async () => {
         const scope = requestScope(request);
         const published = await repository.getPublished(scope.tenantId, setId);
+        const licenseDirectory = options.licenseCohort ? await userSources.getDirectorySource(scope) : undefined;
         const view = buildOfficialUsageUserView(published, {
-          ...options, limit: 100_000, offset: 0,
+          ...options, licenseDirectory, limit: 100_000, offset: 0,
         });
+        if (view.licenseCoverage?.state === "unavailable") {
+          throw new AppError(409, "license_verification_unavailable", "Run Users sync before exporting active users without paid Copilot.");
+        }
         const datasetKey = officialDatasetKey(published);
+        const licenseKey = licenseDirectory ? createHash("sha256").update(JSON.stringify(licenseDirectory)).digest("hex") : undefined;
         return {
           columns: ["username", "displayName", "licenseAssignmentStatus", "reviewCohort", "reviewCandidate", "userMetricSource", "reportedAgentsUsed", "reportedResponsesReceived", "agentsAccessedTotal", "responseProducingAgentCount", "bridgeResponsesSentToUsers", "missingUserReport", "missingBridgeRows", "hasReportMismatch", "userLastActivityDateUtc", "agentId", "agentName", "creatorType", "creatorTypeSource", "responsesSentToUsers", "agentLastUsedByAnyoneDateUtc", "reportSetId", "reportingStart", "reportingEnd", "usersVersionId", "usersPeriodProvenance", "usersSourceFreshness", "userAgentsVersionId", "userAgentsPeriodProvenance", "userAgentsSourceFreshness", "identityStatus"] as const,
           rows: userExportRows(view),
           metadata: { source: "official_usage", reportSetId: view.activeSet?.id ?? null,
             reportingStart: view.activeSet?.reportingPeriod.startDate ?? null, reportingEnd: view.activeSet?.reportingPeriod.endDate ?? null },
           validateSource: async () => {
+            if (licenseKey && createHash("sha256").update(JSON.stringify(await userSources.getDirectorySource(scope))).digest("hex") !== licenseKey) {
+              throw new AppError(409, "dataset_invalidated", "Saved user licensing changed before export publication completed; reload users and retry.");
+            }
             if (officialDatasetKey(await repository.getPublished(scope.tenantId, setId)) !== datasetKey) {
               throw new AppError(409, "dataset_invalidated", "The official usage dataset changed or was deleted before export publication completed.");
             }
@@ -435,7 +448,7 @@ function aggregateOptions(query: Record<string, unknown>) {
 function userViewOptions(query: Record<string, unknown>) {
   validateViewQuery(query, [
     "setId", "search", "agentId", "creatorType", "activity", "responsesOnly", "inactiveDays",
-    "startDate", "endDate", "lowResponseThreshold", "cohort", "sortBy", "sortDirection", "limit", "offset",
+    "startDate", "endDate", "lowResponseThreshold", "cohort", "licenseCohort", "sortBy", "sortDirection", "limit", "offset",
   ]);
   const activity = first(query.activity);
   if (activity !== undefined && !["all", "recent", "inactive", "no-activity"].includes(activity)) {
@@ -446,6 +459,7 @@ function userViewOptions(query: Record<string, unknown>) {
     throw new AppError(400, "invalid_usage_query", "The official usage response filter is invalid.");
   }
   const cohort = queryEnum(first(query.cohort), ["all", "zero", "low", "review"] as const, "review cohort");
+  const licenseCohort = queryEnum(first(query.licenseCohort), ["active_without_paid"] as const, "license cohort");
   const sortBy = queryEnum(first(query.sortBy), ["displayName", "responses", "agentsUsed", "lastActivity"] as const, "user sort");
   const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
   const [startDate, endDate] = queryDateRange(query);
@@ -461,6 +475,7 @@ function userViewOptions(query: Record<string, unknown>) {
     endDate,
     lowResponseThreshold: queryInteger(first(query.lowResponseThreshold), 5, 100_000_000, true),
     cohort,
+    licenseCohort,
     userSortBy: sortBy,
     sortDirection,
     limit: queryInteger(first(query.limit), 100, 500, true),

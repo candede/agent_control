@@ -6,6 +6,8 @@ import { parse as parseCsv } from "csv-parse/sync";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "../config.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
+import { DataSyncRepository, type SavedCopilotUsageSource } from "../db/dataSync.js";
+import type { CopilotDirectoryUser } from "../services/copilotUsageGraph.js";
 import { PackageInventoryRepository } from "../db/packageInventory.js";
 import { AppError, errorHandler } from "../errors.js";
 import * as auditLog from "../services/auditLog.js";
@@ -101,6 +103,71 @@ afterAll(async () => {
 });
 
 describe("official usage report-agent routes", () => {
+  it("uses principal-private saved licensing before unpaid paging and excludes paid or unknown identities", async () => {
+    const directory = savedDirectory();
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(directory);
+    const result = await get<OfficialUsageUserView>(`${usersPath}?licenseCohort=active_without_paid&limit=1&offset=0`);
+    expect(result).toMatchObject({
+      status: 200,
+      body: {
+        filters: { licenseCohort: "active_without_paid" },
+        licenseCoverage: { state: "available", paidUsers: 1, unpaidUsers: 2, unknownUsers: 2 },
+        users: { count: 2, value: [{ username: "only-lower", licenseAssignmentStatus: "no_active_paid_license" }] },
+        counts: { users: 2, totalResponsesReceived: 13 },
+      },
+    });
+    expect(readDirectory).toHaveBeenCalledExactlyOnceWith({ tenantId: config.tenantId, principalId: "report-reader" });
+    expect(await get(`${usersPath}?licenseCohort=active_without_paid&limit=1&offset=1`)).toMatchObject({
+      status: 200, body: { users: { count: 2, value: [{ username: "only-set" }] } },
+    });
+    directory.value![0].copilotServiceState = "enabled";
+    expect(await get(`${usersPath}?licenseCohort=active_without_paid`)).toMatchObject({
+      status: 200, body: { users: { count: 1, value: [{ username: "only-set" }] } },
+    });
+  });
+
+  it("reports unavailable verification instead of leaking report identities as unpaid", async () => {
+    vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue({
+      ...savedDirectory(), attemptStatus: "failed", message: "Directory refresh failed.",
+    });
+    expect(await get(`${usersPath}?licenseCohort=active_without_paid`)).toMatchObject({
+      status: 200, body: {
+        users: { value: [], count: 0 },
+        licenseCoverage: { state: "unavailable", unknownUsers: 5, message: "Directory refresh failed." },
+      },
+    });
+  });
+
+  it("exports only verified active unpaid users and revalidates saved licensing at publication", async () => {
+    const directory = savedDirectory();
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(directory);
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }), completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    const response = await get(`${usersPath}.csv?licenseCohort=active_without_paid&limit=1&offset=1`);
+    expect(response.status).toBe(200);
+    const rows = parseCsv(response.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+    expect(rows.map(row => row.username)).toEqual(["only-lower", "only-set"]);
+    expect(rows.every(row => row.licenseAssignmentStatus === "no_active_paid_license")).toBe(true);
+    expect(readDirectory.mock.calls.length).toBeGreaterThan(1);
+    readDirectory.mockReset().mockResolvedValue({ ...directory, attemptStatus: "failed" }).mockResolvedValueOnce(directory);
+    expect(await get(`${usersPath}.csv?licenseCohort=active_without_paid`)).toMatchObject({
+      status: 409, body: { code: "dataset_invalidated" },
+    });
+    expect(await get(`${usersPath}.csv?licenseCohort=active_without_paid`)).toMatchObject({
+      status: 409, body: { code: "license_verification_unavailable" },
+    });
+  });
+
+  it.each(["licenseCohort=free", "licenseCohort=active_without_paid&licenseCohort=active_without_paid", "licenseCohort[]=active_without_paid"])(
+    "rejects invalid license filters before reading saved data (%s)", async query => {
+      const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockRejectedValue(new Error("Must not read"));
+      expect(await get(`${usersPath}?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });
+      expect(readDirectory).not.toHaveBeenCalled();
+      expect(readPublished).not.toHaveBeenCalled();
+    });
+
   it("uses the distinct active-user order consistently in aggregate JSON and CSV", async () => {
     expectedInventoryReads = 2;
     inventoryRead.mockResolvedValue({
@@ -444,6 +511,21 @@ describe("official usage report-agent query validation", () => {
     expect(readPublished).not.toHaveBeenCalled();
   });
 });
+
+function savedDirectory(): SavedCopilotUsageSource<CopilotDirectoryUser[]> {
+  const observedAt = "2026-09-23T00:00:00.000Z";
+  return {
+    source: "directory", attemptStatus: "available", message: "Saved license evidence.",
+    observedAt, attemptedAt: observedAt, lastSuccessAt: observedAt, rowCount: 4,
+    value: ["only-lower", "only-set", "users-only", "zero-user"].map((userPrincipalName, index) => ({
+      serviceEvidenceVersion: 1, copilotServiceState: userPrincipalName === "users-only" ? "enabled" : "disabled", servicePlans: [],
+      identity: {
+        objectId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, userPrincipalName,
+        displayName: userPrincipalName, accountEnabled: true, employeeType: null, userType: "Member", companyName: null, department: null,
+      },
+    })),
+  };
+}
 
 function published(setId: string, responses: number): PublishedOfficialUsage {
   const setOnlyId = setId === retainedSetId ? "retained-only" : "current-only";

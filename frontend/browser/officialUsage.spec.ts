@@ -2,12 +2,13 @@ import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { parseOfficialUsageReport } from "../../backend/src/services/officialUsageParser";
-import { buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../../backend/src/services/officialUsageViews";
+import { buildOfficialUsageAggregateView } from "../../backend/src/services/officialUsageViews";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import type { AcceptedOfficialUsageReports, ParsedOfficialUsageReport, PublishedOfficialUsage } from "../../backend/src/types/officialUsage";
 import type { OfficialUsageAdminState, OfficialUsageHistoryView, OfficialUsageStagingPreview } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
 import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
+import { activeWithoutPaidUsersFixture } from "./userCohortFixtures";
 
 const instant = "2026-09-12T14:45:00.000Z";
 const setId = "11111111-1111-4111-8111-111111111111";
@@ -190,14 +191,15 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     }
     if (path === "/api/official-usage/users") {
       userRequests.push(url.searchParams);
-      return respond(buildOfficialUsageUserView(published(), {
+      expect(url.searchParams.get("licenseCohort")).toBe("active_without_paid");
+      return respond(activeWithoutPaidUsersFixture({
         staleAfterDays: 35, now: new Date(instant),
         ...Object.fromEntries(url.searchParams),
         userSortBy: (["displayName", "responses", "agentsUsed", "lastActivity"] as const).find(value => value === url.searchParams.get("sortBy")),
         lowResponseThreshold: Number(url.searchParams.get("lowResponseThreshold") ?? 5),
         responsesOnly: url.searchParams.get("responsesOnly") === "true",
         limit: Number(url.searchParams.get("limit") ?? 100), offset: Number(url.searchParams.get("offset") ?? 0),
-      }));
+      }, published()));
     }
     if (path === "/api/official-usage/history") {
       const observations = Object.values(published().reports).map(report => ({

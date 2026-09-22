@@ -1,16 +1,23 @@
 import { AppError } from "../errors.js";
 import { parse as parseCsv } from "csv-parse/sync";
-import type { CopilotAppActivity, CopilotDirectoryIdentity, CopilotServicePlan, CopilotServiceSummaryState } from "../types/copilotUsage.js";
+import { isCopilotServiceActive, type CopilotAppActivity, type CopilotDirectoryUser, type CopilotServicePlan } from "../types/copilotUsage.js";
 import { graphError, type FetchLike } from "./graphPackages.js";
 import { boundedProviderJson, boundedProviderText, ProviderResponseLimitError } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
 import { copilotServicePlanDefinitions, resolveCopilotServicePlan, summarizeCopilotServices, type CopilotPlanObservation } from "./copilotServicePlans.js";
+import { normalizeCopilotIdentity } from "./copilotUsageIdentity.js";
+
+export type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+export { normalizeCopilotIdentity } from "./copilotUsageIdentity.js";
 
 const graphOrigin = "https://graph.microsoft.com";
 const graphV1 = `${graphOrigin}/v1.0`;
 const reportDownloadOrigins = new Set(["https://reports.office.com", "https://reportsweu.office.com"]);
 const maximumSkus = 1_000;
 const skusPerQuery = 20;
+const identitiesPerQuery = 20;
+const maximumDirectoryUrlLength = 8_192;
+const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 // Enterprise users can carry hundreds of plans; row paging alone does not bound response bytes.
 const directoryPageSize = 100;
 const maximumDirectoryPageBytes = 16 * 1024 * 1024;
@@ -18,6 +25,8 @@ const maximumCatalogPages = 200;
 const maximumUsers = 100_000;
 const maximumDirectoryPages = Math.ceil(maximumUsers / directoryPageSize);
 const maximumReportRows = 100_000;
+// Allow every bounded identity batch plus a directory-sized continuation allowance.
+const maximumVerificationPages = Math.ceil(maximumReportRows / identitiesPerQuery) + maximumDirectoryPages;
 const maximumReportBytes = 64 * 1024 * 1024;
 const requestTimeoutMs = 15_000;
 const reportHeaders = [
@@ -69,13 +78,9 @@ type GraphCollection<T> = {
 
 type GraphEndpoint = "directory" | "catalog" | "report";
 
-// Product-filtered candidate; the service evidence determines effective paid entitlement.
-export type CopilotDirectoryUser = {
-  serviceEvidenceVersion: 1;
-  identity: CopilotDirectoryIdentity;
-  copilotServiceState: CopilotServiceSummaryState;
-  servicePlans: CopilotServicePlan[];
-};
+type DirectoryFilter =
+  | { kind: "products"; skuIds: readonly string[] }
+  | { kind: "reported"; identities: readonly string[] };
 
 export type CopilotDirectoryProgress = (observedCount: number) => void | Promise<void>;
 
@@ -92,22 +97,35 @@ export type CopilotReportResult = {
 export class CopilotUsageGraphClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
-  async listCopilotUsers(accessToken: string, signal?: AbortSignal, onProgress?: CopilotDirectoryProgress): Promise<CopilotDirectoryUser[]> {
+  // Callers supply only report identities with positive Users or Users&agents responses.
+  async listCopilotUsers(
+    accessToken: string,
+    signal?: AbortSignal,
+    onProgress?: CopilotDirectoryProgress,
+    reportedIdentities: readonly string[] = [],
+  ): Promise<CopilotDirectoryUser[]> {
     signal?.throwIfAborted();
-    const skus = await this.listCopilotSkus(accessToken, signal);
+    if (reportedIdentities.length > maximumReportRows) {
+      operationalLog("warn", "copilot_license_result_limit", {
+        reason: "reported_identity_count", count: reportedIdentities.length, rowLimit: maximumReportRows,
+      });
+      throw providerLimit("Reported identities exceeded the result limit.");
+    }
+    const skus = await this.listSubscribedSkus(accessToken, signal);
     signal?.throwIfAborted();
     const users = new Map<string, CopilotDirectoryUser>();
     let observedRows = 0;
-    const visited = new Set<string>();
-    const skuIds = [...skus.keys()];
-    for (let offset = 0; offset < skuIds.length; offset += skusPerQuery) {
-      const batchIds = skuIds.slice(offset, offset + skusPerQuery);
+    const discoveryPages = new Set<string>();
+    const verificationPages = new Set<string>();
+    const readBatch = async (url: string, filter: DirectoryFilter) => {
+      const visited = filter.kind === "products" ? discoveryPages : verificationPages;
+      const pageLimit = filter.kind === "products" ? maximumDirectoryPages : maximumVerificationPages;
       const batchUsers = new Set<string>();
       let expectedCount: number | undefined;
-      let nextUrl: string | undefined = buildCopilotUsersUrl(batchIds);
+      let nextUrl: string | undefined = url;
       while (nextUrl) {
         signal?.throwIfAborted();
-        enforcePageBounds(nextUrl, visited, observedRows, maximumUsers, maximumDirectoryPages, "Directory");
+        enforcePageBounds(nextUrl, visited, observedRows, maximumUsers, pageLimit, "Directory");
         visited.add(nextUrl);
         const page = await this.request<GraphCollection<GraphUser>>(nextUrl, accessToken, "directory", signal);
         signal?.throwIfAborted();
@@ -122,12 +140,22 @@ export class CopilotUsageGraphClient {
             throw providerLimit("Directory users exceeded the result limit.");
           }
         }
+        if (filter.kind === "reported") {
+          if (page["@odata.count"] !== undefined && page["@odata.count"] !== expectedCount) {
+            throw providerSchema("Directory identity verification returned an inconsistent total count.");
+          }
+          if (expectedCount > filter.identities.length) {
+            throw new AppError(502, "provider_count_mismatch", "Directory identity totals exceed the requested batch; refresh usage.");
+          }
+        }
         observedRows += page.value.length;
         if (observedRows > maximumUsers) throw providerLimit("Directory users exceeded the result limit.");
         for (const value of page.value) {
-          const user = parseDirectoryUser(value, skus, batchIds);
+          const user = parseDirectoryUser(value, skus, filter);
           if (!user) {
-            throw providerSchema("Directory returned a user outside the requested product-assignment filter.");
+            throw providerSchema(filter.kind === "products"
+              ? "Directory returned a user outside the requested product-assignment filter."
+              : "Directory returned a user outside the requested exact-identity filter.");
           }
           const existing = users.get(user.identity.objectId);
           if (existing && JSON.stringify(existing) !== JSON.stringify(user)) {
@@ -137,8 +165,14 @@ export class CopilotUsageGraphClient {
           batchUsers.add(user.identity.objectId);
         }
         nextUrl = parseNextLink(page["@odata.nextLink"], "directory");
+        if (nextUrl && filter.kind === "reported") {
+          const nextFilters = new URL(nextUrl).searchParams.getAll("$filter");
+          if (nextFilters.length !== 1 || nextFilters[0] !== new URL(url).searchParams.get("$filter")) {
+            throw providerSchema("Directory continuation changed the requested exact-identity filter.");
+          }
+        }
         operationalLog("info", "copilot_license_directory_page", {
-          page: visited.size, returnedCount: page.value.length, totalRecords: expectedCount,
+          page: discoveryPages.size + verificationPages.size, returnedCount: page.value.length, totalRecords: expectedCount,
           observedCount: batchUsers.size, hasContinuation: Boolean(nextUrl),
         });
         await onProgress?.(users.size);
@@ -147,18 +181,43 @@ export class CopilotUsageGraphClient {
       if (batchUsers.size !== expectedCount) {
         throw new AppError(502, "provider_count_mismatch", "Directory license totals changed or paging was incomplete; refresh usage.");
       }
+    };
+    const skuIds = [...skus].filter(([, plans]) => plans.length > 0).map(([id]) => id);
+    for (let offset = 0; offset < skuIds.length; offset += skusPerQuery) {
+      const batchIds = skuIds.slice(offset, offset + skusPerQuery);
+      await readBatch(buildCopilotUsersUrl(batchIds), { kind: "products", skuIds: batchIds });
     }
     if (!skuIds.length) {
       await onProgress?.(0);
       signal?.throwIfAborted();
     }
+    const knownIdentities = new Set([...users.values()].flatMap(user => [
+      user.identity.objectId, normalizeCopilotIdentity(user.identity.userPrincipalName),
+    ]));
+    const remainingIdentities = new Set<string>();
+    for (const value of reportedIdentities) {
+      const identity = parseReportedIdentity(value);
+      if (identity && !knownIdentities.has(identity)) remainingIdentities.add(identity);
+    }
+    const identities = [...remainingIdentities];
+    for (let offset = 0; offset < identities.length;) {
+      const batch = identities.slice(offset, offset + identitiesPerQuery);
+      let url = buildReportedUsersUrl(batch);
+      while (url.length > maximumDirectoryUrlLength) {
+        batch.pop();
+        url = buildReportedUsersUrl(batch);
+      }
+      offset += batch.length;
+      await readBatch(url, { kind: "reported", identities: batch });
+    }
     operationalLog("info", "copilot_license_inventory", {
-      count: users.size, pages: visited.size, observedCount: observedRows, catalogScopedCount: skus.size,
+      count: users.size, pages: discoveryPages.size + verificationPages.size,
+      observedCount: observedRows, catalogScopedCount: skuIds.length,
     });
     return [...users.values()];
   }
 
-  private async listCopilotSkus(accessToken: string, signal?: AbortSignal): Promise<Map<string, string[]>> {
+  private async listSubscribedSkus(accessToken: string, signal?: AbortSignal): Promise<Map<string, string[]>> {
     const catalog = new Map<string, string[]>();
     const visited = new Set<string>();
     let observedRows = 0;
@@ -182,11 +241,11 @@ export class CopilotUsageGraphClient {
       }
       nextUrl = parseNextLink(page["@odata.nextLink"], "catalog");
     }
-    const skus = new Map([...catalog].filter(([, servicePlanIds]) => servicePlanIds.length > 0));
     operationalLog("info", "copilot_license_catalog", {
-      observedCount: observedRows, catalogScopedCount: skus.size, pages: visited.size,
+      observedCount: observedRows, catalogScopedCount: [...catalog.values()].filter(plans => plans.length > 0).length,
+      pages: visited.size,
     });
-    return skus;
+    return catalog;
   }
 
   async listAppActivity(accessToken: string, signal?: AbortSignal): Promise<CopilotReportResult> {
@@ -265,10 +324,20 @@ export function buildSubscribedSkusUrl() {
 
 export function buildCopilotUsersUrl(skuIds: readonly string[]) {
   if (skuIds.length === 0 || skuIds.length > skusPerQuery) throw providerSchema("Directory SKU filter has an invalid size.");
+  return buildDirectoryUsersUrl(skuIds
+    .map(skuId => `assignedLicenses/any(value:value/skuId eq ${skuId})`).join(" or "));
+}
+
+function buildReportedUsersUrl(identities: readonly string[]) {
+  if (identities.length === 0 || identities.length > identitiesPerQuery) throw providerSchema("Directory identity filter has an invalid size.");
+  return buildDirectoryUsersUrl(identities.map(identity =>
+    `${uuidPattern.test(identity) ? "id" : "userPrincipalName"} eq '${identity.replace(/'/g, "''")}'`).join(" or "));
+}
+
+function buildDirectoryUsersUrl(filter: string) {
   const url = new URL(`${graphV1}/users`);
   url.searchParams.set("$select", "id,userPrincipalName,displayName,accountEnabled,employeeType,companyName,department,userType,assignedLicenses,assignedPlans");
-  url.searchParams.set("$filter", skuIds
-    .map(skuId => `assignedLicenses/any(value:value/skuId eq ${skuId})`).join(" or "));
+  url.searchParams.set("$filter", filter);
   url.searchParams.set("$count", "true");
   url.searchParams.set("$top", String(directoryPageSize));
   return url.toString();
@@ -322,8 +391,15 @@ export function validateGraphUrl(url: string, kind: GraphEndpoint) {
   }
 }
 
-export function normalizeCopilotIdentity(value: string) {
-  return value.trim().toLowerCase();
+function parseReportedIdentity(value: string): string | null {
+  if (value.length > 320) return null;
+  const identity = normalizeCopilotIdentity(value);
+  if (uuidPattern.test(identity)) return identity;
+  // Do not turn concealed report labels into directory accounts.
+  if (identity.startsWith(".") || identity.includes(".@") || identity.includes("..")
+    || identity.length - identity.indexOf("@") - 1 > 253) return null;
+  const upnPattern = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+  return upnPattern.test(identity) ? identity : null;
 }
 
 function parseSubscribedSku(value: unknown) {
@@ -340,7 +416,7 @@ function parseSubscribedSku(value: unknown) {
   return { skuId, servicePlanIds: sku.appliesTo === "User" ? servicePlanIds : [] };
 }
 
-function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly string[]>, batchIds: readonly string[]): CopilotDirectoryUser | null {
+function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly string[]>, filter: DirectoryFilter): CopilotDirectoryUser | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw providerSchema("Directory user entry is invalid.");
   const user = value as GraphUser;
   const id = requiredUuid(user.id, "Directory user ID").toLowerCase();
@@ -348,7 +424,11 @@ function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly s
   const userType = optionalText(user.userType, "Directory user type", 64);
   const assigned = assignedLicenses(user.assignedLicenses);
   const copilot = assigned.filter(license => skus.has(license.skuId));
-  if (!copilot.some(license => batchIds.includes(license.skuId))) return null;
+  if (filter.kind === "products") {
+    if (!copilot.some(license => filter.skuIds.includes(license.skuId))) return null;
+  } else if (!filter.identities.includes(id) && !filter.identities.includes(normalizeCopilotIdentity(userPrincipalName))) {
+    return null;
+  }
   const observations = assignedPlans(user.assignedPlans);
   const enabledPlans = new Map<string, boolean>();
   for (const license of copilot) {
@@ -359,6 +439,10 @@ function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly s
   const servicePlans = [...copilotServicePlanDefinitions.keys()].flatMap(planId => enabledPlans.has(planId)
     ? [resolveCopilotServicePlan(planId, enabledPlans.get(planId)!, observations)]
     : []);
+  const serviceState = servicePlans.length ? summarizeCopilotServices(servicePlans) : "disabled";
+  // Unknown products prevent a no-paid conclusion, but do not negate verified active plans.
+  const copilotServiceState = assigned.some(license => !skus.has(license.skuId)) && !isCopilotServiceActive(serviceState)
+    ? "unknown" : serviceState;
   return {
     serviceEvidenceVersion: 1,
     identity: {
@@ -371,7 +455,7 @@ function parseDirectoryUser(value: unknown, skus: ReadonlyMap<string, readonly s
       companyName: optionalText(user.companyName, "Directory company name", 256),
       department: optionalText(user.department, "Directory department", 256),
     },
-    copilotServiceState: summarizeCopilotServices(servicePlans),
+    copilotServiceState,
     servicePlans,
   };
 }
@@ -480,7 +564,7 @@ function optionalBoolean(value: unknown, field: string): boolean | null {
 
 function requiredUuid(value: unknown, field: string) {
   const text = requiredText(value, field, 36).toLowerCase();
-  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(text)) throw providerSchema(`${field} is invalid.`);
+  if (!uuidPattern.test(text)) throw providerSchema(`${field} is invalid.`);
   return text;
 }
 

@@ -2,6 +2,27 @@ import type { OfficialUsageUserSummary } from "./officialUsage.js";
 
 export const copilotUsagePeriod = "D30" as const;
 
+export type CopilotUsageSnapshotSource = "directory" | "app_activity";
+export type CopilotUsageAttemptStatus = "available" | "waiting_authorization" | "permission_required" | "failed";
+
+export type SavedCopilotUsageSource<T> = {
+  source: CopilotUsageSnapshotSource;
+  attemptStatus: CopilotUsageAttemptStatus | null;
+  message: string | null;
+  attemptedAt: string | null;
+  lastSuccessAt: string | null;
+  rowCount: number | null;
+  observedAt: string | null;
+  value: T | null;
+};
+
+export type CopilotDirectoryUser = {
+  serviceEvidenceVersion: 1;
+  identity: CopilotDirectoryIdentity;
+  copilotServiceState: CopilotServiceSummaryState;
+  servicePlans: CopilotServicePlan[];
+};
+
 export type CopilotUsageSourceState =
   | "available"
   | "partial"

@@ -13,6 +13,7 @@ import {
 } from "./copilotUsageGraph.js";
 import type { CopilotUsageSnapshotSource, DataSyncRepository, SavedCopilotUsageSource } from "../db/dataSync.js";
 import type { FetchLike } from "./graphPackages.js";
+import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 
 const now = new Date("2026-09-13T01:00:00.000Z");
 const publication = {
@@ -28,6 +29,48 @@ const user: AuthenticatedUser = {
 };
 
 describe("CopilotUsageService", () => {
+  it("verifies active report identities during sync and moves a newly paid user out of unpaid activity", async () => {
+    const published = importedPublished([
+      { username: "person@example.com", displayName: "Person", numberOfAgentsUsed: 1, agentResponsesReceived: 8 },
+      { username: "zero@example.com", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+    ], [
+      { username: "bridge@example.com", agentId: "agent-a", agentName: "Agent", creatorType: "Custom", responsesSentToUsers: 2 },
+    ], "2026-01-01");
+    const person = directoryUser("11111111-1111-4111-8111-111111111111", "person@example.com");
+    person.copilotServiceState = "disabled";
+    person.servicePlans = [];
+    const graph = {
+      listCopilotUsers: vi.fn<CopilotUsageGraphClient["listCopilotUsers"]>().mockImplementation(async () => [structuredClone(person)]),
+      listAppActivity: vi.fn(async () => ({ users: [], reportRefreshDate: null })),
+    };
+    const usageStore = memoryUsageStore();
+    const value = new CopilotUsageService({} as pg.Pool, {
+      graph: graph as unknown as CopilotUsageGraphClient, usageStore, now: () => now,
+      loadPublished: vi.fn(async () => published),
+      requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
+      delegatedToken: vi.fn(async () => "directory-token") as never,
+      revalidateUser: vi.fn(async () => user), requireProviderAdmissions: vi.fn(),
+    });
+    await value.refreshUsers(user, undefined, { publication });
+    expect(graph.listCopilotUsers).toHaveBeenLastCalledWith(
+      "directory-token", undefined, expect.any(Function), expect.arrayContaining(["person@example.com", "bridge@example.com"]),
+    );
+    expect(graph.listCopilotUsers.mock.calls[0][3]).not.toContain("zero@example.com");
+    const source = async () => (await usageStore.getUserSources()).directory;
+    const unpaid = async () => buildOfficialUsageUserView(published, {
+      staleAfterDays: 35, licenseCohort: "active_without_paid", licenseDirectory: await source(),
+    });
+    expect(await unpaid()).toMatchObject({ users: { count: 1 }, licenseCoverage: { unpaidUsers: 1, unknownUsers: 1 } });
+    expect((await value.users(user)).counts.licensedUsers).toBe(0);
+    person.copilotServiceState = "enabled";
+    person.servicePlans = directoryUser(person.identity.objectId, person.identity.userPrincipalName).servicePlans;
+    await value.refreshUsers(user, undefined, { publication });
+    expect(await unpaid()).toMatchObject({ users: { count: 0 }, licenseCoverage: { paidUsers: 1, unpaidUsers: 0 } });
+    expect((await value.users(user)).counts.licensedUsers).toBe(1);
+    expect(graph.listCopilotUsers).toHaveBeenCalledTimes(2);
+    expect(usageStore.publishDirectory).toHaveBeenCalledTimes(2);
+  });
+
   it("blocks restored provider-disabled user collection before token or Graph access", async () => {
     const graph = {
       listCopilotUsers: vi.fn(),
@@ -42,10 +85,33 @@ describe("CopilotUsageService", () => {
         throw new AppError(503, "provider_requalification_required", "Provider work is fenced.");
       }),
     });
+
     await expect(value.refreshUsers(user, undefined, { publication })).rejects.toMatchObject({ code: "provider_requalification_required" });
     expect(delegatedToken).not.toHaveBeenCalled();
     expect(graph.listCopilotUsers).not.toHaveBeenCalled();
     expect(graph.listAppActivity).not.toHaveBeenCalled();
+  });
+
+  it("surfaces report-read failures without publishing an incomplete license-verification snapshot", async () => {
+    const usageStore = memoryUsageStore([directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")]);
+    const graph = {
+      listCopilotUsers: vi.fn<CopilotUsageGraphClient["listCopilotUsers"]>().mockResolvedValue([]),
+      listAppActivity: vi.fn(async () => ({ users: [], reportRefreshDate: null })),
+    };
+    const value = new CopilotUsageService({} as pg.Pool, {
+      graph: graph as unknown as CopilotUsageGraphClient, usageStore, now: () => now,
+      loadPublished: vi.fn(async () => { throw new AppError(503, "report_unavailable", "Saved report unavailable."); }),
+      requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
+      delegatedToken: vi.fn(async () => "directory-token") as never,
+      revalidateUser: vi.fn(async () => user), requireProviderAdmissions: vi.fn(),
+    });
+    expect(await value.refreshUsers(user, undefined, { publication })).toMatchObject({ status: "partial" });
+    expect(graph.listCopilotUsers).not.toHaveBeenCalled();
+    expect(usageStore.publishDirectory).not.toHaveBeenCalled();
+    const saved = (await usageStore.getUserSources()).directory;
+    expect(saved).toMatchObject({ attemptStatus: "failed", value: [{ identity: { userPrincipalName: "saved@example.com" } }] });
+    expect(saved.message).toContain("could not verify active report identities");
+    expect((await value.users(user)).counts.licensedUsers).toBeNull();
   });
 
   it("reads saved user sources without invoking Microsoft Graph and reflects later accepted usage immediately", async () => {
@@ -102,7 +168,7 @@ describe("CopilotUsageService", () => {
     expect(result.users.find(value => value.copilotServiceState === "partially_enabled")?.attention).toContain("copilot_service_partial");
     expect(result.users.find(value => value.copilotServiceState === "warning")?.attention).toContain("copilot_service_warning");
     expect(JSON.stringify(result.users)).not.toMatch(/skuId|skuPartNumber|assignmentStates|licenses/);
-    expect(result.sources.directory.message).toContain("Checked 7 directory users assigned products that can include paid M365 Copilot");
+    expect(result.sources.directory.message).toContain("Checked 7 directory users from products containing paid M365 Copilot and exact active report identities");
     expect(result.sources.directory.message).toContain("not the total number of tenant accounts");
     expect(result.notices).toContain("Active M365 Copilot licensed users counts only users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.");
     expect(result.notices.some(notice => notice.includes("Basic access and usage are not measured here"))).toBe(true);
@@ -409,7 +475,7 @@ describe("CopilotUsageService", () => {
     const signal = new AbortController().signal;
     expect(await harness.value.refreshUsers(user, signal, { publication, onDirectoryProgress: progress }))
       .toMatchObject({ status: "succeeded", count: 2 });
-    expect(harness.graph.listCopilotUsers).toHaveBeenCalledWith("directory-token", signal, expect.any(Function));
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledWith("directory-token", signal, expect.any(Function), []);
     expect(progress.mock.calls).toEqual([[1], [2]]);
     expect(harness.usageStore.publishDirectory).toHaveBeenCalledOnce();
   });

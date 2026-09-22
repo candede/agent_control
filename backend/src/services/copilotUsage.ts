@@ -15,7 +15,6 @@ import { AppError } from "../errors.js";
 import type {
   CopilotUsageAttention,
   CopilotUsageSourceSummary,
-  CopilotUsageUnresolvedImportedIdentity,
   CopilotUsageUser,
   CopilotUsageUsersResponse,
 } from "../types/copilotUsage.js";
@@ -27,7 +26,6 @@ import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import {
   CopilotUsageGraphClient,
-  normalizeCopilotIdentity,
   type CopilotDirectoryProgress,
   type CopilotDirectoryUser,
   type CopilotReportResult,
@@ -36,6 +34,7 @@ import {
 import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
+import { hasReportedAgentActivity, identityIndex, matchImportedUsage } from "./copilotUsageIdentity.js";
 
 const appReportStaleAfterDays = 3;
 
@@ -175,7 +174,7 @@ export class CopilotUsageService {
             scope,
             value,
             loaded.fetchedAt,
-            `Saved paid M365 Copilot feature evidence for ${value.length} checked directory users. Containing product assignments alone do not establish Copilot entitlement; this is not the tenant headcount.`,
+            `Saved current M365 Copilot license evidence for ${value.length} directory users, including verified active report identities. This is not the tenant headcount.`,
             publication,
           );
         } else {
@@ -217,8 +216,14 @@ export class CopilotUsageService {
   private async loadDirectory(user: AuthenticatedUser, signal: AbortSignal | undefined, onProgress: CopilotDirectoryProgress): Promise<Loaded<CopilotDirectoryUser[]>> {
     let progressFailure: { error: unknown } | undefined;
     try {
-      const token = await this.currentDelegatedToken(dataScope(user), "graph.licenses.read");
+      const scope = dataScope(user);
+      const token = await this.currentDelegatedToken(scope, "graph.licenses.read");
       signal?.throwIfAborted();
+      const imported = await this.loadImported(scope.tenantId);
+      signal?.throwIfAborted();
+      if (!imported.ok) {
+        throw new AppError(502, "report_license_verification_unavailable", imported.message);
+      }
       const value = await this.dependencies.graph.listCopilotUsers(token, signal, async count => {
         try {
           await onProgress(count);
@@ -226,7 +231,7 @@ export class CopilotUsageService {
           progressFailure = { error };
           throw error;
         }
-      });
+      }, imported.value.users.value.filter(hasReportedAgentActivity).map(value => value.username));
       return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
     } catch (error) {
       signal?.throwIfAborted();
@@ -305,7 +310,7 @@ export function composeCopilotUsageUsers(input: {
     }).sort(compareUsers);
     const licensedUsers = users.filter(value => isCopilotServiceActive(value.copilotServiceState));
     let directorySource = directory.ok
-      ? source("available", `Checked ${directoryUsers.length} directory users assigned products that can include paid M365 Copilot. Product assignment alone does not establish a Copilot license. Microsoft Graph filters these candidates across the tenant in bulk; all matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
+      ? source("available", `Checked ${directoryUsers.length} directory users from products containing paid M365 Copilot and exact active report identities. Product assignment alone does not establish a Copilot license. All matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
       : unavailableSource(directory.message);
     let appSource = appActivity.ok
       ? appActivitySource(appActivity, appMatching.size, appMetricsFresh)
@@ -348,7 +353,7 @@ export function composeCopilotUsageUsers(input: {
       notices: [
         "This dashboard is read-only and never changes license assignments.",
         "Active M365 Copilot licensed users counts only users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.",
-        "The checked directory roster includes candidates from products containing paid Copilot features, including bundles with Copilot disabled. SKU assignment alone is not M365 Copilot entitlement. Licensed-user labels and adoption counts require verified active paid features.",
+        "The checked directory roster includes candidates from products containing paid Copilot features and verified active report identities. Licensed-user labels and adoption counts require verified active paid features. Active users without paid Copilot require verified inactive paid features or no assigned paid Copilot service; unknown licensing is excluded.",
         "Paid-feature states do not describe basic Copilot Chat availability. Users without a paid M365 Copilot license, or with paid features not enabled, may still have basic Copilot Chat access subject to tenant policy. Basic access and usage are not measured here.",
         "Zero or low imported agent responses describe Copilot Agents usage only, not total Microsoft 365 Copilot use.",
         "Missing source data remains unknown and is never converted to zero or an unlicensed state.",
@@ -463,55 +468,6 @@ function sourceFailure(
   return { ok: false, message, status };
 }
 
-function matchImportedUsage(
-  directoryUsers: readonly CopilotDirectoryUser[],
-  imported: readonly OfficialUsageUserSummary[],
-  directoryAvailable: boolean,
-) {
-  const directoryKeys = identityIndex(directoryUsers);
-  const importedKeys = new Map<string, OfficialUsageUserSummary[]>();
-  for (const summary of imported) {
-    const key = normalizeCopilotIdentity(summary.username);
-    const rows = importedKeys.get(key) ?? [];
-    rows.push(summary);
-    importedKeys.set(key, rows);
-  }
-  const byObjectId = new Map<string, OfficialUsageUserSummary>();
-  const unresolved: CopilotUsageUnresolvedImportedIdentity[] = [];
-  const candidates = new Map<string, Array<{ key: string; summary: OfficialUsageUserSummary }>>();
-  for (const [key, summaries] of importedKeys) {
-    const directoryMatches = directoryKeys.get(key) ?? [];
-    if (directoryAvailable && summaries.length === 1 && directoryMatches.length === 1) {
-      const objectId = directoryMatches[0].identity.objectId;
-      const values = candidates.get(objectId) ?? [];
-      values.push({ key, summary: summaries[0] });
-      candidates.set(objectId, values);
-      continue;
-    }
-    const reason = !directoryAvailable
-      ? "directory_unavailable" as const
-      : summaries.length > 1 || directoryMatches.length > 1
-        ? "ambiguous_directory_match" as const
-        : "no_exact_directory_match" as const;
-    for (const summary of summaries) {
-      unresolved.push({ normalizedUserPrincipalName: key, importedUsage: summary, reason });
-    }
-  }
-  for (const [objectId, values] of candidates) {
-    if (values.length === 1) {
-      byObjectId.set(objectId, values[0].summary);
-    } else {
-      unresolved.push(...values.map(value => ({
-        normalizedUserPrincipalName: value.key,
-        importedUsage: value.summary,
-        reason: "ambiguous_directory_match" as const,
-      })));
-    }
-  }
-  unresolved.sort((left, right) => left.normalizedUserPrincipalName.localeCompare(right.normalizedUserPrincipalName));
-  return { byObjectId, unresolved };
-}
-
 function matchAppActivity(
   directoryUsers: readonly CopilotDirectoryUser[],
   reportUsers: readonly CopilotReportUser[],
@@ -538,21 +494,6 @@ function matchAppActivity(
     if (values.length === 1) matched.set(objectId, values[0].activity);
   }
   return matched;
-}
-
-function identityIndex(users: readonly CopilotDirectoryUser[]) {
-  const result = new Map<string, CopilotDirectoryUser[]>();
-  for (const user of users) {
-    for (const key of new Set([
-      normalizeCopilotIdentity(user.identity.userPrincipalName),
-      normalizeCopilotIdentity(user.identity.objectId),
-    ])) {
-      const values = result.get(key) ?? [];
-      values.push(user);
-      result.set(key, values);
-    }
-  }
-  return result;
 }
 
 function buildUser(
@@ -693,6 +634,7 @@ function sourceErrorMessage(error: unknown, label: string, permission?: "User.Re
     if (error.code === "provider_result_limit") return `${label} exceeded the bounded page or result limit; no truncated data was returned.`;
     if (error.code === "provider_response_size_limit") return `${label} exceeded the response-size safety limit, not the user-count limit. Check the backend's copilot_license_response_size_limit diagnostic; additional permissions will not fix this payload-size issue. No truncated data was returned.`;
     if (error.code === "provider_count_mismatch") return `${label} did not match Microsoft Graph's total count. The directory may have changed during paging; refresh usage. No incomplete license count was returned.`;
+    if (error.code === "report_license_verification_unavailable") return `${label} could not verify active report identities. ${error.message}`;
     if (error.code === "report_download_failed") return `${label} download failed. Refresh usage to request a new download; no additional delegated permission is needed for the download URL.`;
     if (error.code === "invalid_provider_link") return `${label} returned an unsupported continuation or report download link; no unvalidated link was followed.`;
     if (error.code === "provider_schema") return `${label} returned an invalid response; no unvalidated data was used.`;

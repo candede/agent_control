@@ -357,7 +357,7 @@ export class DataSyncService {
         incompleteOnly, publication: { runId, jobId },
         onDirectoryProgress: async count => {
           observedCount = count;
-          await progress(`Checked ${count} directory users assigned Copilot-capable products. Paid-feature verification and app-activity collection are in progress.`, count);
+          await progress(`Checked ${count} directory users from Copilot-capable products and active report identities. License verification and app-activity collection are in progress.`, count);
         },
       });
       signal.throwIfAborted();

@@ -3,7 +3,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { statusLabels } from "../src/capabilityState";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
-import type { CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, PackageRefreshJob, QuarantineTargetPage } from "../src/api/client";
+import type { CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView, PackageRefreshJob, QuarantineTargetPage } from "../src/api/client";
 import { createInventoryVerification } from "../src/test/inventoryVerification";
 import { mockLayoutApi } from "./layoutFixtures";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
@@ -1243,16 +1243,19 @@ test("official usage imports through real HTTP and remains role-separated", asyn
 
   await modal.getByRole("button", { name: "Close", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
-  await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
-  const reportedUsers = page.getByRole("region", { name: "Reported users", exact: true });
-  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("Unknown");
-  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("9");
-  await reportedUsers.getByRole("button", { name: "View reported details for Example user" }).click();
-  const userDetail = page.getByRole("dialog", { name: "Example user", exact: true });
-  await expect(userDetail.getByRole("button", { name: "Support agent", exact: true })).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(userDetail).not.toBeVisible();
+  const cohortRead = page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/official-usage/users" && url.searchParams.get("licenseCohort") === "active_without_paid";
+  });
+  await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");
+  const cohortView: OfficialUsageUserView = await (await cohortRead).json();
+  expect(cohortView.licenseCoverage?.unknownUsers).toBeGreaterThan(0);
+  expect(cohortView.users.value).toEqual([]);
+  await expect(page.getByText(/Run Users sync/).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "View reported details for Example user" })).toHaveCount(0);
+  if (cohortView.licenseCoverage?.state === "unavailable") {
+    await expect(page.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+  }
 
   await page.evaluate(() => localStorage.setItem("agent-control:usage-reports:v1", "still-untrusted"));
   await login(page, "role-Viewer");
@@ -1271,9 +1274,9 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   });
   expect(deniedImport.status()).toBe(403);
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await page.getByRole("button", { name: "Reported activity", exact: true }).click();
-  await expect(page.getByText("User@example.invalid", { exact: true }).first()).toBeVisible();
-  await expect(reportedUsers.getByRole("row", { name: /Example user/ })).toContainText("9");
+  await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");
+  await expect(page.getByText(/Run Users sync/).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "View reported details for Example user" })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("official-usage.png"), fullPage: true });

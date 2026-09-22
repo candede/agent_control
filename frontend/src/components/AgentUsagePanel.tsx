@@ -113,7 +113,7 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
             ? "Automatically matched: exact report Agent ID = saved Graph package ID."
             : `Existing administrator-reviewed association, reviewed on ${usageDate(association.reviewedAt)}.`}</small></div>
         <div className="agent-insight-actions">
-          <a href={reportedUserActivityUrl(association.reportAgentId, usage.reportSetId ?? undefined)}>View reported users</a>
+          <a href={reportedUserActivityUrl(association.reportAgentId, usage.reportSetId ?? undefined)}>View active users without paid Copilot</a>
           {editable && association.basis === "admin_reviewed" ? <WorkbenchActionGate actionId="agentUsage.remove" compact><button type="button" className="secondary"
             disabled={busy} aria-label={`Remove association for ${association.reportAgentName} (${association.reportAgentId})`}
             onClick={() => review(association)}>Remove reviewed association</button></WorkbenchActionGate> : null}

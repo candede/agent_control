@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { PublishedOfficialUsage } from "../types/officialUsage.js";
+import type { CopilotServiceSummaryState } from "../types/copilotUsage.js";
+import type { SavedCopilotUsageSource } from "../db/dataSync.js";
+import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
 import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
 
 const set = {
@@ -96,7 +99,121 @@ function drilldownPublished() {
   return source;
 }
 
+function savedLicenses(entries: Array<[string, CopilotServiceSummaryState]>): SavedCopilotUsageSource<CopilotDirectoryUser[]> {
+  const observedAt = "2026-09-23T00:00:00.000Z";
+  return {
+    source: "directory", attemptStatus: "available", message: "Saved license evidence.",
+    attemptedAt: observedAt, lastSuccessAt: observedAt, observedAt, rowCount: entries.length,
+    value: entries.map(([userPrincipalName, copilotServiceState], index) => ({
+      serviceEvidenceVersion: 1, copilotServiceState, servicePlans: [],
+      identity: {
+        objectId: `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`, userPrincipalName,
+        displayName: userPrincipalName, accountEnabled: true, userType: "Member", employeeType: null, companyName: null, department: null,
+      },
+    })),
+  };
+}
+
 describe("official usage views", () => {
+  it("filters active unpaid users before paging, rankings, counts and relationship search", () => {
+    const source = published();
+    source.reports.users!.rows = [
+      { username: "paid@example.com", displayName: "Paid", numberOfAgentsUsed: 1, agentResponsesReceived: 900 },
+      { username: "unpaid@example.com", displayName: "Unpaid", numberOfAgentsUsed: 2, agentResponsesReceived: 7 },
+      { username: "suspended@example.com", displayName: "Suspended", numberOfAgentsUsed: 1, agentResponsesReceived: 3 },
+      { username: "unknown@example.com", displayName: "Unknown", numberOfAgentsUsed: 1, agentResponsesReceived: 50 },
+      { username: "unmatched@example.com", displayName: "Unmatched", numberOfAgentsUsed: 1, agentResponsesReceived: 60 },
+      { username: "zero@example.com", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+    ];
+    source.reports.userAgents!.rows = [
+      { agentId: "agent-a", agentName: "Find me", creatorType: "Custom", username: "unpaid@example.com", responsesSentToUsers: 2 },
+      { agentId: "agent-b", agentName: "Another", creatorType: "Custom", username: "unpaid@example.com", responsesSentToUsers: 5 },
+      { agentId: "agent-a", agentName: "Find me", creatorType: "Custom", username: "bridge@example.com", responsesSentToUsers: 1 },
+    ];
+    const licenseDirectory = savedLicenses([
+      ["paid@example.com", "enabled"], ["unpaid@example.com", "disabled"],
+      ["suspended@example.com", "suspended"], ["unknown@example.com", "unknown"],
+      ["zero@example.com", "disabled"], ["bridge@example.com", "disabled"],
+    ]);
+    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
+    const result = buildOfficialUsageUserView(source, { ...options, limit: 1, offset: 1 });
+    expect(result.users).toMatchObject({ count: 3, limit: 1, offset: 1, value: [{ username: "suspended@example.com", licenseAssignmentStatus: "no_active_paid_license" }] });
+    expect(result.counts).toMatchObject({ users: 3, filteredUsers: 3, userRows: 2, accessRows: 3, totalResponsesReceived: 10 });
+    expect(result.topUsersByResponses.map(user => user.username)).toEqual(["unpaid@example.com", "suspended@example.com", "bridge@example.com"]);
+    expect(result.topUsersByResponses.at(-1)).toMatchObject({ responses: 1, responsesSource: "userAgents" });
+    expect(result.licenseCoverage).toEqual({
+      state: "available", observedAt: licenseDirectory.observedAt, activeReportUsers: 6,
+      paidUsers: 1, unpaidUsers: 3, unknownUsers: 2, message: null,
+    });
+    const searched = buildOfficialUsageUserView(source, { ...options, search: "Find me", limit: 1 });
+    expect(searched.users.count).toBe(2);
+    expect(searched.users.value[0].rows.map(row => row.agentId)).toEqual(["agent-b", "agent-a"]);
+    const bridge = buildOfficialUsageUserView(source, { ...options, search: "bridge@example.com" }).users.value[0];
+    expect(bridge).toMatchObject({ missingUserReport: true, reportedResponsesReceived: 0, bridgeResponsesSentToUsers: 1, licenseAssignmentStatus: "no_active_paid_license" });
+  });
+
+  it("moves users between exclusive current-license cohorts without consulting the activity period", () => {
+    const source = published();
+    source.reports.userAgents!.rows = [];
+    source.reports.users!.rows = [
+      { username: "person@example.com", displayName: "Person", numberOfAgentsUsed: 1, agentResponsesReceived: 1 },
+      { username: "paid-no-activity@example.com", displayName: "No activity", numberOfAgentsUsed: 0, agentResponsesReceived: 0 },
+    ];
+    const licenseDirectory = savedLicenses([["person@example.com", "disabled"], ["paid-no-activity@example.com", "enabled"]]);
+    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
+    expect(buildOfficialUsageUserView(source, options).users.count).toBe(1);
+    for (const state of ["enabled", "warning", "partially_enabled"] as const) {
+      licenseDirectory.value![0].copilotServiceState = state;
+      const result = buildOfficialUsageUserView(source, options);
+      expect(result.users.count).toBe(0);
+      expect(result.licenseCoverage).toMatchObject({ paidUsers: 1, unpaidUsers: 0 });
+    }
+    for (const state of ["disabled", "suspended", "locked_out"] as const) {
+      licenseDirectory.value![0].copilotServiceState = state;
+      expect(buildOfficialUsageUserView(source, options).users.count).toBe(1);
+    }
+    licenseDirectory.value![0].copilotServiceState = "unknown";
+    expect(buildOfficialUsageUserView(source, options)).toMatchObject({ users: { count: 0 }, licenseCoverage: { unknownUsers: 1 } });
+  });
+
+  it("excludes unknown, expired, failed and ambiguous licensing instead of treating it as unpaid", () => {
+    const source = published();
+    source.reports.userAgents!.rows = [];
+    source.reports.users!.rows = [
+      { username: "case@example.com", displayName: "Case", numberOfAgentsUsed: 1, agentResponsesReceived: 2 },
+      { username: "CASE@example.com", displayName: "Other", numberOfAgentsUsed: 1, agentResponsesReceived: 3 },
+    ];
+    const licenseDirectory = savedLicenses([["case@example.com", "disabled"]]);
+    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
+    expect(buildOfficialUsageUserView(source, options)).toMatchObject({
+      users: { count: 0 }, licenseCoverage: { state: "available", unknownUsers: 2 },
+    });
+    source.reports.users!.rows.pop();
+    source.reports.users!.rows.push({
+      username: licenseDirectory.value![0].identity.objectId, displayName: "Object ID alias", numberOfAgentsUsed: 1, agentResponsesReceived: 3,
+    });
+    expect(buildOfficialUsageUserView(source, options)).toMatchObject({ users: { count: 0 }, licenseCoverage: { unknownUsers: 2 } });
+    source.reports.users!.rows.pop();
+    for (const directory of [
+      undefined,
+      { ...licenseDirectory, value: null },
+      { ...licenseDirectory, observedAt: null },
+      { ...licenseDirectory, attemptStatus: "failed" as const, message: "Directory refresh failed." },
+    ]) {
+      expect(buildOfficialUsageUserView(source, { ...options, licenseDirectory: directory })).toMatchObject({
+        users: { count: 0, value: [] }, licenseCoverage: { state: "unavailable", paidUsers: 0, unpaidUsers: 0, unknownUsers: 1 },
+      });
+    }
+    expect(buildOfficialUsageUserView(source, {
+      ...options, licenseDirectory: { ...licenseDirectory, value: null },
+    }).licenseCoverage?.message).toBe("Saved license data is missing or expired. Run Users sync.");
+    expect(buildOfficialUsageUserView(source, {
+      ...options, licenseDirectory: { ...licenseDirectory, value: [] },
+    })).toMatchObject({
+      users: { count: 0 }, licenseCoverage: { state: "available", unknownUsers: 1 },
+    });
+  });
+
   it("computes aggregate metrics without treating active-user counts as additive identities", () => {
     const result = buildOfficialUsageAggregateView(published(), [], {
       staleAfterDays: 35,

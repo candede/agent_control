@@ -11,7 +11,7 @@ const pageSize = 50;
 export function ReportedUserAgents({ user, filters, onFocusAgent }: {
   user: OfficialUsageUserSummary;
   filters?: UserRelationshipFilters;
-  onFocusAgent: (agentId: string, reportSetId: string) => void;
+  onFocusAgent?: (agentId: string, reportSetId: string) => void;
 }) {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -72,7 +72,10 @@ export function ReportedUserAgents({ user, filters, onFocusAgent }: {
           <tbody>{visible.map(tableRow => {
             const row = tableRow.original;
             return <tr key={tableRow.id}>
-            <td>{reportSetId ? <button type="button" className="reported-agent-button" title={`Show users of report agent ${row.agentId}`} onClick={() => onFocusAgent(row.agentId, reportSetId)}>{row.displayAgentName || row.agentId}</button> : row.displayAgentName || row.agentId}<small>{row.agentId}</small></td>
+            <td>{reportSetId && onFocusAgent ? <button type="button" className="reported-agent-button"
+              aria-label={`${row.displayAgentName || row.agentId}: active users without paid Copilot`}
+              title={`Show active users without paid Copilot for report agent ${row.agentId}`}
+              onClick={() => onFocusAgent(row.agentId, reportSetId)}>{row.displayAgentName || row.agentId}</button> : row.displayAgentName || row.agentId}<small>{row.agentId}</small></td>
             <td>{row.creatorType || "Unknown"}</td>
             <td data-numeric>{usageCount(row.responsesSentToUsers)}</td>
             <td>{usageDate(row.lastActivityDateUtc)}<small>Anyone, not this user</small></td>
