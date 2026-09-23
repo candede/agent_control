@@ -3,6 +3,7 @@ import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
 import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
+import { mapWithConcurrency } from "./mapWithConcurrency.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { normalizePackageStatus } from "../types/copilotPackage.js";
@@ -23,7 +24,7 @@ import type {
 const graphV1 = "https://graph.microsoft.com/v1.0";
 const graphBeta = "https://graph.microsoft.com/beta";
 export const packageReadTimeoutMs = 30_000;
-export const packageInventoryReadPolicy = { minimumReadIntervalMs: 250, maxThrottleAttempts: 6 };
+export const packageInventoryReadPolicy = { minimumReadIntervalMs: 0, throttledReadIntervalMs: 250, maxThrottleAttempts: 6 };
 const maximumRetryAfterMs = 5 * 60_000;
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
 const bulkDetailConcurrency = 6;
@@ -36,6 +37,7 @@ const defaultRetryPolicy = {
   throttleBaseDelayMs: 30_000,
   maxThrottleDelayMs: 120_000,
   minimumReadIntervalMs: 0,
+  throttledReadIntervalMs: 0,
   now: () => performance.now(),
   delay: (ms: number, signal?: AbortSignal) => delay(ms, undefined, { signal }),
 };
@@ -53,6 +55,7 @@ type RetryPolicy = {
   throttleBaseDelayMs: number;
   maxThrottleDelayMs: number;
   minimumReadIntervalMs: number;
+  throttledReadIntervalMs: number;
   now: () => number;
   delay: (delayMs: number, signal?: AbortSignal) => Promise<unknown>;
 };
@@ -102,6 +105,7 @@ export class GraphPackagesClient {
   private nextReadAt = 0;
   private cooldownUntil = 0;
   private cooldownError?: AppError;
+  private readIntervalMs: number;
 
   constructor(
     fetcher: FetchLike = fetch,
@@ -110,6 +114,7 @@ export class GraphPackagesClient {
     this.fetcher = fetcher;
     this.retryPolicy = { ...defaultRetryPolicy, ...retryPolicy,
       maxThrottleAttempts: retryPolicy.maxThrottleAttempts ?? retryPolicy.maxAttempts ?? defaultRetryPolicy.maxAttempts };
+    this.readIntervalMs = this.retryPolicy.minimumReadIntervalMs;
   }
 
   async listCopilotAgents(accessToken: string, options: PackageReadOptions = {}) {
@@ -148,11 +153,13 @@ export class GraphPackagesClient {
   }
 
   async getPackageDetails(accessToken: string, id: string, options: PackageReadOptions = {}) {
-    return allowlistedPackage(await this.requestReadWithRetry<CopilotPackageDetail>(
+    const details = allowlistedPackage(await this.requestReadWithRetry<CopilotPackageDetail>(
       `${graphV1}/copilot/admin/catalog/packages/${encodeURIComponent(id)}`,
       accessToken,
       options,
     ));
+    requirePackageIdentity(details, id);
+    return details;
   }
 
   async blockPackage(accessToken: string, id: string, options: PackageMutationOptions = { correlationId: randomUUID() }) {
@@ -265,7 +272,8 @@ export class GraphPackagesClient {
         const throttled = error instanceof AppError && isGraphThrottling(error);
         const retryable = error instanceof AppError && isRetryableGraphError(error);
         const retryDelayMs = retryable ? getRetryDelayMs(error, attempt, this.retryPolicy) : undefined;
-        if (throttled && this.retryPolicy.minimumReadIntervalMs > 0) {
+        if (throttled && (this.readIntervalMs > 0 || this.retryPolicy.throttledReadIntervalMs > 0)) {
+          this.readIntervalMs = Math.max(this.readIntervalMs, this.retryPolicy.throttledReadIntervalMs);
           const cooldownMs = retryDelayMs ?? retryAfterFromDetails(error.details);
           if (cooldownMs !== undefined && this.retryPolicy.now() + cooldownMs > this.cooldownUntil) {
             this.cooldownUntil = this.retryPolicy.now() + cooldownMs;
@@ -302,7 +310,7 @@ export class GraphPackagesClient {
   }
 
   private async waitForReadSlot(signal?: AbortSignal) {
-    if (this.retryPolicy.minimumReadIntervalMs === 0) return;
+    if (this.readIntervalMs === 0 && this.retryPolicy.throttledReadIntervalMs === 0) return;
     const admission = this.readQueue.then(async () => {
       signal?.throwIfAborted();
       for (;;) {
@@ -313,7 +321,7 @@ export class GraphPackagesClient {
         await waitForReadRetry(this.retryPolicy.delay, waitMs, signal);
       }
       signal?.throwIfAborted();
-      this.nextReadAt = this.retryPolicy.now() + this.retryPolicy.minimumReadIntervalMs;
+      this.nextReadAt = this.retryPolicy.now() + this.readIntervalMs;
     });
     // A cancelled waiter must not reject the admission queue for other jobs.
     this.readQueue = admission.then(() => undefined, () => undefined);
@@ -334,6 +342,7 @@ export async function updatePackageAccess(
   beforeWrite?: () => Promise<string | void>,
   mutationOptions?: PackageMutationOptions,
 ): Promise<PackageAccessUpdateResult> {
+  mutationOptions?.signal?.throwIfAborted();
   const property = accessCollectionProperty(update.target);
   const requested = deduplicateAccessEntities(update.principals);
 
@@ -354,7 +363,9 @@ export async function updatePackageAccess(
   }
 
   const details =
-    currentDetails ?? (await client.getPackageDetails(accessToken, id));
+    currentDetails ?? (await client.getPackageDetails(accessToken, id, mutationOptions));
+  mutationOptions?.signal?.throwIfAborted();
+  requirePackageIdentity(details, id);
   const previous = deduplicateAccessEntities(details[property] ?? []);
   const currentScope = inferCurrentAccessScope(
     details,
@@ -385,6 +396,14 @@ export async function updatePackageAccess(
     resulting = deduplicateAccessEntities([...previous, ...requested]);
   }
 
+  if (details[property] === undefined) {
+    throw new AppError(
+      409,
+      "incomplete_package_access_state",
+      `Microsoft Graph did not return ${property}, so the current access assignment cannot be determined safely.`,
+    );
+  }
+
   if (
     currentScope === desiredScope &&
     sameAccessEntities(previous, resulting)
@@ -397,10 +416,8 @@ export async function updatePackageAccess(
     };
   }
 
-  const unselectedProperty =
-    update.target === "availability"
-      ? ("acquireUsersAndGroups" as const)
-      : ("allowedUsersAndGroups" as const);
+  const unselectedTarget = otherAccessTarget(update.target);
+  const unselectedProperty = accessCollectionProperty(unselectedTarget);
 
   if (details[unselectedProperty] === undefined) {
     throw new AppError(
@@ -410,17 +427,27 @@ export async function updatePackageAccess(
     );
   }
 
-  const dispatchToken = await beforeWrite?.() ?? accessToken;
+  const preserved = deduplicateAccessEntities(details[unselectedProperty]);
+  if (inferCurrentAccessScope(details, unselectedTarget, preserved) === "unknown") {
+    throw new AppError(
+      409,
+      "ambiguous_access_scope",
+      "Current unselected access could not be determined safely. Refresh complete access state before retrying.",
+    );
+  }
+
   const payload = {
     allowedUsersAndGroups:
       update.target === "availability"
         ? resulting
-        : deduplicateAccessEntities(details.allowedUsersAndGroups ?? []),
+        : preserved,
     acquireUsersAndGroups:
       update.target === "installation"
         ? resulting
-        : deduplicateAccessEntities(details.acquireUsersAndGroups ?? []),
+        : preserved,
   };
+  const dispatchToken = await beforeWrite?.() ?? accessToken;
+  mutationOptions?.signal?.throwIfAborted();
   if (mutationOptions) await client.patchPackageAccess(dispatchToken, id, payload, mutationOptions);
   else await client.patchPackageAccess(dispatchToken, id, payload);
 
@@ -446,7 +473,7 @@ export async function verifyPackageMutationConverged(
   let lastState: PackageMutationState | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const details = await client.getPackageDetails(accessToken, id, options);
-    if (details.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
+    requirePackageIdentity(details, id);
     lastState = capturePackageMutationState(details, action);
     if (packageMutationStatesEqual(lastState, expectedState)) return { details, state: lastState, readbackCount: attempt };
     if (attempt < maxAttempts && delayMs > 0) await waitForReadRetry(wait, delayMs, options.signal);
@@ -460,6 +487,7 @@ export function verifyPackageAccessApplied(
   expectedPrincipals: PackageAccessEntity[],
   previousDetails: CopilotPackageDetail,
 ) {
+  requirePackageIdentity(details, previousDetails.id);
   const property = accessCollectionProperty(update.target);
   const actualPrincipals = deduplicateAccessEntities(details[property] ?? []);
   const actualScope = inferCurrentAccessScope(
@@ -486,10 +514,18 @@ export function verifyPackageAccessApplied(
     preservedTarget,
     actualPreservedPrincipals,
   );
+  const requestedAccessKnown = details[property] !== undefined && actualScope !== "unknown";
   const requestedAccessApplied =
+    requestedAccessKnown &&
     actualScope === expectedScope &&
     sameAccessEntities(actualPrincipals, expectedPrincipals);
+  const preservedAccessKnown =
+    previousDetails[preservedProperty] !== undefined &&
+    details[preservedProperty] !== undefined &&
+    expectedPreservedScope !== "unknown" &&
+    actualPreservedScope !== "unknown";
   const otherAccessPreserved =
+    preservedAccessKnown &&
     actualPreservedScope === expectedPreservedScope &&
     sameAccessEntities(actualPreservedPrincipals, expectedPreservedPrincipals);
 
@@ -497,12 +533,17 @@ export function verifyPackageAccessApplied(
     return;
   }
 
+  const message = !requestedAccessKnown
+    ? `Microsoft Graph accepted the request but the requested ${formatAccessTarget(update.target)} access setting could not be verified from incomplete readback.`
+    : !requestedAccessApplied
+      ? `Microsoft Graph accepted the request but did not apply the requested ${formatAccessScope(expectedScope)} access scope. Effective access is still ${formatAccessScope(actualScope)}.`
+      : preservedAccessKnown
+        ? `Microsoft Graph accepted the request but changed the unselected ${formatAccessTarget(preservedTarget)} access setting.`
+        : `Microsoft Graph accepted the request but preservation of the unselected ${formatAccessTarget(preservedTarget)} access setting could not be verified.`;
   throw new AppError(
     409,
     "access_update_not_applied",
-    requestedAccessApplied
-      ? `Microsoft Graph accepted the request but changed the unselected ${formatAccessTarget(preservedTarget)} access setting.`
-      : `Microsoft Graph accepted the request but did not apply the requested ${formatAccessScope(expectedScope)} access scope. Effective access is still ${formatAccessScope(actualScope)}.`,
+    message,
     {
       target: update.target,
       expectedScope,
@@ -516,6 +557,10 @@ export function verifyPackageAccessApplied(
       actualPreservedPrincipals,
     },
   );
+}
+
+function requirePackageIdentity(details: CopilotPackageDetail, id: string) {
+  if (details.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
 }
 
 function sameAccessEntities(
@@ -604,12 +649,12 @@ function deduplicateAccessEntities(entities: PackageAccessEntity[]) {
   const unique = new Map<string, PackageAccessEntity>();
 
   for (const entity of entities) {
+    if (!entity || typeof entity.resourceId !== "string" || typeof entity.resourceType !== "string"
+      || !entity.resourceId.trim() || !entity.resourceType.trim()) {
+      throw new AppError(400, "invalid_principal", "Each access principal requires a resource type and ID.");
+    }
     const resourceId = entity.resourceId.trim();
     const resourceType = entity.resourceType.trim();
-
-    if (!resourceId || !resourceType) {
-      continue;
-    }
 
     const key = `${resourceType.toLowerCase()}:${resourceId.toLowerCase()}`;
     unique.set(key, { resourceId, resourceType });
@@ -1082,29 +1127,6 @@ async function waitForReadRetry(wait: (delayMs: number, signal?: AbortSignal) =>
   } finally {
     removeAbort();
   }
-}
-
-async function mapWithConcurrency<T, U>(
-  items: T[],
-  concurrency: number,
-  mapper: (item: T) => Promise<U>,
-) {
-  const results: U[] = [];
-  let index = 0;
-
-  async function worker() {
-    while (index < items.length) {
-      const currentIndex = index;
-      index += 1;
-      results[currentIndex] = await mapper(items[currentIndex]);
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
-  );
-
-  return results;
 }
 
 function normalizePositiveInteger(value: number | undefined, fallback: number) {

@@ -636,6 +636,7 @@ describe("GraphPackagesClient", () => {
           displayName: "First",
           isBlocked: false,
           availableTo: "allowedForSome",
+          deployedTo: "none",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
         });
@@ -666,6 +667,7 @@ describe("GraphPackagesClient", () => {
           displayName: "First",
           isBlocked: false,
           availableTo: "all",
+          deployedTo: "none",
           allowedUsersAndGroups: [],
           acquireUsersAndGroups: [],
         });
@@ -824,6 +826,7 @@ describe("GraphPackagesClient", () => {
           isBlocked: false,
           availableTo:
             id === "P_1" || this.updatedIds.has(id) ? "some" : "none",
+          deployedTo: "none",
           acquireUsersAndGroups: [],
           allowedUsersAndGroups:
             id === "P_1" || this.updatedIds.has(id)

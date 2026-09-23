@@ -8,6 +8,7 @@ import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy } from "./graphPackages.js";
+import { mapWithConcurrency } from "./mapWithConcurrency.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
@@ -89,15 +90,16 @@ export class PackageInventoryService {
 
   private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, options: { retryFailed?: boolean }) {
     const signal = controller.signal;
-    signal.throwIfAborted();
-    const current = await this.repository.getJob(scope, id);
-    signal.throwIfAborted();
-    if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
-    if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
-    requireRefreshRole(user);
+    let current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>>;
     let token = "";
     let markedRunning = false;
     try {
+      signal.throwIfAborted();
+      current = await this.repository.getJob(scope, id);
+      signal.throwIfAborted();
+      if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
+      if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
+      requireRefreshRole(user);
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const freshUser = await this.dependencies.revalidateUser(actor.principalId);
       signal.throwIfAborted();
@@ -126,6 +128,7 @@ export class PackageInventoryService {
           await this.repository.markWaitingAuthorization(scope, id);
         }
       }
+      signal.throwIfAborted();
       throw error;
     }
     const executionDeadlineMs = current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
@@ -203,6 +206,7 @@ export class PackageInventoryService {
         requireRefreshRole(freshUser);
         const capabilityId = capabilityForMode(current.tokenMode);
         if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+        signal.throwIfAborted();
         await this.dependencies.requireAvailable(capabilityId, freshUser);
         signal.throwIfAborted();
         stage = "publication";
@@ -265,46 +269,64 @@ export async function scanPackages(
     await onProgress(Math.max(1, listPages), 0, ids.length, `Matching agent records (0/${ids.length} identities checked).`);
   }
   if (!broad && ids.length > 100) throw new AppError(400, "invalid_targets", "An exact package refresh accepts at most 100 native IDs.");
-  const packages: CopilotPackageDetail[] = [];
+  const failure = new AbortController();
+  const readSignal = AbortSignal.any([signal, failure.signal]);
   let completed = 0;
-  for (let offset = 0; offset < ids.length; offset += exactReadConcurrency) {
-    signal.throwIfAborted();
-    const batch = ids.slice(offset, offset + exactReadConcurrency);
-    const results = await Promise.allSettled(batch.map(async id => {
+  let observedCount = 0;
+  let progress = Promise.resolve();
+  let retryNotice: { until: number; throttled: boolean } | undefined;
+  const reportProgress = (retry?: { retryDelayMs: number; throttled: boolean }) => {
+    if (retry && performance.now() + retry.retryDelayMs > (retryNotice?.until ?? 0)) {
+      retryNotice = { until: performance.now() + retry.retryDelayMs, throttled: retry.throttled };
+    }
+    const pages = broad ? Math.max(1, listPages) : completed;
+    const observed = broad ? completed : observedCount;
+    const total = broad ? ids.length : observedCount;
+    const remainingWaitMs = completed === ids.length ? 0 : (retryNotice?.until ?? 0) - performance.now();
+    const message = remainingWaitMs > 0
+      ? `${retryNotice?.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph package read needs a retry."} Waiting ${Math.ceil(remainingWaitMs / 1000)} seconds before retrying (${completed}/${ids.length} identities checked).`
+      : broad ? `Matching agent records (${completed}/${ids.length} identities checked).` : undefined;
+    // Serialize writes so a slow progress update cannot overwrite a newer count or retry message.
+    progress = progress.then(async () => {
+      readSignal.throwIfAborted();
+      await onProgress(pages, observed, total, message);
+    });
+    return progress;
+  };
+  const results = await mapWithConcurrency(ids, exactReadConcurrency, async id => {
+    try {
+      readSignal.throwIfAborted();
+      let value: CopilotPackageDetail | null;
       try {
         const detail = await client.getPackageDetails(token, id, {
-          signal,
-          onRetry: retry => onProgress(
-            broad ? Math.max(1, listPages) : completed,
-            broad ? completed : packages.length,
-            broad ? ids.length : packages.length,
-            `${retry.throttled ? "Microsoft Graph is throttling package reads." : "Microsoft Graph package read needs a retry."} Waiting ${Math.ceil(retry.retryDelayMs / 1000)} seconds before retrying (${completed}/${ids.length} identities checked).`,
-          ),
+          signal: readSignal,
+          onRetry: reportProgress,
         });
         if (detail.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
         const summary = summaries.get(id);
-        return {
+        value = {
           ...summary, ...detail, identityDetailsCollected: true as const,
           authoringTool: detail.authoringTool ?? summary?.authoringTool ?? null,
           provenance: { ...summary?.provenance, ...detail.provenance },
         };
       } catch (error) {
-        if (error instanceof AppError && error.status === 404) return null;
-        throw error;
+        if (!(error instanceof AppError && error.status === 404)) throw error;
+        value = null;
       }
-    }));
-    signal.throwIfAborted();
-    for (const result of results) {
-      if (result.status === "rejected") throw result.reason;
-      if (result.value) packages.push(result.value);
+      readSignal.throwIfAborted();
+      completed += 1;
+      if (value) observedCount += 1;
+      if (completed % exactReadConcurrency === 0 || completed === ids.length) {
+        await reportProgress();
+      }
+      return value;
+    } catch (error) {
+      failure.abort(error);
+      throw readSignal.reason;
     }
-    completed += batch.length;
-    if (broad) {
-      await onProgress(Math.max(1, listPages), completed, ids.length, `Matching agent records (${completed}/${ids.length} identities checked).`);
-    } else {
-      await onProgress(completed, packages.length, packages.length);
-    }
-  }
+  });
+  signal.throwIfAborted();
+  const packages = results.filter(value => value !== null);
   return { packages, totalRecords: packages.length, pages: Math.max(1, broad ? listPages : completed) };
 }
 

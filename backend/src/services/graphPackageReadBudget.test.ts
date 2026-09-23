@@ -11,6 +11,38 @@ const packageResponse = (id = "package") => Response.json({ id, displayName: id,
 const timerDelay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 describe("Graph inventory read budget", () => {
+  it.each([1071, 5000])("collects %i healthy package details without an artificial four-reads-per-second ceiling", async count => {
+    vi.useFakeTimers();
+    const listed = Array.from({ length: count }, (_, index) => ({ id: `package-${index}`, displayName: `Agent ${index}`, isBlocked: false }));
+    let active = 0;
+    let maximumActive = 0;
+    let finishedAt = 0;
+    const fetcher = vi.fn<FetchLike>(async input => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await timerDelay(50);
+      active -= 1;
+      finishedAt = performance.now();
+      return new URL(input).pathname.endsWith("/packages")
+        ? Response.json({ value: listed }) : packageResponse(new URL(input).pathname.split("/").at(-1)!);
+    });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), 15 * 60_000);
+    try {
+      const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: timerDelay });
+      const result = scanPackages("token", [], controller.signal, async () => undefined, client).finally(() => clearTimeout(deadline));
+      const assertion = expect(result).resolves.toMatchObject({ totalRecords: count, pages: 1 });
+      await Promise.all([assertion, vi.runAllTimersAsync()]);
+      expect((await result).packages.map(value => value.id)).toEqual(listed.map(value => value.id));
+      expect(fetcher).toHaveBeenCalledTimes(count + 1);
+      expect(maximumActive).toBe(4);
+      expect(finishedAt).toBeLessThanOrEqual(50 + Math.ceil(count / 4) * 50);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("identifies the observed wrapped throttle without exposing the provider message", async () => {
     const error = await graphError(throttledResponse());
     expect(error.details).toMatchObject({ httpStatus: 424, providerErrorCode: "UnknownError", throttled: true });
@@ -70,7 +102,7 @@ describe("Graph inventory read budget", () => {
       .mockResolvedValueOnce(Response.json({ error: { code: "UnknownError", message: "Dependency failed" } }, { status: 424 }))
       .mockResolvedValueOnce(throttledResponse());
     const wait = vi.fn(async () => undefined);
-    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, minimumReadIntervalMs: 0, delay: wait });
+    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, throttledReadIntervalMs: 0, delay: wait });
     await expect(client.getPackageDetails("token", "package")).rejects.toMatchObject({ status: 424 });
     await expect(client.blockPackage("token", "package")).rejects.toMatchObject({ status: 424 });
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -80,7 +112,7 @@ describe("Graph inventory read budget", () => {
   it("bounds persistent inventory throttling to six attempts, without increasing other read retries", async () => {
     const wait = vi.fn(async () => undefined);
     const fetcher = vi.fn<FetchLike>(async () => throttledResponse());
-    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, minimumReadIntervalMs: 0, delay: wait });
+    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, throttledReadIntervalMs: 0, delay: wait });
     await expect(client.getPackageDetails("token", "package")).rejects.toMatchObject({ status: 424 });
     expect(fetcher).toHaveBeenCalledTimes(6);
     expect(wait.mock.calls).toEqual([[30_000], [60_000], [120_000], [120_000], [120_000]]);
@@ -100,8 +132,8 @@ describe("Graph inventory read budget", () => {
     try {
       const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: timerDelay });
       const first = client.getPackageDetails("token-a", "first");
-      const second = client.getPackageDetails("token-b", "second");
       await vi.advanceTimersByTimeAsync(0);
+      const second = client.getPackageDetails("token-b", "second");
       const controller = new AbortController();
       const cancelled = client.getPackageDetails("token-c", "cancelled", { signal: controller.signal });
       const cancellation = expect(cancelled).rejects.toMatchObject({ code: "read_job_cancelled" });
@@ -204,7 +236,9 @@ describe("Graph inventory read budget", () => {
       const completed = await result;
       expect(completed.packages.map(value => value.id)).toEqual(listed.map(value => value.id));
       expect(completed.packages.every(value => value.identityDetailsCollected === true)).toBe(true);
-      expect(reads.every((at, index) => index === 0 || at - reads[index - 1]! >= packageInventoryReadPolicy.minimumReadIntervalMs)).toBe(true);
+      const pacedReads = reads.filter(at => at >= 30_000);
+      expect(pacedReads.length).toBeGreaterThan(0);
+      expect(pacedReads.every((at, index) => index === 0 || at - pacedReads[index - 1]! >= packageInventoryReadPolicy.throttledReadIntervalMs)).toBe(true);
       expect(reads.at(-1)).toBeLessThan(15 * 60_000);
       expect(fetcher.mock.calls.length).toBeGreaterThan(1012);
       expect(progress.mock.calls.some(call => call[3]?.includes("Microsoft Graph is throttling"))).toBe(true);

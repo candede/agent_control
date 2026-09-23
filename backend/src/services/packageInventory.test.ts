@@ -5,7 +5,7 @@ import { revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { PackageInventoryService, scanPackages } from "./packageInventory.js";
 import { allowlistedPackage } from "./packageObservation.js";
-import { GraphPackagesClient, packageInventoryReadPolicy, type FetchLike } from "./graphPackages.js";
+import { GraphPackagesClient, packageInventoryReadPolicy, type FetchLike, type PackageReadOptions } from "./graphPackages.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -137,7 +137,7 @@ describe("Package refresh service", () => {
         ? Response.json({ value: [{ id: "package", displayName: "Agent", isBlocked: false }] })
         : Response.json({ error: { code: providerCode, message: `${status === 424 ? "Too many requests " : ""}private-token person@example.invalid` } },
           { status, headers: { "request-id": requestId } }));
-      const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, minimumReadIntervalMs: 0, delay: async () => undefined });
+      const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, throttledReadIntervalMs: 0, delay: async () => undefined });
       const { service, repository, dependencies, job } = fixture();
       dependencies.scan.mockImplementation((token, ids, signal, progress) => scanPackages(token, ids, signal, progress, client));
       const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -191,6 +191,114 @@ describe("Package refresh service", () => {
       expect(result.packages[0].elementDetails).toBeUndefined();
     });
 
+    it("keeps free detail workers busy while one package is slow and preserves catalog order", async () => {
+      const slow = deferred<ReturnType<typeof packageValue>>();
+      const ids = Array.from({ length: 9 }, (_, index) => `package-${index}`);
+      const client = {
+        listCopilotAgents: vi.fn(async () => ids.map(packageValue)),
+        getPackageDetails: vi.fn(async (_token: string, id: string) =>
+          id === ids[0] ? slow.promise : packageValue(id)),
+      };
+      const progress = vi.fn(async () => undefined);
+      const result = scanPackages("token", [], new AbortController().signal, progress, client);
+      try {
+        await vi.waitFor(() => expect(client.getPackageDetails).toHaveBeenCalledTimes(ids.length));
+        expect(progress).toHaveBeenLastCalledWith(1, 8, 9, "Matching agent records (8/9 identities checked).");
+      } finally {
+        slow.resolve(packageValue(ids[0]));
+        await result;
+      }
+      expect((await result).packages.map(value => value.id)).toEqual(ids);
+      expect(progress).toHaveBeenLastCalledWith(1, 9, 9, "Matching agent records (9/9 identities checked).");
+    });
+
+    it("serializes progress persistence without stopping all available detail workers", async () => {
+      const pending = deferred<void>();
+      const counts: number[] = [];
+      const client = {
+        listCopilotAgents: vi.fn(async () => Array.from({ length: 9 }, (_, index) => packageValue(`package-${index}`))),
+        getPackageDetails: vi.fn(async (_token: string, id: string) => packageValue(id)),
+      };
+      const progress = vi.fn(async (_pages: number, count: number) => {
+        counts.push(count);
+        if (count === 4) await pending.promise;
+      });
+      const result = scanPackages("token", [], new AbortController().signal, progress, client);
+      try {
+        await vi.waitFor(() => expect(client.getPackageDetails).toHaveBeenCalledTimes(9));
+        expect(counts).toEqual([0, 4]);
+      } finally {
+        pending.resolve();
+        await result;
+      }
+      expect(counts).toEqual([0, 4, 8, 9]);
+    });
+
+    it("retains a retry notice while other workers report completed details", async () => {
+      vi.useFakeTimers();
+      const slow = deferred<ReturnType<typeof packageValue>>();
+      const client = {
+        listCopilotAgents: vi.fn(async () => Array.from({ length: 9 }, (_, index) => packageValue(`package-${index}`))),
+        getPackageDetails: vi.fn(async (_token: string, id: string, options: PackageReadOptions) => {
+          if (id !== "package-0") return packageValue(id);
+          await options.onRetry?.({ attempt: 1, retryDelayMs: 30_000, throttled: true });
+          return slow.promise;
+        }),
+      };
+      const progress = vi.fn(async () => undefined);
+      const result = scanPackages("token", [], new AbortController().signal, progress, client);
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(progress).toHaveBeenLastCalledWith(1, 8, 9,
+          "Microsoft Graph is throttling package reads. Waiting 30 seconds before retrying (8/9 identities checked).");
+        await vi.advanceTimersByTimeAsync(30_000);
+        slow.resolve(packageValue("package-0"));
+        await result;
+        expect(progress).toHaveBeenLastCalledWith(1, 9, 9, "Matching agent records (9/9 identities checked).");
+      } finally {
+        slow.resolve(packageValue("package-0"));
+        await result;
+        vi.useRealTimers();
+      }
+    });
+
+    it.each(["provider", "progress"] as const)("aborts and drains in-flight reads after a %s failure", async source => {
+      const pending = deferred<ReturnType<typeof packageValue>>();
+      const error = new AppError(502, "provider_error", "Read failed.");
+      const signals: AbortSignal[] = [];
+      const client = {
+        listCopilotAgents: vi.fn(async () => Array.from({ length: 20 }, (_, index) => packageValue(`package-${index}`))),
+        getPackageDetails: vi.fn(async (_token: string, id: string, options: PackageReadOptions) => {
+          signals.push(options.signal!);
+          if (id === "package-0") return pending.promise;
+          if (source === "provider" && id === "package-1") throw error;
+          return packageValue(id);
+        }),
+      };
+      const progress = vi.fn(async (_pages: number, count: number) => {
+        if (source === "progress" && count === 4) throw error;
+      });
+      const result = scanPackages("token", [], new AbortController().signal, progress, client);
+      const assertion = expect(result).rejects.toBe(error);
+      let settled = false;
+      void result.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await vi.waitFor(() => expect(signals[0]?.aborted).toBe(true));
+        expect(signals.every(signal => signal.reason === error)).toBe(true);
+        expect(settled).toBe(false);
+        expect(client.getPackageDetails.mock.calls.length).toBeLessThan(20);
+        const calls = client.getPackageDetails.mock.calls.length;
+        const updates = progress.mock.calls.length;
+        pending.resolve(packageValue("package-0"));
+        await assertion;
+        expect(client.getPackageDetails).toHaveBeenCalledTimes(calls);
+        expect(progress).toHaveBeenCalledTimes(updates);
+      } finally {
+        pending.resolve(packageValue("package-0"));
+        await assertion;
+      }
+    });
+
     it("does not advance identity collection after cancellation or a failed detail read", async () => {
       const controller = new AbortController();
       const client = {
@@ -202,14 +310,15 @@ describe("Package refresh service", () => {
       };
       await expect(scanPackages("token", [], controller.signal, async () => undefined, client))
         .rejects.toMatchObject({ code: "read_job_cancelled" });
-      expect(client.getPackageDetails).toHaveBeenCalledTimes(4);
+      expect(client.getPackageDetails).toHaveBeenCalledTimes(2);
+      client.getPackageDetails.mockClear();
       client.getPackageDetails.mockRejectedValue(new AppError(403, "missing_permission", "Denied"));
       await expect(scanPackages("token", [], new AbortController().signal, async () => undefined, client))
         .rejects.toMatchObject({ code: "missing_permission" });
-      expect(client.getPackageDetails).toHaveBeenCalledTimes(8);
+      expect(client.getPackageDetails).toHaveBeenCalledTimes(4);
     });
 
-    it("reads exact details in bounded batches and retains complete deterministic results", async () => {
+    it("reads exact details with bounded workers and retains complete deterministic results", async () => {
       let active = 0;
       let maximumActive = 0;
       const client = {
@@ -228,7 +337,7 @@ describe("Package refresh service", () => {
       expect(result.packages.map(value => value.id)).toEqual(ids);
       expect(result).toMatchObject({ pages: 9, totalRecords: 9 });
       expect(maximumActive).toBe(4);
-      expect(progress.mock.calls).toEqual([[4, 4, 4], [8, 8, 8], [9, 9, 9]]);
+      expect(progress.mock.calls).toEqual([[4, 4, 4, undefined], [8, 8, 8, undefined], [9, 9, 9, undefined]]);
       expect(client.listCopilotAgents).not.toHaveBeenCalled();
     });
 
@@ -247,7 +356,7 @@ describe("Package refresh service", () => {
         .rejects.toMatchObject({ code: "target_mismatch" });
     });
 
-    it("does not publish a partial scan or dispatch the next batch after an error", async () => {
+    it("does not publish a partial scan or dispatch more reads after an error", async () => {
       const client = {
         listCopilotAgents: vi.fn(),
         getPackageDetails: vi.fn(async (_token: string, id: string) => {
@@ -401,6 +510,63 @@ describe("Package refresh service", () => {
     await expect(service.start(user, "after-shutdown", "delegated")).rejects.toMatchObject({ code: "package_refresh_shutdown" });
   });
 
+  it.each(
+    (["getJob", "revalidateUser", "requireAvailable", "delegatedToken", "markRunning"] as const).flatMap(stage =>
+      (["cancel", "logout", "shutdown"] as const).map(interruption => ({ stage, interruption }))),
+  )("preserves $interruption when startup at $stage rejects later", async ({ stage, interruption }) => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<never>();
+    const boundary = stage === "getJob" || stage === "markRunning" ? repository[stage] : dependencies[stage];
+    boundary.mockReturnValueOnce(pending.promise);
+    const starting = service.start(user, job.id, "delegated");
+    const stopped = expect(starting).rejects.toMatchObject({
+      code: interruption === "cancel" ? "read_job_cancelled" : "interaction_required",
+    });
+    await vi.waitFor(() => expect(boundary).toHaveBeenCalledOnce());
+    if (interruption === "cancel") await service.cancel(user, job.id, "delegated");
+    else if (interruption === "logout") await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+    const drained = expect(service.drain()).resolves.toBeUndefined();
+    pending.reject(new Error("Late startup dependency failure."));
+    await Promise.all([stopped, drained]);
+    expect(dependencies.scan).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.markFailed).not.toHaveBeenCalled();
+  });
+
+  it.each(["getJob", "revalidateUser", "requireAvailable", "delegatedToken", "markRunning"] as const)(
+    "propagates a startup failure at %s when not interrupted",
+    async stage => {
+      const { service, repository, dependencies, job } = fixture();
+      const failure = new Error("Startup dependency failure.");
+      const boundary = stage === "getJob" || stage === "markRunning" ? repository[stage] : dependencies[stage];
+      boundary.mockRejectedValueOnce(failure);
+      await expect(service.start(user, job.id, "delegated")).rejects.toBe(failure);
+      expect(dependencies.scan).not.toHaveBeenCalled();
+      await service.drain();
+    },
+  );
+
+  it.each(["cancel", "shutdown"] as const)("surfaces persistence failure while cleaning up %s during startup", async interruption => {
+    const { service, repository, dependencies, job } = fixture();
+    const pending = deferred<boolean>();
+    const failure = new Error("Startup cleanup persistence failure.");
+    repository.markRunning.mockReturnValueOnce(pending.promise);
+    const starting = service.start(user, job.id, "delegated");
+    const stopped = expect(starting).rejects.toBe(failure);
+    await vi.waitFor(() => expect(repository.markRunning).toHaveBeenCalledOnce());
+    if (interruption === "cancel") {
+      await service.cancel(user, job.id, "delegated");
+      repository.cancel.mockRejectedValueOnce(failure);
+    } else {
+      repository.markWaitingAuthorization.mockRejectedValueOnce(failure);
+    }
+    const drained = expect(service.drain()).rejects.toBe(failure);
+    pending.resolve(true);
+    await Promise.all([stopped, drained]);
+    expect(dependencies.scan).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
   it("rejects a duplicate admission without consuming another slot", async () => {
     const { service, dependencies, job } = fixture();
     const pending = deferred<AuthenticatedUser>();
@@ -537,6 +703,39 @@ describe("Package refresh service", () => {
     await service.drain();
     expect(dependencies.scan).not.toHaveBeenCalled();
   });
+
+  it.each(["cancel", "logout", "shutdown", "deadline"] as const)(
+    "does not begin a publication capability check after %s interrupts application-scope authorization",
+    async interruption => {
+      const applicationJob = { ...fixture().job, tokenMode: "application" as const };
+      const { service, repository, dependencies } = fixture({ getJob: vi.fn(async () => applicationJob) });
+      const pending = deferred<void>();
+      const deadline = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      dependencies.requireApplicationDataScope.mockResolvedValueOnce(undefined).mockReturnValueOnce(pending.promise);
+      await service.start(user, applicationJob.id, "application");
+      await vi.waitFor(() => expect(dependencies.requireApplicationDataScope).toHaveBeenCalledTimes(2));
+      if (interruption === "cancel") await service.cancel(user, applicationJob.id, "application");
+      else if (interruption === "logout") await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+      else if (interruption === "deadline") deadline.abort(new DOMException("Execution deadline", "TimeoutError"));
+      const draining = service.drain();
+      pending.resolve();
+      await draining;
+      expect(dependencies.requireAvailable).toHaveBeenCalledTimes(1);
+      expect(repository.publish).not.toHaveBeenCalled();
+      expect(getEventListeners(deadline.signal, "abort")).toHaveLength(0);
+      if (interruption === "deadline") {
+        expect(repository.markFailed).toHaveBeenCalledWith(
+          expect.anything(), applicationJob.id, "package_refresh_timeout", expect.stringContaining("execution deadline"),
+        );
+        expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+      } else {
+        expect(repository.markFailed).not.toHaveBeenCalled();
+        expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(interruption === "cancel" ? 0 : 1);
+        expect(repository.cancel).toHaveBeenCalledTimes(interruption === "cancel" ? 2 : 0);
+      }
+    },
+  );
 
   it.each(["requireApplicationDataScope", "applicationToken"] as const)(
     "stops an application read paused at %s using the authorizing user's scope",
