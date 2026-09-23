@@ -113,6 +113,45 @@ describe("persistent agent people resolution", () => {
     expect(value.directory.resolve).toHaveBeenCalledTimes(8);
   });
 
+  it("preserves cancellation before reads and records provider request deadlines distinctly", async () => {
+    const cancelled = harness();
+    const controller = new AbortController();
+    controller.abort(new Error("Fixture cancellation"));
+    await expect(cancelled.service.resolve(cancelled.user, [id], { ...options, signal: controller.signal }))
+      .rejects.toThrow("Fixture cancellation");
+    expect(cancelled.saved.getDirectorySource).not.toHaveBeenCalled();
+    expect(cancelled.repository.read).not.toHaveBeenCalled();
+    expect(cancelled.directory.resolve).not.toHaveBeenCalled();
+
+    const deadline = harness();
+    const deadlineController = new AbortController();
+    deadlineController.abort(new DOMException("Private deadline details", "TimeoutError"));
+    await expect(deadline.service.resolve(deadline.user, [id], { ...options, signal: deadlineController.signal }))
+      .rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    expect(deadline.saved.getDirectorySource).not.toHaveBeenCalled();
+
+    const timedOut = harness();
+    timedOut.directory.resolve.mockRejectedValueOnce(new DOMException("Private provider details", "TimeoutError"));
+    expect((await timedOut.service.resolve(timedOut.user, [id], options)).failed).toBe(1);
+    expect(timedOut.repository.save.mock.calls[0][1][0]).toMatchObject({
+      status: "lookup_failed", errorCode: "provider_timeout",
+    });
+  });
+
+  it("stops refresh-reference reads when cancellation arrives between persistence calls", async () => {
+    const value = harness();
+    const controller = new AbortController();
+    value.repository.generation.mockImplementationOnce(async () => {
+      controller.abort(new Error("Fixture cancellation"));
+      return "initial";
+    });
+    await expect(value.service.refreshReferences(value.user, controller.signal,
+      { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false }))
+      .rejects.toThrow("Fixture cancellation");
+    expect(value.repository.referencedIds).not.toHaveBeenCalled();
+    expect(value.saved.getDirectorySource).not.toHaveBeenCalled();
+  });
+
   it("bounds provider concurrency and rejects invalid IDs before provider work", async () => {
     const value = harness();
     let active = 0;

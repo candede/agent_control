@@ -216,24 +216,33 @@ describe("CSV import history projection", () => {
     expect(summary).toMatchObject({
       label: "Users & agents CSV import", target: "Users & agents export · 536 validated rows",
       createdAt: stage.createdAt, updatedAt: stage.createdAt,
-      status: "active", canCancel: true, href: "/official-usage?staging=stage-1",
+      status: "active", canCancel: true, href: "/sync?reports=import&staging=stage-1",
     });
     expect(summary).not.toHaveProperty("completedAt");
     expect(summary).not.toHaveProperty("startedAt");
     expect(summary).not.toHaveProperty("reconciliation");
   });
-  it("links accepted files to exact report history instead of reopening the import modal", () => {
+  it("links accepted files to the exact Sync snapshot inspector instead of reopening the import modal", () => {
     const acceptedAt = "2026-09-15T09:00:00.000Z";
     const summary = officialUsageJobSummary({ ...stage, status: "accepted", acceptedAt, acceptedSetId: "set/one" });
     expect(summary).toMatchObject({
       createdAt: stage.createdAt, completedAt: acceptedAt, updatedAt: acceptedAt,
-      status: "accepted", canCancel: false, href: "/official-usage?view=history&snapshot=set%2Fone",
+      status: "accepted", canCancel: false, href: "/sync?reports=snapshot&snapshot=set%2Fone",
     });
     expect(summary).not.toHaveProperty("startedAt");
   });
   it.each(["discarded", "expired", "accepted"] as const)("does not invent dates or reopen a %s draft without a snapshot", status => {
     const summary = officialUsageJobSummary({ ...stage, status });
-    expect(summary).toMatchObject({ canCancel: false, href: "/official-usage?view=history" });
+    expect(summary).toMatchObject({ canCancel: false, href: "/sync?reports=manage" });
     expect(summary).not.toHaveProperty("completedAt");
+  });
+  it("encodes exact staging and snapshot identifiers without letting them change the report workflow", () => {
+    const id = "exact/id&reports=manage#one";
+    expect(officialUsageJobSummary({ ...stage, id }).href).toBe(
+      "/sync?reports=import&staging=exact%2Fid%26reports%3Dmanage%23one",
+    );
+    expect(officialUsageJobSummary({ ...stage, status: "accepted", acceptedSetId: id }).href).toBe(
+      "/sync?reports=snapshot&snapshot=exact%2Fid%26reports%3Dmanage%23one",
+    );
   });
 });

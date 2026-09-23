@@ -94,6 +94,7 @@ function renderPanel(options: {
   active?: boolean;
   canUploadUsage?: boolean;
   onOpenUsageImport?: () => void;
+  onManageUsageReports?: () => void;
   onRequestedRunChange?: (runId: string | undefined) => void;
   onSetupRequiredChange?: (required: boolean) => void;
   onSourcesChanged?: (sources: DataSyncSourceId[]) => void;
@@ -109,6 +110,7 @@ function renderPanel(options: {
     canUploadUsage: options.canUploadUsage ?? true,
     requestedRunId: options.requestedRunId,
     onOpenUsageImport: options.onOpenUsageImport ?? vi.fn(),
+    onManageUsageReports: options.onManageUsageReports ?? vi.fn(),
     onRequestedRunChange: options.onRequestedRunChange ?? vi.fn(),
     onSetupRequiredChange: options.onSetupRequiredChange,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
@@ -134,6 +136,17 @@ describe("DataSyncPanel", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it.each([true, false])("provides one report-management entry with upload permission %s", async canUploadUsage => {
+    api.getState.mockResolvedValue(syncState());
+    const onManageUsageReports = vi.fn();
+    renderPanel({ canUploadUsage, onManageUsageReports });
+    await userEvent.click(await screen.findByRole("button", { name: "Manage reports" }));
+    expect(onManageUsageReports).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("link", { name: "View report history" })).not.toBeInTheDocument();
+    expect(screen.queryAllByRole("button", { name: "Manage reports" })).toHaveLength(1);
+    expect(screen.queryAllByRole("button", { name: "Add CSV reports" })).toHaveLength(canUploadUsage ? 1 : 0);
   });
 
   it("loads onboarding while initially inactive and reports the setup hint without exposing UI", async () => {
@@ -295,6 +308,34 @@ describe("DataSyncPanel", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
     expect(api.cancel).toHaveBeenCalledWith(waiting.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it.each(["failed", "permission_required"] as const)("distinguishes Graph readiness %s from missing permissions", async status => {
+    const message = status === "failed"
+      ? "The Microsoft readiness check timed out. This does not establish missing permissions. Retry the readiness check."
+      : "Required delegated Microsoft read permission or provider role is unavailable.";
+    const sources = [
+      source("users", "succeeded", { count: 10 }),
+      source("graph_packages", status, { count: 0, canRetry: true, message }),
+      source("power_platform", "succeeded", { count: 20 }),
+    ];
+    api.getState.mockResolvedValue(syncState({
+      onboardingRequired: false,
+      sources: sourceIds.map(id => source(id, "succeeded", { count: 20, lastSuccessAt: "2026-09-15T10:00:00.000Z" })),
+      run: run(status === "failed" ? "partial" : "waiting", sources),
+    }));
+    renderPanel();
+    expect(await screen.findByText(message)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry incomplete (1)" })).toBeEnabled();
+    const progress = within(screen.getByRole("region", { name: "Sync status" }));
+    if (status === "failed") {
+      expect(progress.getByText("Failed", { exact: true })).toBeVisible();
+      expect(screen.queryByText("Permission required", { exact: true })).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: "Review permissions" })).not.toBeInTheDocument();
+    } else {
+      expect(progress.getByText("Permission required", { exact: true })).toBeVisible();
+      expect(screen.getByRole("link", { name: "Review permissions" })).toBeVisible();
+    }
   });
 
   it("groups run details and cancellation in the footer and shows the pending cancellation state", async () => {

@@ -65,6 +65,67 @@
   min-width: 0;
 }
 
+.usage-manage-reports,
+.usage-snapshot {
+  display: grid;
+  gap: 1.25rem;
+  min-width: 0;
+}
+
+.usage-snapshot {
+  align-content: start;
+  gap: 0.75rem;
+}
+
+.usage-snapshot > .report-section-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem 1rem;
+}
+
+.usage-snapshot > .report-section-header h3 { margin: 0; }
+
+.usage-snapshot > .report-section-header p {
+  margin: 0.35rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.usage-snapshot > .report-section-header .table-actions {
+  justify-content: flex-end;
+  max-width: 25rem;
+}
+
+.usage-snapshot .reporting-view {
+  align-content: start;
+  gap: 0.75rem;
+}
+
+.usage-snapshot .usage-agent-explorer { gap: 0.65rem; }
+
+.usage-snapshot .usage-agent-explorer .report-section-header {
+  flex-wrap: nowrap;
+}
+
+.usage-snapshot .usage-agent-explorer .report-section-header > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.usage-snapshot-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+}
+
+.usage-snapshot-totals > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.usage-snapshot-totals strong { font-size: 1.4rem; }
+.usage-snapshot-totals small { color: var(--muted); }
+
 .official-usage-history-panel .report-section-header p {
   margin: 0.35rem 0 0;
   color: var(--muted);
@@ -482,6 +543,29 @@
   padding: 0;
 }
 
+.usage-modal-import-pane:not([hidden]) {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.usage-modal-content > .usage-snapshot,
+.usage-modal-content > .usage-manage-reports {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 1rem 1.5rem;
+}
+
+.usage-modal-content > .usage-snapshot:focus-visible,
+.usage-modal-content > .usage-manage-reports:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -2px;
+}
+
 .official-usage-import.usage-wizard {
   display: flex;
   flex-direction: column;
@@ -787,6 +871,24 @@
 
   .usage-modal-content {
     padding: 0;
+  }
+
+  .usage-modal-content > .usage-snapshot,
+  .usage-modal-content > .usage-manage-reports {
+    padding: 0.85rem 1rem;
+  }
+
+  .usage-snapshot > .report-section-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .usage-snapshot > .report-section-header .table-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+
+  .usage-snapshot .usage-agent-explorer .report-section-header {
+    flex-wrap: wrap;
   }
 
   .usage-wizard-body,

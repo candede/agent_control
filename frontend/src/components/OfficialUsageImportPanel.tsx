@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import { Check, FileText, RefreshCw, Trash2, Upload } from "lucide-react";
 import {
   ApiError,
@@ -19,6 +19,7 @@ import { trapDialogFocus } from "../dialogFocus";
 import { useSavedRead } from "../savedQueries";
 import { OfficialUsageImportReview } from "./OfficialUsageImportReview";
 import { OfficialUsageManageReports } from "./OfficialUsageManageReports";
+import type { ReportLocatorState } from "./CumulativeAgentActivity";
 import {
   acceptedBundleMessage, companionMetadata, errorMessage, formatCoverage, importSteps, kindLabel,
   type FileValidation, type ImportResult, type ImportStep, type ImportView,
@@ -32,9 +33,12 @@ export type OfficialUsageImportPanelProps = {
   onChanged: () => void;
   onLegacyCleared?: () => void;
   active?: boolean;
+  revision?: number;
   view?: ImportView;
   onViewChange?: (view: ImportView) => void;
-  onViewSnapshot?: (setId: string) => void;
+  onViewSnapshot?: (setId: string | undefined) => void;
+  locatorState?: ReportLocatorState;
+  onLocatorStateChange?: (state: ReportLocatorState) => void;
 };
 
 export function OfficialUsageImportPanel({
@@ -42,9 +46,12 @@ export function OfficialUsageImportPanel({
   onChanged,
   onLegacyCleared,
   active = true,
+  revision = 0,
   view = "import",
   onViewChange,
   onViewSnapshot,
+  locatorState,
+  onLocatorStateChange,
 }: OfficialUsageImportPanelProps) {
   const [adminState, setAdminState] = useState<OfficialUsageAdminState>();
   const [adminVerified, setAdminVerified] = useState(false);
@@ -62,6 +69,7 @@ export function OfficialUsageImportPanel({
   const [validating, setValidating] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string }>();
   const [legacyPresent, setLegacyPresent] = useState(hasLegacyUsageStorage);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const readSaved = useSavedRead();
   const fileInput = useRef<HTMLInputElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -72,13 +80,26 @@ export function OfficialUsageImportPanel({
   const loadGeneration = useRef(0);
   const lifetime = useRef<AbortController | undefined>(undefined);
   const activeRef = useRef(active);
+  const loadedStaging = useRef<{ id?: string } | undefined>(undefined);
+  const observedRevision = useRef(revision);
+  const previouslyActive = useRef(active);
   const priorScreen = useRef(view === "manage" ? "manage" : `import:${step}`);
   const previews = bundlePreview?.staging ?? [];
   const readAdminState = useCallback((signal: AbortSignal) =>
     readSaved(["official-usage-admin"], readSignal => getOfficialUsageAdminState({ signal: readSignal }), signal),
   [readSaved]);
+  const refreshRevision = useEffectEvent(() => { void refresh(); });
+  const readAcceptance = useEffectEvent(() => ({ result, acceptanceRetry }));
 
   useEffect(() => { activeRef.current = active; }, [active]);
+  useEffect(() => {
+    const reactivated = active && !previouslyActive.current;
+    previouslyActive.current = active;
+    if (reactivated) observedRevision.current = revision;
+    if (!active || busy || observedRevision.current === revision) return;
+    observedRevision.current = revision;
+    refreshRevision();
+  }, [active, busy, revision]);
   useEffect(() => {
     const screen = view === "manage" ? "manage" : `import:${step}`;
     if (screen === priorScreen.current) return;
@@ -116,7 +137,7 @@ export function OfficialUsageImportPanel({
   }, [active, adminState, busy, confirmation]);
 
   function isLive(generation: number) {
-    return !lifetime.current?.signal.aborted && generation === loadGeneration.current;
+    return activeRef.current && !lifetime.current?.signal.aborted && generation === loadGeneration.current;
   }
 
   function applyBundlePreview(preview: OfficialUsageBundlePreview, state?: OfficialUsageAdminState) {
@@ -165,44 +186,68 @@ export function OfficialUsageImportPanel({
     lifetime.current = controller;
     void Promise.resolve().then(async () => {
       if (controller.signal.aborted) return;
-      setAdminState(undefined);
-      setAdminVerified(false);
-      setBundlePreview(undefined);
-      setPreviewVerified(false);
-      setAcceptanceRetry(undefined);
-      setConfirmation(undefined);
-      confirmationFocusPending.current = false;
-      confirmationReturnFocus.current = null;
-      setDraft(undefined);
-      pendingBundleId.current = undefined;
-      pendingCorrection.current = undefined;
-      setFiles([]);
-      setValidation([]);
-      setResult(undefined);
-      setCorrectionMode(false);
-      setStep("files");
-      setMessage(undefined);
+      if (!active) {
+        setAdminVerified(false);
+        setPreviewVerified(false);
+        setConfirmation(undefined);
+        setBusy(false);
+        setValidating(false);
+        return;
+      }
+      const { result, acceptanceRetry } = readAcceptance();
+      const reset = !loadedStaging.current || loadedStaging.current.id !== initialStagingId;
+      loadedStaging.current = { id: initialStagingId };
+      if (reset) {
+        setAdminState(undefined);
+        setAdminVerified(false);
+        setBundlePreview(undefined);
+        setPreviewVerified(false);
+        setAcceptanceRetry(undefined);
+        setConfirmation(undefined);
+        confirmationFocusPending.current = false;
+        confirmationReturnFocus.current = null;
+        setDraft(undefined);
+        pendingBundleId.current = undefined;
+        pendingCorrection.current = undefined;
+        setFiles([]);
+        setValidation([]);
+        setResult(undefined);
+        setCorrectionMode(false);
+        setStep("files");
+        setMessage(undefined);
+      }
       setValidating(false);
       setBusy(true);
+      setAdminVerified(false);
+      setPreviewVerified(false);
       const state = await readAdminState(controller.signal);
       if (controller.signal.aborted || generation !== loadGeneration.current) return;
       setAdminState(state);
       setAdminVerified(true);
-      const exactStage = initialStagingId
+      if (!reset && result) {
+        setResult({ ...result, verifiedState: state, refreshError: undefined });
+        return;
+      }
+      if (!reset && acceptanceRetry) {
+        setMessage({ tone: "error", text: "Acceptance was not confirmed. Retry the same acceptance request before changing reports." });
+        return;
+      }
+      const exactStage = reset && initialStagingId
         ? state.staging.find(stage => stage.id === initialStagingId && stage.status === "active")
         : undefined;
-      if (initialStagingId && !exactStage) {
+      if (reset && initialStagingId && !exactStage) {
         setMessage({ tone: "error", text: "The exact staging record is expired, deleted, or unavailable to this account." });
         return;
       }
-      const bundleId = exactStage?.bundleId ?? state.staging.find(stage => stage.status === "active")?.bundleId;
+      const bundleId = reset ? exactStage?.bundleId ?? state.staging.find(stage => stage.status === "active")?.bundleId : pendingBundleId.current;
       if (bundleId) {
         pendingBundleId.current = bundleId;
         pendingCorrection.current = exactStage?.correctionOfSetId
-          ?? state.staging.find(stage => stage.bundleId === bundleId)?.correctionOfSetId ?? undefined;
+          ?? state.staging.find(stage => stage.bundleId === bundleId)?.correctionOfSetId
+          ?? state.sets.find(reportSet => reportSet.bundleId === bundleId)?.supersedesSetId ?? undefined;
         setDraft({ bundleId, correctionOfSetId: pendingCorrection.current });
         setCorrectionMode(Boolean(pendingCorrection.current));
-        setStep("validation");
+        if (reset) setStep("validation");
         const preview = await previewOfficialUsageBundle(bundleId, { signal: controller.signal });
         if (!controller.signal.aborted && generation === loadGeneration.current) applyBundlePreview(preview, state);
       }
@@ -215,14 +260,16 @@ export function OfficialUsageImportPanel({
       controller.abort();
       loadGeneration.current += 1;
     };
-  }, [initialStagingId, readAdminState, showError]);
+  }, [active, initialStagingId, readAdminState, showError]);
 
   async function refresh(preferredBundleId: string | null | undefined = pendingBundleId.current) {
+    if (!activeRef.current) return;
     const signal = lifetime.current?.signal;
     const generation = ++loadGeneration.current;
     setBusy(true);
     setAdminVerified(false);
     setPreviewVerified(false);
+    setHistoryRevision(value => value + 1);
     if (result) setResult({ ...result, verifiedState: undefined, refreshError: undefined });
     try {
       if (!signal) return;
@@ -278,11 +325,12 @@ export function OfficialUsageImportPanel({
   }
 
   async function stageFiles() {
-    if (busy || !files.length || !adminState || !adminVerified) return;
+    if (!active || busy || !files.length || !adminState || !adminVerified) return;
     const signal = lifetime.current?.signal;
     const generation = ++loadGeneration.current;
     const reportSet = adminState.sets.find(value => value.bundleId === pendingBundleId.current);
-    const bundleId = pendingBundleId.current ?? crypto.randomUUID();
+    const priorBundleId = pendingBundleId.current;
+    const bundleId = priorBundleId ?? crypto.randomUUID();
     const correctionOfSetId = pendingBundleId.current ? pendingCorrection.current
       : correctionMode ? adminState.activeSetId ?? undefined : undefined;
     const metadata = companionMetadata(bundlePreview, reportSet, adminState.staging.find(stage => stage.bundleId === bundleId && stage.status === "active"));
@@ -299,6 +347,9 @@ export function OfficialUsageImportPanel({
     setAcceptanceRetry(undefined);
     setMessage(undefined);
     setValidation([...entries]);
+    pendingBundleId.current = bundleId;
+    pendingCorrection.current = correctionOfSetId;
+    setDraft({ bundleId, correctionOfSetId });
     for (const [index, file] of files.entries()) {
       const label = { name: file.name, size: file.size };
       entries[index] = { file: label, status: "validating" };
@@ -320,6 +371,11 @@ export function OfficialUsageImportPanel({
     }
     setFiles(rejectedFiles);
     if (fileInput.current) fileInput.current.value = "";
+    if (!priorBundleId && !stagedKinds.size) {
+      pendingBundleId.current = undefined;
+      pendingCorrection.current = undefined;
+      setDraft(undefined);
+    }
     if (pendingBundleId.current) {
       try {
         const preview = await previewOfficialUsageBundle(bundleId, { signal });
@@ -354,6 +410,7 @@ export function OfficialUsageImportPanel({
     });
     setBusy(false);
     setValidating(false);
+    setHistoryRevision(value => value + 1);
   }
 
   async function acceptPreviews(retry = false) {
@@ -364,6 +421,7 @@ export function OfficialUsageImportPanel({
     const priorState = adminState;
     setBusy(true);
     setMessage(undefined);
+    setAcceptanceRetry(reviewed);
     try {
       const accepted = await acceptOfficialUsageBundle(reviewed);
       if (!isLive(generation)) return;
@@ -406,7 +464,7 @@ export function OfficialUsageImportPanel({
   }
 
   async function discardPreviews() {
-    if (busy || !previews.length) return;
+    if (!active || busy || !adminVerified || !previews.length) return;
     const generation = ++loadGeneration.current;
     setBusy(true);
     setPreviewVerified(false);
@@ -512,7 +570,7 @@ export function OfficialUsageImportPanel({
   }
 
   async function acknowledgeLegacy(disposition: "reimported" | "discarded") {
-    if (busy) return;
+    if (!active || busy || !adminVerified) return;
     const generation = ++loadGeneration.current;
     setBusy(true);
     try {
@@ -556,9 +614,11 @@ export function OfficialUsageImportPanel({
         </header>
         {message && !confirmation ? <div className={`report-status ${message.tone}`} role={message.tone === "error" ? "alert" : "status"}>{message.text}</div> : null}
         {view === "manage" && acceptanceRetry ? <p className="usage-context-warning">An acceptance response is unresolved. Return to Add CSV reports and retry the same acceptance before changing reports.</p> : null}
-        {view === "manage" ? <OfficialUsageManageReports state={adminState} verified={adminVerified} busy={busy || Boolean(acceptanceRetry)}
-          onResume={bundleId => void resumeSet(bundleId)} onOperation={(setId, operation) => void beginSetOperation(setId, operation)}
-          onViewSnapshot={onViewSnapshot} /> : (
+        {view === "manage" ? active && <OfficialUsageManageReports state={adminState} revision={revision + historyRevision}
+          locatorState={locatorState} onLocatorStateChange={onLocatorStateChange}
+          admin={adminState ? { verified: adminVerified, busy: busy || Boolean(acceptanceRetry),
+            onResume: bundleId => void resumeSet(bundleId), onOperation: (setId, operation) => void beginSetOperation(setId, operation) } : undefined}
+          onRefresh={() => void refresh(null)} onViewSnapshot={onViewSnapshot} /> : (
           <>
             {step === "files" ? (
               <section className="usage-files-step" aria-label="Choose report files">
@@ -622,7 +682,7 @@ export function OfficialUsageImportPanel({
           </>
         )}
         {view === "import" && previews.length && step !== "result" ? <div className="usage-staging-actions">
-          <button type="button" className="secondary" disabled={busy || Boolean(acceptanceRetry)} onClick={() => void discardPreviews()}><Trash2 size={16} aria-hidden="true" />Discard staging</button>
+          <button type="button" className="secondary" disabled={busy || !adminVerified || Boolean(acceptanceRetry)} onClick={() => void discardPreviews()}><Trash2 size={16} aria-hidden="true" />Discard staging</button>
           <span>Only unaccepted staging will be discarded.</span>
         </div> : null}
         {legacyPresent && (view === "manage" || step === "files" || step === "result") ? (
@@ -630,8 +690,8 @@ export function OfficialUsageImportPanel({
             <strong>Legacy browser report data is present in this browser.</strong>
             <p>It was not read or migrated. Re-import the original Microsoft exports, or explicitly discard the legacy copy.</p>
             <div className="report-actions">
-              {result?.accepted.complete ? <button type="button" disabled={busy} onClick={() => void acknowledgeLegacy("reimported")}><Check size={16} aria-hidden="true" />Acknowledge re-import and remove</button> : null}
-              <button type="button" className="secondary" disabled={busy} onClick={() => void acknowledgeLegacy("discarded")}><Trash2 size={16} aria-hidden="true" />Acknowledge discard and remove</button>
+              {result?.accepted.complete ? <button type="button" disabled={busy || !adminVerified} onClick={() => void acknowledgeLegacy("reimported")}><Check size={16} aria-hidden="true" />Acknowledge re-import and remove</button> : null}
+              <button type="button" className="secondary" disabled={busy || !adminVerified} onClick={() => void acknowledgeLegacy("discarded")}><Trash2 size={16} aria-hidden="true" />Acknowledge discard and remove</button>
             </div>
           </section>
         ) : null}

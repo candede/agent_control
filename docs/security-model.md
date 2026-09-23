@@ -26,7 +26,7 @@ The source boundary is enforced independently of those roles:
 | --- | --- | --- |
 | Graph package inventory | All saved list/detail views, exact native targets and assignments; own delegated refresh/search/export jobs and cancellation | Same viewing plus on-demand confirmed package access/block changes and mutation-job controls |
 | Power Platform inventory and quarantine | Initiating principal's snapshots, exact targets, status, counts and exports; own delegated read jobs and cancellation | Same principal-scoped viewing plus on-demand confirmed quarantine changes and mutation-job controls |
-| Official usage reports | Tenant aggregate and user-level accepted projections and exports | Same viewing plus three-file validation, import, selection and deletion |
+| Official usage reports | Tenant aggregate and user-level accepted projections and exports; read-only history and snapshot inspection in Sync > Manage reports | Same viewing plus three-file validation/import in Sync > Import reports and confirmed selection/deletion in Manage reports |
 | Purview and Defender | Own explicit delegated searches and resulting private evidence/results; explicitly approved application-shared results; own exports and local cancellation/deletion; optional delegated qualification/retained-scope controls are not prerequisites for ordinary work | Same viewing plus application/shared-scope qualification and application-mode configuration |
 | Local administrative audit and jobs | All authorized local audit views; own delegated read-job state and cancellation | Same viewing plus safe diagnostics and supported administrative/mutation job controls |
 

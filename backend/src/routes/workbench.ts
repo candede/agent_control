@@ -119,8 +119,8 @@ export function officialUsageJobSummary(
 ): WorkbenchJobSummary {
   const kindLabels = { agents: "Agents", userAgents: "Users & agents", users: "Users" };
   const history = stage.status === "accepted" && stage.acceptedSetId
-    ? `/official-usage?view=history&snapshot=${encodeURIComponent(stage.acceptedSetId)}` as const
-    : "/official-usage?view=history";
+    ? `/sync?reports=snapshot&snapshot=${encodeURIComponent(stage.acceptedSetId)}` as const
+    : "/sync?reports=manage";
   return {
     id: stage.id, source: "official-usage", label: `${kindLabels[stage.kind]} CSV import`,
     target: `${kindLabels[stage.kind]} export · ${stage.rowCount} validated row${stage.rowCount === 1 ? "" : "s"}`,
@@ -129,7 +129,7 @@ export function officialUsageJobSummary(
     createdAt: stage.createdAt,
     ...(stage.acceptedAt ? { completedAt: stage.acceptedAt } : {}),
     updatedAt: stage.acceptedAt ?? stage.createdAt, expiresAt: stage.expiresAt,
-    href: stage.status === "active" ? `/official-usage?staging=${encodeURIComponent(stage.id)}` : history,
+    href: stage.status === "active" ? `/sync?reports=import&staging=${encodeURIComponent(stage.id)}` : history,
   };
 }
 

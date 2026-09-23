@@ -9,6 +9,16 @@
   margin-bottom: 20px;
 }
 
+.usage-agent-locator {
+  display: grid;
+  gap: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+}
+
+.usage-agent-locator summary { cursor: pointer; }
+.usage-agent-locator .cumulative-agent-activity { margin-top: 1rem; }
+
 .agent-overview-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

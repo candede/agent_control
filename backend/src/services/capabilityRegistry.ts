@@ -136,7 +136,7 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "on_demand", adapterRegistered: true, description: "The explicit dashboard load validates the bounded report request; no report is scanned by background capability checks." },
   },
   {
-    id: "reports.official.import", displayName: "Official report import", purpose: "Validate and import administrator-supplied Microsoft 365 usage CSV reports.",
+    id: "reports.official.import", displayName: "Import reports", purpose: "Validate and import administrator-supplied Microsoft 365 usage CSV reports in Sync > Import reports; manage retained reports in Sync > Manage reports.",
     provider: "Local", maturity: "local", cloud: "local", audience: "agent-control", mode: "local", permissions: [], providerRoles: [], licenses: [],
     configuration: ["Admin-submitted files", "Tenant-shared aggregate and user-level data"], sources: [reportsSource], dataClass: "report_import", internalRoles: admin,
     probe: { kind: "local_policy", adapterRegistered: true, description: "Local authorization policy only; no Microsoft token or probe." },

@@ -169,7 +169,7 @@ describe("OfficialUsageHistoryPanel", () => {
     expect(api.getHistory.mock.calls[0][1].signal.aborted).toBe(true);
     expect(api.getHistory.mock.calls[1][1].signal.aborted).toBe(false);
     await act(async () => finishAbandoned(history([])));
-    expect(screen.getAllByRole("button", { name: "View snapshot" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "View snapshot" })).toHaveLength(4);
     expect(screen.queryByText("No accepted official usage snapshots are retained.")).not.toBeInTheDocument();
   });
 
@@ -191,7 +191,9 @@ describe("OfficialUsageHistoryPanel", () => {
     await act(async () => finishOld(history()));
     expect(current.getByText("No accepted official usage snapshots are retained.")).toBeVisible();
     expect(current.queryByRole("button", { name: "View snapshot" })).not.toBeInTheDocument();
-    expect(within(screen.getByRole("region", { name: "Earlier history reader" })).getByRole("button", { name: "View snapshot" })).toBeEnabled();
+    for (const button of within(screen.getByRole("region", { name: "Earlier history reader" })).getAllByRole("button", { name: "View snapshot" })) {
+      expect(button).toBeEnabled();
+    }
   });
 
   it("labels overlapping and unknown windows as non-additive and exposes duplicate reuse", async () => {
@@ -255,7 +257,7 @@ describe("OfficialUsageHistoryPanel", () => {
     const onSelect = vi.fn();
     const view = render(<OfficialUsageHistoryPanel revision={0} onSelect={onSelect} />);
     await screen.findByText("Observed activity Aug 14, 2026 to Sep 12, 2026");
-    await userEvent.click(screen.getByRole("button", { name: "View snapshot" }));
+    await userEvent.click(within(screen.getByText("Retained", { exact: true }).closest("tr")!).getByRole("button", { name: "View snapshot" }));
     const selectedId = "11111111-1111-4111-8111-111111111111";
     expect(onSelect).toHaveBeenCalledWith(selectedId);
 
@@ -291,6 +293,36 @@ describe("OfficialUsageHistoryPanel", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh history" })).toBeEnabled());
   });
 
+  it("opens the current complete set from its own row without changing tenant selection", async () => {
+    const onSelect = vi.fn();
+    const admin = { verified: true, busy: false, onResume: vi.fn(), onOperation: vi.fn() };
+    render(<OfficialUsageHistoryPanel revision={0} onSelect={onSelect} admin={admin} />);
+    const current = within((await screen.findByText("Current", { exact: true })).closest("tr")!);
+    expect(current.getByText("Current", { exact: true })).toBeVisible();
+    await userEvent.click(current.getByRole("button", { name: "View snapshot" }));
+    expect(onSelect).toHaveBeenCalledWith("22222222-2222-4222-8222-222222222222");
+    expect(current.queryByRole("button", { name: "Make current" })).not.toBeInTheDocument();
+    expect(admin.onOperation).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "View current snapshot" }));
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it.each(["loading", "empty", "error"] as const)("allows independent current-snapshot inspection with %s history", async state => {
+    if (state === "loading") api.getHistory.mockReturnValueOnce(new Promise(() => {}));
+    else if (state === "empty") api.getHistory.mockResolvedValueOnce(history([]));
+    else api.getHistory.mockRejectedValueOnce(new Error("History unavailable."));
+    const onSelect = vi.fn();
+    const admin = { verified: false, busy: true, onResume: vi.fn(), onOperation: vi.fn() };
+    render(<OfficialUsageHistoryPanel revision={0} onSelect={onSelect} admin={admin} />);
+    if (state === "empty") await screen.findByText("No accepted official usage snapshots are retained.");
+    else if (state === "error") await screen.findByRole("alert");
+    const current = screen.getByRole("button", { name: "View current snapshot" });
+    expect(current).toBeEnabled();
+    await userEvent.click(current);
+    expect(onSelect).toHaveBeenCalledWith(undefined);
+    expect(admin.onOperation).not.toHaveBeenCalled();
+  });
+
   it.each([401, 403])("clears retained history when read authorization fails with %s", async status => {
     api.getHistory.mockResolvedValueOnce(history()).mockRejectedValueOnce(new ApiError(status, "access_revoked", "History access was revoked."));
     render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
@@ -324,13 +356,13 @@ describe("OfficialUsageHistoryPanel", () => {
     let finish!: (value: OfficialUsageHistoryView) => void;
     api.getHistory.mockResolvedValueOnce(history()).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
-    await screen.findByRole("button", { name: "View snapshot" });
+    await screen.findAllByRole("button", { name: "View snapshot" });
     await userEvent.click(screen.getByRole("button", { name: "Refresh history" }));
     expect(screen.getByText(/Showing the last loaded history while refreshing/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "View snapshot" })).toBeDisabled();
+    for (const button of screen.getAllByRole("button", { name: "View snapshot" })) expect(button).toBeDisabled();
     await act(async () => finish(history()));
     expect(screen.queryByText(/Showing the last loaded history while refreshing/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "View snapshot" })).toBeEnabled();
+    for (const button of screen.getAllByRole("button", { name: "View snapshot" })) expect(button).toBeEnabled();
   });
 
   it.each(["success", "unauthorized"] as const)("ignores a late %s from an aborted revision read", async outcome => {
@@ -367,6 +399,6 @@ describe("OfficialUsageHistoryPanel", () => {
     expect(api.getHistory).toHaveBeenLastCalledWith(
       { limit: 25, offset: 0 }, expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-    expect(screen.getByRole("button", { name: "View snapshot" })).toBeEnabled();
+    for (const button of screen.getAllByRole("button", { name: "View snapshot" })) expect(button).toBeEnabled();
   });
 });

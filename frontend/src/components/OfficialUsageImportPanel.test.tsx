@@ -1,9 +1,11 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   OfficialUsageAdminState,
+  OfficialUsageOverviewQuery,
   OfficialUsageReportKind,
   OfficialUsageStagingPreview,
 } from "../api/client";
@@ -11,8 +13,11 @@ import { ApiError } from "../api/client";
 import { legacyUsageStorageKey } from "../legacyUsageStorage";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 import { OfficialUsageImportPanel } from "./OfficialUsageImportPanel";
-import { OfficialUsageImportModal } from "./OfficialUsageImportModal";
+import { OfficialUsageImportModal as ControlledImportModal } from "./OfficialUsageImportModal";
+import type { SyncReportRouteState } from "../workbenchRouting";
+import { reportHistoryFixture } from "./reportHistoryFixture";
 import { mockNativeDialogs } from "../test/dialog";
+import { usageAggregateFixture, usageOverviewFixture } from "../test/usageInsightsFixture";
 
 mockNativeDialogs();
 
@@ -22,6 +27,9 @@ const api = vi.hoisted(() => ({
   confirm: vi.fn(),
   discard: vi.fn(),
   getAdminState: vi.fn(),
+  getHistory: vi.fn(),
+  getOverview: vi.fn(),
+  getAggregate: vi.fn(),
   previewBundle: vi.fn(),
   previewOperation: vi.fn(),
   stage: vi.fn(),
@@ -34,10 +42,21 @@ vi.mock("../api/client", async importOriginal => ({
   confirmOfficialUsageSetOperation: api.confirm,
   discardOfficialUsageStaging: api.discard,
   getOfficialUsageAdminState: api.getAdminState,
+  getOfficialUsageHistory: api.getHistory,
+  getOfficialUsageOverview: api.getOverview,
+  getOfficialUsageAggregate: api.getAggregate,
   previewOfficialUsageBundle: api.previewBundle,
   previewOfficialUsageSetOperation: api.previewOperation,
   stageOfficialUsageReport: api.stage,
 }));
+
+function OfficialUsageImportModal({ onChanged }: { onChanged: () => void }) {
+  const [route, setRoute] = useState<SyncReportRouteState>();
+  return <>
+    <button onClick={() => setRoute({ view: "import", activityWindowDays: 30 })}>Import reports</button>
+    <ControlledImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={onChanged} />
+  </>;
+}
 
 const emptyAdminState: OfficialUsageAdminState = {
   activeSetId: null,
@@ -122,6 +141,17 @@ describe("OfficialUsageImportPanel", () => {
     vi.clearAllMocks();
     localStorage.clear();
     api.getAdminState.mockResolvedValue(emptyAdminState);
+    api.getAggregate.mockResolvedValue(usageAggregateFixture());
+    api.getOverview.mockImplementation(async query => usageOverviewFixture(query));
+    let historyState = emptyAdminState;
+    api.getHistory.mockImplementation(async () => {
+      await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
+      await Promise.resolve(api.getAdminState.mock.results.at(-1)?.value).then(
+        state => { historyState = state ?? emptyAdminState; },
+        () => { /* Independent history remains readable when administration fails. */ },
+      );
+      return reportHistoryFixture(historyState.sets, historyState.activeSetId);
+    });
     api.acknowledge.mockResolvedValue(undefined);
     api.discard.mockResolvedValue(undefined);
     api.stage.mockImplementation((file: File) => {
@@ -213,7 +243,7 @@ describe("OfficialUsageImportPanel", () => {
         else if (operation === "select") expect(screen.getByText("Current", { exact: true })).toBeVisible();
         else if (operation === "stage") expect(screen.getByText(/saved report selection changed during validation/)).toBeVisible();
         else if (operation === "discard") expect(screen.getByText("All staged rows were discarded.")).toBeVisible();
-        else expect(screen.getByText("No retained official usage sets.")).toBeVisible();
+        else expect(screen.getByText("No accepted official usage snapshots are retained.")).toBeVisible();
       };
       try {
         if (operation === "accept") {
@@ -583,9 +613,10 @@ describe("OfficialUsageImportPanel", () => {
 
     render(<OfficialUsageImportPanel view="manage" onChanged={vi.fn()} />);
 
-    expect(await screen.findByText("Corrects 55555555")).toBeVisible();
+    await userEvent.click(await screen.findByText("3 exports"));
+    expect(screen.getByText(/Intentional correction of 55555555/)).toBeVisible();
     expect(screen.getByText("Current", { exact: true })).toBeVisible();
-    expect(screen.getByText("Agents, Users & agents, Users")).toBeVisible();
+    expect(screen.getByText(/Agents, Users & agents, Users/)).toBeVisible();
   });
 
   it("restores actor-owned staging after reload and keeps acceptance disabled until companions arrive", async () => {
@@ -782,7 +813,7 @@ describe("OfficialUsageImportPanel", () => {
     expect(await screen.findByText("Deleted history refresh unavailable.")).toBeVisible();
     expect(onChanged).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: /Delete retained set for/ })).toBeDisabled();
-    expect(screen.getByText("Not verified", { exact: true })).toBeVisible();
+    expect(screen.getByText(/Report administration is not verified/)).toBeVisible();
   });
 
   it.each(["success", "failure"] as const)(
@@ -1052,20 +1083,65 @@ describe("OfficialUsageImportPanel", () => {
     expect(within(modal).getByText(/0 of 3 files checked/)).toBeVisible();
     expect(within(modal).queryByRole("progressbar")).not.toBeInTheDocument();
     expect(within(modal).getByRole("button", { name: "Continue to review" })).toBeDisabled();
-    await userEvent.click(within(modal).getByRole("button", { name: "Close report import" }));
+    await userEvent.click(within(modal).getByRole("button", { name: "Close reports" }));
     expect(trigger).toHaveFocus();
     await act(async () => {
       staged = [preview("agents")];
       finish(staged[0]);
     });
-    await waitFor(() => expect(api.stage).toHaveBeenCalledTimes(3));
+    expect(api.stage).toHaveBeenCalledTimes(1);
+    expect(api.previewBundle).not.toHaveBeenCalled();
     expect(trigger).toHaveFocus();
     expect(modal).not.toHaveAttribute("open");
     expect(document.body.style.overflow).not.toBe("hidden");
     await userEvent.click(trigger);
     await validationReady();
-    expect(screen.getByRole("button", { name: "Continue to review" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    expect(screen.getByText("Missing Users & agents, Users")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry rejected files" })).toBeEnabled();
     expect(api.acceptBundle).not.toHaveBeenCalled();
+  });
+
+  it("keeps an interrupted acceptance retryable without fetching report evidence while closed", async () => {
+    staged = [preview("agents"), preview("userAgents"), preview("users")];
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    let finish!: (value: { setId: string; versionId: string; activeRevision: number; complete: boolean }) => void;
+    api.acceptBundle.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+    await continueToReview();
+    await userEvent.click(screen.getByRole("button", { name: "Accept reviewed bundle" }));
+    const reviewed = api.acceptBundle.mock.calls[0][0];
+    await userEvent.click(screen.getByRole("button", { name: "Close reports" }));
+    const reads = api.getAdminState.mock.calls.length;
+    await act(async () => finish({ setId: "accepted-set", versionId: "version", activeRevision: 2, complete: true }));
+    expect(api.getAdminState).toHaveBeenCalledTimes(reads);
+    expect(api.getHistory).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Import reports" })).toHaveFocus();
+    await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Retry same acceptance" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Retry same acceptance" }));
+    expect(api.acceptBundle.mock.calls[1][0]).toBe(reviewed);
+    expect(api.stage).not.toHaveBeenCalled();
+  });
+
+  it("defers revision refreshes until reactivation and preserves selected files", async () => {
+    const props = { onChanged: vi.fn() };
+    const view = render(<OfficialUsageImportPanel {...props} active={false} revision={0} />);
+    await act(async () => {});
+    expect(api.getAdminState).not.toHaveBeenCalled();
+    view.rerender(<OfficialUsageImportPanel {...props} active revision={0} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["agents"], "agents.csv", { type: "text/csv" }));
+    view.rerender(<OfficialUsageImportPanel {...props} active={false} revision={1} />);
+    await act(async () => {});
+    expect(api.getAdminState).toHaveBeenCalledOnce();
+    view.rerender(<OfficialUsageImportPanel {...props} active revision={1} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Validate and stage" })).toBeEnabled());
+    expect(screen.getByText("1 file(s) selected")).toBeVisible();
+    expect(api.getAdminState.mock.calls.length).toBeGreaterThan(1);
+    expect(api.stage).not.toHaveBeenCalled();
   });
 
   it("leaves legacy browser data untouched when acknowledgement fails", async () => {
@@ -1085,7 +1161,7 @@ describe("OfficialUsageImportPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
     await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["agents"], "agents.csv", { type: "text/csv" }));
     await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
-    expect(await screen.findByRole("region", { name: "Retained report sets" })).toBeVisible();
+    expect(await screen.findByRole("region", { name: "Retained official usage snapshots" })).toBeVisible();
     expect(screen.queryByLabelText("Official usage CSV files")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Import progress")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
@@ -1095,5 +1171,38 @@ describe("OfficialUsageImportPanel", () => {
     await validationReady();
     expect(api.stage).toHaveBeenCalledOnce();
     expect(api.stage.mock.calls[0][0].name).toBe("agents.csv");
+  });
+
+  it("restores admin locator search, dates, order and paging after inspecting a source snapshot", async () => {
+    api.getOverview.mockImplementation(async (query: OfficialUsageOverviewQuery) => {
+      const data = usageOverviewFixture({ ...query, offset: 0 });
+      data.agents = { ...data.agents, offset: query.offset ?? 0, count: 50 };
+      return data;
+    });
+    render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+    await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
+    expect(api.getOverview).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByText("Find an agent across reports", { selector: "summary" }));
+    await screen.findByRole("button", { name: "View source snapshot for Researcher" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search retained agents" }), { target: { value: "Researcher" } });
+    fireEvent.change(screen.getByLabelText("Observed activity on or after (UTC)"), { target: { value: "2026-09-01" } });
+    fireEvent.change(screen.getByLabelText("Observed activity on or before (UTC)"), { target: { value: "2026-09-20" } });
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order retained agents" }), "name-desc");
+    await userEvent.click(await screen.findByRole("button", { name: "Next retained agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "View source snapshot for Researcher" }));
+    await screen.findByText("Showing retained set");
+    expect(screen.queryByRole("searchbox", { name: "Search retained agents" })).not.toBeInTheDocument();
+    const reads = api.getOverview.mock.calls.length;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
+    await screen.findByText("Showing retained set");
+    expect(api.getOverview).toHaveBeenCalledTimes(reads);
+    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+    expect(screen.getByRole("searchbox", { name: "Search retained agents" })).toHaveValue("Researcher");
+    expect(screen.getByLabelText("Observed activity on or after (UTC)")).toHaveValue("2026-09-01");
+    expect(screen.getByLabelText("Observed activity on or before (UTC)")).toHaveValue("2026-09-20");
+    expect(screen.getByRole("combobox", { name: "Order retained agents" })).toHaveValue("name-desc");
+    await waitFor(() => expect(api.getOverview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: "Researcher", startDate: "2026-09-01", endDate: "2026-09-20", sortBy: "agentName", sortDirection: "desc", offset: 25 }), expect.anything()));
   });
 });

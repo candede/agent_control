@@ -72,7 +72,12 @@ test("Agents separates its compact overview from agent details and snapshot resp
   const unexpected = await mockLayoutApi(page);
   await mockUsageReports(page, unexpected);
   const reportReads: string[] = [];
+  const otherReportRequests: string[] = [];
   page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/api/official-usage/") && path !== "/api/official-usage/overview") otherReportRequests.push(request.url());
+  });
+  page.on("requestfinished", request => {
     if (new URL(request.url()).pathname.startsWith("/api/official-usage/")) reportReads.push(request.url());
   });
   await page.goto("/agents");
@@ -80,9 +85,10 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(page.getByRole("region", { name: "Tenant adoption insights" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Explore usage & users" })).toHaveCount(0);
   await expect(page.getByLabel("Tenant report totals")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Official usage", exact: true })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Agent inventory overview" })).toContainText("Reported used agents");
-  expect(reportReads.map(url => new URL(url).pathname)).toEqual(["/api/official-usage/overview"]);
+  await expect.poll(() => reportReads.map(url => new URL(url).pathname)).toEqual(["/api/official-usage/overview"]);
   await page.screenshot({ path: info.outputPath("agents-inventory.png"), fullPage: true });
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
@@ -131,6 +137,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(page.getByRole("button", { name: "Service desk assistant", exact: true })).toBeFocused();
   await expect(page.getByRole("region", { name: "Tenant adoption insights" })).toHaveCount(0);
   expect(reportReads.map(url => new URL(url).pathname)).toEqual(["/api/official-usage/overview"]);
+  expect(otherReportRequests).toEqual([]);
   expect(unexpected).toEqual([]);
 });
 
@@ -186,11 +193,14 @@ for (const state of ["missing", "unavailable"] as const) {
     await page.route("**/api/official-usage/aggregate*", route => state === "missing"
       ? route.fulfill({ json: empty })
       : route.fulfill({ status: 503, json: { detail: "Tenant usage unavailable.", code: "synthetic_tenant_reports_unavailable" } }));
-    await page.goto("/official-usage?view=snapshot");
+    await page.goto("/sync?reports=snapshot");
+    const reports = page.locator("dialog.official-usage-modal");
+    await expect(reports).toBeVisible();
     if (state === "missing") {
       await expect(page.getByRole("heading", { name: "Reports not imported" })).toBeVisible();
     }
     else await expect(page.getByRole("alert")).toContainText("Tenant usage unavailable.");
+    await reports.getByRole("button", { name: "Close", exact: true }).click();
     await page.getByRole("button", { name: "Agents", exact: true }).click();
     await expect(page.getByRole("region", { name: "Tenant adoption insights" })).toHaveCount(0);
     await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
@@ -227,10 +237,18 @@ test("fresh activity links keep their search, page and snapshot separate from ot
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
   await expect(page).toHaveURL(/\/agents$/);
   await expect(page.getByLabel("Tenant report totals")).toHaveCount(0);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  await expect(page).toHaveURL(/\/sync\?reports=manage$/);
+  const reports = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(reports.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
   const reportRead = page.waitForRequest(request => new URL(request.url()).pathname === "/api/official-usage/overview");
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  expect(new URL((await reportRead).url()).searchParams.has("setId")).toBe(false);
-  await expect(page).toHaveURL(/\/official-usage$/);
+  await reports.getByText("Find an agent across reports", { exact: true }).click();
+  const reportParams = new URL((await reportRead).url()).searchParams;
+  expect(reportParams.has("setId")).toBe(false);
+  expect(reportParams.has("search")).toBe(false);
+  expect(reportParams.get("offset")).toBe("0");
+  await reports.getByRole("button", { name: "Close", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`${activityUrl.replace("?", "\\?")}$`));
   await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Emery");

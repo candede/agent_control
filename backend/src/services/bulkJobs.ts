@@ -17,6 +17,10 @@ const processOwner = randomUUID();
 const itemExecutionDeadlineMs = 90_000;
 const reconciliationDeadlineMs = 30_000;
 const work = new Map<Promise<void>, { controller: AbortController; scope: DataScope }>();
+type BulkJobExecutionRepository = Pick<JobRepository,
+  "get" | "waitForAuthorization" | "claim" | "pauseForAuthorization" | "beginItem" |
+  "withTargetLock" | "markSent" | "finishItem" | "pauseItemForAuthorization" | "release"
+>;
 
 export function requireWorkerCapacity() {
   requireProviderAdmissions();
@@ -63,13 +67,15 @@ export async function pauseBulkJobsForPrincipal(scope: DataScope) {
 
 export async function runBulkJob(
   id: string, scope: DataScope, resume = false,
-  repository = bulkJobs, provider = new GraphPackagesClient(),
+  repository: BulkJobExecutionRepository = bulkJobs, provider = new GraphPackagesClient(),
   authorize: (scope: DataScope, capabilityId: CapabilityId) => Promise<string> = authorizeDelegatedJob,
   externalSignal?: AbortSignal,
 ) {
+  requireProviderAdmissions();
   const jobSummary = await repository.get(id, scope);
   if (!jobSummary) throw new AppError(404, "not_found", "Job was not found.");
   if (jobSummary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "The delegated worker cannot execute an application-mode job.");
+  requireProviderAdmissions();
   let accessToken: string;
   try { accessToken = await authorize(scope, jobSummary.capabilityId); }
   catch (error) { await repository.waitForAuthorization(id, scope); throw error; }
@@ -88,11 +94,17 @@ export async function runBulkJob(
       const signal = externalSignal
         ? AbortSignal.any([externalSignal, AbortSignal.timeout(itemExecutionDeadlineMs)])
         : AbortSignal.timeout(itemExecutionDeadlineMs);
+      const getPackageDetails = async (...args: Parameters<GraphPackagesClient["getPackageDetails"]>) => {
+        requireProviderAdmissions();
+        const details = await provider.getPackageDetails(...args);
+        requireProviderAdmissions();
+        return details;
+      };
       let sent = false;
       try {
         await repository.withTargetLock(lease, item, async () => {
           const readOptions = { correlationId: item.correlation_id!, signal };
-          const before = await provider.getPackageDetails(accessToken, item.target_id, readOptions);
+          const before = await getPackageDetails(accessToken, item.target_id, readOptions);
           if (before.id !== item.target_id) throw new AppError(502,"target_mismatch","Provider returned a different package identity.");
           const beforeState = capturePackageMutationState(before, job.action);
           requireFrozenPrestate(item.prestate_hash, beforeState);
@@ -100,16 +112,18 @@ export async function runBulkJob(
           const dispatch = async () => {
             const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
             const dispatchToken = await authorize(scope, job.capability);
-            const immediate = await provider.getPackageDetails(dispatchToken, item.target_id, readOptions);
+            const immediate = await getPackageDetails(dispatchToken, item.target_id, readOptions);
             if (immediate.id !== item.target_id) throw new AppError(502,"target_mismatch","Provider returned a different package identity.");
             const immediateState = capturePackageMutationState(immediate, job.action);
             requireFrozenPrestate(item.prestate_hash, immediateState);
             signal.throwIfAborted();
             await commitAccountSessionValidation(validation, async () => {
+              requireProviderAdmissions();
               signal.throwIfAborted();
               await repository.markSent(lease, item.id, packageMutationStateHash(immediateState));
             });
             sent = true;
+            requireProviderAdmissions();
             readbackToken = dispatchToken;
             return dispatchToken;
           };
@@ -117,12 +131,13 @@ export async function runBulkJob(
             const accessAction = job.action;
             if (accessAction !== "update-availability" && accessAction !== "update-installation") throw new AppError(409, "mutation_state_mismatch", "The durable package access action does not match its payload.");
             const result = await updatePackageAccess(provider, accessToken, item.target_id, job.access_update, before, dispatch, readOptions);
+            requireProviderAdmissions();
             if (!result.changed) {
               await finishAuthorized(repository, lease, item.id, "skipped", { poststate: beforeState, readbackCount: 1, readback: before, inventoryGeneration }, scope, job.capability, authorize, signal);
               return;
             }
             const expected = expectedPackageMutationState(beforeState, accessAction, job.access_update);
-            const verified = await verifyPackageMutationConverged(provider, readbackToken, item.target_id, accessAction, expected, readOptions);
+            const verified = await verifyPackageMutationConverged({ getPackageDetails }, readbackToken, item.target_id, accessAction, expected, readOptions);
             await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorize, signal);
             return;
           }
@@ -136,12 +151,13 @@ export async function runBulkJob(
           const dispatchToken = await dispatch();
           if (blockAction === "block") await provider.blockPackage(dispatchToken, item.target_id, readOptions);
           else await provider.unblockPackage(dispatchToken, item.target_id, readOptions);
-          const verified = await verifyPackageMutationConverged(provider, dispatchToken, item.target_id, blockAction, expected, readOptions);
+          requireProviderAdmissions();
+          const verified = await verifyPackageMutationConverged({ getPackageDetails }, dispatchToken, item.target_id, blockAction, expected, readOptions);
           await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorize, signal);
         });
       } catch (error) {
         if (error instanceof AppError && error.code === "lease_lost") throw error;
-        if (!sent && (isAuthorizationFailure(error) || error instanceof AppError && [401, 403].includes(error.status))) {
+        if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error) || error instanceof AppError && [401, 403].includes(error.status))) {
           await repository.pauseItemForAuthorization(lease, item.id);
           return;
         }
@@ -151,12 +167,13 @@ export async function runBulkJob(
           operationalLog("error", "job_execution_stopped", { jobId: id, outcome: "deadline_exceeded" });
         }
         await repository.finishItem(lease, item.id,
-          sent ? "inconclusive" : error instanceof AppError && ["cancelled","maintenance"].includes(error.code) ? "cancelled" : "failed",
+          sent ? "inconclusive" : error instanceof AppError && ["cancelled","shutdown","maintenance"].includes(error.code) ? "cancelled" : "failed",
           {
             message: sent ? "Provider write outcome is inconclusive; do not retry without reconciliation." : "The item stopped before provider dispatch.",
-            errorCode: error instanceof AppError ? error.code : "provider_error",
+            errorCode: failureCode(error),
             ...failureEvidence(error),
           });
+        if (isAdmissionFailure(error)) return;
       }
     }
   } finally { await releaseIfOwned(repository, lease); }
@@ -215,7 +232,7 @@ export async function reconcileBulkJob(
   return { ...(await repository.get(id, scope))!, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
 }
 
-async function releaseIfOwned(repository: JobRepository, lease: Lease) {
+async function releaseIfOwned(repository: BulkJobExecutionRepository, lease: Lease) {
   try { await repository.release(lease); }
   catch (error) { if (!(error instanceof AppError && error.code === "lease_lost")) throw error; }
 }
@@ -236,7 +253,7 @@ async function authorizeReconciliation(scope: DataScope, capabilityId: Capabilit
 }
 
 async function finishAuthorized(
-  repository: JobRepository,
+  repository: BulkJobExecutionRepository,
   lease: Lease,
   itemId: string,
   outcome: "succeeded" | "skipped",
@@ -248,8 +265,10 @@ async function finishAuthorized(
 ) {
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   await authorize(scope, capabilityId);
+  requireProviderAdmissions();
   signal.throwIfAborted();
   await commitAccountSessionValidation(validation, async () => {
+    requireProviderAdmissions();
     signal.throwIfAborted();
     await repository.finishItem(lease, itemId, outcome, evidence);
   });
@@ -259,8 +278,18 @@ function isAuthorizationFailure(error: unknown) {
   return error instanceof AppError && ["interaction_required", "authorization_expired", "missing_permission", "missing_internal_role", "capability_unavailable", "unauthorized", "invalid_token_mode"].includes(error.code);
 }
 
+function isAdmissionFailure(error: unknown) {
+  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
+}
+
 function isDeadlineExceeded(error: unknown) {
-  return error instanceof Error && error.name === "TimeoutError";
+  return error instanceof Error && error.name === "TimeoutError"
+    || error instanceof AppError && error.code === "provider_timeout";
+}
+
+function failureCode(error: unknown) {
+  if (error instanceof AppError) return error.code;
+  return isDeadlineExceeded(error) ? "provider_timeout" : "provider_error";
 }
 
 function requireFrozenPrestate(expectedHash: string, observed: PackageMutationState) {

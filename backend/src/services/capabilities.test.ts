@@ -178,7 +178,10 @@ describe("capability decisions", () => {
         expect(await value.refresh(id, admin)).toMatchObject({
           status, authorized: false, evidence: { category: code, phase: "token_acquisition" },
         });
-        await expect(value.requireAvailable(id, admin)).rejects.toMatchObject({ code: "capability_unavailable" });
+        await expect(value.requireAvailable(id, admin)).rejects.toMatchObject({
+          code: status === "missing_permission" ? "capability_unavailable"
+            : status === "provider_error" ? "provider_error" : code,
+        });
       }
       expect(await value.refresh(id, admin)).toMatchObject({ status: "available", verification: "token" });
       const evidence = [...repository.evidenceRows.values()][0];
@@ -383,6 +386,51 @@ describe("capability decisions", () => {
     expect(probes.applicationToken).not.toHaveBeenCalled();
     expect(result.find(view => view.definition.id === "graph.package.read.delegated")?.decision.status).toBe("available");
     expect(result.find(view => view.definition.id === "graph.package.block.manage")?.decision.authorized).toBe(false);
+  });
+
+  it.each([
+    [new DOMException("private timeout", "TimeoutError"), 504, "provider_timeout"],
+    [new TypeError("private transport error"), 503, "provider_error"],
+    [new AppError(403, "graph_error", "private denial"), 503, "provider_error"],
+    [new AppError(429, "TooManyRequests", "private throttle"), 429, "provider_throttled"],
+    [new AppError(403, "missing_permission", "private consent"), 403, "capability_unavailable"],
+    [new AppError(401, "interaction_required", "private authentication"), 401, "interaction_required"],
+  ])("preserves the readiness failure category for %s", async (error, status, code) => {
+    const packageProbe = vi.fn().mockRejectedValue(error);
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    await value.refresh("graph.package.read.delegated", reader);
+    await expect(value.requireAvailable("graph.package.read.delegated", reader)).rejects.toMatchObject({
+      status, code, details: { authorized: false },
+    });
+    expect(packageProbe).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks only the requested capability on an explicit failed-read retry", async () => {
+    const packageProbe = vi.fn().mockRejectedValueOnce(new DOMException("private", "TimeoutError")).mockResolvedValue([]);
+    const { value, probes } = service(new MemoryRepository(), { packageProbe });
+    await value.refresh("graph.package.read.delegated", reader);
+    await expect(value.requireAvailable("graph.package.read.delegated", reader)).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(packageProbe).toHaveBeenCalledOnce();
+    await expect(value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true }))
+      .resolves.toMatchObject({ authorized: true });
+    await value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true });
+    expect(packageProbe).toHaveBeenCalledTimes(2);
+    expect(probes.directoryProbe).not.toHaveBeenCalled();
+    expect(probes.inventoryProbe).not.toHaveBeenCalled();
+    expect(probes.applicationToken).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit read retries blocked when rechecking fails and honors throttling cooldowns", async () => {
+    const packageProbe = vi.fn()
+      .mockRejectedValueOnce(new DOMException("private", "TimeoutError"))
+      .mockRejectedValue(new AppError(429, "TooManyRequests", "private"));
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    await value.refresh("graph.package.read.delegated", reader);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true }))
+        .rejects.toMatchObject({ status: 429, code: "provider_throttled" });
+    }
+    expect(packageProbe).toHaveBeenCalledTimes(2);
   });
 
   it.each([429, 424])("preserves a fresh provider throttling cooldown for HTTP %i during explicit retry", async status => {
@@ -643,6 +691,38 @@ describe("capability decisions", () => {
     held.resolve();
     await invalidation;
     await expect(pending).resolves.toMatchObject({ status: "unknown", authorized: false });
+  });
+
+  it("blocks stale evidence after failed principal invalidation until cleanup succeeds", async () => {
+    const { value, repository, probes } = service();
+    await value.refresh("graph.package.read.delegated", reader);
+    expect(repository.evidenceRows.size).toBe(1);
+    const failure = new Error("Evidence invalidation failed");
+    repository.invalidatePrincipal.mockRejectedValueOnce(failure);
+
+    await expect(value.invalidatePrincipal(reader)).rejects.toBe(failure);
+    await expect(value.decision("graph.package.read.delegated", reader)).rejects.toMatchObject({
+      status: 503,
+      code: "capability_invalidation_failed",
+    });
+    await expect(value.refresh("graph.package.read.delegated", reader)).rejects.toMatchObject({
+      status: 503,
+      code: "capability_invalidation_failed",
+    });
+    expect(probes.packageProbe).toHaveBeenCalledOnce();
+    expect(repository.evidenceRows.size).toBe(1);
+
+    await value.invalidatePrincipal(reader);
+    expect(repository.evidenceRows.size).toBe(0);
+    await expect(value.decision("graph.package.read.delegated", reader)).resolves.toMatchObject({
+      status: "unknown",
+      authorized: false,
+    });
+    await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({
+      status: "available",
+      authorized: true,
+    });
+    expect(probes.packageProbe).toHaveBeenCalledTimes(2);
   });
 
   it("waits for pending application configuration before granting scope or starting a probe", async () => {

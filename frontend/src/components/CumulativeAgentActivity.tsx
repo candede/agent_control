@@ -16,12 +16,37 @@ const orders = [
 ] as const;
 type OverviewAgent = OfficialUsageOverviewView["agents"]["value"][number];
 
-export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {}, onQueryChange }: {
+export type ReportLocatorState = {
+  query: OfficialUsageOverviewQuery;
+  expanded: boolean;
+};
+
+type Props = {
   revision: number;
   onSnapshot: (setId: string) => void;
   initialQuery?: OfficialUsageOverviewQuery;
   onQueryChange?: (query: OfficialUsageOverviewQuery) => void;
-}) {
+  initialExpanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+};
+
+export function CumulativeAgentActivity(props: Props) {
+  const [expanded, setExpanded] = useState(props.initialExpanded ?? false);
+  const [query, setQuery] = useState(props.initialQuery ?? {});
+  return <section className="usage-agent-locator" aria-label="Find an agent across reports">
+    <details open={expanded}>
+      <summary aria-expanded={expanded} onClick={event => {
+        event.preventDefault();
+        setExpanded(!expanded);
+        props.onExpandedChange?.(!expanded);
+      }}>Find an agent across reports</summary>
+      {expanded ? <RetainedAgentLocator {...props} initialQuery={query}
+        onQueryChange={next => { setQuery(next); props.onQueryChange?.(next); }} /> : null}
+    </details>
+  </section>;
+}
+
+function RetainedAgentLocator({ revision, onSnapshot, initialQuery = {}, onQueryChange }: Props) {
   const [query, setQuery] = useState(initialQuery);
   const tableRegion = useRef<HTMLDivElement>(null);
   const pendingSortFocus = useRef<string | undefined>(undefined);
@@ -70,11 +95,6 @@ export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {
   return <section className="cumulative-agent-activity" aria-label="Cumulative agent activity" aria-busy={loading}>
     <p className="usage-scope-note">All retained imports, not just the latest bundle. Exact agent IDs are deduplicated across Agents and Users &amp; agents exports.
       {" "}Overlapping response totals are not added; inspect a source snapshot for its original totals and CSV exports.</p>
-    {data?.summary.retainedSets ? <section className="summary-grid usage-headline-grid" aria-label="Retained activity summary">
-      <div className="metric"><span>Reported agents</span><strong>{data.summary.reportedAgents.toLocaleString()}</strong><small>Distinct IDs across all retained imports</small></div>
-      <div className="metric"><span>Reported used agents</span><strong>{data.summary.usedAgents.toLocaleString()}</strong><small>Positive-response evidence in any retained report</small></div>
-      <div className="metric"><span>Reported active · 30 days</span><strong>{data.summary.activeAgents30Days.toLocaleString()}</strong><small>{usageDate(data.summary.activeSinceDateUtc)} through {usageDate(data.summary.asOf)} (UTC)</small></div>
-    </section> : null}
     {data ? <p className="usage-result-summary">
       {data.summary.retainedSets.toLocaleString()} retained bundles. Observed agent activity: {usageDate(data.summary.earliestActivityDateUtc ?? undefined)} to {usageDate(data.summary.latestActivityDateUtc ?? undefined)}.
       {" "}Last-activity dates are not complete daily coverage. {data.summary.undatedAgents.toLocaleString()} agents have no dated evidence.
@@ -93,7 +113,7 @@ export function CumulativeAgentActivity({ revision, onSnapshot, initialQuery = {
     </div>
     {filtered ? <button type="button" className="secondary" onClick={() => change({})}>Clear activity filters</button> : null}
     <p className="agent-overview-note">Dates select retained observations of an agent&apos;s last activity, not responses occurring within an interval.
-      {" "}Summary cards remain history-wide. Inventory associations and report identities are not automatically matched.</p>
+      {" "}This includes report-only identities. Inventory associations and report identities are not automatically matched.</p>
     {error ? <div className="error-banner" role="alert">{error}
       <button type="button" className="secondary" onClick={retry}>Retry retained activity</button>
     </div> : null}

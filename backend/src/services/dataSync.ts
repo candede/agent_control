@@ -154,7 +154,7 @@ export class DataSyncService {
       if (admissions) await admissions;
       const active = this.active.get(id);
       const tracker = active ?? childTracker(id, scope, user);
-      active?.controller.abort(reason);
+      tracker.controller.abort(reason);
       const cancelled = await this.dependencies.repository.cancel(scope, id);
       this.trackPersistedChildren(tracker, before);
       await this.cleanupTrackedChildren(tracker);
@@ -318,10 +318,10 @@ export class DataSyncService {
     activeRun: ActiveRun,
   ) {
     const inventoryReady = sources.includes("power_platform")
-      ? this.runPowerPlatform(user, scope, runId, signal, activeRun) : undefined;
+      ? this.runPowerPlatform(user, scope, runId, signal, activeRun, incompleteOnly) : undefined;
     const results = await Promise.allSettled(sources.map(source => {
       if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal, inventoryReady);
-      if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun);
+      if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun, incompleteOnly);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
@@ -391,7 +391,7 @@ export class DataSyncService {
     }
   }
 
-  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun) {
+  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun, retryFailed: boolean) {
     let jobId: string | null = null;
     try {
       signal.throwIfAborted();
@@ -416,7 +416,7 @@ export class DataSyncService {
       });
       signal.throwIfAborted();
       const started = job.status === "waiting_authorization"
-        ? await this.dependencies.packages.start(user, job.id, "delegated")
+        ? await this.dependencies.packages.start(user, job.id, "delegated", { retryFailed })
         : job;
       signal.throwIfAborted();
       await this.trackPackageJob(user, scope, runId, started, signal);
@@ -426,7 +426,7 @@ export class DataSyncService {
     }
   }
 
-  private async runPowerPlatform(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun) {
+  private async runPowerPlatform(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun, retryFailed: boolean) {
     let jobId: string | null = null;
     try {
       signal.throwIfAborted();
@@ -450,7 +450,7 @@ export class DataSyncService {
       });
       signal.throwIfAborted();
       const started = job.status === "waiting_authorization"
-        ? await this.dependencies.powerPlatform.start(user, job.id)
+        ? await this.dependencies.powerPlatform.start(user, job.id, { retryFailed })
         : job;
       signal.throwIfAborted();
       await this.trackPowerPlatformJob(user, scope, runId, started, signal);
@@ -493,6 +493,7 @@ export class DataSyncService {
   }
 
   private reconcilePackageJob(scope: DataSyncScope, runId: string, job: PackageJob) {
+    if (job.errorCode === "data_sync_cleanup") return;
     return this.dependencies.repository.updateSource(scope, runId, "graph_packages", childSourceUpdate(
       "Graph package",
       job,
@@ -500,6 +501,7 @@ export class DataSyncService {
   }
 
   private reconcilePowerPlatformJob(scope: DataSyncScope, runId: string, job: PowerPlatformJob) {
+    if (job.errorCode === "data_sync_cleanup") return;
     return this.dependencies.repository.updateSource(scope, runId, "power_platform", childSourceUpdate(
       "Power Platform",
       job,
@@ -514,6 +516,9 @@ export class DataSyncService {
     error: unknown,
   ) {
     const cancelled = error instanceof AppError && error.code === "read_job_cancelled";
+    operationalLog(cancelled ? "info" : "warn", "data_sync_source_failed", {
+      runId, jobId, source, ...errorTelemetry(error),
+    });
     await this.dependencies.repository.updateSource(scope, runId, source, {
       status: cancelled ? "cancelled" : authorizationStatus(error),
       jobId,
@@ -529,6 +534,8 @@ export class DataSyncService {
     published: PublishedOfficialUsage,
   ) {
     run = await this.reconcileUsage(scope, run, published);
+    // The local worker owns child progress and failure cleanup until it settles.
+    if (this.active.has(run.id)) return run;
     for (const source of run.sources) {
       if (!source.jobId || !["queued", "running", "waiting_authorization"].includes(source.status)) continue;
       if (source.source === "graph_packages") {
@@ -604,7 +611,8 @@ export class DataSyncService {
     const children = [...tracker.children.entries()].filter(([key]) => !selectedKeys || selectedKeys.has(key));
     await Promise.all(children.map(async ([key, child]) => {
       try {
-        await this.cancelChild(tracker.user, child);
+        const reason = tracker.controller.signal.reason;
+        await this.cancelChild(tracker.user, child, !(reason instanceof AppError && reason.code === "read_job_cancelled"));
         tracker.cleanupFailures.delete(key);
       } catch (error) {
         tracker.cleanupFailures.set(key, error);
@@ -632,19 +640,21 @@ export class DataSyncService {
     for (const source of run.sources) {
       if (!source.jobId || source.status === "succeeded" || (selectedSources && !selectedSources.includes(source.source))) continue;
       if (source.source === "graph_packages" || source.source === "power_platform") {
-        operations.push(this.cancelChild(user, { source: source.source, jobId: source.jobId }));
+        operations.push(this.cancelChild(user, { source: source.source, jobId: source.jobId }, true));
       }
     }
     const results = await Promise.allSettled(operations);
     return results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
   }
 
-  private async cancelChild(user: AuthenticatedUser, child: TrackedChild) {
+  private async cancelChild(user: AuthenticatedUser, child: TrackedChild, cleanup = false) {
     try {
       if (child.source === "graph_packages") {
-        await this.dependencies.packages.cancel(user, child.jobId, "delegated");
+        if (cleanup) await this.dependencies.packages.cancel(user, child.jobId, "delegated", "sync_cleanup");
+        else await this.dependencies.packages.cancel(user, child.jobId, "delegated");
       } else {
-        await this.dependencies.powerPlatform.cancel(user, child.jobId);
+        if (cleanup) await this.dependencies.powerPlatform.cancel(user, child.jobId, "sync_cleanup");
+        else await this.dependencies.powerPlatform.cancel(user, child.jobId);
       }
     } catch (error) {
       if (!(error instanceof AppError) || error.status !== 404) throw error;
@@ -761,7 +771,7 @@ function safeSyncFailure(error: unknown) {
   if (status === "waiting_authorization") return "Explicit resume with renewed Microsoft authorization is required.";
   if (status === "permission_required") return "Required delegated Microsoft read permission or provider role is unavailable.";
   if (error instanceof AppError && [
-    "provider_error", "provider_timeout", "provider_schema", "provider_result_limit",
+    "provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit",
     "provider_response_size_limit", "provider_count_mismatch", "report_download_failed",
   ].includes(error.code)) return error.message.slice(0, 1024);
   return "The source failed before complete saved-data publication.";

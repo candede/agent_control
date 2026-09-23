@@ -2510,8 +2510,7 @@ button.icon-button.danger:hover {
   }
 }
 
-.jobs-view,
-.official-usage-workbench {
+.jobs-view {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 16px;

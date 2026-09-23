@@ -222,7 +222,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/api/auth/callback")).status).toBe(400);
     expect((await request("/assets/missing.js")).status).toBe(404);
     expect((await request("/missing.css")).status).toBe(404);
-    for (const route of ["/agents", "/power-platform", "/users", "/official-usage", "/audit", "/security", "/permissions", "/jobs"]) {
+    for (const route of ["/agents", "/power-platform", "/users", "/sync", "/audit", "/security", "/permissions", "/jobs"]) {
       const deepLink = await request(route);
       expect(deepLink.status).toBe(200);
       expect(deepLink.headers.get("cache-control")).toContain("no-store");
@@ -231,6 +231,33 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/assets/app.js")).headers.get("cache-control")).toContain("immutable");
     expect((await request("/api/diagnostics")).status).toBe(401);
     expect((await request("/assets/%2e%2e%2fsecret")).status).toBe(400);
+  });
+  it.each([
+    "/sync?reports=manage",
+    "/sync?reports=import&staging=stage%2Fone",
+    "/sync?reports=snapshot&snapshot=set%2Fone&window=30",
+    "/official-usage",
+    "/official-usage?view=history",
+    "/official-usage?view=overview",
+    "/official-usage?view=snapshot",
+    "/official-usage?snapshot=set%2Fone",
+    "/official-usage?window=7",
+    "/official-usage?view=history&snapshot=set%2Fone&window=30",
+    "/official-usage?staging=stage%2Fone&snapshot=set%2Fone&window=30",
+  ])("serves the SPA at %s without stripping bookmark values before client canonicalization", async route => {
+    const response = await request(route);
+    expect(response.status).toBe(200);
+    expect(response.url).toBe(`${base}${route}`);
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(await response.text()).toContain("Fixture shell");
+  });
+  it("keeps report data APIs separate from retired page bookmarks", async () => {
+    const response = await request("/api/official-usage/history");
+    expect(response.status).toBe(401);
+    expect(response.headers.get("location")).toBeNull();
+    expect(response.headers.get("content-type")).toContain("application/problem+json");
+    expect(await response.json()).toMatchObject({ code: "unauthorized" });
   });
   it("regenerates the session at login and removes the previous identifier", async () => {
     const login = await request("/api/auth/login");

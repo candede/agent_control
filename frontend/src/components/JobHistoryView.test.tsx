@@ -165,7 +165,7 @@ describe("Job history layout", () => {
     })])} />);
     await userEvent.click(screen.getByRole("button", { name: /View details for Refresh 1/ }));
     const details = within(screen.getByRole("dialog"));
-    expect(details.getByRole("link", { name: "View report history" })).toHaveAttribute("href", "/official-usage?view=history&snapshot=accepted-set");
+    expect(details.getByRole("link", { name: "View snapshot" })).toHaveAttribute("href", "/sync?reports=snapshot&snapshot=accepted-set");
     expect(details.queryByRole("button", { name: "Discard draft" })).not.toBeInTheDocument();
     expect(details.getByText(/one validated CSV file/)).toBeVisible();
     expect(details.getByText(/last 24 hours/)).toBeVisible();

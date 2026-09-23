@@ -3,6 +3,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { packageInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
+import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
 import {
   formatAgentAuthoringTool, formatPackageFacetLabel as formatFacetLabel, normalizePackageAuthoringTool as normalizeBuiltWith,
   normalizePackageStatus, packageStatusAliases,
@@ -233,13 +234,14 @@ export class PackageInventoryRepository {
     return this.getJob(scope, id);
   }
 
-  async cancel(scope: PackageDataScope, id: string, authorizationPrincipalId: string) {
+  async cancel(scope: PackageDataScope, id: string, authorizationPrincipalId: string, reason: RefreshCancellationReason = "requested") {
     validateScope(scope);
-    await this.database.query(`UPDATE package_refresh_jobs SET status='cancelled',error_code='cancelled',message='Cancelled by the requesting principal.',
+    const cancellation = refreshCancellation(reason);
+    await this.database.query(`UPDATE package_refresh_jobs SET status='cancelled',error_code=$5,message=$6,
       finished_at=clock_timestamp(),updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND authorization_principal_id=$4
         AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
-    [id, scope.tenantId, scope.principalId, authorizationPrincipalId]);
+    [id, scope.tenantId, scope.principalId, authorizationPrincipalId, cancellation.code, cancellation.message]);
     return this.getJob(scope, id);
   }
 

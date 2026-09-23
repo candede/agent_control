@@ -145,7 +145,7 @@ export function SyncHistoryTable({ state, error, loading = false, pollingPaused 
         </div> : null}
       </div> : null}
       <p className="jobs-note">{state ? <>Last checked <time dateTime={state.polledAt}>{formatJobInstant(state.polledAt)}</time>. </> : null}
-        CSV imports have their own <a href="/official-usage?view=history">report history</a>. Audit and security investigations stay in their source views.</p>
+        CSV imports are retained in Manage reports above. Audit and security investigations stay in their source views.</p>
     </section>
   );
 }

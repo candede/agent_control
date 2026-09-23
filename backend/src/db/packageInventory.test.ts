@@ -68,6 +68,17 @@ describe.sequential("Package inventory repository", () => {
     expect(await repository.cancel(scope, job.id, scope.principalId)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
   });
 
+  it("retains internal sync cleanup provenance instead of blaming the requesting principal", async () => {
+    const job = await repository.submit(scope, {
+      authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-sync-cleanup",
+    });
+    await repository.cancel(scope, job.id, scope.principalId, "sync_cleanup");
+    await repository.cancel(scope, job.id, scope.principalId);
+    expect(await repository.getJob(scope, job.id)).toMatchObject({
+      status: "cancelled", errorCode: "data_sync_cleanup", message: expect.stringContaining("original failure or interruption"),
+    });
+  });
+
   it("publishes complete allowlisted snapshots and scopes filters before counts and paging", async () => {
     const id = await running("package-broad");
     await repository.publish(scope, id, { packages: [packageValue("b", true), packageValue("a")], totalRecords: 2, pages: 2 });

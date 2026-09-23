@@ -4,7 +4,7 @@ import { AgentPeopleRepository, type AgentPersonObservation } from "../db/agentP
 import { DataSyncRepository, type DataSyncScope, type UserSourcePublication } from "../db/dataSync.js";
 import { pool } from "../db/pool.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError, errorTelemetry } from "../errors.js";
+import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import { hasAppRole } from "../types/capability.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -43,22 +43,30 @@ export class AgentPeopleService {
 
   async refreshReferences(user: AuthenticatedUser, signal: AbortSignal, publication: UserSourcePublication,
     options: { incompleteOnly: boolean }) {
+    throwIfResolutionAborted(signal);
     const scope = userScope(user);
     const generation = await this.generation(scope);
+    throwIfResolutionAborted(signal);
     const ids = await this.dependencies.repository.referencedIds(scope);
+    throwIfResolutionAborted(signal);
     return this.resolve(user, ids, { generation, publication, signal, force: true, skipLicensed: true, ...options });
   }
 
   async resolve(user: AuthenticatedUser, ids: readonly string[], options: {
     generation: string; signal?: AbortSignal; publication?: UserSourcePublication; force?: boolean; skipLicensed?: boolean; incompleteOnly?: boolean;
   }) {
+    if (options.signal) throwIfResolutionAborted(options.signal);
     const scope = userScope(user);
     if (ids.length > 10_000 || ids.some(id => !isDirectoryObjectId(id))) {
       throw new AppError(400, "invalid_agent_people", "Resolve at most 10,000 exact agent user IDs.");
     }
-    const saved = directoryPeople(await this.dependencies.saved.getDirectorySource(scope));
+    const directorySource = await this.dependencies.saved.getDirectorySource(scope);
+    if (options.signal) throwIfResolutionAborted(options.signal);
+    const saved = directoryPeople(directorySource);
     const unique = [...new Set(ids.map(id => id.toLowerCase()))];
-    const cached = new Map((await this.dependencies.repository.read(scope, unique)).map(person => [person.objectId, person]));
+    const cachedPeople = await this.dependencies.repository.read(scope, unique);
+    if (options.signal) throwIfResolutionAborted(options.signal);
+    const cached = new Map(cachedPeople.map(person => [person.objectId, person]));
     const pending = unique.filter(id => {
       if (options.skipLicensed && saved.has(id)) return false;
       if (options.incompleteOnly) return !cached.has(id) || cached.get(id)?.status === "lookup_failed";
@@ -70,16 +78,19 @@ export class AgentPeopleService {
     const signal = options.signal
       ? AbortSignal.any([options.signal, AbortSignal.timeout(120_000)])
       : AbortSignal.timeout(120_000);
-    signal.throwIfAborted();
+    throwIfResolutionAborted(signal);
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    throwIfResolutionAborted(signal);
     requireSameUser(scope, freshUser);
     const token = await commitAccountSessionValidation(validation, async () => {
+      throwIfResolutionAborted(signal);
       await this.dependencies.requireAvailable("graph.directory.read", freshUser);
+      throwIfResolutionAborted(signal);
       return this.dependencies.delegatedToken(scope.principalId, "graph.directory.read");
     });
     for (let offset = 0; offset < pending.length; offset += 8) {
-      signal.throwIfAborted();
+      throwIfResolutionAborted(signal);
       const observations = await Promise.all(pending.slice(offset, offset + 8).map(async (objectId): Promise<AgentPersonObservation> => {
         const checkedAt = this.dependencies.now().toISOString();
         try {
@@ -95,9 +106,10 @@ export class AgentPeopleService {
               displayName: boundedName(person.displayName.toLowerCase() === objectId ? null : person.displayName, 512),
               userPrincipalName: boundedName(person.userPrincipalName ?? null, 320) };
         } catch (error) {
-          signal.throwIfAborted();
+          throwIfResolutionAborted(signal);
           const telemetry = errorTelemetry(error, "directory_lookup_failed");
-          const errorCode = telemetry.status === 403 ? "missing_permission" : telemetry.status === 401 ? "unauthorized"
+          const errorCode = telemetry.errorKind === "timeout" ? "provider_timeout"
+            : telemetry.status === 403 ? "missing_permission" : telemetry.status === 401 ? "unauthorized"
             : telemetry.status === 429 ? "provider_throttled"
               : /^[a-z][a-z0-9_]{0,127}$/.test(telemetry.errorCode) ? telemetry.errorCode : "directory_lookup_failed";
           operationalLog("warn", "agent_person_lookup_failed", { ...telemetry, errorCode });
@@ -105,13 +117,15 @@ export class AgentPeopleService {
             errorCode };
         }
       }));
-      signal.throwIfAborted();
+      throwIfResolutionAborted(signal);
       const current = await this.dependencies.revalidateUser(scope.principalId);
+      throwIfResolutionAborted(signal);
       requireSameUser(scope, current);
       await commitAccountSessionValidation(validation, async () => {
-        signal.throwIfAborted();
+        throwIfResolutionAborted(signal);
         this.dependencies.admissions();
         await this.dependencies.requireAvailable("graph.directory.read", current);
+        throwIfResolutionAborted(signal);
         await this.dependencies.repository.save(scope, observations, { ...options, signal });
       });
       result.changed = true;
@@ -151,4 +165,11 @@ function boundedName(value: string | null, maximum: number) {
     throw new AppError(502, "provider_schema", "Directory user metadata is invalid.");
   }
   return value;
+}
+
+function throwIfResolutionAborted(signal: AbortSignal) {
+  if (signal.aborted && isTimeoutError(signal.reason)) {
+    throw new AppError(504, "provider_timeout", "Agent people resolution exceeded its bounded deadline.");
+  }
+  signal.throwIfAborted();
 }

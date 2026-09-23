@@ -4,7 +4,6 @@ export const workbenchViewIds = [
   "agents",
   "power-platform",
   "users",
-  "official-usage",
   "sync",
   "audit",
   "security",
@@ -82,8 +81,8 @@ export type SecurityRouteState = {
   actorObjectIds?: string;
 };
 
-export type OfficialUsageRouteState = {
-  view?: "overview" | "snapshot" | "history";
+export type SyncReportRouteState = {
+  view: "import" | "manage" | "snapshot";
   stagingId?: string;
   reportSetId?: string;
   activityWindowDays: number;
@@ -101,6 +100,7 @@ export type DataSyncRouteState = {
   syncRunId?: string;
   refreshJobId?: string;
   refreshMode: "delegated" | "application";
+  reports?: SyncReportRouteState;
 };
 
 export const maximumPackageSelection = 5_000;
@@ -110,7 +110,6 @@ const viewPaths: Record<WorkbenchViewId, string> = {
   agents: "/agents",
   "power-platform": "/power-platform",
   users: "/users",
-  "official-usage": "/official-usage",
   sync: "/sync",
   audit: "/audit",
   security: "/security",
@@ -123,6 +122,7 @@ const viewsByPath = new Map(
 );
 
 export function parseWorkbenchView(pathname: string): WorkbenchViewId {
+  if (normalizePath(pathname) === "/official-usage") return "sync";
   return viewsByPath.get(normalizePath(pathname)) ?? "agents";
 }
 
@@ -140,6 +140,7 @@ export function parseDataSyncRoute(search: string): DataSyncRouteState {
     syncRunId: bounded(params.get("syncRun"), 512),
     refreshJobId: bounded(params.get("refreshJob"), 512),
     refreshMode: params.get("mode") === "application" ? "application" : "delegated",
+    reports: parseSyncReportRoute(search),
   };
 }
 
@@ -149,6 +150,19 @@ export function dataSyncRouteSearch(state: DataSyncRouteState): URLSearchParams 
   if (state.refreshJobId && validSelectedId(state.refreshJobId)) {
     params.set("refreshJob", state.refreshJobId);
     if (state.refreshMode === "application") params.set("mode", state.refreshMode);
+  }
+  if (state.reports) {
+    params.set("reports", state.reports.view);
+    if (state.reports.view === "import" && state.reports.stagingId && validSelectedId(state.reports.stagingId)) {
+      params.set("staging", state.reports.stagingId);
+    }
+    if (state.reports.view === "snapshot") {
+      if (state.reports.reportSetId && validSelectedId(state.reports.reportSetId)) params.set("snapshot", state.reports.reportSetId);
+      const defaultDays = state.reports.reportSetId ? 365 : 30;
+      if (state.reports.activityWindowDays !== defaultDays) {
+        params.set("window", String(Math.min(365, Math.max(1, state.reports.activityWindowDays))));
+      }
+    }
   }
   return params;
 }
@@ -394,31 +408,36 @@ export function securityRouteSearch(state: SecurityRouteState) {
   return params;
 }
 
-export function parseOfficialUsageRoute(search: string): OfficialUsageRouteState {
+export function parseSyncReportRoute(search: string): SyncReportRouteState | undefined {
   const params = new URLSearchParams(search);
+  const view = params.get("reports");
+  if (view !== "import" && view !== "manage" && view !== "snapshot") return undefined;
   const reportSetId = bounded(params.get("snapshot"), 512);
   const activityWindowDays = Number(params.get("window"));
-  const requestedView = params.get("view");
   return {
-    view: requestedView === "history" ? "history" : requestedView === "snapshot" || reportSetId
-      || Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365 ? "snapshot" : "overview",
-    stagingId: bounded(params.get("staging"), 512),
-    reportSetId,
-    activityWindowDays: Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365
+    view,
+    stagingId: view === "import" ? bounded(params.get("staging"), 512) : undefined,
+    reportSetId: view === "snapshot" ? reportSetId : undefined,
+    activityWindowDays: view !== "snapshot" ? 30 : Number.isSafeInteger(activityWindowDays) && activityWindowDays >= 1 && activityWindowDays <= 365
       ? activityWindowDays
       : reportSetId ? 365 : 30,
   };
 }
 
-export function officialUsageRouteSearch(state: OfficialUsageRouteState) {
-  const params = new URLSearchParams();
-  if (state.stagingId && validSelectedId(state.stagingId)) params.set("staging", state.stagingId);
-  if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);
-  const defaultWindowDays = state.reportSetId ? 365 : 30;
-  if (state.view === "history") params.set("view", "history");
-  else if (state.view === "snapshot" && !state.reportSetId && state.activityWindowDays === defaultWindowDays) params.set("view", "snapshot");
-  if (state.activityWindowDays !== defaultWindowDays) params.set("window", String(Math.min(365, Math.max(1, state.activityWindowDays))));
-  return params;
+export function migrateOfficialUsageRoute(pathname: string, search: string): URLSearchParams | undefined {
+  if (normalizePath(pathname) !== "/official-usage") return undefined;
+  const params = new URLSearchParams(search);
+  const stagingId = bounded(params.get("staging"), 512);
+  const reportSetId = bounded(params.get("snapshot"), 512);
+  const window = Number(params.get("window"));
+  const validWindow = Number.isSafeInteger(window) && window >= 1 && window <= 365;
+  const view = stagingId ? "import"
+    : params.get("view") === "history" ? "manage"
+    : params.get("view") === "snapshot" || reportSetId || validWindow ? "snapshot" : "manage";
+  return dataSyncRouteSearch({
+    refreshMode: "delegated",
+    reports: { view, stagingId, reportSetId, activityWindowDays: validWindow ? window : reportSetId ? 365 : 30 },
+  });
 }
 
 export function parseUsersRoute(search: string): UsersRouteState {

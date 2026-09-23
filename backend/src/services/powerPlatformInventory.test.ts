@@ -67,6 +67,19 @@ describe("Power Platform inventory refresh service", () => {
     expect(repository.markRunning).toHaveBeenCalledBefore(dependencies.query);
   });
 
+  it("forwards explicit readiness retry and internal cleanup without querying after failure", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    dependencies.requireAvailable.mockRejectedValueOnce(new AppError(504, "provider_timeout", "Readiness timed out."));
+    await expect(service.start(user, job.id, { retryFailed: true })).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.inventory.read", user, { retryFailed: true });
+    expect(repository.markRunning).not.toHaveBeenCalled();
+    expect(dependencies.query).not.toHaveBeenCalled();
+    await service.cancel(user, job.id, "sync_cleanup");
+    expect(repository.cancel).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "sync_cleanup",
+    );
+  });
+
   it("does not fail an agent-only query when optional role claims disappear or change to another supported inventory role", async () => {
     for (const providerRoleIds of [[], [inventoryProviderRoleIds.aiReader]]) {
       const { service, job, repository, dependencies } = fixture();
@@ -216,7 +229,7 @@ describe("Power Platform inventory refresh service", () => {
   it("lets only the owning Viewer cancel its inventory refresh", async () => {
     const direct = fixture();
     await expect(direct.service.cancel(user, direct.job.id)).resolves.toMatchObject({ status: "cancelled" });
-    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id);
+    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id, "requested");
     await expect(direct.service.cancel({ ...user, roles: [] }, direct.job.id)).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 

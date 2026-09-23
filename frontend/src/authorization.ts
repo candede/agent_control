@@ -12,7 +12,6 @@ export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
     "agents",
     "power-platform",
     "users",
-    "official-usage",
     "sync",
     "audit",
     "security",

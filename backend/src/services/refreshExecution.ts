@@ -1,3 +1,11 @@
+export type RefreshCancellationReason = "requested" | "sync_cleanup";
+
+export function refreshCancellation(reason: RefreshCancellationReason) {
+  return reason === "sync_cleanup"
+    ? { code: "data_sync_cleanup", message: "Stopped during data sync cleanup. See the sync source for the original failure or interruption." }
+    : { code: "cancelled", message: "Cancelled by the requesting principal." };
+}
+
 export function createRefreshExecutionSignal(
   cancellationSignal: AbortSignal,
   deadlineMs: number,

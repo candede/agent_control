@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render as renderClosed, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api/client";
@@ -12,7 +12,38 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+function render(...args: Parameters<typeof renderClosed>) {
+  const result = renderClosed(...args);
+  for (const summary of screen.queryAllByText("Find an agent across reports", { selector: "summary" })) fireEvent.click(summary);
+  return result;
+}
+
 describe("cumulative retained agent activity", () => {
+  it("fetches only when expanded, cancels on collapse and preserves the search on reopen", async () => {
+    renderClosed(<CumulativeAgentActivity revision={0} onSnapshot={vi.fn()} />);
+    expect(api.getOfficialUsageOverview).not.toHaveBeenCalled();
+    const toggle = screen.getByText("Find an agent across reports", { selector: "summary" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle.closest("details")).not.toHaveAttribute("open");
+    await userEvent.click(toggle);
+    expect(toggle.closest("details")).toHaveAttribute("open");
+    await screen.findByRole("row", { name: /Researcher/ });
+    expect(screen.queryByRole("region", { name: "Retained activity summary" })).not.toBeInTheDocument();
+    expect(screen.getByText(/report-only identities/)).toBeVisible();
+    vi.mocked(api.getOfficialUsageOverview).mockReturnValueOnce(new Promise(() => {}));
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "Helpdesk" } });
+    const signal = vi.mocked(api.getOfficialUsageOverview).mock.calls.at(-1)?.[1]?.signal;
+    await userEvent.click(toggle);
+    expect(toggle.closest("details")).not.toHaveAttribute("open");
+    expect(signal?.aborted).toBe(true);
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    const calls = vi.mocked(api.getOfficialUsageOverview).mock.calls.length;
+    await act(async () => {});
+    expect(api.getOfficialUsageOverview).toHaveBeenCalledTimes(calls);
+    await userEvent.click(toggle);
+    expect(screen.getByRole("searchbox")).toHaveValue("Helpdesk");
+    expect(await screen.findByRole("row", { name: /Helpdesk/ })).toBeVisible();
+  });
   it("isolates a new revision from a saved read kept alive by another observer", async () => {
     let completePrevious!: (value: ReturnType<typeof usageOverviewFixture>) => void;
     const previous = new Promise<ReturnType<typeof usageOverviewFixture>>(resolve => { completePrevious = resolve; });
@@ -57,7 +88,8 @@ describe("cumulative retained agent activity", () => {
     expect(screen.queryByRole("region", { name: "Retained activity summary" })).not.toBeInTheDocument();
     vi.mocked(api.getOfficialUsageOverview).mockResolvedValue({ ...data, summary: { ...data.summary, retainedSets: 1 } });
     rerender(<CumulativeAgentActivity revision={1} onSnapshot={vi.fn()} />);
-    expect(await screen.findByRole("region", { name: "Retained activity summary" })).toHaveTextContent("Reported agents0");
+    expect(await screen.findByText(/1 retained bundles/)).toBeVisible();
+    expect(screen.queryByText("Reported agents")).not.toBeInTheDocument();
     expect(screen.getByText(/Missing evidence is not zero activity/)).toBeVisible();
   });
 
@@ -98,7 +130,7 @@ describe("cumulative retained agent activity", () => {
     await userEvent.type(screen.getByRole("searchbox", { name: "Search retained agents" }), "Helpdesk");
     await waitFor(() => expect(api.getOfficialUsageOverview).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0, search: "Helpdesk" }), expect.anything()));
     expect(await screen.findByRole("row", { name: /Helpdesk/ })).toBeVisible();
-    expect(screen.getByRole("region", { name: "Retained activity summary" })).toHaveTextContent("Reported agents2");
+    expect(screen.getByText(/1 retained bundles/)).toBeVisible();
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order retained agents" }), "name");
     await waitFor(() => expect(api.getOfficialUsageOverview).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0, sortBy: "agentName", sortDirection: "asc" }), expect.anything()));
   });

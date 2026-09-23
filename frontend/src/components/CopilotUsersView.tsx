@@ -217,7 +217,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
     {!directoryKnown ? <div className="copilot-users-notice" role="status"><p>Current paid license inventory is unverified. {data.sources.directory.message} Use Sync or Permissions in the top navigation to refresh or reconnect.</p></div> : null}
     {data.sources.importedAgentUsage.state !== "available" ? <div className="copilot-users-notice" role="status">
       <p>{data.sources.importedAgentUsage.state === "stale" ? "Agent usage is out of date. Historical totals are shown, but are not used for low-usage recommendations." : "Agent usage is not available yet. Saved license status remains visible; missing usage is not zero."}</p>
-      <p>Use Official usage in the top navigation to manage agent reports.</p>
+      <p>Use <a href="/sync?reports=manage">Sync &gt; Manage reports</a> to inspect saved agent reports.</p>
     </div> : null}
     {data.sources.appActivity.state === "unavailable" ? <div className="copilot-users-notice" role="status">
       <p>Office app activity unavailable. {data.sources.appActivity.message}</p>

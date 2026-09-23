@@ -11,7 +11,7 @@ import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate, usag
 import { ListTableHead } from "./ListTableHead";
 import "./officialUsage.css";
 
-type AgentFilters = Pick<OfficialUsageAgentQuery, "search" | "creatorType" | "startDate" | "endDate" | "sortBy" | "sortDirection">;
+export type AgentFilters = Pick<OfficialUsageAgentQuery, "search" | "creatorType" | "startDate" | "endDate" | "sortBy" | "sortDirection">;
 type Agent = OfficialUsageAggregateView["agents"]["value"][number];
 type Comparison = OfficialUsageAggregateView["summary"]["usage"]["responseReconciliation"];
 type Props = {
@@ -116,10 +116,9 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
       </div>
       {data.availability === "stale" ? <p className="usage-context-warning" role="status">These reports are out of date. Historical totals remain available, but refresh the source exports before adoption decisions.</p> : null}
       {data.activeSet ? <>
-        <section className="summary-grid usage-headline-grid" aria-label="Usage summary">
+        <section className="usage-snapshot-totals" aria-label="Snapshot tenant totals">
           <Metric label="Responses" value={data.summary.usage.totalResponses} hint="Agents export total" />
           <Metric label="Active report users" value={data.summary.usage.totalActiveUsers} hint="Distinct identities with positive responses" />
-          <Metric label="Reported agents" value={hasAgentEvidence ? data.summary.activityWindow.totalAgents : null} hint="Across the selected report bundle" />
         </section>
         <p className="usage-scope-note">Agent activity only, not total Copilot utilization or license assignments.
           {data.activeSet.reportingPeriod.provenance === "activity_range" ? " Observed dates are last-activity dates, not a proven reporting window." : ""}
@@ -128,9 +127,9 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
     </> : null}
 
     {data?.activeSet ? <ReportSources data={data} /> : null}
-    <section className="usage-agent-explorer" aria-labelledby="agent-comparison-title" aria-busy={pending}>
+    <section className="usage-agent-explorer" aria-label="Report source rows" aria-busy={pending}>
       <header className="report-section-header">
-        <div><h3 id="agent-comparison-title">Agent comparison</h3><p>Compare response volume and reach. Open an agent for its source details.</p></div>
+        <div><h3 id="report-agent-rows-title">Report agent rows</h3><p>Inspect response and identity evidence, including report-only agents. Open a row for source details; report IDs are not automatically matched to inventory.</p></div>
         <button type="button" className="secondary" disabled={!ready || exporting || Boolean(dateError)}
           onClick={() => void exportAgents()}>{exporting ? "Exporting..." : "Export agents CSV"}</button>
       </header>
@@ -193,7 +192,7 @@ export function ReportingView({ data, query, offset, loading = false, error, onR
 }
 
 function Metric({ label, value, hint }: { label: string; value: number | null; hint: string }) {
-  return <div className="metric"><span>{label}</span><strong>{usageCount(value)}</strong><small>{hint}</small></div>;
+  return <div><span>{label}</span><strong>{usageCount(value)}</strong><small>{hint}</small></div>;
 }
 
 function AgentUsageTable({
@@ -228,7 +227,7 @@ function AgentUsageTable({
     <h4>{!hasAgentEvidence ? "Agent usage evidence unavailable" : count ? "No agents on this page" : hasFilters ? "No agents match" : "No reported agents"}</h4>
     <p>{!hasAgentEvidence ? "The selected snapshot has no Agents or Users & agents evidence." : count || hasFilters ? "Change the search or filters, or return to the first page." : "The selected snapshot contains no agent rows."} Missing usage is not zero usage or a measure of total Copilot activity.</p>
   </div>;
-  return <div ref={tableRegion} className="table-shell usage-agent-table" role="region" aria-label="Agent comparison rows" tabIndex={0}>
+  return <div ref={tableRegion} className="table-shell usage-agent-table" role="region" aria-label="Report agent rows" tabIndex={0}>
     <table>
       <ListTableHead table={table} titles={{ activeUsers: "Distinct positive-response identities per agent; not additive across agents" }} />
       <tbody>{table.getRowModel().rows.map((row, index) => {

@@ -18,18 +18,19 @@ function renderReport(overrides: Partial<Parameters<typeof ReportingView>[0]> = 
 }
 
 describe("focused official agent reporting", () => {
-  it("leads with three snapshot measures and one bounded-width table, not duplicate dashboards or user objects", () => {
+  it("preserves unique snapshot tenant totals and one source table without duplicating inventory cards", () => {
     const data = usageAggregateFixture();
     data.summary.catalog.totalAgents = 500;
     renderReport({ data });
-    const summary = screen.getByRole("region", { name: "Usage summary" });
+    const summary = screen.getByRole("region", { name: "Snapshot tenant totals" });
     expect(within(summary).getByText("Responses").parentElement).toHaveTextContent("270");
     expect(within(summary).getByText("Active report users").parentElement).toHaveTextContent("3");
-    expect(within(summary).getByText("Reported agents").parentElement).toHaveTextContent("2");
-    expect(summary.children).toHaveLength(3);
+    expect(screen.queryByText("Reported agents")).not.toBeInTheDocument();
+    expect(summary.children).toHaveLength(2);
     expect(screen.getAllByRole("table")).toHaveLength(1);
     expect(screen.getAllByRole("columnheader")).toHaveLength(5);
-    expect(screen.getByRole("heading", { name: "Agent comparison" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Report agent rows" })).toBeVisible();
+    expect(screen.getByText(/including report-only agents/)).toBeVisible();
     expect(screen.queryByText("User engagement")).not.toBeInTheDocument();
     expect(screen.queryByText("Catalog-only analysis")).not.toBeInTheDocument();
     expect(screen.queryByText("Active agents")).not.toBeInTheDocument();
@@ -61,7 +62,7 @@ describe("focused official agent reporting", () => {
 
   it("opens only the chosen agent's source evidence and never adds overlapping license categories", async () => {
     renderReport();
-    const table = screen.getByRole("region", { name: "Agent comparison rows" });
+    const table = screen.getByRole("region", { name: "Report agent rows" });
     expect(within(table).queryByText("synthetic-researcher")).not.toBeInTheDocument();
     const researcher = within(table).getByRole("button", { name: "Researcher" });
     await userEvent.click(researcher);
@@ -117,7 +118,7 @@ describe("focused official agent reporting", () => {
     const applied = await screen.findByRole("button", { name: "Sort by Responses" });
     expect(applied.closest("th")).toHaveAttribute("aria-sort", "ascending");
     expect(screen.getByLabelText("Order agents by")).toHaveValue("responses-asc");
-    expect(within(screen.getByRole("region", { name: "Agent comparison rows" })).getAllByRole("rowheader")
+    expect(within(screen.getByRole("region", { name: "Report agent rows" })).getAllByRole("rowheader")
       .map(header => within(header).getByRole("button").textContent)).toEqual(data.agents.value.map(agent => agent.agentName));
     await waitFor(() => expect(applied).toHaveFocus());
   });
@@ -144,7 +145,7 @@ describe("focused official agent reporting", () => {
     expect(props.onAgentPageChange).toHaveBeenLastCalledWith(25);
     await userEvent.type(screen.getByLabelText("Search agents"), "x");
     expect(props.onAgentQueryChange).toHaveBeenLastCalledWith({ search: "x" });
-    expect(screen.getByRole("region", { name: "Usage summary" })).toHaveTextContent("270");
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
   });
 
   it("keeps controls usable on empty and out-of-range pages", async () => {
@@ -164,11 +165,9 @@ describe("focused official agent reporting", () => {
     data.summary.usage.hasAgentUsage = false;
     data.summary.activityWindow.totalAgents = 0;
     const { props, rerender } = renderReport({ data });
-    const metric = within(screen.getByRole("region", { name: "Usage summary" })).getByText("Reported agents").parentElement;
-    expect(metric).toHaveTextContent("0");
+    expect(screen.queryByText("Reported agents")).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No reported agents" })).toBeVisible();
     rerender(<ReportingView {...props} data={{ ...data, lineages: [] }} />);
-    expect(within(screen.getByRole("region", { name: "Usage summary" })).getByText("Reported agents").parentElement).toHaveTextContent("Unknown");
     expect(screen.queryByRole("heading", { name: "No reported agents" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Agent usage evidence unavailable" })).toBeVisible();
   });
@@ -180,9 +179,9 @@ describe("focused official agent reporting", () => {
     expect(screen.getByText(/Responses remain full-snapshot totals/)).toBeVisible();
     rerender(<ReportingView {...props} query={{ startDate: "2026-09-12", endDate: "2026-09-01" }} />);
     expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before the end date");
-    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "false");
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
-    expect(screen.queryByRole("region", { name: "Agent comparison rows" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Reset agent filters" }));
     expect(props.onAgentQueryChange).toHaveBeenCalledWith({});
   });
@@ -190,9 +189,9 @@ describe("focused official agent reporting", () => {
   it("does not describe a failed read as loading or expose old rows under changed filters", () => {
     const { props, rerender } = renderReport({ error: "The report could not be read.", query: { search: "different" } });
     expect(screen.getByRole("alert")).toHaveTextContent("last loaded summary");
-    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "false");
     expect(screen.queryByText("Loading official usage...")).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Agent comparison rows" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
     rerender(<ReportingView {...props} error={undefined} query={{ search: "different" }} />);
     expect(screen.getByRole("status")).toHaveTextContent("Updating agent results");
@@ -204,19 +203,19 @@ describe("focused official agent reporting", () => {
     data.agents = { ...data.agents, count: 50, limit: 25, offset: 0 };
     const { props, rerender } = renderReport({ data });
     rerender(<ReportingView {...props} offset={25} />);
-    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "true");
-    expect(screen.queryByRole("region", { name: "Agent comparison rows" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
-    expect(screen.getByRole("region", { name: "Usage summary" })).toHaveTextContent("270");
+    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
     rerender(<ReportingView {...props} offset={25} data={{ ...data, agents: { ...data.agents, offset: 25 } }} />);
-    expect(screen.getByRole("region", { name: "Agent comparison rows" })).toBeVisible();
-    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("region", { name: "Report agent rows" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "false");
   });
 
   it("does not announce loading when reversed dates prevent the first report read", () => {
     renderReport({ data: undefined, loading: true, query: { startDate: "2026-09-12", endDate: "2026-09-01" } });
     expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before the end date");
-    expect(screen.getByRole("region", { name: "Agent comparison" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "false");
     expect(screen.queryByText("Loading official usage...")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
   });
@@ -228,7 +227,7 @@ describe("focused official agent reporting", () => {
     rerender(<ReportingView {...props} error={undefined} data={{ ...usageAggregateFixture(), activeSet: null, availability: "never_imported" }} />);
     expect(screen.getByRole("heading", { name: "Reports not imported" })).toBeVisible();
     expect(screen.getByText("Missing reports are not zero activity.")).toBeVisible();
-    expect(screen.queryByRole("region", { name: "Usage summary" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
   });
 });

@@ -268,7 +268,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
       {data.availability === "stale" ? <p className="copilot-users-notice">Historical reports are out of date. Refresh reports before making adoption decisions.</p> : null}
       {!data.activeSet ? <div className="reported-users-empty">
         <h3>No selected user reports</h3>
-        <p>{usageAvailabilityLabel(data.availability)}. Use Official usage in the top navigation to select or import reports. Missing reports are not zero activity.</p>
+        <p>{usageAvailabilityLabel(data.availability)}. Use <a href="/sync?reports=manage">Sync &gt; Manage reports</a> to inspect reports; an administrator can select or import reports there. Missing reports are not zero activity.</p>
       </div> : coverageUnavailable ? null : <>
         {!hasRelationships ? <p className="reported-users-note">The Users &amp; agents companion is missing. Relationships are unknown, not zero.</p> : null}
         <p className="reported-users-note">Users-report responses and agents used are all-agent totals. Missing Users rows show Unknown, never a substituted relationship sum. License status is verified from current saved licenses regardless of report period; detailed directory evidence requires a unique exact report link.</p>

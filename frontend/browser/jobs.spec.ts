@@ -31,7 +31,7 @@ function jobs(): WorkbenchJobsResponse {
       job("draft-users", "2026-09-20T13:02:00.000Z", {
         source: "official-usage", label: "Users CSV import", target: "Users export · 34 validated rows",
         status: "active", total: 34, completed: 34, startedAt: undefined, completedAt: undefined,
-        canCancel: true, href: "/official-usage?staging=draft-users",
+        canCancel: true, href: "/sync?reports=import&staging=draft-users",
       }),
       job("sync-latest", "2026-09-20T12:00:00.000Z", {
         source: "data-sync", label: "Data sync", target: "Users, Graph packages, Power Platform",
@@ -45,7 +45,7 @@ function jobs(): WorkbenchJobsResponse {
       ...["Agents", "Users & agents", "Users"].map((kind, index) => job(`accepted-${index}`, `2026-09-19T18:0${index}:00.000Z`, {
         source: "official-usage", label: `${kind} CSV import`, target: `${kind} export`,
         status: "accepted", total: index === 1 ? 536 : 306, completed: index === 1 ? 536 : 306, startedAt: undefined,
-        href: "/official-usage?view=history&snapshot=accepted-snapshot",
+        href: "/sync?reports=snapshot&snapshot=accepted-snapshot",
       })),
       job("old-failed-platform", "2026-09-15T09:00:00.000Z", {
         source: "power-platform", label: "Power Platform inventory refresh", target: "11 allowlisted resource types",
@@ -82,6 +82,8 @@ test("Jobs separates current work from chronological table history and accessibl
   await expect(page.getByRole("button", { name: "Cancel refresh", exact: true })).toHaveCount(0);
   await expect(page.getByText("old-incomplete-sync", { exact: true })).toHaveCount(0);
   await expect(page.getByText(/1-15 of 26 recent history records/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "Manage reports", exact: true })).toHaveAttribute("href", "/sync?reports=manage");
+  await expect(page.getByRole("link", { name: "View report history", exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   const clippedIdentity = await page.locator(".jobs-table-scroll").evaluateAll(regions => regions.flatMap(region => {
     const bounds = region.getBoundingClientRect();
@@ -119,6 +121,50 @@ test("Jobs separates current work from chronological table history and accessibl
   expect(unexpected).toEqual([]);
 });
 
+const stagingId = "33333333-3333-4333-8333-333333333333";
+const retainedSetId = "55555555-5555-4555-8555-555555555555";
+for (const scenario of [
+  { status: "active", label: "Review CSV import", legacy: `/official-usage?staging=${stagingId}`,
+    canonical: `/sync?reports=import&staging=${stagingId}`, dialog: "Import CSV reports" },
+  { status: "accepted", label: "View snapshot", legacy: `/official-usage?view=history&snapshot=${retainedSetId}`,
+    canonical: `/sync?reports=snapshot&snapshot=${retainedSetId}`, dialog: "Report snapshot" },
+  { status: "accepted", label: "Manage reports", legacy: "/official-usage?view=history",
+    canonical: "/sync?reports=manage", dialog: "Manage reports" },
+] as const) {
+  for (const legacy of [false, true]) {
+    test(`CSV job ${scenario.label} opens the canonical Sync dialog from ${legacy ? "legacy" : "canonical"} metadata`, async ({ page }) => {
+      const csvJob = job("csv-route", "2026-09-20T13:02:00.000Z", {
+        source: "official-usage", label: "Users CSV import", target: "Users export",
+        status: scenario.status, total: 34, completed: 34,
+        canCancel: scenario.status === "active", href: legacy ? scenario.legacy : scenario.canonical,
+      });
+      const { unexpected, commands } = await mockJobs(page, () => ({ ...jobs(), value: [csvJob] }));
+      await page.goto("/jobs");
+      await page.getByRole("button", { name: "View details for Users CSV import, job csv-route", exact: true }).click();
+      const details = page.getByRole("dialog", { name: "Job details", exact: true });
+      const source = details.getByRole("link", { name: scenario.label, exact: true });
+      await expect(source).toHaveAttribute("href", scenario.canonical);
+      await expect(details.getByRole("link", { name: "View report history", exact: true })).toHaveCount(0);
+      await source.click();
+      await expect(page).toHaveURL(scenario.canonical);
+      await expect(details).toHaveCount(0);
+      const report = page.getByRole("dialog", { name: scenario.dialog, exact: true });
+      await expect(report).toBeVisible();
+      await expect(page.getByRole("dialog")).toHaveCount(1);
+      if (scenario.status === "active") {
+        await expect(report.getByText(/exact staging record is expired, deleted, or unavailable/)).toBeVisible();
+      } else if (scenario.label === "View snapshot") {
+        await expect(report.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(2);
+      } else {
+        await expect(report.getByRole("region", { name: "Retained official usage snapshots" }).locator("tbody tr")).toHaveCount(1);
+      }
+      await expect(page.getByRole("button", { name: "Official usage", exact: true, includeHidden: true })).toHaveCount(0);
+      expect(commands.filter(command => command !== "POST /api/capabilities/check")).toEqual([]);
+      expect(unexpected).toEqual([]);
+    });
+  }
+}
+
 test("Jobs filters old outcomes without promoting failed runs or accepted reports into actionable cards", async ({ page }, info) => {
   const { unexpected, commands } = await mockJobs(page, jobs);
   await page.goto("/jobs");
@@ -149,7 +195,7 @@ test("Jobs filters old outcomes without promoting failed runs or accepted report
   await expect(history.getByRole("row")).toHaveCount(4);
   await expect(page.getByRole("table", { name: "Current jobs" }).getByRole("row")).toHaveCount(2);
   await history.getByRole("button", { name: /job accepted-0$/ }).click();
-  await expect(dialog.getByRole("link", { name: "View report history", exact: true })).toHaveAttribute("href", "/official-usage?view=history&snapshot=accepted-snapshot");
+  await expect(dialog.getByRole("link", { name: "View snapshot", exact: true })).toHaveAttribute("href", "/sync?reports=snapshot&snapshot=accepted-snapshot");
   await expect(dialog.getByRole("link", { name: "Review CSV import" })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: "Discard draft" })).toHaveCount(0);
   await page.keyboard.press("Escape");

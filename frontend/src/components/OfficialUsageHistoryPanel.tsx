@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, Trash2 } from "lucide-react";
 import {
   ApiError,
   getOfficialUsageHistory,
@@ -12,14 +12,27 @@ import "./officialUsage.css";
 
 const pageSize = 25;
 
+export type ReportHistoryAdminControls = {
+  verified: boolean;
+  busy: boolean;
+  onResume: (bundleId: string) => void;
+  onOperation: (setId: string, operation: "select" | "delete") => void;
+};
+
 export function OfficialUsageHistoryPanel({
   revision,
   selectedSetId,
   onSelect,
+  admin,
+  onRefresh,
+  onVerificationChange,
 }: {
   revision: number;
   selectedSetId?: string;
-  onSelect: (setId: string | undefined) => void;
+  onSelect?: (setId: string | undefined) => void;
+  admin?: ReportHistoryAdminControls;
+  onRefresh?: () => void;
+  onVerificationChange?: (verified: boolean) => void;
 }) {
   const [history, setHistory] = useState<OfficialUsageHistoryView>();
   const [offset, setOffset] = useState(0);
@@ -31,6 +44,10 @@ export function OfficialUsageHistoryPanel({
   const loading = !scopedRead;
   const error = scopedRead?.error;
   const displayedHistory = history?.bundles.offset === offset ? history : undefined;
+  const verified = !loading && !error && Boolean(displayedHistory);
+  const mutationsDisabled = !verified || !admin?.verified || admin.busy;
+
+  useEffect(() => { onVerificationChange?.(verified); }, [onVerificationChange, verified]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -66,9 +83,12 @@ export function OfficialUsageHistoryPanel({
           <h3 id="official-usage-history-title">Report history</h3>
           <p>Open a retained snapshot without changing the tenant&apos;s current report selection.</p>
         </div>
-        <button type="button" className="secondary" disabled={loading} onClick={() => setReload(value => value + 1)}>
+        <div className="table-actions">
+        {onSelect ? <button type="button" className="secondary" onClick={() => onSelect(undefined)}>View current snapshot</button> : null}
+        <button type="button" className="secondary" disabled={loading || admin?.busy} onClick={() => { setReload(value => value + 1); onRefresh?.(); }}>
           <RefreshCw size={15} aria-hidden="true" />Refresh history
         </button>
+        </div>
       </header>
 
       {selectedSetId ? (
@@ -80,11 +100,12 @@ export function OfficialUsageHistoryPanel({
               {" "}This read-only view does not change the active snapshot.
             </span>
           </div>
-          <button type="button" className="secondary" onClick={() => onSelect(undefined)}>Return to current snapshot</button>
+          {onSelect ? <button type="button" className="secondary" onClick={() => onSelect(undefined)}>Return to current snapshot</button> : null}
         </div>
       ) : null}
 
       {error ? <div className="error-banner" role="alert">{error}{displayedHistory ? <p>Showing the last loaded history. Refresh successfully before opening another snapshot.</p> : null}</div> : null}
+      {admin && !admin.verified ? <p className="usage-context-warning">Report administration is not verified. Refresh successfully before changing the saved selection, resuming, or deleting reports.</p> : null}
       {loading ? <p role="status">{displayedHistory
         ? "Showing the last loaded history while refreshing. Snapshot actions are unavailable until the refresh succeeds."
         : "Loading retained official usage snapshots..."}</p> : null}
@@ -104,7 +125,7 @@ export function OfficialUsageHistoryPanel({
                     <th scope="col">Reporting coverage</th>
                     <th scope="col">Source files</th>
                     <th scope="col">Status</th>
-                    <th scope="col">View</th>
+                    <th scope="col">{admin ? "Actions" : "View"}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -120,6 +141,7 @@ export function OfficialUsageHistoryPanel({
                           <summary>{bundle.kinds.length} exports</summary>
                           <p>{bundle.kinds.map(kindLabel).join(", ")}. {bundle.rowCount.toLocaleString()} rows; {bundle.repeatedRowsReused.toLocaleString()} duplicate rows reused.</p>
                           <p>{bundleLineage(bundle)}. {bundleRetention(bundle)}.</p>
+                          <p>Snapshot {bundle.id}; bundle {bundle.bundleId}; content hash {bundle.contentHash ?? "Not recorded"}.</p>
                           <ul className="usage-history-observations">
                             {bundle.observations.map(observation => (
                               <li key={observation.versionId}>
@@ -127,11 +149,13 @@ export function OfficialUsageHistoryPanel({
                                 {observation.uniquePayloadCount.toLocaleString()} unique payloads,{" "}
                                 {observation.repeatedRowsReused.toLocaleString()} duplicate rows reused
                                 <small>
-                                  Original acceptance {formatInstant(observation.lineage.acceptedAt)} · content {observation.contentHash.slice(0, 12)}
+                                  Original acceptance {formatInstant(observation.lineage.acceptedAt)} · content {observation.contentHash}
                                   {observation.lineage.supersedesVersionId
                                     ? ` · corrects observation ${observation.lineage.supersedesVersionId.slice(0, 8)}`
                                     : ""}
                                 </small>
+                                <small>File hash {observation.lineage.fileHash} · schema {observation.lineage.schemaVersion} / parser {observation.lineage.parserVersion}</small>
+                                {observation.lineage.warnings.length ? <ul>{observation.lineage.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul> : null}
                               </li>
                             ))}
                           </ul>
@@ -140,17 +164,21 @@ export function OfficialUsageHistoryPanel({
                       <td>
                         <strong>{bundleStatus(bundle)}</strong>
                       </td>
-                      <td>
+                      <td><div className="table-actions">
                         {selectedSetId === bundle.id ? (
                           <span className="usage-state">Viewing</span>
-                        ) : bundle.isActive && !selectedSetId ? (
-                          <span className="usage-state">Current</span>
-                        ) : bundle.complete && !bundle.deletedAt ? (
-                          <button type="button" className="secondary" disabled={loading || Boolean(error)} onClick={() => onSelect(bundle.id)}>
+                        ) : bundle.complete && !bundle.deletedAt && onSelect ? (
+                          <button type="button" className="secondary" disabled={!verified || admin?.busy} onClick={() => onSelect(bundle.id)}>
                             View snapshot
                           </button>
                         ) : <span>Unavailable</span>}
-                      </td>
+                        {admin && !bundle.deletedAt ? <>
+                          {!bundle.complete ? <button type="button" className="secondary" disabled={mutationsDisabled} onClick={() => admin.onResume(bundle.bundleId)}>Resume</button> : null}
+                          {bundle.complete && !bundle.isActive ? <button type="button" className="secondary" disabled={mutationsDisabled} onClick={() => admin.onOperation(bundle.id, "select")}>Make current</button> : null}
+                          <button type="button" className="icon-button danger" aria-label={`Delete retained set for ${windowLabel(bundle)}`}
+                            disabled={mutationsDisabled} onClick={() => admin.onOperation(bundle.id, "delete")}><Trash2 size={16} aria-hidden="true" /></button>
+                        </> : null}
+                      </div></td>
                     </tr>
                   ))}
                 </tbody>

@@ -29,7 +29,12 @@ describe("capability registry", () => {
       "graph.package.access.manage", "graph.package.block.manage", "graph.licenses.read", "powerPlatform.quarantine.manage",
       "reports.copilotUsage.read",
     ]);
-    expect(capabilityDefinitions.find(definition => definition.id === "reports.official.import")?.mode).toBe("local");
+    expect(capabilityDefinitions.find(definition => definition.id === "reports.official.import")).toMatchObject({
+      displayName: "Import reports",
+      purpose: expect.stringContaining("Sync > Import reports"),
+      mode: "local", permissions: [], internalRoles: ["AgentControl.Admin"],
+      probe: { kind: "local_policy" },
+    });
     expect(JSON.stringify(capabilityDefinitions)).not.toMatch(/Phase\s*0?5|owning.*phase/i);
     for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand"
       && definition.id !== "reports.copilotUsage.read")) {

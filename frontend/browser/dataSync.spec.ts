@@ -197,6 +197,8 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(panel.getByText(/Closing this window does not cancel sync/)).toHaveCount(0);
   await expect(panel.getByText("Sync all sources", { exact: true })).toHaveCount(1);
   await expect(panel.getByRole("button", { name: "Add CSV reports" })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
+  await expect(panel.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
   await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
   await expect(panel.getByText("Import needed", { exact: true })).toBeVisible();
   await expectAccessibleSyncPage(page);
@@ -204,7 +206,7 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(panel.locator("details")).toHaveCount(0);
   await panel.getByRole("button", { name: "Add CSV reports" }).click();
   await expect(panel).toBeVisible();
-  await expect(page).toHaveURL(/\/sync$/);
+  await expect(page).toHaveURL(/\/sync\?reports=import$/);
   const importer = page.getByRole("dialog", { name: "Import CSV reports" });
   await expect(importer).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(1);
@@ -216,10 +218,12 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(page).toHaveURL(/\/sync$/);
   await expect(panel.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
   await panel.getByRole("button", { name: "Manage reports", exact: true }).click();
-  const manager = page.getByRole("dialog");
-  await expect(manager.getByRole("button", { name: "Manage reports", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page).toHaveURL(/\/sync\?reports=manage$/);
+  const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(manager).toBeVisible();
+  await expect(page.getByRole("dialog")).toHaveCount(1);
   await expect(manager.getByRole("list", { name: "Import progress" })).toHaveCount(0);
-  await manager.getByRole("button", { name: "Close report import" }).click();
+  await manager.getByRole("button", { name: "Close reports" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
@@ -429,6 +433,9 @@ test("direct Sync navigation keeps diagnostics optional and history restricted t
   await expect(disclosure).toBeFocused();
   const history = page.getByRole("region", { name: "Sync history", exact: true });
   await expect(history.getByRole("heading", { name: "Sync history", level: 2 })).toBeVisible();
+  await expect(history.getByText(/CSV imports are retained in Manage reports above/)).toBeVisible();
+  await expect(history.getByRole("link", { name: /reports|report history/i })).toHaveCount(0);
+  await expect(history.getByRole("button", { name: /reports|report history/i })).toHaveCount(0);
   await expect(history.getByText("Power Platform inventory refresh", { exact: true })).toHaveCount(0);
   await history.getByRole("button", { name: "Source jobs" }).click();
   await expect(history.getByRole("table", { name: "Source job history" })).toBeVisible();

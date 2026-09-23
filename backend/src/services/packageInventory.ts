@@ -8,7 +8,7 @@ import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy } from "./graphPackages.js";
-import { createRefreshExecutionSignal } from "./refreshExecution.js";
+import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
 type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
@@ -62,7 +62,7 @@ export class PackageInventoryService {
     return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
   }
 
-  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
+  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
     const actor = actorScope(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
     id = id.toLowerCase();
@@ -80,14 +80,14 @@ export class PackageInventoryService {
     const controller = new AbortController();
     const starting: StartingRefresh = {
       actor, controller,
-      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller))
+      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, options))
         .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
     };
     this.starting.set(id, starting);
     return starting.operation;
   }
 
-  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController) {
+  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, options: { retryFailed?: boolean }) {
     const signal = controller.signal;
     signal.throwIfAborted();
     const current = await this.repository.getJob(scope, id);
@@ -108,7 +108,7 @@ export class PackageInventoryService {
         const capabilityId = capabilityForMode(tokenMode);
         if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
         signal.throwIfAborted();
-        await this.dependencies.requireAvailable(capabilityId, freshUser);
+        await this.dependencies.requireAvailable(capabilityId, freshUser, options);
         signal.throwIfAborted();
         token = tokenMode === "delegated"
           ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
@@ -149,13 +149,13 @@ export class PackageInventoryService {
     return job;
   }
 
-  async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
+  async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], cancellationReason: RefreshCancellationReason = "requested") {
     requireRefreshRole(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
     id = id.toLowerCase();
     const job = await this.repository.getJob(scope, id);
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
-    const cancelled = await this.repository.cancel(scope, id, user.homeAccountId);
+    const cancelled = await this.repository.cancel(scope, id, user.homeAccountId, cancellationReason);
     const reason = new AppError(409, "read_job_cancelled", "Package refresh was cancelled.");
     this.starting.get(id)?.controller.abort(reason);
     this.active.get(id)?.controller.abort(reason);
@@ -340,7 +340,7 @@ function safeFailureMessage(error: unknown) {
   if (diagnostics) {
     return `${diagnostics.throttled ? "Microsoft Graph is throttling package reads" : "Microsoft Graph package read failed"} (HTTP ${diagnostics.status}${diagnostics.providerCode ? `, ${diagnostics.providerCode}` : ""}). The previous complete inventory is unchanged; ${diagnostics.throttled ? "allow the provider cooldown to finish, then retry" : "retry"} from Sync.${diagnostics.requestId ? ` Graph request ID: ${diagnostics.requestId}.` : ""}`;
   }
-  if (error instanceof AppError && ["provider_error", "provider_schema", "provider_result_limit", "provider_timeout", "provider_network_error",
+  if (error instanceof AppError && ["provider_error", "provider_schema", "provider_result_limit", "provider_timeout", "provider_throttled", "provider_network_error",
     "invalid_provider_link", "incomplete_package_coverage", "package_scope_mismatch", "target_mismatch"].includes(error.code)) {
     return `${error.message.slice(0, 800)} The previous complete inventory is unchanged; retry from Sync.`;
   }

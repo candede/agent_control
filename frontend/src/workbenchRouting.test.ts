@@ -4,10 +4,10 @@ import {
   auditRouteSearch,
   dataSyncRouteSearch,
   parseDataSyncRoute,
-  officialUsageRouteSearch,
   parseAgentRoute,
   parseAuditRoute,
-  parseOfficialUsageRoute,
+  parseSyncReportRoute,
+  migrateOfficialUsageRoute,
   parsePowerPlatformRoute,
   parseSecurityRoute,
   parseUsersRoute,
@@ -31,7 +31,7 @@ describe("workbench routing", () => {
   it("maps every canonical deep link without a query-string view alias", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
     expect(parseWorkbenchView("/power-platform/")).toBe("power-platform");
-    expect(parseWorkbenchView("/official-usage")).toBe("official-usage");
+    expect(parseWorkbenchView("/official-usage")).toBe("sync");
     expect(parseWorkbenchView("/security")).toBe("security");
     expect(parseWorkbenchView("/jobs")).toBe("jobs");
     expect(parseWorkbenchView("/sync")).toBe("sync");
@@ -40,7 +40,7 @@ describe("workbench routing", () => {
 
   it("round trips exact sync and package refresh jobs on the dedicated sync route", () => {
     const route = parseDataSyncRoute("?syncRun=retained-run&refreshJob=exact-package-job&mode=application&q=not-a-sync-filter");
-    expect(route).toEqual({ syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application" });
+    expect(route).toEqual({ syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application", reports: undefined });
     expect(workbenchUrl("sync", dataSyncRouteSearch(route))).toBe("/sync?syncRun=retained-run&refreshJob=exact-package-job&mode=application");
     expect(parseDataSyncRoute(`?syncRun=${"x".repeat(513)}&mode=invalid`).syncRunId).toBeUndefined();
     expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
@@ -268,7 +268,7 @@ describe("workbench routing", () => {
     expect(parseAgentRoute("source=power_platform&environment=env-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
   });
 
-  it("round trips source-specific audit, security and official-usage state", () => {
+  it("round trips source-specific audit, security and Sync report state", () => {
     const audit = parseAuditRoute("source=purview&job=older&q=actor&action=block&status=failed&page=3");
     expect(audit).toEqual({ source: "purview", jobId: "older", search: "actor", action: "block", status: "failed", page: 2 });
     expect(parseAuditRoute(auditRouteSearch(audit).toString())).toEqual(audit);
@@ -276,8 +276,34 @@ describe("workbench routing", () => {
     const security = parseSecurityRoute("job=older&mode=application&template=agent_activity&operation=InvokeAgent&agentIds=agent-a");
     expect(parseSecurityRoute(securityRouteSearch(security).toString())).toEqual(security);
 
-    const officialUsage = parseOfficialUsageRoute("staging=stage-old&snapshot=11111111-1111-4111-8111-111111111111&window=90");
-    expect(parseOfficialUsageRoute(officialUsageRouteSearch(officialUsage).toString())).toEqual(officialUsage);
+    const sync = parseDataSyncRoute("reports=snapshot&snapshot=11111111-1111-4111-8111-111111111111&window=90");
+    expect(parseDataSyncRoute(dataSyncRouteSearch(sync).toString())).toEqual(sync);
+  });
+
+  it.each([
+    ["", "reports=manage"],
+    ["view=overview", "reports=manage"],
+    ["view=history&snapshot=retained", "reports=manage"],
+    ["view=snapshot", "reports=snapshot"],
+    ["snapshot=retained", "reports=snapshot&snapshot=retained"],
+    ["window=90", "reports=snapshot&window=90"],
+    ["staging=draft&snapshot=retained", "reports=import&staging=draft"],
+    ["snapshot=bad%0Aid&window=999", "reports=manage"],
+  ])("migrates legacy report bookmarks %s without restoring a duplicate page", (search, expected) => {
+    expect(migrateOfficialUsageRoute("/official-usage/", search)?.toString()).toBe(expected);
+    expect(migrateOfficialUsageRoute("/agents", search)).toBeUndefined();
+  });
+
+  it("bounds report route state and keeps sync job links when opening or closing reports", () => {
+    const state = parseDataSyncRoute("syncRun=run&refreshJob=job&mode=application&reports=import&staging=draft");
+    expect(state.reports).toEqual({ view: "import", stagingId: "draft", reportSetId: undefined, activityWindowDays: 30 });
+    expect(parseDataSyncRoute(dataSyncRouteSearch(state).toString())).toEqual(state);
+    expect(dataSyncRouteSearch({ ...state, reports: undefined }).toString()).toBe("syncRun=run&refreshJob=job&mode=application");
+    expect(parseSyncReportRoute("reports=unknown")).toBeUndefined();
+    expect(parseSyncReportRoute("reports=snapshot&snapshot=bad%0Aid&window=-10"))
+      .toEqual({ view: "snapshot", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
+    expect(parseSyncReportRoute("reports=manage&snapshot=retained&staging=draft&window=90"))
+      .toEqual({ view: "manage", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
   });
 
   it("round trips organization views and all supported table sorts without changing old links", () => {
@@ -309,28 +335,27 @@ describe("workbench routing", () => {
 
   it("defaults retained usage snapshots to the full historical activity window", () => {
     const reportSetId = "11111111-1111-4111-8111-111111111111";
-    const historical = parseOfficialUsageRoute(`snapshot=${reportSetId}`);
+    const historical = parseSyncReportRoute(`reports=snapshot&snapshot=${reportSetId}`);
     expect(historical).toEqual({
       view: "snapshot",
       stagingId: undefined,
       reportSetId,
       activityWindowDays: 365,
     });
-    expect(officialUsageRouteSearch(historical).toString()).toBe(`snapshot=${reportSetId}`);
-    expect(parseOfficialUsageRoute("")).toEqual({
-      view: "overview",
+    expect(dataSyncRouteSearch({ refreshMode: "delegated", reports: historical }).toString()).toBe(`reports=snapshot&snapshot=${reportSetId}`);
+    expect(parseSyncReportRoute("reports=snapshot")).toEqual({
+      view: "snapshot",
       stagingId: undefined,
       reportSetId: undefined,
       activityWindowDays: 30,
     });
   });
 
-  it("keeps cumulative, explicit snapshot, history and legacy window routes distinct", () => {
-    expect(officialUsageRouteSearch(parseOfficialUsageRoute("")).toString()).toBe("");
-    expect(officialUsageRouteSearch(parseOfficialUsageRoute("view=snapshot")).toString()).toBe("view=snapshot");
-    expect(officialUsageRouteSearch(parseOfficialUsageRoute("view=history")).toString()).toBe("view=history");
-    expect(parseOfficialUsageRoute("window=90")).toMatchObject({ view: "snapshot", activityWindowDays: 90 });
-    expect(officialUsageRouteSearch(parseOfficialUsageRoute("window=90")).toString()).toBe("window=90");
+  it("keeps the Sync page, import workflow, history and snapshot routes distinct", () => {
+    for (const search of ["", "reports=import", "reports=manage", "reports=snapshot", "reports=snapshot&window=90"]) {
+      expect(dataSyncRouteSearch(parseDataSyncRoute(search)).toString()).toBe(search);
+    }
+    expect(parseSyncReportRoute("reports=snapshot&window=90")).toMatchObject({ view: "snapshot", activityWindowDays: 90 });
   });
 
   it("carries an exact employee identity into an explicit Purview search", () => {

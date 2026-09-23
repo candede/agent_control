@@ -90,11 +90,12 @@ describe("job presentation", () => {
   });
   it("keeps snapshot links read-only and only active imports linked to draft review", () => {
     const draft = { ...base, source: "official-usage" as const, status: "active", href: "/official-usage?staging=draft-1" as const };
-    expect(jobSourceHref(draft)).toBe(draft.href);
+    expect(jobSourceHref(draft)).toBe("/sync?reports=import&staging=draft-1");
     expect(jobSourceLinkLabel(draft)).toBe("Review CSV import");
-    expect(jobSourceHref({ ...draft, status: "accepted" })).toBe("/official-usage?view=history");
-    expect(jobSourceHref({ ...draft, status: "accepted", href: "/official-usage?view=history&snapshot=set-1" })).toBe("/official-usage?view=history&snapshot=set-1");
-    expect(jobSourceLinkLabel({ ...draft, status: "accepted" })).toBe("View report history");
+    expect(jobSourceHref({ ...draft, status: "accepted" })).toBe("/sync?reports=manage");
+    expect(jobSourceHref({ ...draft, status: "accepted", href: "/official-usage?view=history&snapshot=set-1" })).toBe("/sync?reports=snapshot&snapshot=set-1");
+    expect(jobSourceLinkLabel({ ...draft, status: "accepted" })).toBe("Manage reports");
+    expect(jobSourceLinkLabel({ ...draft, status: "accepted", href: "/sync?reports=snapshot&snapshot=set-1" })).toBe("View snapshot");
     expect(jobSourceHref({ ...base, href: "/agents?syncRun=job-1" })).toBe("/sync?syncRun=job-1");
   });
   it("uses cancel metadata, not provider-read resume metadata, for read refresh cancellation", () => {

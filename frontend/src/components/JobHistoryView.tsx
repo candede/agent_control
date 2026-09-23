@@ -135,7 +135,7 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
         {state ? <p>Last checked <time dateTime={state.polledAt}>{formatJobInstant(state.polledAt)}</time>. Status request <code>{state.requestId}</code>.</p> : null}
         <p>Up to 100 recent records, capped per source. Filters apply to this list, not a complete archive. Sync runs and their source jobs are separate records.</p>
         <div className="jobs-related-history">
-          <a href="/official-usage?view=history">Report snapshot history</a>
+          <a href="/sync?reports=manage">Manage reports</a>
           <a href="/audit?source=local">Administrative audit log</a>
         </div>
       </footer>
@@ -185,7 +185,7 @@ export function JobHistoryView({ state, error, loading, busy, pollingPaused, onR
             {state ? <div><dt>Status lookup request</dt><dd><code>{state.requestId}</code></dd></div> : null}
           </dl>
           <p>Missing start or finish times are not inferred from updates. The status lookup request identifies this page's status check, not a provider operation. Detailed results and diagnostics remain in the source view.</p>
-          {selected.source === "official-usage" ? <p>Jobs shows at most 50 CSV staging records created in the last 24 hours. Older accepted reports remain in report snapshot history, subject to retention.</p> : null}
+          {selected.source === "official-usage" ? <p>Jobs shows at most 50 CSV staging records created in the last 24 hours. Older accepted reports remain in Sync &gt; Manage reports, subject to retention.</p> : null}
         </section>
       </> : <p role="status">{loading ? "Checking the selected job..." : "This job is no longer in the latest authorized recent-records list. Its source may be unavailable, the record may have expired, or access may have changed."}</p>}
     </WorkbenchDialog>

@@ -49,6 +49,17 @@ async function submitAndRun(idempotencyKey: string, roleScope: "full" | "ai" | "
 }
 
 describe.sequential("Power Platform inventory repository", () => {
+  it("retains internal sync cleanup provenance instead of blaming the requesting principal", async () => {
+    const job = await repository.submit(scope, {
+      idempotencyKey: "inventory-sync-cleanup", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
+    });
+    await repository.cancel(scope, job.id, "sync_cleanup");
+    await repository.cancel(scope, job.id);
+    expect(await repository.getJob(scope, job.id)).toMatchObject({
+      status: "cancelled", errorCode: "data_sync_cleanup", message: expect.stringContaining("original failure or interruption"),
+    });
+  });
+
   it("projects recognized authoring metadata from an existing saved row without changing its raw evidence", async () => {
     const legacyFixture = await testDatabase();
     const legacyRepository = new PowerPlatformInventoryRepository(legacyFixture.runtime);

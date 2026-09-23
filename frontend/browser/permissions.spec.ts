@@ -122,7 +122,8 @@ test("primary navigation uses the full header width at every screen size", async
   });
   await page.goto("/permissions");
   const navigation = page.getByRole("navigation", { name: "Primary views" });
-  await expect(navigation.getByRole("button")).toHaveCount(9);
+  await expect(navigation.getByRole("button")).toHaveCount(8);
+  await expect(navigation.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   const originalViewport = page.viewportSize()!;
   for (const width of [originalViewport.width, 768, 1024, 1920]) {
     await page.setViewportSize({ ...originalViewport, width });
@@ -647,20 +648,28 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
     if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/refresh-jobs")) providerRefreshes += 1;
   });
   await login(page, "role-Admin");
-  for (const view of ["Agents", "Power Platform", "Users", "Official usage", "Audit", "Security", "Jobs"]) {
+  for (const view of ["Agents", "Power Platform", "Users", "Audit", "Security", "Jobs"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Close", exact: true }).click();
   await login(page, "role-Viewer");
-  for (const view of ["Agents", "Power Platform", "Users", "Official usage", "Audit", "Security", "Jobs"]) {
+  for (const view of ["Agents", "Power Platform", "Users", "Audit", "Security", "Jobs"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Manage reports", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Delete retained set for / })).toHaveCount(0);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   const beforeViewerView = providerRefreshes;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   expect(providerRefreshes).toBe(beforeViewerView);
@@ -687,7 +696,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
     ["/agents", "Agents"],
     ["/power-platform", "Power Platform"],
     ["/users", "Users"],
-    ["/official-usage", "Official usage"],
+    ["/sync", "Sync"],
     ["/audit", "Audit"],
     ["/security", "Security"],
     ["/permissions", "Permissions"],
@@ -696,7 +705,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   for (const [path, label] of routes) {
     const response = await page.goto(path);
     expect(response?.status()).toBe(200);
-    await expect(page.getByRole("button", { name: label, exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: label === "Sync" ? /^Sync/ : label, exact: label !== "Sync" })).toHaveAttribute("aria-current", "page");
   }
 
   await page.goto("/agents?q=synthetic&status=allowed&selected=synthetic-package");
@@ -722,14 +731,20 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   });
   const initialReportRead = scopedReportRequest();
   await page.goto("/official-usage?window=90");
+  await expect(page).toHaveURL(/\/sync\?reports=snapshot&window=90$/);
   await initialReportRead;
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByLabel("Active in last")).toHaveCount(0);
+  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page).toHaveURL(/\/sync$/);
   await page.getByRole("button", { name: "Jobs", exact: true }).click();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/sync$/);
   const restoredReportRead = scopedReportRequest();
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await expect(page).toHaveURL(/\/official-usage\?window=90$/);
+  await page.goBack();
+  await expect(page).toHaveURL(/\/sync\?reports=snapshot&window=90$/);
   await restoredReportRead;
+  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
 
   await page.goto("/security?template=agent_activity&operation=InvokeAgent&agentIds=saved-agent");
   await expect(page.getByLabel("Fixed template")).toHaveValue("agent_activity");
@@ -1099,7 +1114,7 @@ test("loading and automatic-check transport failure preserve layout and fail clo
   }
   await expect(page.getByRole("table", { name: "Account permissions" }).getByRole("button", { name: /^View details for/ })).toHaveCount(primaryCapabilityCount);
   await expect(page.getByRole("alert")).toContainText("Automatic permission check failed");
-  await page.getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   const diagnosticsTrigger = page.getByRole("button", { name: "View diagnostics", exact: true });
   await diagnosticsTrigger.click();
   const diagnostics = page.getByRole("dialog", { name: "Inventory diagnostics", exact: true });
@@ -1122,8 +1137,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
     localStorage.setItem("agent-control:usage-reports:v1", "untrusted legacy rows");
     localStorage.setItem("unrelated", "preserve me");
   });
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   const modal = page.locator("dialog.official-usage-modal");
   await expect(page.getByRole("dialog", { name: "Import CSV reports" })).toBeVisible();
   await expect(modal.getByText(/Legacy browser report data is present/)).toBeVisible();
@@ -1139,7 +1154,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
 
   await page.reload();
-  await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await expect(page).toHaveURL(/\/sync\?reports=import$/);
+  await expect(modal).toBeVisible();
   validation = modal.getByRole("region", { name: "Server validation" });
   await expect(validation.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
   const stagedState: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
@@ -1187,14 +1203,15 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   expect(await page.evaluate(() => ({ legacy: localStorage.getItem("agent-control:usage-reports:v1"), unrelated: localStorage.getItem("unrelated") }))).toEqual({ legacy: null, unrelated: "preserve me" });
 
   await modal.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Retained activity summary" })).toContainText("Reported used agents");
-  await page.getByRole("button", { name: "Snapshot details", exact: true }).click();
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  await expect(modal.getByRole("region", { name: "Retained activity summary" })).toHaveCount(0);
+  await modal.getByRole("button", { name: "View current snapshot", exact: true }).click();
   await page.locator(".usage-report-details > summary").click();
   await expect(page.getByText(/Microsoft 365 admin center Copilot Agents usage exports\. Source discrepancies/)).toBeVisible();
   const lineage = page.locator(".usage-source-files");
   await expect(lineage.locator(":scope > details")).toHaveCount(3);
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("region", { name: "Agent comparison rows" }).locator("tbody tr")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(1);
   await expect(page.getByRole("region", { name: "Agent activity report" }).getByRole("link")).toHaveCount(0);
   for (const source of await lineage.locator(":scope > details").all()) {
     await source.locator("summary").click();
@@ -1204,9 +1221,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   }
   await expect(page.getByText(/Import time does not establish source freshness/)).toBeVisible();
 
-  await page.getByRole("button", { name: "Import reports", exact: true }).click();
-  await modal.getByRole("button", { name: "Manage reports", exact: true }).click();
-  const activeSetRow = modal.getByRole("region", { name: "Retained report sets" }).getByRole("row").filter({ hasText: "Current" });
+  await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+  const activeSetRow = modal.getByRole("region", { name: "Retained official usage snapshots" }).getByRole("row").filter({ hasText: "Current" });
   const deleteSet = activeSetRow.getByRole("button", { name: /^Delete retained set for / });
   await deleteSet.click();
   const dialog = page.getByRole("dialog", { name: "Confirm delete" });
@@ -1234,8 +1250,10 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   const unchanged: OfficialUsageAggregateView = await (await page.request.get("/api/official-usage/aggregate")).json();
   expect(unchanged.activeSet?.id).toBe(accepted.activeSet?.id);
   expect(unchanged.summary.usage).toMatchObject({ totalResponses: 9, totalActiveUsers: 1 });
-  await expect(page.getByRole("region", { name: "Usage summary" })).toContainText("9");
-  await page.getByRole("button", { name: "Import reports", exact: true }).click();
+  await page.goto(`/sync?reports=snapshot&snapshot=${accepted.activeSet!.id}`);
+  await expect(page.getByRole("region", { name: "Snapshot tenant totals" })).toContainText("9");
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   await modal.getByRole("button", { name: "Discard staging" }).click();
   await expect(modal.getByText("All staged rows were discarded.", { exact: true })).toBeVisible();
   const discarded: OfficialUsageAdminState = await (await page.request.get("/api/official-usage/admin")).json();
@@ -1260,19 +1278,21 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await page.evaluate(() => localStorage.setItem("agent-control:usage-reports:v1", "still-untrusted"));
   await login(page, "role-Viewer");
   await expect(page.getByText(/Legacy browser report data is present in this browser/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Official usage", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Cumulative agent activity" })).toBeVisible();
-  await page.getByRole("button", { name: "Snapshot details", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  await expect(modal.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
+  await modal.getByRole("button", { name: "View current snapshot", exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole("button", { name: "Import reports", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
   const session = await (await page.request.get("/api/me")).json();
   const deniedImport = await page.request.post("/api/official-usage/staging", {
     headers: { "X-CSRF-Token": session.csrfToken },
     multipart: { bundleId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", file: { name: "agents.csv", mimeType: "text/csv", buffer: Buffer.from(agentsCsv) } },
   });
   expect(deniedImport.status()).toBe(403);
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");
   await expect(page.getByText(/Run Users sync/).first()).toBeVisible();

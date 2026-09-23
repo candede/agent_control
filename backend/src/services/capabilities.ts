@@ -32,6 +32,7 @@ export class CapabilityService {
   private readonly inFlight = new Map<string, Promise<CapabilityDecision>>();
   private readonly automaticInFlight = new Map<string, Promise<void>>();
   private readonly generations = new Map<string, number>();
+  private readonly pendingPrincipalInvalidations = new Map<string, number>();
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly repository = new CapabilityRepository(), private readonly probes: ProbeDependencies = defaultProbeDependencies) {}
@@ -97,16 +98,16 @@ export class CapabilityService {
     return decision(definition, evidence.status, evidence, previewState(definition, configuration));
   }
 
-  async requireAvailable(capabilityId: CapabilityId, user: AuthenticatedUser) {
+  async requireAvailable(capabilityId: CapabilityId, user: AuthenticatedUser, options: { retryFailed?: boolean } = {}) {
     const definition = requiredDefinition(capabilityId);
     const generation = this.generation(definition.id, user);
     let current = await this.decision(definition, user);
     this.requireGeneration(definition.id, user, generation);
-    if (!current.authorized && !current.fresh
+    if (!current.authorized && !reuseCapabilityCheck(current, Boolean(options.retryFailed))
       && (supportsAutomaticCapabilityCheck(capabilityId) || definition.probe.kind === "on_demand")) {
       current = await this.refreshAtGeneration(definition, user, generation);
     }
-    if (!current.authorized) throw new AppError(403, "capability_unavailable", "The capability is not currently authorized.", current);
+    if (!current.authorized) throw unavailableCapabilityError(current);
     return current;
   }
 
@@ -257,8 +258,7 @@ export class CapabilityService {
       .map(definition => ({ definition, refreshGeneration: this.generation(definition.id, user) }));
     await Promise.all(eligible.map(async ({ definition, refreshGeneration }) => {
       const current = await this.decision(definition, user);
-      const reuseFresh = current.fresh && current.verification !== "on_demand"
-        && (!retryFailed || current.authorized || current.evidence?.category === "provider_throttled");
+      const reuseFresh = reuseCapabilityCheck(current, retryFailed);
       if (reuseFresh || generation !== (this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0)) return;
       await this.refreshAtGeneration(definition, user, refreshGeneration);
     }));
@@ -284,13 +284,21 @@ export class CapabilityService {
   }
 
   async invalidatePrincipal(user: AuthenticatedUser) {
-    this.bump(this.principalGenerationKey(user.tenantId!, user.homeAccountId));
-    await this.mutate(() => this.repository.invalidatePrincipal(user.tenantId!, user.homeAccountId));
+    const key = this.principalGenerationKey(user.tenantId!, user.homeAccountId);
+    const generation = this.bump(key);
+    this.pendingPrincipalInvalidations.set(key, generation);
+    await this.mutate(async () => {
+      await this.repository.invalidatePrincipal(user.tenantId!, user.homeAccountId);
+      if (this.pendingPrincipalInvalidations.get(key) === generation) this.pendingPrincipalInvalidations.delete(key);
+    });
   }
 
   private async currentConfiguration(definition: CapabilityDefinition, user: AuthenticatedUser, generation = this.generation(definition.id, user)) {
     await this.mutationTail;
     this.requireGeneration(definition.id, user, generation);
+    if (this.pendingPrincipalInvalidations.has(this.principalGenerationKey(user.tenantId!, user.homeAccountId))) {
+      throw new AppError(503, "capability_invalidation_failed", "Capability evidence could not be invalidated. Retry after account authorization cleanup succeeds.");
+    }
     const configuration = await this.repository.configuration(user.tenantId!, definition.id);
     this.requireGeneration(definition.id, user, generation);
     return configuration;
@@ -348,7 +356,9 @@ export class CapabilityService {
   }
 
   private bump(key: string) {
-    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+    const generation = (this.generations.get(key) ?? 0) + 1;
+    this.generations.set(key, generation);
+    return generation;
   }
 
   private mutate<T>(operation: () => Promise<T>): Promise<T> {
@@ -359,6 +369,28 @@ export class CapabilityService {
 }
 
 export const capabilities = new CapabilityService();
+
+function reuseCapabilityCheck(current: CapabilityDecision, retryFailed: boolean) {
+  return current.fresh && current.verification !== "on_demand"
+    && (!retryFailed || current.authorized || current.evidence?.category === "provider_throttled");
+}
+
+function unavailableCapabilityError(current: CapabilityDecision) {
+  const category = current.evidence?.category;
+  if (current.status === "provider_error") {
+    if (category === "provider_timeout") {
+      return new AppError(504, "provider_timeout", "The Microsoft readiness check timed out. This does not establish missing permissions. Retry the readiness check.", current);
+    }
+    if (category === "provider_throttled") {
+      return new AppError(429, "provider_throttled", "Microsoft throttled the readiness check. Wait for the provider cooldown before retrying; no permission change is indicated.", current);
+    }
+    return new AppError(503, "provider_error", "The Microsoft readiness check failed. This does not establish missing permissions. Retry the readiness check.", current);
+  }
+  if (current.status === "unknown" && (category === "interaction_required" || category === "authorization_expired")) {
+    return new AppError(401, category, "Explicit resume with renewed Microsoft authorization is required.", current);
+  }
+  return new AppError(403, "capability_unavailable", "The capability is not currently authorized.", current);
+}
 
 function requiredDefinition(capabilityId: CapabilityId) {
   const definition = getCapabilityDefinition(capabilityId);

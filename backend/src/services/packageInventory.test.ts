@@ -286,7 +286,7 @@ describe("Package refresh service", () => {
   it("lets only the owning Viewer cancel a read refresh", async () => {
     const direct = fixture();
     await expect(direct.service.cancel(user, direct.job.id, "delegated")).resolves.toMatchObject({ status: "cancelled" });
-    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id, user.homeAccountId);
+    expect(direct.repository.cancel).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, direct.job.id, user.homeAccountId, "requested");
     await expect(direct.service.cancel({ ...user, roles: [] }, direct.job.id, "delegated")).rejects.toMatchObject({ code: "missing_internal_role" });
   });
 
@@ -296,6 +296,20 @@ describe("Package refresh service", () => {
     await expect(service.start(user, job.id, "delegated")).rejects.toMatchObject({ code: "interaction_required" });
     expect(repository.markRunning).not.toHaveBeenCalled();
     expect(dependencies.scan).not.toHaveBeenCalled();
+  });
+
+  it("forwards explicit readiness retry and internal cleanup without weakening admission", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    dependencies.requireAvailable.mockRejectedValueOnce(new AppError(504, "provider_timeout", "Readiness timed out."));
+    await expect(service.start(user, job.id, "delegated", { retryFailed: true }))
+      .rejects.toMatchObject({ code: "provider_timeout" });
+    expect(dependencies.requireAvailable).toHaveBeenCalledWith("graph.package.read.delegated", user, { retryFailed: true });
+    expect(repository.markRunning).not.toHaveBeenCalled();
+    expect(dependencies.scan).not.toHaveBeenCalled();
+    await service.cancel(user, job.id, "delegated", "sync_cleanup");
+    expect(repository.cancel).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, user.homeAccountId, "sync_cleanup",
+    );
   });
 
   it("aborts logout work and never publishes after the principal changes", async () => {

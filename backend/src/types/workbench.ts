@@ -5,7 +5,6 @@ export const workbenchViewIds = [
   "agents",
   "power-platform",
   "users",
-  "official-usage",
   "sync",
   "audit",
   "security",

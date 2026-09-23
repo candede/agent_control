@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
+import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
 import { powerPlatformAgentKey, powerPlatformInventoryIdentity, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { inventoryQueryTypes } from "../services/inventoryRoleScope.js";
 import {
@@ -219,12 +220,13 @@ export class PowerPlatformInventoryRepository {
     return this.getJob(scope, id);
   }
 
-  async cancel(scope: InventoryDataScope, id: string) {
+  async cancel(scope: InventoryDataScope, id: string, reason: RefreshCancellationReason = "requested") {
     validateScope(scope);
-    await this.database.query(`UPDATE power_platform_refresh_jobs SET status='cancelled',error_code='cancelled',message='Cancelled by the requesting principal.',
+    const cancellation = refreshCancellation(reason);
+    await this.database.query(`UPDATE power_platform_refresh_jobs SET status='cancelled',error_code=$4,message=$5,
       finished_at=clock_timestamp(),updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()`,
-    [id, scope.tenantId, scope.principalId]);
+    [id, scope.tenantId, scope.principalId, cancellation.code, cancellation.message]);
     return this.getJob(scope, id);
   }
 

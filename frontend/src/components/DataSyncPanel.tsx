@@ -610,8 +610,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                 {usageReady && usage.lastSuccessAt ? <p>Accepted <time dateTime={usage.lastSuccessAt}>{formatInstant(usage.lastSuccessAt)}</time>. Overlapping snapshots are not added together.</p>
                   : <p>Manual import is separate from automatic sync and does not block collecting users or inventory.</p>}
                 <div className="data-sync-links">
-                  <a href="/official-usage?view=history">View report history</a>
-                  {canUploadUsage && onManageUsageReports ? <button type="button" className="sync-text-button" onClick={onManageUsageReports}>Manage reports</button> : null}
+                  {onManageUsageReports ? <button type="button" className="sync-text-button" onClick={onManageUsageReports}>Manage reports</button> : null}
                 </div>
               </div>
               {canUploadUsage ? <button type="button" className="secondary" onClick={onOpenUsageImport}>

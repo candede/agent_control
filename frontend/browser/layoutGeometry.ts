@@ -59,7 +59,7 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
   for (const child of Array.from(shell.children).filter(visible)) contained(child, shell);
   const surfaces = [
     ".catalog-controls", ".agent-summary-grid", ".inventory-view", ".copilot-users",
-    ".official-usage-workbench", ".audit-source-view", ".defender-hunting", ".permission-center", ".jobs-view",
+    ".data-sync-panel", ".audit-source-view", ".defender-hunting", ".permission-center", ".jobs-view",
   ];
   for (const surface of Array.from(shell.querySelectorAll(surfaces.join(", "))).filter(visible)) {
     const rect = surface.getBoundingClientRect();

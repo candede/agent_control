@@ -10,7 +10,7 @@ const cases = [
     fields: [".inventory-controls"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
     fields: [".copilot-users-toolbar"] },
-  { name: "official-usage", path: "/official-usage?view=snapshot", ready: ".usage-agent-table tbody tr",
+  { name: "report-snapshot", path: "/sync?reports=snapshot", ready: ".usage-agent-table tbody tr",
     fields: [".usage-agent-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
@@ -43,7 +43,7 @@ for (const scenario of cases) {
     const unexpectedRequests = await mockLayoutApi(page);
     await page.goto(scenario.path);
     await expect(page.locator(scenario.ready).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: /provider-verified.*degraded/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: /provider-verified.*degraded/, includeHidden: scenario.name === "report-snapshot" })).toBeVisible();
     if (scenario.name === "agents") {
       await page.getByRole("checkbox", { name: "Advanced filters" }).check();
     }
@@ -67,11 +67,12 @@ for (const scenario of cases) {
       await page.getByRole("button", { name: "Shared application modes (3)" }).click();
       await expect(page.getByRole("table", { name: "Shared application permissions" })).toBeVisible();
     }
-    if (scenario.name === "official-usage") {
+    if (scenario.name === "report-snapshot") {
       await expect(page.locator(".usage-report-context")).toContainText("2026-08-30");
-      await expect(page.getByRole("dialog")).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "Import reports", exact: true })).toBeVisible();
-      await expect(page.getByRole("region", { name: "Agent comparison rows" }).locator("tbody tr")).toHaveCount(2);
+      await expect(page.getByRole("dialog")).toHaveCount(1);
+      await expect(page.locator("dialog.official-usage-modal")).toBeVisible();
+      await expect(page.locator("dialog.official-usage-modal").getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(2);
       await expect(page.locator(".report-chart-panel")).toHaveCount(0);
     }
     if (scenario.name === "agents") {
@@ -117,16 +118,26 @@ for (const scenario of cases) {
           await assertLayout(page, scenario.fields, `security three-field activity form at ${width}px`);
           await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agents_inventory");
         }
-        if (scenario.name === "official-usage") {
-          const columns = await page.locator(".usage-headline-grid")
-            .evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
-          expect.soft(columns, `Three headline metrics form complete rows at ${width}px`).toBe(width === 360 ? 1 : 3);
+        if (scenario.name === "report-snapshot") {
+          const totals = page.getByRole("region", { name: "Snapshot tenant totals" });
+          const metrics = totals.locator(":scope > div");
+          await expect(metrics).toHaveCount(2);
+          const first = (await metrics.nth(0).boundingBox())!, second = (await metrics.nth(1).boundingBox())!;
+          if (width === 360) {
+            expect(second.y, "Narrow snapshots wrap tenant totals without overlap").toBeGreaterThanOrEqual(first.y + first.height);
+          } else {
+            expect(second.y, "Wide snapshots align tenant totals").toBeCloseTo(first.y, 1);
+            expect(second.x).toBeGreaterThanOrEqual(first.x + first.width);
+          }
+          const modal = page.locator("dialog.official-usage-modal");
+          await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport({ ratio: 1 });
+          expect(await modal.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
           if (width >= 1280) {
-            const bounds = await page.getByRole("region", { name: "Agent comparison rows" }).boundingBox();
-            expect(bounds!.y, `Agent comparison begins in the first viewport at ${width}px`).toBeLessThan(760);
+            const bounds = await page.getByRole("region", { name: "Report agent rows" }).boundingBox();
+            expect(bounds!.y, `Source rows begin in the first viewport at ${width}px`).toBeLessThan(760);
           }
         }
-        if (["jobs", "official-usage"].includes(scenario.name) && [360, 1920].includes(width)) {
+        if (["jobs", "report-snapshot"].includes(scenario.name) && [360, 1920].includes(width)) {
           await test.step("Reduced-motion layout parity", async () => {
             await assertReducedMotionParity(page, `${scenario.name} at ${width}px`);
             await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}-reduced-motion.png`), fullPage: true, animations: "disabled" });
@@ -144,7 +155,7 @@ for (const scenario of cases) {
 async function assertReducedMotionParity(page: Page, description: string) {
   const surfaces = [
     ".jobs-view", ".jobs-current", ".jobs-history", ".job-history-table", ".job-history-table tbody tr", ".inline-actions",
-    ".official-usage-workbench", ".official-usage-import", ".official-usage-fields", ".official-usage-fields > label",
+    ".official-usage-modal", ".official-usage-import", ".official-usage-fields", ".official-usage-fields > label",
     ".reporting-view", ".usage-comparison-header", ".usage-agent-table", ".usage-agent-filters",
   ].join(", ");
   const geometry = () => page.locator(surfaces).evaluateAll(elements => elements.map(element => {

@@ -18,8 +18,31 @@ describe("workbench metadata", () => {
   it("declares every required view once with Agents first", () => {
     const metadata = getWorkbenchMetadata();
     expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds);
+    expect(metadata.views.map(view => view.id)).toEqual([
+      "agents", "power-platform", "users", "sync", "audit", "security", "permissions", "jobs",
+    ]);
     expect(metadata.views[0]).toMatchObject({ id: "agents", path: "/agents" });
     expect(new Set(metadata.views.map(view => view.path)).size).toBe(metadata.views.length);
+    expect(metadata.views.find(view => view.id === "sync")).toMatchObject({
+      path: "/sync", roles: ["AgentControl.Viewer"],
+      source: expect.stringContaining("report import, management, and snapshot inspection"),
+    });
+  });
+
+  it("moves report workflow labels to Sync without renaming APIs or changing authority", () => {
+    const actions = getWorkbenchMetadata().actions;
+    expect(actions.find(action => action.id === "usage.import")).toMatchObject({
+      label: "Import reports in Sync", roles: ["AgentControl.Admin"], capabilityId: "reports.official.import",
+      method: "POST", route: "/api/official-usage/bundles/:id/accept", preview: "required", confirmation: "explicit",
+    });
+    expect(actions.find(action => action.id === "usage.staging.cancel")).toMatchObject({
+      label: "Discard actor-owned staging in Sync", roles: ["AgentControl.Admin"],
+      method: "DELETE", route: "/api/official-usage/staging/:id", confirmation: "explicit",
+    });
+    expect(actions.find(action => action.id === "usage.export.aggregate")).toMatchObject({
+      label: "Export report snapshot in Sync", roles: ["AgentControl.Viewer"],
+      method: "GET", route: "/api/official-usage/aggregate.csv",
+    });
   });
 
   it.each(["purview.resume", "defender.resume"])("leaves %s authorization mode to the retained job", id => {

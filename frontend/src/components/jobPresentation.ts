@@ -1,4 +1,5 @@
 import type { WorkbenchJobSource, WorkbenchJobSummary } from "../api/client";
+import { dataSyncRouteSearch, parseSyncReportRoute, workbenchUrl } from "../workbenchRouting";
 import { formatSyncInstant, syncDuration } from "./syncPresentation";
 
 export type JobOperation = "resume" | "cancel" | "reconcile";
@@ -116,9 +117,11 @@ export function jobDuration(job: WorkbenchJobSummary) {
 
 export function jobSourceHref(job: WorkbenchJobSummary) {
   if (job.source === "data-sync") return `/sync?syncRun=${encodeURIComponent(job.id)}`;
-  if (job.source === "official-usage" && job.status !== "active") {
-    const snapshot = new URL(job.href, "https://agent-control.invalid").searchParams.get("snapshot");
-    return `/official-usage?view=history${snapshot ? `&snapshot=${encodeURIComponent(snapshot)}` : ""}`;
+  if (job.source === "official-usage") {
+    const params = new URL(job.href, "https://agent-control.invalid").searchParams;
+    params.set("reports", job.status === "active" ? "import" : params.has("snapshot") ? "snapshot" : "manage");
+    const reports = parseSyncReportRoute(params.toString());
+    return workbenchUrl("sync", dataSyncRouteSearch({ refreshMode: "delegated", reports }));
   }
   return job.href;
 }
@@ -132,7 +135,8 @@ export function jobSourceLinkLabel(job: WorkbenchJobSummary) {
     case "quarantine": return "Open quarantine job";
     case "purview": return "Open audit search";
     case "defender": return "Open investigation";
-    case "official-usage": return job.status === "active" ? "Review CSV import" : "View report history";
+    case "official-usage": return job.status === "active" ? "Review CSV import"
+      : new URL(jobSourceHref(job), "https://agent-control.invalid").searchParams.has("snapshot") ? "View snapshot" : "Manage reports";
   }
 }
 
