@@ -345,7 +345,6 @@
 .data-sync-run-meta { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .data-sync-progress-note { margin-bottom: 7px; }
 .data-sync-run-meta code { overflow-wrap: anywhere; }
-.data-sync-poll-note { margin: 0; color: #79551c; font-size: 13px; }
 
 .data-sync-reports {
   display: grid;

@@ -439,6 +439,53 @@ describe("JobsView", () => {
     expect(reads).toBe(2);
   });
 
+  it.each([401, 403])("releases an interrupted status check after a %s action denial", async status => {
+    const onChanged = vi.fn();
+    const active = {
+      id: "denied-job", source: "data-sync", label: "Private retained sync", target: "Saved sources",
+      status: "partial", total: 3, completed: 1, partial: true, canResume: true, canCancel: false,
+      canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=denied-job",
+    };
+    const projection = { ...emptyProjection, value: [active] };
+    let releaseOld!: (response: Response) => void;
+    let reads = 0;
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/api/workbench/jobs") {
+        reads += 1;
+        if (reads === 2) return new Promise<Response>(resolve => { releaseOld = resolve; });
+        return Response.json(projection);
+      }
+      return Response.json({ type: "about:blank", status, code: "forbidden", detail: "This sync is no longer authorized." },
+        { status, headers: { "Content-Type": "application/problem+json", "X-Request-ID": "denied-request" } });
+    });
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} onChanged={onChanged} />);
+    const details = await openJob(active.id);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() => expect(reads).toBe(2));
+    const staleSignal = fetchMock.mock.calls[1][1].signal as AbortSignal;
+    expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
+
+    await userEvent.click(details.getByRole("button", { name: "Retry incomplete" }));
+
+    expect(await details.findByRole("alert")).toHaveTextContent("This sync is no longer authorized. Request denied-request.");
+    expect(staleSignal.aborted).toBe(true);
+    expect(details.queryByText(active.id, { exact: true })).not.toBeInTheDocument();
+    expect(details.queryByRole("button", { name: "Retry incomplete" })).not.toBeInTheDocument();
+    expect(details.queryByText("Checking the selected job...")).not.toBeInTheDocument();
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(reads).toBe(2);
+
+    await act(async () => { releaseOld(Response.json(projection)); });
+    expect(details.queryByText(active.id, { exact: true })).not.toBeInTheDocument();
+    await userEvent.click(details.getByRole("button", { name: "Close job details" }));
+    expect(screen.getByRole("button", { name: "Refresh status" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(await screen.findByText(active.label)).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reads).toBe(3);
+    expect(fetchMock.mock.calls.filter(([, init]) => init.method === "POST")).toHaveLength(1);
+  });
+
   it("leaves a shared pre-action observer running while using a fresh post-action read", async () => {
     const client = createSavedQueryClient();
     const active = {
@@ -784,10 +831,7 @@ describe("JobsView", () => {
     expect(screen.getByRole("heading", { name: "Jobs" })).toHaveFocus();
   });
 
-  it.each([
-    ["all", "Refresh status"],
-    ["sync", "Refresh history"],
-  ] as const)("announces its finite polling budget in %s scope and resumes only on refresh", async (scope, refreshLabel) => {
+  it("announces the standalone Jobs polling budget and resumes only on refresh", async () => {
     vi.useFakeTimers();
     fetchMock.mockImplementation(async () => Response.json({
       ...emptyProjection, value: [{
@@ -796,22 +840,48 @@ describe("JobsView", () => {
         canReconcile: false, updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=running-job",
       }],
     }));
-    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} scope={scope} />);
+    render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(299_999); });
     expect(fetchMock).toHaveBeenCalledTimes(150);
     expect(screen.queryByText(/Automatic status updates paused/)).not.toBeInTheDocument();
     await act(async () => { await vi.advanceTimersByTimeAsync(2); });
     expect(fetchMock).toHaveBeenCalledTimes(151);
     expect(screen.getByText(/Automatic status updates paused after five minutes/)).toBeVisible();
-    expect(screen.getByText(/Automatic status updates paused after five minutes/)).toHaveTextContent(`Use ${refreshLabel} to continue`);
+    expect(screen.getByText(/Automatic status updates paused after five minutes/)).toHaveTextContent("Use Refresh status to continue");
     const reads = fetchMock.mock.calls.length;
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(fetchMock).toHaveBeenCalledTimes(reads);
     await act(async () => {
-      screen.getByRole("button", { name: refreshLabel }).click();
+      screen.getByRole("button", { name: "Refresh status" }).click();
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(fetchMock).toHaveBeenCalledTimes(reads + 1);
     expect(screen.queryByText(/Automatic status updates paused/)).not.toBeInTheDocument();
+  });
+
+  it("keeps Sync history updating beyond thirty minutes until collection finishes", async () => {
+    vi.useFakeTimers();
+    let completed = false;
+    fetchMock.mockImplementation(async () => Response.json({
+      ...emptyProjection, value: [{
+        id: "running-job", source: "data-sync", label: "Active sync", target: "3 sources",
+        status: completed ? "completed" : "running", total: 3, completed: completed ? 3 : 1,
+        partial: false, canResume: false, canCancel: !completed, canReconcile: false,
+        updatedAt: emptyProjection.polledAt, href: "/sync?syncRun=running-job",
+      }],
+    }));
+    const view = render(<JobsView user={{ ...user, roles: ["AgentControl.Viewer"] }} scope="sync" />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    vi.setSystemTime(Date.now() + 30 * 60_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(screen.queryByText(/Automatic status updates paused/)).not.toBeInTheDocument();
+    completed = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(screen.getByRole("table", { name: "Sync run history" })).toHaveTextContent("Complete");
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    view.unmount();
   });
 });

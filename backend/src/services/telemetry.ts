@@ -1,6 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Request, RequestHandler } from "express";
 
+const packageDiagnosticNumberFields = new Set([
+  "missingCount", "nullCount", "emptyCount", "nonemptyCount", "invalidCount",
+  "matchingCount", "differingCount", "listOnlyCount", "detailOnlyCount", "bothMissingCount",
+  "requestCount", "retryCount", "throttleCount", "requestDurationMs", "maxRequestDurationMs",
+  "admissionWaitMs", "retryWaitMs", "readIntervalMs", "retryAfterMs",
+]);
+
 const allowedFields = new Set([
   "requestId", "runId", "jobId", "capabilityId", "provider", "outcome", "status",
   "durationMs", "ageMs", "attempt", "count", "mode", "source", "schemaVersion",
@@ -10,6 +17,7 @@ const allowedFields = new Set([
   "pageLimit", "rowLimit", "deadlineMs", "retryDelayMs", "providerRequestId",
   "providerCorrelationId", "resourceType", "field", "actualType", "length",
   "maximumLength", "resourceIndex", "firstSeenPage", "reason", "catalogScopedCount",
+  ...packageDiagnosticNumberFields, "retryDelaySource",
 ]);
 
 type TelemetryContext = { requestId?: string; jobId?: string; route?: string };
@@ -23,6 +31,8 @@ export function safeTelemetry(fields: Record<string, unknown> = {}) {
   const result: Record<string, string | number | boolean> = {};
   for (const [key, value] of Object.entries(fields)) {
     if (!allowedFields.has(key)) continue;
+    if (packageDiagnosticNumberFields.has(key) && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) continue;
+    if (key === "retryDelaySource" && value !== "retry_after" && value !== "fallback") continue;
     if (key === "route" && (typeof value !== "string" || /[?#]/.test(value))) continue;
     if (key === "errorCode" && (typeof value !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(value))) continue;
     if (["providerRequestId", "providerCorrelationId"].includes(key)

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowlistedPackage } from "../services/packageObservation.js";
-import { normalizePackageAuthoringTool } from "../types/copilotPackage.js";
+import { normalizePackageAuthoringTool, type CopilotPackageDetail } from "../types/copilotPackage.js";
 import { PackageInventoryRepository, packageFacets } from "./packageInventory.js";
 import { pool } from "./pool.js";
 
@@ -19,6 +19,22 @@ const snapshot = {
 };
 const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
 
+function mockList(values: CopilotPackageDetail[]) {
+  query.mockImplementation(async statement => {
+    if (typeof statement !== "string") throw new Error("Expected a saved package SQL statement.");
+    if (statement.startsWith("SELECT * FROM package_inventory_snapshots")) {
+      return { ...emptyResult, rowCount: 1, rows: [snapshot] };
+    }
+    if (statement.includes("SELECT count(*)::int AS total")) {
+      return { ...emptyResult, rowCount: 1, rows: [{ total: values.length, allowed: values.length, blocked: 0 }] };
+    }
+    if (statement.includes("SELECT package_data")) {
+      return { ...emptyResult, rowCount: values.length, rows: values.map(package_data => ({ package_data })) };
+    }
+    throw new Error("Unexpected saved package query.");
+  });
+}
+
 beforeEach(() => {
   query.mockReset();
   query.mockRejectedValue(new Error("Unexpected database query in authoring-filter unit test."));
@@ -30,30 +46,56 @@ afterAll(() => {
 
 describe("saved package authoring filters", () => {
   it.each([
-    ["Copilot Studio", "copilotstudio", true],
-    ["MicrosoftCopilotStudio", "copilotstudio", true],
-    ["Microsoft Copilot Studio", "copilotstudio", true],
-    ["Custom SDK", "customsdk", false],
-    ["CustomSDK", "customsdk", false],
-  ])("uses canonical filtering for %s in both counts and pages", async (platform, canonical, studio) => {
+    ["Copilot Studio", "copilotstudio", "Copilot Studio"],
+    ["MicrosoftCopilotStudio", "copilotstudio", "Copilot Studio"],
+    ["Microsoft Copilot Studio", "copilotstudio", "Copilot Studio"],
+    ["Custom SDK", "customsdk", "Custom SDK"],
+    ["CustomSDK", "customsdk", "Custom SDK"],
+    ["Copilot Studio Lite", "microsoft365copilotagentbuilder", "Microsoft 365 Copilot Agent Builder"],
+    ["MicrosoftCopilotStudioLite", "microsoft365copilotagentbuilder", "Microsoft 365 Copilot Agent Builder"],
+  ])("uses canonical filtering for %s in both counts and pages", async (platform, canonical, label) => {
     const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, platform });
-    query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [snapshot] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ total: 1, allowed: 1, blocked: 0 }] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ package_data: value }] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ package_data: value }] });
+    mockList([value]);
 
     const result = await new PackageInventoryRepository().list(scope, { platform, limit: 25, offset: 5 });
     expect(normalizePackageAuthoringTool(platform)).toBe(canonical);
-    expect(result.facets.platforms).toEqual([{ value: studio ? "Copilot Studio" : "Custom SDK", label: studio ? "Copilot Studio" : "Custom SDK" }]);
+    expect(result.facets.platforms).toEqual([{ value: label, label }]);
     expect(normalizePackageAuthoringTool(result.facets.platforms[0].value)).toBe(canonical);
     expect(query).toHaveBeenCalledTimes(4);
-    for (const call of [query.mock.calls[1], query.mock.calls[3]]) {
-      expect(call[0]).toContain("regexp_replace(lower(COALESCE(");
-      expect(call[0]).toContain(studio ? "LIKE '%' || $4 || '%'" : "=$4");
+    const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
+    expect(filtered).toHaveLength(2);
+    for (const call of filtered) {
+      expect(call[0]).toContain("native_id=ANY($4::text[])");
       expect(call[0]).toContain("tenant_id=$2 AND principal_id=$3");
     }
-    expect(query.mock.calls[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, canonical]);
-    expect(query.mock.calls[3][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, canonical, 25, 5]);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id]]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id], 25, 5]);
+  });
+
+  it.each([
+    ["Copilot Studio", ["studio"]],
+    ["Microsoft 365 Copilot Agent Builder", ["lite", "microsoft-lite", "builder", "description"]],
+    ["Copilot Studio Lite", ["lite", "microsoft-lite", "builder", "description"]],
+    ["Custom SDK", ["custom"]],
+    ["Missing tool", []],
+  ])("binds only packages belonging to the %s facet", async (platform, expectedIds) => {
+    mockList([
+      ...[
+        ["studio", "Microsoft Copilot Studio"],
+        ["lite", "Copilot Studio Lite"],
+        ["microsoft-lite", "MicrosoftCopilotStudioLite"],
+        ["builder", "Microsoft 365 Copilot Agent Builder"],
+        ["custom", "CustomSDK"],
+        ["blank", ""],
+      ].map(([id, savedPlatform]) => allowlistedPackage({ id, displayName: id, isBlocked: false, platform: savedPlatform })),
+      allowlistedPackage({ id: "description", displayName: "Description", isBlocked: false, shortDescription: "  Built using Copilot Studio Lite.  " }),
+    ]);
+
+    await new PackageInventoryRepository().list(scope, { platform, limit: 25, offset: 5 });
+    const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
+    expect(filtered).toHaveLength(2);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds, 25, 5]);
   });
 
   it.each([
@@ -89,16 +131,15 @@ describe("saved package availability filters", () => {
 
   it.each(["__some_or_all__", "available:__some_or_all__"])("uses case-safe shared aliases for %s in counts and pages", async availableTo => {
     const value = allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, availableTo: "allowedForAll" });
-    query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [snapshot] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ total: 1, allowed: 1, blocked: 0 }] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ package_data: value }] })
-      .mockResolvedValueOnce({ ...emptyResult, rowCount: 1, rows: [{ package_data: value }] });
+    mockList([value]);
 
     const result = await new PackageInventoryRepository().list(scope, { availableTo, limit: 25, offset: 5 });
     expect(result.count).toBe(1);
     expect(result.value).toEqual([value]);
     expect(query).toHaveBeenCalledTimes(4);
-    for (const call of [query.mock.calls[1], query.mock.calls[3]]) {
+    const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
+    expect(filtered).toHaveLength(2);
+    for (const call of filtered) {
       expect(call[0]).toContain("regexp_replace(lower(available_to),'[^a-z0-9]','','g')=ANY($4::text[])");
       expect(call[0]).toContain("tenant_id=$2 AND principal_id=$3");
     }
@@ -106,7 +147,7 @@ describe("saved package availability filters", () => {
       "all", "everyone", "allowedforall", "availabletoall", "deployedtoall", "installedforall",
       "some", "allowedforsome", "availabletosome", "deployedtosome", "installedforsome",
     ];
-    expect(query.mock.calls[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases]);
-    expect(query.mock.calls[3][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases, 25, 5]);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases, 25, 5]);
   });
 });

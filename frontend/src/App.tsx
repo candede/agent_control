@@ -113,13 +113,13 @@ import {
 import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionContext";
 import { SavedQueryProvider } from "./components/SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
+import { trapDialogFocus } from "./dialogFocus";
 
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
 const packageRefreshPollIntervalMs = 750;
 const inventoryRefreshPollIntervalMs = 1_000;
 const foregroundJobPollBudgetMs = 5 * 60_000;
-const identityCollectionPollBudgetMs = 16 * 60_000;
 const agentDisplayPageSize = 50;
 
 function withPackageSummaryFallback(
@@ -336,6 +336,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   });
   const collectMissingAgentIdentities = useEffectEvent((snapshotId: string) => {
     void handleRefreshAgents(`agent-identities-${snapshotId}`);
+  });
+  const reloadPublishedPackages = useEffectEvent(() => {
+    handleDataSyncSourcesChanged(["graph_packages"]);
   });
   const revalidateCurrentSession = useEffectEvent(() => {
     if (sessionRevalidationInFlight.current || (!user && loadingSession)) return;
@@ -613,6 +616,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       const detail = await readSavedQuery(savedQueries, ["package-detail", principalKey, target.packageId, agentReloadRevision],
         signal => getAgentDetails(target.packageId, { signal }), controller.signal);
       if (!controller.signal.aborted && requestId === agentDetailRequestId.current) {
+        if (detail.id !== target.packageId) throw new Error("Saved agent details did not match the requested published version.");
         const fallbackRecord: UnifiedAgentRecord = {
           id: unifiedAgentRecordId({ source: "graph_packages", packageId: detail.id }),
           displayName: detail.displayName,
@@ -655,14 +659,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const owner = ++linkedPackageRefreshRequestId.current;
     const controller = new AbortController();
     let timer: number | undefined;
-    const deadline = Date.now() + foregroundJobPollBudgetMs;
     const load = async () => {
       try {
         const job = await getPackageRefreshJob(requestedPackageRefreshJobId, requestedPackageRefreshMode, { signal: controller.signal });
         if (controller.signal.aborted || owner !== linkedPackageRefreshRequestId.current) return;
         setLinkedPackageRefreshJob(job);
-        if (job.status === "running" && Date.now() < deadline) {
+        if (job.status === "running") {
           timer = window.setTimeout(() => void load(), packageRefreshPollIntervalMs);
+        } else if (job.status === "succeeded") {
+          reloadPublishedPackages();
         }
       } catch (requestError) {
         if (!controller.signal.aborted && owner === linkedPackageRefreshRequestId.current) {
@@ -1327,7 +1332,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!isCurrentAgentScope() || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
-    const deadline = Date.now() + identityCollectionPollBudgetMs;
     setRefreshingAgents(true);
     setError(undefined);
 
@@ -1339,7 +1343,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       setLinkedPackageRefreshJob(job);
       handleSyncRunsChanged();
-      while (job.status === "running" && Date.now() < deadline) {
+      while (job.status === "running") {
         await wait(packageRefreshPollIntervalMs);
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
         job = await getPackageRefreshJob(job.id, job.tokenMode);
@@ -1347,7 +1351,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setLinkedPackageRefreshJob(job);
       }
 
-      if (job.status === "running") throw new Error("Agent identity collection status polling reached its sixteen-minute bound. The durable job remains available in Sync and Jobs.");
       if (job.status !== "succeeded") {
         throw new Error(job.message ?? (job.status === "waiting_authorization"
           ? "Package refresh requires current delegated read authorization. Open Permissions to request consent or retry the probe."
@@ -1367,7 +1370,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (ids.length < 1 || ids.length > 100 || !user || sessionRevalidationInFlight.current) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
-    const deadline = Date.now() + foregroundJobPollBudgetMs;
     setRefreshingAgents(true);
     setError(undefined);
     try {
@@ -1375,14 +1377,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       handleSyncRunsChanged();
       setLinkedPackageRefreshJob(job);
-      while (job.status === "running" && Date.now() < deadline) {
+      while (job.status === "running") {
         await wait(packageRefreshPollIntervalMs);
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
         job = await getPackageRefreshJob(job.id, job.tokenMode);
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
         setLinkedPackageRefreshJob(job);
       }
-      if (job.status === "running") throw new Error("Matching-detail refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
       if (job.status !== "succeeded") {
         throw new Error(job.message ?? (job.status === "waiting_authorization"
           ? "Matching-detail refresh requires current delegated package-read authorization."
@@ -1400,20 +1401,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!isCurrentAgentScope()) return;
     const requestId = ++packageRefreshRequestId.current;
     const owner = principalKey;
-    const deadline = Date.now() + foregroundJobPollBudgetMs;
     setRefreshingAgents(true);
     setError(undefined);
     setAgentDetailError(undefined);
     try {
       let job = await startExactPackageRefresh(id, "delegated");
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
-      while (job.status === "running" && Date.now() < deadline) {
+      while (job.status === "running") {
         await wait(packageRefreshPollIntervalMs);
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
         job = await getPackageRefreshJob(job.id, job.tokenMode);
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
       }
-      if (job.status === "running") throw new Error("Exact package refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
       if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current delegated package-read authorization.");
       setRequestedAgentDetailId(id);
       requestCurrentAgentReload();
@@ -1431,8 +1430,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setSigningOut(true);
     sessionRequestId.current += 1;
     sessionAbortController.current?.abort();
-    agentDetailRequestId.current += 1;
-    agentDetailAbortController.current?.abort();
 
     try {
       await signOut({ signal: controller.signal });
@@ -1503,7 +1500,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setSelectedUnifiedAgent(record);
   }
 
-  async function refreshAccessDetails(id: string, requestId: number, deadline = Date.now() + foregroundJobPollBudgetMs) {
+  async function refreshAccessDetails(id: string, requestId: number) {
     if (!isCurrentAgentScope()) return;
     const access = capabilityState.views.find(view => view.definition.id === "graph.package.access.manage");
     if (!hasRole(user, "AgentControl.Admin") || !providerActionAllowed(access, true, Date.now())) {
@@ -1511,13 +1508,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
     let job = await startExactPackageRefresh(id, "delegated");
     if (agentDetailRequestId.current !== requestId) return;
-    while (job.status === "running" && Date.now() < deadline) {
+    while (job.status === "running") {
       await wait(packageRefreshPollIntervalMs);
       if (agentDetailRequestId.current !== requestId) return;
       job = await getPackageRefreshJob(job.id, job.tokenMode);
       if (agentDetailRequestId.current !== requestId) return;
     }
-    if (job.status === "running") throw new Error("Reading current package access reached its five-minute bound. The read-only job remains available in Jobs.");
     if (job.status !== "succeeded") throw new Error(job.message ?? "Microsoft Graph could not load current package access. Check delegated permissions and retry.");
     const detail = await getAgentDetails(id);
     if (agentDetailRequestId.current !== requestId) return;
@@ -1889,12 +1885,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
     setBulkResult(undefined);
     const requestId = ++agentDetailRequestId.current;
-    const deadline = Date.now() + foregroundJobPollBudgetMs;
 
     try {
       for (const id of ids) {
-        if (Date.now() >= deadline) throw new Error("Reading current access for the selected packages reached its five-minute bound. Select fewer packages and retry.");
-        if (!await refreshAccessDetails(id, requestId, deadline)) return;
+        if (!await refreshAccessDetails(id, requestId)) return;
       }
       await requestAccessConfirmation(ids, update, "bulk");
       if (agentDetailRequestId.current !== requestId) return;
@@ -2494,7 +2488,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ) : null}
       {hasRole(user, "AgentControl.Viewer") ? (
         <OfficialUsageImportModal
-          key={principalKey}
+          key={`usage-reports:${principalKey}`}
           route={visibleActiveView === "sync" ? syncReportRoute : undefined}
           onRouteChange={handleSyncReportRouteChange}
           canManage={canImportReports}
@@ -3190,7 +3184,6 @@ export function BulkConfirmModal({
   const panel = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    if (!inline) return;
     const previouslyFocused = document.activeElement;
     panel.current?.focus();
     return () => {
@@ -3206,6 +3199,8 @@ export function BulkConfirmModal({
           event.stopPropagation();
         }
         onCancel();
+      } else if (!inline) {
+        trapDialogFocus(event, panel.current);
       }
     }
 
@@ -3221,7 +3216,7 @@ export function BulkConfirmModal({
         role={inline ? "region" : "dialog"}
         aria-modal={inline ? undefined : true}
         aria-labelledby="bulk-confirm-title"
-        tabIndex={inline ? -1 : undefined}
+        tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
       >
         <div>
@@ -3307,10 +3302,22 @@ function ExportChoiceModal({
   onClearSelection: () => void;
   onExport: (scope: UnifiedAgentExportScope) => void;
 }) {
+  const panel = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement;
+    panel.current?.focus();
+    return () => {
+      if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) previouslyFocused.focus();
+    };
+  }, []);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         onCancel();
+      } else {
+        trapDialogFocus(event, panel.current);
       }
     }
 
@@ -3322,10 +3329,12 @@ function ExportChoiceModal({
   return (
     <div className="modal-backdrop" role="presentation" onClick={onCancel}>
       <section
+        ref={panel}
         className="confirm-modal export-choice-modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="export-choice-title"
+        tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
       >
         <div>

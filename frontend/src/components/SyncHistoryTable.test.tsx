@@ -100,6 +100,76 @@ describe("SyncHistoryTable", () => {
     expect(labels()).toEqual(["Thousand", "Twenty", "Zero", "Unknown"]);
   });
 
+  it.each(["package-refresh", "power-platform"] as const)(
+    "uses reported completed counts, not totals, to render and sort %s results", async source => {
+      render(<SyncHistoryTable state={projection([
+        job(1, { source, label: "Zero", status: "succeeded", completed: 0, total: null }),
+        job(2, { source, label: "Seven", status: "succeeded", completed: 7, total: 100 }),
+        job(3, { source, label: "Twenty", status: "succeeded", completed: 20, total: 20 }),
+        job(4, { source, label: "Unknown", status: "succeeded", completed: null, total: 1 }),
+      ])} error="" onRefresh={vi.fn()} />);
+      await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
+      const table = screen.getByRole("table", { name: "Source job history" });
+      expect(screen.getByText("Zero").closest("tr")).toHaveTextContent("0 records saved");
+      expect(screen.getByText("Seven").closest("tr")).toHaveTextContent("7 records saved");
+      expect(screen.getByText("Twenty").closest("tr")).toHaveTextContent("20 records saved");
+      expect(screen.getByText("Unknown").closest("tr")).toHaveTextContent("Count not reported");
+      const labels = () => within(table).getAllByRole("row").slice(1).map(row => row.querySelector("strong")?.textContent);
+      await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+      expect(labels()).toEqual(["Zero", "Seven", "Twenty", "Unknown"]);
+      await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+      expect(labels()).toEqual(["Twenty", "Seven", "Zero", "Unknown"]);
+    },
+  );
+
+  it("preserves known completed-source counts when the sync total is unknown", async () => {
+    render(<SyncHistoryTable state={projection([
+      job(1, { completed: 0, total: null }),
+      job(2, { completed: 2, total: null }),
+      job(3, { completed: null, total: 3 }),
+    ])} error="" onRefresh={vi.fn()} />);
+    expect(screen.getByText("Sync 1").closest("tr")).toHaveTextContent("0 sources complete");
+    expect(screen.getByText("Sync 2").closest("tr")).toHaveTextContent("2 sources complete");
+    expect(screen.getByText("Sync 3").closest("tr")).toHaveTextContent("Count not reported");
+    const table = screen.getByRole("table");
+    const labels = () => within(table).getAllByRole("row").slice(1).map(row => row.querySelector(".sync-history-scope small")?.textContent);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Sync 1", "Sync 2", "Sync 3"]);
+    await userEvent.click(within(table).getByRole("button", { name: "Sort by Result" }));
+    expect(labels()).toEqual(["Sync 2", "Sync 1", "Sync 3"]);
+  });
+
+  it("describes source history limits per Graph authorization mode", async () => {
+    const values = Array.from({ length: 20 }, (_, index) => [
+      job(index, { source: "package-refresh", tokenMode: "delegated" }),
+      job(index, { id: `application-${index}`, source: "package-refresh", tokenMode: "application" }),
+      job(index, { source: "power-platform" }),
+    ]).flat();
+    render(<SyncHistoryTable state={projection(values)} error="" onRefresh={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
+    expect(screen.getByText(/1-10 of 60 recent records/)).toHaveTextContent(
+      "Up to 20 recent Graph jobs per authorization mode and 20 Power Platform jobs.",
+    );
+  });
+
+  it("distinguishes original run durations from the latest source-job attempt", async () => {
+    render(<SyncHistoryTable state={projection([
+      job(1),
+      job(2, {
+        source: "package-refresh", label: "Retried source job",
+        createdAt: "2026-09-01T10:00:00.000Z",
+      }),
+    ])} error="" onRefresh={vi.fn()} />);
+    expect(screen.getByRole("columnheader", { name: "Duration" })).toHaveAttribute(
+      "title", "Time since the original start, including waits and retries",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Source jobs" }));
+    expect(screen.getByRole("columnheader", { name: "Duration" })).toHaveAttribute(
+      "title", "Time from the latest source-job attempt to completion",
+    );
+    expect(screen.getByText("Retried source job").closest("tr")).toHaveTextContent("1m 5s");
+  });
+
   it("keeps partial successful statuses out of complete outcomes and never calls their counts saved", async () => {
     render(<SyncHistoryTable state={projection([
       job(1, { source: "package-refresh", label: "Partial refresh", status: "succeeded", partial: true, completed: 7, total: 10 }),

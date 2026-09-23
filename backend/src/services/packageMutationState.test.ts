@@ -6,7 +6,7 @@ import {
   type PackageAccessMutationState, type PackageMutationState,
 } from "./packageMutationState.js";
 import { allowlistedPackage } from "./packageObservation.js";
-import { GraphPackagesClient, updatePackageAccess, verifyPackageAccessApplied, verifyPackageMutationConverged } from "./graphPackages.js";
+import { GraphPackagesClient, updatePackageAccess, verifyPackageAccessApplied, verifyPackageMutationConverged, type FetchLike } from "./graphPackages.js";
 
 describe("package access scope consistency", () => {
   it.each(["deployedToNoOne", "deployedToNone"])("treats %s as no access during capture, update and verification", async status => {
@@ -38,6 +38,39 @@ describe("package access scope consistency", () => {
     expect(capturePackageMutationState(details, "update-installation")).toEqual({
       kind: "access", availableTo: status === "all" ? "all" : "none", deployedTo: status === "all" ? "all" : "none",
       allowedUsersAndGroups: [principal], acquireUsersAndGroups: [principal],
+    });
+  });
+
+  describe.each(["availability", "installation"] as const)("additive %s access", target => {
+    it.each(["none", "deployedToNoOne", "deployedToNone"])("does not reactivate inactive principals under %s", async status => {
+      const property = target === "availability" ? "allowedUsersAndGroups" : "acquireUsersAndGroups";
+      const scopeProperty = target === "availability" ? "availableTo" : "deployedTo";
+      const action = target === "availability" ? "update-availability" : "update-installation";
+      const preserved = { resourceType: "group", resourceId: "preserved-group" };
+      const requested = { resourceType: "user", resourceId: "requested-user" };
+      const details = allowlistedPackage({
+        id: "package", displayName: "Package", isBlocked: false,
+        availableTo: "some", deployedTo: "some",
+        allowedUsersAndGroups: [preserved], acquireUsersAndGroups: [preserved],
+        [scopeProperty]: status,
+        [property]: [{ resourceType: "user", resourceId: "inactive-user" }],
+      });
+      const update: PackageAccessUpdate = { target, mode: "add", scope: "specific", principals: [requested] };
+      const before = capturePackageMutationState(details, action);
+      const expected = { ...before, [scopeProperty]: "some", [property]: [requested] };
+      expect.soft(expectedPackageMutationState(before, action, update)).toEqual(expected);
+
+      const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 204 }));
+      const result = await updatePackageAccess(new GraphPackagesClient(fetcher), "token", details.id, update, details);
+      expect(result).toEqual({ changed: true, previousCount: 1, resultingCount: 1, principals: [requested] });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({
+        allowedUsersAndGroups: target === "availability" ? [requested] : [preserved],
+        acquireUsersAndGroups: target === "installation" ? [requested] : [preserved],
+      });
+      const applied = { ...details, [scopeProperty]: "some", [property]: [requested] };
+      expect(() => verifyPackageAccessApplied(applied, update, result.principals, details)).not.toThrow();
+      expect(capturePackageMutationState(applied, action)).toEqual(expected);
     });
   });
 

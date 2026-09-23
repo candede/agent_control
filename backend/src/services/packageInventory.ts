@@ -1,4 +1,5 @@
 import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
+import { setTimeout as delay } from "node:timers/promises";
 import { config } from "../config.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageRefreshInput, type PackageScanResult } from "../db/packageInventory.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
@@ -7,12 +8,19 @@ import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
-import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy } from "./graphPackages.js";
+import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy, type PackageReadOptions } from "./graphPackages.js";
 import { mapWithConcurrency } from "./mapWithConcurrency.js";
+import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
+import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
 type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
+type PackageScanClient = Pick<GraphPackagesClient, "listCopilotAgents" | "getPackageDetails">;
+export type PackageScanOptions = Pick<PackageReadOptions, "getAccessToken" | "retryThrottlingUntilAborted">;
+export type PackageRefreshScan = (
+  token: string, requestedIds: readonly string[], signal: AbortSignal, onProgress: PackageRefreshProgress, options?: PackageScanOptions,
+) => Promise<PackageScanResult>;
 
 type PackageRefreshDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
@@ -20,8 +28,9 @@ type PackageRefreshDependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
-  scan: (token: string, requestedIds: readonly string[], signal: AbortSignal, onProgress: PackageRefreshProgress) => Promise<PackageScanResult>;
+  scan: PackageRefreshScan;
   applicationPrincipalId: () => string | undefined;
+  wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
 const graphPackages = new GraphPackagesClient(fetch, packageInventoryReadPolicy);
@@ -31,8 +40,9 @@ const defaultDependencies: PackageRefreshDependencies = {
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
-  scan: scanPackages,
+  scan: (token, ids, signal, progress, options) => scanPackages(token, ids, signal, progress, graphPackages, options),
   applicationPrincipalId: () => config.clientId,
+  wait: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
 };
 
 type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
@@ -41,9 +51,6 @@ type StartingRefresh = Omit<ActiveRefresh, "operation"> & {
   operation: Promise<NonNullable<Awaited<ReturnType<PackageInventoryRepository["getJob"]>>>>;
 };
 const maximumActiveRefreshes = 4;
-const refreshExecutionDeadlineMs = 45_000;
-const identityRefreshExecutionDeadlineMs = 120_000;
-const completeInventoryExecutionDeadlineMs = 15 * 60_000;
 const exactReadConcurrency = 4;
 
 export class PackageInventoryService {
@@ -103,18 +110,19 @@ export class PackageInventoryService {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const freshUser = await this.dependencies.revalidateUser(actor.principalId);
       signal.throwIfAborted();
+      requireSamePrincipal(actor, freshUser);
+      requireRefreshRole(freshUser);
+      const capabilityId = capabilityForMode(tokenMode);
+      if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+      signal.throwIfAborted();
+      await this.dependencies.requireAvailable(capabilityId, freshUser, options);
+      signal.throwIfAborted();
+      token = tokenMode === "delegated"
+        ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
+        : await this.dependencies.applicationToken(capabilityId);
+      signal.throwIfAborted();
+      // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
-        signal.throwIfAborted();
-        requireSamePrincipal(actor, freshUser);
-        requireRefreshRole(freshUser);
-        const capabilityId = capabilityForMode(tokenMode);
-        if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
-        signal.throwIfAborted();
-        await this.dependencies.requireAvailable(capabilityId, freshUser, options);
-        signal.throwIfAborted();
-        token = tokenMode === "delegated"
-          ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
-          : await this.dependencies.applicationToken(capabilityId);
         signal.throwIfAborted();
         markedRunning = await this.repository.markRunning(scope, id);
         if (!markedRunning) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
@@ -131,9 +139,7 @@ export class PackageInventoryService {
       signal.throwIfAborted();
       throw error;
     }
-    const executionDeadlineMs = current.requestedIds.length === 0 ? completeInventoryExecutionDeadlineMs
-      : current.requestedIds.length > 1 ? identityRefreshExecutionDeadlineMs : refreshExecutionDeadlineMs;
-    const execution = createRefreshExecutionSignal(signal, executionDeadlineMs);
+    const execution = createRefreshExecutionSignal(signal, packageRefreshExecutionDeadlineMs);
     const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal))
       .finally(() => {
         execution.dispose();
@@ -194,24 +200,52 @@ export class PackageInventoryService {
     try {
       operationalLog("info", "package_refresh_started", { mode: current.scopeKind });
       const result = await this.dependencies.scan(token, current.requestedIds, signal,
-        (pages, observedCount, totalRecords, message) => this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message));
+        (pages, observedCount, totalRecords, message) => this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message), {
+          retryThrottlingUntilAborted: true,
+          getAccessToken: async () => {
+            signal.throwIfAborted();
+            const capabilityId = capabilityForMode(current.tokenMode);
+            const currentToken = current.tokenMode === "delegated"
+              ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
+              : await this.dependencies.applicationToken(capabilityId);
+            signal.throwIfAborted();
+            return currentToken;
+          },
+        });
       signal.throwIfAborted();
-      stage = "publication_authorization";
-      const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-      const freshUser = await this.dependencies.revalidateUser(actor.principalId);
-      signal.throwIfAborted();
-      await commitAccountSessionValidation(validation, async () => {
-        signal.throwIfAborted();
-        requireSamePrincipal(actor, freshUser);
-        requireRefreshRole(freshUser);
-        const capabilityId = capabilityForMode(current.tokenMode);
-        if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
-        signal.throwIfAborted();
-        await this.dependencies.requireAvailable(capabilityId, freshUser);
-        signal.throwIfAborted();
-        stage = "publication";
-        await this.repository.publish(scope, id, result);
-      });
+      for (let attempt = 1; ; attempt += 1) {
+        stage = "publication_authorization";
+        try {
+          signal.throwIfAborted();
+          const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+          const freshUser = await this.dependencies.revalidateUser(actor.principalId);
+          signal.throwIfAborted();
+          requireSamePrincipal(actor, freshUser);
+          requireRefreshRole(freshUser);
+          const capabilityId = capabilityForMode(current.tokenMode);
+          if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
+          signal.throwIfAborted();
+          await this.dependencies.requireAvailable(capabilityId, freshUser, { retryFailed: true });
+          signal.throwIfAborted();
+          await commitAccountSessionValidation(validation, async () => {
+            signal.throwIfAborted();
+            stage = "publication";
+            await this.repository.publish(scope, id, result);
+          });
+          break;
+        } catch (error) {
+          signal.throwIfAborted();
+          if (stage !== "publication_authorization" || !transientPublicationReadinessFailure(error)) throw error;
+          const retryDelayMs = publicationReadinessRetryDelay(error, attempt);
+          operationalLog("warn", "package_publication_readiness_retry", {
+            stage, attempt, retryDelayMs, count: result.packages.length, ...graphErrorTelemetry(error),
+          });
+          await this.repository.recordProgress(scope, id, result.pages, result.packages.length, result.totalRecords,
+            `All ${result.packages.length} packages collected. Microsoft readiness verification is temporarily unavailable; retrying in ${Math.ceil(retryDelayMs / 1000)} seconds. Collected data is retained in this running job; no packages are being downloaded again.`);
+          // Only publication holds the account lock; provider checks and backoff must not block sign-out.
+          await this.dependencies.wait(retryDelayMs, signal);
+        }
+      }
       operationalLog("info", "package_refresh_succeeded", {
         status: "succeeded", count: result.packages.length, pages: result.pages,
         durationMs: Math.round(performance.now() - startedAt),
@@ -234,7 +268,7 @@ export class PackageInventoryService {
       const code = timedOut ? "package_refresh_timeout" : diagnostics ? `graph_http_${diagnostics.status}`
         : failure instanceof AppError ? failure.code : "provider_error";
       await this.repository.markFailed(scope, id, code,
-        timedOut ? "Agent identity collection reached its bounded execution deadline. The previous complete inventory is unchanged; retry from Sync." : safeFailureMessage(failure));
+        timedOut ? "Package refresh reached its four-hour execution deadline. The previous complete inventory is unchanged; retry from Sync." : safeFailureMessage(failure));
       operationalLog("error", "package_refresh_failed", { stage, ...graphErrorTelemetry(failure), errorCode: code });
     }
   }
@@ -242,12 +276,55 @@ export class PackageInventoryService {
 
 export const packageInventory = new PackageInventoryService();
 
+function transientPublicationReadinessFailure(error: unknown): error is AppError {
+  if (!(error instanceof AppError) || error.status === 401 || error.status === 403) return false;
+  if (["provider_timeout", "provider_network_error", "provider_throttled"].includes(error.code)) return true;
+  if (error.code !== "provider_error" || !error.details || typeof error.details !== "object" || !("evidence" in error.details)) return false;
+  const evidence = error.details.evidence;
+  if (!evidence || typeof evidence !== "object") return false;
+  if ("httpStatus" in evidence && (evidence.httpStatus === 401 || evidence.httpStatus === 403)) return false;
+  return "category" in evidence && evidence.category === "provider_network_error"
+    || "httpStatus" in evidence && typeof evidence.httpStatus === "number" && [500, 502, 503, 504].includes(evidence.httpStatus);
+}
+
+function publicationReadinessRetryDelay(error: AppError, attempt: number) {
+  const backoff = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
+  const details = error.details;
+  const expiresAt = details && typeof details === "object" && "expiresAt" in details && typeof details.expiresAt === "string"
+    ? Date.parse(details.expiresAt) : NaN;
+  return error.code === "provider_throttled" && Number.isFinite(expiresAt)
+    ? Math.max(backoff, expiresAt - Date.now() + 1) : backoff;
+}
+
 export async function scanPackages(
   token: string,
   requestedIds: readonly string[],
   signal: AbortSignal,
   onProgress: PackageRefreshProgress,
-  client: Pick<GraphPackagesClient, "listCopilotAgents" | "getPackageDetails"> = graphPackages,
+  client: PackageScanClient = graphPackages,
+  options: PackageScanOptions = {},
+): Promise<PackageScanResult> {
+  const diagnostics = new PackageScanDiagnostics(requestedIds.length === 0 ? "broad" : "exact");
+  let outcome: "collected" | "failed" = "failed";
+  try {
+    const result = await collectPackages(token, requestedIds, signal, onProgress, client, diagnostics, options);
+    outcome = "collected";
+    return result;
+  } finally {
+    diagnostics.finish(signal.aborted
+      ? signal.reason instanceof Error && signal.reason.name === "TimeoutError" ? "timed_out" : "cancelled"
+      : outcome);
+  }
+}
+
+async function collectPackages(
+  token: string,
+  requestedIds: readonly string[],
+  signal: AbortSignal,
+  onProgress: PackageRefreshProgress,
+  client: PackageScanClient,
+  diagnostics: PackageScanDiagnostics,
+  options: PackageScanOptions,
 ): Promise<PackageScanResult> {
   const broad = requestedIds.length === 0;
   let listPages = 0;
@@ -255,7 +332,9 @@ export async function scanPackages(
   const summaries = new Map<string, CopilotPackageDetail>();
   if (broad) {
     const listed = await client.listCopilotAgents(token, {
+      ...options,
       signal,
+      diagnostics,
       onProgress: async progress => {
         listPages = progress.pages;
         await onProgress(progress.pages, progress.observedCount, progress.observedCount, "Reading the agent list before identity collection.");
@@ -269,6 +348,7 @@ export async function scanPackages(
     await onProgress(Math.max(1, listPages), 0, ids.length, `Matching agent records (0/${ids.length} identities checked).`);
   }
   if (!broad && ids.length > 100) throw new AppError(400, "invalid_targets", "An exact package refresh accepts at most 100 native IDs.");
+  diagnostics.startDetails(ids.length);
   const failure = new AbortController();
   const readSignal = AbortSignal.any([signal, failure.signal]);
   let completed = 0;
@@ -299,11 +379,14 @@ export async function scanPackages(
       let value: CopilotPackageDetail | null;
       try {
         const detail = await client.getPackageDetails(token, id, {
+          ...options,
           signal: readSignal,
+          diagnostics,
           onRetry: reportProgress,
         });
         if (detail.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
         const summary = summaries.get(id);
+        diagnostics.compareDetail(summary, detail);
         value = {
           ...summary, ...detail, identityDetailsCollected: true as const,
           authoringTool: detail.authoringTool ?? summary?.authoringTool ?? null,
@@ -316,6 +399,7 @@ export async function scanPackages(
       readSignal.throwIfAborted();
       completed += 1;
       if (value) observedCount += 1;
+      diagnostics.completeDetail(value !== null);
       if (completed % exactReadConcurrency === 0 || completed === ids.length) {
         await reportProgress();
       }

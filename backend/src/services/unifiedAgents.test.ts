@@ -1164,6 +1164,26 @@ describe("UnifiedAgentsService", () => {
     });
   });
 
+  it.each([
+    ["!first", "__proto__"],
+    ["__proto__", "!first"],
+  ])("preserves observation keys while grouping Graph-only versions %s and %s", async (firstId, secondId) => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [packageValue(firstId, "Version one", true), packageValue(secondId, "Version two", true)],
+    }));
+
+    const result = await service.list({ tenantId, principalId: "viewer" });
+
+    expect(result.count).toBe(1);
+    expect(result.value[0].packages.map(value => value.id)).toEqual(["!first", "__proto__"]);
+    const observations = result.value[0].observations.packageSnapshots;
+    expect(Object.keys(observations).sort()).toEqual(["!first", "__proto__"]);
+    expect(Object.hasOwn(observations, "__proto__")).toBe(true);
+    expect(observations["__proto__"]).toMatchObject({ scopeKind: "broad", current: true });
+    expect(Object.keys(JSON.parse(JSON.stringify(observations))).sort()).toEqual(["!first", "__proto__"]);
+    expect(Object.getPrototypeOf(observations)).toBe(Object.prototype);
+  });
+
   it("preserves environment-separated and same-name source-only rows without deduplication", async () => {
     const service = new UnifiedAgentsService(dependencies({
       packages: [packageValue("graph-a", "Duplicate"), packageValue("graph-b", "Duplicate")],

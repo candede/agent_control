@@ -52,7 +52,7 @@ export function expectedPackageMutationState(before: PackageMutationState, actio
   const previousScope = accessUpdate.target === "availability" ? before.availableTo : before.deployedTo;
   const previousPrincipals = accessUpdate.target === "availability" ? before.allowedUsersAndGroups : before.acquireUsersAndGroups;
   if (accessUpdate.mode === "add" && previousScope === "all") return before;
-  const principals = accessUpdate.mode === "add"
+  const principals = accessUpdate.mode === "add" && previousScope === "some"
     ? canonicalAccessEntities([...new Map([...previousPrincipals, ...requested].map(principal => [`${principal.resourceType}:${principal.resourceId}`, principal])).values()])
     : requested;
   if (accessUpdate.target === "availability") {

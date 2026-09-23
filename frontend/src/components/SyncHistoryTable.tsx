@@ -4,7 +4,7 @@ import type { SortingState } from "@tanstack/react-table";
 import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../api/client";
 import { useListTable, type ListColumn } from "../listTable";
 import { ListTableHead } from "./ListTableHead";
-import { formatJobInstant, jobDuration, jobStatusLabel } from "./jobPresentation";
+import { formatJobInstant, jobDuration, jobResultCount, jobStatusLabel } from "./jobPresentation";
 import { syncSourceDetails, syncStatusLabel } from "./syncPresentation";
 import "./dataSync.css";
 
@@ -12,11 +12,10 @@ const pageSize = 10;
 const sourceJobs = new Set(["package-refresh", "power-platform"]);
 const defaultSorting: SortingState = [{ id: "started", desc: true }];
 
-export function SyncHistoryTable({ state, error, loading = false, pollingPaused = false, onRefresh, onOpenSyncRun }: {
+export function SyncHistoryTable({ state, error, loading = false, onRefresh, onOpenSyncRun }: {
   state?: WorkbenchJobsResponse;
   error: string;
   loading?: boolean;
-  pollingPaused?: boolean;
   onRefresh: () => void;
   onOpenSyncRun?: (runId: string) => void;
 }) {
@@ -41,7 +40,7 @@ export function SyncHistoryTable({ state, error, loading = false, pollingPaused 
         : job.label,
     },
     { id: "outcome", header: "Outcome", accessorFn: statusLabel },
-    { id: "result", header: "Result", accessorFn: resultCount },
+    { id: "result", header: "Result", accessorFn: jobResultCount },
     {
       id: "duration", header: "Duration",
       accessorFn: job => durationMilliseconds(job),
@@ -93,7 +92,6 @@ export function SyncHistoryTable({ state, error, loading = false, pollingPaused 
       </div>
       {view === "sources" ? <p className="jobs-note">Standalone refreshes and underlying Graph / Power Platform jobs, including older collection workflows. These are not additional full sync runs.</p> : null}
       {error ? <div className="error-banner" role="alert">{error}</div> : null}
-      {pollingPaused ? <p className="notice" role="status">Automatic status updates paused after five minutes. Use Refresh history to continue checking; jobs may still be running.</p> : null}
       {!state && !error ? <p role="status">Loading sync history...</p> : null}
       {unavailable.length ? <p className="notice" role="status">History is temporarily unavailable for {unavailable.map(source => source.source === "data-sync" ? "sync runs" : source.source === "package-refresh" ? "Graph packages" : "Power Platform").join(" and ")}. Displayed rows may be incomplete.</p> : null}
       {state && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"
@@ -102,7 +100,9 @@ export function SyncHistoryTable({ state, error, loading = false, pollingPaused 
       {rows.length ? (
         <div className="sync-table-scroll" role="region" aria-label="Scrollable sync history" tabIndex={0}>
           <table className="sync-history-table" aria-label={view === "runs" ? "Sync run history" : "Source job history"}>
-            <ListTableHead table={table} titles={{ duration: "Time since the original start, including waits and retries" }} />
+            <ListTableHead table={table} titles={{ duration: view === "runs"
+              ? "Time since the original start, including waits and retries"
+              : "Time from the latest source-job attempt to completion" }} />
             <tbody>
               {rows.map(row => {
                 const job = row.original;
@@ -137,7 +137,7 @@ export function SyncHistoryTable({ state, error, loading = false, pollingPaused 
       ) : null}
       {state ? <div className="sync-history-pagination">
         <p className="jobs-note">{jobs.length ? `${currentPage * pageSize + 1}-${Math.min((currentPage + 1) * pageSize, jobs.length)} of ${jobs.length} recent records. ` : ""}
-          {view === "runs" ? "Up to 20 sync runs retained for 30 days." : "Up to 20 recent jobs per source."}
+          {view === "runs" ? "Up to 20 sync runs retained for 30 days." : "Up to 20 recent Graph jobs per authorization mode and 20 Power Platform jobs."}
           {" "}Filters apply to these recent records.</p>
         {lastPage > 0 ? <div>
           <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
@@ -157,18 +157,13 @@ function matchesOutcome(job: WorkbenchJobSummary, outcome: string) {
     || (outcome === "active" && active) || (outcome === "incomplete" && !complete && !active);
 }
 
-function resultCount(job: WorkbenchJobSummary) {
-  if (job.source === "data-sync") return job.total !== null ? job.completed ?? undefined : undefined;
-  return (job.status === "succeeded" && !job.partial ? job.total ?? job.completed : job.completed) ?? undefined;
-}
-
 function resultLabel(job: WorkbenchJobSummary) {
-  const count = resultCount(job);
+  const count = jobResultCount(job);
   if (count === undefined) return "Count not reported";
   if (job.source === "data-sync") {
-    return `${count} of ${job.total} sources complete`;
+    return `${job.total === null ? count : `${count} of ${job.total}`} sources complete`;
   }
-  if (job.status === "succeeded" && !job.partial && job.total !== null) return `${count.toLocaleString()} records saved`;
+  if (job.status === "succeeded" && !job.partial) return `${count.toLocaleString()} records saved`;
   return `${count.toLocaleString()} reported so far`;
 }
 

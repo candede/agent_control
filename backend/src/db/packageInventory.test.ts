@@ -39,6 +39,25 @@ async function running(idempotencyKey: string, requestedIds?: string[]) {
 }
 
 describe.sequential("Package inventory repository", () => {
+  it("gives admitted package work a fresh four-hour deadline and publishes beyond the old thirty-minute window", async () => {
+    const longScope = { tenantId: "tenant-long-package-refresh", principalId: "reader-long-package-refresh" };
+    const job = await repository.submit(longScope, {
+      authorizationPrincipalId: longScope.principalId, tokenMode: "delegated", idempotencyKey: "long-refresh",
+    });
+    const submitted = await fixture.operator.query<{ seconds: number }>(
+      "SELECT EXTRACT(EPOCH FROM (deadline_at-created_at))::double precision AS seconds FROM package_refresh_jobs WHERE id=$1", [job.id]);
+    expect(submitted.rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
+    await fixture.operator.query("UPDATE package_refresh_jobs SET created_at=clock_timestamp()-interval '2 hours',deadline_at=clock_timestamp()+interval '1 minute' WHERE id=$1", [job.id]);
+    expect(await repository.markRunning(longScope, job.id)).toBe(true);
+    const admitted = await fixture.operator.query<{ seconds: number }>(
+      "SELECT EXTRACT(EPOCH FROM (deadline_at-attempted_at))::double precision AS seconds FROM package_refresh_jobs WHERE id=$1", [job.id]);
+    expect(admitted.rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
+    await fixture.operator.query("UPDATE package_refresh_jobs SET attempted_at=clock_timestamp()-interval '1 hour',deadline_at=clock_timestamp()+interval '3 hours' WHERE id=$1", [job.id]);
+    await repository.recordProgress(longScope, job.id, 1, 1, 1, "Active long-running collection.");
+    await repository.publish(longScope, job.id, { packages: [packageValue("long-collected")], totalRecords: 1, pages: 1 });
+    expect(await repository.getJob(longScope, job.id)).toMatchObject({ status: "succeeded", observedCount: 1 });
+  });
+
   it("does not let retained dispatch-expired jobs exhaust fresh admission", async () => {
     const expiredScope = { tenantId: "tenant-package-deadline", principalId: "reader-package-deadline" };
     const input = { authorizationPrincipalId: expiredScope.principalId, tokenMode: "delegated" as const };

@@ -47,7 +47,6 @@ import {
 import "./dataSync.css";
 
 const pollIntervalMs = 1_000;
-const pollBudgetMs = 5 * 60_000;
 
 const incompleteStates = new Set<DataSyncSourceState>([
   "not_started",
@@ -92,14 +91,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const [requestedRunError, setRequestedRunError] = useState("");
   const [requestedRunLoading, setRequestedRunLoading] = useState(false);
   const [requestedRunReload, setRequestedRunReload] = useState(0);
-  const [requestedPollingPaused, setRequestedPollingPaused] = useState(false);
   const [confirmClean, setConfirmClean] = useState(false);
   const [cleanAcknowledged, setCleanAcknowledged] = useState(false);
   const [checkedAt, setCheckedAt] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"start" | "retry" | "cancel">();
   const [error, setError] = useState("");
-  const [pollingPaused, setPollingPaused] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const readOwner = useId();
   const generation = useRef(0);
@@ -109,14 +106,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const accessDenied = useRef(false);
   const actionRevision = useRef(0);
   const timer = useRef<number | undefined>(undefined);
-  const pollDeadline = useRef(0);
   const sourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const stateRef = useRef<DataSyncState | undefined>(undefined);
   const requestedRunIdRef = useRef(requestedRunId);
   const requestedRunGeneration = useRef(0);
   const requestedRunController = useRef<AbortController | undefined>(undefined);
   const requestedRunTimer = useRef<number | undefined>(undefined);
-  const requestedPollDeadline = useRef(0);
   const requestedSourceStatuses = useRef<Map<DataSyncSourceId, DataSyncSourceStatus> | undefined>(undefined);
   const onSourcesChangedRef = useRef(onSourcesChanged);
   const onRunsChangedRef = useRef(onRunsChanged);
@@ -137,7 +132,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   useEffect(() => {
     requestedRunIdRef.current = requestedRunId;
     requestedSourceStatuses.current = undefined;
-    requestedPollDeadline.current = 0;
   }, [principalKey, requestedRunId]);
 
   const stopPolling = useCallback(() => {
@@ -168,8 +162,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     stateRef.current = undefined;
     sourceStatuses.current = undefined;
     requestedSourceStatuses.current = undefined;
-    pollDeadline.current = 0;
-    requestedPollDeadline.current = 0;
     setState(undefined);
     setRequestedRun(undefined);
     setRequestedRunError("");
@@ -177,8 +169,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     setLoading(false);
     setBusy(undefined);
     setError(requestError(reason, "Data sync access was denied."));
-    setPollingPaused(false);
-    setRequestedPollingPaused(false);
     setCheckedAt(undefined);
     setConfirmClean(false);
     setCleanAcknowledged(false);
@@ -216,13 +206,10 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const applyRun = useCallback((run: DataSyncRun) => {
     const current = stateRef.current;
     if (!current) return;
-    observeSources(current.sources.map(source =>
-      run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded") ?? source,
-    ), sourceStatuses);
     const next = { ...current, run };
     stateRef.current = next;
     setState(next);
-  }, [observeSources]);
+  }, []);
 
   const load = useCallback(async (owner: number, preserveActionError = false) => {
     if (loadController.current) return false;
@@ -253,24 +240,12 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     }
   }, [applyState, clearDeniedState, principalKey, readOwner, readSaved]);
 
-  const startPolling = useCallback((owner: number, resetBudget: boolean, preserveActionError = false) => {
+  const startPolling = useCallback((owner: number, preserveActionError = false) => {
     stopPolling();
     const pollingOwner = pollingGeneration.current;
-    setPollingPaused(false);
-    if (resetBudget || pollDeadline.current === 0) {
-      pollDeadline.current = Date.now() + pollBudgetMs;
-    }
     const poll = async () => {
       const progressing = await load(owner, preserveActionError);
-      if (owner !== generation.current || pollingOwner !== pollingGeneration.current) return;
-      if (!progressing) {
-        pollDeadline.current = 0;
-        return;
-      }
-      if (Date.now() >= pollDeadline.current) {
-        setPollingPaused(true);
-        return;
-      }
+      if (owner !== generation.current || pollingOwner !== pollingGeneration.current || !progressing) return;
       timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
     };
     return poll();
@@ -285,19 +260,17 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     actionController.current = undefined;
     sourceStatuses.current = undefined;
     stateRef.current = undefined;
-    pollDeadline.current = 0;
     void Promise.resolve().then(() => {
       if (owner !== generation.current) return;
       setState(undefined);
       setLoading(true);
       setBusy(undefined);
       setError("");
-      setPollingPaused(false);
       setConfirmClean(false);
       setCleanAcknowledged(false);
       setCheckedAt(undefined);
     });
-    startPolling(owner, true);
+    startPolling(owner);
     return () => {
       generation.current += 1;
       stopPolling();
@@ -315,12 +288,9 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       setRequestedRun(undefined);
       setRequestedRunError("");
       setRequestedRunLoading(Boolean(requestedRunId) && !accessDenied.current);
-      setRequestedPollingPaused(false);
     });
     if (!requestedRunId || accessDenied.current) return;
 
-    if (requestedPollDeadline.current === 0) requestedPollDeadline.current = Date.now() + pollBudgetMs;
-    const deadline = requestedPollDeadline.current;
     const poll = async () => {
       const controller = new AbortController();
       requestedRunController.current = controller;
@@ -336,10 +306,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         observeSources(run.sources, requestedSourceStatuses);
         if (controller.signal.aborted || owner !== requestedRunGeneration.current) return;
         if (!isProgressing(run)) return;
-        if (Date.now() >= deadline) {
-          setRequestedPollingPaused(true);
-          return;
-        }
         requestedRunTimer.current = window.setTimeout(() => void poll(), pollIntervalMs);
       } catch (reason) {
         if (controller.signal.aborted || owner !== requestedRunGeneration.current || (reason instanceof ApiError && reason.kind === "aborted")) return;
@@ -376,15 +342,20 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     try {
       const run = await operation(controller.signal);
       if (controller.signal.aborted || owner !== generation.current) return;
+      const current = stateRef.current;
+      const updatesCurrentRun = key === "start" || key === "retry" || current?.run?.id === run.id;
       if (requestedRunIdRef.current === run.id) {
         requestedRunGeneration.current += 1;
         stopRequestedRunPolling();
         setRequestedRun(run);
         setRequestedRunError("");
         observeSources(run.sources, requestedSourceStatuses);
-      } else if (key === "start" || stateRef.current?.run?.id === run.id) {
-        applyRun(run);
+      } else if (updatesCurrentRun && current) {
+        observeSources(current.sources.map(source =>
+          run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded") ?? source,
+        ), sourceStatuses);
       }
+      if (updatesCurrentRun) applyRun(run);
     } catch (reason) {
       if (controller.signal.aborted || owner !== generation.current) return;
       if (clearDeniedState(reason)) return;
@@ -396,9 +367,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         actionRevision.current += 1;
         requestedRunGeneration.current += 1;
         stopRequestedRunPolling();
-        requestedPollDeadline.current = 0;
         if (requestedRunIdRef.current) setRequestedRunReload(value => value + 1);
-        await startPolling(owner, true, actionFailed);
+        await startPolling(owner, actionFailed);
       }
       if (actionController.current === controller) actionController.current = undefined;
       if (owner === generation.current) {
@@ -439,15 +409,14 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     });
   }, [onRequestedRunChange, perform, requestedRunId]);
 
-  const refresh = useCallback(async (resetBudget = true) => {
+  const refresh = useCallback(async (explicit = true) => {
     if (actionController.current) return;
-    if (accessDenied.current && !resetBudget) return;
+    if (accessDenied.current && !explicit) return;
     accessDenied.current = false;
     actionRevision.current += 1;
     requestedRunGeneration.current += 1;
     stopRequestedRunPolling();
-    if (resetBudget) requestedPollDeadline.current = 0;
-    void startPolling(generation.current, resetBudget);
+    void startPolling(generation.current);
     if (requestedRunId) setRequestedRunReload(value => value + 1);
   }, [requestedRunId, startPolling, stopRequestedRunPolling]);
 
@@ -469,7 +438,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
     wasActive.current = active;
   }, [active, refresh]);
 
-  function runActions(run: DataSyncRun, paused: boolean) {
+  function runActions(run: DataSyncRun) {
     const retrySources = run.sources
       .filter(source => source.canRetry && incompleteStates.has(source.status))
       .map(source => source.source);
@@ -477,16 +446,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       || (isProgressing(currentRun) && currentRun?.id !== run.id);
     return (
       <div className="data-sync-run-actions">
-        {paused && isProgressing(run) ? (
-          <>
-            <p className="data-sync-poll-note" role="status">Live updates are paused. The server job is not stopped.</p>
-            <WorkbenchActionGate actionId="data-sync.read" compact>
-              <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void refresh()}>
-                <RotateCcw size={15} aria-hidden="true" />Resume updates
-              </button>
-            </WorkbenchActionGate>
-          </>
-        ) : null}
         {retrySources.length ? (
           <WorkbenchActionGate actionId="data-sync.retry">
             <button type="button" className="secondary" disabled={Boolean(busy) || retryBlocked}
@@ -552,7 +511,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                       Sync continues when you switch tabs.
                       {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
                     </p>
-                    {runActions(currentRun, pollingPaused)}
+                    {runActions(currentRun)}
                   </div>
                 </section>
               ) : (
@@ -638,7 +597,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                 ? syncDuration(requestedRun.startedAt, requestedRun.completedAt) : formatInstant(requestedRun.updatedAt)}</dd></div>
             </dl>
             <SyncProgress run={requestedRun} showJobIds />
-            {runActions(requestedRun, requestedPollingPaused)}
+            {runActions(requestedRun)}
             {requestedRun.sources.some(source => source.status === "awaiting_upload") ? (
               <div className="notice">
                 <p>This older run includes a manual CSV step. Import reports to complete it, or cancel the waiting run before starting a new automatic sync.</p>

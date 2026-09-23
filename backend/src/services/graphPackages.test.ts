@@ -126,6 +126,31 @@ describe("GraphPackagesClient", () => {
     } finally { timeout.mockRestore(); }
   });
 
+  it("does not report mutation completion after cancellation wins at response headers", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "Cancelled");
+    const fetcher = vi.fn<FetchLike>(async () => {
+      controller.abort(reason);
+      return new Response(null, { status: 204 });
+    });
+    await expect(new GraphPackagesClient(fetcher).blockPackage("token", "P_1", {
+      signal: controller.signal, correlationId: "cancelled-write",
+    })).rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("does not report catalog completion after cancellation during final progress", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "Cancelled");
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ value: [] }));
+    const onProgress = vi.fn(async () => { controller.abort(reason); });
+    await expect(new GraphPackagesClient(fetcher).listCopilotAgents("token", {
+      signal: controller.signal, onProgress,
+    })).rejects.toBe(reason);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(onProgress).toHaveBeenCalledOnce();
+  });
+
   it("cancels a stalled successful catalog response body at the caller deadline", async () => {
     const controller = new AbortController();
     const cancel = vi.fn();
@@ -229,6 +254,38 @@ describe("GraphPackagesClient", () => {
     await assertion;
     expect(fetcher).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([403, 429])("retains HTTP %i and Retry-After when a stalled error body times out", async status => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), {
+        status, headers: { "Retry-After": "120", "request-id": "graph-request-123" },
+      }))
+      .mockResolvedValueOnce(Response.json({ id: "P_1", displayName: "Package", isBlocked: false }));
+    const wait = vi.fn(async () => undefined);
+    try {
+      const read = new GraphPackagesClient(fetcher, { delay: wait }).getPackageDetails("token", "P_1");
+      const assertion = status === 403
+        ? expect(read).rejects.toMatchObject({
+          status, code: "graph_error", details: { httpStatus: status, correlationId: "graph-request-123", retryAfterMs: 120_000 },
+        })
+        : expect(read).resolves.toMatchObject({ id: "P_1" });
+      await Promise.all([assertion, vi.advanceTimersByTimeAsync(30_000)]);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledTimes(status === 403 ? 1 : 2);
+      expect(wait.mock.calls).toEqual(status === 403 ? [] : [[120_000]]);
+    } finally {
+      timeout.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("does not retry local schema failures or actual mutations with a 5xx status", async () => {
@@ -378,6 +435,19 @@ describe("GraphPackagesClient", () => {
       code: "verification_inconclusive",
       details: { lastState: { kind: "block", isBlocked: false }, readbackCount: 3 },
     });
+  });
+
+  it("does not report readback completion after cancellation during a matching detail read", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "Cancelled");
+    const client = { getPackageDetails: vi.fn(async () => {
+      controller.abort(reason);
+      return allowlistedPackage({ id: "P_1", displayName: "Package", isBlocked: true });
+    }) };
+    await expect(verifyPackageMutationConverged(client, "token", "P_1", "block", { kind: "block", isBlocked: true }, {
+      signal: controller.signal,
+    })).rejects.toBe(reason);
+    expect(client.getPackageDetails).toHaveBeenCalledOnce();
   });
 
   it("propagates an overall readback abort without starting another retry", async () => {

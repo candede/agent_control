@@ -350,7 +350,9 @@ function buildRecords(
     const existing = graphOnly.get(groupKey);
     if (existing) {
       existing.packages.push(packageSummary(detail));
-      Object.assign(existing.observations.packageSnapshots, pickPackageSnapshots([detail.id], packageSnapshots));
+      // Copy own properties without invoking setters for opaque IDs such as "__proto__".
+      Object.defineProperties(existing.observations.packageSnapshots,
+        Object.getOwnPropertyDescriptors(pickPackageSnapshots([detail.id], packageSnapshots)));
       continue;
     }
     graphOnly.set(groupKey, {

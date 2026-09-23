@@ -1702,6 +1702,14 @@ CREATE UNIQUE INDEX package_mutation_qualification_current ON package_mutation_q
   (CASE WHEN action IN ('update-availability','update-installation') THEN cycle_stage ELSE '' END)
 ) WHERE status='qualified';
 ` },
+  { version: 39, sql: `
+ALTER TABLE package_refresh_jobs ALTER COLUMN deadline_at SET DEFAULT clock_timestamp()+interval '4 hours';
+` },
+  { version: 40, sql: `
+UPDATE defender_hunting_rows
+SET row_data=(row_data-'actorUserKey'-'actorUserId') || '{"projectionVersion":2}'::jsonb
+WHERE source_table='CloudAppEvents' AND projection_version=2;
+` },
 ] as const;
 
 export function migrationChecksum(sql: string) {

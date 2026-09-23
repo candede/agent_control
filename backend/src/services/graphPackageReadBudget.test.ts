@@ -189,7 +189,7 @@ describe("Graph inventory read budget", () => {
   it("shares an over-budget cooldown without repeatedly extending it for queued callers", async () => {
     vi.useFakeTimers();
     const fetcher = vi.fn<FetchLike>()
-      .mockResolvedValueOnce(throttledResponse({ "Retry-After": "600" }))
+      .mockResolvedValueOnce(throttledResponse({ "Retry-After": "15000" }))
       .mockResolvedValueOnce(packageResponse());
     try {
       const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: timerDelay });
@@ -197,7 +197,7 @@ describe("Graph inventory read budget", () => {
       await vi.advanceTimersByTimeAsync(100_000);
       await expect(client.getPackageDetails("token", "package")).rejects.toMatchObject({ status: 424 });
       expect(fetcher).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(500_001);
+      await vi.advanceTimersByTimeAsync(14_900_001);
       await expect(client.getPackageDetails("token", "package")).resolves.toMatchObject({ id: "package" });
       expect(fetcher).toHaveBeenCalledTimes(2);
     } finally {

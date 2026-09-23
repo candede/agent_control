@@ -838,19 +838,25 @@ describe("API response failures", () => {
     const send = () => format === "JSON" ? getAgents() : downloadInventoryCsv({ snapshotId: "snapshot-one" });
     const expected = format === "JSON" ? { value: [] } : { size: csv.length };
 
-    it.each(["fetch", "body"] as const)("fences a during-logout read waiting for %s after logout succeeds", async phase => {
+    it.each((["before", "during"] as const).flatMap(timing =>
+      (["fetch", "body"] as const).map(phase => ({ timing, phase })),
+    ))("fences a $timing-logout read waiting for $phase after logout succeeds", async ({ timing, phase }) => {
       const fetchMock = mockJsonResponse({ csrfToken: "logout-session-csrf" });
       await getCurrentUser();
       const logoutResponse = deferredResponse();
-      fetchMock.mockReturnValueOnce(logoutResponse.promise);
-      const logout = signOut();
       const readResponse = deferredResponse();
       const earlyResponse = response();
       const body = vi.spyOn(earlyResponse, format === "JSON" ? "json" : "blob")
         .mockImplementation(() => readResponse.promise.then(value => format === "JSON" ? value.json() : value.blob()));
-      if (phase === "fetch") fetchMock.mockReturnValueOnce(readResponse.promise);
-      else fetchMock.mockResolvedValueOnce(earlyResponse);
-      const read = send();
+      const startRead = () => {
+        if (phase === "fetch") fetchMock.mockReturnValueOnce(readResponse.promise);
+        else fetchMock.mockResolvedValueOnce(earlyResponse);
+        return send();
+      };
+      const earlierRead = timing === "before" ? startRead() : undefined;
+      fetchMock.mockReturnValueOnce(logoutResponse.promise);
+      const logout = signOut();
+      const read = earlierRead ?? startRead();
       const cancelled = expect(read).rejects.toMatchObject({ status: 0, code: "request_aborted", kind: "aborted" });
       if (phase === "body") await vi.waitFor(() => expect(body).toHaveBeenCalledOnce());
       logoutResponse.resolve(new Response(null, { status: 204 }));
@@ -864,19 +870,24 @@ describe("API response failures", () => {
     it.each([
       { status: 503, code: "service_unavailable" },
       { status: 403, code: "invalid_origin" },
-    ])("preserves during-logout reads and CSRF after logout fails with $code", async ({ status, code }) => {
+    ].flatMap(failure => (["before", "during"] as const).map(timing => ({ ...failure, timing }))))("preserves $timing-logout reads and CSRF after logout fails with $code", async ({ status, code, timing }) => {
       const fetchMock = mockJsonResponse({ csrfToken: "retained-session-csrf" });
       await getCurrentUser();
       const logoutResponse = deferredResponse();
+      const readResponse = deferredResponse();
+      const startRead = () => {
+        fetchMock.mockReturnValueOnce(readResponse.promise);
+        return send();
+      };
+      const earlierRead = timing === "before" ? startRead() : undefined;
       fetchMock.mockReturnValueOnce(logoutResponse.promise);
       const failure = expect(signOut()).rejects.toMatchObject({ status, code });
-      const readResponse = deferredResponse();
-      fetchMock.mockReturnValueOnce(readResponse.promise);
-      const read = send();
+      const read = earlierRead ?? startRead();
+      const completedRead = expect(read).resolves.toMatchObject(expected);
       logoutResponse.resolve(Response.json({ code }, { status }));
       await failure;
       readResponse.resolve(response());
-      await expect(read).resolves.toMatchObject(expected);
+      await completedRead;
       await checkCapabilities();
       expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "retained-session-csrf");
     });

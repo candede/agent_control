@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import { packageInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
+import { packageRefreshExecutionDeadlineMs } from "../services/packageRefreshPolicy.js";
 import {
   formatAgentAuthoringTool, formatPackageFacetLabel as formatFacetLabel, normalizePackageAuthoringTool as normalizeBuiltWith,
   normalizePackageStatus, packageStatusAliases,
@@ -174,7 +175,9 @@ export class PackageInventoryRepository {
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, [jobId, scope.tenantId, scope.principalId, input.authorizationPrincipalId, input.tokenMode, input.idempotencyKey, requestHash, queryHash, scopeKind, JSON.stringify(requestedIds)]);
       return jobId;
     });
-    return (await this.getJob(scope, id))!;
+    const job = await this.getJob(scope, id);
+    if (!job) throw new AppError(409, "package_refresh_expired", "The package refresh is no longer available. Submit a new refresh with a new idempotency key.");
+    return job;
   }
 
   async getJob(scope: PackageDataScope, id: string) {
@@ -211,8 +214,9 @@ export class PackageInventoryRepository {
   }
 
   async markRunning(scope: PackageDataScope, id: string) {
-    const result = await this.database.query(`UPDATE package_refresh_jobs SET status='running',attempted_at=clock_timestamp(),updated_at=clock_timestamp(),error_code=NULL,message=NULL
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId]);
+    const result = await this.database.query(`UPDATE package_refresh_jobs SET status='running',attempted_at=clock_timestamp(),updated_at=clock_timestamp(),error_code=NULL,message=NULL,
+      deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId, packageRefreshExecutionDeadlineMs]);
     return result.rowCount === 1;
   }
 
@@ -223,8 +227,13 @@ export class PackageInventoryRepository {
   }
 
   async markWaitingAuthorization(scope: PackageDataScope, id: string) {
-    await this.database.query(`UPDATE package_refresh_jobs SET status='waiting_authorization',error_code='interaction_required',message='Explicit resume with current authorization is required.',updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId]);
+    await this.database.query(`UPDATE package_refresh_jobs SET
+      status=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'waiting_authorization' ELSE 'failed' END,
+      error_code=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'interaction_required' ELSE 'package_refresh_expired' END,
+      message=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN 'Explicit resume with current authorization is required.' ELSE 'The package refresh expired before authorization could resume.' END,
+      finished_at=CASE WHEN expires_at>clock.checked_at AND deadline_at>clock.checked_at THEN NULL ELSE clock.checked_at END,updated_at=clock.checked_at
+      FROM (SELECT clock_timestamp() AS checked_at) AS clock
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running'`, [id, scope.tenantId, scope.principalId]);
     return this.getJob(scope, id);
   }
 
@@ -270,8 +279,9 @@ export class PackageInventoryRepository {
           AND (created_at,id)>(SELECT created_at,id FROM package_refresh_jobs WHERE id=$5) LIMIT 1`, [scope.tenantId, scope.principalId, job.token_mode, job.query_hash, job.id]);
       if (newer.rowCount) throw new AppError(409, "package_refresh_superseded", "A newer package refresh for this scope superseded publication.");
       const createdSnapshotId = await writePackageSnapshot(client, scope, job, id, result);
-      await client.query(`UPDATE package_refresh_jobs SET status='succeeded',page_count=$4,observed_count=$5,total_records=$6,error_code=NULL,message=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3`, [id, scope.tenantId, scope.principalId, result.pages, result.packages.length, result.totalRecords]);
+      const completion = await client.query(`UPDATE package_refresh_jobs SET status='succeeded',page_count=$4,observed_count=$5,total_records=$6,error_code=NULL,message=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId, result.pages, result.packages.length, result.totalRecords]);
+      if (completion.rowCount !== 1) throw new AppError(409, "package_refresh_expired", "Package refresh expired or stopped before publication completed.");
       return createdSnapshotId;
     });
     return { job: (await this.getJob(scope, id))!, snapshotId };
@@ -287,31 +297,31 @@ export class PackageInventoryRepository {
       filteredSummary: { total: 0, allowed: 0, blocked: 0 },
       facets: { publishers: [], availability: [], hosts: [], platforms: [] },
     };
-    const { sql, values } = listFilters(snapshot.id, scope, query);
-    const [counts, allResources] = await Promise.all([
-      this.database.query<{ total: number; allowed: number; blocked: number }>(`WITH scoped AS (
-          SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
-        SELECT count(*)::int AS total,count(*) FILTER (WHERE NOT is_blocked)::int AS allowed,
-          count(*) FILTER (WHERE is_blocked)::int AS blocked FROM scoped WHERE ${sql}`, values),
-      this.database.query<ResourceRow>(`SELECT package_data FROM package_inventory_resources
-        WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
-        ORDER BY native_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId]),
-    ]);
-    const summary = summarizePackages(allResources.rows.map(row => row.package_data));
-    const filteredSummary = counts.rows[0] ?? { total: 0, allowed: 0, blocked: 0 };
+    const allResources = await this.database.query<ResourceRow>(`SELECT package_data FROM package_inventory_resources
+      WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
+      ORDER BY native_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId]);
+    const packages = allResources.rows.map(row => row.package_data);
+    const { sql, values } = listFilters(snapshot.id, scope, query, packages);
     const sortColumn = { displayName: `display_name COLLATE "C"`, publisher: `publisher COLLATE "C"`, lastModifiedAt: "last_modified_at" }[query.sortBy ?? "displayName"];
     const direction = query.sortDirection === "desc" ? "DESC" : "ASC";
     const limit = Math.min(Math.max(query.limit ?? 100, 1), 5000);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
-    const rows = await this.database.query<ResourceRow>(`WITH scoped AS (SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
-      SELECT package_data FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]);
+    const [counts, rows] = await Promise.all([
+      this.database.query<{ total: number; allowed: number; blocked: number }>(`WITH scoped AS (
+          SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
+        SELECT count(*)::int AS total,count(*) FILTER (WHERE NOT is_blocked)::int AS allowed,
+          count(*) FILTER (WHERE is_blocked)::int AS blocked FROM scoped WHERE ${sql}`, values),
+      this.database.query<ResourceRow>(`WITH scoped AS (SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
+        SELECT package_data FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]),
+    ]);
+    const filteredSummary = counts.rows[0] ?? { total: 0, allowed: 0, blocked: 0 };
     return {
       value: rows.rows.map(row => row.package_data),
       count: filteredSummary.total,
       snapshot: projectSnapshot(snapshot),
-      summary,
+      summary: summarizePackages(packages),
       filteredSummary,
-      facets: packageFacets(allResources.rows.map(row => row.package_data)),
+      facets: packageFacets(packages),
     };
   }
 
@@ -400,7 +410,7 @@ export class PackageInventoryRepository {
       throw packageVerificationFailed();
     }
     const packages = new Map(base.rows.map(row => [row.package_data.id, row.package_data]));
-    const observations: UnifiedPackageSourceResult["observations"] = Object.fromEntries(base.rows.map(row => [row.package_data.id, {
+    const observations = new Map<string, UnifiedPackageSourceResult["observations"][string]>(base.rows.map(row => [row.package_data.id, {
       snapshotId: snapshot.id,
       scopeKind: "broad",
       observedAt: snapshot.observed_at.toISOString(),
@@ -422,7 +432,7 @@ export class PackageInventoryRepository {
       );
       if (overlay.package_data && overlayIsNewer) {
         packages.set(overlay.native_id, overlay.package_data);
-        observations[overlay.native_id] = {
+        observations.set(overlay.native_id, {
           snapshotId: overlay.snapshot_id,
           scopeKind: "exact",
           observedAt: overlay.observed_at.toISOString(),
@@ -434,15 +444,15 @@ export class PackageInventoryRepository {
               expiresAt: overlay.expires_at.toISOString(),
             },
           } : {}),
-        };
+        });
       } else if (!overlay.package_data && overlayIsNewer) {
         packages.delete(overlay.native_id);
-        delete observations[overlay.native_id];
+        observations.delete(overlay.native_id);
       }
     }
     for (const detail of details.rows) {
       const current = packages.get(detail.native_id);
-      const observation = observations[detail.native_id];
+      const observation = observations.get(detail.native_id);
       if (!current || !observation) continue;
       if (observation.scopeKind === "exact" || !canReuseDetailedIdentity(current, detail.package_data)) continue;
       const currentDetails = observation.identityDetails;
@@ -464,7 +474,7 @@ export class PackageInventoryRepository {
     }
     return {
       packages: [...packages.values()].sort((left, right) => ordinal(left.id, right.id)),
-      observations,
+      observations: Object.fromEntries(observations),
       snapshot: projectSnapshot(snapshot),
     };
   }
@@ -569,7 +579,7 @@ function validatePublication(job: Pick<SnapshotQuery, "requested_ids" | "scope_k
   }
 }
 
-function listFilters(snapshotId: string, scope: PackageDataScope, query: PackageListQuery) {
+function listFilters(snapshotId: string, scope: PackageDataScope, query: PackageListQuery, packages: readonly CopilotPackageDetail[]) {
   const conditions = ["true"];
   const values: unknown[] = [snapshotId, scope.tenantId, scope.principalId];
   if (query.search) {
@@ -607,12 +617,11 @@ function listFilters(snapshotId: string, scope: PackageDataScope, query: Package
   }
   if (query.platform) {
     const platform = normalizeBuiltWith(query.platform);
-    values.push(platform);
-    const savedPlatform = `regexp_replace(lower(COALESCE(NULLIF(package_data->>'authoringTool',''),NULLIF(package_data->>'platform',''),
-      substring(package_data->>'shortDescription' from '(?i)^built\\s+using\\s+(.+?)[.]?$'),'')),'[^a-z0-9]','','g')`;
-    conditions.push(platform === "copilotstudio"
-      ? `${savedPlatform} LIKE '%' || $${values.length} || '%'`
-      : `${savedPlatform}=$${values.length}`);
+    values.push(packages.filter(value => {
+      const label = builtWithLabel(value);
+      return label && normalizeBuiltWith(label) === platform;
+    }).map(value => value.id));
+    conditions.push(`native_id=ANY($${values.length}::text[])`);
   }
   if (query.createdWithinDays !== undefined) {
     values.push(query.createdWithinDays);

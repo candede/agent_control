@@ -90,7 +90,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       const isProgressing = next.value.some(job =>
         isVisibleJob(job)
         && (progressingStatuses.has(job.status) || (job.source === "data-sync" && job.status === "waiting")));
-      if (isProgressing && pollDeadline.current === 0) pollDeadline.current = Date.now() + pollBudgetMs;
+      if (scope === "all" && isProgressing && pollDeadline.current === 0) pollDeadline.current = Date.now() + pollBudgetMs;
       if (!isProgressing) pollDeadline.current = 0;
       return isProgressing;
     } catch (reason) {
@@ -106,7 +106,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       if (request.current === controller) request.current = undefined;
       if (!controller.signal.aborted && owner === generation.current) setLoading(false);
     }
-  }, [isVisibleJob, principalKey, readOwner, readSaved, revision]);
+  }, [isVisibleJob, principalKey, readOwner, readSaved, revision, scope]);
 
   const startPolling = useCallback((owner: number, preserveActionError = false) => {
     const pollingOwner = pollingGeneration.current;
@@ -114,14 +114,14 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
     const poll = async () => {
       const progressing = await load(owner, preserveActionError);
       if (owner !== generation.current || pollingOwner !== pollingGeneration.current || !progressing) return;
-      if (Date.now() < pollDeadline.current) timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
+      if (scope === "sync" || Date.now() < pollDeadline.current) timer.current = window.setTimeout(() => void poll(), pollIntervalMs);
       else {
         pollDeadline.current = 0;
         setPollingPaused(true);
       }
     };
     return poll();
-  }, [load]);
+  }, [load, scope]);
 
   useEffect(() => {
     generation.current += 1;
@@ -164,7 +164,10 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
       if (owner !== generation.current) return;
       actionFailed = true;
       denied = reason instanceof ApiError && (reason.status === 401 || reason.status === 403);
-      if (denied) setState(undefined);
+      if (denied) {
+        setState(undefined);
+        setLoading(false);
+      }
       setError(reason instanceof ApiError
         ? `${reason.message}${reason.requestId ? ` Request ${reason.requestId}.` : ""}`
         : "The job operation failed.");
@@ -219,7 +222,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   }
 
   if (scope === "sync") return (
-    <SyncHistoryTable key={principalKey} state={state} error={error} loading={loading} pollingPaused={pollingPaused}
+    <SyncHistoryTable key={principalKey} state={state} error={error} loading={loading}
       onOpenSyncRun={onOpenSyncRun} onRefresh={refresh} />
   );
 

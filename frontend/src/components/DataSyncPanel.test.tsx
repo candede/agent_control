@@ -565,7 +565,65 @@ describe("DataSyncPanel", () => {
     expect(screen.getByText(newer.id, { selector: "code" })).toBeVisible();
   });
 
-  it.each(["state", "run"] as const)("preserves the %s five-minute budget across navigation and real Strict Mode effect replay", async target => {
+  it("keeps an accepted exact-run cancellation in workspace state when status revalidation fails", async () => {
+    const running = run("running", [source("users", "running")]);
+    const cancelled = run("cancelled", [source("users", "cancelled", { canRetry: true })]);
+    api.getState.mockResolvedValueOnce(syncState({ run: running }))
+      .mockRejectedValue(new Error("Status read failed after cancellation."));
+    api.getRun.mockResolvedValueOnce(running).mockResolvedValue(cancelled);
+    api.cancel.mockResolvedValue(cancelled);
+    const view = renderPanel({ requestedRunId: running.id });
+    const details = within(await screen.findByRole("dialog", { name: "Sync run details" }));
+
+    await userEvent.click(await details.findByRole("button", { name: "Cancel run" }));
+    expect(await details.findByRole("alert")).toHaveTextContent("Status read failed after cancellation.");
+    await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+
+    expect(screen.getByText("Sync cancelled", { exact: true })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start initial sync" })).toBeEnabled();
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith(running.id, expect.anything());
+  });
+
+  it.each(["same", "closed", "different"] as const)(
+    "retains a fast historical retry completion with %s details when status revalidation fails",
+    async selection => {
+      const failed = run("partial", [source("users", "failed", { canRetry: true })], { id: "older-run" });
+      const saved = source("users", "succeeded", { count: 5, lastSuccessAt: "2026-09-15T10:00:00.000Z" });
+      const newer = run("completed", [saved], { id: "newer-run" });
+      const completed = run("completed", [source("users", "succeeded", {
+        count: 6, lastSuccessAt: "2026-09-15T11:00:00.000Z",
+      })], { id: failed.id });
+      api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false, run: newer, sources: [saved] }))
+        .mockRejectedValue(new Error("Status read failed after retry."));
+      api.getRun.mockResolvedValueOnce(failed).mockResolvedValue(selection === "same" ? completed : newer);
+      let resolveRetry!: (value: DataSyncRun) => void;
+      api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
+      const onChanged = vi.fn();
+      const onRequestedRunChange = vi.fn();
+      const view = renderPanel({
+        requestedRunId: failed.id, onSourcesChanged: onChanged, onRequestedRunChange,
+      });
+      await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+      if (selection !== "same") {
+        await act(async () => {
+          view.rerenderPanel({ requestedRunId: selection === "closed" ? undefined : newer.id });
+        });
+      }
+      await act(async () => { resolveRetry(completed); });
+
+      expect(screen.getByRole("alert")).toHaveTextContent("Status read failed after retry.");
+      expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+      if (selection === "different") expect(screen.getByText(newer.id, { selector: "code" })).toBeVisible();
+      await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+      await userEvent.click(screen.getByRole("button", { name: "View run details" }));
+      expect(onRequestedRunChange).toHaveBeenLastCalledWith(failed.id);
+      expect(within(screen.getByRole("article", { name: "Users" })).getByText("5")).toBeVisible();
+      expect(api.retry).toHaveBeenCalledExactlyOnceWith(failed.id, ["users"], expect.anything());
+    },
+  );
+
+  it.each(["state", "run"] as const)("keeps %s updates live beyond five minutes across navigation and Strict Mode effect replay", async target => {
     vi.useFakeTimers();
     const active = run("running", [source("users", "running")]);
     api.getState.mockResolvedValue(syncState({ run: target === "state" ? active : null }));
@@ -575,12 +633,13 @@ describe("DataSyncPanel", () => {
     await act(async () => { view.rerenderPanel({ active: false }); });
     await act(async () => { view.rerenderPanel({ active: true }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(60_001); });
-    expect(screen.getByRole("button", { name: "Resume updates" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Resume updates" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Live updates are paused/)).not.toBeInTheDocument();
     const reads = api.getState.mock.calls.length;
     const runReads = api.getRun.mock.calls.length;
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
-    expect(api.getState).toHaveBeenCalledTimes(reads);
-    expect(api.getRun).toHaveBeenCalledTimes(runReads);
+    expect(target === "state" ? api.getState.mock.calls.length : api.getRun.mock.calls.length)
+      .toBeGreaterThan(target === "state" ? reads : runReads);
     expect(api.start).not.toHaveBeenCalled();
   });
 
@@ -1463,26 +1522,39 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByText("old-run", { selector: "code" })).not.toBeInTheDocument();
   });
 
-  it("stops at the foreground polling budget and requires an explicit resume", async () => {
+  it.each(["state", "run"] as const)("keeps %s polling beyond thirty minutes until completion without a resume control", async target => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
     const runningSources = sourceIds.map(id => source(id, "running"));
     api.getState.mockResolvedValue(syncState({
       onboardingRequired: false,
       usageImportRequired: false,
-      run: run("running", runningSources),
+      run: target === "state" ? run("running", runningSources) : null,
       sources: runningSources,
     }));
+    api.getRun.mockResolvedValue(run("running", runningSources, { id: "exact-run" }));
     const consoleErrors = vi.spyOn(console, "error");
-    const view = renderPanel();
+    const view = renderPanel({ requestedRunId: target === "run" ? "exact-run" : undefined });
+    const reads = target === "state" ? api.getState : api.getRun;
     try {
       await act(async () => { await Promise.resolve(); });
-      vi.setSystemTime(301_001);
+      vi.setSystemTime(30 * 60_000);
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      expect(reads).toHaveBeenCalledTimes(4);
+      expect(screen.queryByRole("button", { name: "Resume updates" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/Live updates are paused/)).not.toBeInTheDocument();
+      const completed = run("completed", runningSources.map(item => source(item.source, "succeeded", { count: 10 })), {
+        id: target === "run" ? "exact-run" : "sync-run-1",
+      });
+      api.getState.mockResolvedValue(syncState({ run: target === "state" ? completed : null, sources: completed.sources }));
+      api.getRun.mockResolvedValue(completed);
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-      const resume = screen.getByRole("button", { name: "Resume updates" });
-      expect(api.getState).toHaveBeenCalledTimes(2);
-      await act(async () => { resume.click(); });
-      expect(api.getState).toHaveBeenCalledTimes(3);
+      expect(reads).toHaveBeenCalledTimes(5);
+      expect(screen.getByText("Sync complete", { exact: true })).toBeVisible();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(reads).toHaveBeenCalledTimes(5);
+      expect(api.start).not.toHaveBeenCalled();
+      expect(api.cancel).not.toHaveBeenCalled();
       expect(consoleErrors.mock.calls.filter(([message]) => typeof message === "string" && message.includes("act("))).toEqual([]);
     } finally {
       view.unmount();
@@ -1522,6 +1594,32 @@ describe("DataSyncPanel", () => {
     expect(api.cancel).not.toHaveBeenCalled();
   });
 
+  it.each(["state", "run"] as const)("does not overlap slow %s reads after the former time limit", async target => {
+    vi.useFakeTimers();
+    const running = run("running", [source("graph_packages", "running")]);
+    const current = syncState({ run: target === "state" ? running : null });
+    api.getState.mockResolvedValue(current);
+    api.getRun.mockResolvedValue(running);
+    const reads = target === "state" ? api.getState : api.getRun;
+    const value = target === "state" ? current : running;
+    let resolvePending!: (value: DataSyncState | DataSyncRun) => void;
+    reads.mockResolvedValueOnce(value)
+      .mockReturnValueOnce(new Promise(resolve => { resolvePending = resolve; }));
+    const view = renderPanel({ requestedRunId: target === "run" ? running.id : undefined });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(reads).toHaveBeenCalledTimes(2);
+    vi.setSystemTime(Date.now() + 30 * 60_000);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(reads).toHaveBeenCalledTimes(2);
+    await act(async () => { resolvePending(value); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(reads).toHaveBeenCalledTimes(3);
+    view.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(reads).toHaveBeenCalledTimes(3);
+    expect(api.cancel).not.toHaveBeenCalled();
+  });
+
   it("cleans up background polling timers without cancelling the server-owned run on unmount", async () => {
     vi.useFakeTimers();
     const sources = sourceIds.map(id => source(id, "running"));
@@ -1536,7 +1634,7 @@ describe("DataSyncPanel", () => {
   });
 
   it.each(["refresh", "principal"] as const)(
-    "keeps a replacement polling budget when a superseded request settles after %s",
+    "keeps the replacement polling cycle when a superseded request settles after %s",
     async replacement => {
       vi.useFakeTimers();
       const sources = [source("users", "running")];

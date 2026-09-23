@@ -1,106 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../src/api/client";
-import { mockLayoutApi } from "./layoutFixtures";
-import { createUnifiedVerification } from "../src/test/inventoryVerification";
-
-const sourceIds: DataSyncSourceId[] = ["users", "graph_packages", "power_platform", "usage_reports"];
-const initial: DataSyncState = {
-  onboardingRequired: true,
-  usageImportRequired: true,
-  run: null,
-  sources: sourceIds.map(source => ({
-    source, status: "not_started", count: null, lastSuccessAt: null, updatedAt: null,
-    jobId: null, message: "", canRetry: false,
-  })),
-};
-
-async function mockSync(page: Page, firstState: DataSyncState, retainedRuns: DataSyncRun[] = []) {
-  const unexpected = await mockLayoutApi(page);
-  let state = firstState;
-  const starts: StartDataSyncInput[] = [];
-  const reads: string[] = [];
-  await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
-    revision: "a".repeat(64),
-    verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
-    value: [], count: 0, offset: 0, limit: 50,
-    summary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
-    filteredSummary: { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
-    sources: {
-      graphPackages: { state: "unavailable", observation: null, error: null },
-      powerPlatform: { state: "unavailable", observation: null, error: null },
-    },
-    partial: false, errors: [],
-  } }));
-  await page.route("**/api/data-sync/**", route => {
-    const path = new URL(route.request().url()).pathname;
-    if (route.request().method() === "GET") {
-      reads.push(path);
-      if (path === "/api/data-sync/state") return route.fulfill({ json: state });
-      const run = [state.run, ...retainedRuns].find(run => run && path === `/api/data-sync/runs/${run.id}`);
-      if (run) return route.fulfill({ json: run });
-      return route.fulfill({ status: 404, json: { error: "Requested sync run not found." } });
-    }
-    if (route.request().method() !== "POST" || path !== "/api/data-sync/runs") {
-      unexpected.push(`${route.request().method()} ${path}`);
-      return route.fulfill({ status: 501, json: { error: "Unexpected sync fixture request" } });
-    }
-    const input = route.request().postDataJSON() as StartDataSyncInput;
-    starts.push(input);
-    const run: DataSyncRun = {
-      id: "11111111-1111-4111-8111-111111111111", mode: input.mode, status: "running",
-      startedAt: "2026-09-15T10:00:00.000Z", updatedAt: "2026-09-15T10:00:00.000Z", completedAt: null,
-      sources: initial.sources.filter(source => input.sources ? input.sources.includes(source.source) : source.source !== "usage_reports").map(source => ({
-        ...source,
-        status: source.source === "users" && !input.sources ? "succeeded" : "running",
-        count: source.source === "users" ? input.sources ? 17 : 42 : source.source === "graph_packages" ? 650 : 2451,
-        lastSuccessAt: source.source === "users" && !input.sources ? "2026-09-15T10:00:00.000Z" : null,
-        message: source.source === "graph_packages" ? "Reading the next page of Graph packages." : "",
-      })),
-    };
-    const sources = state.sources.map(source => {
-      const finished = run.sources.find(attempt => attempt.source === source.source && attempt.status === "succeeded");
-      if (finished) return finished;
-      return input.clearSavedData && source.source !== "usage_reports"
-        ? { ...source, status: "not_started" as const, count: null, lastSuccessAt: null } : source;
-    });
-    state = { ...state, run, sources, onboardingRequired: sources.some(source => source.source !== "usage_reports" && source.status !== "succeeded") };
-    return route.fulfill({ status: 202, json: run });
-  });
-  return { starts, reads, unexpected, finish() {
-    if (!state.run) throw new Error("Expected a sync run before completion.");
-    const completed = state.run.sources.map(source => ({
-      ...source, status: "succeeded" as const, count: 42, lastSuccessAt: "2026-09-15T10:01:00.000Z",
-    }));
-    const sources = state.sources.map(source => completed.find(attempt => attempt.source === source.source) ?? source);
-    state = {
-      ...state, onboardingRequired: false, sources,
-      run: { ...state.run, status: "completed", completedAt: "2026-09-15T10:01:00.000Z", sources: completed },
-    };
-  }, cancel() {
-    if (!state.run) throw new Error("Expected a sync run before cancellation.");
-    state = {
-      ...state,
-      run: { ...state.run, status: "cancelled", completedAt: "2026-09-15T10:01:00.000Z",
-        sources: state.run.sources.map(source => source.status === "running" ? { ...source, status: "cancelled" } : source) },
-    };
-    return state.run;
-  } };
-}
-
-function completedState(): DataSyncState {
-  const sources = initial.sources.map(source => ({
-    ...source, status: "succeeded" as const, count: 42, lastSuccessAt: "2026-09-15T10:01:00.000Z",
-  }));
-  return {
-    onboardingRequired: false, usageImportRequired: false, sources,
-    run: {
-      id: "be5ba369-4cc9-4a32-ba3b-f08d781acba0", mode: "initial", status: "completed",
-      startedAt: "2026-09-15T10:00:00.000Z", updatedAt: "2026-09-15T10:01:00.000Z",
-      completedAt: "2026-09-15T10:01:00.000Z", sources,
-    },
-  };
-}
+import type { DataSyncRun, DataSyncSourceId } from "../src/api/client";
+import { completedState, initial, mockSync } from "./dataSyncFixtures";
 
 function primarySync(page: Page) {
   return page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ });
@@ -130,6 +31,65 @@ async function expectAccessibleSyncPage(page: Page) {
 
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
+});
+
+test("Sync status, run details and history remain live beyond thirty minutes without resume controls", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-09-23T10:00:00.000Z") });
+  const running: DataSyncRun = {
+    id: "44444444-4444-4444-8444-444444444444", mode: "initial", status: "running",
+    startedAt: "2026-09-23T10:00:00.000Z", updatedAt: "2026-09-23T10:00:00.000Z", completedAt: null,
+    sources: initial.sources.filter(source => source.source !== "usage_reports").map(source => ({
+      ...source, status: "running", count: 100,
+    })),
+  };
+  const fixture = await mockSync(page, { ...initial, run: running });
+  let historyRun = running;
+  let historyReads = 0;
+  await page.route("**/api/workbench/jobs", route => {
+    if (route.request().method() !== "GET") return route.fallback();
+    historyReads += 1;
+    return route.fulfill({ json: {
+      value: [{
+        id: historyRun.id, source: "data-sync", label: "Initial sync", target: "3 sources",
+        status: historyRun.status, total: 3, completed: historyRun.sources.filter(source => source.status === "succeeded").length,
+        partial: false, canResume: false, canCancel: historyRun.status === "running", canReconcile: false,
+        startedAt: historyRun.startedAt, completedAt: historyRun.completedAt, syncSources: historyRun.sources.map(source => source.source),
+        updatedAt: historyRun.updatedAt, href: `/sync?syncRun=${historyRun.id}`,
+      }],
+      unavailableSources: [], polledAt: historyRun.updatedAt, requestId: "long-running-history",
+    } });
+  });
+  const stateReads = () => fixture.reads.filter(path => path === "/api/data-sync/state").length;
+  const runReads = () => fixture.reads.filter(path => path === `/api/data-sync/runs/${running.id}`).length;
+  await page.goto(`/sync?syncRun=${running.id}`);
+  const dialog = page.getByRole("dialog", { name: "Sync run details" });
+  await expect(dialog.getByText(running.id, { exact: true })).toBeVisible();
+  await expect.poll(stateReads).toBeGreaterThan(0);
+  await expect.poll(() => historyReads).toBeGreaterThan(0);
+  await page.clock.fastForward(30 * 60_000);
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const before = { state: stateReads(), run: runReads(), history: historyReads };
+    await page.clock.runFor(2_100);
+    await expect.poll(stateReads).toBeGreaterThan(before.state);
+    await expect.poll(runReads).toBeGreaterThan(before.run);
+    await expect.poll(() => historyReads).toBeGreaterThan(before.history);
+  }
+  await expect(page.getByRole("button", { name: "Resume updates", includeHidden: true })).toHaveCount(0);
+  await expect(page.getByText(/updates (are )?paused/)).toHaveCount(0);
+  historyRun = fixture.finish(await page.evaluate(() => new Date().toISOString()));
+  await page.clock.runFor(2_100);
+  await expect(dialog.getByText("Sync complete", { exact: true })).toBeVisible();
+  await expect(page.locator(".data-sync-last-run")).toContainText("Sync complete");
+  await expect(page.getByRole("table", { name: "Sync run history", includeHidden: true })).toContainText("Complete");
+  await expect(page.locator(".data-sync-panel")).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator(".sync-history")).toHaveAttribute("aria-busy", "false");
+  const finalReads = { state: stateReads(), run: runReads(), history: historyReads };
+  await page.clock.runFor(4_100);
+  await expect(dialog).toBeVisible();
+  expect({ state: stateReads(), run: runReads(), history: historyReads }).toEqual(finalReads);
+  await dialog.getByRole("button", { name: "Back to workspace" }).click();
+  expect(fixture.starts).toEqual([]);
+  expect(fixture.unexpected).toEqual([]);
 });
 
 test("setup stays out of Agents and the responsive Sync page continues live progress in the background", async ({ page }, info) => {
@@ -561,7 +521,7 @@ test("sync history rewrites legacy sync-run links and opens retained details in 
   const state = completedState();
   const retained: DataSyncRun = { ...state.run!, id: "33333333-3333-4333-8333-333333333333" };
   const fixture = await mockSync(page, state, [retained]);
-  await page.route("**/api/workbench/jobs", route => route.fulfill({ json: {
+  await page.route("**/api/workbench/jobs", route => route.request().method() !== "GET" ? route.fallback() : route.fulfill({ json: {
     value: [{
       id: retained.id, source: "data-sync", label: "Retained initial sync", target: "4 saved sources",
       status: "completed", total: 4, completed: 4, partial: false, canResume: false, canCancel: false, canReconcile: false,

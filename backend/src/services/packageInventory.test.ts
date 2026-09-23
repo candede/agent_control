@@ -3,9 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import { PackageInventoryService, scanPackages } from "./packageInventory.js";
+import { PackageInventoryService, scanPackages, type PackageRefreshScan } from "./packageInventory.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { GraphPackagesClient, packageInventoryReadPolicy, type FetchLike, type PackageReadOptions } from "./graphPackages.js";
+import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -68,8 +69,9 @@ function fixture(overrides: Record<string, unknown> = {}) {
     revalidateUser: vi.fn(async () => user),
     requireAvailable: vi.fn(async () => undefined),
     requireApplicationDataScope: vi.fn(async () => undefined),
-    scan: vi.fn<typeof scanPackages>(async () => ({ packages: [], totalRecords: 0, pages: 1 })),
+    scan: vi.fn<PackageRefreshScan>(async () => ({ packages: [], totalRecords: 0, pages: 1 })),
     applicationPrincipalId: vi.fn(() => "application-id"),
+    wait: vi.fn(async (_milliseconds: number, signal: AbortSignal) => { signal.throwIfAborted(); }),
   };
   return { job, repository, dependencies, service: new PackageInventoryService(repository as never, dependencies as never) };
 }
@@ -86,8 +88,207 @@ describe("Package refresh service", () => {
     const { service, repository, dependencies, job } = fixture();
     await service.start(user, job.id, "delegated");
     await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledTimes(1));
-    expect(dependencies.requireAvailable).toHaveBeenCalledWith("graph.package.read.delegated", user);
+    expect(dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.delegated", user, { retryFailed: true });
     expect(repository.markRunning).toHaveBeenCalledBefore(dependencies.scan);
+  });
+
+  it.each(["provider_timeout", "provider_network_error", "provider_throttled"])(
+    "retains complete collection and retries transient publication readiness: %s", async code => {
+      const { service, repository, dependencies, job } = fixture();
+      const result = { packages: [allowlistedPackage({ id: "complete", displayName: "Complete", isBlocked: false })], totalRecords: 1, pages: 2 };
+      dependencies.scan.mockResolvedValue(result);
+      dependencies.requireAvailable.mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new AppError(code === "provider_throttled" ? 429 : 504, code, "Transient readiness failure."));
+      await service.start(user, job.id, "delegated");
+      await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+      expect(dependencies.scan).toHaveBeenCalledOnce();
+      expect(dependencies.wait).toHaveBeenCalledWith(1_000, expect.any(AbortSignal));
+      expect(dependencies.revalidateUser).toHaveBeenCalledTimes(3);
+      expect(dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.delegated", user, { retryFailed: true });
+      expect(repository.recordProgress).toHaveBeenCalledWith(expect.anything(), job.id, 2, 1, 1, expect.stringContaining("no packages are being downloaded again"));
+      expect(repository.publish).toHaveBeenCalledWith(expect.anything(), job.id, result);
+      expect(repository.markFailed).not.toHaveBeenCalled();
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    },
+  );
+
+  it("honors the remaining readiness throttle cache rather than repeatedly probing during its cooldown", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    dependencies.requireAvailable.mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new AppError(429, "provider_throttled", "Cooling down.", { expiresAt }));
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+    expect(dependencies.wait.mock.calls[0][0]).toBeGreaterThan(299_000);
+    expect(dependencies.wait.mock.calls[0][0]).toBeLessThanOrEqual(300_001);
+    expect(dependencies.scan).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    new AppError(401, "interaction_required", "Sign in again."),
+    new AppError(403, "missing_permission", "Permission revoked."),
+    new AppError(503, "provider_error", "Provider denied access.", { evidence: { httpStatus: 403 } }),
+    new AppError(502, "provider_schema", "Invalid observation."),
+  ])("never retries a permanent publication authorization or schema failure: $code", async error => {
+    const { service, repository, dependencies, job } = fixture();
+    dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.markFailed.mock.calls.length + repository.markWaitingAuthorization.mock.calls.length).toBe(1));
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(dependencies.wait).not.toHaveBeenCalled();
+    expect(dependencies.scan).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry an uncertain publication as if it were a readiness failure", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.publish.mockRejectedValueOnce(new AppError(504, "provider_timeout", "Publication failed."));
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledOnce());
+    expect(repository.publish).toHaveBeenCalledOnce();
+    expect(dependencies.wait).not.toHaveBeenCalled();
+    expect(dependencies.scan).toHaveBeenCalledOnce();
+  });
+
+  it.each(["principal", "role"] as const)("rechecks the %s before retrying publication rather than reusing old authority", async changed => {
+    const { service, repository, dependencies, job } = fixture();
+    dependencies.requireAvailable.mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new AppError(504, "provider_timeout", "Transient readiness failure."));
+    dependencies.wait.mockImplementation(async (_ms, signal) => {
+      signal.throwIfAborted();
+      dependencies.revalidateUser.mockResolvedValueOnce(changed === "principal"
+        ? { ...user, homeAccountId: "different-reader" } : { ...user, roles: [] });
+    });
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.markFailed.mock.calls.length + repository.markWaitingAuthorization.mock.calls.length).toBe(1));
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(dependencies.wait).toHaveBeenCalledOnce();
+    expect(dependencies.requireAvailable).toHaveBeenCalledTimes(2);
+    expect(dependencies.scan).toHaveBeenCalledOnce();
+  });
+
+  it.each(["cancel", "logout"] as const)("interrupts publication recovery promptly on %s without holding the account lock", async action => {
+    const { service, repository, dependencies, job } = fixture();
+    const currentUser = { ...user, homeAccountId: `publication-recovery-${action}` };
+    job.authorizationPrincipalId = currentUser.homeAccountId;
+    dependencies.revalidateUser.mockResolvedValue(currentUser);
+    dependencies.requireAvailable.mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new AppError(504, "provider_timeout", "Transient failure."));
+    dependencies.wait.mockImplementation((_ms, signal) => new Promise<void>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    await service.start(currentUser, job.id, "delegated");
+    await vi.waitFor(() => expect(dependencies.wait).toHaveBeenCalledOnce());
+    if (action === "cancel") await service.cancel(currentUser, job.id, "delegated");
+    else await revokeAccountSessionMutations(currentUser.tenantId!, currentUser.homeAccountId, () =>
+      service.waitForPrincipalAuthorization({ tenantId: currentUser.tenantId!, principalId: currentUser.homeAccountId }));
+    await service.drain();
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.markFailed).not.toHaveBeenCalled();
+    expect(dependencies.scan).toHaveBeenCalledOnce();
+    expect(dependencies.requireAvailable).toHaveBeenCalledTimes(2);
+    expect(repository.markWaitingAuthorization).toHaveBeenCalledTimes(action === "logout" ? 1 : 0);
+  });
+
+  it.each([{ requestedIds: [] }, { requestedIds: ["one"] }, { requestedIds: ["one", "two"] }])(
+    "keeps package collection active for three hours within the four-hour ceiling ($requestedIds)", async ({ requestedIds }) => {
+    vi.useFakeTimers();
+    const initial = fixture().job;
+    const { service, repository, dependencies, job } = fixture({
+      getJob: vi.fn(async () => ({ ...initial, requestedIds, scopeKind: requestedIds.length ? "exact" : "broad" })),
+    });
+    const pending = deferred<{ packages: []; totalRecords: number; pages: number }>();
+    dependencies.scan.mockReturnValue(pending.promise);
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+      setTimeout(() => deadline.abort(new DOMException("Execution deadline", "TimeoutError")), milliseconds);
+      return deadline.signal;
+    });
+    try {
+      await service.start(user, job.id, "delegated");
+      expect(timeout).toHaveBeenCalledWith(packageRefreshExecutionDeadlineMs);
+      expect(packageRefreshExecutionDeadlineMs).toBe(4 * 60 * 60_000);
+      await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+      expect(dependencies.scan.mock.calls[0][2].aborted).toBe(false);
+      expect(repository.markFailed).not.toHaveBeenCalled();
+      pending.resolve({ packages: [], totalRecords: 0, pages: 1 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(repository.publish).toHaveBeenCalledOnce();
+    } finally {
+      pending.resolve({ packages: [], totalRecords: 0, pages: 1 });
+      await service.drain();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops pending collection exactly at the four-hour execution ceiling", async () => {
+    vi.useFakeTimers();
+    const { service, repository, dependencies, job } = fixture();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+      const deadline = new AbortController();
+      setTimeout(() => deadline.abort(new DOMException("Execution deadline", "TimeoutError")), milliseconds);
+      return deadline.signal;
+    });
+    dependencies.scan.mockImplementation((_token, _ids, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    try {
+      await service.start(user, job.id, "delegated");
+      await vi.advanceTimersByTimeAsync(4 * 60 * 60_000 - 1);
+      expect(dependencies.scan.mock.calls[0][2].aborted).toBe(false);
+      expect(repository.markFailed).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(repository.markFailed).toHaveBeenCalledWith(
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id,
+        "package_refresh_timeout", expect.stringContaining("four-hour execution deadline"),
+      );
+      expect(repository.publish).not.toHaveBeenCalled();
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    } finally {
+      await service.drain();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not hold the account lock during a slow publication probe or publish after session revocation", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const currentUser = { ...user, homeAccountId: "publication-probe-revocation" };
+    job.authorizationPrincipalId = currentUser.homeAccountId;
+    dependencies.revalidateUser.mockResolvedValue(currentUser);
+    const pending = deferred<undefined>();
+    dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockReturnValueOnce(pending.promise);
+    await service.start(currentUser, job.id, "delegated");
+    await vi.waitFor(() => expect(dependencies.requireAvailable).toHaveBeenCalledTimes(2));
+    await revokeAccountSessionMutations(currentUser.tenantId!, currentUser.homeAccountId, () =>
+      service.waitForPrincipalAuthorization({ tenantId: currentUser.tenantId!, principalId: currentUser.homeAccountId }));
+    expect(repository.publish).not.toHaveBeenCalled();
+    pending.resolve(undefined);
+    await service.drain();
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+  });
+
+  it("supplies renewable tokens and deadline-controlled throttle retries to the real scanner", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    let reads = 0;
+    const fetcher = vi.fn<FetchLike>(async (input, init) => {
+      reads += 1;
+      expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer renewed-${reads}`);
+      return Response.json(new URL(input).pathname.endsWith("/packages")
+        ? { value: [{ id: "one", displayName: "One", isBlocked: false }] }
+        : { id: "one", displayName: "One", isBlocked: false });
+    });
+    dependencies.delegatedToken.mockResolvedValueOnce("admission-token")
+      .mockResolvedValueOnce("renewed-1").mockResolvedValueOnce("renewed-2");
+    const client = new GraphPackagesClient(fetcher);
+    dependencies.scan.mockImplementation((token, ids, signal, progress, options) => scanPackages(token, ids, signal, progress, client, options));
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+    expect(reads).toBe(2);
+    expect(dependencies.scan.mock.calls[0][4]).toMatchObject({ retryThrottlingUntilAborted: true });
+    expect(dependencies.delegatedToken).toHaveBeenCalledTimes(3);
   });
 
   describe("bounded identity detail refresh", () => {
@@ -703,6 +904,68 @@ describe("Package refresh service", () => {
     await service.drain();
     expect(dependencies.scan).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { mode: "delegated", stage: "requireAvailable" },
+    { mode: "delegated", stage: "delegatedToken" },
+    { mode: "application", stage: "requireApplicationDataScope" },
+    { mode: "application", stage: "requireAvailable" },
+    { mode: "application", stage: "applicationToken" },
+  ] as const)("does not block sign-out while $mode admission waits for $stage", async ({ mode, stage }) => {
+    const currentUser = { ...user, homeAccountId: `admission-signout-${mode}-${stage}` };
+    const currentJob = { ...fixture().job, tokenMode: mode, authorizationPrincipalId: currentUser.homeAccountId };
+    const { service, repository, dependencies } = fixture({ getJob: vi.fn(async () => currentJob) });
+    const pending = deferred<void>();
+    dependencies.revalidateUser.mockResolvedValue(currentUser);
+    if (stage === "requireAvailable" || stage === "requireApplicationDataScope") {
+      dependencies[stage].mockImplementationOnce(async () => { await pending.promise; });
+    } else {
+      dependencies[stage].mockImplementationOnce(async () => { await pending.promise; return "token"; });
+    }
+    const starting = service.start(currentUser, currentJob.id, mode);
+    const stopped = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
+    await vi.waitFor(() => expect(dependencies[stage]).toHaveBeenCalledOnce());
+    let signedOut = false;
+    const revoking = revokeAccountSessionMutations(currentUser.tenantId!, currentUser.homeAccountId, async () => {
+      await service.waitForPrincipalAuthorization({ tenantId: currentUser.tenantId!, principalId: currentUser.homeAccountId });
+      signedOut = true;
+    });
+    try {
+      await vi.waitFor(() => expect(signedOut).toBe(true), { timeout: 200 });
+    } finally {
+      pending.resolve();
+      await Promise.all([stopped, revoking]);
+      await service.drain();
+    }
+    expect(repository.markRunning).not.toHaveBeenCalled();
+    expect(dependencies.scan).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
+  it.each(["delegated", "application"] as const)(
+    "fences %s admission against revocation even before cancellation is delivered",
+    async mode => {
+      const currentUser = { ...user, homeAccountId: `admission-generation-${mode}` };
+      const currentJob = { ...fixture().job, tokenMode: mode, authorizationPrincipalId: currentUser.homeAccountId };
+      const { service, repository, dependencies } = fixture({ getJob: vi.fn(async () => currentJob) });
+      const pending = deferred<void>();
+      dependencies.revalidateUser.mockResolvedValue(currentUser);
+      dependencies.requireAvailable.mockReturnValueOnce(pending.promise);
+      const starting = service.start(currentUser, currentJob.id, mode);
+      const stopped = expect(starting).rejects.toMatchObject({ code: "unauthorized" });
+      await vi.waitFor(() => expect(dependencies.requireAvailable).toHaveBeenCalledOnce());
+      const revoking = revokeAccountSessionMutations(currentUser.tenantId!, currentUser.homeAccountId, async () => undefined);
+      pending.resolve();
+      try {
+        await Promise.all([stopped, revoking]);
+        expect(repository.markRunning).not.toHaveBeenCalled();
+        expect(dependencies.scan).not.toHaveBeenCalled();
+        expect(repository.publish).not.toHaveBeenCalled();
+      } finally {
+        await service.drain();
+      }
+    },
+  );
 
   it.each(["cancel", "logout", "shutdown", "deadline"] as const)(
     "does not begin a publication capability check after %s interrupts application-scope authorization",

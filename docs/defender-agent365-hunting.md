@@ -113,6 +113,8 @@ Requested, observed, and unobserved ranges remain distinct. A 201-row response p
 
 Jobs, snapshots, and rows expire after 30 days with dependent export data. Capability evidence established by an explicit delegated provider request follows the finite five-minute readiness TTL. Optional qualification/retained-scope records retain their separate finite lifecycle; those records do not bind ordinary delegated jobs. Source retention remains a Microsoft policy. CSV is formula-hardened, source-safe, and bounded to the retained rows.
 
+Migration 40 repairs retained `CloudAppEvents` rows upgraded by migration 19: their JSON `projectionVersion` is set to the stored version 2, and obsolete `actorUserKey`/`actorUserId` aliases are removed after their values have been mapped to the human/agent actor fields. Legacy rows are not relabeled as version 3 or treated as fresh provider evidence. Inventory rows, current version-3 payloads, job/snapshot query versions, retention, and prior migration checksums remain unchanged. Validate the populated-schema upgrade regression in an isolated PostgreSQL test environment before applying this forward migration; static source checks do not establish database execution success.
+
 ## Audit and fixture boundary
 
 Application/shared approval and qualification, optional delegated qualification and retained-scope revocation, delegated request evidence, submission, provider query, cancellation, view, deletion, and export produce immutable local lifecycle records. Audit metadata is allowlisted to safe source, mode, template, count, status, and correlation fields. It never stores KQL, typed filters, requested target IDs, time ranges, provider bodies, or result rows.

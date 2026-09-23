@@ -1294,7 +1294,7 @@ export async function getAuditEvents(
 
 export async function signOut(options: { signal?: AbortSignal } = {}) {
   assertCurrentRequest(sessionGeneration, options.signal);
-  const generation = ++sessionGeneration;
+  const generation = sessionGeneration;
   await request<void>("/api/auth/logout", { method: "POST", signal: options.signal });
   assertCurrentRequest(generation, options.signal);
   sessionGeneration += 1;
