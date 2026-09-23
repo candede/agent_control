@@ -18,7 +18,7 @@ export type AgentPerson = {
   expired?: boolean;
   invalidId?: boolean;
 };
-type PeopleRead = { key: string; evidenceKey: string; attemptCount: number; error?: string };
+type PeopleRead = { key: string; error?: string };
 
 export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onPeopleChanged?: () => void) {
   const capabilities = useContext(CapabilityContext);
@@ -65,19 +65,15 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
       } : {}),
     };
   }
-  const needsLookup = Object.values(people).some(person =>
-    !person.invalidId && (person.status === "unverified" && !returned || person.expired));
   const canRetry = canLookup && Object.values(people).some(person =>
     !person.invalidId && (person.status !== "resolved" || person.expired));
-  const requestKey = JSON.stringify([evidenceKey, attemptCount, ...personFields.map(field => Boolean(people[field]?.expired))]);
+  const requestKey = JSON.stringify([evidenceKey, attemptCount]);
   const scoped = read?.key === requestKey ? read : undefined;
-  // A completed explicit retry must not turn later expiry/permission changes into forced retries.
-  const force = attemptCount > 0 && !(read?.evidenceKey === evidenceKey && read.attemptCount === attemptCount);
   const onChanged = useEffectEvent(() => onPeopleChanged?.());
   const ownsRequest = useEffectEvent((key: string) => key === requestKey && canLookup);
   const startLookup = useEffectEvent((signal: AbortSignal) => {
-    if (!canLookup || scoped || (!needsLookup && !force)) return;
-    void resolveAgentPeople(record.id, { signal, ...(force ? { force: true } : {}) })
+    if (!canLookup || scoped || attemptCount === 0) return;
+    void resolveAgentPeople(record.id, { signal, force: true })
       .then(response => {
         if (signal.aborted || !ownsRequest(requestKey)) return;
         if (Object.entries(response.people ?? {}).some(([field, person]) => !personFields.includes(field as PersonField)
@@ -86,12 +82,12 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
           throw new Error("Directory lookup did not return the requested agent's person identities.");
         }
         setPersisted({ key: evidenceKey, value: response.people });
-        setRead({ key: requestKey, evidenceKey, attemptCount });
+        setRead({ key: requestKey });
         if (response.changed) onChanged();
       })
       .catch((failure: unknown) => {
         if (!signal.aborted && ownsRequest(requestKey)) setRead({
-          key: requestKey, evidenceKey, attemptCount,
+          key: requestKey,
           error: failure instanceof Error ? failure.message : "Agent people could not be resolved.",
         });
       });
@@ -103,7 +99,7 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
     return () => controller.abort();
   }, [requestKey, canLookup]);
 
-  const loading = canLookup && (needsLookup || force) && !scoped;
+  const loading = canLookup && attemptCount > 0 && !scoped;
   const needsAttention = Object.values(people).some(person => person.status !== "resolved" || person.expired);
   return {
     people,

@@ -129,3 +129,10 @@
   .copilot-users-toolbar > label { flex-basis: 100%; }
   .copilot-users-tabs button { flex: 1 1 calc(50% - 6px); }
 }
+.user-responsibility { min-width: 0; }
+.user-responsibility p, .user-responsibility small { overflow-wrap: anywhere; }
+.user-responsibility label { display: grid; gap: .4rem; max-width: 32rem; }
+.responsibility-list { display: grid; gap: .75rem; list-style: none; padding: 0; }
+.responsibility-list > li { display: grid; gap: .4rem; padding: 1rem; border: 1px solid var(--border); border-radius: .5rem; min-width: 0; overflow-wrap: anywhere; }
+.responsibility-list button { justify-self: start; white-space: normal; text-align: left; max-width: 100%; }
+.responsibility-identity { display: grid; gap: .3rem; overflow-wrap: anywhere; }

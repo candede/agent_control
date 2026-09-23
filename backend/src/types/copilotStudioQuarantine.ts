@@ -22,25 +22,6 @@ export type InventoryQuarantineTarget = CopilotStudioQuarantineTarget & {
   inventoryQuarantinedAt: string | null;
 };
 
-export type QuarantineTargetEligibilityCode = "eligible" | "stale_snapshot" | "ambiguous_native_id" | "native_identity_unavailable";
-
-export type QuarantineTargetCandidate = {
-  nativeId: string;
-  type: "microsoft.copilotstudio/agents";
-  displayName: string;
-  environmentId: string | null;
-  botId: string | null;
-  identifiers: Array<{ kind: "environment_id" | "cds_bot_id"; value: string }>;
-  details: { isQuarantined?: boolean; quarantinedAt?: string };
-  quarantineEligibility: { eligible: boolean; code: QuarantineTargetEligibilityCode; reason?: string };
-};
-
-export type QuarantineTargetPage = {
-  value: QuarantineTargetCandidate[];
-  count: number;
-  snapshot: { id: string; observedAt: string; expiresAt: string } | null;
-};
-
 export type FrozenQuarantineTarget = InventoryQuarantineTarget & {
   directStatus: CopilotStudioQuarantineStatus;
 };

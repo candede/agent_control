@@ -92,22 +92,15 @@ describe("Power Platform inventory refresh service", () => {
     }
   });
 
-  it("rejects a real type-scope change before querying and fails a changed publication scope instead of requesting irrelevant reauthorization", async () => {
+  it("preserves the two-type query when changing between supported full and AI roles", async () => {
     const changedUser = { ...user, providerRoleIds: [inventoryProviderRoleIds.aiReader] };
-    const beforeStart = fixture();
-    beforeStart.job.requestedTypes = ["microsoft.copilotstudio/agents", "microsoft.powerapps/canvasapps"];
-    beforeStart.dependencies.revalidateUser.mockResolvedValue(changedUser);
-    await expect(beforeStart.service.start(user, beforeStart.job.id)).rejects.toMatchObject({ code: "inventory_scope_changed" });
-    expect(beforeStart.dependencies.query).not.toHaveBeenCalled();
     const duringQuery = fixture();
-    duringQuery.job.requestedTypes = [...beforeStart.job.requestedTypes];
+    duringQuery.job.requestedTypes = ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"];
     duringQuery.dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(changedUser);
     await duringQuery.service.start(user, duringQuery.job.id);
-    await vi.waitFor(() => expect(duringQuery.repository.markFailed).toHaveBeenCalledWith(
-      { tenantId: user.tenantId, principalId: user.homeAccountId }, duringQuery.job.id,
-      "inventory_scope_changed", expect.stringContaining("Submit a new refresh"),
-    ));
-    expect(duringQuery.repository.publish).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(duringQuery.repository.publish).toHaveBeenCalledOnce());
+    expect(duringQuery.dependencies.query).toHaveBeenCalledWith(expect.any(String), duringQuery.job.requestedTypes, expect.any(Object));
+    expect(duringQuery.repository.markFailed).not.toHaveBeenCalled();
     expect(duringQuery.repository.markWaitingAuthorization).not.toHaveBeenCalled();
   });
 

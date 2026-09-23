@@ -56,11 +56,8 @@ async function mockPeopleInventory(page: Page, record: UnifiedAgentRecord) {
     source: "power_platform", nativeId, resourceType: record.powerPlatformResource!.type,
     environmentId: record.environmentId, snapshotId: record.observations.powerPlatform!.snapshotId,
     observedAt: layoutTime, expiresAt: "2026-10-12T10:00:00Z", identifiers: [],
-    package: { status: "unmatched", reason: "No source-declared counterpart was saved." },
-    reports: { status: "unavailable", reason: "No report association was saved." },
     audit: { status: "available", count: 0, value: [] },
     security: { status: "available", count: 0, value: [] },
-    controls: { quarantineTarget: null, packageTarget: null },
   };
   await page.route(url => url.pathname === `/api/inventory/resources/${nativeId}/related`, route => {
     expect(route.request().method()).toBe("GET");
@@ -143,14 +140,17 @@ test("missing creator lookup is bounded, shows errors, and retries without hidin
   expect(requests).toEqual([]);
   await page.getByRole("button", { name: nativeId, exact: true }).click();
   const information = page.getByRole("region", { name: "Agent information" });
+  await expect(information.getByText("Created by", { exact: true }).locator("..")).toContainText(creatorId);
+  expect(requests).toEqual([]);
+  await information.getByRole("button", { name: "Look up people" }).click();
   await expect(information.getByRole("alert")).toContainText("Synthetic directory lookup unavailable.");
   await expect(information.getByText("Owner", { exact: true }).locator("..")).toContainText("Saved agent owner");
   const readsBeforeRetry = inventoryReads.length;
-  await information.getByRole("button", { name: "Retry person lookup" }).click();
+  await information.getByRole("button", { name: "Look up people" }).click();
   await expect(information.getByText("Created by", { exact: true }).locator("..")).toContainText("Resolved creator");
   await expect(information.getByText("Created by", { exact: true }).locator("..")).toContainText("creator@example.invalid");
   expect(requests).toEqual([
-    { recordId: record.id },
+    { recordId: record.id, force: true },
     { recordId: record.id, force: true },
   ]);
   await expect.poll(() => inventoryReads.length).toBeGreaterThan(readsBeforeRetry);
@@ -194,8 +194,8 @@ test("fresh negative and failure evidence is not automatically retried and prese
   await expect(information.getByText("Owner", { exact: true }).locator("..")).toContainText("Saved agent owner");
   await expect(information.getByText("Created by", { exact: true }).locator("..")).toContainText("User not found at the last directory lookup.");
   expect(requests).toEqual([]);
-  await information.getByRole("button", { name: "Retry person lookup" }).click();
-  await expect(information.getByRole("button", { name: "Retry person lookup" })).toBeVisible();
+  await information.getByRole("button", { name: "Look up people" }).click();
+  await expect(information.getByRole("button", { name: "Look up people" })).toBeVisible();
   expect(requests).toEqual([{ recordId: record.id, force: true }]);
   expect(unexpected).toEqual([]);
 });

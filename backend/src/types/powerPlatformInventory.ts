@@ -1,17 +1,6 @@
-import type { IdentityResolution } from "../services/inventoryIdentity.js";
-
 export const powerPlatformResourceTypes = [
-  "microsoft.powerapps/canvasapps",
-  "microsoft.powerapps/modeldrivenapps",
-  "microsoft.powerapps/codeapps",
-  "microsoft.powerapps/apps",
-  "microsoft.powerautomate/cloudflows",
-  "microsoft.powerautomate/agentflows",
-  "microsoft.powerautomate/m365agentflows",
   "microsoft.copilotstudio/agents",
-  "microsoft.powerplatformconnector/connectors",
   "microsoft.powerplatform/environments",
-  "microsoft.powerplatform/environmentgroups",
 ] as const;
 
 export type PowerPlatformResourceType = typeof powerPlatformResourceTypes[number];
@@ -44,9 +33,8 @@ export type InventoryFieldProvenance = {
 
 export type InventoryConnectorOperation = {
   operationId: string;
-  displayName?: string;
-  description?: string;
-  method?: string;
+  /** User who configured this operation, not the agent owner or creator. */
+  createdBy?: string;
   usedAs?: string;
   isEnabled?: boolean;
   requiresEndUserConsent?: boolean;
@@ -60,7 +48,6 @@ export type InventoryConnector = {
 };
 
 export type PowerPlatformResourceDetails = {
-  sourceTenantId?: string | null;
   ownerId?: string;
   lastModifiedAt?: string;
   lastModifiedBy?: string;
@@ -69,21 +56,9 @@ export type PowerPlatformResourceDetails = {
   isManaged?: boolean;
   schemaName?: string;
   createdIn?: string;
-  appModuleId?: string;
-  logicalName?: string;
-  subType?: string;
-  workflowEntityId?: string;
-  trigger?: string;
-  triggerOperation?: string;
   environmentType?: string;
   environmentGroup?: string;
   environmentGroupId?: string;
-  description?: string;
-  connectorId?: string;
-  publisher?: string;
-  tier?: string;
-  releaseTag?: string;
-  isDeprecated?: boolean;
   orchestration?: string;
   model?: string;
   authentication?: string;
@@ -97,7 +72,6 @@ export type PowerPlatformResourceDetails = {
 };
 
 export type PowerPlatformResource = {
-  // Authorized inventory partition; catalog source ownership is recorded separately.
   tenantId: string;
   nativeId: string;
   type: PowerPlatformResourceType;
@@ -114,7 +88,6 @@ export type PowerPlatformResource = {
   lifecycle: "draft" | "published" | "unknown" | "not_applicable";
   identityConfidence: "exact_native" | "partial";
   identifiers: InventoryIdentifier[];
-  association?: IdentityResolution;
   provenance: Record<string, InventoryFieldProvenance>;
   details: PowerPlatformResourceDetails;
   unknownFieldCount: number;
@@ -127,8 +100,6 @@ export function derivePowerPlatformAuthoringTool(type: PowerPlatformResourceType
       : normalized === "copilotstudiolite" || normalized === "microsoft365copilotagentbuilder"
         ? "Microsoft 365 Copilot Agent Builder" : null;
   }
-  if (type.startsWith("microsoft.powerapps/")) return "Power Apps";
-  if (type === "microsoft.powerautomate/cloudflows" || type === "microsoft.powerautomate/agentflows") return "Power Automate";
   return null;
 }
 
@@ -179,7 +150,6 @@ export type InventorySnapshot = {
 export type InventoryResourcePage = {
   value: PowerPlatformResource[];
   count: number;
-  typeCounts: InventoryTypeCoverage[];
   snapshot: InventorySnapshot | null;
 };
 
@@ -206,8 +176,4 @@ export type InventoryRefreshJobList = {
   value: InventoryRefreshJob[];
   lastAttemptAt: string | null;
   lastSuccessAt: string | null;
-};
-
-export type InventorySnapshotList = {
-  value: InventorySnapshot[];
 };

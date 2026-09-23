@@ -119,6 +119,7 @@ export async function publishBoundedCsv(
 
 export function csvValue(value: unknown) {
   const text = value === null || value === undefined ? "" : typeof value === "string" ? value : String(value);
+  if (!text) return "";
   const safe = /^[=+\-@\t\r\u2212]/u.test(text) ? `'${text}` : text;
   return `"${safe.replaceAll('"', '""')}"`;
 }

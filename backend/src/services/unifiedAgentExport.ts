@@ -1,9 +1,9 @@
 import { agentAuthoringToolLabels, agentColumnValue } from "../types/agentPresentation.js";
 import type { UnifiedAgentInventoryPage, UnifiedAgentSort } from "../types/unifiedAgents.js";
 import { buildBoundedCsv } from "./csvExport.js";
+import { agentCapabilityExport, agentCapabilityExportColumns } from "./agentContextExport.js";
 
 export function buildUnifiedAgentCsv(inventory: UnifiedAgentInventoryPage, deadlineAt: number) {
-  const environments = new Map(inventory.facets.environments.map(value => [value.value.toLowerCase(), value.label]));
   const columns = [
     "agentId", "displayName", "environmentId", "environmentName", "builtWith", "packageIds", "packageStates",
     "nativeResourceId", "publicationStatus", "quarantineStatus", "identityState", "identityEvidence",
@@ -22,6 +22,10 @@ export function buildUnifiedAgentCsv(inventory: UnifiedAgentInventoryPage, deadl
     "ownerResolutionStatus", "ownerCheckedAt", "ownerErrorCode",
     "createdByResolutionStatus", "createdByCheckedAt", "createdByErrorCode",
     "lastModifiedByResolutionStatus", "lastModifiedByCheckedAt", "lastModifiedByErrorCode",
+    "environmentContextStatus", "environmentRegion", "environmentType", "managedEnvironment",
+    "environmentGroup", "environmentGroupId", "environmentSnapshotId", "environmentObservedAt",
+    "environmentExpiresAt", "environmentProvenance",
+    ...agentCapabilityExportColumns,
   ] as const;
   function* rows() {
     for (const record of inventory.value) {
@@ -34,7 +38,18 @@ export function buildUnifiedAgentCsv(inventory: UnifiedAgentInventoryPage, deadl
         agentId: record.id,
         displayName: record.displayName,
         environmentId: record.environmentId,
-        environmentName: record.environmentId ? environments.get(record.environmentId.toLowerCase()) ?? record.environmentId : null,
+        environmentName: record.environment?.displayName,
+        environmentContextStatus: record.environment ? "available" : record.environmentId ? "saved_metadata_unavailable" : "identity_not_established",
+        environmentRegion: record.environment?.region,
+        environmentType: record.environment?.environmentType,
+        managedEnvironment: record.environment?.isManaged,
+        environmentGroup: record.environment?.groupName,
+        environmentGroupId: record.environment?.groupId,
+        environmentSnapshotId: record.environment?.observation.snapshotId,
+        environmentObservedAt: record.environment?.observation.observedAt,
+        environmentExpiresAt: record.environment?.observation.expiresAt,
+        environmentProvenance: record.environment ? JSON.stringify(record.environment.provenance) : null,
+        ...agentCapabilityExport(record.powerPlatformResource),
         builtWith: agentAuthoringToolLabels(record).join("; "),
         packageIds: JSON.stringify(record.packages.map(value => value.id)),
         packageStates: JSON.stringify(record.packages.map(value => ({

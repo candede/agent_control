@@ -3,7 +3,6 @@ import type { DataSyncSourceId } from "./dataSync.js";
 
 export const workbenchViewIds = [
   "agents",
-  "power-platform",
   "users",
   "sync",
   "audit",
@@ -94,8 +93,6 @@ export type InventorySourceAwareDetail = {
   observedAt: string;
   expiresAt: string;
   identifiers: Array<{ kind: string; value: string }>;
-  package: RelatedSource<never>;
-  reports: RelatedSource<never>;
   audit: RelatedSource<{
     jobId: string; nativeEventId: string | null; wrapperId: string; observedAt: string;
     operation: string; resultStatus: string | null; correlationId: string | null; matchedKind: "cds_bot_id";
@@ -104,5 +101,4 @@ export type InventorySourceAwareDetail = {
     jobId: string; snapshotId: string; nativeRecordId: string; observedAt: string; platform: string | null;
     lifecycleStatus: string | null; publishedStatus: string | null; matchedKind: "entra_agent_id";
   }>;
-  controls: { quarantineTarget: { environmentId: string; botId: string } | null; packageTarget: null };
 };

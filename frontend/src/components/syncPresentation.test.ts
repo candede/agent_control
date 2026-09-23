@@ -21,6 +21,7 @@ describe("sync presentation", () => {
     expect(Object.keys(syncSourceDetails).sort()).toEqual([...dataSyncSourceIds].sort());
     expect(automaticSyncSources).toEqual(automaticDataSyncSourceIds);
     expect(automaticSyncSources).not.toContain("usage_reports");
+    expect(syncSourceDetails.power_platform.description).toBe("Agents and supporting environment metadata");
   });
 
   const sourceLabels: Record<DataSyncSourceId, { label: string; unit: string }> = {

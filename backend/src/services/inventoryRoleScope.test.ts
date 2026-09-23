@@ -13,13 +13,8 @@ describe("Power Platform provider role scope", () => {
     expect(normalizeInventoryProviderRoleIds([inventoryProviderRoleIds.aiReader, inventoryProviderRoleIds.aiReader, 1, "not-a-guid"])).toEqual([inventoryProviderRoleIds.aiReader]);
     expect(normalizeInventoryProviderRoleIds(Array.from({ length: 65 }, () => inventoryProviderRoleIds.globalReader))).toEqual([]);
     expect(resourceTypesForInventoryScope("ai")).toEqual([
-      "microsoft.powerapps/codeapps",
-      "microsoft.powerapps/apps",
-      "microsoft.powerautomate/agentflows",
-      "microsoft.powerautomate/m365agentflows",
       "microsoft.copilotstudio/agents",
       "microsoft.powerplatform/environments",
-      "microsoft.powerplatform/environmentgroups",
     ]);
   });
 });

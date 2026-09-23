@@ -39,11 +39,10 @@ describe("DataSyncService", () => {
       requestedIds: [],
     }));
     expect(harness.powerPlatform.submit).toHaveBeenCalledWith(user, expect.objectContaining({
-      requestedTypes: expect.arrayContaining([
+      requestedTypes: [
         "microsoft.copilotstudio/agents",
-        "microsoft.powerapps/canvasapps",
-        "microsoft.powerautomate/cloudflows",
-      ]),
+        "microsoft.powerplatform/environments",
+      ],
     }));
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), {
       incompleteOnly: false,

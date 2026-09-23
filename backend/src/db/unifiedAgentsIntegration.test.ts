@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parse as parseCsv } from "csv-parse/sync";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { AppError } from "../errors.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
@@ -6,6 +7,7 @@ import { resolvePackageAgentLinks } from "../services/packageAgentIdentity.js";
 import { UnifiedAgentsService } from "../services/unifiedAgents.js";
 import { AgentUsageService } from "../services/agentUsage.js";
 import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
+import { PowerPlatformResourceQueryClient } from "../services/powerPlatformResourceQuery.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
@@ -14,6 +16,9 @@ import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 import { UnifiedAgentRegistry } from "./unifiedAgentRegistry.js";
 import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
 import { deleteUsageSet, publishUsageReports, saveUsageInventory, usageAudit } from "./agentUsageTestSupport.js";
+import { SavedAgentPeopleService } from "../services/savedAgentPeople.js";
+import { AgentPeopleRepository } from "./agentPeople.js";
+import { DataSyncRepository } from "./dataSync.js";
 
 const scope = { tenantId: "unified-integration-tenant", principalId: "unified-reader" };
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -77,6 +82,140 @@ async function publishResources(repository: PowerPlatformInventoryRepository, ke
 }
 
 describe("persisted unified agent inventory", () => {
+  it("projects scoped cached responsibility outside directory/report cohorts with current canonical navigation after refresh", async () => {
+    const fixture = await testDatabase();
+    try {
+      const packages = new PackageInventoryRepository(fixture.runtime);
+      const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+      const cache = new AgentPeopleRepository(fixture.runtime);
+      const service = new UnifiedAgentsService({
+        packages, powerPlatform, usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
+        people: new SavedAgentPeopleService(new DataSyncRepository(fixture.runtime), cache),
+        resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
+      });
+      await publishResources(powerPlatform, "responsibility", [
+        { ...nativeResource(botId, "cr_studio"), createdBy: unrelatedId, details: { schemaName: "cr_studio", ownerId: manifestId, lastModifiedBy: manifestId } },
+        { ...nativeResource(unrelatedId, "two"), details: { ownerId: manifestId } },
+      ]);
+      await publishPackages(packages, "responsibility-packages", [studioPackage()]);
+      await cache.save(scope, [{ objectId: manifestId, status: "resolved", displayName: "Outside paid roster",
+        userPrincipalName: "owner@example.invalid", checkedAt: new Date().toISOString() }], { generation: await cache.generation(scope) });
+      const result = await service.responsibility(scope, { objectId: manifestId, limit: 1 });
+      expect(result.selected?.person.evidence?.displayName).toBe("Outside paid roster");
+      expect(result.selected?.count).toBe(2);
+      expect(result.selected?.agents).toHaveLength(1);
+      expect((await service.responsibility(scope, { objectId: manifestId })).selected?.agents.map(agent => agent.presence).sort())
+        .toEqual(["both", "power_platform"]);
+      const canonicalId = result.selected!.agents[0].id;
+      expect(canonicalId).toMatch(/^agent:/);
+      expect((await service.list(scope, { recordId: canonicalId })).value).toHaveLength(1);
+      expect((await service.responsibility({ ...scope, principalId: "different-reader" })).people).toEqual([]);
+      expect((await service.responsibility({ ...scope, tenantId: "different-tenant" })).people).toEqual([]);
+      await expect(service.responsibility({ ...scope, principalId: "different-reader" }, { objectId: manifestId }))
+        .rejects.toMatchObject({ code: "responsibility_person_unavailable" });
+      await publishResources(powerPlatform, "responsibility-refresh", [
+        { ...nativeResource(botId, "cr_studio"), createdBy: unrelatedId, details: { schemaName: "cr_studio", ownerId: manifestId } },
+        { ...nativeResource(unrelatedId, "two"), details: { ownerId: manifestId } },
+      ]);
+      const refreshed = await service.responsibility(scope, { objectId: manifestId });
+      expect(refreshed.selected?.agents.map(agent => agent.id)).toContain(canonicalId);
+      expect(refreshed.revision).not.toBe(result.revision);
+      await publishResources(powerPlatform, "responsibility-remove", []);
+      expect((await service.responsibility(scope, { objectId: manifestId })).selected?.state).toBe("no_reported_relationships");
+      await publishPackages(packages, "responsibility-remove-packages", []);
+      expect((await service.list(scope, { recordId: canonicalId })).count).toBe(0);
+    } finally { await fixture.close(); }
+  });
+  it("carries exact scoped environment and configured operations from provider projection through persistence and export", async () => {
+    const fixture = await testDatabase();
+    try {
+      const packages = new PackageInventoryRepository(fixture.runtime);
+      const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+      const creator = "52bff06b-5db5-42cd-9919-28f95e3c07af";
+      const raw = [
+        ...[botId, unrelatedId].map(name => ({
+          tenantId: scope.tenantId, name, type: "microsoft.copilotstudio/agents", location: "europe",
+          properties: {
+            name, environmentId, displayName: "Same agent name", ownerId: manifestId, createdBy: botId,
+            powerPlatformConnectors: [{ connectorId: "shared_excelonlinebusiness", operations: [{
+              operationId: "RunScriptProd", createdBy: creator, isEnabled: false, requiresEndUserConsent: false,
+              usedAs: "Topic Tool", whenCanBeUsed: "ViaDirectReferenceOnly", connectionProvider: "Maker",
+              connectionIdSharedByMaker: "secret-connection", callbackUrl: "https://private.invalid/?sig=secret",
+            }] }],
+            capabilitiesCounts: { distinctPowerPlatformConnectors: 3, distinctPowerPlatformConnectorsOperations: 5 },
+            flowIds: [unrelatedId],
+          },
+        })),
+        ...[environmentId, manifestId].map(name => ({
+          tenantId: scope.tenantId, name, type: "microsoft.powerplatform/environments", location: "europe",
+          properties: { displayName: "Finance production", environmentType: "Production", isManaged: false, environmentGroup: "Finance" },
+        })),
+      ];
+      const query = new PowerPlatformResourceQueryClient(async () => Response.json({
+        totalRecords: raw.length, count: raw.length, resultTruncated: false, data: raw,
+      }));
+      const projected = await query.query("fixture-token", undefined, { expectedTenantId: scope.tenantId });
+      const job = await powerPlatform.submit(scope, {
+        idempotencyKey: "context", roleScope: "full",
+        requestedTypes: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"],
+      });
+      await powerPlatform.markRunning(scope, job.id);
+      const published = await powerPlatform.publish(scope, job.id, projected);
+      const graphOnly = {
+        ...studioPackage(), id: "unmatched-package",
+        elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "", definition: JSON.stringify({
+          SourceIds: { EnvironmentId: environmentId, CdsBotId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" },
+        }) }] }],
+      };
+      await publishPackages(packages, "context-packages", [graphOnly]);
+      const service = new UnifiedAgentsService({
+        packages, powerPlatform, usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
+        resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
+      });
+      const page = await service.list(scope);
+      expect(page.value).toHaveLength(3);
+      expect(page.value.filter(record => record.presence === "power_platform")).toHaveLength(2);
+      for (const record of page.value) expect(record.environment).toMatchObject({
+        id: environmentId, displayName: "Finance production", region: "europe", environmentType: "Production",
+        isManaged: false, groupName: "Finance", groupId: null,
+        observation: { snapshotId: published.snapshotId, current: true },
+        provenance: { isManaged: { path: "properties.isManaged", maturity: "ga" } },
+      });
+      const native = page.value.find(record => record.powerPlatformResource?.nativeId === botId)!;
+      expect(native.powerPlatformResource?.details).toMatchObject({
+        ownerId: manifestId, connectorDetailsStatus: "partial",
+        connectors: [{ connectorId: "shared_excelonlinebusiness", operations: [{ createdBy: creator, isEnabled: false, requiresEndUserConsent: false }] }],
+      });
+      expect(native.powerPlatformResource?.createdBy).toBe(botId);
+      expect(JSON.stringify(page)).not.toMatch(/secret-connection|private.invalid|flowIds/);
+      const rows = parseCsv(buildUnifiedAgentCsv(page, Date.now() + 15_000).buffer, { columns: true, bom: true });
+      const exported = rows.find((row: { agentId: string }) => row.agentId === native.id);
+      expect(exported).toMatchObject({
+        environmentName: "Finance production", managedEnvironment: "false", environmentSnapshotId: published.snapshotId,
+        reportedConnectorTotal: "3", reportedOperationTotal: "5", savedConnectorDetails: "1", savedOperationDetails: "1",
+        connectorDetailsStatus: "partial", owner: manifestId, createdBy: botId,
+      });
+      expect(JSON.parse(exported.configuredConnectors)[0].operations[0]).toMatchObject({ createdBy: creator, isEnabled: false });
+      expect(exported.invokedFlowContext).toBe("unavailable_from_synced_sources");
+      const refreshed = await powerPlatform.submit(scope, {
+        idempotencyKey: "new-environment-context", roleScope: "full", requestedTypes: ["microsoft.powerplatform/environments"],
+      });
+      await powerPlatform.markRunning(scope, refreshed.id);
+      const next = await powerPlatform.publish(scope, refreshed.id, {
+        queriedTypes: ["microsoft.powerplatform/environments"], environmentScope: null, pages: 1, totalRecords: 1, unknownFieldCount: 0,
+        resources: projected.resources.filter(value => value.nativeId === environmentId).map(value => ({ ...value, displayName: "Renamed environment" })),
+      });
+      const updated = await service.list(scope);
+      expect(updated.value.every(record => record.environment?.observation.snapshotId === next.snapshotId)).toBe(true);
+      expect(updated.revision).not.toBe(page.revision);
+      await expect(service.forExport(scope, page.revision!)).rejects.toMatchObject({ code: "inventory_changed" });
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("projects reviewed usage into private inventories and fences filtered exports across associations and report changes", async () => {
     const fixture = await testDatabase();
     try {

@@ -50,14 +50,11 @@ describe("corroborated agent control identity", () => {
       const proof = await publish(scope.principalId, "current-proof");
       expect(await inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
         .toMatchObject([{ resourceNativeId: botId, environmentId, botId, snapshotId: saved.snapshotId }]);
-      expect((await inventory.listQuarantineTargets(scope)).value[0])
-        .toMatchObject({ botId, quarantineEligibility: { eligible: true } });
       expect((await inventory.readUnifiedSource(scope)).resources[0].identifiers)
         .not.toContainEqual({ kind: "cds_bot_id", value: botId });
       await fixture.operator.query("UPDATE package_inventory_snapshots SET observed_at=clock_timestamp()-interval '25 hours' WHERE id=$1", [proof.snapshotId]);
       await expect(inventory.resolveQuarantineTargets(scope, saved.snapshotId, [botId]))
         .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
-      expect((await inventory.listQuarantineTargets(scope)).value[0].quarantineEligibility.eligible).toBe(false);
       const exact = await packages.submit(scope, {
         authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "retained-exact-proof", requestedIds: [packaged.id],
       });

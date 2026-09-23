@@ -7,7 +7,7 @@ function user(role: AppRole): SessionUser {
 }
 
 describe("role-aware views", () => {
-  const observationalViews = ["agents", "power-platform", "users", "sync", "audit", "security", "permissions", "jobs"];
+  const observationalViews = ["agents", "users", "sync", "audit", "security", "permissions", "jobs"];
 
   it("allows Viewer and Admin to every observational view", () => {
     expect(allowedViews(user("AgentControl.Viewer"))).toEqual(observationalViews);

@@ -34,7 +34,7 @@ describe("capability UX decisions", () => {
       expect(capabilityExplanation(ready)).toContain("Microsoft validates delegated permissions and provider roles on the actual operation");
       expect(capabilityExplanation(ready)).toContain("Review and confirm the exact targets");
       expect(capabilityNextStep(ready)?.text).toContain(id === "powerPlatform.quarantine.manage" ? "Microsoft validates permission on each operation" : "CopilotPackages.ReadWrite.All");
-      expect(capabilityNextStep(ready)?.href).toBe(id === "powerPlatform.quarantine.manage" ? "/power-platform" : "/agents");
+      expect(capabilityNextStep(ready)?.href).toBe("/agents");
     },
   );
   it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(

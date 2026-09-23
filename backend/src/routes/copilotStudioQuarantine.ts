@@ -1,5 +1,4 @@
 import { Router } from "express";
-import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
 import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { copilotStudioQuarantineCanaries, copilotStudioQuarantineCanaryRepository } from "../services/copilotStudioQuarantineCanaries.js";
@@ -14,15 +13,6 @@ import type { QuarantineAction } from "../types/copilotStudioQuarantine.js";
 import { policyRoute } from "./policy.js";
 
 export const copilotStudioQuarantineRouter = Router();
-const inventoryRepository = new PowerPlatformInventoryRepository();
-
-policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/targets", { access: "authenticated", dataClass: "copilot_studio_quarantine_target", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await inventoryRepository.listQuarantineTargets(requestScope(request), {
-    search: optionalSearch(first(request.query.search)),
-    limit: positiveInteger(first(request.query.limit), 50, 100),
-    offset: nonnegativeInteger(first(request.query.offset), 0, 100_000),
-  }));
-});
 
 policyRoute(copilotStudioQuarantineRouter, "get", "/quarantine/status", { access: "authenticated", dataClass: "copilot_studio_quarantine_status", roles: ["AgentControl.Viewer"], capabilityId: "powerPlatform.quarantine.read" }, async (request, response) => {
   response.json(await copilotStudioQuarantineControl.status(request.session.user!, requiredUuid(first(request.query.snapshotId), "snapshotId"), requiredNativeId(first(request.query.nativeId)), first(request.query.force) === "true"));
@@ -157,19 +147,6 @@ function positiveInteger(value: string | undefined, fallback: number, maximum: n
   const parsed = Number(value);
   if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) throw new AppError(400, "invalid_quarantine_query", "Quarantine paging value is outside the supported range.");
   return parsed;
-}
-
-function nonnegativeInteger(value: string | undefined, fallback: number, maximum: number) {
-  if (value === undefined) return fallback;
-  const parsed = Number(value);
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 0 || parsed > maximum) throw new AppError(400, "invalid_quarantine_query", "Quarantine paging value is outside the supported range.");
-  return parsed;
-}
-
-function optionalSearch(value: string | undefined) {
-  if (value === undefined || value === "") return undefined;
-  if (value.length > 128 || /[\r\n\0]/.test(value)) throw new AppError(400, "invalid_quarantine_query", "Quarantine target search is invalid.");
-  return value;
 }
 
 function first(value: unknown) {

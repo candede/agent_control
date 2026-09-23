@@ -3,7 +3,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
-import { powerPlatformAgentKey, powerPlatformInventoryIdentity, resolveExactInventoryIdentity, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
+import { powerPlatformAgentKey, type InventoryIdentityRecord } from "../services/inventoryIdentity.js";
 import { inventoryQueryTypes } from "../services/inventoryRoleScope.js";
 import {
   derivePowerPlatformAuthoringTool,
@@ -13,13 +13,13 @@ import {
   type InventoryResourcePage,
   type InventoryRoleScope,
   type InventorySnapshot,
-  type InventorySnapshotList,
   type InventoryTypeCoverage,
   type PowerPlatformResource,
   type PowerPlatformResourceType,
   type ResourceQueryResult,
 } from "../types/powerPlatformInventory.js";
-import type { InventoryQuarantineTarget, QuarantineTargetCandidate, QuarantineTargetEligibilityCode, QuarantineTargetPage } from "../types/copilotStudioQuarantine.js";
+import type { InventoryQuarantineTarget } from "../types/copilotStudioQuarantine.js";
+import type { SavedAgentEnvironment } from "../types/unifiedAgents.js";
 import { validateQuarantineTarget } from "../services/copilotStudioQuarantine.js";
 import { resolvePackageAgentLinks, withVerifiedControlIdentities } from "../services/packageAgentIdentity.js";
 import { PackageInventoryRepository } from "./packageInventory.js";
@@ -34,20 +34,16 @@ export type InventoryRefreshInput = {
   idempotencyKey: string;
 };
 export type InventoryListQuery = {
-  includeAssociations?: boolean;
-  excludeAgents?: boolean;
   snapshotId?: string;
-  type?: PowerPlatformResourceType;
   environmentId?: string;
   search?: string;
-  sortBy?: "displayName" | "type" | "environmentId" | "createdAt" | "lastPublishedAt";
+  sortBy?: "displayName" | "environmentId" | "createdAt" | "lastPublishedAt";
   sortDirection?: "asc" | "desc";
   limit?: number;
   offset?: number;
 };
 export type UnifiedPowerPlatformSourceResult = {
   resources: PowerPlatformResource[];
-  environmentNames: Record<string, string>;
   snapshot: InventorySnapshot | null;
 };
 
@@ -171,15 +167,6 @@ export class PowerPlatformInventoryRepository {
     };
   }
 
-  async listSnapshots(scope: InventoryDataScope, limit = 50): Promise<InventorySnapshotList> {
-    validateScope(scope);
-    const boundedLimit = Math.min(Math.max(limit, 1), 50);
-    const { rows } = await this.database.query<SnapshotRow>(`SELECT * FROM power_platform_inventory_snapshots
-      WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
-      ORDER BY observed_at DESC,id DESC LIMIT $3`, [scope.tenantId, scope.principalId, boundedLimit]);
-    return { value: await this.verifySnapshots(scope, rows) };
-  }
-
   async markRunning(scope: InventoryDataScope, id: string) {
     const result = await this.database.query(`UPDATE power_platform_refresh_jobs SET status='running',attempted_at=clock_timestamp(),updated_at=clock_timestamp(),error_code=NULL,message=NULL
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId]);
@@ -277,38 +264,19 @@ export class PowerPlatformInventoryRepository {
     if (!snapshot) return {
       value: [],
       count: 0,
-      typeCounts: query.excludeAgents
-        ? emptyCoverage().filter(item => item.type !== "microsoft.copilotstudio/agents")
-        : emptyCoverage(),
       snapshot: null,
     };
     const [verifiedSnapshot] = await this.verifySnapshots(scope, [snapshot]);
     const { sql, values } = listFilters(snapshot.id, scope, query);
     const countResult = await this.database.query<{ count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT count(*)::int AS count FROM scoped WHERE ${sql}`, values);
-    const countRows = await this.database.query<{ resource_type: PowerPlatformResourceType; count: number }>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3) SELECT resource_type,count(*)::int AS count FROM scoped WHERE ${sql} GROUP BY resource_type`, values);
-    const sortColumn = { displayName: `display_name COLLATE "C"`, type: `resource_type COLLATE "C"`, environmentId: `NULLIF(environment_id, '') COLLATE "C"`, createdAt: "created_at", lastPublishedAt: "last_published_at" }[query.sortBy ?? "displayName"];
+    const sortColumn = { displayName: `display_name COLLATE "C"`, environmentId: `NULLIF(environment_id, '') COLLATE "C"`, createdAt: "created_at", lastPublishedAt: "last_published_at" }[query.sortBy ?? "displayName"];
     const direction = query.sortDirection === "desc" ? "DESC" : "ASC";
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 5000);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const rows = await this.database.query<ResourceRow>(`WITH scoped AS (SELECT * FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
       SELECT * FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,resource_type COLLATE "C" ASC,environment_id COLLATE "C" ASC,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]);
-    const filteredCounts = new Map(countRows.rows.map(row => [row.resource_type, row.count]));
-    const typeCounts = verifiedSnapshot.coverage
-      .filter(item => !query.excludeAgents || item.type !== "microsoft.copilotstudio/agents")
-      .map(item => ({ ...item, count: item.count === null ? null : filteredCounts.get(item.type) ?? 0 }));
     const resources = rows.rows.map(projectResource);
-    if (resources.length && query.includeAssociations !== false) {
-      const candidates = await this.database.query<Pick<ResourceRow, "tenant_id" | "native_id" | "resource_type" | "environment_id" | "identifiers">>(
-        `SELECT tenant_id,native_id,resource_type,environment_id,identifiers FROM power_platform_inventory_resources
-          WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3 ORDER BY resource_type COLLATE "C",environment_id COLLATE "C",native_id COLLATE "C" LIMIT 5000`,
-        [snapshot.id, scope.tenantId, scope.principalId]);
-      const identities: InventoryIdentityRecord[] = candidates.rows.map(row => ({ tenantId: row.tenant_id, nativeId: row.native_id, resourceType: row.resource_type, environmentId: row.environment_id || null, sourceSystem: "power_platform", identifiers: row.identifiers }));
-      for (const resource of resources) {
-        resource.association = resolveExactInventoryIdentity(powerPlatformInventoryIdentity(resource), identities.filter(candidate =>
-          candidate.nativeId !== resource.nativeId || candidate.resourceType !== resource.type || candidate.environmentId !== resource.environmentId));
-      }
-    }
-    return { value: resources, count: countResult.rows[0].count, typeCounts, snapshot: verifiedSnapshot };
+    return { value: resources, count: countResult.rows[0].count, snapshot: verifiedSnapshot };
   }
 
   async readUnifiedSource(scope: InventoryDataScope, database: Pick<pg.Pool, "query"> = this.database): Promise<UnifiedPowerPlatformSourceResult> {
@@ -319,7 +287,7 @@ export class PowerPlatformInventoryRepository {
       ORDER BY CASE WHEN environment_scope='' THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1`,
     [scope.tenantId, scope.principalId]);
     const snapshot = snapshotResult.rows[0];
-    if (!snapshot) return { resources: [], environmentNames: {}, snapshot: null };
+    if (!snapshot) return { resources: [], snapshot: null };
     const resources = await database.query<ResourceRow>(`SELECT * FROM power_platform_inventory_resources
       WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
         AND resource_type='microsoft.copilotstudio/agents'
@@ -332,9 +300,18 @@ export class PowerPlatformInventoryRepository {
     if (verifiedSnapshot.coverage.find(item => item.type === "microsoft.copilotstudio/agents")?.count !== resources.rows.length) {
       throw inventoryVerificationFailed();
     }
-    const environmentIds = [...new Set(resources.rows.map(row => row.environment_id.toLocaleLowerCase("en-US")).filter(Boolean))];
-    const environments = environmentIds.length ? await database.query<{ id: string; display_name: string | null }>(`
-      SELECT DISTINCT ON (lower(resource.native_id)) lower(resource.native_id) AS id,resource.display_name
+    return { resources: resources.rows.map(projectResource), snapshot: verifiedSnapshot };
+  }
+
+  async readAgentEnvironments(scope: InventoryDataScope, ids: readonly string[], database: Pick<pg.Pool, "query"> = this.database): Promise<Record<string, SavedAgentEnvironment>> {
+    validateScope(scope);
+    const environmentIds = [...new Set(ids.map(id => id.toLowerCase()))];
+    if (environmentIds.length > 10_000 || environmentIds.some(id => !id || id.length > 512 || /[\r\n\0]/.test(id))) {
+      throw new AppError(400, "invalid_environment_scope", "Agent environment context requires bounded exact environment identities.");
+    }
+    if (!environmentIds.length) return {};
+    const environments = await database.query<ResourceRow & { context_snapshot_id: string }>(`
+      SELECT DISTINCT ON (lower(resource.native_id)) resource.*,saved.id AS context_snapshot_id
       FROM power_platform_inventory_resources resource
       JOIN power_platform_inventory_snapshots saved ON saved.id=resource.snapshot_id
         AND saved.tenant_id=resource.tenant_id AND saved.principal_id=resource.principal_id
@@ -344,13 +321,26 @@ export class PowerPlatformInventoryRepository {
         AND lower(resource.native_id)=ANY($3::text[])
         AND (saved.environment_scope='' OR lower(saved.environment_scope)=lower(resource.native_id))
       ORDER BY lower(resource.native_id),saved.observed_at DESC,saved.id DESC,resource.native_id COLLATE "C"`,
-    [scope.tenantId, scope.principalId, environmentIds]) : { rows: [] };
-    return {
-      resources: resources.rows.map(projectResource),
-      environmentNames: Object.fromEntries(environments.rows.flatMap(row => row.display_name?.trim()
-        ? [[row.id, row.display_name.trim()]] : [])),
-      snapshot: verifiedSnapshot,
-    };
+    [scope.tenantId, scope.principalId, environmentIds]);
+    if (!environments.rows.length) return {};
+    const snapshots = await database.query<SnapshotRow>(`SELECT * FROM power_platform_inventory_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2 AND id=ANY($3::uuid[]) AND is_current AND expires_at>clock_timestamp()`,
+    [scope.tenantId, scope.principalId, [...new Set(environments.rows.map(row => row.context_snapshot_id))]]);
+    const verified = new Map((await this.verifySnapshots(scope, snapshots.rows, database)).map(snapshot => [snapshot.id, snapshot]));
+    return Object.fromEntries(environments.rows.flatMap(row => {
+      const snapshot = verified.get(row.context_snapshot_id);
+      if (!snapshot || snapshot.coverage.find(value => value.type === "microsoft.powerplatform/environments")?.status !== "covered") return [];
+      return [[row.native_id.toLowerCase(), {
+        id: row.native_id, displayName: row.display_name, region: row.location,
+        environmentType: row.details.environmentType ?? null, isManaged: row.details.isManaged ?? null,
+        groupName: row.details.environmentGroup ?? null, groupId: row.details.environmentGroupId ?? null,
+        observation: {
+          id: snapshot.id, snapshotId: snapshot.id, observedAt: snapshot.observedAt, expiresAt: snapshot.expiresAt, current: true as const,
+        },
+        provenance: Object.fromEntries(Object.entries(row.provenance).filter(([key]) =>
+          ["sourceSystem", "nativeId", "displayName", "location", "environmentType", "isManaged", "environmentGroup", "environmentGroupId"].includes(key))),
+      }]];
+    }));
   }
 
   async readIdentityCandidates(scope: InventoryDataScope, types: readonly PowerPlatformResourceType[], database: Pick<pg.Pool, "query"> = this.database): Promise<InventoryIdentityRecord[]> {
@@ -409,35 +399,6 @@ export class PowerPlatformInventoryRepository {
     }
     const [verifiedSnapshot] = await this.verifySnapshots(scope, [snapshot]);
     return { value: rows.rows.map(projectResource), snapshot: verifiedSnapshot };
-  }
-
-  async listQuarantineTargets(scope: InventoryDataScope, query: { search?: string; limit?: number; offset?: number } = {}): Promise<QuarantineTargetPage> {
-    validateScope(scope);
-    const snapshotResult = await this.database.query<SnapshotRow>(`SELECT * FROM power_platform_inventory_snapshots
-      WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
-        AND requested_types @> '["microsoft.copilotstudio/agents"]'::jsonb
-      ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
-    const snapshot = snapshotResult.rows[0];
-    if (!snapshot) return { value: [], count: 0, snapshot: null };
-    await this.verifySnapshots(scope, [snapshot]);
-    const resources = await this.database.query<ResourceRow>(`SELECT * FROM power_platform_inventory_resources
-      WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3 AND resource_type='microsoft.copilotstudio/agents'
-      ORDER BY native_id COLLATE "C",environment_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId]);
-    const grouped = new Map<string, ResourceRow[]>();
-    for (const resource of await this.withVerifiedQuarantineIdentities(scope, snapshot, resources.rows)) {
-      grouped.set(resource.native_id, [...(grouped.get(resource.native_id) ?? []), resource]);
-    }
-    const stale = snapshot.observed_at.getTime() < Date.now() - 24 * 60 * 60 * 1000;
-    const normalizedSearch = query.search?.trim().toLocaleLowerCase("en-US") ?? "";
-    const candidates = [...grouped.values()].map(matches => projectQuarantineCandidate(snapshot, matches, stale)).filter(candidate => !normalizedSearch
-      || [candidate.displayName, candidate.nativeId, candidate.environmentId, candidate.botId].some(value => value?.toLocaleLowerCase("en-US").includes(normalizedSearch)));
-    const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
-    const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
-    return {
-      value: candidates.slice(offset, offset + limit),
-      count: candidates.length,
-      snapshot: { id: snapshot.id, observedAt: snapshot.observed_at.toISOString(), expiresAt: snapshot.expires_at.toISOString() },
-    };
   }
 
   async assertSnapshotCurrent(scope: InventoryDataScope, snapshotId: string) {
@@ -525,7 +486,7 @@ export class PowerPlatformInventoryRepository {
     const { rows } = await this.database.query<SnapshotRow>(`SELECT * FROM power_platform_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
         AND is_current AND ($3::uuid IS NOT NULL AND id=$3 OR $3::uuid IS NULL)
-      ORDER BY CASE WHEN environment_scope='' AND jsonb_array_length(requested_types)=11 THEN 1 ELSE 0 END DESC,observed_at DESC LIMIT 1`, [scope.tenantId, scope.principalId, snapshotId ?? null]);
+      ORDER BY CASE WHEN environment_scope='' AND jsonb_array_length(requested_types)=2 THEN 1 ELSE 0 END DESC,observed_at DESC LIMIT 1`, [scope.tenantId, scope.principalId, snapshotId ?? null]);
     return rows[0];
   }
 }
@@ -561,15 +522,9 @@ export function buildCoverage(requestedTypes: readonly PowerPlatformResourceType
   });
 }
 
-function emptyCoverage(): InventoryTypeCoverage[] {
-  return powerPlatformResourceTypes.map(type => ({ type, status: "unknown", count: null }));
-}
-
 function listFilters(snapshotId: string, scope: InventoryDataScope, query: InventoryListQuery) {
-  const conditions = ["true"];
+  const conditions = ["resource_type='microsoft.copilotstudio/agents'"];
   const values: unknown[] = [snapshotId, scope.tenantId, scope.principalId];
-  if (query.excludeAgents) conditions.push(`resource_type<>'microsoft.copilotstudio/agents'`);
-  if (query.type) { values.push(query.type); conditions.push(`resource_type=$${values.length}`); }
   if (query.environmentId) { values.push(query.environmentId); conditions.push(`environment_id=$${values.length}`); }
   if (query.search) { values.push(`%${query.search}%`); conditions.push(`(display_name ILIKE $${values.length} OR native_id ILIKE $${values.length})`); }
   return { sql: conditions.join(" AND "), values };
@@ -623,23 +578,6 @@ function inventoryVerificationFailed() {
     "Saved Power Platform inventory failed verification of provider totals, unique identities, or request scope. Refresh Power Platform inventory before using this snapshot.");
 }
 
-function projectQuarantineCandidate(snapshot: SnapshotRow, matches: ResourceRow[], stale: boolean): QuarantineTargetCandidate {
-  const resolution = quarantineTargetResolution(snapshot, matches);
-  const resource = matches[0];
-  const target = resolution.target;
-  const identifiers = resource.identifiers.filter((identifier): identifier is { kind: "environment_id" | "cds_bot_id"; value: string } => identifier.kind === "environment_id" || identifier.kind === "cds_bot_id");
-  const details = {
-    ...(typeof resource.details.isQuarantined === "boolean" ? { isQuarantined: resource.details.isQuarantined } : {}),
-    ...(typeof resource.details.quarantinedAt === "string" ? { quarantinedAt: resource.details.quarantinedAt } : {}),
-  };
-  if (stale) return { nativeId: resource.native_id, type: "microsoft.copilotstudio/agents", displayName: resource.display_name ?? resource.native_id,
-    environmentId: matches.length === 1 ? resource.environment_id || null : null, botId: matches.length === 1 ? singleIdentifier(identifiers, "cds_bot_id") : null, identifiers, details,
-    quarantineEligibility: { eligible: false, code: "stale_snapshot", reason: "The saved inventory target is older than 24 hours. A Viewer must refresh inventory explicitly before quarantine work." } };
-  return { nativeId: resource.native_id, type: "microsoft.copilotstudio/agents", displayName: resource.display_name ?? resource.native_id,
-    environmentId: target?.environmentId ?? null, botId: target?.botId ?? null, identifiers, details,
-    quarantineEligibility: target ? { eligible: true, code: "eligible" } : { eligible: false, code: eligibilityCode(resolution.errorCode!), reason: resolution.reason } };
-}
-
 function quarantineTargetResolution(snapshot: SnapshotRow, matches: ResourceRow[]): { target?: InventoryQuarantineTarget; errorCode?: string; reason?: string } {
   if (matches.length !== 1) return { errorCode: "quarantine_target_ambiguous", reason: "The native inventory target is ambiguous across environments." };
   const resource = matches[0];
@@ -656,15 +594,6 @@ function quarantineTargetResolution(snapshot: SnapshotRow, matches: ResourceRow[
     inventoryQuarantineState: typeof resource.details.isQuarantined === "boolean" ? resource.details.isQuarantined : null,
     inventoryQuarantinedAt: typeof resource.details.quarantinedAt === "string" ? resource.details.quarantinedAt : null,
   } };
-}
-
-function singleIdentifier(identifiers: QuarantineTargetCandidate["identifiers"], kind: "environment_id" | "cds_bot_id") {
-  const values = identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value);
-  return values.length === 1 ? values[0] : null;
-}
-
-function eligibilityCode(errorCode: string): QuarantineTargetEligibilityCode {
-  return errorCode === "quarantine_target_ambiguous" ? "ambiguous_native_id" : "native_identity_unavailable";
 }
 
 function projectJob(row: JobRow): InventoryRefreshJob {

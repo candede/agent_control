@@ -78,7 +78,7 @@ export function powerPlatformJobSummary(
     status: job.status, total: job.totalRecords, completed: job.observedCount, partial: false,
     canResume: job.status === "waiting_authorization", canCancel: ["waiting_authorization", "running"].includes(job.status), canReconcile: false,
     ...sourceJobDates(job),
-    updatedAt: job.updatedAt, href: `/power-platform?refreshJob=${encodeURIComponent(job.id)}`,
+    updatedAt: job.updatedAt, href: `/sync?powerPlatformJob=${encodeURIComponent(job.id)}`,
   };
 }
 
@@ -189,7 +189,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
       canCancel: hasAppRole(user.roles, "AgentControl.Admin") && (["queued", "running", "waiting_authorization"].includes(job.status)
         || job.status === "inconclusive" && job.completed < job.total),
       canReconcile: hasAppRole(user.roles, "AgentControl.Admin") && job.canReconcile,
-      createdAt: job.createdAt, updatedAt: job.updatedAt, href: `/power-platform?quarantineJob=${encodeURIComponent(job.id)}` as const,
+      createdAt: job.createdAt, updatedAt: job.updatedAt, href: `/agents?quarantineJob=${encodeURIComponent(job.id)}` as const,
     })) });
   }
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {

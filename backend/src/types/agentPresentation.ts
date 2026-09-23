@@ -141,7 +141,7 @@ export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgen
       return hasKnownStatus ? uniqueText(agentStatusLabels(record), undefined, false) : null;
     }
     case "hosts": return uniqueText(record.packages.flatMap(item => item.supportedHosts ?? []), formatPackageFacetLabel);
-    case "publisher": return uniqueText([...record.packages.map(item => item.publisher), details?.publisher]);
+    case "publisher": return uniqueText(record.packages.map(item => item.publisher));
     case "origin": return partiallyKnownText([
       ...record.packages.map(item => originLabels.get(item.type?.trim().toLowerCase() ?? "")),
       ...(resource ? ["Organization-created"] : []),

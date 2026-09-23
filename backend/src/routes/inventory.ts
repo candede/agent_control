@@ -5,6 +5,7 @@ import { AppError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
+import { agentCapabilityExport, agentCapabilityExportColumns } from "../services/agentContextExport.js";
 import { defenderHunting } from "../services/defenderHunting.js";
 import { powerPlatformInventory } from "../services/powerPlatformInventory.js";
 import { purviewAudit } from "../services/purviewAudit.js";
@@ -48,23 +49,14 @@ policyRoute(inventoryRouter, "post", "/inventory/refresh-jobs/:id/cancel", { acc
   response.json(await powerPlatformInventory.cancel(request.session.user!, id));
 });
 
-policyRoute(inventoryRouter, "get", "/inventory/snapshots", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await inventoryRepository.listSnapshots(requestScope(request), positiveInteger(first(request.query.limit), 50, 50)));
-});
-
-policyRoute(inventoryRouter, "get", "/inventory/resources", { access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  response.json(await inventoryRepository.list(requestScope(request), inventoryListQuery(request.query)));
-});
-
 policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
   access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
 }, async (request, response) => {
   const snapshotId = optionalUuid(first(request.query.snapshotId));
   if (!snapshotId) throw new AppError(400, "snapshot_required", "Source-aware detail requires the exact saved snapshot.");
-  const resourceType = optionalType(first(request.query.type));
-  if (!resourceType) throw new AppError(400, "resource_type_required", "Source-aware detail requires the exact resource type.");
+  if (request.query.type !== undefined) throw new AppError(400, "invalid_inventory_query", "Agent activity does not accept a resource type.");
   const environmentId = optionalText(first(request.query.environmentId), 512) ?? "";
-  const exact = await inventoryRepository.getResource(requestScope(request), snapshotId, resourceType, environmentId, exactNativeId(request.params.nativeId));
+  const exact = await inventoryRepository.getResource(requestScope(request), snapshotId, "microsoft.copilotstudio/agents", environmentId, exactNativeId(request.params.nativeId));
   const identifierValues = (kind: string) => exact.resource.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value);
   const botIds = identifierValues("cds_bot_id");
   const entraAgentIds = identifierValues("entra_agent_id");
@@ -83,13 +75,7 @@ policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
     source: "power_platform", nativeId: exact.resource.nativeId, resourceType: exact.resource.type,
     environmentId: exact.resource.environmentId, snapshotId: exact.snapshot.id, observedAt: exact.snapshot.observedAt,
     expiresAt: exact.snapshot.expiresAt, identifiers: exact.resource.identifiers,
-    package: { status: "unmatched", reason: "No documented package-to-Power-Platform identifier equivalence exists; names were not compared." },
-    reports: { status: "unmatched", reason: "Official report agent IDs are report-only and have no documented cross-source contract." },
     audit, security,
-    controls: {
-      quarantineTarget: exact.resource.environmentId && botIds.length === 1 ? { environmentId: exact.resource.environmentId, botId: botIds[0] } : null,
-      packageTarget: null,
-    },
   };
   response.json(body);
 });
@@ -126,14 +112,18 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
   });
   try {
     await validatePublication();
-    const result = await inventoryRepository.list(scope, { ...inventoryListQuery(request.query), snapshotId, limit: 5_000, offset: 0, includeAssociations: false });
+    const result = await inventoryRepository.list(scope, { ...inventoryExportQuery(request.query), snapshotId, limit: 5_000, offset: 0 });
     if (!result.snapshot) throw new AppError(409, "snapshot_unavailable", "The exact Power Platform snapshot is no longer available.");
     if (result.count > 5_000 || result.value.length !== result.count) {
       throw new AppError(413, "export_row_limit", "The filtered Power Platform selection exceeds the 5,000 row export limit.");
     }
-    const columns = ["sourceSystem", "nativeId", "displayName", "type", "environmentId", "location", "authoringTool", "agentKind", "lifecycle", "createdAt", "lastPublishedAt", "snapshotId", "snapshotObservedAt", "snapshotExpiresAt"] as const;
+    const columns = ["sourceSystem", "nativeId", "displayName", "type", "environmentId", "location", "authoringTool", "agentKind", "lifecycle", "createdAt", "createdBy", "ownerId", "lastModifiedBy", "lastModifiedAt", "lastPublishedAt", "snapshotId", "snapshotObservedAt", "snapshotExpiresAt", ...agentCapabilityExportColumns] as const;
     const rows = result.value.map(resource => ({
       ...resource,
+      ownerId: resource.details.ownerId,
+      lastModifiedBy: resource.details.lastModifiedBy,
+      lastModifiedAt: resource.details.lastModifiedAt,
+      ...agentCapabilityExport(resource),
       snapshotId: result.snapshot!.id,
       snapshotObservedAt: result.snapshot!.observedAt,
       snapshotExpiresAt: result.snapshot!.expiresAt,
@@ -154,12 +144,13 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
   }
 });
 
-export function inventoryListQuery(query: Record<string, unknown>) {
+export function inventoryExportQuery(query: Record<string, unknown>) {
+  if (query.type !== undefined || query.excludeAgents !== undefined || query.limit !== undefined || query.offset !== undefined) {
+    throw new AppError(400, "invalid_inventory_query", "Only complete agent exports are supported; catalog type and paging filters have been removed.");
+  }
   return {
-    snapshotId: optionalUuid(first(query.snapshotId)), type: optionalType(first(query.type)), environmentId: optionalText(first(query.environmentId), 512),
+    environmentId: optionalText(first(query.environmentId), 512),
     search: optionalText(first(query.search), 256), sortBy: parseSort(first(query.sortBy)), sortDirection: first(query.sortDirection) === "desc" ? "desc" as const : "asc" as const,
-    excludeAgents: optionalBoolean(first(query.excludeAgents), "excludeAgents") ?? false,
-    limit: positiveInteger(first(query.limit), 50, 500), offset: positiveInteger(first(query.offset), 0, 100_000, true),
   };
 }
 
@@ -170,14 +161,17 @@ function parseTypes(value: unknown): PowerPlatformResourceType[] {
 }
 
 function parseSort(value: string | undefined) {
-  const allowed = ["displayName", "type", "environmentId", "createdAt", "lastPublishedAt"] as const;
+  const allowed = ["displayName", "environmentId", "createdAt", "lastPublishedAt"] as const;
+  if (value !== undefined && !allowed.some(sort => sort === value)) throw new AppError(400, "invalid_inventory_query", "Unsupported agent export sort.");
   return allowed.includes(value as typeof allowed[number]) ? value as typeof allowed[number] : "displayName";
 }
 
-function positiveInteger(value: string | undefined, fallback: number, maximum: number, allowZero = false) {
+function positiveInteger(value: string | undefined, fallback: number, maximum: number) {
   if (value === undefined) return fallback;
   const parsed = Number(value);
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < (allowZero ? 0 : 1) || parsed > maximum) throw new AppError(400, "invalid_inventory_query", "Inventory paging value is outside the supported range.");
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new AppError(400, "invalid_inventory_query", "Inventory job limit is outside the supported range.");
+  }
   return parsed;
 }
 
@@ -185,13 +179,6 @@ function optionalText(value: unknown, maximum: number) {
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value !== "string" || value.length > maximum || /[\r\n\0]/.test(value)) throw new AppError(400, "invalid_inventory_query", "Inventory query text is invalid.");
   return value;
-}
-
-function optionalBoolean(value: string | undefined, name: string) {
-  if (value === undefined) return undefined;
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new AppError(400, "invalid_inventory_query", `${name} must be true or false.`);
 }
 
 function exactNativeId(value: string | string[] | undefined) {
@@ -207,12 +194,6 @@ async function sourceResult<T>(load: () => Promise<{ count: number; value: T[] }
 
 function optionalUuid(value: string | undefined) {
   return value === undefined ? undefined : jobId(value);
-}
-
-function optionalType(value: string | undefined) {
-  if (value === undefined) return undefined;
-  if (!powerPlatformResourceTypes.includes(value as PowerPlatformResourceType)) throw new AppError(400, "invalid_inventory_query", "Inventory type is unsupported.");
-  return value as PowerPlatformResourceType;
 }
 
 function jobId(value: unknown) {

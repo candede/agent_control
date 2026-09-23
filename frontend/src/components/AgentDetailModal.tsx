@@ -7,7 +7,7 @@ import type {
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
 import { getBuiltWithLabel } from "../agentDisplay";
-import { extractConnectedServices, getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetails";
+import { getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetails";
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 
@@ -65,7 +65,6 @@ export function AgentDetailModal({
   };
   const allowedSummary = summarizeAccess(agent.allowedUsersAndGroups);
   const acquireSummary = summarizeAccess(agent.acquireUsersAndGroups);
-  const connectedServices = extractConnectedServices(agent.elementDetails);
   const elementDetails = agent.elementDetails ?? [];
   const elementCount = elementDetails.reduce(
     (total, detail) => total + detail.elements.length,
@@ -172,14 +171,6 @@ export function AgentDetailModal({
             value={statusLabel}
             tone={agent.isBlocked ? "danger" : "success"}
           />
-          <SummaryStat
-            label="Connected services"
-            value={
-              connectedServices.length
-                ? connectedServices.length.toLocaleString()
-                : "None"
-            }
-          />
         </div>
 
         <div className="detail-layout">
@@ -254,12 +245,6 @@ export function AgentDetailModal({
                   label: "Acquire assignments",
                   value: formatAccessSummary(acquireSummary),
                 },
-                {
-                  label: "Detected services",
-                  value: connectedServices.length
-                    ? `${connectedServices.length} detected`
-                    : "None returned",
-                },
                 { label: "Package ID", value: agent.id, variant: "code" },
                 { label: "App ID", value: agent.appId, variant: "code" },
                 {
@@ -297,29 +282,6 @@ export function AgentDetailModal({
             <p className="detail-overflow-note">
               Package block is Microsoft Graph package catalog state. It is not Copilot Studio quarantine.
             </p>
-          </DetailSection>
-
-          <DetailSection
-            title="Connected services"
-            countLabel={`${connectedServices.length} detected`}
-            tone="services"
-          >
-            {connectedServices.length ? (
-              <ul className="detail-list service-list expanded-detail-list">
-                {connectedServices.slice(0, 20).map((service) => (
-                  <li key={`${service.source}-${service.value}`}>
-                    <span>{service.value}</span>
-                    <small>{service.source}</small>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p>
-                No connected service metadata was returned for this package.
-              </p>
-            )}
-            {connectedServices.length > 20 ? <p>Showing the first 20 of {connectedServices.length} detected service references.</p> : null}
-            <p className="detail-overflow-note">Detected metadata references do not prove a live connection.</p>
           </DetailSection>
 
         </div>
@@ -405,7 +367,6 @@ function DetailSection({
     | "activity"
     | "governance"
     | "metadata"
-    | "services"
     | "technical"
     | "usage";
   children: ReactNode;

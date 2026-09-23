@@ -15,6 +15,7 @@ type Props = {
   refreshingPowerPlatform: boolean;
   exportingPowerPlatform: boolean;
   powerPlatformJob?: InventoryRefreshJob;
+  onInspectPowerPlatformJob: (id: string) => void;
   onRefreshPackages: () => void;
   onRefreshMatchingDetails: () => void;
   onRefreshPowerPlatform: () => void;
@@ -33,6 +34,7 @@ export function AgentSyncTools({
   refreshingPowerPlatform,
   exportingPowerPlatform,
   powerPlatformJob,
+  onInspectPowerPlatformJob,
   onRefreshPackages,
   onRefreshMatchingDetails,
   onRefreshPowerPlatform,
@@ -104,13 +106,14 @@ export function AgentSyncTools({
           </section>
           <section className="sync-source-tools" aria-label="Power Platform agent source">
             <h3>Power Platform agent source</h3>
-            <p>Refresh retained Copilot Studio agent observations or export the exact saved Power Platform snapshot. These controls do not infer links or change agent state. Exports use the search and environment filters saved on Agents.</p>
+            <p>Refresh Copilot Studio agents and supporting environment metadata, or export agents from the exact saved Power Platform snapshot. These controls do not infer links or change agent state. Exports use the search and environment filters saved on Agents.</p>
             {powerPlatformJob ? <p role="status">
               Latest agent refresh: {powerPlatformJob.status.replaceAll("_", " ")}
               {powerPlatformJob.message ? ` - ${powerPlatformJob.message}` : ""}
               {powerPlatformJob.status === "waiting_authorization" ? <> - <a href="/api/auth/login">Sign in again</a></> : null}
             </p> : null}
             <div className="inline-actions">
+              {powerPlatformJob ? <button type="button" onClick={() => { setDiagnosticsOpen(false); onInspectPowerPlatformJob(powerPlatformJob.id); }}>Inspect source job</button> : null}
               <WorkbenchActionGate actionId="power-platform.refresh">
                 <button type="button" className="secondary" disabled={refreshingPowerPlatform || powerPlatformJob?.status === "running"} onClick={onRefreshPowerPlatform}>
                   <RefreshCw size={15} aria-hidden="true" />{refreshingPowerPlatform ? "Refreshing PP agents..." : "Refresh PP agent inventory"}

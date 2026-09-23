@@ -2,18 +2,68 @@ import pg from "pg";
 import { pathToFileURL } from "node:url";
 import { databaseSettings, secretValue, transaction } from "../src/db/pool.js";
 import { migrations, migrationChecksum, verifySchema } from "../src/db/schema.js";
+import { DatabaseResetError, preflightDatabaseReset, resetDatabase } from "./databaseReset.js";
 
-export async function migrate(database: pg.Pool, steps: ReadonlyArray<{ version: number; sql: string }> = migrations) {
+type MigrationStep = { version: number; sql: string };
+
+class DatabaseSchemaError extends Error {
+  readonly code: string;
+  readonly migrationVersion?: number;
+
+  constructor(version?: number) {
+    super(version === undefined
+      ? "Existing schema has no migration history. Use an explicitly owned fresh development database; existing data was not reset."
+      : `Unknown or modified applied migration at version ${version}. This build is incompatible with the saved schema. Use a fresh development database for a deliberate schema replacement; do not rewrite migration checksums.`);
+    this.code = version === undefined ? "database_schema_unversioned" : "database_schema_incompatible";
+    this.migrationVersion = version;
+  }
+}
+
+function assertMigrationHistory(applied: readonly { version: number; checksum: string }[], steps: readonly MigrationStep[]) {
+  for (const [index, row] of applied.entries()) {
+    const expected = steps[index];
+    if (expected?.version !== row.version || migrationChecksum(expected.sql) !== row.checksum) {
+      throw new DatabaseSchemaError(row.version);
+    }
+  }
+}
+
+export async function preflightMigrations(database: pg.Pool, steps: readonly MigrationStep[] = migrations) {
+  return transaction(database, async client => {
+    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    const history = await client.query<{ name: string | null }>("SELECT to_regclass('public.schema_migrations')::text AS name");
+    if (!history.rows[0].name) {
+      const objects = await client.query<{ populated: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace) AS populated",
+      );
+      if (objects.rows[0].populated) throw new DatabaseSchemaError();
+      return { state: "fresh", currentVersion: 0, targetVersion: steps.at(-1)?.version ?? 0 };
+    }
+    const applied = await client.query<{ version: number; checksum: string }>("SELECT version, checksum FROM schema_migrations ORDER BY version");
+    assertMigrationHistory(applied.rows, steps);
+    return { state: "compatible", currentVersion: applied.rows.at(-1)?.version ?? 0, targetVersion: steps.at(-1)?.version ?? 0 };
+  });
+}
+
+export function databaseOperatorFailure(error: unknown) {
+  if (error instanceof DatabaseResetError) {
+    return { event: "database_operator_command", outcome: "failed", code: error.code, message: error.message, phase: error.phase };
+  }
+  return {
+    event: "database_operator_command", outcome: "failed",
+    ...(error instanceof DatabaseSchemaError
+      ? { code: error.code, message: error.message, migrationVersion: error.migrationVersion }
+      : { code: "database_operator_failed", message: "Database command failed. Check operator connectivity, secret files, runtime credentials and database permissions. No automatic reset was attempted." }),
+  };
+}
+
+export async function migrate(database: pg.Pool, steps: readonly MigrationStep[] = migrations) {
   await transaction(database, async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(3650101)");
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`);
     const applied = await client.query<{ version: number; checksum: string }>("SELECT version, checksum FROM schema_migrations ORDER BY version");
-    for (const [index, row] of applied.rows.entries()) {
-      if (steps[index]?.version !== row.version || migrationChecksum(steps[index].sql) !== row.checksum) {
-        throw new Error("Unknown or modified applied migration; no changes applied.");
-      }
-    }
+    assertMigrationHistory(applied.rows, steps);
     for (const step of steps.slice(applied.rows.length)) {
       await client.query(step.sql);
       await client.query("INSERT INTO schema_migrations(version,checksum) VALUES ($1,$2)", [step.version, migrationChecksum(step.sql)]);
@@ -299,9 +349,20 @@ export async function retainUntilConverged(
 }
 
 async function main() {
-  const database = new pg.Pool(databaseSettings());
+  const command = process.argv[2] ?? "migrate";
+  const settings = databaseSettings();
+  const resetting = command === "preflight-reset" || command === "reset";
+  const database = new pg.Pool(resetting ? { ...settings, database: "postgres" } : settings);
   try {
-    if (process.argv[2] === "retain") {
+    if (!["preflight", "preflight-reset", "reset", "migrate", "retain"].includes(command)) throw new Error("Unsupported database operator command.");
+    if (resetting) {
+      const operation = command === "reset" ? resetDatabase : preflightDatabaseReset;
+      const result = await operation(database, settings.database ?? "", process.argv[3] ?? "");
+      console.log(JSON.stringify({ event: "database_operator_command", command, outcome: "succeeded", ...result }));
+    } else if (command === "preflight") {
+      const schema = await preflightMigrations(database);
+      console.log(JSON.stringify({ event: "database_operator_command", command, outcome: "succeeded", ...schema }));
+    } else if (command === "retain") {
       if (process.argv[3] !== "confirmed") throw new Error("Retention requires an explicit confirmed target.");
       const batchSize = Number(process.argv[4] ?? 1_000);
       const result = await retain(database, { batchSize, dryRun: process.argv[5] === "dry-run" });
@@ -313,10 +374,10 @@ async function main() {
       await grantRuntime(database);
       await verifySchema(database);
     }
-    if (process.argv[2] !== "retain") console.log(JSON.stringify({ event: "database_operator_command", outcome: "succeeded" }));
+    if (command === "migrate") console.log(JSON.stringify({ event: "database_operator_command", command, outcome: "succeeded" }));
   } finally { await database.end(); }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => { console.error(JSON.stringify({event:"database_operator_command",outcome:"failed"})); process.exitCode = 1; });
+  main().catch(error => { console.error(JSON.stringify(databaseOperatorFailure(error))); process.exitCode = 1; });
 }

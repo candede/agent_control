@@ -26,11 +26,11 @@ describe("AgentDetailModal metadata contract", () => {
     </WorkbenchActionProvider>);
 
     expect(definition.length).toBeGreaterThan(32_768);
-    expect(screen.getByRole("heading", { name: "Connected services" })).toBeVisible();
-    expect(screen.getByText("Exact connector")).toBeVisible();
-    expect(screen.getByText("Exact connector").parentElement).toHaveTextContent(elementId || "Agent Metadatas");
-    expect(screen.getByText("api.example.invalid")).toBeVisible();
-    expect(screen.getByText("native-schema")).toBeVisible();
+    expect(screen.getByText("1 groups, 1 elements")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Connected services" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Exact connector")).not.toBeInTheDocument();
+    expect(screen.queryByText("api.example.invalid")).not.toBeInTheDocument();
+    expect(screen.queryByText("native-schema")).not.toBeInTheDocument();
     expect(screen.queryByText(definition)).not.toBeInTheDocument();
   });
 
@@ -52,7 +52,7 @@ describe("AgentDetailModal metadata contract", () => {
       />
     </WorkbenchActionProvider>);
     expect(screen.getByText("2 groups, 2 elements")).toBeVisible();
-    expect(screen.getByText("bot.example.invalid")).toBeVisible();
-    expect(screen.getByText("Engine connector")).toBeVisible();
+    expect(screen.queryByText("bot.example.invalid")).not.toBeInTheDocument();
+    expect(screen.queryByText("Engine connector")).not.toBeInTheDocument();
   });
 });

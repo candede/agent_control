@@ -445,7 +445,7 @@ export class DataSyncService {
         status: "waiting_authorization",
         jobId,
         count: job.observedCount,
-        message: "Waiting for explicit delegated authorization to read Power Platform agents and non-agent resources.",
+        message: "Waiting for explicit delegated authorization to read Power Platform agents and supporting environment metadata.",
         canRetry: true,
       });
       signal.throwIfAborted();

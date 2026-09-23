@@ -30,6 +30,7 @@ import { launchBulkJob, runBulkJob } from "./services/bulkJobs.js";
 import type { AppRole } from "./types/capability.js";
 import type { PowerPlatformResource, PowerPlatformResourceType } from "./types/powerPlatformInventory.js";
 import { clearAdmissionForTest } from "./middleware/admission.js";
+import { AgentPeopleRepository } from "./db/agentPeople.js";
 
 vi.hoisted(() => {
   process.env.TENANT_ID="11111111-1111-1111-1111-111111111111";
@@ -145,7 +146,7 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
   });
   return (await repository.getJob(scope, job.id))!.snapshotId!;
 }
-async function publishQuarantineInventory(principalId: string) {
+async function publishQuarantineInventory(principalId: string, ownerId?: string) {
   const repository = new PowerPlatformInventoryRepository(fixture.runtime);
   const scope = { tenantId: config.tenantId!, principalId };
   const job = await repository.submit(scope, { idempotencyKey: `quarantine-inventory-${principalId}-${randomUUID()}`, roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"] });
@@ -155,7 +156,7 @@ async function publishQuarantineInventory(principalId: string) {
     lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
     lifecycle: "published", identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "native-agent" },
       { kind: "environment_id", value: "11111111-1111-4111-8111-111111111111" }, { kind: "cds_bot_id", value: "22222222-2222-4222-8222-222222222222" }],
-    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z" }, unknownFieldCount: 0 }],
+    provenance: {}, details: { isQuarantined: true, quarantinedAt: "2026-09-09T09:00:00.000Z", ...(ownerId ? { ownerId } : {}) }, unknownFieldCount: 0 }],
     queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0 });
   return (await repository.getJob(scope, job.id))!.snapshotId!;
 }
@@ -222,7 +223,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/api/auth/callback")).status).toBe(400);
     expect((await request("/assets/missing.js")).status).toBe(404);
     expect((await request("/missing.css")).status).toBe(404);
-    for (const route of ["/agents", "/power-platform", "/users", "/sync", "/audit", "/security", "/permissions", "/jobs"]) {
+    for (const route of ["/agents", "/users", "/sync", "/audit", "/security", "/permissions", "/jobs"]) {
       const deepLink = await request(route);
       expect(deepLink.status).toBe(200);
       expect(deepLink.headers.get("cache-control")).toContain("no-store");
@@ -928,6 +929,37 @@ describe.sequential("packaged API/session contracts", () => {
     expect(stale.status).toBe(409);
     await expect(stale.json()).resolves.toMatchObject({ code: "snapshot_invalidated" });
   });
+  it("reads private responsibility with Viewer access, outside paid rosters, without provider reads or ownership-based authority", async () => {
+    const principalId = "responsibility-reader";
+    const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const scope = { tenantId: config.tenantId!, principalId };
+    const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    await publishQuarantineInventory(principalId, objectId);
+    const cache = new AgentPeopleRepository(fixture.runtime);
+    await cache.save(scope, [{ objectId, displayName: "Responsibility only", userPrincipalName: "responsibility@example.invalid",
+      status: "resolved", checkedAt: new Date().toISOString() }], { generation: await cache.generation(scope) });
+    const platformReads = inventoryProviderFixture.queries;
+    const graphReads = vi.mocked(GraphPackagesClient.prototype.getPackageDetails).mock.calls.length;
+    const tokenReads = vi.mocked(acquireDelegatedToken).mock.calls.length;
+    const response = await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: readerCookie } });
+    expect(response.status).toBe(200);
+    const result = await response.json() as { selected: { agents: Array<{ id: string }> } };
+    expect(result).toMatchObject({ selected: { person: { evidence: { displayName: "Responsibility only" } },
+      count: 1, agents: [{ roles: ["owner"], presence: "power_platform" }] } });
+    expect(result.selected.agents[0].id).toMatch(/^agent:/);
+    const exact = await request(`/api/agent-inventory?recordId=${encodeURIComponent(result.selected.agents[0].id)}`, { headers: { Cookie: readerCookie } });
+    expect(exact.status).toBe(200);
+    expect(await exact.json()).toMatchObject({ count: 1 });
+    expect(inventoryProviderFixture.queries).toBe(platformReads);
+    expect(GraphPackagesClient.prototype.getPackageDetails).toHaveBeenCalledTimes(graphReads);
+    expect(acquireDelegatedToken).toHaveBeenCalledTimes(tokenReads);
+    const other = await roleCookie("responsibility-other", ["AgentControl.Viewer"]);
+    expect((await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: other } })).status).toBe(404);
+    expect((await request("/api/agent-responsibility?principalId=responsibility-reader", { headers: { Cookie: other } })).status).toBe(400);
+    const unassigned = await roleCookie(principalId, []);
+    expect((await request("/api/agent-responsibility", { headers: { Cookie: unassigned } })).status).toBe(403);
+    expect((await request("/api/agent-responsibility", { headers: { Cookie: "" } })).status).toBe(401);
+  });
   it("exports the authorized unified inventory with revision, environment filtering, source aliases and row-free audit", async () => {
     const principalId = "unified-export-reader";
     const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
@@ -1183,7 +1215,7 @@ describe.sequential("packaged API/session contracts", () => {
       environmentId: "11111111-1111-4111-8111-111111111111", botComponentId: null, aiPluginOperationId: null,
       messages: [], contentAvailable: false, unknownFieldCount: 0,
     }], pageCount: 1, providerRowCount: 1, storedRowCount: 1, byteCount: 512, unknownFieldCount: 0, complete: true, nextLink: null, partialReason: null });
-    const path = `/api/inventory/resources/native-agent/related?snapshotId=${snapshotId}&type=microsoft.copilotstudio%2Fagents&environmentId=11111111-1111-4111-8111-111111111111`;
+    const path = `/api/inventory/resources/native-agent/related?snapshotId=${snapshotId}&environmentId=11111111-1111-4111-8111-111111111111`;
     const readerOnly = await roleCookie(principalId, ["AgentControl.Viewer"]);
     const permitted = await request(path, { headers: { Cookie: readerOnly } });
     expect(permitted.status).toBe(200);
@@ -1191,7 +1223,6 @@ describe.sequential("packaged API/session contracts", () => {
       snapshotId, nativeId: "native-agent",
       audit: { status: "available", count: 1, value: [{ jobId: job.id, nativeEventId: "88888888-8888-4888-8888-888888888888", matchedKind: "cds_bot_id" }] },
       security: { status: "unmatched" },
-      controls: { quarantineTarget: { environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222" }, packageTarget: null },
     });
     const otherReader = await roleCookie("source-detail-other", ["AgentControl.Viewer"]);
     expect((await request(path, { headers: { Cookie: otherReader } })).status).toBe(404);
@@ -1215,36 +1246,59 @@ describe.sequential("packaged API/session contracts", () => {
     const malicious:PowerPlatformResource={
       tenantId:config.tenantId!,nativeId:"@native",type:"microsoft.copilotstudio/agents",location:null,displayName:"=SUM(1,1)",environmentId:"environment-a",
       createdAt:null,createdBy:null,lastPublishedAt:null,sourceSystem:"power_platform",authoringTool:null,creatorType:"unknown",agentKind:"agent",lifecycle:"draft",
-      identityConfidence:"exact_native",identifiers:[{kind:"power_platform_resource_id",value:"@native"}],provenance:{},details:{},unknownFieldCount:0,
+      identityConfidence:"exact_native",identifiers:[{kind:"power_platform_resource_id",value:"@native"}],
+      provenance:{connectors:{sourceSystem:"power_platform",path:"properties.powerPlatformConnectors",maturity:"preview"}},
+      details:{
+        ownerId:"owner-id",lastModifiedBy:"modifier-id",connectorDetailsStatus:"partial",
+        distinctPowerPlatformConnectors:1,distinctPowerPlatformConnectorsOperations:2,
+        connectors:[{connectorId:"shared_test",operations:[{
+          operationId:"read",isEnabled:false,requiresEndUserConsent:false,createdBy:"52bff06b-5db5-42cd-9919-28f95e3c07af",
+          ...{connectionIdSharedByMaker:"private-connection",callbackUrl:"https://private.invalid"},
+        }]}],
+      },unknownFieldCount:0,
     };
     await repository.publish(inventoryScope,job.id,{resources:[malicious],queriedTypes:["microsoft.copilotstudio/agents"],environmentScope:null,totalRecords:1,pages:1,unknownFieldCount:0});
     const snapshotId=(await repository.getJob(inventoryScope,job.id))!.snapshotId!;
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(new AppError(502,"provider_error","provider unavailable"));
     try {
-      for (const path of ["/api/inventory/resources","/api/inventory/refresh-jobs","/api/inventory/snapshots"]) {
-        expect((await request(path,{headers:{Cookie:readerCookie}})).status).toBe(200);
+      for (const path of ["/api/inventory/resources","/api/inventory/snapshots","/api/quarantine/targets"]) {
+        expect((await request(path,{headers:{Cookie:readerCookie}})).status).toBe(404);
       }
+      expect((await request("/api/inventory/refresh-jobs",{headers:{Cookie:readerCookie}})).status).toBe(200);
       expect((await request("/api/inventory/export.csv",{headers:{Cookie:readerCookie}})).status).toBe(400);
-      const resources=await (await request(`/api/inventory/resources?snapshotId=${snapshotId}`,{headers:{Cookie:readerCookie}})).json();
-      expect(resources).toMatchObject({count:1,value:[{nativeId:"@native"}],snapshot:{id:snapshotId}});
+      const resources=await (await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:readerCookie}})).json();
+      expect(resources).toMatchObject({value:[{nativeId:"@native"}],snapshot:{id:snapshotId}});
+      for (const filter of ["type=microsoft.powerplatform%2Fenvironments", "excludeAgents=true"]) {
+        expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}&${filter}`,{headers:{Cookie:readerCookie}})).status).toBe(400);
+      }
       const csv=await (await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`,{headers:{Cookie:readerCookie}})).text();
       expect(csv.split("\r\n")[0]).toContain("sourceSystem");
       expect(csv).toContain("\"power_platform\"");
       expect(csv).toContain("\"'@native\"");
       expect(csv).toContain("\"'=SUM(1,1)\"");
+      const exported = parseCsv(csv, { columns: true, bom: true })[0];
+      expect(exported).toMatchObject({
+        ownerId: "owner-id", lastModifiedBy: "modifier-id", connectorDetailsStatus: "partial",
+        reportedConnectorTotal: "1", reportedOperationTotal: "2", savedConnectorDetails: "1", savedOperationDetails: "1",
+        invokedFlowContext: "unavailable_from_synced_sources",
+      });
+      expect(JSON.parse(exported.configuredConnectors)[0].operations[0]).toMatchObject({
+        isEnabled: false, requiresEndUserConsent: false, createdBy: "52bff06b-5db5-42cd-9919-28f95e3c07af",
+      });
+      expect(csv).not.toMatch(/private-connection|private.invalid/);
 
       expect((await request("/api/inventory/refresh-jobs",{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong","Content-Type":"application/json"},body:"{}"})).status).toBe(403);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}/resume`,{method:"POST",headers:{Cookie:readerCookie,"x-csrf-token":"wrong"}})).status).toBe(403);
       const adminReader = await roleCookie(principalId, ["AgentControl.Admin"]);
-      expect((await request(`/api/inventory/resources?snapshotId=${snapshotId}`, { headers: { Cookie: adminReader } })).status).toBe(200);
+      expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`, { headers: { Cookie: adminReader } })).status).toBe(200);
       const unassigned = await roleCookie("inventory-unassigned", []);
-      for (const path of ["/api/inventory/resources","/api/inventory/refresh-jobs","/api/inventory/snapshots","/api/inventory/export.csv"]) expect((await request(path,{headers:{Cookie:unassigned}})).status).toBe(403);
+      for (const path of ["/api/inventory/quarantine-selection","/api/inventory/refresh-jobs","/api/inventory/export.csv"]) expect((await request(path,{headers:{Cookie:unassigned}})).status).toBe(403);
 
       const otherReader=await roleCookie("inventory-other",["AgentControl.Viewer"]);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}`,{headers:{Cookie:otherReader}})).status).toBe(404);
-      expect((await request(`/api/inventory/resources?snapshotId=${snapshotId}&limit=1&offset=0`,{headers:{Cookie:otherReader}})).status).toBe(404);
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:otherReader}})).status).toBe(404);
       expect((await request(`/api/inventory/export.csv?snapshotId=${snapshotId}`,{headers:{Cookie:otherReader}})).status).toBe(404);
-      expect(await (await request("/api/inventory/resources",{headers:{Cookie:otherReader}})).json()).toMatchObject({count:0,value:[],snapshot:null});
+      expect(await (await request("/api/inventory/refresh-jobs",{headers:{Cookie:otherReader}})).json()).toMatchObject({value:[]});
     } finally { vi.mocked(capabilities.requireAvailable).mockResolvedValue(undefined); }
   });
   it("allows Viewer quarantine reads while keeping controls and canaries Admin-only", async () => {
@@ -1259,13 +1313,11 @@ describe.sequential("packaged API/session contracts", () => {
     authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Quarantine operator", username: "quarantine-operator@example.invalid", roles: ["AgentControl.Admin"] };
     const providerReads = vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length;
     try {
-      expect((await request("/api/quarantine/targets", { headers: { Cookie: readerCookie } })).status).toBe(200);
-      const targetList = await request("/api/quarantine/targets?limit=25&offset=0", { headers: { Cookie: operatorCookie } });
+      const targetList = await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: operatorCookie } });
       expect(targetList.status).toBe(200);
       const targetPage = await targetList.json();
-      expect(targetPage).toMatchObject({ count: 1, snapshot: { id: snapshotId }, value: [{ nativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222", quarantineEligibility: { eligible: true } }] });
-      expect(targetPage.value[0]).not.toHaveProperty("provenance");
-      expect(await (await request("/api/quarantine/targets", { headers: { Cookie: otherOperatorCookie } })).json()).toEqual({ value: [], count: 0, snapshot: null });
+      expect(targetPage).toMatchObject({ snapshot: { id: snapshotId }, value: [{ nativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111" }] });
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: otherOperatorCookie } })).status).toBe(404);
       expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads);
       expect((await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/status?snapshotId=not-a-uuid&nativeId=native-agent", { headers: { Cookie: operatorCookie } })).status).toBe(400);

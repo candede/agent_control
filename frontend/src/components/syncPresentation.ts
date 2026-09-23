@@ -19,7 +19,7 @@ export const syncSourceDetails: Record<DataSyncSourceId, {
   },
   power_platform: {
     label: "Power Platform",
-    description: "Environments, agents, apps, and flows",
+    description: "Agents and supporting environment metadata",
     unit: "resources",
   },
   usage_reports: {

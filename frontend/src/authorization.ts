@@ -10,7 +10,6 @@ export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
   if (!hasRole(user, "AgentControl.Viewer")) return ["permissions"];
   return [
     "agents",
-    "power-platform",
     "users",
     "sync",
     "audit",

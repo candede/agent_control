@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { downloadInventoryCsv, getInventoryRefreshJobs, getInventoryResources, getInventorySnapshots, subscribeSessionRevalidationRequired } from "./client";
+import { downloadInventoryCsv, getInventoryRefreshJobs, getInventoryRefreshJob, getInventoryQuarantineSelection, subscribeSessionRevalidationRequired } from "./client";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -10,11 +10,11 @@ describe("inventory CSV request contract", () => {
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
     await downloadInventoryCsv({
-      snapshotId: "saved-snapshot", excludeAgents: true, search: "Flow & app",
-      sortBy: "environmentId", sortDirection: "desc", limit: undefined, offset: undefined,
+      snapshotId: "saved-snapshot", search: "Agent & bot",
+      sortBy: "environmentId", sortDirection: "desc",
     }, controller.signal);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-      "/api/inventory/export.csv?snapshotId=saved-snapshot&excludeAgents=true&search=Flow+%26+app&sortBy=environmentId&sortDirection=desc",
+      "/api/inventory/export.csv?snapshotId=saved-snapshot&search=Agent+%26+bot&sortBy=environmentId&sortDirection=desc",
       { signal: controller.signal, credentials: "include", headers: { Accept: "text/csv" } },
     );
   });
@@ -38,7 +38,7 @@ describe("inventory CSV request contract", () => {
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
     controller.abort();
-    await expect(downloadInventoryCsv({}, controller.signal)).rejects.toMatchObject({ code: "request_aborted" });
+    await expect(downloadInventoryCsv({ snapshotId: "saved-snapshot" }, controller.signal)).rejects.toMatchObject({ code: "request_aborted" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -63,21 +63,21 @@ describe("inventory saved-read authorization boundaries", () => {
     const onSessionDenied = vi.fn(() => client.clear());
     const unsubscribe = subscribeSessionRevalidationRequired(onSessionDenied);
     try {
-      const resourceRead = () => readSavedQuery(client, ["inventory-resources"], signal =>
-        getInventoryResources({}, { signal }), new AbortController().signal);
+      const resourceRead = () => readSavedQuery(client, ["inventory-selection"], signal =>
+        getInventoryQuarantineSelection("saved-snapshot", ["agent-a"], { signal }), new AbortController().signal);
       const outcomes = Promise.allSettled([
         resourceRead(), resourceRead(),
-        readSavedQuery(client, ["inventory-snapshots"], signal =>
-          getInventorySnapshots({ signal }), new AbortController().signal),
+        readSavedQuery(client, ["inventory-exact-job"], signal =>
+          getInventoryRefreshJob("exact-job", { signal }), new AbortController().signal),
         readSavedQuery(client, ["inventory-refresh-jobs"], signal =>
           getInventoryRefreshJobs({ signal }), new AbortController().signal),
       ]);
       expect(fetchMock).toHaveBeenCalledTimes(3);
       const signals = fetchMock.mock.calls.map(([, options]) => (options as RequestInit).signal);
-      await expect(downloadInventoryCsv()).rejects.toMatchObject({ status, code });
+      await expect(downloadInventoryCsv({ snapshotId: "saved-snapshot" })).rejects.toMatchObject({ status, code });
       expect(onSessionDenied).toHaveBeenCalledTimes(revokeSession ? 1 : 0);
       expect(signals.every(signal => signal?.aborted === revokeSession)).toBe(true);
-      complete[0](Response.json({ value: [], count: 0, typeCounts: [], snapshot: null }));
+      complete[0](Response.json({ value: [], snapshot: null }));
       complete[1](Response.json({ value: [] }));
       complete[2](Response.json({ value: [], lastAttemptAt: null, lastSuccessAt: null }));
       const results = await outcomes;

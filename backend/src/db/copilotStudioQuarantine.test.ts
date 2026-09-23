@@ -58,10 +58,6 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     const snapshotId = await seedInventory();
     const target = await inventory.resolveQuarantineTargets(scope, snapshotId, ["native-agent"]);
     expect(target).toMatchObject([{ resourceNativeId: "native-agent", environmentId, botId, inventoryQuarantineState: false }]);
-    const candidates = await inventory.listQuarantineTargets(scope);
-    expect(candidates).toMatchObject({ count: 1, snapshot: { id: snapshotId }, value: [{ nativeId: "native-agent", environmentId, botId, quarantineEligibility: { eligible: true, code: "eligible" } }] });
-    expect(candidates.value[0]).not.toHaveProperty("tenantId");
-    expect(await inventory.listQuarantineTargets({ ...scope, principalId: "other" })).toEqual({ value: [], count: 0, snapshot: null });
     await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: "other" }, snapshotId, ["native-agent"]))
       .rejects.toMatchObject({ code: "quarantine_inventory_unavailable" });
     await expect(inventory.resolveQuarantineTargets(scope, snapshotId, ["Canary agent"]))
@@ -70,9 +66,6 @@ describe.sequential("Copilot Studio quarantine repository", () => {
 
   it("rejects stale inventory and duplicate bulk selection", async () => {
     const staleSnapshot = await seedInventory("stale-operator", new Date(Date.now() - 25 * 60 * 60 * 1000));
-    expect(await inventory.listQuarantineTargets({ tenantId: "tenant-a", principalId: "stale-operator" })).toMatchObject({
-      snapshot: { id: staleSnapshot }, value: [{ quarantineEligibility: { eligible: false, code: "stale_snapshot" } }],
-    });
     await expect(inventory.resolveQuarantineTargets({ tenantId: "tenant-a", principalId: "stale-operator" }, staleSnapshot, ["native-agent"]))
       .rejects.toMatchObject({ code: "quarantine_inventory_stale" });
     const snapshotId = await seedInventory("duplicate-operator");

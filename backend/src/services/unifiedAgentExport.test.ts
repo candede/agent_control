@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { csvValue } from "./csvExport.js";
+import { agentCapabilityExport } from "./agentContextExport.js";
+import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { buildUnifiedAgentCsv } from "./unifiedAgentExport.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
@@ -58,6 +60,28 @@ function inventory(value = [record("first"), record("second")]): UnifiedAgentInv
 }
 
 describe("unified agent CSV projection", () => {
+  it("exports unknown, explicit empty, zero and false distinctly and never exports connection credentials", () => {
+    expect(agentCapabilityExport(null)).toMatchObject({ connectorDetailsStatus: "not_supplied", configuredConnectors: null });
+    const resource = { details: {
+      connectors: [], connectorDetailsStatus: "complete", distinctPowerPlatformConnectors: 0, distinctPowerPlatformConnectorsOperations: 0,
+    }, provenance: {} } as unknown as PowerPlatformResource;
+    expect(agentCapabilityExport(resource)).toMatchObject({
+      connectorDetailsStatus: "complete", configuredConnectors: "[]", reportedConnectorTotal: 0, reportedOperationTotal: 0,
+      savedConnectorDetails: 0, savedOperationDetails: 0,
+    });
+    resource.details.connectors = [{
+      connectorId: "shared_test", operations: [{
+        operationId: "read", isEnabled: false, requiresEndUserConsent: false,
+        createdBy: "52bff06b-5db5-42cd-9919-28f95e3c07af", connectionProvider: "Maker",
+        ...{ connectionIdSharedByMaker: "secret", callbackUrl: "https://private.invalid" },
+      }],
+    }];
+    const exported = agentCapabilityExport(resource);
+    expect(exported.configuredConnectors).toContain('"isEnabled":false');
+    expect(exported.configuredConnectors).toContain('"requiresEndUserConsent":false');
+    expect(JSON.stringify(exported)).not.toMatch(/secret|private.invalid/);
+  });
+
   it.each(["before", "during"] as const)("stops projecting rows when the deadline expires %s projection", phase => {
     const page = inventory();
     let now = Date.now();

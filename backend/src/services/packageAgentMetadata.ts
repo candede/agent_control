@@ -36,7 +36,6 @@ export function isPackageElementType(value: string, expected: string) {
   return value.toLowerCase() === expected.toLowerCase();
 }
 
-// Connected services also uses this definition; validating identities must not discard its configuration.
 export function validatePackageAgentMetadata(definition: string): string {
   let metadata: unknown;
   try {

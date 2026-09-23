@@ -1,5 +1,7 @@
 # Azure production deployment
 
+**Scope of this runbook:** the deployment baseline and receipts below belong to the earlier production roadmap, not the current agent-centered development campaign. The current Power Platform definitions require a fresh development database and provide no upgrade/backfill for broad-catalog data. This campaign neither authorizes nor qualifies an Azure deployment or reuse of these existing-database upgrade steps; its evidence is isolated local PostgreSQL and mocked-provider browser validation only.
+
 `deploy-azure.ps1` is the only Azure release entry point. It deploys one tested Express/React Linux/x64 ZIP to one Linux Basic B1 App Service and one PostgreSQL 17 Flexible Server (`Standard_B1ms`, Burstable, 32 GiB, seven-day backup retention). It reuses one administrator-prepared Key Vault. It never creates a VM, database container, registry, Static Web App, slot, replica, HA pair, autoscale target, Redis, Cosmos DB or Azure Files share.
 
 ## Approval file and preview

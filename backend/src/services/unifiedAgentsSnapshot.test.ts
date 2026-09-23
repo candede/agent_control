@@ -44,7 +44,7 @@ describe("Unified agent snapshot dependencies", () => {
       },
     });
     vi.spyOn(PowerPlatformInventoryRepository.prototype, "readUnifiedSource").mockResolvedValue({
-      resources: [], environmentNames: {}, snapshot: null,
+      resources: [], snapshot: null,
     });
     vi.spyOn(UnifiedAgentRegistry.prototype, "withSnapshot").mockImplementation((_scope, work) => work(client));
     vi.spyOn(UnifiedAgentRegistry.prototype, "reconcile").mockImplementation(async (_client, _scope, records) => [...records]);

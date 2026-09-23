@@ -6,8 +6,6 @@ const viewports = [360, 768, 1280, 1920];
 const cases = [
   { name: "agents", path: "/agents", ready: ".agent-table-stack tbody tr",
     fields: [".filter-section-primary", ".filter-section-advanced"] },
-  { name: "power-platform", path: "/power-platform", ready: ".inventory-table tbody tr",
-    fields: [".inventory-controls"] },
   { name: "users", path: "/users", ready: ".copilot-users-table tbody tr",
     fields: [".copilot-users-toolbar"] },
   { name: "report-snapshot", path: "/sync?reports=snapshot", ready: ".usage-agent-table tbody tr",
@@ -78,10 +76,6 @@ for (const scenario of cases) {
     if (scenario.name === "agents") {
       await expect(page.locator(".agent-table-stack .capability-gate > button:disabled").first()).toBeVisible();
     }
-    if (scenario.name === "power-platform") {
-      await expect(page.locator(".gate-explanation").first()).toBeVisible();
-      await expect(page.locator(".capability-gate > button:disabled").first()).toBeVisible();
-    }
     if (scenario.name === "jobs") {
       await expect(page.getByText(/authorized source is temporarily unavailable/)).toBeVisible();
       await page.getByRole("button", { name: /View details for Power Platform inventory refresh/ }).click();
@@ -103,9 +97,9 @@ for (const scenario of cases) {
         await page.evaluate(() => window.scrollTo(0, 0));
         await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}.png`), fullPage: true, animations: "disabled" });
         await assertLayout(page, scenario.fields, `${scenario.name} at ${width}px`);
-        if (scenario.name === "agents" || scenario.name === "power-platform") {
-          const selector = scenario.name === "agents" ? ".filter-section-advanced" : ".inventory-controls";
-          const expectedColumns = width === 360 ? 1 : scenario.name === "agents" ? 3 : width === 768 ? 2 : 4;
+        if (scenario.name === "agents") {
+          const selector = ".filter-section-advanced";
+          const expectedColumns = width === 360 ? 1 : 3;
           const columns = await page.locator(selector).evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
           expect.soft(columns, `${selector} column contract at ${width}px`).toBe(expectedColumns);
         }

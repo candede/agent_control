@@ -510,7 +510,7 @@ describe("canonical agent registry", () => {
     }
     expect((await fixture.runtime.query(`SELECT native_id,environment_id FROM power_platform_inventory_resources WHERE snapshot_id=$1`, [snapshot])).rows)
       .toEqual([{ native_id: nativeGuid, environment_id: "environment" }]);
-    await expect(copy(nativeGuid.toUpperCase(), "ENVIRONMENT", "microsoft.powerapps/canvasapps")).resolves.toMatchObject({ rowCount: 1 });
+    await expect(copy(nativeGuid.toUpperCase(), "ENVIRONMENT", "microsoft.powerplatform/environments")).resolves.toMatchObject({ rowCount: 1 });
     await expect(copy(nativeGuid.toUpperCase(), "another-environment")).resolves.toMatchObject({ rowCount: 1 });
     for (const nativeId of ["Opaque", "opaque", `${nativeGuid}-suffix`, `${nativeGuid.toUpperCase()}-SUFFIX`]) {
       await expect(copy(nativeId, "environment")).resolves.toMatchObject({ rowCount: 1 });

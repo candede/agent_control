@@ -370,7 +370,7 @@ describe("migration 6 inventory retention upgrade", () => {
           const job = (await upgradeFixture.operator.query<{ id: string }>(`INSERT INTO power_platform_refresh_jobs(id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
             VALUES(gen_random_uuid(),'tenant','principal','upgrade',repeat('a',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`)).rows[0].id;
           await upgradeFixture.operator.query(`INSERT INTO power_platform_inventory_snapshots(id,job_id,tenant_id,principal_id,query_hash,role_scope,requested_types,coverage,observed_count,total_records,page_count,unknown_field_count)
-            VALUES(gen_random_uuid(),$1,'tenant','principal',repeat('a',64),'full','["microsoft.copilotstudio/agents"]',$2,0,0,1,0)`, [job, JSON.stringify(Array.from({ length: 11 }, () => ({ type: "fixture", status: "unknown", count: null })))]);
+            VALUES(gen_random_uuid(),$1,'tenant','principal',repeat('a',64),'full','["microsoft.copilotstudio/agents"]',$2,0,0,1,0)`, [job, JSON.stringify(Array.from({ length: 2 }, () => ({ type: "fixture", status: "unknown", count: null })))]);
         }
 
         await migrate(upgradeFixture.operator);

@@ -47,12 +47,14 @@ const sorts: { value: string; label: string; sortBy: OfficialUsageUserView["filt
   { value: "name-desc", label: "Name Z–A", sortBy: "displayName", sortDirection: "desc" },
 ];
 
-export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, directoryData, onAccessDenied }: {
+export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, directoryData, onAccessDenied, onOpenAgent }: {
   route: UsersRouteState;
   onRouteChange: (route: UsersRouteState, replace?: boolean) => void;
   dataRevision?: number;
+  agentInventoryRevision?: number;
   directoryData?: CopilotUsageUsersResponse;
   onAccessDenied?: (message: string) => void;
+  onOpenAgent?: (id: string) => void;
 }) {
   const [result, setResult] = useState<ReadState>();
   const [retry, setRetry] = useState(0);
@@ -314,6 +316,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, d
         <p>CSV filters select matching people, not individual exported relationships. Every agent relationship of each matching user is exported, not only this page or the selected agent. Repeated all-agent Users-report totals are not additive across relationship rows.</p>
       </details>
       {selected ? <ReportedUserDetail key={reportUserKey(selected)} user={selected} directoryUser={directoryMatches.get(reportUserKey(selected))}
+        onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision}
         hasRelationships={hasRelationships} filters={data.filters} returnFocusTo={searchInput} onClose={() => setSelectedUser(undefined)}
         onFocusAgent={(id, setId) => {
           setSelectedUser(undefined);

@@ -129,9 +129,17 @@ function dependencies(options: {
       })),
     },
     powerPlatform: {
+      readAgentEnvironments: vi.fn(async (_scope, ids) => Object.fromEntries(ids.flatMap(id => {
+        const name = options.environmentNames?.[id.toLowerCase()];
+        return name ? [[id.toLowerCase(), {
+          id, displayName: name, region: "europe", environmentType: "Production", isManaged: false,
+          groupName: null, groupId: null, provenance: {},
+          observation: { id: "environment-snapshot", snapshotId: "environment-snapshot", current: true as const,
+            observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-21T00:00:00.000Z" },
+        }]] : [];
+      }))),
       readUnifiedSource: vi.fn(async () => ({
         resources: options.resources ?? [],
-        environmentNames: options.environmentNames ?? {},
         snapshot: options.powerPlatformSnapshot === undefined ? powerPlatformSnapshot() : options.powerPlatformSnapshot,
       })),
     },
@@ -158,6 +166,96 @@ function dependencies(options: {
 }
 
 describe("UnifiedAgentsService", () => {
+  it("projects all responsible people before paging, including agents beyond the normal 250-row clamp", async () => {
+    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const resources = Array.from({ length: 301 }, (_, index) => ({
+      ...resource(environmentB, `native-${index}`), displayName: `Agent ${String(index).padStart(3, "0")}`,
+      createdBy: owner, details: { ownerId: index === 300 ? owner : other, lastModifiedBy: other },
+    }));
+    const deps = dependencies({ resources });
+    const service = new UnifiedAgentsService(deps);
+    const result = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: owner, offset: 300, limit: 1 });
+    expect(result.selected?.count).toBe(301);
+    expect(result.selected?.agents[0]).toMatchObject({ displayName: "Agent 300", roles: ["owner", "createdBy"] });
+    expect(result.selected?.person.evidence).toBeNull();
+    expect(deps.powerPlatform.readUnifiedSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages the full responsibility people cohort rather than the first 250 source agents", async () => {
+    const id = (index: number) => `dddddddd-dddd-4ddd-8ddd-${String(index).padStart(12, "0")}`;
+    const deps = dependencies({ resources: Array.from({ length: 301 }, (_, index) => ({
+      ...resource(environmentB, `native-${index}`), details: { ownerId: id(index) },
+    })) });
+    const service = new UnifiedAgentsService(deps);
+    const page = await service.responsibility({ tenantId, principalId: "viewer" }, { offset: 250, limit: 50 });
+    expect(page.count).toBe(301);
+    expect(page.people).toHaveLength(50);
+    expect(page.people[0].objectId).toBe(id(250));
+    expect((await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: id(300) })).selected)
+      .toMatchObject({ person: { objectId: id(300) }, count: 1, agents: [{ roles: ["owner"] }] });
+  });
+
+  it("keeps owner, creator and modifier distinct, preserves PP-only/shared agents, and ignores operation creators and names", async () => {
+    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const creator = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const modifier = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const operationCreator = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const deps = dependencies({ packages: [packageValue("same-name", "Same displayed name")], resources: [
+      { ...resource(environmentA), createdBy: creator.toUpperCase(),
+        details: { ownerId: owner, lastModifiedBy: modifier, connectors: [{ connectorId: "shared", operations: [{ operationId: "op", createdBy: operationCreator }] }] } },
+      { ...resource(environmentB), createdBy: owner, details: { ownerId: creator, lastModifiedBy: owner } },
+      { ...resource(environmentB, "invalid"), details: { ownerId: "Same displayed name", lastModifiedBy: "aaaaaaaa" } },
+    ] });
+    const service = new UnifiedAgentsService(deps);
+    const result = await service.responsibility({ tenantId, principalId: "viewer" });
+    expect(result.people.map(person => person.objectId).sort()).toEqual([owner, creator, modifier]);
+    expect(result.people.find(person => person.objectId === owner)).toMatchObject({ agentCount: 2, roles: ["owner", "createdBy", "lastModifiedBy"], evidence: null });
+    expect(result.coverage).toBe("partial");
+    expect(result.unknownAgentCount).toBe(2);
+    expect(result.invalidReferenceCount).toBe(2);
+    const selected = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: creator });
+    expect(selected.selected?.agents).toHaveLength(2);
+    expect(selected.selected?.agents.map(agent => agent.roles)).toEqual([["createdBy"], ["owner"]]);
+    expect(selected.selected?.agents.every(agent => agent.presence === "power_platform")).toBe(true);
+    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId: operationCreator }))
+      .rejects.toMatchObject({ code: "responsibility_person_unavailable" });
+    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId: "Same displayed name" }))
+      .rejects.toMatchObject({ code: "invalid_responsibility_person" });
+  });
+
+  it.each(["not_found", "lookup_failed", "resolved"] as const)("preserves saved %s people outside the paid/report roster", async status => {
+    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const deps = dependencies({ resources: [{ ...resource(environmentA), details: { ownerId: owner } }] });
+    const evidence = { objectId: owner, displayName: status === "resolved" ? "Responsible only" : null, userPrincipalName: null,
+      observedAt: "2026-09-15T00:00:00Z", status, ...(status === "lookup_failed" ? { errorCode: "provider_error" } : {}) };
+    deps.people = new SavedAgentPeopleService({ getDirectorySource: vi.fn(async () => ({
+      source: "directory", value: null, observedAt: null, rowCount: null, attemptStatus: null, message: null, attemptedAt: null, lastSuccessAt: null,
+    })) }, { read: vi.fn(async (_scope, ids) => ids.includes(owner) ? [{ ...evidence, lastConclusiveAt: null }] : []) });
+    const service = new UnifiedAgentsService(deps);
+    const selected = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId: owner });
+    expect(selected.selected?.person.evidence).toMatchObject(evidence);
+    expect(selected.selected?.count).toBe(1);
+    expect(selected.selected?.agents[0].roles).toEqual(["owner"]);
+  });
+
+  it("distinguishes unavailable, no-reported and unknown responsibility and rejects a changed revision", async () => {
+    const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const evidence = { objectId, displayName: "Same displayed name", userPrincipalName: "saved@example.invalid", observedAt: "2026-09-15T00:00:00Z" };
+    const deps = dependencies({ resources: [], powerPlatformSnapshot: null });
+    deps.people!.read = vi.fn(async () => new Map([[objectId, evidence]]));
+    let service = new UnifiedAgentsService(deps);
+    expect((await service.responsibility({ tenantId, principalId: "viewer" }, { objectId })).selected?.state).toBe("unavailable");
+    const known = dependencies({ resources: [] });
+    known.people!.read = vi.fn(async () => new Map([[objectId, evidence]]));
+    service = new UnifiedAgentsService(known);
+    const result = await service.responsibility({ tenantId, principalId: "viewer" }, { objectId });
+    expect(result.coverage).toBe("available");
+    expect(result.selected).toMatchObject({ state: "no_reported_relationships", count: 0, agents: [] });
+    vi.mocked(known.readRevision).mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("a".repeat(64)).mockResolvedValueOnce("b".repeat(64));
+    await expect(service.responsibility({ tenantId, principalId: "viewer" }, { objectId })).rejects.toMatchObject({ code: "inventory_changed" });
+  });
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-16T12:00:00.000Z"));
@@ -465,7 +563,9 @@ describe("UnifiedAgentsService", () => {
       ? [environmentB, "Alpha", "Alpha", "Zebra", null]
       : ["Zebra", "Alpha", "Alpha", environmentB, null]);
     const rows = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
-    expect(rows.map(row => row.environmentName)).toEqual(displayed.map(value => value ?? ""));
+    expect(rows.map(row => row.environmentName || row.environmentId)).toEqual(displayed.map(value => value ?? ""));
+    expect(rows.find(row => row.environmentId === environmentB)?.environmentName).toBe("");
+    expect(rows.find(row => row.environmentId === environmentB)?.environmentContextStatus).toBe("saved_metadata_unavailable");
   });
 
   it.each(["asc", "desc"] as const)("keeps reported-empty channels distinct from missing data in %s display, sort and CSV", async sortDirection => {

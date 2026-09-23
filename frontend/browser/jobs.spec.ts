@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../src/api/client";
+import type { InventoryRefreshJob, WorkbenchJobSummary, WorkbenchJobsResponse } from "../src/api/client";
 import { mockJobs } from "./jobsFixtures";
 
 function job(id: string, createdAt: string, overrides: Partial<WorkbenchJobSummary> = {}): WorkbenchJobSummary {
@@ -24,9 +24,9 @@ function jobs(): WorkbenchJobsResponse {
         status: "running", completed: 144, completedAt: undefined, canCancel: true,
       }),
       job("waiting-platform", "2026-09-20T13:01:00.000Z", {
-        source: "power-platform", label: "Power Platform inventory refresh", target: "11 allowlisted resource types",
+        source: "power-platform", label: "Power Platform inventory refresh", target: "2 allowlisted resource types",
         status: "waiting_authorization", completed: 0, total: null, startedAt: undefined, completedAt: undefined,
-        canResume: true, canCancel: true, href: "/power-platform?refreshJob=waiting-platform",
+        canResume: true, canCancel: true, href: "/sync?powerPlatformJob=waiting-platform",
       }),
       job("draft-users", "2026-09-20T13:02:00.000Z", {
         source: "official-usage", label: "Users CSV import", target: "Users export · 34 validated rows",
@@ -39,8 +39,8 @@ function jobs(): WorkbenchJobsResponse {
       }),
       job("package-latest", "2026-09-20T11:58:00.000Z"),
       job("platform-latest", "2026-09-20T11:50:00.000Z", {
-        source: "power-platform", label: "Power Platform inventory refresh", target: "11 allowlisted resource types",
-        total: 4219, completed: 4219, href: "/power-platform?refreshJob=platform-latest",
+        source: "power-platform", label: "Power Platform inventory refresh", target: "2 allowlisted resource types",
+        total: 4219, completed: 4219, href: "/sync?powerPlatformJob=platform-latest",
       }),
       ...["Agents", "Users & agents", "Users"].map((kind, index) => job(`accepted-${index}`, `2026-09-19T18:0${index}:00.000Z`, {
         source: "official-usage", label: `${kind} CSV import`, target: `${kind} export`,
@@ -48,8 +48,8 @@ function jobs(): WorkbenchJobsResponse {
         href: "/sync?reports=snapshot&snapshot=accepted-snapshot",
       })),
       job("old-failed-platform", "2026-09-15T09:00:00.000Z", {
-        source: "power-platform", label: "Power Platform inventory refresh", target: "11 allowlisted resource types",
-        status: "failed", total: 4173, completed: 4173, href: "/power-platform?refreshJob=old-failed-platform",
+        source: "power-platform", label: "Power Platform inventory refresh", target: "2 allowlisted resource types",
+        status: "failed", total: 4173, completed: 4173, href: "/sync?powerPlatformJob=old-failed-platform",
       }),
       job("old-inconclusive-hunt", "2026-09-12T10:00:00.000Z", {
         source: "defender", label: "Defender fixed-template investigation",
@@ -123,6 +123,38 @@ test("Jobs separates current work from chronological table history and accessibl
 
 const stagingId = "33333333-3333-4333-8333-333333333333";
 const retainedSetId = "55555555-5555-4555-8555-555555555555";
+for (const status of ["failed", "waiting_authorization", "running", "succeeded", "cancelled"] as const) {
+  test(`Power Platform ${status} job opens its exact Sync diagnostics from Jobs`, async ({ page }) => {
+    const id = `exact-${status}`;
+    const now = "2026-09-20T13:00:00.000Z";
+    const sourceJob: InventoryRefreshJob = {
+      id, status, roleScope: "full", environmentScope: null,
+      requestedTypes: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"],
+      pageCount: 1, observedCount: 12, totalRecords: null, unknownFieldCount: 2, snapshotId: null,
+      createdAt: now, attemptedAt: now, updatedAt: now, finishedAt: null, message: `Exact ${status} diagnostics`,
+    };
+    const { unexpected, commands } = await mockJobs(page, () => ({ ...jobs(), value: [
+      job(id, now, { source: "power-platform", label: "Power Platform refresh", status,
+        href: `/sync?powerPlatformJob=${id}`, canResume: status === "waiting_authorization", canCancel: status === "running" || status === "waiting_authorization" }),
+    ] }));
+    const reads: string[] = [];
+    await page.route(url => url.pathname === `/api/inventory/refresh-jobs/${id}`, route => {
+      reads.push(new URL(route.request().url()).pathname);
+      return route.fulfill({ json: sourceJob });
+    });
+    await page.goto("/jobs");
+    await page.getByRole("button", { name: `View details for Power Platform refresh, job ${id}`, exact: true }).click();
+    await page.getByRole("dialog", { name: "Job details", exact: true }).getByRole("link", { name: "Open Power Platform refresh", exact: true }).click();
+    await expect(page).toHaveURL(`/sync?powerPlatformJob=${id}`);
+    const inspection = page.getByRole("region", { name: "Power Platform source job", exact: true });
+    await expect(inspection).toContainText(`Exact ${status} diagnostics`);
+    await expect(inspection.getByText("Unknown", { exact: true })).toBeVisible();
+    expect(reads).toContain(`/api/inventory/refresh-jobs/${id}`);
+    expect(commands.filter(command => command !== "POST /api/capabilities/check")).toEqual([]);
+    expect(unexpected).toEqual([]);
+  });
+}
+
 for (const scenario of [
   { status: "active", label: "Review CSV import", legacy: `/official-usage?staging=${stagingId}`,
     canonical: `/sync?reports=import&staging=${stagingId}`, dialog: "Import CSV reports" },

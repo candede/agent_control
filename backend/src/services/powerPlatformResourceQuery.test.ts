@@ -46,6 +46,23 @@ describe("PowerPlatformResourceQueryClient", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
   });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+  it("limits default collection to agents and contextual environments", async () => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.queriedTypes).toEqual(["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"]);
+    const query = JSON.stringify(JSON.parse(fetcher.mock.calls[0][1].body as string).Clauses);
+    expect(query).toContain("microsoft.copilotstudio/agents");
+    expect(query).toContain("microsoft.powerplatform/environments");
+    expect(query).not.toMatch(/powerapps|powerautomate|connector|environmentgroups/);
+  });
+
+  it.each(["microsoft.powerapps/apps", "microsoft.powerautomate/cloudflows", "microsoft.powerplatformconnector/connectors", "microsoft.powerplatform/environmentgroups"])("rejects retired source type %s", async type => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, type }] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token")).rejects.toMatchObject({
+      code: "provider_schema", diagnostics: { reason: "invalid_resource_type" },
+    });
+  });
+
   it("checks access with one bounded page and no continuation", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 0,
@@ -140,7 +157,7 @@ describe("PowerPlatformResourceQueryClient", () => {
 
   it("discards nested details that are not documented for the returned resource type", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{
-      ...resource, type: "microsoft.powerapps/codeapps", properties: {
+      ...resource, type: "microsoft.powerplatform/environments", properties: {
         powerPlatformConnectors: [{ connectorId: "unsupported-connector", operations: [{ operationId: "unsupported-operation" }] }],
         capabilitiesCounts: { distinctPowerPlatformConnectors: 7 },
       },
@@ -254,10 +271,10 @@ describe("PowerPlatformResourceQueryClient", () => {
     ]);
   });
 
-  it.each([[101, false], [201, false], [4_008, false], [4_008, true]] as const)("enumerates %i resources (catalog entries: %s) when explicit Skip overrides the continuation offset", async (totalRecords, includeCatalog) => {
+  it.each([101, 201, 4_008])("enumerates %i agents and environments when explicit Skip overrides the continuation offset", async totalRecords => {
     const rows = Array.from({ length: totalRecords }, (_, index) => ({
       ...resource, name: `agent-${String(index).padStart(4, "0")}`, properties: {},
-      ...(includeCatalog && index < 1_001 ? { type: "microsoft.powerplatformconnector/connectors", tenantId: "" } : {}),
+      ...(index % 2 ? { type: "microsoft.powerplatform/environments" } : {}),
     }));
     const progress = vi.fn();
     const fetcher = vi.fn(async (_input: string | URL, init?: RequestInit) => {
@@ -552,38 +569,8 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(result.resources[0]).toMatchObject({ tenantId, nativeId });
   });
 
-  it.each(["", null, undefined])("scopes connector catalog entries with absent tenant metadata (%s) to the authenticated query", async sourceTenantId => {
-    const fetcher = vi.fn().mockResolvedValue(Response.json({
-      totalRecords: 1, count: 1, resultTruncated: 0,
-      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: sourceTenantId }],
-    }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId });
-
-    expect(result.resources[0]).toMatchObject({
-      tenantId: resource.tenantId, nativeId: resource.name, environmentId: null,
-      provenance: { tenantId: { path: "authenticated_query.tenantId" } },
-      identifiers: [{ kind: "power_platform_resource_id", value: resource.name }],
-    });
-    if (sourceTenantId === undefined) {
-      expect(result.resources[0].details).not.toHaveProperty("sourceTenantId");
-      expect(result.resources[0].provenance.sourceTenantId.path).toBe("not_supplied");
-    } else {
-      expect(result.resources[0].details.sourceTenantId).toBe(sourceTenantId);
-      expect(result.resources[0].provenance.sourceTenantId.path).toBe("tenantId");
-    }
-  });
-
-  it("does not infer catalog tenant scope without an authenticated query scope", async () => {
-    const fetcher = vi.fn().mockResolvedValue(Response.json({
-      totalRecords: 1, count: 1, resultTruncated: 0,
-      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: "" }],
-    }));
-    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token"))
-      .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("require an authenticated inventory tenant scope") });
-  });
-
   it.each(["", null, undefined])("still rejects absent tenant metadata (%s) on tenant-owned resources", async tenantId => {
-    for (const type of ["microsoft.copilotstudio/agents", "microsoft.powerapps/canvasapps", "microsoft.powerplatform/environments"]) {
+    for (const type of ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"]) {
       const fetcher = vi.fn().mockResolvedValue(Response.json({
         totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, type, tenantId }],
       }));
@@ -592,21 +579,21 @@ describe("PowerPlatformResourceQueryClient", () => {
     }
   });
 
-  it.each(["foreign-tenant", 42, {}, "x".repeat(129)])("does not replace foreign or malformed connector tenant metadata (%s)", async tenantId => {
+  it.each(["foreign-tenant", 42, {}, "x".repeat(129)])("does not replace foreign or malformed environment tenant metadata (%s)", async tenantId => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 1, count: 1, resultTruncated: 0,
-      data: [{ ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId }],
+      data: [{ ...resource, type: "microsoft.powerplatform/environments", tenantId }],
     }));
     await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
-  it("retains duplicate and environment-scope guards for connector catalog entries", async () => {
-    const connector = { ...resource, type: "microsoft.powerplatformconnector/connectors", tenantId: "" };
-    const duplicate = vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [connector, connector] }));
+  it("retains duplicate and environment-scope guards for environment context", async () => {
+    const environment = { ...resource, type: "microsoft.powerplatform/environments" };
+    const duplicate = vi.fn().mockResolvedValue(Response.json({ totalRecords: 2, count: 2, resultTruncated: 0, data: [environment, environment] }));
     await expect(new PowerPlatformResourceQueryClient(duplicate).query("opaque-token", undefined, { expectedTenantId: resource.tenantId }))
       .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("duplicate resource identity") });
-    const outOfScope = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [connector] }));
+    const outOfScope = vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [environment] }));
     await expect(new PowerPlatformResourceQueryClient(outOfScope).query("opaque-token", undefined, { expectedTenantId: resource.tenantId, environmentId: "environment-a" }))
       .rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("outside the requested") });
   });
@@ -658,6 +645,69 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(result.unknownFieldCount).toBeGreaterThan(0);
   });
 
+  it("retains documented operation creators and false values without connection credentials", async () => {
+    const creator = "52bff06b-5db5-42cd-9919-28f95e3c07af";
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, properties: {
+        powerPlatformConnectors: [{ connectorId: "shared_excelonlinebusiness", operations: [{
+          operationId: "RunScriptProd", createdBy: creator, usedAs: "Topic Tool", isEnabled: false,
+          requiresEndUserConsent: false, whenCanBeUsed: "ViaDirectReferenceOnly", connectionProvider: "Maker",
+          connectionIdSharedByMaker: "private-connection", callbackUrl: "https://example.invalid?sig=private",
+        }] }],
+      } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    expect(result.resources[0].details).toMatchObject({
+      connectorDetailsStatus: "complete",
+      connectors: [{ connectorId: "shared_excelonlinebusiness", operations: [{
+        operationId: "RunScriptProd", createdBy: creator, usedAs: "Topic Tool", isEnabled: false,
+        requiresEndUserConsent: false, whenCanBeUsed: "ViaDirectReferenceOnly", connectionProvider: "Maker",
+      }] }],
+    });
+    expect(result.resources[0].provenance.connectors.path).toBe("properties.powerPlatformConnectors");
+    expect(JSON.stringify(result)).not.toContain("private");
+  });
+
+  it.each([
+    { isEnabled: "false" }, { requiresEndUserConsent: 0 }, { createdBy: "not-a-guid" },
+    { usedAs: "x".repeat(513) }, { connectionProvider: { secret: "private" } },
+  ])("marks malformed optional operation fields partial rather than complete: %j", async invalid => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, properties: { powerPlatformConnectors: [{
+        connectorId: "shared_test", operations: [{ operationId: "read", ...invalid }],
+      }] } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    expect(result.resources[0].details.connectorDetailsStatus).toBe("partial");
+    expect(result.resources[0].details.connectors?.[0].operations).toEqual([{ operationId: "read" }]);
+  });
+
+  it.each([undefined, 200, 250])("keeps the documented 200-operation provider boundary truthful with total %s", async total => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, properties: {
+        powerPlatformConnectors: [{ connectorId: "shared_test", operations: Array.from({ length: 200 }, (_, index) => ({ operationId: `op-${index}` })) }],
+        capabilitiesCounts: { distinctPowerPlatformConnectors: 1, distinctPowerPlatformConnectorsOperations: total },
+      } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    expect(result.resources[0].details.connectorDetailsStatus).toBe(total === 200 ? "complete" : "partial");
+    expect(result.resources[0].details.distinctPowerPlatformConnectorsOperations).toBe(total);
+    expect(result.resources[0].details.connectors?.[0].operations).toHaveLength(200);
+  });
+
+  it.each([-1, "0", false, 1.5])("does not turn malformed capability total %s into zero or a complete list", async count => {
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false,
+      data: [{ ...resource, properties: { powerPlatformConnectors: [], capabilitiesCounts: { distinctPowerPlatformConnectors: count } } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    expect(result.resources[0].details).toMatchObject({ connectorDetailsStatus: "partial", connectors: [] });
+    expect(result.resources[0].details.distinctPowerPlatformConnectors).toBeUndefined();
+  });
+
   it("classifies only explicit empty publication metadata as draft", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 3,
@@ -686,43 +736,37 @@ describe("PowerPlatformResourceQueryClient", () => {
         { ...resource, name: "studio", properties: { createdIn: "Copilot Studio" } },
         { ...resource, name: "builder", properties: { createdIn: "Microsoft 365 Copilot Agent Builder" } },
         { ...resource, name: "unknown", properties: { createdIn: "Agent Builder custom" } },
-        { ...resource, name: "workflow", type: "microsoft.powerautomate/m365agentflows", properties: {} },
+        { ...resource, name: "environment", type: "microsoft.powerplatform/environments", properties: {} },
       ],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents", "microsoft.powerautomate/m365agentflows"]);
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
 
     expect(result.resources.map(({ authoringTool, agentKind }) => ({ authoringTool, agentKind }))).toEqual([
       { authoringTool: "Copilot Studio", agentKind: "copilot_studio_agent" },
       { authoringTool: "Microsoft 365 Copilot Agent Builder", agentKind: "agent_builder_agent" },
       { authoringTool: null, agentKind: "agent" },
-      { authoringTool: null, agentKind: "workflow_agent_flow" },
+      { authoringTool: null, agentKind: "not_agent" },
     ]);
   });
 
   it("uses per-resource field authority and maturity without leaking unrelated identity fields", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
-      totalRecords: 5, count: 5, resultTruncated: false,
+      totalRecords: 2, count: 2, resultTruncated: false,
       data: [
-        { ...resource, name: "canvas", type: "microsoft.powerapps/canvasapps", properties: { isQuarantined: false, isManaged: true, entraAgentId: "not-an-app-identity" } },
-        { ...resource, name: "model", type: "microsoft.powerapps/modeldrivenapps", properties: { ownerId: "not-applicable", appModuleId: "module-a" } },
-        { ...resource, name: "environment", type: "microsoft.powerplatform/environments", properties: { isManaged: true, isQuarantined: false } },
-        { ...resource, name: "connector", type: "microsoft.powerplatformconnector/connectors", location: "not-applicable", properties: { description: "Connector description", ownerId: "not-applicable", environmentId: "not-applicable", createdAt: "2026-09-08T00:00:00Z", operations: [] } },
-        { ...resource, name: "group", type: "microsoft.powerplatform/environmentgroups", properties: { description: "Group description" } },
+        { ...resource, name: "agent", properties: { isQuarantined: false, isManaged: true, entraAgentId: "exact-agent-id" } },
+        { ...resource, name: "environment", type: "microsoft.powerplatform/environments", properties: { isManaged: true, environmentType: "Production", environmentGroupId: "group-a", isQuarantined: false, entraAgentId: "not-an-environment-identity" } },
       ],
     }));
-    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.powerapps/canvasapps", "microsoft.powerapps/modeldrivenapps", "microsoft.powerplatform/environments", "microsoft.powerplatformconnector/connectors", "microsoft.powerplatform/environmentgroups"]);
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
 
-    expect(result.resources[0]).toMatchObject({ details: { isQuarantined: false }, identifiers: [{ kind: "power_platform_resource_id", value: "canvas" }] });
-    expect(result.resources[0].provenance.isQuarantined.maturity).toBe("ga");
-    expect(result.resources[0].details.isManaged).toBeUndefined();
-    expect(result.resources[1].details).toEqual({ appModuleId: "module-a", connectorDetailsStatus: "not_supplied" });
-    expect(result.resources[2].provenance.isManaged.maturity).toBe("ga");
-    expect(result.resources[3]).toMatchObject({ location: null, createdAt: null, environmentId: null, details: { description: "Connector description", connectorDetailsStatus: "complete" } });
-    expect(result.resources[3].provenance.description.maturity).toBe("preview");
-    expect(result.resources[4].provenance.description.maturity).toBe("ga");
-    expect(JSON.stringify(result)).not.toContain("not-an-app-identity");
-    expect(JSON.stringify(result)).not.toContain("not-applicable");
-    expect(result.unknownFieldCount).toBeGreaterThanOrEqual(7);
+    expect(result.resources[0]).toMatchObject({ details: { isQuarantined: false, isManaged: true } });
+    expect(result.resources[0].identifiers).toContainEqual({ kind: "entra_agent_id", value: "exact-agent-id" });
+    expect(result.resources[0].provenance.isQuarantined.maturity).toBe("preview");
+    expect(result.resources[1].provenance.isManaged.maturity).toBe("ga");
+    expect(result.resources[1].details).toEqual({ isManaged: true, environmentType: "Production", environmentGroupId: "group-a" });
+    expect(result.resources[1].location).toBe("unitedstates");
+    expect(JSON.stringify(result)).not.toContain("not-an-environment-identity");
+    expect(result.unknownFieldCount).toBe(2);
   });
 
   it("distinguishes absent, supplied-empty and bounded partial capability details", async () => {
@@ -774,7 +818,7 @@ describe("PowerPlatformResourceQueryClient", () => {
       await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json(body))).query("opaque-token")).rejects.toMatchObject({ code: "provider_schema" });
     }
     await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", ["microsoft.copilotstudio/agents"], { expectedTenantId: "tenant-b" })).rejects.toMatchObject({ code: "provider_schema" });
-    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", ["microsoft.powerapps/canvasapps"])).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", ["microsoft.powerplatform/environments"])).rejects.toMatchObject({ code: "provider_schema" });
     await expect(new PowerPlatformResourceQueryClient(vi.fn().mockResolvedValue(Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [resource] }))).query("opaque-token", undefined, { environmentId: "environment-b" })).rejects.toMatchObject({ code: "provider_schema" });
   });
 

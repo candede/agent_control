@@ -434,7 +434,7 @@ export class CopilotStudioQuarantineRepository {
         SELECT id FROM power_platform_inventory_snapshots WHERE tenant_id=$1 AND principal_id=$2 AND is_current
           AND expires_at>clock_timestamp() AND observed_at>clock_timestamp()-interval '24 hours'
           AND requested_types ? 'microsoft.copilotstudio/agents' AND ($4::boolean OR id=$5)
-        ORDER BY CASE WHEN environment_scope='' AND jsonb_array_length(requested_types)=11 THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1)
+        ORDER BY CASE WHEN environment_scope='' AND jsonb_array_length(requested_types)=2 THEN 1 ELSE 0 END DESC,observed_at DESC,id DESC LIMIT 1)
       SELECT resource.environment_id,resource.identifiers FROM power_platform_inventory_resources resource
       JOIN selected_snapshot snapshot ON snapshot.id=resource.snapshot_id
       WHERE resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.resource_type='microsoft.copilotstudio/agents' AND resource.native_id=$3`,

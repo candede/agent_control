@@ -4,7 +4,7 @@ import { type Server } from "node:http";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { testDatabase, fixturePassword } from "./testDatabase.js";
-import { closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
+import { browserFixtureTestFiles, closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
 import { createApp } from "../src/app.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
@@ -59,6 +59,7 @@ vi.mock("../src/auth/msal.js", async original => {
 });
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
+const selectedBrowserFiles = browserFixtureTestFiles();
 let application: ReturnType<typeof createApp>;
 let server: Server;
 const statuses: CapabilityStatus[] = ["available", "missing_permission", "missing_internal_role", "missing_role", "missing_license", "not_configured", "unsupported", "preview_disabled", "provider_error", "unknown"];
@@ -123,6 +124,7 @@ beforeAll(async () => {
     server.once("error", reject);
   });
   console.log(JSON.stringify({ event: "isolated_browser_fixture", origin: origin.origin, database: fixture.name, liveProviders: false }));
+  expect((await fetch(new URL("/api/ready", origin))).ok).toBe(true);
 });
 afterAll(() => closeFixtureResources(
   () => application?.store.close(),
@@ -132,12 +134,16 @@ afterAll(() => closeFixtureResources(
   () => { vi.unstubAllGlobals(); },
   () => { vi.restoreAllMocks(); },
 ));
-it("qualifies the packaged Permission Center through Chromium and axe", async ({ signal }) => {
+it("qualifies packaged browser workflows through Chromium and axe", async ({ signal }) => {
   const exitCode = await new Promise<number | null>((done, reject) => {
-    const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts"], { stdio: "inherit", env: process.env, signal });
+    const child = spawn(process.execPath, ["../node_modules/@playwright/test/cli.js", "test", "--config", "../frontend/playwright.config.ts",
+      ...selectedBrowserFiles.map(file => `${file.replaceAll(".", "\\.")}$`)], { stdio: "inherit", env: process.env, signal });
     child.once("error", reject); child.once("exit", done);
   });
   expect(exitCode).toBe(0);
+  expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows[0].count).toBe(0);
+  // The report restart and quarantine mutation postconditions belong to the full browser campaign.
+  if (selectedBrowserFiles.length) return;
   const repository = new OfficialUsageRepository(fixture.runtime);
   const viewOptions = { staleAfterDays: config.officialUsageStaleDays, now: new Date("2026-09-08T12:00:00.000Z") };
   const beforeRestart = await officialUsageFingerprint(repository, viewOptions);
@@ -156,7 +162,6 @@ it("qualifies the packaged Permission Center through Chromium and axe", async ({
   expect(afterRestart.lineage).toHaveLength(3);
   expect(afterRestart.aggregate).toMatchObject({ responses: 9, activeUsers: 1 });
   expect(afterRestart.users).toMatchObject({ count: 1, responses: 9 });
-  expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows[0].count).toBe(0);
   expect(quarantineProviderFixture.writes).toBe(2);
   expect((await fixture.operator.query("SELECT status,count(*)::int AS count FROM copilot_quarantine_jobs GROUP BY status")).rows).toEqual(expect.arrayContaining([
     { status: "succeeded", count: 2 },

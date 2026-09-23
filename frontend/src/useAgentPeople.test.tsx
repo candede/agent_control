@@ -59,6 +59,8 @@ describe("authoritative saved agent people responses", () => {
       const { result, rerender } = renderHook(value => useAgentPeople(value, ["AgentControl.Viewer"], changed),
         { initialProps: original, wrapper: authorized });
       expect(result.current.people.owner?.displayName).toBe("Saved owner");
+      expect(lookup).not.toHaveBeenCalled();
+      act(() => result.current.retry());
       await waitFor(() => expect(result.current.people.owner?.status).toBe("unverified"));
       expect(result.current.people.owner).toEqual({ id: ownerId, invalidId: false, status: "unverified" });
       expect(result.current.people.createdBy?.displayName).toBe(response === "partial" ? "Current creator" : undefined);
@@ -85,6 +87,8 @@ describe("authoritative saved agent people responses", () => {
       .mockRejectedValueOnce(new Error("Retry unavailable"));
     const { result } = renderHook(() => useAgentPeople({ ...record, people: { owner: savedPerson } }, ["AgentControl.Viewer"]),
       { wrapper: authorized });
+    expect(lookup).not.toHaveBeenCalled();
+    act(() => result.current.retry());
     await waitFor(() => expect(result.current.error).toBe("Directory unavailable"));
     expect(result.current.people.owner?.displayName).toBe("Saved owner");
     act(() => result.current.retry());
@@ -96,7 +100,7 @@ describe("authoritative saved agent people responses", () => {
     expect(lookup).toHaveBeenCalledTimes(3);
   });
 
-  it("automatically refreshes newly expired returned people even when another field was omitted", async () => {
+  it("keeps newly expired returned people visible without provider reads until explicitly refreshed", async () => {
     const now = Date.now();
     vi.spyOn(Date, "now").mockReturnValue(now);
     const createdBy = { ...savedPerson, objectId: creatorId, expiresAt: new Date(now + 1_000).toISOString() };
@@ -104,14 +108,19 @@ describe("authoritative saved agent people responses", () => {
       .mockResolvedValueOnce({ people: { createdBy }, changed: true })
       .mockResolvedValue({ people: undefined, changed: false });
     const { result, rerender } = renderHook(() => useAgentPeople(record, ["AgentControl.Viewer"]), { wrapper: authorized });
+    expect(lookup).not.toHaveBeenCalled();
+    act(() => result.current.retry());
     await waitFor(() => expect(result.current.people.createdBy?.displayName).toBe("Saved owner"));
     expect(result.current.people.owner?.status).toBe("unverified");
     expect(lookup).toHaveBeenCalledOnce();
     vi.mocked(Date.now).mockReturnValue(now + 2_000);
     rerender();
+    expect(result.current.people.createdBy?.expired).toBe(true);
+    expect(lookup).toHaveBeenCalledOnce();
+    act(() => result.current.retry());
     await waitFor(() => expect(result.current.people.createdBy?.status).toBe("unverified"));
     expect(result.current.loading).toBe(false);
     expect(lookup).toHaveBeenCalledTimes(2);
-    expect(lookup).toHaveBeenLastCalledWith(record.id, { signal: expect.any(AbortSignal) });
+    expect(lookup).toHaveBeenLastCalledWith(record.id, { force: true, signal: expect.any(AbortSignal) });
   });
 });

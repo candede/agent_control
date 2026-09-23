@@ -6,10 +6,11 @@ import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { usageOverviewFixture } from "../src/test/usageInsightsFixture";
 import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
-import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
+import { createUnifiedVerification } from "../src/test/inventoryVerification";
+import { projectAgentResponsibility } from "../../backend/src/services/agentResponsibility";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
-  InventoryResourcePage, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageUserView,
+  OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageUserView,
   PackagePage, PurviewAuditCatalog, PurviewAuditJob, PurviewAuditRecordPage, SessionUser,
   WorkbenchJobsResponse, UnifiedAgentInventoryPage,
 } from "../src/api/client";
@@ -91,33 +92,6 @@ export const unifiedAgents: UnifiedAgentInventoryPage = {
   },
   partial: true,
   errors: [{ source: "power_platform", code: "snapshot_unavailable", message: "Power Platform saved inventory is unavailable." }],
-};
-
-const inventory: InventoryResourcePage = {
-  value: ["Service desk automation", "Knowledge routing agent"].map((displayName, index) => ({
-    tenantId: actor.tenantId!, nativeId: `layout-resource-${index + 1}`,
-    type: "microsoft.copilotstudio/agents", location: "unitedstates", displayName,
-    environmentId: "22222222-2222-4222-8222-222222222222", createdAt: observedAt, createdBy: "layout-maker",
-    lastPublishedAt: observedAt, sourceSystem: "power_platform", authoringTool: "Copilot Studio",
-    creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published", identityConfidence: "exact_native",
-    identifiers: [{ kind: "cds_bot_id", value: `33333333-3333-4333-8333-33333333333${index}` }],
-    provenance: {}, details: { isQuarantined: index === 1, ownerId: "layout-maker" }, unknownFieldCount: 0,
-  })),
-  count: 2,
-  typeCounts: [
-    { type: "microsoft.copilotstudio/agents", status: "covered", count: 2 },
-    { type: "microsoft.powerapps/apps", status: "not_authorized_scope", count: null },
-  ],
-  snapshot: {
-    id: "44444444-4444-4444-8444-444444444444", roleScope: "ai", environmentScope: null,
-    requestedTypes: ["microsoft.copilotstudio/agents", "microsoft.powerapps/apps"],
-    coverage: [
-      { type: "microsoft.copilotstudio/agents", status: "covered", count: 2 },
-      { type: "microsoft.powerapps/apps", status: "not_authorized_scope", count: null },
-    ],
-    observedCount: 2, totalRecords: 2, pageCount: 1, unknownFieldCount: 0, observedAt, expiresAt,
-    verification: createInventoryVerification(2, ["microsoft.copilotstudio/agents"], layoutTime),
-  },
 };
 
 const activeSet: NonNullable<OfficialUsageAggregateView["activeSet"]> = {
@@ -336,7 +310,7 @@ const jobs: WorkbenchJobsResponse = {
   value: [
     { id: "layout-inventory-refresh", source: "power-platform", label: "Power Platform inventory refresh", target: "Saved delegated resource scope",
       status: "waiting_authorization", total: 2, completed: 0, partial: false, canResume: true, canCancel: false, canReconcile: false,
-      updatedAt: observedAt, href: "/power-platform" },
+      updatedAt: observedAt, href: "/sync?powerPlatformJob=layout-inventory-refresh" },
     { id: "layout-package-recovery", source: "package-controls", label: "Package access recovery", target: "3 exact saved package targets",
       status: "waiting_authorization", total: 3, completed: 1, partial: true, canResume: true, canCancel: true, canReconcile: true,
       updatedAt: observedAt, href: "/agents" },
@@ -372,7 +346,6 @@ export async function mockLayoutApi(page: Page) {
       })),
     },
     "/api/agents/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
-    "/api/inventory/resources": inventory, "/api/inventory/snapshots": { value: [inventory.snapshot] },
     "/api/inventory/refresh-jobs": { value: [], lastAttemptAt: observedAt, lastSuccessAt: observedAt },
     "/api/quarantine/jobs": { value: [] },
     "/api/official-usage/admin": usageAdmin, "/api/official-usage/aggregate": aggregate, "/api/official-usage/users": users,
@@ -388,6 +361,15 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/agent-responsibility" && route.request().method() === "GET") {
+      const query = new URL(route.request().url()).searchParams;
+      const objectId = query.get("objectId") ?? undefined;
+      const user = copilotUsageFixture.users.find(user => user.directory.objectId === objectId);
+      if (objectId && !user) return route.fulfill({ status: 404, json: { detail: "Exact saved person unavailable", code: "responsibility_person_unavailable" } });
+      return route.fulfill({ json: projectAgentResponsibility(unifiedAgents, {
+        objectId, search: query.get("search") ?? undefined, offset: Number(query.get("offset") ?? 0), limit: Number(query.get("limit") ?? 50),
+      }, user ? { ...user.directory, observedAt } : undefined) });
+    }
     if (path === "/api/official-usage/users" && new URL(route.request().url()).searchParams.get("licenseCohort") !== "active_without_paid") {
       unexpectedRequests.push(`Missing active_without_paid cohort: ${route.request().url()}`);
       return route.fulfill({ status: 400, json: { error: "Expected the active nonpaid cohort" } });

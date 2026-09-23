@@ -165,8 +165,8 @@ export function capabilityNextStep(view: CapabilityView, now = Date.now()): { te
     href: "/agents", label: "Open Agents",
   };
   if (view.definition.id.startsWith("powerPlatform.quarantine.")) return {
-    text: "Open Power Platform to check status or confirm a change for exact inventoried Copilot Studio agents. Microsoft validates permission on each operation.",
-    href: "/power-platform", label: "Open Power Platform",
+    text: "Open Agents to check status or confirm a change for exact inventoried Copilot Studio agents. Microsoft validates permission on each operation.",
+    href: "/agents", label: "Open Agents",
   };
   if (view.definition.id.startsWith("purview.audit.search.")) return {
     text: "Open Audit and explicitly submit a bounded Purview search to verify operation access. Ready to try is not a failure; permission checks do not start searches.",

@@ -344,6 +344,10 @@ button.agent-sort-heading {
   margin: 0;
 }
 
+.unified-agent-detail-modal .agent-overview-facts {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .agent-property-grid > div {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -372,7 +376,7 @@ button.agent-sort-heading {
 
 .agent-service-list {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -393,6 +397,16 @@ button.agent-sort-heading {
 .agent-service-list small {
   display: block;
   color: var(--muted);
+}
+
+.agent-service-list > li > ul {
+  display: grid;
+  gap: 16px;
+  padding-left: 20px;
+}
+
+.agent-service-list .agent-property-grid {
+  margin-top: 8px;
 }
 
 .agent-version-selector {
@@ -568,6 +582,10 @@ button.agent-sort-heading {
 
   .unified-agent-detail-modal .agent-overview-facts {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .agent-overview-facts > div:last-child {
+    grid-column: 1 / -1;
   }
 
   .agent-overview-facts > div {

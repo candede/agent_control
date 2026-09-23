@@ -10,6 +10,7 @@ import { copilotUsageFixture } from "../test/copilotUsageFixture";
 import { reportLicenseDirectory, usageFixtureNow, usageFixtureSetId, usageInsightsPublished } from "../test/usageInsightsFixture";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { SavedQueryProvider } from "./SavedQueryProvider";
+import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 
 vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
@@ -78,6 +79,7 @@ async function openUser(name: string) {
 }
 
 beforeEach(() => {
+  vi.spyOn(api, "getAgentResponsibility").mockImplementation(async query => responsibilityFixture(query?.objectId));
   vi.spyOn(api, "getOfficialUsageUsers").mockImplementation(async query => usageUsersFixture({
     staleAfterDays: 35, ...query, userSortBy: query?.sortBy,
   }));
@@ -344,6 +346,18 @@ describe("reported user activity", () => {
     expect(within(detail).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("Not reported");
   });
 
+  it("loads responsibility only for an already-established exact directory/report identity", async () => {
+    const directory = directoryFixture();
+    renderActivity(initialRoute, directory);
+    const detail = (await openUser("Ada")).dialog;
+    expect(await within(detail).findByText("Responsible agent")).toBeVisible();
+    expect(api.getAgentResponsibility).toHaveBeenCalledOnce();
+    expect(api.getAgentResponsibility).toHaveBeenCalledWith(
+      expect.objectContaining({ objectId: directory.users[0].directory.objectId }), expect.anything(),
+    );
+    expect(within(detail).getByText("Responses (Users report)").parentElement).toHaveTextContent("215");
+  });
+
   it.each(["set", "missing-set", "users-version", "bridge-version", "case", "ambiguous", "unmatched", "unavailable", "partial", "stale"])(
     "preserves current nonpaid membership but withholds detailed directory evidence for a %s link", async scenario => {
       const directory = directoryFixture();
@@ -368,6 +382,8 @@ describe("reported user activity", () => {
       expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|M365 Copilot licensed|License not verified)$/)).not.toBeInTheDocument();
       expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Unknown");
       expect(within(detail).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
+      expect(within(detail).getByText(/Responsibility unavailable: no exact verified directory object ID/)).toBeVisible();
+      expect(api.getAgentResponsibility).not.toHaveBeenCalled();
     },
   );
 

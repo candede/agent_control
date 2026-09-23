@@ -23,12 +23,18 @@ const resource: PowerPlatformResource = {
   provenance: {}, details: {
     schemaName: "cr123_serviceDesk", isQuarantined: false, ownerId: "Support operations",
     model: "Support language model",
-    connectors: [{ connectorId: "Support knowledge connector", operations: [{ operationId: "readKnowledge", displayName: "Read support knowledge", method: "GET" }] }],
+    connectors: [{ connectorId: "Support knowledge connector", operations: [{ operationId: "readKnowledge", usedAs: "Knowledge" }] }],
+    connectorDetailsStatus: "complete",
   }, unknownFieldCount: 0,
 };
 const primary = unifiedAgents.value[0];
 const merged: UnifiedAgentRecord = {
   ...primary, id: `power_platform:${environmentId}:${botId}`, presence: "both", environmentId,
+  environment: {
+    id: environmentId, displayName: "Finance production", region: "europe", environmentType: "Production",
+    isManaged: false, groupName: "Finance", groupId: null, provenance: {},
+    observation: { ...observation, id: "environment-observation", snapshotId: "environment-observation" },
+  },
   packages: [
     { ...primary.packages[0], version: "1" },
     { ...unifiedAgents.value[1].packages[0], displayName: "Service desk assistant (Teams)", version: "2" },
@@ -76,16 +82,11 @@ test("one agent row selects all published versions and configuration controls wi
   const related: InventorySourceAwareDetail = {
     source: "power_platform", nativeId: botId, resourceType: resource.type, environmentId, snapshotId: observation.snapshotId,
     observedAt: observation.observedAt, expiresAt: observation.expiresAt, identifiers: resource.identifiers,
-    package: { status: "unmatched", reason: "Package controls use the unified record's exact targets." },
-    reports: { status: "unavailable", reason: "No saved usage observations." },
     audit: { status: "available", count: 0, value: [] }, security: { status: "available", count: 0, value: [] },
-    controls: { quarantineTarget: { environmentId, botId }, packageTarget: null },
   };
   await page.route(`**/api/inventory/resources/${botId}/related*`, route => route.fulfill({ json: related }));
   await page.route(`**/api/inventory/resources/${draftId}/related*`, route => route.fulfill({ json: {
     ...related, nativeId: draftId, identifiers: draft.powerPlatformResource!.identifiers,
-    package: { status: "unmatched", reason: "No published version was observed." },
-    controls: { quarantineTarget: { environmentId, botId: draftId }, packageTarget: null },
   } }));
   const detailReads: string[] = [];
   await page.route(`**/api/agents/${encodeURIComponent(merged.packages[0].id)}`, route => {
@@ -139,12 +140,12 @@ test("one agent row selects all published versions and configuration controls wi
   await expect(dialog.getByText("Support operations", { exact: true })).toBeVisible();
   await expect(dialog.getByText("Support language model", { exact: true })).toBeVisible();
   await expect(dialog.getByText("Support knowledge connector", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("Service desk connector", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Service desk connector", { exact: true })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: /Details & services|Viewing details|Review usage|Review access/ })).toHaveCount(0);
   expect(detailReads).toEqual([`GET ${merged.packages[0].id}`]);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   await dialog.screenshot({ path: info.outputPath("unified-agent-overview.png") });
-  await dialog.getByRole("region", { name: "Connected services", exact: true }).scrollIntoViewIfNeeded();
+  await dialog.getByRole("region", { name: "Configured connectors and operations", exact: true }).scrollIntoViewIfNeeded();
   await dialog.screenshot({ path: info.outputPath("unified-agent-services.png") });
   await dialog.getByRole("tab", { name: "Manage", exact: true }).click();
   await expect(dialog.getByRole("tab", { name: "Manage", exact: true })).toHaveAttribute("aria-selected", "true");
@@ -180,12 +181,12 @@ test("one agent row selects all published versions and configuration controls wi
   await expect(dialog.getByRole("tablist", { name: "Agent details" })).toBeVisible();
   await dialog.getByRole("combobox", { name: "Published version details" }).selectOption(merged.packages[1].id);
   await expect(dialog.getByText("Microsoft Teams edition with its own saved configuration.")).toBeVisible();
-  await expect(dialog.getByText("Teams knowledge connector", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Teams knowledge connector", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Resolve common requests without leaving your conversation.")).toHaveCount(0);
   await expect(dialog.getByText("Service desk connector", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Support knowledge connector", { exact: true })).toBeVisible();
   expect(await dialog.boundingBox()).toEqual(initialBounds);
-  await expect(dialog.getByRole("heading", { name: "Connected services", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "Configured connectors and operations", exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(1);
   await dialog.screenshot({ path: info.outputPath("unified-agent-selected-version.png") });
   await page.keyboard.press("Escape");

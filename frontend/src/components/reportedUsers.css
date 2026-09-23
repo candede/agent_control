@@ -49,6 +49,7 @@
 .reported-agent-table thead th { position: sticky; top: 0; z-index: 1; }
 .reported-agent-table td { overflow-wrap: anywhere; }
 .reported-agent-button { background: none; padding: 0; border: 0; color: var(--ink); text-decoration: underline; text-align: left; overflow-wrap: anywhere; }
+button.reported-agent-button:hover { background: #f5f2e9; color: var(--ink); }
 
 @media (max-width: 760px) {
   .reported-users-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

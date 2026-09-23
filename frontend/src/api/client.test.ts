@@ -50,7 +50,6 @@ import {
   getPurviewAuditJobs,
   getPurviewAuditRecords,
   getQuarantineJob,
-  getQuarantineTargets,
   getQuarantineStatus,
   previewQuarantine,
   previewPackageMutation,
@@ -232,11 +231,11 @@ describe("access API client", () => {
     const controller = new AbortController();
     const signal = cancellable ? controller.signal : undefined;
     const blob = await downloadInventoryCsv({
-      snapshotId: "snapshot / saved", type: undefined, excludeAgents: false, environmentId: "env & one",
-      search: "Agent & bot", sortBy: "displayName", sortDirection: "asc", limit: undefined, offset: undefined,
+      snapshotId: "snapshot / saved", environmentId: "env & one",
+      search: "Agent & bot", sortBy: "displayName", sortDirection: "asc",
     }, signal);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-      "/api/inventory/export.csv?snapshotId=snapshot+%2F+saved&excludeAgents=false&environmentId=env+%26+one&search=Agent+%26+bot&sortBy=displayName&sortDirection=asc",
+      "/api/inventory/export.csv?snapshotId=snapshot+%2F+saved&environmentId=env+%26+one&search=Agent+%26+bot&sortBy=displayName&sortDirection=asc",
       { credentials: "include", signal, headers: { Accept: "text/csv" } },
     );
     expect(await blob.text()).toBe("selected-inventory-csv");
@@ -725,15 +724,12 @@ describe("access API client", () => {
 
   it("encodes exact quarantine status targets and preserves a caller-owned write key", async () => {
     const fetchMock = mockJsonResponse({ confirmationHash: "c".repeat(64), summary: {} });
-    const controller = new AbortController();
-    await getQuarantineTargets({ search: "Agent & one", limit: 25, offset: 50 }, { signal: controller.signal });
     await getQuarantineStatus("snapshot/id", "native id", true);
     await previewQuarantine({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] });
     await submitQuarantine({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"], confirmationHash: "c".repeat(64) }, "stable-write-key");
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/quarantine/targets?search=Agent+%26+one&limit=25&offset=50", expect.objectContaining({ credentials: "include", signal: controller.signal }));
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/quarantine/status?snapshotId=snapshot%2Fid&nativeId=native+id&force=true", expect.objectContaining({ credentials: "include" }));
-    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/preview", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] }) }));
-    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/quarantine/jobs", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": "stable-write-key" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/quarantine/status?snapshotId=snapshot%2Fid&nativeId=native+id&force=true", expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/quarantine/preview", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/jobs", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": "stable-write-key" }) }));
   });
 
   it.each(["status", "preview"] as const)("cancels an explicitly admitted quarantine %s read without changing its target", async kind => {
@@ -839,7 +835,7 @@ describe("API response failures", () => {
   describe.each(["JSON", "CSV"] as const)("logout completion ownership (%s)", format => {
     const csv = "saved,private,csv";
     const response = () => format === "JSON" ? Response.json({ value: [] }) : new Response(csv);
-    const send = () => format === "JSON" ? getAgents() : downloadInventoryCsv();
+    const send = () => format === "JSON" ? getAgents() : downloadInventoryCsv({ snapshotId: "snapshot-one" });
     const expected = format === "JSON" ? { value: [] } : { size: csv.length };
 
     it.each(["fetch", "body"] as const)("fences a during-logout read waiting for %s after logout succeeds", async phase => {
@@ -927,7 +923,7 @@ describe("API response failures", () => {
     const pending = deferredResponse();
     const fetchMock = mockJsonResponse({});
     fetchMock.mockReturnValueOnce(pending.promise);
-    const result = format === "JSON" ? getAgents() : downloadInventoryCsv();
+    const result = format === "JSON" ? getAgents() : downloadInventoryCsv({ snapshotId: "snapshot-one" });
     const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted", kind: "aborted" });
     fetchMock.mockResolvedValueOnce(Response.json({ code: "unauthorized" }, { status: 401 }));
     await expect(getAgents()).rejects.toMatchObject({ status: 401, code: "unauthorized" });
@@ -1006,7 +1002,7 @@ describe("API response failures", () => {
     { name: "JSON", send: () => getAgents(), body: "json" },
     { name: "unified inventory CSV", send: () => downloadUnifiedAgentInventoryCsv({ revision: "a".repeat(64) }), body: "blob" },
     { name: "package inventory CSV", send: () => downloadPackageInventoryCsv({ snapshotId: "snapshot-one" }), body: "blob" },
-    { name: "Power Platform CSV", send: () => downloadInventoryCsv(), body: "blob" },
+    { name: "Power Platform CSV", send: () => downloadInventoryCsv({ snapshotId: "snapshot-one" }), body: "blob" },
     { name: "Purview CSV", send: () => downloadPurviewAuditCsv("job/one"), body: "blob" },
     { name: "Defender CSV", send: () => downloadDefenderHuntingCsv("job/one"), body: "blob" },
     { name: "official usage CSV", send: () => downloadOfficialUsageCsv("aggregate"), body: "blob" },
@@ -1055,7 +1051,7 @@ describe("API response failures", () => {
 
   describe.each([
     { name: "JSON", send: (signal: AbortSignal) => getAgents({}, { signal }), body: "json" },
-    { name: "Power Platform CSV", send: (signal: AbortSignal) => downloadInventoryCsv({}, signal), body: "blob" },
+    { name: "Power Platform CSV", send: (signal: AbortSignal) => downloadInventoryCsv({ snapshotId: "snapshot-one" }, signal), body: "blob" },
     { name: "official usage CSV", send: (signal: AbortSignal) => downloadOfficialUsageCsv("aggregate", {}, signal), body: "blob" },
     { name: "administrative audit CSV", send: (signal: AbortSignal) => downloadAdministrativeAuditCsv(["event-one"], signal), body: "blob" },
   ] as const)("$name cancellation signal", ({ send, body }) => {
@@ -1124,7 +1120,7 @@ describe("API response failures", () => {
     const unsubscribe = subscribeSessionRevalidationRequired(listener);
     try {
       fetchMock.mockResolvedValueOnce(Response.json({ code: "session_invalidated" }, { status: 401 }));
-      await expect(downloadInventoryCsv()).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
+      await expect(downloadInventoryCsv({ snapshotId: "snapshot-one" })).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
       expect(listener).toHaveBeenCalledOnce();
       await checkCapabilities();
       expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");

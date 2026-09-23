@@ -1,6 +1,6 @@
 import { Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment } from "./fixtureSupport.js";
+import { browserFixtureTestFiles, closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment } from "./fixtureSupport.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -9,6 +9,21 @@ function browserEnvironment(values: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 describe("browser fixture environment", () => {
+  it("supports bounded exact browser file selection without changing the default full run", () => {
+    expect(browserFixtureTestFiles("agentContext.spec.ts,agentPeople.spec.ts")).toEqual(["agentContext.spec.ts", "agentPeople.spec.ts"]);
+    const previous = process.env.AGENT_CONTROL_BROWSER_TEST_FILES;
+    delete process.env.AGENT_CONTROL_BROWSER_TEST_FILES;
+    try { expect(browserFixtureTestFiles()).toEqual([]); }
+    finally {
+      if (previous !== undefined) process.env.AGENT_CONTROL_BROWSER_TEST_FILES = previous;
+    }
+  });
+
+  it.each(["", "../agent.spec.ts", "--grep", "agent.spec.ts,agent.spec.ts", "agent.*.spec.ts",
+    Array.from({ length: 33 }, (_, index) => `agent${index}.spec.ts`).join(",")])("rejects unsafe or unbounded browser selection: %s", value => {
+    expect(() => browserFixtureTestFiles(value)).toThrow("distinct spec filenames");
+  });
+
   it("removes file-backed identity overrides without changing database settings", () => {
     const env = browserEnvironment({
       TENANT_ID_FILE: "/unused/tenant", CLIENT_ID_FILE: "/unused/client",

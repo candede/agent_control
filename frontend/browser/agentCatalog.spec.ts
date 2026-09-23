@@ -339,7 +339,7 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await expect(dialog.getByText(automaticUsageReportName, { exact: true })).toBeVisible();
   await expect(dialog.getByText("Automatically matched: exact report Agent ID = saved Graph package ID.")).toBeVisible();
   await expect(dialog.getByText(/Selected report snapshot:/)).toContainText(reportSetId);
-  const usersUrl = new URL((await dialog.getByRole("link", { name: "View reported users" }).getAttribute("href"))!, "http://localhost");
+  const usersUrl = new URL((await dialog.getByRole("link", { name: "View active users without paid Copilot", exact: true }).getAttribute("href"))!, "http://localhost");
   expect(usersUrl.searchParams.get("agent")).toBe(automaticUsagePackageId);
   expect(usersUrl.searchParams.get("snapshot")).toBe(reportSetId);
   await expect(dialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
@@ -368,7 +368,7 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await dialog.getByRole("tab", { name: "Usage & users" }).click();
   await expect(dialog.getByLabel("Selected agent report metrics").getByText("179", { exact: true })).toBeVisible();
   await expect(dialog.getByText("Out-of-date report")).toBeVisible();
-  await expect(dialog.getByRole("link", { name: "View reported users" })).toHaveAttribute("href", new RegExp(`snapshot=${olderReportId}`));
+  await expect(dialog.getByRole("link", { name: "View active users without paid Copilot", exact: true })).toHaveAttribute("href", new RegExp(`snapshot=${olderReportId}`));
   await closeDetails();
 
   for (const unavailableSnapshot of ["mismatched", "unavailable"] as const) {

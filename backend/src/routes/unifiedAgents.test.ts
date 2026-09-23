@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { agentPeopleResolveInput, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
+import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 
 describe("unified agent inventory query", () => {
+  it("validates bounded exact responsibility input without accepting scope overrides or name joins", () => {
+    expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", offset: "250", limit: "100" }))
+      .toEqual({ objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", search: undefined, offset: 250, limit: 100 });
+    for (const query of [{ objectId: "alice@example.invalid" }, { objectId: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
+      { tenantId: "other" }, { principalId: "other" }, { name: "Alice" }, { limit: "101" }, { limit: "0" },
+      { offset: "-1" }, { offset: "30001" }, { offset: "NaN" }, { search: "bad\nname" }, { search: "x".repeat(257) }]) {
+      expect(() => agentResponsibilityQuery(query)).toThrowError(expect.objectContaining({ code: "invalid_responsibility_query" }));
+    }
+  });
   it("accepts only saved record identifiers for persistent people resolution, not arbitrary directory IDs", () => {
     expect(agentPeopleResolveInput({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }))
       .toEqual({ recordId: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", force: false });

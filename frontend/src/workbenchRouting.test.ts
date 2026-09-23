@@ -8,19 +8,24 @@ import {
   parseAuditRoute,
   parseSyncReportRoute,
   migrateOfficialUsageRoute,
-  parsePowerPlatformRoute,
   parseSecurityRoute,
   parseUsersRoute,
   parseWorkbenchView,
-  powerPlatformRouteSearch,
   securityRouteSearch,
   usersRouteSearch,
   workbenchUrl,
   maximumInlinePackageRouteBytes,
-  migratePowerPlatformAgentRoute,
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it("round trips exact Users responsibility context and leaves invalid identities explicitly invalid", () => {
+    const route = { view: "responsibility" as const, personId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", search: "", page: 2 };
+    const query = usersRouteSearch(route);
+    expect(query.toString()).toBe("view=responsibility&person=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&page=3");
+    expect(parseUsersRoute(query.toString())).toMatchObject({ ...route, personId: route.personId.toLowerCase() });
+    expect(parseUsersRoute("view=responsibility&person=Alice")).toMatchObject({ view: "responsibility", personId: "Alice" });
+    expect(usersRouteSearch({ ...route, personId: "Alice" }).get("person")).toBe("invalid");
+  });
   it.each(["available", "unavailable", "availability_unknown"] as const)("round trips the %s end-user access filter", agentView => {
     const state = { ...parseAgentRoute(""), agentView };
     const query = agentRouteSearch(state);
@@ -30,7 +35,7 @@ describe("workbench routing", () => {
 
   it("maps every canonical deep link without a query-string view alias", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
-    expect(parseWorkbenchView("/power-platform/")).toBe("power-platform");
+    expect(parseWorkbenchView("/power-platform/")).toBe("agents");
     expect(parseWorkbenchView("/official-usage")).toBe("sync");
     expect(parseWorkbenchView("/security")).toBe("security");
     expect(parseWorkbenchView("/jobs")).toBe("jobs");
@@ -39,9 +44,9 @@ describe("workbench routing", () => {
   });
 
   it("round trips exact sync and package refresh jobs on the dedicated sync route", () => {
-    const route = parseDataSyncRoute("?syncRun=retained-run&refreshJob=exact-package-job&mode=application&q=not-a-sync-filter");
-    expect(route).toEqual({ syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application", reports: undefined });
-    expect(workbenchUrl("sync", dataSyncRouteSearch(route))).toBe("/sync?syncRun=retained-run&refreshJob=exact-package-job&mode=application");
+    const route = parseDataSyncRoute("?powerPlatformJob=exact-source-job&syncRun=retained-run&refreshJob=exact-package-job&mode=application&q=not-a-sync-filter");
+    expect(route).toEqual({ powerPlatformJobId: "exact-source-job", syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application", reports: undefined });
+    expect(workbenchUrl("sync", dataSyncRouteSearch(route))).toBe("/sync?powerPlatformJob=exact-source-job&syncRun=retained-run&refreshJob=exact-package-job&mode=application");
     expect(parseDataSyncRoute(`?syncRun=${"x".repeat(513)}&mode=invalid`).syncRunId).toBeUndefined();
     expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
   });
@@ -155,58 +160,10 @@ describe("workbench routing", () => {
     });
   });
 
-  it("round trips Power Platform snapshot, paging, exact detail tab, and 25-target selection", () => {
-    const selectedIds = Array.from({ length: 25 }, (_, index) => `native-${index}`);
-    const query = powerPlatformRouteSearch({
-      search: "maker bot", type: "microsoft.copilotstudio/agents", environmentId: "environment-1",
-      sortBy: "lastPublishedAt", sortDirection: "desc", page: 3, snapshotId: "snapshot-1",
-      detailId: "native-24", detailType: "microsoft.copilotstudio/agents", detailEnvironmentId: "environment-1",
-      detailTab: "audit", selectedIds, refreshJobId: undefined, quarantineJobId: undefined,
-    });
-
-    expect(parsePowerPlatformRoute(query.toString())).toEqual({
-      search: "maker bot", type: "microsoft.copilotstudio/agents", environmentId: "environment-1",
-      sortBy: "lastPublishedAt", sortDirection: "desc", page: 3, snapshotId: "snapshot-1",
-      detailId: "native-24", detailType: "microsoft.copilotstudio/agents", detailEnvironmentId: "environment-1",
-      detailTab: "audit", selectedIds,
-      refreshJobId: undefined, quarantineJobId: undefined,
-    });
-  });
-
-  it("migrates only legacy Power Platform agent and quarantine links to Agents", () => {
-    const migrated = migratePowerPlatformAgentRoute(
-      "q=builder&type=microsoft.copilotstudio%2Fagents&environment=environment-1&snapshot=snapshot-1&detail=agent-1&detailType=microsoft.copilotstudio%2Fagents&detailTab=controls&selected=agent-1&quarantineJob=job-1",
-    );
-    expect(migrated).toBeDefined();
-    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
-      search: "builder",
-      environmentId: "environment-1",
-      detailId: "power_platform:environment-1:agent-1",
-      detailTab: "controls",
-      inventorySnapshotId: "snapshot-1",
-      selectedPowerPlatformIds: ["power_platform:environment-1:agent-1"],
-      source: "all",
-      quarantineJobId: "job-1",
-    });
-    expect(migratePowerPlatformAgentRoute("type=microsoft.powerapps%2Fapps")).toBeUndefined();
-  });
-
-  it("preserves the detail environment independently of the old Power Platform list filter", () => {
-    const migrated = migratePowerPlatformAgentRoute("detail=bot-1&detailType=microsoft.copilotstudio%2Fagents&detailEnvironment=env-1&detailTab=audit");
-    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
-      detailId: "power_platform:env-1:bot-1",
-      environmentId: "",
-      source: "all",
-      detailTab: "audit-security",
-    });
-    const anotherEnvironment = migratePowerPlatformAgentRoute("detail=bot-1&detailType=microsoft.copilotstudio%2Fagents&detailEnvironment=env-2");
-    expect(parseAgentRoute(anotherEnvironment!.toString()).detailId).toBe("power_platform:env-2:bot-1");
-  });
-
   it("retains source-qualified links for native IDs at the existing length limit", () => {
     const nativeId = "a".repeat(512);
-    const migrated = migratePowerPlatformAgentRoute(`type=microsoft.copilotstudio%2Fagents&environment=env-1&detail=${nativeId}&selected=${nativeId}`);
-    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+    const route = agentRouteSearch({ ...parseAgentRoute(""), detailId: `power_platform:env-1:${nativeId}`, selectedPowerPlatformIds: [`power_platform:env-1:${nativeId}`] });
+    expect(parseAgentRoute(route.toString())).toMatchObject({
       detailId: `power_platform:env-1:${nativeId}`,
       selectedPowerPlatformIds: [`power_platform:env-1:${nativeId}`],
     });
@@ -231,8 +188,7 @@ describe("workbench routing", () => {
   });
 
   it("keeps quarantine job-only links independently of a saved selection", () => {
-    const migrated = migratePowerPlatformAgentRoute("quarantineJob=job-1");
-    expect(parseAgentRoute(migrated!.toString())).toMatchObject({
+    expect(parseAgentRoute("quarantineJob=job-1")).toMatchObject({
       source: "all",
       selectedPowerPlatformIds: [],
       quarantineJobId: "job-1",

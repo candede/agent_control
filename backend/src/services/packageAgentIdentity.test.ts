@@ -80,7 +80,7 @@ describe("explicit package-to-agent identity", () => {
     for (const changed of [
       { details: {} }, { details: { schemaName: "cr123_unrelated" } }, { nativeId: otherId },
       { environmentId: otherId }, { environmentId: `Default-${environmentId}` }, { tenantId: "tenant-b" },
-      { type: "microsoft.powerautomate/agentflows" as const },
+      { type: "microsoft.powerplatform/environments" as const },
     ]) expect(resolvePackageAgentLinks("tenant-a", [value], [{ ...saved, ...changed }])[0].status).toBe("unmatched");
     expect(resolvePackageAgentLinks("tenant-a", [value], [saved, { ...saved }])[0].status).toBe("ambiguous");
     expect(resolvePackageAgentLinks("tenant-a", [value], [{
@@ -248,7 +248,7 @@ describe("explicit package-to-agent identity", () => {
       environmentId: `Default-${environmentId}`,
       identifiers: [{ kind: "environment_id", value: `Default-${environmentId}` }, { kind: "entra_agent_id", value: entraAgentId }],
     })])[0].status).toBe("matched");
-    expect(resolvePackageAgentLinks("tenant-a", [packaged()], [resource({ type: "microsoft.powerautomate/agentflows" })])[0].status).toBe("unmatched");
+    expect(resolvePackageAgentLinks("tenant-a", [packaged()], [resource({ type: "microsoft.powerplatform/environments" })])[0].status).toBe("unmatched");
   });
 
   it("surfaces invalid metadata without logging provider definition contents", () => {
@@ -317,7 +317,7 @@ describe("explicit package-to-agent identity", () => {
     ]) expect(resolvePackageAgentLinks("tenant-a", [{ ...value, ...changed }], [saved])[0].status).toBe("unmatched");
     for (const changed of [
       { nativeId: otherId }, { details: { schemaName: otherId } }, { details: {} },
-      { tenantId: "tenant-b" }, { type: "microsoft.powerautomate/agentflows" as const }, { environmentId: null },
+      { tenantId: "tenant-b" }, { type: "microsoft.powerplatform/environments" as const }, { environmentId: null },
     ]) expect(resolvePackageAgentLinks("tenant-a", [value], [{ ...saved, ...changed }])[0].status).toBe("unmatched");
   });
 

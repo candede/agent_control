@@ -6,8 +6,7 @@ import type {
 
 export const workbenchViews: WorkbenchViewDefinition[] = [
   { id: "agents", label: "Agents", path: "/agents", roles: ["AgentControl.Viewer"], source: "Unified saved Graph package and Power Platform Copilot Studio agent inventory" },
-  { id: "power-platform", label: "Power Platform", path: "/power-platform", roles: ["AgentControl.Viewer"], source: "Power Platform Resource Query" },
-  { id: "users", label: "Users", path: "/users", roles: ["AgentControl.Viewer"], source: "Saved Microsoft Graph directory/license and app activity snapshots with imported official agent usage" },
+  { id: "users", label: "Users", path: "/users", roles: ["AgentControl.Viewer"], source: "Saved Microsoft Graph directory/license and app activity snapshots, imported official agent usage, and exact saved Power Platform agent responsibility" },
   { id: "sync", label: "Sync", path: "/sync", roles: ["AgentControl.Viewer"], source: "Saved data collection, source coverage, durable sync history, and Microsoft 365 report import, management, and snapshot inspection" },
   { id: "audit", label: "Audit", path: "/audit", roles: ["AgentControl.Viewer"], source: "Local administrative audit and Microsoft Purview Audit Search" },
   { id: "security", label: "Security", path: "/security", roles: ["AgentControl.Viewer"], source: "Defender fixed-template hunting" },

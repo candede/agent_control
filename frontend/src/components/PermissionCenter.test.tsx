@@ -211,7 +211,7 @@ describe("Permission Center", () => {
       } };
       rerender(<CapabilityContext value={context([recovered])}><PermissionCenter /></CapabilityContext>);
       expect(screen.queryByRole("button", { name: "Request consent" })).not.toBeInTheDocument();
-      expect(screen.getByRole("link", { name: id === "powerPlatform.quarantine.manage" ? "Open Power Platform" : "Open Agents" })).toBeVisible();
+      expect(screen.getByRole("link", { name: "Open Agents" })).toBeVisible();
       const details = await openDetails(ready.definition.displayName);
       expect(details.getByText("Token acquired; provider authorization not verified")).toBeVisible();
     },
@@ -245,8 +245,8 @@ describe("Permission Center", () => {
   it.each([
     ["graph.package.block.manage", "Open Agents", "/agents"],
     ["graph.package.access.manage", "Open Agents", "/agents"],
-    ["powerPlatform.quarantine.read", "Open Power Platform", "/power-platform"],
-    ["powerPlatform.quarantine.manage", "Open Power Platform", "/power-platform"],
+    ["powerPlatform.quarantine.read", "Open Agents", "/agents"],
+    ["powerPlatform.quarantine.manage", "Open Agents", "/agents"],
     ["purview.audit.search.delegated", "Open Audit", "/audit"],
     ["defender.hunting.delegated", "Open Security", "/security"],
   ])("offers navigation, not automatic provider execution, for %s", (id, label, href) => {

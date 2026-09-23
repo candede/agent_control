@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { Request, Response } from "express";
 import { describe, expect, it, vi } from "vitest";
+import { parse as parseCsv } from "csv-parse/sync";
 import { AppError } from "../errors.js";
 import { buildBoundedCsv, csvValue, publishBoundedCsv } from "./csvExport.js";
 
@@ -38,11 +39,21 @@ function transport() {
 }
 
 describe("bounded CSV publication", () => {
-  it("neutralizes formulas and quotes every supported value", () => {
+  it("neutralizes formulas and quotes nonempty values", () => {
     expect(["=1", "+1", "-1", "@x", "\tcmd", "\rcmd", "−1"].map(csvValue)).toEqual([
       "\"'=1\"", "\"'+1\"", "\"'-1\"", "\"'@x\"", "\"'\tcmd\"", "\"'\rcmd\"", "\"'−1\"",
     ]);
     expect(csvValue("a\"b")).toBe("\"a\"\"b\"");
+  });
+
+  it("uses compact empty cells without conflating zero, false, unknown or formula-safe text", () => {
+    const csv = buildBoundedCsv(["empty", "missing", "unknown", "zero", "disabled", "formula"], [{
+      empty: "", missing: undefined, unknown: null, zero: 0, disabled: false, formula: "=SUM(1,1)",
+    }], { maximumRows: 1, maximumBytes: 1_000, deadlineAt: Date.now() + 10_000 });
+    expect(csv.buffer.toString("utf8")).toContain('\r\n,,,"0","false","\'=SUM(1,1)"\r\n');
+    expect(parseCsv(csv.buffer, { columns: true, bom: true })).toEqual([{
+      empty: "", missing: "", unknown: "", zero: "0", disabled: "false", formula: "'=SUM(1,1)",
+    }]);
   });
 
   it("rejects row, byte, and deadline budget violations before publication", () => {

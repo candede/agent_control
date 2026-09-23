@@ -26,6 +26,7 @@ import { mockNativeDialogs } from "./test/dialog";
 import { copilotUsageFixture } from "./test/copilotUsageFixture";
 import { activeWithoutPaidUsersFixture, usageAggregateFixture, usageAgentDetailFixture, usageOverviewFixture } from "./test/usageInsightsFixture";
 import { createInventoryVerification, createUnifiedVerification } from "./test/inventoryVerification";
+import { responsibilityFixture, responsibilityOwnerId } from "./test/agentResponsibilityFixture";
 
 mockNativeDialogs();
 
@@ -304,6 +305,82 @@ describe("App session revalidation", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each((["power_platform", "graph_packages"] as const).flatMap(source => [
+    ...(["responsibility", "licenses", "activity"] as const).map(surface => ({ source, surface, event: "completion" as const })),
+    { source, surface: "responsibility" as const, event: "reset" as const },
+  ]))(
+    "reloads mounted Users responsibility for $surface on background $source $event", async ({ source, surface, event }) => {
+      const directory = structuredClone(copilotUsageFixture);
+      const reportUser = activeWithoutPaidUsersFixture().users.value.find(user => user.username === "ben@example.invalid")!;
+      directory.users[1] = { ...directory.users[1], copilotServiceState: "disabled", importedUsage: reportUser,
+        servicePlans: directory.users[1].servicePlans.map(plan => ({ ...plan, state: "disabled" })) };
+      const personId = surface === "responsibility" ? responsibilityOwnerId
+        : directory.users[surface === "licenses" ? 0 : 1].directory.objectId;
+      const url = surface === "responsibility" ? `/users?view=responsibility&person=${personId}`
+        : surface === "activity" ? "/users?view=activity" : "/users";
+      window.history.replaceState({}, "", url);
+      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+      const base = transport.fetchMock.getMockImplementation()!;
+      let completed = false;
+      let responsibilityReads = 0;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === "/api/data-sync/state") {
+          const state = await (await base(input, init)).json();
+          state.run = { id: "background-responsibility-sync", mode: "incremental", status: completed ? "completed" : "running",
+            startedAt: "2026-09-15T08:00:00.000Z", updatedAt: "2026-09-15T08:01:00.000Z",
+            completedAt: completed ? "2026-09-15T08:01:00.000Z" : null, sources: [] };
+          if (completed) state.sources = state.sources.map((value: { source: string }) => value.source === source
+            ? { ...value, updatedAt: "2026-09-15T08:01:00.000Z", lastSuccessAt: event === "reset" ? null : "2026-09-15T08:01:00.000Z",
+              ...(event === "reset" ? { count: null, status: "not_started" } : {}) } : value);
+          return Response.json(state);
+        }
+        if (input === "/api/copilot-usage/users") return Response.json(directory);
+        if (input.startsWith("/api/agent-responsibility")) {
+          responsibilityReads++;
+          expect(new URL(input, "http://localhost").searchParams.get("objectId")).toBe(personId);
+          const data = responsibilityFixture(personId);
+          data.selected!.agents[0].displayName = completed ? "Current responsibility after sync" : "Previous responsibility";
+          if (completed) {
+            data.selected!.agents[0].id = "agent:dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+            data.selected!.agents[0].roles = ["createdBy"];
+          }
+          return Response.json(data);
+        }
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      if (surface !== "responsibility") await userEvent.click(await screen.findByRole("button", {
+        name: surface === "licenses" ? "Ada" : `View reported details for ${reportUser.displayName}`,
+      }));
+      await screen.findByText("Previous responsibility");
+      const dialog = surface === "responsibility" ? undefined : screen.getByRole("dialog", { name: surface === "licenses" ? "Ada" : reportUser.displayName! });
+      const directoryReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/copilot-usage/users").length;
+      const reportReads = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/users")).length;
+      const beforeReads = [directoryReads(), reportReads()];
+      completed = true;
+      await waitFor(() => expect(screen.getByText("Current responsibility after sync")).toBeVisible(), { timeout: 2_500 });
+      expect(screen.queryByText("Previous responsibility")).not.toBeInTheDocument();
+      expect(screen.getByText("Created by", { exact: true })).toBeVisible();
+      expect(screen.getByRole("combobox", { name: "User cohort" })).toHaveValue(surface);
+      expect(window.location.pathname + window.location.search).toBe(url);
+      expect(responsibilityReads).toBe(2);
+      expect([directoryReads(), reportReads()]).toEqual(beforeReads);
+      if (surface === "responsibility") expect(beforeReads).toEqual([0, 0]);
+      if (dialog) {
+        expect(dialog).toBeInTheDocument();
+        expect(dialog).toHaveAttribute("open");
+        expect(within(dialog).getByText(surface === "licenses" ? "Agent responses" : "Responses (Users report)").parentElement)
+          .toHaveTextContent(String(surface === "licenses" ? directory.users[0].importedUsage!.reportedResponsesReceived : reportUser.reportedResponsesReceived));
+      }
+      expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method && init.method !== "GET").map(([input]) => input))
+        .toEqual(["/api/capabilities/check"]);
+      await userEvent.click(screen.getByRole("button", { name: "Open agent Current responsibility after sync" }));
+      await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) =>
+        input.startsWith("/api/agent-inventory?") && new URL(input, "http://localhost").searchParams.get("recordId") === "agent:dddddddd-dddd-4ddd-8ddd-dddddddddddd")).toBe(true));
+    },
+  );
+
   it.each(["package-summaries", "inventory-refresh-jobs", "official-usage-aggregate", "package-detail"] as const)(
     "does not reattach a post-action %s read to another observer's pre-action request",
     async resource => {
@@ -366,91 +443,48 @@ describe("App session revalidation", () => {
     },
   );
 
-  it("passes completed Power Platform sync revisions through remounts without rejoining a retained read", async () => {
-    window.history.replaceState({}, "", "/power-platform");
-    const client = savedQueries.createSavedQueryClient();
-    const resourceKeys = new Map<string, readonly unknown[]>();
-    const unsubscribe = client.getQueryCache().subscribe(event => {
-      if (event.type === "added" && event.query.queryKey[1] === "inventory-resources") {
-        resourceKeys.set(event.query.queryHash, event.query.queryKey);
-      }
+  it("does not migrate or interpret a retired catalog bookmark", () => {
+    window.history.replaceState({}, "", "/power-platform?refreshJob=old-job&detail=old-object");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+    expect(screen.getByRole("heading", { name: "Page not found" })).toBeVisible();
+    expect(window.location.pathname + window.location.search).toBe("/power-platform?refreshJob=old-job&detail=old-object");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not revive or rewrite a retired catalog route restored through browser history", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    act(() => {
+      window.history.pushState({}, "", "/power-platform?refreshJob=retired-job");
+      window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    expect(screen.getByRole("heading", { name: "Page not found" })).toBeVisible();
+    expect(window.location.pathname + window.location.search).toBe("/power-platform?refreshJob=retired-job");
+  });
+
+  it("opens the exact bookmarked Power Platform job in Sync without selecting the latest or starting provider work", async () => {
+    window.history.replaceState({}, "", "/sync?powerPlatformJob=older-source-job");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
     const base = transport.fetchMock.getMockImplementation()!;
-    const resourcePage = { value: [], count: 0, typeCounts: [], snapshot: null };
-    let completed = false;
-    let stateReads = 0;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input.startsWith("/api/inventory/resources")) return Response.json(resourcePage);
-      if (input.startsWith("/api/inventory/snapshots")) return Response.json({ value: [] });
-      if (input === "/api/data-sync/state") {
-        stateReads += 1;
-        return Response.json({
-          onboardingRequired: false, usageImportRequired: false, run: null,
-          sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
-            source, status: "succeeded", jobId: null, count: completed && source === "power_platform" ? 2 : 1,
-            lastSuccessAt: completed && source === "power_platform" ? "2026-09-15T09:00:00.000Z" : "2026-09-15T08:00:00.000Z",
-            updatedAt: "2026-09-15T08:00:00.000Z", message: "", canRetry: false,
-          })),
-        });
+      if (input === "/api/inventory/refresh-jobs/older-source-job") {
+        return Response.json({ ...inventoryRefreshJob("failed", "older-source-job"), message: "Older exact failure" });
       }
-      if (input === "/api/workbench/jobs") return Response.json({
-        value: [{
-          id: "power-platform-sync", source: "data-sync", label: "Power Platform sync", target: "Power Platform source",
-          status: "partial", total: 1, completed: 0, partial: true,
-          canResume: true, canCancel: false, canReconcile: false,
-          updatedAt: "2026-09-15T08:00:00.000Z", href: "/sync?syncRun=power-platform-sync",
-        }],
-        unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "jobs-projection",
-      });
-      if (input === "/api/data-sync/runs/power-platform-sync/retry") {
-        completed = true;
-        return Response.json({ id: "power-platform-sync" });
+      if (input === "/api/inventory/refresh-jobs") {
+        return Response.json({ value: [inventoryRefreshJob("succeeded", "newer-source-job")], lastAttemptAt: null, lastSuccessAt: null });
       }
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await waitFor(() => {
-      expect(resourceKeys.size).toBe(1);
-      expect(client.isFetching({ queryKey: ["saved", "inventory-resources"] })).toBe(0);
-      expect(stateReads).toBe(1);
-    });
-    const retained = deferredResponse();
-    const controller = new AbortController();
-    let retainedSignal: AbortSignal | undefined;
-    const peer = savedQueries.readSavedQuery(client, [...resourceKeys.values()][0].slice(1), signal => {
-      retainedSignal = signal;
-      return retained.promise.then(response => response.json());
-    }, controller.signal).then(value => ({ value }), error => ({ error }));
-    const resourceReads = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/inventory/resources")).length;
-    const before = resourceReads();
-    const beforeCalls = transport.fetchMock.mock.calls.length;
-    try {
-      await userEvent.click(screen.getByRole("button", { name: "Jobs" }));
-      await userEvent.click(await screen.findByRole("button", { name: name => name.endsWith(", job power-platform-sync") }));
-      const details = within(screen.getByRole("dialog", { name: "Job details" }));
-      await userEvent.click(details.getByRole("button", { name: "Retry incomplete" }));
-      await waitFor(() => expect(stateReads).toBe(2));
-      await userEvent.click(details.getAllByRole("button", { name: /close/i })[0]);
-      await userEvent.click(screen.getByRole("button", { name: "Power Platform" }));
-      await waitFor(() => expect(resourceReads()).toBe(before + 1));
-      expect([...resourceKeys.values()].map(key => key.at(-1))).toEqual([
-        expect.objectContaining({ dataRevision: 0 }),
-        expect.objectContaining({ dataRevision: 1 }),
-      ]);
-      expect(retainedSignal?.aborted).toBe(false);
-      await act(async () => retained.resolve(Response.json(resourcePage)));
-      expect(await peer).toEqual({ value: resourcePage });
-      expect(transport.fetchMock.mock.calls.slice(beforeCalls)
-        .filter(([, init]) => init?.method && init.method !== "GET")
-        .map(([input]) => input)).toEqual(["/api/data-sync/runs/power-platform-sync/retry"]);
-    } finally {
-      controller.abort();
-      unsubscribe();
-      await peer;
-    }
+    expect(await screen.findByText(/Older exact failure/)).toBeVisible();
+    expect(window.location.pathname + window.location.search).toBe("/sync?powerPlatformJob=older-source-job");
+    expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/inventory/refresh-jobs/older-source-job")).toBe(true);
+    expect(transport.fetchMock.mock.calls.filter(([input, init]) => input.startsWith("/api/inventory/refresh") && init?.method === "POST")).toEqual([]);
   });
 
   it("does not reopen a signed-out workbench from a superseded StrictMode bootstrap", async () => {
@@ -1975,7 +2009,7 @@ describe("App session revalidation", () => {
     render(<App />);
 
     expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
-    for (const name of ["Agents", "Power Platform", "Users", "Audit", "Security", "Permissions", "Jobs"]) {
+    for (const name of ["Agents", "Users", "Audit", "Security", "Permissions", "Jobs"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument();
     }
     expect(screen.queryByRole("button", { name: "Official usage" })).not.toBeInTheDocument();
@@ -2398,14 +2432,14 @@ describe("App session revalidation", () => {
       const url = new URL(String(path), "http://localhost");
       return url.pathname === "/api/inventory/export.csv"
         && url.searchParams.get("snapshotId") === "pp-snapshot-exact"
-        && url.searchParams.get("type") === "microsoft.copilotstudio/agents"
+        && !url.searchParams.has("type")
         && url.searchParams.get("environmentId") === "env-a"
         && url.searchParams.get("search") === "linked"
         && !url.searchParams.has("excludeAgents");
     })).toBe(true));
   });
 
-  it("refreshes only Power Platform agents and exposes durable status", async () => {
+  it("refreshes only Power Platform agents and environments and exposes durable status", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     const completedAt = new Date().toISOString();
@@ -2464,7 +2498,7 @@ describe("App session revalidation", () => {
       path === "/api/inventory/refresh-jobs"
       && init?.method === "POST"
       && JSON.stringify(JSON.parse(String(init.body))) === JSON.stringify({
-        types: ["microsoft.copilotstudio/agents"],
+        types: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"],
       }),
     )).toBe(true));
     expect(await screen.findByText(/Latest agent refresh: succeeded/)).toBeVisible();
@@ -4084,8 +4118,6 @@ describe("App session revalidation", () => {
   it.each([
     ["unified", "success"],
     ["unified", "failure"],
-    ["Power Platform", "success"],
-    ["Power Platform", "failure"],
   ] as const)("discards a delayed %s export %s after session revalidation", async (source, outcome) => {
     const transport = appTransport({
       revalidatedRoles: viewer.roles,

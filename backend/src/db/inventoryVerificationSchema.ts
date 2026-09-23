@@ -13,7 +13,7 @@ UPDATE power_platform_inventory_snapshots snapshot SET queried_types=(
 ALTER TABLE power_platform_inventory_snapshots
   ALTER COLUMN queried_types SET NOT NULL,
   ADD CONSTRAINT power_platform_inventory_queried_types CHECK (
-    jsonb_typeof(queried_types)='array' AND jsonb_array_length(queried_types) BETWEEN 1 AND 11
+    jsonb_typeof(queried_types)='array' AND jsonb_array_length(queried_types) BETWEEN 1 AND 2
     AND octet_length(queried_types::text)<=2048 AND requested_types @> queried_types
   ),
   DROP COLUMN coverage;

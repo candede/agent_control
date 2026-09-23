@@ -41,7 +41,6 @@ type Props = {
   record: UnifiedAgentRecord;
   activeTab?: string;
   roles: AppRole[];
-  environmentNames?: Record<string, string>;
   onTabChange: (tab: string) => void;
   onClose: () => void;
   onInspectPackage: (item: CopilotPackage) => void;
@@ -62,13 +61,13 @@ type Props = {
   inventoryRevision?: string;
   onUsageChanged?: () => void;
   onPeopleChanged?: () => void;
+  onOpenPerson?: (id: string) => void;
 };
 
 export function UnifiedAgentDetailModal({
   record,
   activeTab,
   roles,
-  environmentNames = {},
   onTabChange,
   onClose,
   onInspectPackage,
@@ -89,6 +88,7 @@ export function UnifiedAgentDetailModal({
   inventoryRevision,
   onUsageChanged,
   onPeopleChanged,
+  onOpenPerson,
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
   const readSaved = useSavedRead();
@@ -144,8 +144,7 @@ export function UnifiedAgentDetailModal({
     selectedPackage ? record.observations.packageSnapshots[selectedPackage.id]?.snapshotId : undefined,
     record.observations.graphPackages?.snapshotId,
   ]);
-  const requestedTab = activeTab === "package" || activeTab === "power-platform" ? "identities" : activeTab;
-  const selectedTab = tabs.find(tab => tab === (requestedTab ?? internalTab)) ?? "identities";
+  const selectedTab = tabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
   const usesPackageDetails = selectedTab === "identities" || selectedTab === "controls";
   const resource = record.powerPlatformResource;
   const snapshot = record.observations.powerPlatform;
@@ -198,7 +197,6 @@ export function UnifiedAgentDetailModal({
     const input = {
       snapshotId: snapshot.snapshotId,
       nativeId: resource.nativeId,
-      type: resource.type,
       environmentId: resource.environmentId,
     };
     readSaved(["inventory-source-aware-detail", input, relatedRetry, dataRevision], signal => getInventorySourceAwareDetail(input, { signal }), controller.signal)
@@ -289,12 +287,12 @@ export function UnifiedAgentDetailModal({
             ? "Saved details will be loaded when the current management action finishes."
             : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional saved details require the package read action to be available. The saved inventory information remains visible.</p> : null}
         </> : null}
-        {selectedTab === "identities" ? <AgentOverview key={`${record.id}:${selectedPackage?.id ?? "native"}:${selectedDetail?.observation?.observedAt ?? "saved"}`}
-          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} environmentNames={environmentNames} peopleState={peopleState} /> : null}
+        {selectedTab === "identities" ? <AgentOverview onOpenPerson={onOpenPerson} key={`${record.id}:${selectedPackage?.id ?? "native"}:${selectedDetail?.observation?.observedAt ?? "saved"}`}
+          record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
         {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.reportSet?.id, usageContext?.availability, usageContext?.revision, inventoryRevision])}
           record={record} context={usageContext} inventoryRevision={inventoryRevision} canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy} onChanged={onUsageChanged} /> : null}
-        {selectedTab === "identities" ? <details className="agent-technical-details" open={activeTab === "power-platform" || undefined}>
+        {selectedTab === "identities" ? <details className="agent-technical-details">
           <summary>Technical details</summary>
           {resource ? <PowerPlatformPanel record={record} /> : null}
           <IdentityPanel record={record} />

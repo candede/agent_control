@@ -13,7 +13,7 @@ describe("route policy declarations", () => {
       "GET /capabilities", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
       "GET /agent-inventory", "POST /agent-inventory/export.csv", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
-      "POST /agent-inventory/people/resolve",
+      "POST /agent-inventory/people/resolve", "GET /agent-responsibility",
       "GET /agent-inventory/:recordId/usage-candidates", "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
       "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry", "POST /data-sync/runs/:id/cancel",
@@ -21,8 +21,8 @@ describe("route policy declarations", () => {
       "GET /agents/bulk-jobs", "GET /agents/bulk-jobs/:id", "POST /agents/bulk-jobs/:id/cancel", "POST /agents/bulk-jobs/:id/reconcile", "POST /agents/bulk-jobs/:id/resume", "GET /agents/:id",
       "POST /agents/block-all", "POST /agents/block", "POST /agents/:id/block", "POST /agents/unblock-all", "POST /agents/unblock", "POST /agents/:id/unblock",
       "POST /agents/access", "PATCH /agents/:id/access", "POST /agents/mutation-canaries", "POST /agents/mutation-canaries/:id/execute", "POST /agents/mutation-preview", "GET /audit/events",
-      "POST /inventory/refresh-jobs", "GET /inventory/refresh-jobs", "GET /inventory/refresh-jobs/:id", "POST /inventory/refresh-jobs/:id/resume", "POST /inventory/refresh-jobs/:id/cancel", "GET /inventory/snapshots", "GET /inventory/resources", "GET /inventory/resources/:nativeId/related", "GET /inventory/quarantine-selection", "GET /inventory/export.csv",
-      "GET /quarantine/targets", "GET /quarantine/status", "POST /quarantine/preview", "POST /quarantine/jobs", "GET /quarantine/jobs", "GET /quarantine/audit", "GET /quarantine/jobs/:id",
+      "POST /inventory/refresh-jobs", "GET /inventory/refresh-jobs", "GET /inventory/refresh-jobs/:id", "POST /inventory/refresh-jobs/:id/resume", "POST /inventory/refresh-jobs/:id/cancel", "GET /inventory/resources/:nativeId/related", "GET /inventory/quarantine-selection", "GET /inventory/export.csv",
+      "GET /quarantine/status", "POST /quarantine/preview", "POST /quarantine/jobs", "GET /quarantine/jobs", "GET /quarantine/audit", "GET /quarantine/jobs/:id",
       "POST /quarantine/jobs/:id/cancel", "POST /quarantine/jobs/:id/resume", "POST /quarantine/jobs/:id/reconcile",
       "POST /quarantine/canary-approvals", "GET /quarantine/canary-approvals", "POST /quarantine/canary-approvals/:id/execute",
       "GET /copilot-usage/users",
@@ -49,6 +49,12 @@ describe("route policy declarations", () => {
     expect(declaredRoutePolicies.get("POST /agent-inventory/people/resolve")).toEqual({
       access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"],
       capabilityId: "graph.directory.read", csrf: true,
+    });
+  });
+
+  it("requires only saved private Viewer authorization for responsibility, not provider lookup capability", () => {
+    expect(declaredRoutePolicies.get("GET /agent-responsibility")).toEqual({
+      access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
     });
   });
 

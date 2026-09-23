@@ -19,13 +19,8 @@ const fullRoleIds = new Set<string>([
 const aiRoleIds = new Set<string>([inventoryProviderRoleIds.aiAdministrator, inventoryProviderRoleIds.aiReader]);
 const relevantRoleIds = new Set<string>([...fullRoleIds, ...aiRoleIds]);
 const aiResourceTypes = new Set<PowerPlatformResourceType>([
-  "microsoft.powerapps/codeapps",
-  "microsoft.powerapps/apps",
-  "microsoft.powerautomate/agentflows",
-  "microsoft.powerautomate/m365agentflows",
   "microsoft.copilotstudio/agents",
   "microsoft.powerplatform/environments",
-  "microsoft.powerplatform/environmentgroups",
 ]);
 
 export function normalizeInventoryProviderRoleIds(value: unknown) {

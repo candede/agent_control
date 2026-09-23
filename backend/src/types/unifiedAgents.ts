@@ -4,6 +4,7 @@ import type { PackageAgentIdentityWarning, PackageAgentLinkEvidence } from "../s
 import type {
   InventoryCoverageStatus,
   InventorySnapshotVerification,
+  InventoryFieldProvenance,
   PowerPlatformResource,
 } from "./powerPlatformInventory.js";
 
@@ -134,11 +135,24 @@ export type SavedAgentPerson = {
   errorCode?: string;
 };
 
+export type SavedAgentEnvironment = {
+  id: string;
+  displayName: string | null;
+  region: string | null;
+  environmentType: string | null;
+  isManaged: boolean | null;
+  groupName: string | null;
+  groupId: string | null;
+  observation: UnifiedAgentSourceObservation;
+  provenance: Record<string, InventoryFieldProvenance>;
+};
+
 export type UnifiedAgentRecord = {
   id: string;
   displayName: string;
   presence: UnifiedAgentPresence;
   environmentId: string | null;
+  environment?: SavedAgentEnvironment | null;
   packages: CopilotPackage[];
   powerPlatformResource: PowerPlatformResource | null;
   people?: {

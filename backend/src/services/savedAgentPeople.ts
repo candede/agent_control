@@ -13,20 +13,11 @@ export class SavedAgentPeopleService {
   ) {}
 
   async project(scope: DataSyncScope, records: readonly UnifiedAgentRecord[], database?: pg.PoolClient): Promise<UnifiedAgentRecord[]> {
-    const source = await this.repository.getDirectorySource(scope, database);
-    const people = directoryPeople(source);
     const ids = [...new Set(records.flatMap(record => [
       record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
       record.powerPlatformResource?.details.lastModifiedBy,
     ]).filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id)).map(id => id.toLowerCase()))];
-    for (const { lastConclusiveAt, ...cached } of await this.cache.read(scope, ids, database)) {
-      const saved = people.get(cached.objectId);
-      if (saved && Date.parse(saved.observedAt) > Date.parse(cached.checkedAt ?? cached.observedAt)) continue;
-      const identity = cached.status === "lookup_failed" && saved
-        && (lastConclusiveAt === null || Date.parse(saved.observedAt) > Date.parse(lastConclusiveAt)) ? saved : cached;
-      people.set(cached.objectId, { ...identity, status: cached.status, checkedAt: cached.checkedAt,
-        expiresAt: cached.expiresAt, ...(cached.errorCode ? { errorCode: cached.errorCode } : {}) });
-    }
+    const people = await this.read(scope, ids, database);
     return records.map(record => {
       const resource = record.powerPlatformResource;
       if (resource && resource.tenantId !== scope.tenantId) {
@@ -49,6 +40,23 @@ export class SavedAgentPeopleService {
         } } : {}),
       };
     });
+  }
+
+  async read(scope: DataSyncScope, ids: readonly string[], database?: pg.PoolClient): Promise<Map<string, SavedAgentPerson>> {
+    const source = await this.repository.getDirectorySource(scope, database);
+    const people = directoryPeople(source);
+    for (const { lastConclusiveAt, ...cached } of await this.cache.read(scope, ids, database)) {
+      const saved = people.get(cached.objectId);
+      if (saved && Date.parse(saved.observedAt) > Date.parse(cached.checkedAt ?? cached.observedAt)) continue;
+      const identity = cached.status === "lookup_failed" && saved
+        && (lastConclusiveAt === null || Date.parse(saved.observedAt) > Date.parse(lastConclusiveAt)) ? saved : cached;
+      people.set(cached.objectId, { ...identity, status: cached.status, checkedAt: cached.checkedAt,
+        expiresAt: cached.expiresAt, ...(cached.errorCode ? { errorCode: cached.errorCode } : {}) });
+    }
+    return new Map(ids.flatMap(id => {
+      const person = people.get(id.toLowerCase());
+      return person ? [[id.toLowerCase(), person]] : [];
+    }));
   }
 }
 

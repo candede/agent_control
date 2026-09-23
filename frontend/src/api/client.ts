@@ -1,24 +1,26 @@
 import type { AppRole, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
 import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
-import type { InventoryRefreshJob, InventoryRefreshJobList, InventoryResourcePage, InventorySnapshot, InventorySnapshotList, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
+import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
 import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
-import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
+import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
+import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
+export type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
 export type { AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
 import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
-export type { InventoryCoverageStatus, InventoryRefreshJob, InventoryResourcePage, InventorySnapshot, InventorySnapshotVerification, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
-export type { InventoryRefreshJobList, InventorySnapshotList } from "../../../backend/src/types/powerPlatformInventory";
+export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
+export type { InventoryRefreshJobList } from "../../../backend/src/types/powerPlatformInventory";
 export type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
@@ -36,7 +38,7 @@ export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, Purview
 export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 export { automaticDataSyncSourceIds } from "../../../backend/src/types/dataSync";
-export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus, QuarantineTargetCandidate, QuarantineTargetPage } from "../../../backend/src/types/copilotStudioQuarantine";
+export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus } from "../../../backend/src/types/copilotStudioQuarantine";
 
 export type QuarantineStatusView = {
   target: { resourceNativeId: string; displayName: string; environmentId: string; botId: string };
@@ -452,15 +454,11 @@ export type AuditEventsResponse = {
 };
 
 export type InventoryListQuery = {
-  snapshotId?: string;
-  type?: PowerPlatformResourceType;
-  excludeAgents?: boolean;
+  snapshotId: string;
   environmentId?: string;
   search?: string;
-  sortBy?: "displayName" | "type" | "environmentId" | "createdAt" | "lastPublishedAt";
+  sortBy?: "displayName" | "environmentId" | "createdAt" | "lastPublishedAt";
   sortDirection?: "asc" | "desc";
-  limit?: number;
-  offset?: number;
 };
 
 export type AuditRequestContext = {
@@ -559,6 +557,7 @@ export function getUnifiedAgents(
   for (const [key, value] of Object.entries(query)) {
     if (value !== undefined && value !== "") params.set(key, String(value));
   }
+
   return request<UnifiedAgentInventoryPage>(
     `/api/agent-inventory${params.size ? `?${params}` : ""}`,
     { signal: options.signal },
@@ -566,6 +565,12 @@ export function getUnifiedAgents(
 }
 
 export type UnifiedAgentExportQuery = Omit<UnifiedAgentInventoryQuery, "recordId" | "limit" | "offset">;
+
+export function getAgentResponsibility(query: AgentResponsibilityQuery = {}, options: { signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) if (value !== undefined && value !== "") params.set(key, String(value));
+  return request<AgentResponsibilityPage>(`/api/agent-responsibility${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
 
 export function getAgentUsageCandidates(
   recordId: string,
@@ -677,20 +682,13 @@ export function cancelPackageRefreshJob(id: string, mode: "delegated" | "applica
   });
 }
 
-export function getInventoryResources(query: InventoryListQuery = {}, options: { signal?: AbortSignal } = {}) {
-  const params = inventorySearchParams(query);
-  return request<InventoryResourcePage>(`/api/inventory/resources${params.size ? `?${params}` : ""}`, { signal: options.signal });
-}
-
 export function getInventorySourceAwareDetail(input: {
   snapshotId: string;
   nativeId: string;
-  type: PowerPlatformResourceType;
   environmentId: string | null;
 }, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams({
     snapshotId: input.snapshotId,
-    type: input.type,
     environmentId: input.environmentId ?? "",
   });
   return request<InventorySourceAwareDetail>(`/api/inventory/resources/${encodeURIComponent(input.nativeId)}/related?${params}`, { signal: options.signal });
@@ -712,10 +710,6 @@ export function getInventoryRefreshJobs(options: { signal?: AbortSignal } = {}) 
   return request<InventoryRefreshJobList>("/api/inventory/refresh-jobs", { signal: options.signal });
 }
 
-export function getInventorySnapshots(options: { signal?: AbortSignal } = {}) {
-  return request<InventorySnapshotList>("/api/inventory/snapshots", { signal: options.signal });
-}
-
 export function getInventoryRefreshJob(id: string, options: { signal?: AbortSignal } = {}) {
   return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}`, { signal: options.signal });
 }
@@ -726,17 +720,6 @@ export function resumeInventoryRefresh(id: string) {
 
 export function cancelInventoryRefresh(id: string) {
   return request<InventoryRefreshJob>(`/api/inventory/refresh-jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
-}
-
-export function getQuarantineTargets(
-  query: { search?: string; limit?: number; offset?: number } = {},
-  options: { signal?: AbortSignal } = {},
-) {
-  const params = new URLSearchParams();
-  if (query.search) params.set("search", query.search);
-  if (query.limit !== undefined) params.set("limit", String(query.limit));
-  if (query.offset !== undefined) params.set("offset", String(query.offset));
-  return request<QuarantineTargetPage>(`/api/quarantine/targets${params.size ? `?${params}` : ""}`, { signal: options.signal });
 }
 
 export function getQuarantineStatus(snapshotId: string, nativeId: string, force = false, options: { signal?: AbortSignal } = {}) {
@@ -781,7 +764,7 @@ export function reconcileQuarantineJob(id: string) {
   });
 }
 
-export async function downloadInventoryCsv(query: InventoryListQuery = {}, signal?: AbortSignal) {
+export async function downloadInventoryCsv(query: InventoryListQuery, signal?: AbortSignal) {
   const params = inventorySearchParams(query);
   return requestBlob(`/api/inventory/export.csv${params.size ? `?${params}` : ""}`, { signal, headers: { Accept: "text/csv" } });
 }

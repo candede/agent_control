@@ -85,12 +85,11 @@ import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress } from "./components/BulkActions";
 import { AgentInventoryOverview } from "./components/AgentInventoryOverview";
 import { CopilotUsersView } from "./components/CopilotUsersView";
-import { InventoryExplorer } from "./components/InventoryExplorer";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
-import { CopilotStudioQuarantineTargetPicker } from "./components/CopilotStudioQuarantineTargetPicker";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
+import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { EnvironmentFilter } from "./components/EnvironmentFilter";
 import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
@@ -100,12 +99,11 @@ import {
   dataSyncRouteSearch,
   parseDataSyncRoute,
   migrateOfficialUsageRoute,
-  migratePowerPlatformAgentRoute,
   parseAgentRoute,
-  parsePowerPlatformRoute,
   parseUsersRoute,
   usersRouteSearch,
   parseWorkbenchView,
+  isWorkbenchPath,
   workbenchUrl,
   type AgentRouteState,
   type UsersRouteState,
@@ -177,18 +175,19 @@ function readInitialAgentRoute() {
   if (parseWorkbenchView(window.location.pathname) === "agents" && (syncRoute.syncRunId || (syncRoute.refreshJobId && !parseAgentRoute(window.location.search).controlJobId))) {
     window.history.replaceState({ view: "sync" }, "", workbenchUrl("sync", dataSyncRouteSearch(syncRoute)));
   }
-  if (parseWorkbenchView(window.location.pathname) === "power-platform") {
-    const migrated = migratePowerPlatformAgentRoute(window.location.search);
-    if (migrated) {
-      window.history.replaceState({ view: "agents" }, "", workbenchUrl("agents", migrated));
-    }
-  }
   // Sync retains inventory filters and exact job links for saved-data verification.
   return parseAgentRoute(readViewSearch("agents", "sync"));
 }
 
 function App() {
   const [savedQueries] = useState(createSavedQueryClient);
+  const [routeAvailable, setRouteAvailable] = useState(() => isWorkbenchPath(window.location.pathname));
+  useEffect(() => {
+    const restoreRoute = () => setRouteAvailable(isWorkbenchPath(window.location.pathname));
+    window.addEventListener("popstate", restoreRoute);
+    return () => window.removeEventListener("popstate", restoreRoute);
+  }, []);
+  if (!routeAvailable) return <main className="screen-state"><h1>Page not found</h1><p>This page is not available. <a href="/agents">Open Agents</a></p></main>;
   return <SavedQueryProvider client={savedQueries}><Workbench savedQueries={savedQueries} /></SavedQueryProvider>;
 }
 
@@ -196,6 +195,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
   const [initialAgentRoute] = useState(readInitialAgentRoute);
   const [syncReportRoute, setSyncReportRoute] = useState(() => parseDataSyncRoute(readViewSearch("sync")).reports);
+  const [requestedPowerPlatformJobId, setRequestedPowerPlatformJobId] = useState(() => parseDataSyncRoute(readViewSearch("sync")).powerPlatformJobId);
   const [usersRoute, setUsersRoute] = useState(() => parseUsersRoute(readViewSearch("users")));
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
@@ -282,7 +282,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [agentReloadRevision, setAgentReloadRevision] = useState(0);
   const [officialUsageDashboardRevision, setOfficialUsageDashboardRevision] = useState(0);
   const [copilotUsersDataRevision, setCopilotUsersDataRevision] = useState(0);
-  const [powerPlatformDataRevision, setPowerPlatformDataRevision] = useState(0);
   const [activeView, setActiveView] = useState<WorkbenchViewId>(() => parseWorkbenchView(window.location.pathname));
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
   const [packageSnapshotExpiresAt, setPackageSnapshotExpiresAt] = useState<Date>();
@@ -419,6 +418,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   useEffect(() => {
     function restoreRoute() {
+      if (!isWorkbenchPath(window.location.pathname)) return;
       readInitialAgentRoute();
       agentDetailRequestId.current += 1;
       agentDetailAbortController.current?.abort();
@@ -469,6 +469,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setUsersRoute(parseUsersRoute(window.location.search));
       } else if (view === "sync") {
         const route = parseDataSyncRoute(window.location.search);
+        setRequestedPowerPlatformJobId(route.powerPlatformJobId);
         setRequestedDataSyncRunId(route.syncRunId);
         setRequestedPackageRefreshJobId(route.refreshJobId);
         setRequestedPackageRefreshMode(route.refreshMode);
@@ -552,6 +553,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   useEffect(() => {
     if (activeView !== "sync") return;
     const search = dataSyncRouteSearch({
+      powerPlatformJobId: requestedPowerPlatformJobId,
       syncRunId: requestedDataSyncRunId,
       refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
@@ -562,7 +564,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (`${window.location.pathname}${window.location.search}` !== next) {
       window.history.replaceState({ view: "sync" }, "", next);
     }
-  }, [activeView, requestedDataSyncRunId, requestedPackageRefreshJobId, requestedPackageRefreshMode, syncReportRoute]);
+  }, [activeView, requestedPowerPlatformJobId, requestedDataSyncRunId, requestedPackageRefreshJobId, requestedPackageRefreshMode, syncReportRoute]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
@@ -979,6 +981,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
     if (view === "sync") {
       const route = parseDataSyncRoute(search.toString());
+      setRequestedPowerPlatformJobId(route.powerPlatformJobId);
       setRequestedDataSyncRunId(route.syncRunId);
       setRequestedPackageRefreshJobId(route.refreshJobId);
       setRequestedPackageRefreshMode(route.refreshMode);
@@ -1005,6 +1008,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleSyncReportRouteChange(reports: SyncReportRouteState | undefined) {
     const search = dataSyncRouteSearch({
+      powerPlatformJobId: requestedPowerPlatformJobId,
       syncRunId: requestedDataSyncRunId,
       refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
@@ -1036,9 +1040,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (changed.has("graph_packages") || changed.has("power_platform")) {
       requestCurrentAgentReload();
     }
-    if (changed.has("power_platform")) {
-      setPowerPlatformDataRevision(revision => revision + 1);
-    }
     if (changed.has("users")) {
       setCopilotUsersDataRevision(revision => revision + 1);
     }
@@ -1054,6 +1055,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   function handleRequestedSyncRunChange(runId: string | undefined) {
     setRequestedDataSyncRunId(runId);
     const next = workbenchUrl("sync", dataSyncRouteSearch({
+      powerPlatformJobId: requestedPowerPlatformJobId,
       syncRunId: runId,
       refreshJobId: requestedPackageRefreshJobId,
       refreshMode: requestedPackageRefreshMode,
@@ -1113,6 +1115,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setLoadedWorkbenchMetadata(undefined);
     setRequestedDataSyncRunId(undefined);
     setSyncReportRoute(undefined);
+    setRequestedPowerPlatformJobId(undefined);
   }
 
   function clearAgentState() {
@@ -1699,7 +1702,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     try {
       const blob = await downloadInventoryCsv({
         snapshotId,
-        type: "microsoft.copilotstudio/agents",
         search: deferredQuery.trim() || undefined,
         environmentId: agentEnvironmentFilter.trim() || undefined,
       });
@@ -1726,7 +1728,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const owner = principalKey;
     try {
       const job = await refreshInventory({
-        types: ["microsoft.copilotstudio/agents"],
+        types: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"],
       });
       if (!ownsInventoryRefreshRequest(requestId, owner)) return;
       setPowerPlatformAgentRefreshJob(job);
@@ -2411,11 +2413,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </button>
               </CapabilityGate>
               ) : null}
-              {visibleViews.includes("power-platform") ? (
-              <CapabilityGate roles={["AgentControl.Viewer"]}>
-              <button type="button" className={visibleActiveView === "power-platform" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "power-platform" ? "page" : undefined} onClick={() => navigateToView("power-platform")}>Power Platform</button>
-              </CapabilityGate>
-              ) : null}
               {visibleViews.includes("users") ? (
               <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
@@ -2470,6 +2467,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ) : null}
       {visibleActiveView === "sync" ? (
         <>
+          {requestedPowerPlatformJobId ? <PowerPlatformSourceJob key={`${principalKey}:${requestedPowerPlatformJobId}`}
+            jobId={requestedPowerPlatformJobId} onSelect={setRequestedPowerPlatformJobId}
+            onChanged={() => handleDataSyncSourcesChanged(["power_platform"])} /> : null}
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
           <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} />
           <AgentSyncTools
@@ -2482,6 +2482,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             refreshingPowerPlatform={refreshingPowerPlatformAgents}
             exportingPowerPlatform={exportingPowerPlatformCsv}
             powerPlatformJob={powerPlatformAgentRefreshJob}
+            onInspectPowerPlatformJob={setRequestedPowerPlatformJobId}
             onRefreshPackages={() => void handleRefreshAgents()}
             onRefreshMatchingDetails={() => void handleRefreshMatchingDetails()}
             onRefreshPowerPlatform={() => void handleRefreshPowerPlatformAgents()}
@@ -2792,16 +2793,22 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           )}
         </>
         )
-      ) : visibleActiveView === "power-platform" ? (
-        hasRole(user, "AgentControl.Viewer")
-          ? <InventoryExplorer key={`${principalKey}:${powerPlatformDataRevision}`} dataRevision={powerPlatformDataRevision} canManageQuarantine={Boolean(user && hasRole(user, "AgentControl.Admin"))} />
-          : <CopilotStudioQuarantineTargetPicker key={principalKey} initialJobId={parsePowerPlatformRoute(window.location.search).quarantineJobId} />
       ) : visibleActiveView === "users" ? (
         <CopilotUsersView
-          key={principalKey}
+          key={`users:${principalKey}`}
           dataRevision={copilotUsersDataRevision}
+          agentInventoryRevision={agentReloadRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
+          onOpenAgent={id => {
+            if (!ownsAgentScope(principalKey)) return;
+            navigateToView("agents");
+            setUnifiedAgentPage(undefined);
+            setUnifiedAgentDetailPage(undefined);
+            requestCurrentAgentReload();
+            setAgentDetailTab("identities");
+            setRequestedAgentDetailId(id);
+          }}
         />
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />
@@ -2825,6 +2832,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <UnifiedAgentDetailModal
           key={principalKey}
           record={selectedUnifiedAgent}
+          onOpenPerson={personId => {
+            if (!ownsAgentScope(principalKey)) return;
+            navigateToView("users");
+            handleUsersRouteChange({ view: "responsibility", personId, search: "", page: 0 });
+          }}
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
           inventoryRevision={unifiedAgentDetailPage?.sourcePage?.revision}
           onUsageChanged={() => {
@@ -2834,7 +2846,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             if (ownsAgentScope(principalKey)) requestCurrentAgentReload();
           }}
           dataRevision={officialUsageDashboardRevision}
-          environmentNames={agentEnvironmentNames}
           activeTab={agentDetailTab}
           onTabChange={tab => {
             if (busyAgentId) {

@@ -79,6 +79,10 @@ describe("read-source job projection", () => {
     ...dates,
   };
 
+  it.each(["failed", "waiting_authorization", "running", "succeeded", "cancelled"] as const)("routes the exact %s Power Platform job to Sync", status => {
+    expect(powerPlatformJobSummary({ ...inventoryJob, status, id: "exact/job" }).href).toBe("/sync?powerPlatformJob=exact%2Fjob");
+  });
+
   it("uses stored provider-attempt and completion dates rather than treating admission as execution", () => {
     for (const summary of [packageRefreshJobSummary(packageJob), powerPlatformJobSummary(inventoryJob)]) {
       expect(summary).toMatchObject({

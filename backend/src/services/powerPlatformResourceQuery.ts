@@ -153,7 +153,6 @@ export class PowerPlatformResourceQueryClient {
         if (omittedFieldCount) operationalLog("warn", "provider_schema_omission", { ...logContext, count: omittedFieldCount });
         operationalLog("info", "inventory_page_validated", {
           ...logContext, ...metadata, omittedFieldCount,
-          catalogScopedCount: parsed.resources.filter(resource => resource.provenance.tenantId.path === "authenticated_query.tenantId").length,
         });
         stage = "record_progress";
         await options.onProgress?.({ pages, observedCount: resources.length, totalRecords });
@@ -408,15 +407,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
   if (typeof value.name !== "string") {
     throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", { reason: "invalid_identity_type", field: "name", actualType: valueType(value.name), resourceType: type });
   }
-  const catalogWithoutTenant = value.type === "microsoft.powerplatformconnector/connectors"
-    && (value.tenantId === "" || value.tenantId === null || value.tenantId === undefined);
-  if (catalogWithoutTenant && !expectedTenantId) {
-    throw new InventorySchemaError("Power Platform connector catalog entries without tenant metadata require an authenticated inventory tenant scope.", {
-      reason: "missing_catalog_scope", field: "tenantId", actualType: valueType(value.tenantId), resourceType: type,
-    });
-  }
-  // Catalog availability is scoped by the delegated query, not by connector ownership.
-  const sourceTenantId = catalogWithoutTenant ? expectedTenantId : value.tenantId;
+  const sourceTenantId = value.tenantId;
   const tenantId = typeof sourceTenantId === "string" && expectedTenantId
     && normalizeNativeIdentity(sourceTenantId) === normalizeNativeIdentity(expectedTenantId) ? expectedTenantId : sourceTenantId;
   if (typeof tenantId !== "string") throw new InventorySchemaError("Power Platform inventory returned an invalid resource identity.", {
@@ -451,18 +442,16 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     ...identifier(context, "entraAgentId", "entra_agent_id"),
     ...identifier(context, "entraAgentBlueprintId", "entra_blueprint_id"),
   ];
-  const details = projectDetails(context, type);
-  if (type === "microsoft.powerplatformconnector/connectors") {
-    if (typeof value.tenantId === "string" || value.tenantId === null) details.sourceTenantId = value.tenantId;
-    context.provenance.sourceTenantId = { sourceSystem: "power_platform", path: value.tenantId === undefined ? "not_supplied" : "tenantId", maturity: "ga" };
-  }
+  const details = projectDetails(context);
   const authoringTool = derivePowerPlatformAuthoringTool(type, createdIn);
-  const agentKind = deriveAgentKind(type, createdIn, details.subType);
+  const agentKind = deriveAgentKind(type, createdIn);
   const lifecycle = deriveLifecycle(type, context.properties.lastPublishedAt, Object.hasOwn(context.properties, "lastPublishedAt"), lastPublishedAt);
   context.provenance.sourceSystem = { sourceSystem: "power_platform", path: "PowerPlatformResources", maturity: "ga" };
-  context.provenance.tenantId = { sourceSystem: "power_platform", path: catalogWithoutTenant ? "authenticated_query.tenantId" : "tenantId", maturity: "ga" };
+  context.provenance.tenantId = { sourceSystem: "power_platform", path: "tenantId", maturity: "ga" };
+  context.provenance.nativeId = { sourceSystem: "power_platform", path: "name", maturity: "ga" };
+  if (typeof value.location === "string") context.provenance.location = { sourceSystem: "power_platform", path: "location", maturity: "ga" };
   context.provenance.authoringTool = { sourceSystem: "power_platform", path: authoringTool && type === "microsoft.copilotstudio/agents" ? "properties.createdIn" : authoringTool ? "type" : "not_supplied", maturity: "ga" };
-  context.provenance.agentKind = { sourceSystem: "power_platform", path: details.subType ? "properties.subType" : type === "microsoft.copilotstudio/agents" && agentKind !== "agent" ? "properties.createdIn" : "type", maturity: "ga" };
+  context.provenance.agentKind = { sourceSystem: "power_platform", path: type === "microsoft.copilotstudio/agents" && agentKind !== "agent" ? "properties.createdIn" : "type", maturity: "ga" };
   context.provenance.lifecycle = { sourceSystem: "power_platform", path: type === "microsoft.copilotstudio/agents" && Object.hasOwn(context.properties, "lastPublishedAt") ? "properties.lastPublishedAt" : "type", maturity: "ga" };
   context.provenance.creatorType = { sourceSystem: "power_platform", path: "not_supplied", maturity: "ga" };
   context.provenance.identityConfidence = { sourceSystem: "power_platform", path: "name", maturity: "ga" };
@@ -470,7 +459,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     tenantId,
     nativeId: value.name,
     type,
-    location: type !== "microsoft.powerplatformconnector/connectors" && typeof value.location === "string" ? value.location.slice(0, 256) : null,
+    location: typeof value.location === "string" ? value.location.slice(0, 256) : null,
     displayName,
     environmentId,
     createdAt,
@@ -493,17 +482,8 @@ const sharedProperties = fields("ga", "displayName", "createdAt", "createdBy");
 const ownedResourceProperties = fields("ga", "ownerId", "environmentId", "lastModifiedAt", "lastModifiedBy");
 const connectorUsageProperties = fields("preview", "powerPlatformConnectors");
 const resourcePropertySchemas: Record<PowerPlatformResourceType, ReadonlyMap<string, InventoryFieldMaturity>> = {
-  "microsoft.powerapps/canvasapps": schema(sharedProperties, ownedResourceProperties, fields("ga", "isQuarantined"), connectorUsageProperties),
-  "microsoft.powerapps/modeldrivenapps": schema(sharedProperties, fields("ga", "environmentId", "lastModifiedAt", "lastModifiedBy", "isQuarantined", "appModuleId", "logicalName"), connectorUsageProperties),
-  "microsoft.powerapps/codeapps": schema(sharedProperties, ownedResourceProperties, fields("ga", "isQuarantined", "subType")),
-  "microsoft.powerapps/apps": schema(sharedProperties, ownedResourceProperties, fields("ga", "isQuarantined", "subType")),
-  "microsoft.powerautomate/cloudflows": schema(sharedProperties, ownedResourceProperties, fields("ga", "workflowEntityId"), connectorUsageProperties, fields("preview", "trigger", "triggerOperation")),
-  "microsoft.powerautomate/agentflows": schema(sharedProperties, ownedResourceProperties, fields("ga", "workflowEntityId"), connectorUsageProperties, fields("preview", "trigger", "triggerOperation")),
-  "microsoft.powerautomate/m365agentflows": schema(sharedProperties, ownedResourceProperties, fields("ga", "workflowEntityId"), connectorUsageProperties, fields("preview", "trigger", "triggerOperation")),
   "microsoft.copilotstudio/agents": schema(sharedProperties, ownedResourceProperties, fields("ga", "lastPublishedAt", "createdIn", "schemaName", "name", "botId", "entraAppId", "entraAgentId", "entraAgentBlueprintId"), fields("preview", "isQuarantined", "quarantinedAt", "isManaged", "orchestration", "model", "authentication", "channels", "capabilitiesCounts", "IsWebSearchEnabledForKnowledge"), connectorUsageProperties),
-  "microsoft.powerplatformconnector/connectors": schema(fields("ga", "displayName"), fields("preview", "connectorId", "description", "publisher", "tier", "releaseTag", "isDeprecated", "operations")),
   "microsoft.powerplatform/environments": schema(sharedProperties, fields("ga", "environmentType", "isManaged", "environmentGroup", "environmentGroupId", "lastModifiedAt")),
-  "microsoft.powerplatform/environmentgroups": schema(sharedProperties, fields("ga", "description", "lastModifiedAt")),
 };
 
 type ProjectionContext = {
@@ -529,7 +509,7 @@ function projectionContext(value: unknown, type: PowerPlatformResourceType): Pro
   };
 }
 
-function projectDetails(context: ProjectionContext, type: PowerPlatformResourceType): PowerPlatformResourceDetails {
+function projectDetails(context: ProjectionContext): PowerPlatformResourceDetails {
   const details: PowerPlatformResourceDetails = {};
   assign(details, "ownerId", optionalString(context, "ownerId", "properties.ownerId", "ga", 512));
   assign(details, "lastModifiedAt", optionalDate(context, "lastModifiedAt", "properties.lastModifiedAt", "ga"));
@@ -537,43 +517,38 @@ function projectDetails(context: ProjectionContext, type: PowerPlatformResourceT
   assign(details, "isQuarantined", optionalBoolean(context, "isQuarantined", "properties.isQuarantined", maturity(context, "isQuarantined")));
   assign(details, "quarantinedAt", optionalDate(context, "quarantinedAt", "properties.quarantinedAt", "preview"));
   assign(details, "isManaged", optionalBoolean(context, "isManaged", "properties.isManaged", maturity(context, "isManaged")));
-  for (const key of ["schemaName", "createdIn", "appModuleId", "logicalName", "subType", "workflowEntityId", "trigger", "triggerOperation", "environmentType", "environmentGroup", "environmentGroupId", "connectorId", "publisher", "tier", "releaseTag", "orchestration", "model", "authentication"] as const) {
+  for (const key of ["schemaName", "createdIn", "environmentType", "environmentGroup", "environmentGroupId", "orchestration", "model", "authentication"] as const) {
     assign(details, key, optionalString(context, key, `properties.${key}`, maturity(context, key), 512));
   }
-  assign(details, "description", optionalString(context, "description", "properties.description", maturity(context, "description"), 16_384));
-  assign(details, "isDeprecated", optionalBoolean(context, "isDeprecated", "properties.isDeprecated", "preview"));
   assign(details, "isWebSearchEnabledForKnowledge", optionalBoolean(context, "IsWebSearchEnabledForKnowledge", "properties.IsWebSearchEnabledForKnowledge", "preview"));
   const channels = optionalStringArray(context, "channels", "properties.channels", "preview", 50);
   if (channels) details.channels = channels;
-  const connectorKey = type === "microsoft.powerplatformconnector/connectors" ? "operations" : "powerPlatformConnectors";
+  const connectorKey = "powerPlatformConnectors";
   const supportsConnectorDetails = context.schema.has(connectorKey);
   const connectorDetailsSupplied = supportsConnectorDetails && Object.hasOwn(context.properties, connectorKey) && context.properties[connectorKey] !== null;
-  const connectors = !supportsConnectorDetails ? undefined : connectorKey === "operations" ? connectorResource(context) : resourceConnectors(context);
+  const connectors = supportsConnectorDetails ? resourceConnectors(context) : undefined;
   if (connectors !== undefined) details.connectors = connectors;
   const counts = context.schema.has("capabilitiesCounts") && isRecord(context.properties.capabilitiesCounts) ? context.properties.capabilitiesCounts : undefined;
-  if (context.properties.capabilitiesCounts !== undefined && !counts) context.omittedCount += 1;
+  if (context.properties.capabilitiesCounts !== undefined && context.properties.capabilitiesCounts !== null && !counts) omitCapability(context);
   if (counts) {
     const connectorCount = safeCount(counts.distinctPowerPlatformConnectors);
     const operationCount = safeCount(counts.distinctPowerPlatformConnectorsOperations);
+    for (const key of ["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations"]) {
+      if (counts[key] !== undefined && counts[key] !== null && safeCount(counts[key]) === undefined) omitCapability(context);
+    }
     if (connectorCount !== undefined) details.distinctPowerPlatformConnectors = connectorCount;
     if (operationCount !== undefined) details.distinctPowerPlatformConnectorsOperations = operationCount;
     context.provenance.capabilityCounts = { sourceSystem: "power_platform", path: "properties.capabilitiesCounts", maturity: "preview" };
     const retainedConnectors = details.connectors?.length ?? 0;
     const retainedOperations = details.connectors?.reduce((sum, connector) => sum + (connector.operations?.length ?? 0), 0) ?? 0;
-    if (connectorCount !== undefined && connectorCount > retainedConnectors || operationCount !== undefined && operationCount > retainedOperations) details.capabilityDetailsTruncated = true;
+    if (connectorCount !== undefined && connectorCount !== retainedConnectors || operationCount !== undefined && operationCount !== retainedOperations) details.capabilityDetailsTruncated = true;
     context.omittedCount += Object.keys(counts).filter(key => !["distinctPowerPlatformConnectors", "distinctPowerPlatformConnectorsOperations"].includes(key)).length;
   }
   if (context.capabilityDetailsTruncated) details.capabilityDetailsTruncated = true;
+  if (connectors?.length === maximumConnectors && details.distinctPowerPlatformConnectors === undefined
+    || context.retainedOperations === maximumOperations && details.distinctPowerPlatformConnectorsOperations === undefined) details.capabilityDetailsTruncated = true;
   if (supportsConnectorDetails) details.connectorDetailsStatus = !connectorDetailsSupplied ? "not_supplied" : details.capabilityDetailsTruncated ? "partial" : "complete";
   return details;
-}
-
-function connectorResource(context: ProjectionContext): InventoryConnector[] | undefined {
-  const value = context.properties.operations;
-  if (value === undefined || value === null) return undefined;
-  const connectorId = typeof context.properties.connectorId === "string" ? context.properties.connectorId.slice(0, 512) : "catalog";
-  const operations = parseOperations(context, value, "properties.operations", true);
-  return operations === undefined ? undefined : [{ connectorId, operations }];
 }
 
 function resourceConnectors(context: ProjectionContext): InventoryConnector[] | undefined {
@@ -581,38 +556,49 @@ function resourceConnectors(context: ProjectionContext): InventoryConnector[] | 
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) { context.omittedCount += 1; context.capabilityDetailsTruncated = true; return undefined; }
   if (value.length > maximumConnectors) { context.omittedCount += value.length - maximumConnectors; context.capabilityDetailsTruncated = true; }
-  const connectors = value.slice(0, maximumConnectors).flatMap((entry, index) => {
+  const connectors = value.slice(0, maximumConnectors).flatMap(entry => {
     if (!isRecord(entry) || !validText(entry.connectorId, 512)) { context.omittedCount += 1; context.capabilityDetailsTruncated = true; return []; }
     context.omittedCount += Object.keys(entry).filter(key => !["connectorId", "operations"].includes(key)).length;
-    const operations = parseOperations(context, entry.operations, `properties.powerPlatformConnectors[${index}].operations`, false);
+    const operations = parseOperations(context, entry.operations);
     return [{ connectorId: entry.connectorId, ...(operations === undefined ? {} : { operations }) }];
   });
   context.provenance.connectors = { sourceSystem: "power_platform", path: "properties.powerPlatformConnectors", maturity: "preview" };
   return connectors;
 }
 
-function parseOperations(context: ProjectionContext, value: unknown, path: string, catalog: boolean) {
-  if (value === undefined || value === null) return undefined;
+function parseOperations(context: ProjectionContext, value: unknown) {
+  if (value === undefined || value === null) { context.capabilityDetailsTruncated = true; return undefined; }
   if (!Array.isArray(value)) { context.omittedCount += 1; context.capabilityDetailsTruncated = true; return undefined; }
   const remaining = Math.max(maximumOperations - context.retainedOperations, 0);
   if (value.length > remaining) { context.omittedCount += value.length - remaining; context.capabilityDetailsTruncated = true; }
   const operations = value.slice(0, remaining).flatMap(entry => {
     if (!isRecord(entry) || !validText(entry.operationId, 512)) { context.omittedCount += 1; context.capabilityDetailsTruncated = true; return []; }
     const operation: InventoryConnectorOperation = { operationId: entry.operationId };
-    for (const key of catalog ? ["displayName", "description", "method"] as const : ["usedAs", "whenCanBeUsed", "connectionProvider"] as const) {
-      if (typeof entry[key] === "string") operation[key] = entry[key].slice(0, key === "description" ? 1_024 : 512);
-      else if (entry[key] !== undefined && entry[key] !== null) context.omittedCount += 1;
+    const values = {
+      usedAs: ["Tool", "Topic Tool", "Knowledge"],
+      whenCanBeUsed: ["Anytime", "ViaDirectReferenceOnly", "Conditional"],
+      connectionProvider: ["User", "Maker"],
+    };
+    for (const key of ["usedAs", "whenCanBeUsed", "connectionProvider"] as const) {
+      if (typeof entry[key] === "string" && values[key].includes(entry[key])) operation[key] = entry[key];
+      else if (entry[key] !== undefined && entry[key] !== null) omitCapability(context);
     }
-    if (!catalog) for (const key of ["isEnabled", "requiresEndUserConsent"] as const) {
+    if (typeof entry.createdBy === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(entry.createdBy)) operation.createdBy = entry.createdBy;
+    else if (entry.createdBy !== undefined && entry.createdBy !== null) omitCapability(context);
+    for (const key of ["isEnabled", "requiresEndUserConsent"] as const) {
       if (typeof entry[key] === "boolean") operation[key] = entry[key];
-      else if (entry[key] !== undefined && entry[key] !== null) context.omittedCount += 1;
+      else if (entry[key] !== undefined && entry[key] !== null) omitCapability(context);
     }
-    context.omittedCount += Object.keys(entry).filter(key => !["operationId", "displayName", "description", "method", "usedAs", "isEnabled", "requiresEndUserConsent", "whenCanBeUsed", "connectionProvider"].includes(key)).length;
+    context.omittedCount += Object.keys(entry).filter(key => !["operationId", "createdBy", "usedAs", "isEnabled", "requiresEndUserConsent", "whenCanBeUsed", "connectionProvider"].includes(key)).length;
     return [operation];
   });
   context.retainedOperations += operations.length;
-  context.provenance.connectors = { sourceSystem: "power_platform", path, maturity: "preview" };
   return operations;
+}
+
+function omitCapability(context: ProjectionContext) {
+  context.omittedCount += 1;
+  context.capabilityDetailsTruncated = true;
 }
 
 function identifier(context: ProjectionContext, property: string, kind: InventoryIdentifier["kind"]): InventoryIdentifier[] {
@@ -657,21 +643,16 @@ function optionalStringArray(context: ProjectionContext, property: string, path:
   return retained;
 }
 
-function deriveAgentKind(type: PowerPlatformResourceType, createdIn: string | null, subType?: string) {
+function deriveAgentKind(type: PowerPlatformResourceType, createdIn: string | null) {
   if (type === "microsoft.copilotstudio/agents") {
     const authoringTool = derivePowerPlatformAuthoringTool(type, createdIn);
     return authoringTool === "Microsoft 365 Copilot Agent Builder" ? "agent_builder_agent"
       : authoringTool === "Copilot Studio" ? "copilot_studio_agent" : "agent";
   }
-  if (type === "microsoft.powerautomate/agentflows") return "agent_flow";
-  if (type === "microsoft.powerautomate/m365agentflows") return "workflow_agent_flow";
-  if (type === "microsoft.powerapps/codeapps") return subType === "vibeApp" ? "vibe_app" : "code_app";
-  if (type === "microsoft.powerapps/apps") return "app_builder_app";
   return "not_agent";
 }
 
 function deriveLifecycle(type: PowerPlatformResourceType, rawLastPublishedAt: unknown, supplied: boolean, lastPublishedAt: string | null): PowerPlatformResource["lifecycle"] {
-  if (type === "microsoft.powerapps/modeldrivenapps") return "published";
   if (type !== "microsoft.copilotstudio/agents") return "not_applicable";
   if (lastPublishedAt) return "published";
   if (supplied && (rawLastPublishedAt === null || rawLastPublishedAt === "")) return "draft";

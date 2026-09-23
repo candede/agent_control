@@ -155,7 +155,7 @@ describe("exact inventory identity resolution", () => {
 
   it("scopes resource IDs by type and preserves same-native ambiguous candidates", () => {
     const source = identity({ nativeId: "source", identifiers: [{ kind: "power_platform_resource_id", value: "shared" }] });
-    expect(resolveExactInventoryIdentity(source, [identity({ nativeId: "other-type", resourceType: "microsoft.powerautomate/agentflows", identifiers: [{ kind: "power_platform_resource_id", value: "shared" }] })])).toEqual({
+    expect(resolveExactInventoryIdentity(source, [identity({ nativeId: "other-type", resourceType: "microsoft.powerplatform/environments", identifiers: [{ kind: "power_platform_resource_id", value: "shared" }] })])).toEqual({
       status: "unresolved", reason: "no_documented_exact_identifier",
     });
 

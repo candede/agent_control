@@ -44,9 +44,8 @@ describe("saved inventory verification", () => {
         verification: { status: "verified", scope: "authorized_query", storedCount: 2, uniqueIdentityCount: 2, queriedTypes: powerPlatformResourceTypes },
       },
     });
-    expect(page.typeCounts.find(item => item.type === agentType)).toMatchObject({ status: "covered", count: 1 });
     expect(page.snapshot?.coverage.find(item => item.type === agentType)).toMatchObject({ status: "covered", count: 2 });
-    expect(page.snapshot?.coverage.find(item => item.type === "microsoft.powerapps/canvasapps")).toMatchObject({ status: "covered", count: 0 });
+    expect(page.snapshot?.coverage.find(item => item.type === "microsoft.powerplatform/environments")).toMatchObject({ status: "covered", count: 0 });
     await fixture.operator.query("UPDATE power_platform_inventory_snapshots SET role_scope='ai' WHERE id=$1", [snapshotId]);
     const changedHint = await repository.list(scope);
     expect(changedHint.snapshot?.coverage).toEqual(page.snapshot?.coverage);
@@ -58,12 +57,10 @@ describe("saved inventory verification", () => {
     await fixture.operator.query("DELETE FROM power_platform_inventory_resources WHERE snapshot_id=$1 AND native_id=$2", [snapshotId, nativeIds[1]]);
     for (const read of [
       () => repository.list(scope),
-      () => repository.listSnapshots(scope),
       () => repository.readUnifiedSource(scope),
       () => repository.readIdentityCandidates(scope, [agentType]),
       () => repository.getResource(scope, snapshotId, agentType, environmentId, nativeIds[0]),
       () => repository.getQuarantineSelection(scope, snapshotId, [nativeIds[0]]),
-      () => repository.listQuarantineTargets(scope),
       () => repository.resolveQuarantineTargets(scope, snapshotId, [nativeIds[0]]),
     ]) {
       await expect(read()).rejects.toMatchObject({ code: "inventory_verification_failed" });
@@ -118,8 +115,8 @@ describe("saved inventory verification", () => {
     const { scope, repository } = await publishInventory([agentType]);
     const snapshot = (await repository.list(scope)).snapshot!;
     expect(snapshot.verification.queriedTypes).toEqual([agentType]);
-    expect(snapshot.coverage.find(item => item.type === "microsoft.powerapps/canvasapps")).toEqual({
-      type: "microsoft.powerapps/canvasapps", status: "not_requested", count: null,
+    expect(snapshot.coverage.find(item => item.type === "microsoft.powerplatform/environments")).toEqual({
+      type: "microsoft.powerplatform/environments", status: "not_requested", count: null,
     });
   });
 

@@ -13,8 +13,31 @@ import { buildUnifiedAgentCsv } from "../services/unifiedAgentExport.js";
 import { agentPeople } from "../services/agentPeople.js";
 import { savedAgentPeople } from "../services/savedAgentPeople.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
+import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
 
 export const unifiedAgentsRouter = Router();
+
+policyRoute(unifiedAgentsRouter, "get", "/agent-responsibility", {
+  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
+}, async (request, response) => {
+  response.json(await unifiedAgents.responsibility(requestScope(request), agentResponsibilityQuery(request.query)));
+});
+
+export function agentResponsibilityQuery(value: Record<string, unknown>): AgentResponsibilityQuery {
+  const invalid = () => new AppError(400, "invalid_responsibility_query", "Use an exact directory object ID and bounded responsibility paging/search.");
+  if (Object.keys(value).some(key => !["objectId", "search", "offset", "limit"].includes(key))) throw invalid();
+  if (value.objectId !== undefined && (typeof value.objectId !== "string" || !isDirectoryObjectId(value.objectId))) throw invalid();
+  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
+  const integer = (key: string, maximum: number, fallback: number) => {
+    if (value[key] === undefined) return fallback;
+    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
+    const number = Number(value[key]);
+    if (!Number.isSafeInteger(number) || number > maximum || (key === "limit" && number < 1)) throw invalid();
+    return number;
+  };
+  return { objectId: typeof value.objectId === "string" ? value.objectId.toLowerCase() : undefined,
+    search: value.search as string | undefined, offset: integer("offset", 30_000, 0), limit: integer("limit", 100, 50) };
+}
 
 policyRoute(unifiedAgentsRouter, "get", "/agent-inventory", {
   access: "authenticated",

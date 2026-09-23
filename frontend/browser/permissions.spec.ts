@@ -3,8 +3,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { statusLabels } from "../src/capabilityState";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
-import type { CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView, PackageRefreshJob, QuarantineTargetPage } from "../src/api/client";
-import { createInventoryVerification } from "../src/test/inventoryVerification";
+import type { CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView, PackageRefreshJob, UnifiedAgentInventoryPage } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
 
@@ -122,7 +121,7 @@ test("primary navigation uses the full header width at every screen size", async
   });
   await page.goto("/permissions");
   const navigation = page.getByRole("navigation", { name: "Primary views" });
-  await expect(navigation.getByRole("button")).toHaveCount(8);
+  await expect(navigation.getByRole("button")).toHaveCount(7);
   await expect(navigation.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   const originalViewport = page.viewportSize()!;
   for (const width of [originalViewport.width, 768, 1024, 1920]) {
@@ -465,97 +464,54 @@ test("package preview is responsive and cancellation dispatches no write", async
 });
 test("saved inventory navigation does not scan and explicit refresh is the only provider command", async ({ page }) => {
   const now = new Date().toISOString();
-  const snapshot = { id: "22222222-2222-2222-2222-222222222222", roleScope: "full", environmentScope: "environment-a", requestedTypes: ["microsoft.powerautomate/cloudflows"], coverage: [], observedCount: 1, totalRecords: 1, pageCount: 1, unknownFieldCount: 2, observedAt: now, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), verification: createInventoryVerification(1, ["microsoft.powerautomate/cloudflows"], now) };
-  const resourcePage = {
-    value: [{ tenantId: "11111111-1111-1111-1111-111111111111", nativeId: "cloud-flow-a", type: "microsoft.powerautomate/cloudflows", location: null, displayName: "Support intake", environmentId: "environment-a", createdAt: null, createdBy: null, lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "not_applicable", lifecycle: "not_applicable", identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "cloud-flow-a" }, { kind: "environment_id", value: "environment-a" }], provenance: { trigger: { sourceSystem: "power_platform", path: "properties.trigger", maturity: "preview" }, connectors: { sourceSystem: "power_platform", path: "properties.powerPlatformConnectors", maturity: "preview" } }, details: { trigger: "Manual", capabilityDetailsTruncated: true, connectorDetailsStatus: "partial", connectors: [{ connectorId: "shared_office365users", operations: [{ operationId: "SearchUser", usedAs: "action", isEnabled: true, requiresEndUserConsent: false }] }] }, unknownFieldCount: 1 }],
-    count: 1,
-    typeCounts: [{ type: "microsoft.powerautomate/cloudflows", status: "covered", count: 1 }, { type: "microsoft.powerplatformconnector/connectors", status: "not_authorized_scope", count: null }, { type: "microsoft.powerapps/codeapps", status: "unknown", count: null }],
-    snapshot,
-  };
-  const waitingJob = { id: "11111111-1111-1111-1111-111111111111", status: "waiting_authorization", roleScope: "full", environmentScope: "environment-a", requestedTypes: ["microsoft.powerautomate/cloudflows"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, createdAt: now, attemptedAt: now, updatedAt: now, finishedAt: null };
+  let sourceJob = { id: "11111111-1111-1111-1111-111111111111", status: "waiting_authorization", roleScope: "full", environmentScope: null, requestedTypes: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"], pageCount: 0, observedCount: 0, totalRecords: null, unknownFieldCount: 0, snapshotId: null, createdAt: now, attemptedAt: now, updatedAt: now, finishedAt: null };
   const refreshBodies: unknown[] = [];
+  const commands: string[] = [];
   await page.route(url => url.pathname.startsWith("/api/inventory/"), async route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/related")) return route.fulfill({ json: {
-      source: "power_platform", nativeId: "cloud-flow-a", resourceType: "microsoft.powerautomate/cloudflows",
-      environmentId: "environment-a", snapshotId: snapshot.id, observedAt: snapshot.observedAt, expiresAt: snapshot.expiresAt,
-      identifiers: resourcePage.value[0].identifiers,
-      package: { status: "unmatched", reason: "current provider schemas document no cross-source package identifier relation" },
-      reports: { status: "unmatched", reason: "official report identifiers are report-only and cannot be joined" },
-      audit: { status: "available", count: 0, value: [] },
-      security: { status: "available", count: 0, value: [] },
-      controls: { quarantineTarget: null, packageTarget: null },
-    } });
-    if (path === "/api/inventory/resources") return route.fulfill({ json: resourcePage });
-    if (path === "/api/inventory/snapshots") return route.fulfill({ json: { value: [snapshot] } });
-    if (path === "/api/inventory/refresh-jobs" && route.request().method() === "GET") return route.fulfill({ json: { value: [waitingJob], lastAttemptAt: now, lastSuccessAt: snapshot.observedAt } });
-    if (path === "/api/inventory/refresh-jobs" && route.request().method() === "POST") { refreshBodies.push(route.request().postDataJSON()); return route.fulfill({ status: 202, json: waitingJob }); }
-    if (path.endsWith("/resume")) return route.fulfill({ status: 202, json: { ...waitingJob, status: "running" } });
+    if (route.request().method() === "POST") commands.push(path);
+    if (path === "/api/inventory/refresh-jobs" && route.request().method() === "GET") return route.fulfill({ json: { value: [sourceJob], lastAttemptAt: now, lastSuccessAt: null } });
+    if (path === "/api/inventory/refresh-jobs" && route.request().method() === "POST") { refreshBodies.push(route.request().postDataJSON()); return route.fulfill({ status: 202, json: sourceJob }); }
+    if (path === `/api/inventory/refresh-jobs/${sourceJob.id}`) return route.fulfill({ json: sourceJob });
+    if (path.endsWith("/resume") || path.endsWith("/cancel")) {
+      sourceJob = { ...sourceJob, status: path.endsWith("/resume") ? "running" : "cancelled" };
+      return route.fulfill({ status: 202, json: sourceJob });
+    }
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
   await login(page, "role-Viewer");
-  await page.getByRole("button", { name: "Power Platform", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Power Platform inventory explorer" })).toBeVisible();
-  await expect(page.getByText("Support intake", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("Resource type coverage").getByText("Not queried (role scope)", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("Resource type coverage").getByText("Unknown (not verified)", { exact: true })).toBeVisible();
-  await expect(page.getByText(/Unknown fields omitted: 2/)).toBeVisible();
-  await expect(page.getByRole("button", { name: /Resume with current authorization/ })).toBeVisible();
-  expect(refreshBodies).toEqual([]);
-  const detailsTrigger = page.getByRole("button", { name: "View details for Support intake" });
-  await detailsTrigger.click();
-  const dialog = page.getByRole("dialog", { name: "Support intake" });
-  await expect(dialog).toBeVisible();
-  const identityTab = dialog.getByRole("tab", { name: "Identity" });
-  const powerPlatformTab = dialog.getByRole("tab", { name: "Power Platform" });
-  await expect(identityTab).toBeFocused();
-  await page.keyboard.press("ArrowRight");
-  await expect(powerPlatformTab).toBeFocused();
-  await expect(powerPlatformTab).toHaveAttribute("aria-selected", "true");
-  expect(await dialog.getByText("Preview", { exact: true }).count()).toBeGreaterThanOrEqual(1);
-  await expect(dialog.getByText(/Capability details are partial/)).toBeVisible();
-  await dialog.getByRole("tab", { name: "Package" }).click();
-  await expect(dialog.getByText(/current provider schemas document no cross-source/)).toBeVisible();
-  await dialog.getByRole("tab", { name: "Audit" }).click();
-  await expect(dialog.getByText(/Authorized and queried; no exact associated records/)).toBeVisible();
-  await dialog.getByRole("tab", { name: "Power Platform" }).click();
-  await expect(dialog.getByText("SearchUser", { exact: true })).toBeVisible();
-  await expect(dialog.getByRole("listitem").filter({ hasText: "SearchUser" })).toHaveText("SearchUser · action");
-  await expect(page).toHaveURL(/detail=cloud-flow-a/);
-  const detailUrl = page.url();
-  for (let index = 0; index < 4; index += 1) { await page.keyboard.press("Tab"); expect(await dialog.evaluate(element => element.contains(document.activeElement))).toBe(true); }
-  await page.keyboard.press("Escape");
-  await expect(dialog).not.toBeVisible();
-  await expect(detailsTrigger).toBeFocused();
-  await page.goto("/jobs");
-  await page.goto(detailUrl);
-  await expect(page.getByRole("dialog", { name: "Support intake" })).toBeVisible();
-  await expect(page.getByRole("tab", { name: "Power Platform" })).toHaveAttribute("aria-selected", "true");
-  await page.goBack();
-  await expect(page).toHaveURL(/\/jobs$/);
-  await page.goForward();
-  await expect(page.getByRole("dialog", { name: "Support intake" })).toBeVisible();
-  await page.keyboard.press("Escape");
-  await page.getByLabel("Refresh resource scope").selectOption("microsoft.powerautomate/cloudflows");
-  await page.getByLabel("Refresh environment scope").fill("environment-b");
-  await page.getByRole("button", { name: /Refresh selected scope/ }).click();
-  await expect.poll(() => refreshBodies).toEqual([{ types: ["microsoft.powerautomate/cloudflows"], environmentId: "environment-b" }]);
+  await expect(page.getByRole("button", { name: "Power Platform", exact: true })).toHaveCount(0);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "View diagnostics", exact: true }).click();
+  expect(commands).toEqual([]);
+  await page.getByRole("button", { name: "Refresh PP agent inventory", exact: true }).click();
+  await expect.poll(() => refreshBodies).toEqual([{ types: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"] }]);
+  await page.getByRole("button", { name: "Inspect source job", exact: true }).click();
+  const inspection = page.getByRole("region", { name: "Power Platform source job", exact: true });
+  await expect(inspection).toContainText("waiting authorization");
+  await expect(page).toHaveURL(new RegExp(`/sync\\?powerPlatformJob=${sourceJob.id}$`));
+  await expect(inspection.getByText("Unknown", { exact: true })).toBeVisible();
+  await inspection.getByRole("button", { name: "Resume source job", exact: true }).click();
+  await expect(inspection.getByRole("status")).toContainText("running");
+  await inspection.getByRole("button", { name: "Cancel source job", exact: true }).click();
+  await expect(inspection.getByRole("status")).toContainText("cancelled");
+  expect(commands).toEqual(["/api/inventory/refresh-jobs", `/api/inventory/refresh-jobs/${sourceJob.id}/resume`, `/api/inventory/refresh-jobs/${sourceJob.id}/cancel`]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
-  await page.screenshot({ path: test.info().outputPath("inventory.png"), fullPage: true });
+  await page.screenshot({ path: test.info().outputPath("source-job.png"), fullPage: true });
 });
 test("quarantine uses real policy, exact saved targets, confirmation and verified fixture write", async ({ page }, testInfo) => {
   const quarantineRequests: string[] = [];
   page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/quarantine/")) quarantineRequests.push(`${request.method()} ${url.pathname}`); });
   await login(page, "role-Admin");
-  const targetResponse = await page.request.get("/api/quarantine/targets");
+  const targetResponse = await page.request.get("/api/agent-inventory");
   expect(targetResponse.ok()).toBe(true);
-  const targets: QuarantineTargetPage = await targetResponse.json();
+  const targets: UnifiedAgentInventoryPage = await targetResponse.json();
   // Each viewport writes a different seeded target so neither depends on the other running first.
   const firstBotId = testInfo.project.name === "mobile" ? "cccccccc-cccc-cccc-cccc-cccccccccccc" : "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
   const secondBotId = testInfo.project.name === "mobile" ? "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" : "cccccccc-cccc-cccc-cccc-cccccccccccc";
-  const firstName = targets.value.find(target => target.botId === firstBotId)!.displayName!;
-  const secondName = targets.value.find(target => target.botId === secondBotId)!.displayName!;
+  const firstName = targets.value.find(target => target.powerPlatformResource?.identifiers.some(identifier => identifier.kind === "cds_bot_id" && identifier.value === firstBotId))!.displayName;
+  const secondName = targets.value.find(target => target.powerPlatformResource?.identifiers.some(identifier => identifier.kind === "cds_bot_id" && identifier.value === secondBotId))!.displayName;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true })).toBeVisible();
   await expect(page.getByRole("checkbox", { name: `Select ${secondName}`, exact: true })).toBeVisible();
@@ -618,23 +574,21 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("quarantine-controls.png"), fullPage: true });
 });
-test("saved inventory remains readable during provider outage without a refresh", async ({ page }) => {
+test("exact saved source jobs remain readable during provider outage without a refresh", async ({ page }) => {
   let writes = 0;
   const now = new Date().toISOString();
-  const snapshot = { id: "33333333-3333-3333-3333-333333333333", roleScope: "full", environmentScope: null, requestedTypes: ["microsoft.powerplatform/environments"], coverage: [], observedCount: 1, totalRecords: 1, pageCount: 1, unknownFieldCount: 0, observedAt: now, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), verification: createInventoryVerification(1, ["microsoft.powerplatform/environments"], now) };
+  const job = { id: "33333333-3333-3333-3333-333333333333", status: "failed", roleScope: "full", environmentScope: null, requestedTypes: ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"], observedCount: 1, totalRecords: 2, pageCount: 1, unknownFieldCount: 0, snapshotId: null, createdAt: now, attemptedAt: now, updatedAt: now, finishedAt: now, errorCode: "provider_error", message: "Synthetic source failure" };
   await page.route(url => url.pathname.startsWith("/api/inventory/"), route => {
     const path = new URL(route.request().url()).pathname;
     if (route.request().method() === "POST") { writes += 1; return route.fulfill({ status: 503, json: { error: { code: "provider_error", message: "Synthetic outage" } } }); }
-    if (path === "/api/inventory/resources") return route.fulfill({ json: { value: [{ tenantId: "11111111-1111-1111-1111-111111111111", nativeId: "environment-saved", type: "microsoft.powerplatform/environments", location: "unitedstates", displayName: "Saved environment", environmentId: "environment-saved", createdAt: null, createdBy: null, lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "not_applicable", lifecycle: "not_applicable", identityConfidence: "exact_native", identifiers: [{ kind: "environment_id", value: "environment-saved" }], provenance: {}, details: { environmentType: "Production" }, unknownFieldCount: 0 }], count: 1, typeCounts: [{ type: "microsoft.powerplatform/environments", status: "covered", count: 1 }], snapshot } });
-    if (path === "/api/inventory/snapshots") return route.fulfill({ json: { value: [snapshot] } });
+    if (path === `/api/inventory/refresh-jobs/${job.id}`) return route.fulfill({ json: job });
     return route.fulfill({ json: { value: [], lastAttemptAt: now, lastSuccessAt: now } });
   });
   await login(page, "provider_error");
-  await page.getByRole("button", { name: "Power Platform", exact: true }).click();
-  await expect(page.getByText("Saved environment", { exact: true })).toBeVisible();
+  await page.goto(`/sync?powerPlatformJob=${job.id}`);
+  await expect(page.getByRole("region", { name: "Power Platform source job" })).toContainText("Synthetic source failure");
   await expect(page.getByText(/latest capability check failed.*authorized saved data remains readable/)).toBeVisible();
-  await expect(page.getByRole("button", { name: /Refresh selected scope/ })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Export filtered inventory CSV" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start a new source refresh" })).toBeDisabled();
   expect(writes).toBe(0);
 });
 test("two-role hierarchy, private evidence, and saved audit during outage", async ({ page, browser }) => {
@@ -648,7 +602,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
     if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/refresh-jobs")) providerRefreshes += 1;
   });
   await login(page, "role-Admin");
-  for (const view of ["Agents", "Power Platform", "Users", "Audit", "Security", "Jobs"]) {
+  for (const view of ["Agents", "Users", "Audit", "Security", "Jobs"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
@@ -657,7 +611,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Close", exact: true }).click();
   await login(page, "role-Viewer");
-  for (const view of ["Agents", "Power Platform", "Users", "Audit", "Security", "Jobs"]) {
+  for (const view of ["Agents", "Users", "Audit", "Security", "Jobs"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
@@ -689,12 +643,22 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
     await other.close();
   }
 });
+
+test("retired catalog bookmarks are not redirected and make no application requests", async ({ page }) => {
+  const requests: string[] = [];
+  page.on("request", request => {
+    if (new URL(request.url()).pathname.startsWith("/api/")) requests.push(request.url());
+  });
+  await page.goto("/power-platform?refreshJob=retired-job&detail=retired-resource");
+  await expect(page.getByRole("heading", { name: "Page not found", exact: true })).toBeVisible();
+  await expect(page).toHaveURL("/power-platform?refreshJob=retired-job&detail=retired-resource");
+  expect(requests).toEqual([]);
+});
 test("all canonical workbench routes are deep-linkable and preserve agent state through history", async ({ page }, testInfo) => {
   await login(page, "available");
   await collectSavedPackages(page);
   const routes = [
     ["/agents", "Agents"],
-    ["/power-platform", "Power Platform"],
     ["/users", "Users"],
     ["/sync", "Sync"],
     ["/audit", "Audit"],
@@ -718,7 +682,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await expect(page.getByPlaceholder("Name, publisher, ID, ref")).toHaveValue("synthetic");
 
   await page.goto("/audit?q=saved-actor&action=block&status=failed");
-  await expect(page.getByLabel("Search")).toHaveValue("saved-actor");
+  await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("saved-actor");
   await expect(page.getByRole("combobox", { name: "Action", exact: true })).toHaveValue("block");
   await page.getByRole("button", { name: "Jobs", exact: true }).click();
   await page.getByRole("button", { name: "Audit", exact: true }).click();

@@ -1,8 +1,8 @@
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
+import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
 
 export const workbenchViewIds = [
   "agents",
-  "power-platform",
   "users",
   "sync",
   "audit",
@@ -42,23 +42,6 @@ export type AgentRouteState = {
   quarantineJobId?: string;
 };
 
-export type PowerPlatformRouteState = {
-  search: string;
-  type: string;
-  environmentId: string;
-  sortBy: "displayName" | "type" | "environmentId" | "createdAt" | "lastPublishedAt";
-  sortDirection: "asc" | "desc";
-  page: number;
-  snapshotId: string;
-  detailId?: string;
-  detailType?: string;
-  detailEnvironmentId?: string;
-  detailTab?: string;
-  selectedIds: string[];
-  refreshJobId?: string;
-  quarantineJobId?: string;
-};
-
 export type AuditRouteState = {
   source: "local" | "purview";
   search: string;
@@ -89,7 +72,8 @@ export type SyncReportRouteState = {
 };
 
 export type UsersRouteState = {
-  view: "licenses" | "activity";
+  view: "licenses" | "activity" | "responsibility";
+  personId?: string;
   search: string;
   agentId?: string;
   reportSetId?: string;
@@ -97,6 +81,7 @@ export type UsersRouteState = {
 };
 
 export type DataSyncRouteState = {
+  powerPlatformJobId?: string;
   syncRunId?: string;
   refreshJobId?: string;
   refreshMode: "delegated" | "application";
@@ -108,7 +93,6 @@ export const maximumInlinePackageRouteBytes = 4_096;
 
 const viewPaths: Record<WorkbenchViewId, string> = {
   agents: "/agents",
-  "power-platform": "/power-platform",
   users: "/users",
   sync: "/sync",
   audit: "/audit",
@@ -126,6 +110,11 @@ export function parseWorkbenchView(pathname: string): WorkbenchViewId {
   return viewsByPath.get(normalizePath(pathname)) ?? "agents";
 }
 
+export function isWorkbenchPath(pathname: string) {
+  const path = normalizePath(pathname);
+  return path === "/" || path === "/official-usage" || viewsByPath.has(path);
+}
+
 export function workbenchUrl(
   view: WorkbenchViewId,
   search: URLSearchParams = new URLSearchParams(),
@@ -137,6 +126,7 @@ export function workbenchUrl(
 export function parseDataSyncRoute(search: string): DataSyncRouteState {
   const params = new URLSearchParams(search);
   return {
+    powerPlatformJobId: bounded(params.get("powerPlatformJob"), 512),
     syncRunId: bounded(params.get("syncRun"), 512),
     refreshJobId: bounded(params.get("refreshJob"), 512),
     refreshMode: params.get("mode") === "application" ? "application" : "delegated",
@@ -146,6 +136,7 @@ export function parseDataSyncRoute(search: string): DataSyncRouteState {
 
 export function dataSyncRouteSearch(state: DataSyncRouteState): URLSearchParams {
   const params = new URLSearchParams();
+  if (state.powerPlatformJobId && validSelectedId(state.powerPlatformJobId)) params.set("powerPlatformJob", state.powerPlatformJobId);
   if (state.syncRunId && validSelectedId(state.syncRunId)) params.set("syncRun", state.syncRunId);
   if (state.refreshJobId && validSelectedId(state.refreshJobId)) {
     params.set("refreshJob", state.refreshJobId);
@@ -245,91 +236,6 @@ export function agentRouteSearch(state: AgentRouteState) {
     }
   }
   return params;
-}
-
-export function parsePowerPlatformRoute(search: string): PowerPlatformRouteState {
-  const params = new URLSearchParams(search);
-  const sort = params.get("sort");
-  return {
-    search: bounded(params.get("q"), 256) ?? "",
-    type: bounded(params.get("type"), 256) ?? "all",
-    environmentId: bounded(params.get("environment"), 512) ?? "",
-    sortBy: sort === "type" || sort === "environmentId" || sort === "createdAt" || sort === "lastPublishedAt" ? sort : "displayName",
-    sortDirection: params.get("direction") === "desc" ? "desc" : "asc",
-    page: boundedPage(params.get("page")),
-    snapshotId: bounded(params.get("snapshot"), 64) ?? "",
-    detailId: bounded(params.get("detail"), 512),
-    detailType: bounded(params.get("detailType"), 256),
-    detailEnvironmentId: bounded(params.get("detailEnvironment"), 512),
-    detailTab: bounded(params.get("detailTab"), 64),
-    selectedIds: [...new Set(params.getAll("selected").filter(validSelectedId))].slice(0, 25),
-    refreshJobId: bounded(params.get("refreshJob"), 512),
-    quarantineJobId: bounded(params.get("quarantineJob"), 512),
-  };
-}
-
-export function powerPlatformRouteSearch(state: PowerPlatformRouteState) {
-  const params = new URLSearchParams();
-  if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
-  if (state.type !== "all") params.set("type", state.type);
-  if (state.environmentId.trim()) params.set("environment", state.environmentId.trim().slice(0, 512));
-  if (state.sortBy !== "displayName") params.set("sort", state.sortBy);
-  if (state.sortDirection !== "asc") params.set("direction", state.sortDirection);
-  if (state.page > 0) params.set("page", String(state.page + 1));
-  if (state.snapshotId) params.set("snapshot", state.snapshotId);
-  if (state.detailId && validSelectedId(state.detailId)) params.set("detail", state.detailId);
-  if (state.detailType) params.set("detailType", state.detailType.slice(0, 256));
-  if (state.detailEnvironmentId) params.set("detailEnvironment", state.detailEnvironmentId.slice(0, 512));
-  if (state.detailId && state.detailTab && state.detailTab !== "identity") params.set("detailTab", state.detailTab.slice(0, 64));
-  if (state.refreshJobId && validSelectedId(state.refreshJobId)) params.set("refreshJob", state.refreshJobId);
-  if (state.quarantineJobId && validSelectedId(state.quarantineJobId)) params.set("quarantineJob", state.quarantineJobId);
-  for (const id of [...new Set(state.selectedIds.filter(validSelectedId))].slice(0, 25)) params.append("selected", id);
-  return params;
-}
-
-export function migratePowerPlatformAgentRoute(search: string) {
-  const route = parsePowerPlatformRoute(search);
-  const isAgentRoute = route.type === "microsoft.copilotstudio/agents"
-    || route.detailType === "microsoft.copilotstudio/agents"
-    || Boolean(route.quarantineJobId);
-  if (!isAgentRoute) return undefined;
-  const detailEnvironment = route.detailEnvironmentId ?? route.environmentId;
-  const detailId = route.detailId ? unifiedAgentRecordId({
-    source: "power_platform",
-    nativeId: route.detailId,
-    environmentId: detailEnvironment || null,
-  }) : undefined;
-  const selectedIds = route.selectedIds.map(nativeId => {
-    const environmentId = route.environmentId || (nativeId === route.detailId ? detailEnvironment : "");
-    return environmentId ? unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId }) : nativeId;
-  });
-  return agentRouteSearch({
-    agentView: "all",
-    search: route.search,
-    status: "all",
-    publisher: "all",
-    availability: "all",
-    host: "all",
-    platform: "all",
-    createdWithinDays: "",
-    sortBy: route.sortBy === "lastPublishedAt" ? "lastModifiedAt" : "displayName",
-    sortDirection: route.sortDirection,
-    page: route.page,
-    detailId,
-    detailTab: route.detailTab === "audit" || route.detailTab === "security"
-      ? "audit-security"
-      : ["package", "power-platform", "controls", "reports"].includes(route.detailTab ?? "")
-        ? route.detailTab
-        : "identity",
-    selectedIds: [],
-    refreshMode: "delegated",
-    source: "power_platform",
-    linkState: "all",
-    environmentId: route.environmentId,
-    inventorySnapshotId: route.snapshotId || undefined,
-    selectedPowerPlatformIds: selectedIds,
-    quarantineJobId: route.quarantineJobId,
-  });
 }
 
 const localAuditActions = new Set([
@@ -443,7 +349,10 @@ export function migrateOfficialUsageRoute(pathname: string, search: string): URL
 export function parseUsersRoute(search: string): UsersRouteState {
   const params = new URLSearchParams(search);
   return {
-    view: params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
+    view: params.get("view") === "responsibility" ? "responsibility"
+      : params.get("view") === "activity" || params.get("view") === "matrix" ? "activity" : "licenses",
+    ...(params.get("view") === "responsibility" && params.has("person")
+      ? { personId: bounded(params.get("person"), 128) || "invalid" } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: bounded(params.get("snapshot"), 512),
@@ -453,8 +362,14 @@ export function parseUsersRoute(search: string): UsersRouteState {
 
 export function usersRouteSearch(state: UsersRouteState) {
   const params = new URLSearchParams();
-  if (state.view !== "activity") return params;
-  params.set("view", "activity");
+  if (state.view === "licenses") return params;
+  params.set("view", state.view);
+  if (state.view === "responsibility") {
+    if (state.personId) params.set("person", isDirectoryObjectId(state.personId) ? state.personId.toLowerCase() : "invalid");
+    if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
+    if (state.page > 0) params.set("page", String(Math.min(601, state.page + 1)));
+    return params;
+  }
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
   if (state.reportSetId && validSelectedId(state.reportSetId)) params.set("snapshot", state.reportSetId);

@@ -131,7 +131,10 @@ try {
     foreach ($removed in @('TenantId','ClientId','ClientSecretFile','Port','StateRoot','Action','DryRun','ConfirmCleanup','BackupFile','RestoreDatabase','CleanupBatchSize','ConfirmReset','OpenBrowser')) {
         Assert-True (-not $entry.Parameters.ContainsKey($removed)) "Entry point still accepts $removed."
     }
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 2) 'Entry point must expose only Command and Project.'
+    Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
+    Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
+    Assert-True ($entry.Parameters['DbReset'].Aliases -contains 'db-reset') 'The db-reset spelling must select the same switch.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 3) 'Entry point must expose only Command, Project and DbReset.'
     Assert-True ($entry.Parameters['Command'].Aliases -contains 'Action') 'Entry point must accept -Action as an alias for Command.'
     $defaultProject=($entry.ScriptBlock.Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Project' }).DefaultValue.Value
     Assert-True ($defaultProject -ceq 'agent-control') 'Default project changed.'
@@ -149,6 +152,11 @@ try {
     $script:Failure=''; $script:ComposeVersion='1.29.0'
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Compose v2'
     $script:ComposeVersion='2.30.0'
+    foreach ($action in @('Stop','EditConfig','Start','Test','Reset','Retain')) {
+        $callCount=$script:Calls.Count
+        Assert-Fails { Invoke-LocalDeployment $context $action -DbReset } 'DbReset.*start'
+        Assert-True ($script:Calls.Count -eq $callCount) 'Invalid DbReset combination invoked Docker.'
+    }
     Assert-Fails { Invoke-LocalDeployment $context 'Reset' } 'reset denied'
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try { Assert-Fails { Assert-LocalPort $listener.LocalEndpoint.Port } 'occupied' } finally { $listener.Stop() }
@@ -555,12 +563,32 @@ try {
         Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) '-Action edit-config did not persist the public URL independently of the port.'
         $messages=. $entryPath -Action start @projectArguments 6>&1
         Assert-True ($script:Prompts.Count -eq $promptCount+9 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) '-Action start did not reuse the saved public URL.'
+        $savedEntry=Get-ConfigSnapshot $context
+        $callOffset=$script:Calls.Count
+        $messages=if ($projectArguments.Project) { . $entryPath start @projectArguments -db-reset 6>&1 }
+            else { . $entryPath @projectArguments -DbReset 6>&1 }
+        $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
+        Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'Public DbReset did not reset the selected application database exactly once.'
+        Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' -and $_.Contains("|--network|${projectName}_default|") }).Count -eq 1) 'Public DbReset used another project network.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+9) 'DbReset prompted for existing configuration again.'
+        Assert-ConfigUnchanged $context $savedEntry
     }
     $context=$retainedContext
     Assert-True ($script:Answers.Count -eq 0) 'Entry-point wizard did not consume the expected answers.'
     Assert-Fails { . $entryPath -Port 3001 } 'parameter.*Port'
     Assert-Fails { . $entryPath -StateRoot $testRoot } 'parameter.*StateRoot'
     Assert-Fails { . $entryPath -Action Reset } 'ValidateSet|validation|not belong'
+    foreach ($invalidResetCommand in @('stop','edit-config')) {
+        $callCount=$script:Calls.Count
+        Assert-Fails { . $entryPath $invalidResetCommand -DbReset } 'DbReset.*only with start'
+        Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public DbReset combination invoked Docker.'
+    }
+    $context=$retainedContext
+    $script:Failure='database\.ts\|migrate$'
+    try {
+        Assert-Fails { . $entryPath start -Project newcustomer -DbReset 6>$null 3>$null } 'explicit database reset began; data may already have been deleted'
+    } finally { $script:Failure='' }
+    $context=$retainedContext
 
     $qualification=New-FixtureContext 'preflight-retained'
     foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
@@ -604,6 +632,25 @@ try {
                 }
             }
         }
+        foreach ($hadMaintenance in @($false,$true)) {
+            foreach ($failurePattern in @('\|--wait-timeout\|90\|postgres$','backend/scripts/database\.ts\|preflight$')) {
+                if ($hadMaintenance) { [IO.File]::WriteAllText($script:MonitoredMarker,'prior-maintenance-state') }
+                elseif (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
+                $callOffset=$script:Calls.Count
+                $script:Failure=$failurePattern
+                Assert-Fails { Invoke-LocalDeployment $qualification 'Deploy' 6>$null } 'Database preflight failed.*Simulated'
+                $script:Failure=''
+                Assert-ConfigUnchanged $qualification $snapshot
+                Assert-True ((Test-Path -LiteralPath $script:MonitoredMarker) -eq $hadMaintenance) 'Database preflight failure changed maintenance admissions.'
+                if ($hadMaintenance) {
+                    Assert-True ([IO.File]::ReadAllText($script:MonitoredMarker) -ceq 'prior-maintenance-state') 'Database preflight failure overwrote existing maintenance.'
+                }
+                Assert-True ([IO.File]::ReadAllText($pendingReauthentication) -ceq 'pending-before-software-checks') 'Database preflight consumed pending reauthentication.'
+                $deploymentCalls=@($script:Calls | Select-Object -Skip $callOffset)
+                Assert-True (-not (($deploymentCalls -join "`n") -match '\|stop\||backend/scripts/database\.ts\|migrate$|\|--wait-timeout\|90\|app$')) 'Database preflight failure stopped, migrated or started the application.'
+                Assert-True (-not (($deploymentCalls -join "`n").Contains("|-p|$($qualification.Project)|down"))) 'Database preflight reset the application project.'
+            }
+        }
         Remove-Item -LiteralPath $script:MonitoredMarker
         $callOffset=$script:Calls.Count
         $script:MarkerCalls.Clear()
@@ -612,10 +659,13 @@ try {
         $tests=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/test-all\.ts$'
         $cleanup=Get-UniqueCallIndex $deploymentCalls '\|down\|--volumes\|--remove-orphans$'
         $runtime=Get-UniqueCallIndex $deploymentCalls '^build\|--target\|runtime\|'
+        $databasePreflight=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|preflight$'
         $stop=Get-UniqueCallIndex $deploymentCalls '\|stop\|--timeout\|130\|app$'
         $migration=Get-UniqueCallIndex $deploymentCalls 'backend/scripts/database\.ts\|migrate$'
         $start=Get-UniqueCallIndex $deploymentCalls '\|--wait-timeout\|90\|app$'
         Assert-True ($tests -lt $cleanup -and $cleanup -lt $runtime -and $runtime -lt $stop -and $stop -lt $migration -and $migration -lt $start) 'Software checks and cleanup must finish before runtime build, shutdown, migration and app start.'
+        Assert-True ($runtime -lt $databasePreflight -and $databasePreflight -lt $stop) 'Database compatibility must be checked before stopping the app.'
+        Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'backend/scripts/database\.ts\|preflight$' -and $_.maintenance }).Count -eq 0) 'Database preflight entered maintenance.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'backend/scripts/test-all\.ts$|^build\|' -and $_.maintenance }).Count -eq 0) 'Maintenance began before software/build qualification finished.'
         Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match '\|stop\|--timeout\|130\|app$' -and $_.maintenance }).Count -eq 1) 'Deployment did not close admissions before stopping the app.'
         foreach ($expected in @('[AUTOMATED CHECKS] PASSED','[LOCAL READINESS] PASSED')) {
@@ -623,6 +673,7 @@ try {
         }
         Assert-True (-not (($messages -join "`n") -match 'MICROSOFT ACCESS|review Permissions')) 'Deployment summary included an unnecessary Microsoft access status or Permissions follow-up.'
         Assert-ConfigUnchanged $qualification $snapshot
+        Assert-True (-not (($deploymentCalls -join "`n") -match 'database\.ts\|(?:reset|preflight-reset)\|')) 'Normal start invoked the destructive reset path.'
         $messages=Invoke-LocalDeployment $qualification 'Start' 6>&1
         Assert-True (($messages -join "`n").Contains('[AUTOMATED CHECKS] NOT RUN')) 'Existing-image Start falsely reported automated checks.'
 
@@ -635,6 +686,58 @@ try {
             Assert-True ($_.Exception.Message.Contains('Cleanup failed for isolated Compose project')) 'Cleanup failure did not identify its owned project.'
         }
         $script:Failure=''
+    } finally {
+        $script:Failure=''
+        $script:MonitoredMarker=''
+    }
+
+    $resetContext=New-FixtureContext 'database-reset-project'
+    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    Initialize-LocalState $resetContext $false -Onboard 6>$null
+    $script:Volumes.Add($resetContext.Volume) | Out-Null
+    $resetSnapshot=Get-ConfigSnapshot $resetContext
+    $backup=Join-Path $resetContext.State 'backups/retained.dump'
+    [IO.File]::WriteAllText($backup,'retained-backup')
+    $script:MonitoredMarker=Join-Path $resetContext.State 'control/maintenance'
+    try {
+        $callOffset=$script:Calls.Count
+        $script:MarkerCalls.Clear()
+        $messages=Invoke-LocalDeployment $resetContext 'Deploy' -DbReset 3>&1 6>&1
+        $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
+        $tests=Get-UniqueCallIndex $resetCalls 'backend/scripts/test-all\.ts$'
+        $preflight=Get-UniqueCallIndex $resetCalls 'database\.ts\|preflight-reset\|agentcontrol$'
+        $stop=Get-UniqueCallIndex $resetCalls '\|stop\|--timeout\|130\|app$'
+        $reset=Get-UniqueCallIndex $resetCalls 'database\.ts\|reset\|agentcontrol$'
+        $migrate=Get-UniqueCallIndex $resetCalls 'database\.ts\|migrate$'
+        $start=Get-UniqueCallIndex $resetCalls '\|--wait-timeout\|90\|app$'
+        Assert-True ($tests -lt $preflight -and $preflight -lt $stop -and $stop -lt $reset -and $reset -lt $migrate -and $migrate -lt $start) 'DbReset did not qualify, validate, drain, reset, initialize and start in order.'
+        Assert-True (-not (($resetCalls -join "`n") -match 'database\.ts\|preflight$')) 'Explicit reset checked compatibility with the schema it is replacing.'
+        Assert-True (@($script:MarkerCalls | Where-Object { $_.command -match 'database\.ts\|reset\|agentcontrol$' -and $_.maintenance }).Count -eq 1) 'DbReset ran without maintenance.'
+        Assert-True (($messages -join "`n").Contains('All saved application data')) 'DbReset omitted the destructive-data warning.'
+        Assert-ConfigUnchanged $resetContext $resetSnapshot
+        Assert-True ([IO.File]::ReadAllText($backup) -ceq 'retained-backup') 'DbReset removed existing backup files.'
+        foreach ($resetFailure in @(
+            @{pattern='backend/scripts/test-all\.ts$';maintenance=$false;started=$false},
+            @{pattern='^build\|--target\|runtime\|';maintenance=$false;started=$false},
+            @{pattern='database\.ts\|preflight-reset\|agentcontrol$';maintenance=$false;started=$false},
+            @{pattern='\|stop\|--timeout\|130\|app$';maintenance=$true;started=$false},
+            @{pattern='database\.ts\|reset\|agentcontrol$';maintenance=$true;started=$true},
+            @{pattern='database\.ts\|migrate$';maintenance=$true;started=$true},
+            @{pattern='\|--wait-timeout\|90\|app$';maintenance=$true;started=$true}
+        )) {
+            if (Test-Path -LiteralPath $script:MonitoredMarker) { Remove-Item -LiteralPath $script:MonitoredMarker }
+            $callOffset=$script:Calls.Count
+            $script:Failure=$resetFailure.pattern
+            Assert-Fails { Invoke-LocalDeployment $resetContext 'Deploy' -DbReset 6>$null } 'Simulated'
+            $script:Failure=''
+            Assert-True ((Test-Path -LiteralPath $script:MonitoredMarker) -eq $resetFailure.maintenance) "Failed DbReset deployment left incorrect maintenance state after $($resetFailure.pattern)."
+            Assert-True ($resetContext.DbResetStarted -eq $resetFailure.started) 'Failed deployment misreported whether reset began.'
+            $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
+            Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq [int]$resetFailure.started) 'Reset ran before qualification/drain or was repeated.'
+            Assert-True (-not (($resetCalls -join "`n").Contains("|-p|$($resetContext.Project)|down"))) 'DbReset destroyed the Compose project or PostgreSQL volume.'
+            Assert-ConfigUnchanged $resetContext $resetSnapshot
+            Assert-True ([IO.File]::ReadAllText($backup) -ceq 'retained-backup') 'Failed reset removed backups.'
+        }
     } finally {
         $script:Failure=''
         $script:MonitoredMarker=''

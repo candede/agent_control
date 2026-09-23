@@ -14,7 +14,7 @@ vi.mock("./packageInventory.js", () => ({ PackageInventoryRepository: vi.fn() })
 const scope = { tenantId: "tenant-a", principalId: "reader-a" };
 const snapshot = {
   id: "11111111-1111-4111-8111-111111111111", role_scope: "full", environment_scope: "",
-  requested_types: ["microsoft.powerapps/apps"], queried_types: ["microsoft.powerapps/apps"],
+  requested_types: ["microsoft.copilotstudio/agents"], queried_types: ["microsoft.copilotstudio/agents"],
   observed_count: 0, total_records: 0, page_count: 1, unknown_field_count: 0,
   observed_at: new Date("2026-09-20T12:00:00.000Z"), expires_at: new Date("2026-09-22T12:00:00.000Z"),
 };
@@ -22,7 +22,6 @@ const snapshot = {
 describe("saved inventory list and selection contracts", () => {
   it.each([
     ["displayName", 'display_name COLLATE "C"'],
-    ["type", 'resource_type COLLATE "C"'],
     ["environmentId", 'NULLIF(environment_id, \'\') COLLATE "C"'],
     ["createdAt", "created_at"],
     ["lastPublishedAt", "last_published_at"],
@@ -33,20 +32,18 @@ describe("saved inventory list and selection contracts", () => {
           .mockResolvedValueOnce({ rows: [snapshot] })
           .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [{ count: 0 }] })
-          .mockResolvedValueOnce({ rows: [] })
           .mockResolvedValueOnce({ rows: [] });
         const repository = new PowerPlatformInventoryRepository({ query } as unknown as pg.Pool);
         const page = await repository.list(scope, {
-          snapshotId: snapshot.id, excludeAgents: true, search: "flow", sortBy, sortDirection, limit: 50, offset: 50,
-          includeAssociations: false,
+          snapshotId: snapshot.id, search: "agent", sortBy, sortDirection, limit: 50, offset: 50,
         });
-        const [sql, values] = query.mock.calls[4]!;
+        const [sql, values] = query.mock.calls[3]!;
         expect(sql).toContain(`ORDER BY ${expression} ${sortDirection.toUpperCase()} NULLS LAST`);
         expect(sql).toContain(',resource_type COLLATE "C" ASC,environment_id COLLATE "C" ASC,native_id COLLATE "C" ASC LIMIT $5 OFFSET $6');
-        expect(sql).toContain("resource_type<>'microsoft.copilotstudio/agents'");
-        expect(values).toEqual([snapshot.id, scope.tenantId, scope.principalId, "%flow%", 50, 50]);
+        expect(sql).toContain("resource_type='microsoft.copilotstudio/agents'");
+        expect(values).toEqual([snapshot.id, scope.tenantId, scope.principalId, "%agent%", 50, 50]);
         expect(page).toMatchObject({ value: [], count: 0, snapshot: { id: snapshot.id } });
-        expect(query).toHaveBeenCalledTimes(5);
+        expect(query).toHaveBeenCalledTimes(4);
       }
     },
   );

@@ -1,5 +1,15 @@
 import type { Server } from "node:http";
 
+export function browserFixtureTestFiles(value = process.env.AGENT_CONTROL_BROWSER_TEST_FILES) {
+  if (value === undefined) return [];
+  const files = value.split(",");
+  if (!files.length || files.length > 32 || new Set(files).size !== files.length
+    || files.some(file => !/^[a-zA-Z][a-zA-Z0-9]*\.spec\.ts$/.test(file))) {
+    throw new Error("Browser fixture test selection requires 1-32 distinct spec filenames, not paths or CLI arguments.");
+  }
+  return files;
+}
+
 export function configureBrowserFixtureEnvironment(env: NodeJS.ProcessEnv = process.env) {
   if (env.AGENT_CONTROL_FIXTURE_MODE !== "browser" || env.NODE_ENV !== "test") {
     throw new Error("This fixture requires its isolated browser test entry point.");

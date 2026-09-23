@@ -5,8 +5,9 @@ import { usageCount, usageDate } from "../usageInsights";
 import { CopilotServiceDetails } from "./CopilotServiceDetails";
 import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { ReportedUserAgents, type UserRelationshipFilters } from "./ReportedUserAgents";
+import { UserAgentResponsibility } from "./UserAgentResponsibility";
 
-export function ReportedUserDetail({ user, directoryUser, hasRelationships, filters, returnFocusTo, onClose, onFocusAgent }: {
+export function ReportedUserDetail({ user, directoryUser, hasRelationships, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision }: {
   user: OfficialUsageUserSummary;
   directoryUser?: CopilotUsageUser | null;
   hasRelationships: boolean;
@@ -14,6 +15,9 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
   returnFocusTo: RefObject<HTMLInputElement | null>;
   onClose: () => void;
   onFocusAgent: (agentId: string, reportSetId: string) => void;
+  onOpenAgent?: (id: string) => void;
+  dataRevision?: number;
+  agentInventoryRevision?: number;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -53,6 +57,7 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
     {user.missingUserReport ? <p className="copilot-users-notice">This identity has no Users-report row. Its response total, agents used and user recency are unknown.</p>
       : user.hasReportMismatch ? <p className="copilot-users-notice">Report totals differ. The Users total and Users &amp; agents breakdown are shown separately, never added or reconciled by guessing.</p> : null}
     <ReportedUserAgents user={user} filters={filters} onFocusAgent={onFocusAgent} />
+    <UserAgentResponsibility objectId={directoryUser?.directory.objectId} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
     <details className="copilot-users-provenance">
       <summary>Identity and report coverage</summary>
       <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}.</p>

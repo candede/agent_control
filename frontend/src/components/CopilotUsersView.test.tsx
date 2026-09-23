@@ -1,16 +1,18 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, downloadOfficialUsageCsv, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers } from "../api/client";
+import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers } from "../api/client";
 import { downloadBlob } from "../agentExport";
 import { copilotUsageFixture, licensedUser } from "../test/copilotUsageFixture";
 import { activeWithoutPaidUsersFixture, usageAgentDetailFixture, usageUsersFixture } from "../test/usageInsightsFixture";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
+import { responsibilityFixture, responsibilityOwnerId } from "../test/agentResponsibilityFixture";
 
 vi.mock("../api/client", async importOriginal => ({
   ...await importOriginal<typeof import("../api/client")>(),
   getCopilotUsageUsers: vi.fn(),
+  getAgentResponsibility: vi.fn(),
   downloadOfficialUsageCsv: vi.fn(),
   getOfficialUsageUsers: vi.fn(),
   getOfficialUsageAgentDetail: vi.fn(),
@@ -23,6 +25,7 @@ function userRows() {
 
 describe("Paid M365 Copilot license dashboard", () => {
   beforeEach(() => {
+    vi.mocked(getAgentResponsibility).mockImplementation(async query => responsibilityFixture(query?.objectId));
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(structuredClone(copilotUsageFixture));
     vi.mocked(getOfficialUsageUsers).mockImplementation(async query => activeWithoutPaidUsersFixture(query));
     vi.mocked(getOfficialUsageAgentDetail).mockResolvedValue(usageAgentDetailFixture());
@@ -30,6 +33,27 @@ describe("Paid M365 Copilot license dashboard", () => {
     HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
   });
   afterEach(() => { vi.resetAllMocks(); });
+
+  it("deep-links a responsible person absent from paid/report cohorts without loading license or report data", async () => {
+    render(<CopilotUsersView route={{ view: "responsibility", personId: responsibilityOwnerId, search: "", page: 0 }} />);
+    expect(await screen.findByText("Responsible only")).toBeVisible();
+    expect(getCopilotUsageUsers).not.toHaveBeenCalled();
+    expect(getOfficialUsageUsers).not.toHaveBeenCalled();
+    expect(getAgentResponsibility).toHaveBeenCalledWith(expect.objectContaining({ objectId: responsibilityOwnerId }), expect.anything());
+    expect(screen.queryByLabelText("M365 Copilot license summary")).not.toBeInTheDocument();
+  });
+
+  it("adds exact responsibility alongside paid user's unchanged usage and license totals", async () => {
+    const open = vi.fn();
+    render(<CopilotUsersView onOpenAgent={open} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const dialog = screen.getByRole("dialog");
+    await within(dialog).findByText("Responsible agent");
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("200");
+    expect(getAgentResponsibility).toHaveBeenCalledWith(expect.objectContaining({ objectId: copilotUsageFixture.users[0].directory.objectId }), expect.anything());
+    await userEvent.click(within(dialog).getByRole("button", { name: "Open agent Responsible agent" }));
+    expect(open).toHaveBeenCalledWith("agent:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  });
 
   it("isolates a new data revision from a saved read kept alive by another observer", async () => {
     let completePrevious!: (value: typeof copilotUsageFixture) => void;
@@ -74,6 +98,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(within(cohort).getAllByRole("option").map(option => [option.getAttribute("value"), option.textContent])).toEqual([
       ["licenses", "Paid M365 Copilot users"],
       ["activity", "Active users without paid Copilot"],
+      ["responsibility", "Agent responsibility"],
     ]);
     expect(screen.queryByRole("button", { name: "M365 Copilot licenses" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Reported activity" })).not.toBeInTheDocument();

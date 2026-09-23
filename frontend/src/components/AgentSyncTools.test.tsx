@@ -26,6 +26,7 @@ function props(overrides: Partial<ComponentProps<typeof AgentSyncTools>> = {}): 
     onRefreshPowerPlatform: vi.fn(),
     onResumePowerPlatform: vi.fn(),
     onExportPowerPlatform: vi.fn(),
+    onInspectPowerPlatformJob: vi.fn(),
     onOpenAgents: vi.fn(),
     ...overrides,
   };

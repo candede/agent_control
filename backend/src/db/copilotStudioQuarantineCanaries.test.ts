@@ -4,6 +4,7 @@ import { testDatabase } from "../../scripts/testDatabase.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotStudioQuarantineCanaryRepository } from "./copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./copilotStudioQuarantine.js";
+import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let canaries: CopilotStudioQuarantineCanaryRepository;
@@ -51,6 +52,34 @@ describe.sequential("Copilot Studio quarantine canary repository", () => {
     expect(job).toMatchObject({ isCanary: true, action: "quarantine", total: 1 });
     await expect(jobs.submit({ tenantId: "tenant-a", principalId: "operator-a" }, { ...input, idempotencyKey: randomUUID(), confirmationHash: confirmation.confirmationHash }))
       .rejects.toMatchObject({ code: "qualification_invalidated" });
+
+    const scope = { tenantId: operator.tenantId, principalId: operator.homeAccountId };
+    const inventory = new PowerPlatformInventoryRepository(fixture.runtime);
+    for (const [types, nativeId] of [
+      [["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"], target.resourceNativeId],
+      [["microsoft.copilotstudio/agents"], "other-native-agent"],
+    ] as const) {
+      const refresh = await inventory.submit(scope, { roleScope: "full", requestedTypes: types, idempotencyKey: randomUUID() });
+      await inventory.markRunning(scope, refresh.id);
+      const published = await inventory.publish(scope, refresh.id, {
+        resources: [{
+          tenantId: scope.tenantId, nativeId, type: "microsoft.copilotstudio/agents", location: null,
+          displayName: "Canary source", environmentId: target.environmentId, createdAt: null, createdBy: null, lastPublishedAt: null,
+          sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
+          lifecycle: "published", identityConfidence: "exact_native", provenance: {}, details: {}, unknownFieldCount: 0,
+          identifiers: [{ kind: "power_platform_resource_id", value: nativeId }, { kind: "environment_id", value: target.environmentId },
+            { kind: "cds_bot_id", value: nativeId === target.resourceNativeId ? target.botId : randomUUID() }],
+        }],
+        queriedTypes: [...types], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
+      });
+      if (types.length === 2) await fixture.operator.query(
+        "UPDATE power_platform_inventory_snapshots SET observed_at=clock_timestamp()-interval '5 minutes' WHERE id=$1", [published.snapshotId],
+      );
+    }
+    const lease = await jobs.claim(scope, job.id, randomUUID());
+    const current = await jobs.beginItem(lease!);
+    // The broader two-type observation remains authoritative for canary recovery.
+    await expect(jobs.markSent(lease!, current!.item, authority)).resolves.toBeUndefined();
   });
 
   it("allows operator retention to expire an unclaimed approval", async () => {

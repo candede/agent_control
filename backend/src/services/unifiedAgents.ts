@@ -45,16 +45,19 @@ import { AuditLog } from "./auditLog.js";
 import { agentColumnValue, matchesAgentView, packageAuthoringTool, summarizeAgentAvailability, type AgentColumnValue } from "../types/agentPresentation.js";
 import { agentUsage, combineAgentInventoryRevision } from "./agentUsage.js";
 import { savedAgentPeople } from "./savedAgentPeople.js";
+import { projectAgentResponsibility } from "./agentResponsibility.js";
+import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
+import { isDirectoryObjectId } from "../types/copilotPackage.js";
 
 export type UnifiedAgentDependencies = {
   packages: Pick<PackageInventoryRepository, "readUnifiedSource">;
-  powerPlatform: Pick<PowerPlatformInventoryRepository, "readUnifiedSource">;
+  powerPlatform: Pick<PowerPlatformInventoryRepository, "readUnifiedSource" | "readAgentEnvironments">;
   resolveLinks: typeof resolvePackageAgentLinks;
   operationPackageIds: (scope: PackageDataScope, ids: readonly string[], prefix: string, database?: pg.PoolClient) => Promise<string[]>;
   registry?: Pick<UnifiedAgentRegistry, "withSnapshot" | "reconcile">;
   readRevision: typeof readUnifiedInventoryRevision;
   usage: Pick<typeof agentUsage, "project" | "revision">;
-  people?: Pick<typeof savedAgentPeople, "project">;
+  people?: Pick<typeof savedAgentPeople, "project" | "read">;
 };
 
 const defaultDependencies: UnifiedAgentDependencies = {
@@ -77,6 +80,23 @@ export class UnifiedAgentsService {
 
   async list(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery = {}): Promise<UnifiedAgentInventoryPage> {
     return this.readPage(scope, query, 250);
+  }
+
+  async responsibility(scope: PackageDataScope & InventoryDataScope, query: AgentResponsibilityQuery = {}) {
+    if (query.objectId !== undefined && !isDirectoryObjectId(query.objectId)) {
+      throw new AppError(400, "invalid_responsibility_person", "Responsibility requires an exact directory object ID.");
+    }
+    const read = async (database?: pg.PoolClient) => {
+      const baseRevision = await this.dependencies.readRevision(scope, database);
+      // Each saved source is independently bounded at 5,000 records. Do not use list's UI clamp.
+      const inventory = await this.listSnapshot(scope, { limit: 10_000 }, 10_000, undefined, database);
+      const evidence = query.objectId && this.dependencies.people
+        ? (await this.dependencies.people.read(scope, [query.objectId], database)).get(query.objectId.toLowerCase()) : undefined;
+      const result = projectAgentResponsibility(inventory, query, evidence);
+      if (await this.dependencies.readRevision(scope, database) !== baseRevision) throw inventoryChanged();
+      return result;
+    };
+    return this.dependencies.registry ? this.dependencies.registry.withSnapshot(scope, read) : read();
   }
 
   async forExport(scope: PackageDataScope & InventoryDataScope, revision: string, query: UnifiedAgentInventoryQuery = {}, recordIds?: readonly string[]) {
@@ -172,10 +192,14 @@ export class UnifiedAgentsService {
     const usage = await this.dependencies.usage.project(scope, canonicalRecords, database);
     const enrichedRecords = this.dependencies.people
       ? await this.dependencies.people.project(scope, canonicalRecords, database) : canonicalRecords;
+    const environmentContext = await this.dependencies.powerPlatform.readAgentEnvironments(scope,
+      [...new Set(enrichedRecords.flatMap(record => record.environmentId ? [record.environmentId] : []))], database);
+    const environmentNames = Object.fromEntries(Object.entries(environmentContext).flatMap(([id, environment]) =>
+      environment.displayName?.trim() ? [[id, environment.displayName.trim()]] : []));
     const records = enrichedRecords.map(record => {
       const summary = usage.summaries.get(record.id);
       if (!summary) throw new AppError(500, "agent_usage_projection_incomplete", "Saved usage did not account for every authorized inventory agent.");
-      return { ...record, usage: summary };
+      return { ...record, environment: record.environmentId ? environmentContext[record.environmentId.toLowerCase()] ?? null : null, usage: summary };
     });
     const revision = combineAgentInventoryRevision(baseRevision, usage.context.revision);
     const selected = recordIds ? exactSelection(records, recordIds) : undefined;
@@ -186,7 +210,7 @@ export class UnifiedAgentsService {
       const key = record.environmentId.toLocaleLowerCase("en-US");
       if (!environments.has(key)) environments.set(key, {
         value: record.environmentId,
-        label: powerPlatformSource.environmentNames[key] ?? record.environmentId,
+        label: environmentNames[key] ?? record.environmentId,
       });
     }
     const platforms = new Map(packageFacets(usablePackages).platforms.map(option => [normalizePackageAuthoringTool(option.value), option]));
@@ -202,7 +226,7 @@ export class UnifiedAgentsService {
     const filtered = records.filter(record => (!selected || selected.has(record)) && matches(record, query)
       && (!referenceIds || record.packages.some(value => referenceIds.has(value.id))));
     const filteredSummary = summarize(filtered);
-    const sorted = [...filtered].sort(recordComparator(query, powerPlatformSource.environmentNames));
+    const sorted = [...filtered].sort(recordComparator(query, environmentNames));
     const limit = Math.min(Math.max(query.limit ?? 50, 1), maximumLimit);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected).length;
@@ -642,7 +666,7 @@ function emptyPackageSource(): UnifiedPackageSourceResult {
 }
 
 function emptyPowerPlatformSource(): UnifiedPowerPlatformSourceResult {
-  return { resources: [], environmentNames: {}, snapshot: null };
+  return { resources: [], snapshot: null };
 }
 
 function ordinal(left: string, right: string) {

@@ -409,7 +409,9 @@ function Remove-ExpiredLocalBackups {
 }
 
 function Invoke-LocalDeployment {
-    param($Context,[string]$Action,[string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset)
+    param($Context,[string]$Action,[string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[string]$ConfirmReset,[switch]$DbReset)
+    if ($DbReset -and $Action -ne 'Deploy') { throw '-DbReset is supported only by the start deployment workflow.' }
+    $Context.DbResetStarted = $false
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Install and start the company-approved Docker engine/Desktop and Compose v2 before continuing.' }
     Invoke-DockerCommand @('info','--format','{{.ServerVersion}}') | Out-Null
     $composeVersion = Invoke-DockerCommand @('compose','version','--short') -Capture
@@ -441,11 +443,27 @@ function Invoke-LocalDeployment {
         return
     }
     if ($Action -eq 'Deploy') {
-        Write-Host '[DEPLOYMENT] Entering maintenance, draining the app and applying forward database migrations.'
+        if ($DbReset) {
+            Write-Warning "Explicit database reset requested for project '$($Context.Project)', database 'agentcontrol'. All saved application data, reports, audit history, jobs and sessions will be deleted. Project configuration, secrets and backup files are retained."
+        }
+        $preflight = if ($DbReset) { @('preflight-reset','agentcontrol') } else { @('preflight') }
+        Write-Host '[DATABASE PREFLIGHT] Checking the database target before changing maintenance or stopping the app.'
+        try {
+            Invoke-DockerCommand ($Context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
+            Invoke-LocalOperator $Context (@('backend/scripts/database.ts') + $preflight)
+        } catch {
+            throw "Database preflight failed for project '$($Context.Project)': $($_.Exception.Message) This attempt has not changed maintenance or stopped the app. Review the database diagnostic above; no data was reset."
+        }
+        Write-Host '[DEPLOYMENT] Entering maintenance and draining the app before database initialization.'
         [IO.File]::WriteAllText($marker,'maintenance')
         Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
         Assert-LocalPort $Context.Port
-        Invoke-DockerCommand ($Context.Compose + @('up','-d','--wait','--wait-timeout','90','postgres'))
+        if ($DbReset) {
+            Write-Host "[DATABASE RESET] Recreating only '$($Context.Project)/agentcontrol'; project configuration and PostgreSQL roles are retained."
+            $Context.DbResetStarted = $true
+            Invoke-LocalOperator $Context @('backend/scripts/database.ts','reset','agentcontrol')
+            Write-Host '[DATABASE RESET] Empty database created. Applying the fresh schema and runtime grants.'
+        }
         Invoke-LocalOperator $Context @('backend/scripts/database.ts','migrate')
     }
     if ($Action -eq 'Retain') {

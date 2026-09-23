@@ -65,7 +65,7 @@ test("paid users remain searchable beyond four thousand without exposing checked
   const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
   const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
   await expect(cohort).toHaveValue("licenses");
-  await expect(cohort.locator("option")).toHaveText(["Paid M365 Copilot users", "Active users without paid Copilot"]);
+  await expect(cohort.locator("option")).toHaveText(["Paid M365 Copilot users", "Active users without paid Copilot", "Agent responsibility"]);
   const active = page.getByText("Active M365 Copilot licensed users", { exact: true }).locator("..");
   await expect(active.locator("strong")).toHaveText("4,053");
   await expect(table.locator("tbody tr")).toHaveCount(50);
@@ -248,6 +248,8 @@ test("report permission recovery is visible without hiding service assignments",
 
 test("the active nonpaid cohort excludes paid and unknown identities and explains incomplete coverage", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
+  const responsibilityReads: string[] = [];
+  page.on("request", request => { if (new URL(request.url()).pathname === "/api/agent-responsibility") responsibilityReads.push(request.url()); });
   await mockReportedUsers(page);
   await page.goto("/users?view=activity");
   const table = page.getByRole("region", { name: "Active users without paid Copilot", exact: true }).and(page.locator(".copilot-users-table-shell"));
@@ -263,6 +265,8 @@ test("the active nonpaid cohort excludes paid and unknown identities and explain
   await expect(details.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
   await expect(details.getByText("License not verified", { exact: true })).toHaveCount(0);
   await expect(details.getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toHaveCount(0);
+  await expect(details.getByText(/Responsibility unavailable: no exact verified directory object ID/)).toBeVisible();
+  expect(responsibilityReads).toEqual([]);
   expect(unexpected).toEqual([]);
 });
 
@@ -374,6 +378,7 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
   expect(measurements.some(read => read.offset === 50)).toBe(true);
   expect(measurements.some(read => read.relationships >= 1_005)).toBe(true);
   await info.attach("reported-users-scale.json", { body: JSON.stringify(measurements, null, 2), contentType: "application/json" });
+  await agents.getByRole("button", { name: `${largeAgentName}: active users without paid Copilot`, exact: true }).hover();
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("reported-user-agent-detail.png"), fullPage: true });
   await page.keyboard.press("Escape");

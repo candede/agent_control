@@ -19,10 +19,14 @@ describe("workbench metadata", () => {
     const metadata = getWorkbenchMetadata();
     expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds);
     expect(metadata.views.map(view => view.id)).toEqual([
-      "agents", "power-platform", "users", "sync", "audit", "security", "permissions", "jobs",
+      "agents", "users", "sync", "audit", "security", "permissions", "jobs",
     ]);
     expect(metadata.views[0]).toMatchObject({ id: "agents", path: "/agents" });
     expect(new Set(metadata.views.map(view => view.path)).size).toBe(metadata.views.length);
+    expect(metadata.views.find(view => view.id === "users")).toMatchObject({
+      path: "/users", roles: ["AgentControl.Viewer"],
+      source: expect.stringContaining("exact saved Power Platform agent responsibility"),
+    });
     expect(metadata.views.find(view => view.id === "sync")).toMatchObject({
       path: "/sync", roles: ["AgentControl.Viewer"],
       source: expect.stringContaining("report import, management, and snapshot inspection"),
