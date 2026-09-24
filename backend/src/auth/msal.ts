@@ -9,8 +9,8 @@ import {
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { authConfigured, config, loginScopes } from "../config.js";
 import { AppError } from "../errors.js";
-import { authFlowLifetimeMs } from "./flows.js";
-import { capabilityDefinitions, getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
+import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, authenticationScopes, authFlowLifetimeMs } from "./flows.js";
+import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import type { CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser, AuthFlow } from "../types/session.js";
@@ -84,53 +84,44 @@ export function capabilityScopes(capabilityId: CapabilityId) {
   return definition.permissions.map(permission => `${resource}/${permission}`);
 }
 
-export function createAuthFlow(kind: "login" | "consent", options: { capabilityId?: CapabilityId; accountId?: string; returnTo?: string } = {}): AuthFlow {
-  const scopes = kind === "login"
-    ? [...loginScopes, "offline_access", ...capabilityScopes("graph.directory.read")]
-    : ["openid", "profile", "offline_access", ...capabilityScopes(options.capabilityId!)];
-  const extraScopesToConsent = kind === "login"
-    ? [...new Set(capabilityDefinitions.filter(definition => definition.mode === "delegated"
-      && definition.probe.adapterRegistered)
-      .flatMap(definition => capabilityScopes(definition.id)))].filter(scope => !scopes.includes(scope))
-    : undefined;
+export function createAuthFlow(kind: "login", options: { returnTo?: string } = {}): AuthFlow {
+  if (kind !== "login" || Object.keys(options).some(key => key !== "returnTo")) throw adminManagedPermissionsError();
   return {
     kind,
     state: randomValue(),
     nonce: randomValue(),
     codeVerifier: randomValue(),
-    scopes,
-    ...(extraScopesToConsent ? { extraScopesToConsent } : {}),
+    scopes: [...authenticationScopes],
     createdAt: Date.now(),
     returnTo: safeReturnPath(options.returnTo),
-    capabilityId: options.capabilityId,
-    accountId: options.accountId,
   };
 }
 
 export async function createAuthorizationUrl(flow: AuthFlow) {
+  assertLoginAuthFlow(flow);
   const url = await getMsalClient().getAuthCodeUrl({
-    scopes: flow.scopes,
-    ...(flow.extraScopesToConsent ? { extraScopesToConsent: flow.extraScopesToConsent } : {}),
+    scopes: [...authenticationScopes],
     redirectUri: config.redirectUri,
     state: flow.state,
     nonce: flow.nonce,
     codeChallenge: createHash("sha256").update(flow.codeVerifier).digest("base64url"),
     codeChallengeMethod: "S256",
-    ...(flow.kind === "login" ? { prompt: "select_account" } : {}),
+    prompt: "select_account",
   });
   return validateAuthorizationUrl(url);
 }
 
 export async function redeemAuthorizationCode(code: string, flow: AuthFlow) {
+  assertLoginAuthFlow(flow);
   if (Date.now() - flow.createdAt > authFlowLifetimeMs) throw new AppError(400, "expired_auth_state", "The authentication request expired. Start again.");
   const result = await getMsalClient().acquireTokenByCode({
     code,
-    scopes: flow.scopes,
+    scopes: [...authenticationScopes],
     redirectUri: config.redirectUri,
     codeVerifier: flow.codeVerifier,
   });
 
-  validateAuthenticationPrincipal(result, flow.kind === "consent" ? flow.accountId : undefined);
+  validateAuthenticationPrincipal(result);
   const claims = result.idTokenClaims as { nonce?: unknown; tid?: unknown } | undefined;
   if (claims?.nonce !== flow.nonce) throw AppError.unauthorized("Microsoft Entra ID returned an invalid nonce.");
 
@@ -252,13 +243,17 @@ function validateAuthenticationPrincipal(result: AuthenticationResult | null, ex
 }
 
 function validateTokenResult(result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
-  if (!result?.accessToken) throw interactionRequired();
+  if (!result?.accessToken) {
+    if (mode === "application") throw new AppError(502, "identity_provider_error",
+      "Microsoft Entra ID did not return an application token. An administrator must verify the existing app registration and its credentials.");
+    throw interactionRequired();
+  }
   if (result.tenantId !== config.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
   if (!(result.expiresOn instanceof Date) || !Number.isFinite(result.expiresOn.getTime())) {
     throw new AppError(502, "identity_provider_error", "Microsoft Entra ID returned invalid token expiry metadata.");
   }
   if (result.expiresOn.getTime() <= Date.now()) {
-    throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in or grant consent again.");
+    throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in again.");
   }
 
   const claims = tryDecodeJwtPayload(result.accessToken);
@@ -318,7 +313,8 @@ function validateApplicationScopeMetadata(scopes: string[], audience: string) {
 function requirePermission(granted: Set<string>, permissions: string[], accepted: string[]) {
   const hasRequired = permissions.every(permission => granted.has(permission.toLowerCase()));
   const hasAccepted = accepted.some(permission => granted.has(permission.toLowerCase()));
-  if (!hasRequired && !hasAccepted) throw new AppError(403, "missing_permission", "The token does not contain the capability's required permission.");
+  if (!hasRequired && !hasAccepted) throw new AppError(403, "missing_permission",
+    `The token does not contain the required permission: ${permissions.join(", ")}. ${adminManagedPermissionsMessage}`);
 }
 
 function validateOptionalProviderClaims(claims: Record<string, unknown> | undefined, mode: "delegated" | "application", audience: string) {
@@ -330,7 +326,7 @@ function validateOptionalProviderClaims(claims: Record<string, unknown> | undefi
   }
   const now = Math.floor(Date.now() / 1000);
   if (typeof claims.exp === "number" && claims.exp <= now) {
-    throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in or grant consent again.");
+    throw new AppError(401, "authorization_expired", "Microsoft authorization expired. Sign in again.");
   }
   if (typeof claims.nbf === "number" && claims.nbf > now) {
     throw new AppError(502, "authorization_not_yet_valid", "The Microsoft token is not yet valid. Check the application host clock before retrying.");
@@ -373,12 +369,17 @@ function normalizeTokenError(error: unknown) {
     : "errorMessage" in fields && typeof fields.errorMessage === "string" ? fields.errorMessage.match(/\bAADSTS(\d{5,9})\b/)?.[1] : undefined;
   const correlationId = "correlationId" in fields && typeof fields.correlationId === "string"
     && /^[a-zA-Z0-9-]{1,128}$/.test(fields.correlationId) ? fields.correlationId : undefined;
+  const httpStatus = "status" in fields && typeof fields.status === "number" && Number.isInteger(fields.status)
+    && fields.status >= 400 && fields.status <= 599 ? fields.status : undefined;
   const details = {
     ...(correlationId ? { correlationId } : {}),
+    ...(httpStatus === undefined ? {} : { httpStatus }),
     ...(errorNo && /^\d{5,9}$/.test(errorNo) ? { providerErrorCode: `AADSTS${errorNo}` } : {}),
+    ...(["request_timeout", "network_error", "no_network_connectivity", "temporarily_unavailable", "server_error"].includes(code)
+      ? { retryable: true } : {}),
   };
   if (code === "consent_required" || subError === "consent_required" || ["65001", "65004", "90094"].includes(errorNo ?? "")) {
-    return new AppError(403, "missing_permission", "Microsoft Entra ID requires consent for this delegated capability.", details);
+    return new AppError(403, "missing_permission", adminManagedPermissionsMessage, details);
   }
   if (["700082", "700084", "70043", "50173"].includes(errorNo ?? "")) {
     return new AppError(401, "authorization_expired", "Microsoft authorization expired or was revoked. Sign in again.", details);
@@ -386,11 +387,12 @@ function normalizeTokenError(error: unknown) {
   if (["interaction_required", "login_required", "no_tokens_found", "invalid_grant"].includes(code)
     || ["interaction_required", "login_required", "basic_action", "additional_action"].includes(subError)
     || ["50076", "50079", "50158", "53000", "53001", "53003"].includes(errorNo ?? "")) {
-    return new AppError(401, "interaction_required", "Microsoft Entra ID requires interactive authorization. Continue sign-in or contact your administrator about Conditional Access.", details);
+    return new AppError(401, "interaction_required", "Sign in again to complete MFA or account verification. Contact your administrator if Conditional Access blocks sign-in; this is not a request for API permissions.", details);
   }
+  if (httpStatus === 429) return new AppError(429, "provider_throttled", "Microsoft Entra ID throttled token acquisition. Wait for the provider cooldown before retrying.", details);
   return new AppError(502, "identity_provider_error", "Microsoft Entra ID could not complete token acquisition.", details);
 }
 
 function interactionRequired() {
-  return new AppError(401, "interaction_required", "Microsoft authorization is required for this capability.");
+  return new AppError(401, "interaction_required", "Sign in again to renew the account session or complete MFA. API permission grants remain administrator-managed.");
 }

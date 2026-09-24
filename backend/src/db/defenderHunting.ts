@@ -24,6 +24,8 @@ export type DefenderHuntingReadScope = {
   resultScopes: DefenderHuntingResultScope[];
   qualifications?: Array<{ resultScope: DefenderHuntingResultScope; authority: DefenderHuntingAuthorityBinding }>;
   inventoryIdentityScope?: InventoryIdentityReadScope;
+  entraAgentIds?: string[];
+  entraAgentApplicationIds?: string[];
 };
 
 export type DefenderHuntingExecution = { owner: string; version: number };
@@ -384,6 +386,7 @@ export class DefenderHuntingRepository {
       WHERE row.snapshot_id=$1 AND row.tenant_id=$2 AND row.result_scope_kind=$3 AND row.result_scope_id=$4
         AND row.result_scope_configuration_revision IS NOT DISTINCT FROM $5 ORDER BY row.row_ordinal LIMIT $6 OFFSET $7`,
     [job.snapshotId, readScope.tenantId, job.resultScope.kind, job.resultScope.scopeId, job.resultScope.configurationRevision, boundedLimit, boundedOffset]);
+    if (readScope.entraAgentIds || readScope.entraAgentApplicationIds) validatePublicationRows(rows.rows.map(value => value.row_data), job.filters, readScope.tenantId);
     const associations = await this.resolveAssociations(readScope, rows.rows.map(value => value.row_data));
     return { value: rows.rows.map((value, index) => ({ ...value.row_data, association: associations[index] })), count: job.storedRowCount,
       limit: boundedLimit, offset: boundedOffset, job, snapshot: projectSnapshot(snapshotResult.rows[0]) };
@@ -449,7 +452,7 @@ export class DefenderHuntingRepository {
           ...(row.agentBlueprintId ? [{ kind: "entra_blueprint_id" as const, value: row.agentBlueprintId }] : [])];
       const resolution = resolveExactInventoryIdentity({ nativeId: row.sourceTable === "AgentsInfo" ? row.agentId : row.reportId ?? row.spanId ?? "unidentified",
         tenantId: scope.tenantId, environmentId: null, sourceSystem: "defender_hunting", resourceType: `microsoft.defender/${row.sourceTable}`, identifiers },
-      identities, { documentedCrossSourceKinds: ["entra_agent_id"], blueprintParentAcrossSources: true });
+      identities, { blueprintParentAcrossSources: true });
       if (resolution.status === "resolved") return { status: "resolved" as const, sourceSystem: resolution.candidate.sourceSystem as "power_platform" | "graph_packages",
         nativeId: resolution.candidate.nativeId, resourceType: resolution.candidate.resourceType, environmentId: resolution.candidate.environmentId, matchedKind: "entra_agent_id" as const };
       if (resolution.status === "ambiguous") return { status: "ambiguous" as const, reason: resolution.reason, candidateCount: resolution.candidateCount ?? resolution.candidates.length };
@@ -488,7 +491,7 @@ function validateSubmissionBinding(scope: DefenderHuntingScope, filters: Defende
     return;
   }
   if (!qualification) throw new AppError(400, "invalid_qualification", "Hunting qualification approval is invalid.");
-  const targetCount = filters.agentIds.length + filters.blueprintIds.length + filters.actorObjectIds.length;
+  const targetCount = filters.agentIds.length + (filters.entraAgentIds?.length ?? 0) + (filters.entraAgentApplicationIds?.length ?? 0) + filters.blueprintIds.length + filters.actorObjectIds.length;
   if (targetCount === 0 || (scope.tokenMode === "delegated") !== (qualification.capabilityId === "defender.hunting.delegated")
     || !/^[a-f0-9]{64}$/.test(qualification.contractRevision) || !/^[a-f0-9]{64}$/.test(qualification.permissionRevision)
     || !Number.isSafeInteger(qualification.configurationRevision) || qualification.configurationRevision < 1
@@ -535,21 +538,46 @@ function scopedWhere(scope: DefenderHuntingReadScope, alias = "job", requireQual
     return `(${alias}.result_scope_kind=$${offset} AND ${alias}.result_scope_id=$${offset + 1} AND ${alias}.result_scope_configuration_revision IS NOT DISTINCT FROM $${offset + 2})`;
   });
   const qualification = requireQualification ? retainedVisibilityPredicate(scope, alias, values) : "";
-  return { sql: `${alias}.tenant_id=$1 AND (${clauses.join(" OR ")})${requireQualification ? qualification ? ` AND (${qualification})` : " AND false" : ""}`, values };
+  const agent = agentScopePredicate(scope, `${alias}.filters`, values);
+  return { sql: `${alias}.tenant_id=$1 AND (${clauses.join(" OR ")})${requireQualification ? qualification ? ` AND (${qualification})` : " AND false" : ""}${agent}`, values };
 }
 
 function qualificationWhere(scope: DefenderHuntingReadScope) {
   validateReadScope(scope);
   const values: unknown[] = [scope.tenantId];
   const predicate = qualificationEvidencePredicate(scope, "evidence", values);
-  return { sql: `evidence.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}`, values };
+  const agent = agentScopePredicate(scope, "evidence.approved_scope", values);
+  return { sql: `evidence.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}${agent}`, values };
 }
 
 function retainedScopeWhere(scope: DefenderHuntingReadScope, alias: string) {
   validateReadScope(scope);
   const values: unknown[] = [scope.tenantId];
   const predicate = retainedAuthorityPredicate(scope, alias, values);
-  return { sql: `${alias}.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}`, values };
+  const agent = agentScopePredicate(scope, `${alias}.approved_scope`, values);
+  return { sql: `${alias}.tenant_id=$1${predicate ? ` AND (${predicate})` : " AND false"}${agent}`, values };
+}
+
+function agentScopePredicate(scope: DefenderHuntingReadScope, filters: string, values: unknown[]) {
+  if (scope.entraAgentIds === undefined && scope.entraAgentApplicationIds === undefined) return "";
+  const objects = scope.entraAgentIds ?? [];
+  const applications = scope.entraAgentApplicationIds ?? [];
+  if (!objects.length && !applications.length || [objects, applications].some(ids => ids.length > 1
+    || ids.some(id => !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)))) {
+    throw new AppError(403, "scope_mismatch", "An exact server-derived Entra agent identity is required.");
+  }
+  const clauses: string[] = [];
+  if (objects.length) {
+    values.push(JSON.stringify(objects));
+    clauses.push(`(${filters}->>'templateId'='agents_inventory' AND ${filters}->'entraAgentIds'=$${values.length}::jsonb
+      AND COALESCE(${filters}->'entraAgentApplicationIds','[]'::jsonb)='[]'::jsonb)`);
+  }
+  if (applications.length) {
+    values.push(JSON.stringify(applications));
+    clauses.push(`(${filters}->>'templateId' IN ('agent_activity','agent_tools') AND ${filters}->'entraAgentApplicationIds'=$${values.length}::jsonb
+      AND COALESCE(${filters}->'entraAgentIds','[]'::jsonb)='[]'::jsonb)`);
+  }
+  return ` AND (${clauses.join(" OR ")}) AND ${filters}->'agentIds'='[]'::jsonb AND ${filters}->'blueprintIds'='[]'::jsonb`;
 }
 
 function qualificationEvidencePredicate(scope: DefenderHuntingReadScope, alias: string, values: unknown[]) {
@@ -644,7 +672,9 @@ function priorSuccessfulJobSelect(alias: string) {
 
 export function huntingTargetScope(filters: DefenderHuntingFilters) {
   return { templateId: filters.templateId, agentIds: [...filters.agentIds].sort(ordinal), blueprintIds: [...filters.blueprintIds].sort(ordinal),
-    actorObjectIds: [...filters.actorObjectIds].sort(ordinal), operations: [...filters.operations].sort(ordinal) };
+    actorObjectIds: [...filters.actorObjectIds].sort(ordinal), operations: [...filters.operations].sort(ordinal),
+    ...(filters.entraAgentIds !== undefined ? { entraAgentIds: [...filters.entraAgentIds].sort(ordinal) } : {}),
+    ...(filters.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...filters.entraAgentApplicationIds].sort(ordinal) } : {}) };
 }
 
 export function huntingTargetScopeHash(filters: DefenderHuntingFilters) {
@@ -676,6 +706,7 @@ const activityFieldStateKeys = ["conversationId", "conversationThreadId", "chann
 const activityFieldStates = new Set(["value", "null", "empty", "unavailable"]);
 
 function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHuntingFilters, tenantId: string) {
+  if (filters.templateId === "agents_inventory" ? filters.entraAgentApplicationIds?.length : filters.entraAgentIds?.length) throw invalidPublication();
   const expectedSource = defenderHuntingTemplates[filters.templateId].sourceTable;
   const start = Date.parse(filters.startDateTime); const end = Date.parse(filters.endDateTime);
   for (const row of rows) {
@@ -688,6 +719,7 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
     if (row.sourceTable === "AgentsInfo") {
       if (!row.agentId || row.agentId.length > 512 || !isExactStateRecord(row.detailStates, inventoryDetailStateKeys, inventoryDetailStates)
         || filters.agentIds.length && !filters.agentIds.includes(row.agentId)
+        || filters.entraAgentIds?.length && (!row.entraAgentObjectId || !filters.entraAgentIds.includes(row.entraAgentObjectId.toLowerCase()))
         || filters.blueprintIds.length && (!row.entraBlueprintId || !filters.blueprintIds.includes(row.entraBlueprintId))) throw invalidPublication();
       continue;
     }
@@ -698,6 +730,7 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
     if (!filters.operations.includes(row.actionType) || !row.operation || !expectedOperations.includes(row.operation)
       || row.organizationId && row.organizationId !== tenantId.toLowerCase()
       || filters.agentIds.length && !agents.some(value => value && filters.agentIds.includes(value))
+      || filters.entraAgentApplicationIds?.length && ![row.targetAgentId, row.agentId].some(value => value && filters.entraAgentApplicationIds!.includes(value.toLowerCase()))
       || filters.blueprintIds.length && !blueprints.some(value => value && filters.blueprintIds.includes(value))
       || filters.actorObjectIds.length && ![row.actorAccountObjectId, row.humanActorUserObjectId].some(value => value && filters.actorObjectIds.includes(value))
       || row.rootSpanObserved !== rootSpanObserved || row.spanRole !== (rootSpanObserved ? "root_invoke_agent" : row.parentSpanId ? "child" : "unresolved")

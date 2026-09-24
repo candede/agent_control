@@ -4,6 +4,7 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import type { CapabilityId, CapabilityView, SessionUser } from "./api/client";
 import { providerActionAllowed } from "./capabilityState";
 import { useCapabilities } from "./useCapabilities";
+import { permissionIssues } from "./permissionIssues";
 
 const user: SessionUser = {
   displayName: "Fixture",
@@ -34,6 +35,171 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+it("exposes the running check identity and retry mode only for the current session", async () => {
+  let release!: (response: Response) => void;
+  const held = new Promise<Response>(resolve => { release = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.startsWith("/api/capabilities/check")
+    ? held : Response.json({ value: [available()] })));
+  const { result, rerender } = renderHook(({ principal }: { principal: SessionUser | undefined }) => useCapabilities(principal),
+    { initialProps: { principal: user as SessionUser | undefined } });
+  await waitFor(() => expect(result.current.activeCheck).toMatchObject({ id: 1, retryFailed: false }));
+  rerender({ principal: undefined });
+  expect(result.current.activeCheck).toBeUndefined();
+  await act(async () => release(Response.json({ value: [available()] })));
+  expect(result.current.activeCheck).toBeUndefined();
+});
+
+it("gives a manual recheck a new run identity and hides completed progress", async () => {
+  let release!: (response: Response) => void;
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.startsWith("/api/capabilities/check")
+    ? new Promise<Response>(resolve => { release = resolve; }) : Response.json({ value: [available()] })));
+  const { result } = renderHook(() => useCapabilities(user));
+  await waitFor(() => expect(result.current.activeCheck).toEqual({ id: 1, retryFailed: false }));
+  await act(async () => release(Response.json({ value: [available()] })));
+  expect(result.current.activeCheck).toBeUndefined();
+  let reload!: Promise<void>;
+  await act(async () => { reload = result.current.reload(); });
+  expect(result.current.activeCheck).toEqual({ id: 2, retryFailed: true });
+  await act(async () => {
+    release(Response.json({ value: [available()] }));
+    await reload;
+  });
+  expect(result.current.activeCheck).toBeUndefined();
+});
+
+it("refreshes reported operation issues on page entry without duplicating the initial check", async () => {
+  let operationFailure: CapabilityView["operationFailure"];
+  const fetchMock = vi.fn(async () => Response.json({ value: [{ ...available(), operationFailure }] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => result.current.refreshOnOpen?.());
+  await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  operationFailure = { status: "missing_role", checkedAt: new Date(Date.now() - 1000).toISOString(),
+    expiresAt: new Date(Date.now() + 60000).toISOString(), remediation: [] };
+  await act(async () => result.current.refreshOnOpen?.());
+  expect(fetchMock).toHaveBeenCalledTimes(4);
+  expect(permissionIssues(result.current.views, result.current.now)[0]?.decision.status).toBe("missing_role");
+  operationFailure = undefined;
+  await act(async () => result.current.refreshOnOpen?.());
+  expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
+  expect(fetchMock).toHaveBeenCalledTimes(6);
+});
+
+it("expires an operation issue without running its on-demand operation or another provider check", async () => {
+  vi.useFakeTimers();
+  const view = available(undefined, "graph.licenses.read");
+  view.decision = { capabilityId: view.definition.id, status: "available", authorized: true, fresh: true,
+    verification: "on_demand", previewQualification: "not_required", remediation: [] };
+  view.operationFailure = { status: "missing_license", checkedAt: new Date(Date.now() - 1000).toISOString(),
+    expiresAt: new Date(Date.now() + 1000).toISOString(), remediation: [] };
+  const fetchMock = vi.fn(async () => Response.json({ value: [view] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  expect(permissionIssues(result.current.views, result.current.now)).toHaveLength(1);
+  expect(providerActionAllowed(result.current.views[0])).toBe(true);
+  await act(() => vi.advanceTimersByTimeAsync(1001));
+  expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it.each(["catalog", "check"] as const)("retries a transient %s failure without showing a one-off warning", async phase => {
+  vi.useFakeTimers();
+  let attempts = 0;
+  const fetchMock = vi.fn(async (url: string) => {
+    const target = phase === "catalog" ? url === "/api/capabilities" : url.startsWith("/api/capabilities/check");
+    if (target && ++attempts === 1) return Response.json({ code: "temporarily_unavailable" }, { status: 503 });
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  expect(result.current.error).toBeUndefined();
+  expect(result.current.loading || result.current.pending).toBe(true);
+  await act(() => vi.advanceTimersByTimeAsync(999));
+  expect(attempts).toBe(1);
+  expect(result.current.error).toBeUndefined();
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(attempts).toBe(2);
+  expect(fetchMock).toHaveBeenCalledTimes(3);
+  expect(result.current.error).toBeUndefined();
+  expect(result.current.pending).toBe(false);
+  expect(result.current.loading).toBe(false);
+  expect(result.current.awaitingInitialCheck).toBeUndefined();
+});
+
+it("reports a persistent transport failure only after retry, without inventing a grant failure", async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url.startsWith("/api/capabilities/check")) throw new TypeError("Synthetic network outage");
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  expect(result.current.error).toBeUndefined();
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(result.current.error).toBe("Permission checks failed after retrying. Use Check status to retry.");
+  expect(result.current.views).toHaveLength(1);
+  expect(permissionIssues(result.current.views, result.current.now, result.current.awaitingInitialCheck)).toEqual([]);
+  await act(() => vi.advanceTimersByTimeAsync(5000));
+  expect(fetchMock).toHaveBeenCalledTimes(3);
+});
+
+it("cancels a queued retry when the current session is removed", async () => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url.startsWith("/api/capabilities/check")) throw new TypeError("Synthetic network outage");
+    return Response.json({ value: [available()] });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { result, rerender } = renderHook(({ principal }: { principal: SessionUser | undefined }) => useCapabilities(principal),
+    { initialProps: { principal: user as SessionUser | undefined } });
+  await act(async () => {});
+  expect(result.current.pending).toBe(true);
+  rerender({ principal: undefined });
+  await act(() => vi.advanceTimersByTimeAsync(5000));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(result.current.views).toEqual([]);
+  expect(result.current.pending).toBe(false);
+  expect(result.current.error).toBeUndefined();
+});
+
+it.each([400, 401, 403, 429])("does not retry deterministic/security/throttling API failure %s", async status => {
+  vi.useFakeTimers();
+  const fetchMock = vi.fn(async (url: string) => url.startsWith("/api/capabilities/check")
+    ? Response.json({ code: "request_denied", detail: "Synthetic rejection" }, { status })
+    : Response.json({ value: [available()] }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await act(async () => {});
+  expect(result.current.error).toBeDefined();
+  expect(result.current.error).not.toContain("after retrying");
+  await act(() => vi.advanceTimersByTimeAsync(5000));
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it("confirms a cached transient failure with retry=failed before exposing it as an issue", async () => {
+  let settle!: (value: Response) => void;
+  const failed = available();
+  failed.decision = { ...failed.decision, status: "provider_error", authorized: false, verification: undefined,
+    evidence: { category: "provider_timeout" } };
+  const fetchMock = vi.fn(async (url: string) => url === "/api/capabilities"
+    ? Response.json({ value: [failed] })
+    : new Promise<Response>(resolve => { settle = resolve; }));
+  vi.stubGlobal("fetch", fetchMock);
+  const { result } = renderHook(() => useCapabilities(user));
+  await waitFor(() => expect(result.current.pending).toBe(true));
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/capabilities", "/api/capabilities/check?retry=failed"]);
+  expect(permissionIssues(result.current.views, result.current.now, result.current.awaitingInitialCheck)).toEqual([]);
+  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
+  await act(async () => settle(Response.json({ value: [available()] })));
+  expect(result.current.awaitingInitialCheck).toBeUndefined();
+  expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
+  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
 });
 
 it("loads decisions then runs one bounded automatic check", async () => {
@@ -398,7 +564,7 @@ it.each(["principal change", "reload"] as const)("clears a cancelled check's pen
     rerender({ principal: { ...user, homeAccountId: "fixture-b" } });
     await act(async () => {});
   }
-  expect(result.current.error).toContain("Capability status could not be loaded");
+  await waitFor(() => expect(result.current.error).toContain("Permission checks could not be loaded"), { timeout: 2000 });
   expect(result.current.loading).toBe(false);
   expect(result.current.pending).toBe(false);
 });
@@ -414,7 +580,7 @@ it("surfaces a failed reload that supersedes the initial catalog request and per
         initialSignal = init?.signal ?? undefined;
         return new Promise<Response>(resolve => { resolveInitialRead = resolve; });
       }
-      if (reads === 2) throw new Error("Synthetic catalog outage");
+      if (reads === 2 || reads === 3) throw new Error("Synthetic catalog outage");
     }
     return Response.json({ value: [available()] });
   });
@@ -426,16 +592,16 @@ it("surfaces a failed reload that supersedes the initial catalog request and per
   expect(initialSignal?.aborted).toBe(true);
   expect(result.current.loading).toBe(false);
   expect(result.current.pending).toBe(false);
-  expect(result.current.error).toContain("Capability status could not be loaded");
+  expect(result.current.error).toContain("Permission checks could not be loaded");
 
   await act(async () => resolveInitialRead(Response.json({ value: [available()] })));
   expect(result.current.views).toEqual([]);
-  expect(result.current.error).toContain("Capability status could not be loaded");
+  expect(result.current.error).toContain("Permission checks could not be loaded");
   await act(async () => result.current.reload());
   expect(result.current.views).toHaveLength(1);
   expect(result.current.error).toBeUndefined();
   expect(result.current.loading).toBe(false);
-  expect(fetchMock).toHaveBeenCalledTimes(4);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
 });
 
 it("preserves loaded decisions and retries an expiry failure once without looping", async () => {
@@ -450,16 +616,19 @@ it("preserves loaded decisions and retries an expiry failure once without loopin
   await act(async () => {});
   await act(async () => {});
   expect(result.current.views).toHaveLength(1);
-  expect(result.current.error).toContain("Automatic permission check failed");
+  expect(result.current.error).toBeUndefined();
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(result.current.error).toContain("Permission checks failed after retrying");
 
-  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  await act(() => vi.advanceTimersByTimeAsync(30_000));
+  await act(() => vi.advanceTimersByTimeAsync(1000));
   await act(async () => {});
-  expect(fetchMock).toHaveBeenCalledTimes(3);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
 
   await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
   act(() => window.dispatchEvent(new Event("focus")));
   await act(async () => {});
-  expect(fetchMock).toHaveBeenCalledTimes(3);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
 });
 
 it("schedules later capability expiries after an earlier expiry exhausts its retry", async () => {
@@ -722,7 +891,7 @@ it("surfaces an origin configuration failure without discarding permission evide
   const { result } = renderHook(() => useCapabilities(user));
 
   await waitFor(() => expect(result.current.error).toContain(detail));
-  expect(result.current.error).toContain("Existing decisions and saved-data permissions are unchanged");
+  expect(result.current.error).toContain("Permission checks failed.");
   expect(result.current.views).toHaveLength(1);
   expect(result.current.pending).toBe(false);
 });

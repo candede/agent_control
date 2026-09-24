@@ -19,7 +19,7 @@ describe("workbench metadata", () => {
     const metadata = getWorkbenchMetadata();
     expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds);
     expect(metadata.views.map(view => view.id)).toEqual([
-      "agents", "users", "sync", "audit", "security", "permissions", "jobs",
+      "agents", "users", "sync", "audit", "permissions", "jobs",
     ]);
     expect(metadata.views[0]).toMatchObject({ id: "agents", path: "/agents" });
     expect(new Set(metadata.views.map(view => view.path)).size).toBe(metadata.views.length);

@@ -98,7 +98,7 @@ export function purviewJobSummary(job: PurviewAuditJob): WorkbenchJobSummary {
     completed: job.storedRowCount, partial: job.status === "partial",
     canResume: job.canResume, canCancel: ["waiting_authorization", "reconciling_create", "running"].includes(job.status),
     canReconcile: false, ...sourceJobDates(job), updatedAt: job.updatedAt, expiresAt: job.expiresAt,
-    href: `/audit?source=purview&job=${encodeURIComponent(job.id)}`,
+    href: job.filters.userPrincipalNames.length === 1 ? "/users" : "/agents",
   };
 }
 
@@ -110,7 +110,7 @@ export function defenderJobSummary(job: DefenderHuntingJob): WorkbenchJobSummary
     completed: job.storedRowCount, partial: job.status === "partial",
     canResume: job.canResume, canCancel: ["waiting_authorization", "running"].includes(job.status),
     canReconcile: false, ...sourceJobDates(job), updatedAt: job.updatedAt, expiresAt: job.expiresAt,
-    href: `/security?job=${encodeURIComponent(job.id)}`,
+    href: "/agents",
   };
 }
 

@@ -97,17 +97,17 @@ describe("controlled Sync report dialog", () => {
     expect(screen.getByRole("button", { name: "Manage reports" })).toHaveFocus();
   });
 
-  it("falls back to the Sync heading when report actions are unavailable", async () => {
+  it("falls back to the CSV reports heading when report actions are unavailable", async () => {
     function LoadingSyncHost() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
       return <>
-        <h2 id="data-sync-heading" tabIndex={-1}>Sync</h2>
+        <h2 id="sync-reports-heading" tabIndex={-1}>CSV usage reports</h2>
         <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={vi.fn()} />
       </>;
     }
     render(<LoadingSyncHost />);
     await userEvent.click(screen.getByRole("button", { name: "Close reports" }));
-    expect(screen.getByRole("heading", { name: "Sync" })).toHaveFocus();
+    expect(screen.getByRole("heading", { name: "CSV usage reports" })).toHaveFocus();
   });
 
   it("has no internal trigger and reports route closure without owning open state", async () => {

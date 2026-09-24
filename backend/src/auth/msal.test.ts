@@ -44,27 +44,14 @@ afterEach(() => {
 });
 
 describe("authentication scopes", () => {
-  it("requests all implemented delegated consent up front, including Admin package-write scopes", () => {
+  it("requests only authentication scopes and leaves every API grant to administrator setup", () => {
     expect(loginScopes).toEqual(["openid", "profile"]);
     const flow = createAuthFlow("login");
-    expect(flow.scopes).toEqual(["openid", "profile", "offline_access",
-      "https://graph.microsoft.com/User.ReadBasic.All", "https://graph.microsoft.com/Group.Read.All"]);
-    expect(flow.extraScopesToConsent).toEqual([
-      "https://graph.microsoft.com/CopilotPackages.Read.All",
-      "https://graph.microsoft.com/CopilotPackages.ReadWrite.All",
-      "https://graph.microsoft.com/User.Read.All",
-      "https://graph.microsoft.com/LicenseAssignment.Read.All",
-      "https://api.powerplatform.com/ResourceQuery.Resources.Read",
-      "https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke",
-      "https://graph.microsoft.com/AuditLogsQuery.Read.All",
-      "https://graph.microsoft.com/ThreatHunting.Read.All",
-      "https://graph.microsoft.com/Reports.Read.All",
-    ]);
-    const requestedScopes = [...flow.scopes, ...flow.extraScopesToConsent!];
-    expect(requestedScopes.join(" ")).not.toMatch(/\.default/);
-    expect(new Set(requestedScopes).size).toBe(requestedScopes.length);
-    for (const definition of capabilityDefinitions.filter(value => value.mode === "delegated" && value.probe.adapterRegistered)) {
-      expect(requestedScopes).toEqual(expect.arrayContaining(capabilityScopes(definition.id)));
+    expect(flow.scopes).toEqual(["openid", "profile", "offline_access"]);
+    expect(flow).not.toHaveProperty("extraScopesToConsent");
+    expect(flow).not.toHaveProperty("capabilityId");
+    for (const definition of capabilityDefinitions.filter(value => value.mode !== "local")) {
+      for (const scope of capabilityScopes(definition.id)) expect(flow.scopes).not.toContain(scope);
     }
     expect(capabilityScopes("graph.package.read.delegated")).toEqual(["https://graph.microsoft.com/CopilotPackages.Read.All"]);
     expect(capabilityScopes("powerPlatform.inventory.read")).toEqual(["https://api.powerplatform.com/ResourceQuery.Resources.Read"]);
@@ -72,17 +59,54 @@ describe("authentication scopes", () => {
     expect(capabilityScopes("reports.copilotUsage.read")).toEqual(["https://graph.microsoft.com/Reports.Read.All"]);
   });
 
-  it("lets Entra decide whether recovery needs consent instead of forcing repeated consent", async () => {
+  it("preserves account selection and normal sign-in without a consent prompt or extra scopes", async () => {
     const { client } = fakeClient();
     replaceMsalClientForTest(client);
-    const flow = createAuthFlow("consent", { capabilityId: "graph.directory.read", accountId: account.homeAccountId });
+    const flow = createAuthFlow("login");
     await createAuthorizationUrl(flow);
     expect(client.getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ scopes: flow.scopes }));
-    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("prompt");
-    expect(flow.extraScopesToConsent).toBeUndefined();
+    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).toMatchObject({ prompt: "select_account" });
+    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("extraScopesToConsent");
   });
 
-  it("encodes cross-resource consent with the installed MSAL SDK without making token or provider requests", async () => {
+  it("rejects old consent constructors and dynamically supplied login permissions", () => {
+    expect(() => Reflect.apply(createAuthFlow, undefined, ["consent", { capabilityId: "graph.agentIdentity.read" }]))
+      .toThrow("Permissions cannot be requested or enabled");
+    expect(() => Reflect.apply(createAuthFlow, undefined, ["login", { scopes: ["https://graph.microsoft.com/AgentIdentity.Read.All"] }]))
+      .toThrow("Permissions cannot be requested or enabled");
+  });
+
+  it.each([
+    { kind: "consent" },
+    { extraScopesToConsent: ["https://graph.microsoft.com/AgentIdentity.Read.All"] },
+    { capabilityId: "graph.agentIdentity.read" },
+    { scopes: ["openid", "profile", "offline_access", "https://graph.microsoft.com/AgentIdentity.Read.All"] },
+  ])("rejects legacy or broadened interactive flows before URL construction and redemption: %j", async change => {
+    const { client } = fakeClient();
+    replaceMsalClientForTest(client);
+    const flow = createAuthFlow("login");
+    Object.assign(flow, change);
+    await expect(createAuthorizationUrl(flow)).rejects.toMatchObject({ status: 410, code: "admin_managed_permissions" });
+    await expect(redeemAuthorizationCode("code", flow)).rejects.toMatchObject({ status: 410, code: "admin_managed_permissions" });
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+    expect(client.acquireTokenByCode).not.toHaveBeenCalled();
+  });
+
+  it("silently acquires the externally pregranted narrow agent identity permission without a broader fallback", async () => {
+    const { client } = fakeClient();
+    replaceMsalClientForTest(client);
+    const scope = "https://graph.microsoft.com/AgentIdentity.Read.All";
+    expect(capabilityScopes("graph.agentIdentity.read")).toEqual([scope]);
+    await acquireDelegatedToken(account.homeAccountId, "graph.agentIdentity.read");
+    expect(client.acquireTokenSilent).toHaveBeenCalledWith(expect.objectContaining({ scopes: [scope] }));
+    vi.mocked(client.acquireTokenSilent).mockResolvedValue({ accessToken: "opaque", scopes: ["Application.Read.All"],
+      account, tenantId, expiresOn: futureExpiry() } as never);
+    await expect(acquireDelegatedToken(account.homeAccountId, "graph.agentIdentity.read")).rejects.toMatchObject({ status: 403 });
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+    expect(client.acquireTokenByCode).not.toHaveBeenCalled();
+  });
+
+  it("encodes only authentication scopes with the installed MSAL SDK without token or provider requests", async () => {
     const authority = `https://login.microsoftonline.com/${tenantId}`;
     const networkClient = {
       sendGetRequestAsync: vi.fn(async () => { throw new Error("Unexpected network request"); }),
@@ -107,11 +131,12 @@ describe("authentication scopes", () => {
     });
     const flow = createAuthFlow("login");
     const url = new URL(await nativeClient.getAuthCodeUrl({
-      scopes: flow.scopes, extraScopesToConsent: flow.extraScopesToConsent,
+      scopes: flow.scopes, prompt: "select_account",
       redirectUri: "http://localhost:3002/api/auth/callback",
     }));
     const requestedScopes = url.searchParams.get("scope")!.split(" ");
-    expect(requestedScopes).toEqual(expect.arrayContaining([...flow.scopes, ...flow.extraScopesToConsent!]));
+    expect([...requestedScopes].sort()).toEqual([...flow.scopes].sort());
+    expect(url.searchParams.get("prompt")).toBe("select_account");
     expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:3002/api/auth/callback");
     expect(networkClient.sendGetRequestAsync).not.toHaveBeenCalled();
     expect(networkClient.sendPostRequestAsync).not.toHaveBeenCalled();
@@ -150,12 +175,53 @@ describe("authentication scopes", () => {
     expect(() => capabilityScopes("reports.official.import")).toThrow("does not use Microsoft authorization");
   });
 
+  it("does not direct a missing application token to user sign-in or MFA", async () => {
+    const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => null) });
+    replaceMsalClientForTest(client);
+    await expect(acquireApplicationToken("graph.package.read.application")).rejects.toMatchObject({
+      code: "identity_provider_error", message: expect.stringContaining("administrator must verify the existing app registration"),
+    });
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+    expect(client.acquireTokenSilent).not.toHaveBeenCalled();
+  });
+
   it("maps interaction, invalid-grant, conditional-access, and provider failures", async () => {
     for (const [errorCode, expectedCode] of [["consent_required", "missing_permission"], ["interaction_required", "interaction_required"], ["invalid_grant", "interaction_required"], ["request_timeout", "identity_provider_error"]]) {
       const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { errorCode }; }) });
       replaceMsalClientForTest(client);
       await expect(acquireDelegatedToken("account-a", "graph.package.read.delegated")).rejects.toMatchObject({ code: expectedCode });
     }
+  });
+
+  it.each(["request_timeout", "network_error", "temporarily_unavailable", "server_error"])(
+    "marks the explicit transient %s token error without exposing provider messages or starting consent", async errorCode => {
+      const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { errorCode, errorMessage: "private-account@example.invalid" }; }) });
+      replaceMsalClientForTest(client);
+      const result = acquireDelegatedToken("account-a", "graph.directory.read");
+      await expect(result).rejects.toMatchObject({ code: "identity_provider_error", details: { retryable: true } });
+      await result.catch(error => { expect(JSON.stringify(error)).not.toContain("private-account"); });
+      expect(client.acquireTokenSilent).toHaveBeenCalledOnce();
+      expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["invalid_client", "invalid_scope", "invalid_request"])("does not mark %s as transient", async errorCode => {
+    const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { errorCode }; }) });
+    replaceMsalClientForTest(client);
+    const result = acquireDelegatedToken("account-a", "graph.directory.read");
+    await expect(result).rejects.toMatchObject({ code: "identity_provider_error" });
+    await result.catch(error => { expect(error.details).not.toHaveProperty("retryable"); });
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+  });
+
+  it("preserves an actual MSAL server throttle rather than immediately retrying it as a generic transient", async () => {
+    const { client } = fakeClient({ acquireTokenSilent: vi.fn(async () => { throw { errorCode: "temporarily_unavailable", status: 429 }; }) });
+    replaceMsalClientForTest(client);
+    await expect(acquireDelegatedToken("account-a", "graph.directory.read")).rejects.toMatchObject({
+      status: 429, code: "provider_throttled", details: { httpStatus: 429 },
+    });
+    expect(client.acquireTokenSilent).toHaveBeenCalledOnce();
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -172,6 +238,15 @@ describe("authentication scopes", () => {
     replaceMsalClientForTest(client);
     const result = acquireDelegatedToken("account-a", "graph.directory.read");
     await expect(result).rejects.toMatchObject({ code: expected, details: { correlationId: "safe-request-id" } });
+    if (expected === "missing_permission") {
+      await expect(result).rejects.toMatchObject({ message: expect.stringContaining("API permissions") });
+      await expect(result).rejects.toMatchObject({ message: expect.stringContaining("Grant admin consent") });
+    } else if (expected === "interaction_required") {
+      await expect(result).rejects.toMatchObject({ message: expect.stringContaining("MFA") });
+      await expect(result).rejects.toMatchObject({ message: expect.not.stringContaining("Grant admin consent") });
+    }
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+    expect(client.acquireTokenByCode).not.toHaveBeenCalled();
     await result.catch(failure => {
       expect(JSON.stringify(failure)).not.toMatch(/private-account|private-claims|errorMessage/);
     });
@@ -190,11 +265,16 @@ describe("authentication scopes", () => {
   it("rejects missing delegated grants and missing application roles", async () => {
     const missingGrant = fakeClient({ acquireTokenSilent: vi.fn(async () => ({ accessToken: "opaque", scopes: [], account, tenantId, expiresOn: futureExpiry() } as never)) });
     replaceMsalClientForTest(missingGrant.client);
-    await expect(acquireDelegatedToken("account-a", "graph.package.read.delegated")).rejects.toMatchObject({ code: "missing_permission" });
+    await expect(acquireDelegatedToken("account-a", "graph.package.read.delegated")).rejects.toMatchObject({
+      code: "missing_permission", message: expect.stringContaining("Grant admin consent"),
+    });
 
     const missingRole = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => ({ accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, idtyp: "app", azp: config.clientId, roles: [] }), scopes: ["https://graph.microsoft.com/.default"], tenantId, expiresOn: futureExpiry() } as never)) });
     replaceMsalClientForTest(missingRole.client);
-    await expect(acquireApplicationToken("graph.package.read.application")).rejects.toMatchObject({ code: "missing_permission" });
+    await expect(acquireApplicationToken("graph.package.read.application")).rejects.toMatchObject({
+      code: "missing_permission", message: expect.stringContaining("Grant admin consent"),
+    });
+    expect(missingRole.client.getAuthCodeUrl).not.toHaveBeenCalled();
   });
 
   it("rejects wrong tenant, account, audience, application, and token mode", async () => {
@@ -247,7 +327,7 @@ describe("authentication scopes", () => {
   });
 
   it("rejects inconsistent callback and refreshed-principal metadata", async () => {
-    const flow = createAuthFlow("consent", { capabilityId: "graph.package.read.delegated", accountId: "account-a" });
+    const flow = createAuthFlow("login");
     const callbackResult = { account, tenantId, idTokenClaims: { nonce: flow.nonce, tid: otherTenantId } };
     const callback = fakeClient({ acquireTokenByCode: vi.fn(async () => callbackResult as never) });
     replaceMsalClientForTest(callback.client);
@@ -266,7 +346,7 @@ describe("authentication scopes", () => {
     replaceMsalClientForTest(client);
     await createAuthorizationUrl(flow);
     expect(getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ codeChallengeMethod: "S256", codeChallenge: expect.not.stringContaining(flow.codeVerifier) }));
-    expect(getAuthCodeUrl).toHaveBeenCalledWith(expect.objectContaining({ extraScopesToConsent: flow.extraScopesToConsent }));
+    expect(vi.mocked(client.getAuthCodeUrl).mock.calls[0][0]).not.toHaveProperty("extraScopesToConsent");
     await redeemAuthorizationCode("authorization-code", flow);
     expect(acquireTokenByCode).toHaveBeenCalledWith(expect.objectContaining({ code: "authorization-code", codeVerifier: flow.codeVerifier }));
     expect(acquireTokenByCode).toHaveBeenCalledWith(expect.objectContaining({ scopes: flow.scopes }));
@@ -298,11 +378,11 @@ describe("authentication scopes", () => {
   });
 
   it("generates isolated PKCE transactions and rejects unsafe returns", () => {
-    const first = createAuthFlow("consent", { capabilityId: "graph.directory.read", accountId: "account-a", returnTo: "/settings?tab=permissions" });
-    const second = createAuthFlow("consent", { capabilityId: "graph.directory.read", accountId: "account-a" });
+    const first = createAuthFlow("login", { returnTo: "/settings?tab=permissions" });
+    const second = createAuthFlow("login");
     expect(first.state).not.toBe(second.state);
     expect(first.codeVerifier).not.toBe(second.codeVerifier);
     expect(first.returnTo).toBe("/settings?tab=permissions");
-    expect(() => createAuthFlow("consent", { capabilityId: "graph.directory.read", returnTo: "//evil.invalid" })).toThrow("local application path");
+    expect(() => createAuthFlow("login", { returnTo: "//evil.invalid" })).toThrow("local application path");
   });
 });

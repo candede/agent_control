@@ -8,10 +8,10 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
   const name = (element: Element) => element.getAttribute("aria-label")
     ?? element.closest("label")?.textContent?.trim().replace(/\s+/g, " ").slice(0, 70)
     ?? `${element.tagName.toLowerCase()}.${Array.from(element.classList).join(".")}`;
-  const contained = (child: Element, parent: Element) => {
+  const contained = (child: Element, parent: Element, checkVertical = true) => {
     const a = child.getBoundingClientRect(), b = parent.getBoundingClientRect();
     if (a.left < b.left - tolerance || a.right > b.right + tolerance
-      || a.top < b.top - tolerance || a.bottom > b.bottom + tolerance) {
+      || checkVertical && (a.top < b.top - tolerance || a.bottom > b.bottom + tolerance)) {
       failures.push(`${name(child)} is outside ${name(parent)}`);
     }
   };
@@ -62,6 +62,19 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
     ".data-sync-panel", ".audit-source-view", ".defender-hunting", ".permission-center", ".jobs-view",
   ];
   for (const surface of Array.from(shell.querySelectorAll(surfaces.join(", "))).filter(visible)) {
+    const modal = surface.closest("dialog");
+    if (modal) {
+      let scroller: Element | undefined;
+      for (let ancestor = surface.parentElement; ancestor && modal.contains(ancestor); ancestor = ancestor.parentElement) {
+        if (["auto", "scroll"].includes(getComputedStyle(ancestor).overflowY) && ancestor.scrollHeight > ancestor.clientHeight) {
+          scroller = ancestor;
+          break;
+        }
+      }
+      contained(surface, modal, !scroller);
+      if (scroller && scroller !== modal) contained(scroller, modal);
+      continue;
+    }
     const rect = surface.getBoundingClientRect();
     if (Math.abs(rect.left - header.left) > tolerance || Math.abs(rect.right - header.right) > tolerance) {
       failures.push(`${name(surface)} does not fill the padded app content width`);
@@ -157,7 +170,13 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
       failures.push("Inventory resource name and native ID run together instead of occupying separate lines");
     }
   }
-  for (const selector of [".filter-action-buttons", ".inventory-actions", ".inline-actions", ".purview-search-actions", ".hunting-search-actions", ".report-section-header", ".report-header-actions", ".report-window-control"]) {
+  for (const selector of [
+    ".filter-action-buttons", ".inventory-actions", ".inline-actions", ".purview-search-actions", ".hunting-search-actions",
+    ".report-section-header", ".report-header-actions", ".report-window-control",
+    ".permission-heading", ".permission-body", ".permission-issue-list", ".permission-issue-list > li",
+    ".permission-actions", ".permission-log-setup > header", ".permission-setup-heading",
+    ".permission-feature-list > div", ".permission-metadata",
+  ]) {
     for (const group of Array.from(document.querySelectorAll(selector)).filter(visible)) {
       const children = Array.from(group.children).filter(visible);
       children.forEach(child => contained(child, group));
@@ -182,8 +201,15 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
     labels.forEach(label => contained(label, progress));
     doNotIntersect(labels, "Job progress metadata");
   }
+  for (const content of Array.from(document.querySelectorAll(
+    ".permission-issue-list p, .permission-feature-list dt, .permission-feature-list dd, .permission-metadata dt, .permission-metadata dd, .permission-log-setup pre",
+  )).filter(visible)) {
+    if (content.clientWidth && content.scrollWidth > content.clientWidth + tolerance) {
+      failures.push(`${name(content)} clips its permission guidance`);
+    }
+  }
   // Wide evidence tables may scroll locally; their containing surface must not escape the grid.
-  const tableShells = ".table-shell, .copilot-users-table-shell, .permission-table-scroll, .jobs-table-scroll";
+  const tableShells = ".table-shell, .copilot-users-table-shell, .jobs-table-scroll";
   for (const table of Array.from(document.querySelectorAll(tableShells)).filter(visible)) {
     contained(table, table.parentElement!);
     if (table.scrollWidth > table.clientWidth + tolerance && !["auto", "scroll"].includes(getComputedStyle(table).overflowX)) {

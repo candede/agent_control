@@ -40,6 +40,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
   const dependencies = {
+    observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     revalidateUser: vi.fn(async () => user), requireAvailable: vi.fn(async () => undefined), delegatedToken: vi.fn(async () => "opaque-token"),
     query: vi.fn(async () => emptyQueryResult()),
   };

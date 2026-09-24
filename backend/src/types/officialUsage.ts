@@ -423,6 +423,8 @@ export type OfficialUsageHistorySummary = {
     provesReportingCoverage: false;
   };
   reportingWindows: {
+    earliestStartDateUtc: string | null;
+    latestEndDateUtc: string | null;
     knownCount: number;
     unknownCount: number;
     overlappingKnownWindowCount: number;

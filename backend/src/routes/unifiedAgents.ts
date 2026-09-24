@@ -14,8 +14,74 @@ import { agentPeople } from "../services/agentPeople.js";
 import { savedAgentPeople } from "../services/savedAgentPeople.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
+import { agentInvestigations, investigationRecordId } from "../services/agentInvestigations.js";
+import { purviewAudit } from "../services/purviewAudit.js";
+import { purviewAuditPresets } from "../types/purviewAudit.js";
+import type { AgentPurviewQuery } from "../types/agentInvestigations.js";
+import { agentIdentityResolution } from "../services/agentIdentityResolution.js";
 
 export const unifiedAgentsRouter = Router();
+
+policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/investigations/resolve", {
+  access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], csrf: true,
+  capabilityId: "graph.agentIdentity.read",
+}, async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (Object.keys(request.query).length || !request.body || typeof request.body !== "object" || Array.isArray(request.body)
+    || Object.keys(request.body).some(key => key !== "recordId")) {
+    throw new AppError(400, "invalid_agent_investigation", "Identity resolution accepts only a saved recordId.");
+  }
+  const recordId = investigationRecordId(request.body.recordId);
+  const controller = new AbortController();
+  const abort = () => { controller.abort(); };
+  response.once("close", abort);
+  try { response.json(await agentIdentityResolution.resolve(request.session.user!, recordId, controller.signal)); }
+  finally { response.removeListener("close", abort); }
+});
+
+policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/context", {
+  access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
+}, async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  if (Object.keys(request.query).some(key => key !== "recordId")) throw new AppError(400, "invalid_agent_investigation", "Select an exact saved agent record.");
+  response.json((await agentInvestigations.resolve(requestScope(request), investigationRecordId(request.query.recordId))).context);
+});
+
+policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview", {
+  access: "authenticated", dataClass: "private_provider_audit", roles: ["AgentControl.Viewer"],
+}, async (request, response) => {
+  response.setHeader("Cache-Control", "private, no-store");
+  const { recordId, query } = agentPurviewQuery(request.query);
+  const audit = getAuditLog(requestScope(request));
+  const event = await audit.startEvent({ operationId: `view-audit-search:${randomUUID()}`, scope: "single", action: "view-audit-search", agentId: recordId,
+    actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
+  try {
+    const result = await purviewAudit.agentRecords(request.session.user!, recordId, query);
+    await audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } });
+    response.json(result);
+  } catch (error) {
+    await audit.completeEvent(event.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_read_failed" });
+    throw error;
+  }
+});
+
+export function agentPurviewQuery(value: Record<string, unknown>): { recordId: string; query: AgentPurviewQuery } {
+  const invalid = () => new AppError(400, "invalid_agent_investigation", "Use bounded saved-agent Purview paging, search and operations.");
+  if (Object.keys(value).some(key => !["recordId", "limit", "offset", "search", "operation"].includes(key))) throw invalid();
+  const integer = (key: "limit" | "offset", fallback: number, maximum: number) => {
+    if (value[key] === undefined) return fallback;
+    if (typeof value[key] !== "string" || !/^\d+$/.test(value[key])) throw invalid();
+    const number = Number(value[key]);
+    if (!Number.isSafeInteger(number) || number > maximum || number < (key === "limit" ? 1 : 0)) throw invalid();
+    return number;
+  };
+  if (value.search !== undefined && (typeof value.search !== "string" || value.search.length > 256 || /[\r\n\0]/.test(value.search))) throw invalid();
+  if (value.operation !== undefined && (typeof value.operation !== "string" || value.operation.length > 128
+    || !purviewAuditPresets.copilot_studio_admin.operationFilters.includes(value.operation))) throw invalid();
+  return { recordId: investigationRecordId(value.recordId), query: { limit: integer("limit", 50, 100), offset: integer("offset", 0, 100_000),
+    ...(typeof value.search === "string" && value.search.trim() ? { search: value.search.trim() } : {}),
+    ...(typeof value.operation === "string" ? { operation: value.operation } : {}) } };
+}
 
 policyRoute(unifiedAgentsRouter, "get", "/agent-responsibility", {
   access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],

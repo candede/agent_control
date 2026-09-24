@@ -20,6 +20,7 @@ import { purviewAuditPresets } from "../types/purviewAudit.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
 import { pool, transaction } from "./pool.js";
+import type { AgentPurviewQuery, AgentPurviewTarget } from "../types/agentInvestigations.js";
 
 export type PurviewAuditScope = {
   tenantId: string;
@@ -204,8 +205,12 @@ export class PurviewAuditRepository {
     return rows[0] ? projectJob(rows[0]) : undefined;
   }
 
-  async listJobs(scope: PurviewAuditReadScope, limit = 20, offset = 0): Promise<PurviewAuditHistory> {
+  async listJobs(scope: PurviewAuditReadScope, limit = 20, offset = 0, userPrincipalName?: string): Promise<PurviewAuditHistory> {
     const read = scopedWhere(scope);
+    if (userPrincipalName !== undefined) {
+      read.values.push(userPrincipalName.toLowerCase());
+      read.sql += ` AND jsonb_array_length(filters->'userPrincipalNames')=1 AND lower(filters->'userPrincipalNames'->>0)=$${read.values.length}`;
+    }
     const bounded = Math.min(Math.max(limit, 1), 50);
     const boundedOffset = Math.min(Math.max(offset, 0), 100_000);
     const { rows } = await this.database.query<JobRow>(`SELECT * FROM purview_audit_jobs
@@ -417,25 +422,39 @@ export class PurviewAuditRepository {
   }
 
   async relatedInventoryRecords(scope: PurviewAuditReadScope | PurviewAuditScope, target: { environmentId: string; botId: string }, limit = 20) {
-    const read = scopedWhere(toReadScope(scope), "job");
+    const read = relatedRecordsWhere(toReadScope(scope), target);
     const boundedLimit = Math.min(Math.max(limit, 1), 50);
-    const targetOffset = read.values.length;
-    const filters = [...read.values, target.environmentId, target.botId, purviewAuditPresets.copilot_studio_admin.operationFilters, boundedLimit];
-    const base = `FROM purview_audit_records record JOIN purview_audit_jobs job ON job.id=record.job_id AND job.tenant_id=record.tenant_id
-      WHERE ${read.sql} AND job.expires_at>clock_timestamp() AND job.status IN ('succeeded','partial')
-        AND record.audit_log_record_type='powerPlatformAdministratorActivity' AND record.service='PowerPlatform'
-        AND record.environment_id=$${targetOffset + 1} AND record.bot_id=$${targetOffset + 2}
-        AND record.operation=ANY($${targetOffset + 3}::text[])`;
     const [rows, count] = await Promise.all([
       this.database.query<{ job_id: string; native_event_id: string | null; wrapper_id: string; event_time: Date; operation: string; result_status: string | null; correlation_id: string | null }>(
-        `SELECT record.job_id,record.native_event_id,record.wrapper_id,record.event_time,record.operation,record.result_status,record.correlation_id ${base}
-          ORDER BY record.event_time DESC,record.wrapper_id COLLATE "C" DESC LIMIT $${targetOffset + 4}`, filters),
-      this.database.query<{ count: number }>(`SELECT count(*)::int AS count ${base}`, filters.slice(0, -1)),
+        `SELECT record.job_id,record.native_event_id,record.wrapper_id,record.event_time,record.operation,record.result_status,record.correlation_id ${read.sql}
+          ORDER BY record.event_time DESC,record.wrapper_id COLLATE "C" DESC LIMIT $${read.values.length + 1}`, [...read.values, boundedLimit]),
+      this.database.query<{ count: number }>(`SELECT count(*)::int AS count ${read.sql}`, read.values),
     ]);
     return { count: count.rows[0].count, value: rows.rows.map(row => ({
       jobId: row.job_id, nativeEventId: row.native_event_id, wrapperId: row.wrapper_id, observedAt: row.event_time.toISOString(),
       operation: row.operation, resultStatus: row.result_status, correlationId: row.correlation_id, matchedKind: "cds_bot_id" as const,
     })) };
+  }
+
+  async agentRecords(scope: PurviewAuditReadScope, target: AgentPurviewTarget, query: AgentPurviewQuery) {
+    const read = relatedRecordsWhere(scope, target);
+    if (query.operation) {
+      read.values.push(query.operation);
+      read.sql += ` AND record.operation=$${read.values.length}`;
+    }
+    if (query.search) {
+      read.values.push(query.search.toLowerCase());
+      read.sql += ` AND strpos(lower(concat_ws(' ',record.operation,record.actor_user_id,record.actor_user_principal_name,record.result_status,record.correlation_id,record.wrapper_id)),$${read.values.length})>0`;
+    }
+    const limit = Math.min(Math.max(query.limit, 1), 100);
+    const offset = Math.min(Math.max(query.offset, 0), 100_000);
+    const [rows, count] = await Promise.all([
+      this.database.query<RecordRow & { job_id: string }>(`SELECT record.* ${read.sql}
+        ORDER BY record.event_time DESC,record.wrapper_id COLLATE "C" DESC,record.job_id DESC LIMIT $${read.values.length + 1} OFFSET $${read.values.length + 2}`,
+      [...read.values, limit, offset]),
+      this.database.query<{ count: number }>(`SELECT count(*)::int AS count ${read.sql}`, read.values),
+    ]);
+    return { value: rows.rows.map(row => ({ ...projectRecord(row), jobId: row.job_id })), count: count.rows[0].count, limit, offset };
   }
 
   async recoverInterrupted() {
@@ -501,6 +520,20 @@ export class PurviewAuditRepository {
     if (!result.rows[0]) throw executionLost();
     return result.rows[0];
   }
+}
+
+function relatedRecordsWhere(scope: PurviewAuditReadScope, target: AgentPurviewTarget) {
+  if (!target.environmentId || !target.botId) throw new AppError(403, "scope_mismatch", "Saved agent records require an exact bot and environment.");
+  const read = scopedWhere(scope, "job");
+  const offset = read.values.length;
+  return { values: [...read.values, target.environmentId.toLowerCase(), target.botId.toLowerCase(), purviewAuditPresets.copilot_studio_admin.operationFilters],
+    sql: `FROM purview_audit_records record JOIN purview_audit_jobs job ON job.id=record.job_id AND job.tenant_id=record.tenant_id
+      AND job.result_scope_kind=record.result_scope_kind AND job.result_scope_id=record.result_scope_id
+      AND job.result_scope_configuration_revision IS NOT DISTINCT FROM record.result_scope_configuration_revision
+      WHERE ${read.sql} AND job.expires_at>clock_timestamp() AND job.status IN ('succeeded','partial')
+        AND record.audit_log_record_type='powerPlatformAdministratorActivity' AND record.service='PowerPlatform'
+        AND lower(record.environment_id)=$${offset + 1} AND lower(record.bot_id)=$${offset + 2}
+        AND record.operation=ANY($${offset + 3}::text[])` };
 }
 
 async function validateQualificationForJob(client: pg.PoolClient, scope: PurviewAuditScope, id: string, filters: PurviewAuditFilters) {

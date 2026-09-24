@@ -44,7 +44,7 @@ policyRoute(purviewAuditRouter, "post", "/audit-search/jobs", { access: "authent
 
 policyRoute(purviewAuditRouter, "get", "/audit-search/jobs", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await purviewAudit.list(request.session.user!, positiveInteger(first(request.query.limit), 20, 50),
-    positiveInteger(first(request.query.offset), 0, 100_000, true)));
+    positiveInteger(first(request.query.offset), 0, 100_000, true), request.query.userPrincipalName));
 });
 
 policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id", { access: "authenticated", dataClass: "private_provider_audit_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {

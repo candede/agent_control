@@ -114,7 +114,7 @@ function Assert-ConfigUnchanged {
 }
 try {
     $guidance=(Show-LocalRegistrationGuidance 6>&1) -join "`n"
-    foreach ($permission in @('CopilotPackages.Read.All','CopilotPackages.ReadWrite.All','User.ReadBasic.All','Group.Read.All','AuditLogsQuery.Read.All','ThreatHunting.Read.All','ResourceQuery.Resources.Read','CopilotStudio.AdminActions.Invoke')) {
+    foreach ($permission in @('openid','profile','offline_access','CopilotPackages.Read.All','CopilotPackages.ReadWrite.All','User.ReadBasic.All','Group.Read.All','User.Read.All','LicenseAssignment.Read.All','Reports.Read.All','AgentIdentity.Read.All','AuditLogsQuery.Read.All','ThreatHunting.Read.All','ResourceQuery.Resources.Read','CopilotStudio.AdminActions.Invoke')) {
         Assert-True ($guidance.Contains($permission)) "Registration guidance omitted permission $permission."
     }
     $manifest=Get-Content -LiteralPath (Join-Path $repositoryRoot 'infra/entra-app-manifest.json') -Raw | ConvertFrom-Json
@@ -124,9 +124,13 @@ try {
     foreach ($requiredText in @('Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Optional Microsoft Graph Application permissions','Admin includes Viewer access','only one role assignment','Assignment required','Users/Groups for Allowed member types','does not verify or grant permissions')) {
         Assert-True ($guidance.Contains($requiredText)) "Registration guidance omitted distinction: $requiredText."
     }
-    foreach ($requiredText in @('checks delegated access automatically','Interactive consent, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Normal sign-in requests all implemented delegated permissions up front, including package changes')) {
+    foreach ($requiredText in @('checks delegated access automatically','Normal sign-in, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Select Grant admin consent','the app does not request or grant permissions')) {
         Assert-True ($guidance.Contains($requiredText)) "Automatic access-check guidance omitted distinction: $requiredText."
     }
+    Assert-True (-not $guidance.Contains('sign-in requests all implemented delegated permissions')) 'Sign-in must not request feature consent.'
+    Assert-True ($guidance -notmatch '(?m)^[ \t]+User\.Read[ \t]+') 'OIDC sign-in must not require an unused Graph profile permission.'
+    Assert-True ($guidance.Contains('User.Read is not used by Agent Control.')) 'Registration guidance must identify the unused Graph profile grant.'
+    Assert-True ($guidance.Contains('the current app requests these read scopes separately.')) 'Registration guidance must preserve separately requested read scopes.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     foreach ($removed in @('TenantId','ClientId','ClientSecretFile','Port','StateRoot','Action','DryRun','ConfirmCleanup','BackupFile','RestoreDatabase','CleanupBatchSize','ConfirmReset','OpenBrowser')) {
         Assert-True (-not $entry.Parameters.ContainsKey($removed)) "Entry point still accepts $removed."

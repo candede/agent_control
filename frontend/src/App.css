@@ -3237,6 +3237,7 @@ button.audit-result-button:focus-visible {
 }
 
 .hunting-heading h2,
+.hunting-heading h3,
 .hunting-history h3,
 .hunting-results h3 {
   margin: 0;
@@ -3559,29 +3560,6 @@ button.audit-result-button:focus-visible {
   .hunting-result-facts > div:last-child {
     border-bottom: 0;
   }
-}
-
-.audit-source-tabs {
-  display: inline-flex;
-  justify-self: start;
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.58);
-}
-
-.audit-source-tabs button {
-  min-height: 34px;
-  border: 0;
-  border-radius: 5px;
-  color: var(--muted);
-  background: transparent;
-  box-shadow: none;
-}
-
-.audit-source-tabs button.active {
-  color: #fff;
-  background: var(--ink);
 }
 
 .purview-audit-heading,

@@ -65,15 +65,18 @@ export async function runCopilotStudioQuarantineJob(
   requireProviderAdmissions();
   if (!await repository.get(scope, id)) throw new AppError(404, "not_found", "Quarantine job was not found.");
   requireProviderAdmissions();
+  const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
   let authorization: QuarantineAuthorization;
-  try { authorization = await authorize(scope); }
+  try { authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
+    () => authorize(scope), { signal: externalSignal, clearOnSuccess: false }); }
   catch (error) { await repository.waitForAuthorization(scope, id); throw error; }
   const lease = await repository.claim(scope, id, processOwner, resume);
   if (!lease) return;
   try {
     for (let index = 0; index < 25 && !maintenanceActive(); index += 1) {
       requireProviderAdmissions();
-      try { authorization = await authorize(scope); }
+      try { authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
+        () => authorize(scope), { signal: externalSignal, clearOnSuccess: false }); }
       catch {
         await repository.waitForAuthorization(scope, id);
         return;
@@ -85,7 +88,7 @@ export async function runCopilotStudioQuarantineJob(
       let sent = false;
       try {
         requireAuthority(job, authorization.authority);
-        await repository.withTargetLock(lease, item, async () => {
+        await capabilities.observeOperation("powerPlatform.quarantine.manage", principal, () => repository.withTargetLock(lease, item, async () => {
           const target = { environmentId: item.environment_id, botId: item.bot_id };
           const options = { correlationId: item.correlation_id!, signal };
           await repository.assertDispatchReady(lease, item, authorization.authority);
@@ -111,7 +114,7 @@ export async function runCopilotStudioQuarantineJob(
               requireProviderAdmissions();
               signal.throwIfAborted();
               await repository.finishItem(lease, item, "skipped", { observed: immediate, readbackCount: 1 });
-            });
+                });
             return;
           }
           requireFrozenPrestate(item, immediate);
@@ -132,7 +135,7 @@ export async function runCopilotStudioQuarantineJob(
             },
           }, dispatchAuthorization.accessToken, target, item.requested_state, options);
           await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorize, signal);
-        });
+        }), { signal, clearOnSuccess: () => sent });
       } catch (error) {
         if (error instanceof AppError && error.code === "lease_lost") throw error;
         if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error))) {

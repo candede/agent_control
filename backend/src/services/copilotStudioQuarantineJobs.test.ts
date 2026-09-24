@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { CopilotStudioQuarantineCanaryRepository } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
@@ -15,6 +15,7 @@ import {
   runTrackedCopilotStudioQuarantineJob,
 } from "./copilotStudioQuarantineJobs.js";
 import { loadOperationalState } from "./operationalState.js";
+import { capabilities } from "./capabilities.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: CopilotStudioQuarantineRepository;
@@ -24,6 +25,7 @@ const botId = "22222222-2222-4222-8222-222222222222";
 const updatedAt = "2026-09-09T19:00:00.1234567Z";
 
 beforeAll(async () => { fixture = await testDatabase(); repository = new CopilotStudioQuarantineRepository(fixture.runtime); });
+beforeEach(() => { vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined)); });
 afterEach(() => vi.restoreAllMocks());
 afterAll(async () => { await fixture?.close(); });
 

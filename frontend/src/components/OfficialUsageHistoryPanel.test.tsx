@@ -123,6 +123,8 @@ function history(value = [
         provesReportingCoverage: false,
       },
       reportingWindows: {
+        earliestStartDateUtc: "2026-08-20",
+        latestEndDateUtc: "2026-09-18",
         knownCount: 1,
         unknownCount: 1,
         overlappingKnownWindowCount: 1,

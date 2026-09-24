@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DataSyncRun, DataSyncSourceStatus } from "../types/dataSync.js";
+import { workbenchViewIds } from "../types/workbench.js";
 import { dataSyncJobSummary, defenderJobSummary, officialUsageJobSummary, packageRefreshJobSummary, powerPlatformJobSummary, purviewJobSummary } from "./workbench.js";
 
 const source = (overrides: Partial<DataSyncSourceStatus> = {}): DataSyncSourceStatus => ({
@@ -153,6 +154,21 @@ describe("investigation history projection", () => {
     snapshotId: null, priorSuccessfulJobId: null, qualification: null, cancelRequested: false, canResume: false,
     message: "Private provider message", ...dates,
   };
+
+  it("retires the Security view and sends legacy/scoped job summaries to Agents without guessing canonical identities", () => {
+    expect(workbenchViewIds).not.toContain("security");
+    for (const filters of [
+      defender.filters,
+      { ...defender.filters, agentIds: [] },
+      { ...defender.filters, agentIds: [], entraAgentIds: ["11111111-1111-4111-8111-111111111111"] },
+    ]) expect(defenderJobSummary({ ...defender, filters }).href).toBe("/agents");
+  });
+
+  it("routes Purview investigations through Users or Agents, never through local Audit", () => {
+    expect(purviewJobSummary(purview).href).toBe("/users");
+    expect(purviewJobSummary({ ...purview, filters: { ...purview.filters, userPrincipalNames: [] } }).href).toBe("/agents");
+    expect(purviewJobSummary({ ...purview, filters: { ...purview.filters, userPrincipalNames: ["one@example.invalid", "two@example.invalid"] } }).href).toBe("/agents");
+  });
 
   it("preserves creation, actual execution and completion separately from later updates", () => {
     for (const summary of [purviewJobSummary(purview), defenderJobSummary(defender)]) {

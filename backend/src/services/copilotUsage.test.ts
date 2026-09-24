@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import type { PublishedOfficialUsage, UserAgentUsageRow, UserUsageRow } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CopilotUsageService } from "./copilotUsage.js";
+import { capabilities } from "./capabilities.js";
 import {
   buildCopilotUsersUrl,
   buildSubscribedSkusUrl,
@@ -27,6 +28,9 @@ const user: AuthenticatedUser = {
   displayName: "Viewer",
   roles: ["AgentControl.Viewer"],
 };
+
+beforeEach(() => { vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined)); });
+afterEach(() => vi.restoreAllMocks());
 
 describe("CopilotUsageService", () => {
   it("verifies active report identities during sync and moves a newly paid user out of unpaid activity", async () => {
@@ -711,6 +715,11 @@ describe("CopilotUsageService", () => {
     expect(result.sources.directory.message).toContain("Directory Readers");
     expect(result.unresolvedImportedIdentities[0]).toMatchObject({ reason: "directory_unavailable" });
     expect(JSON.stringify(result)).not.toContain("sensitive provider text");
+    const observations = vi.mocked(capabilities.observeOperation);
+    const index = observations.mock.calls.findIndex(([id]) => id === "graph.licenses.read");
+    expect(observations.mock.calls.filter(([id]) => id === "graph.licenses.read")).toHaveLength(1);
+    expect(observations.mock.calls[index][1]).toMatchObject({ tenantId: user.tenantId, homeAccountId: user.homeAccountId });
+    await expect(observations.mock.results[index].value).rejects.toMatchObject({ code: "Authorization_RequestDenied" });
   });
 
   it("distinguishes a rejected license query from missing consent and retains a safe diagnostic code", async () => {
@@ -744,6 +753,10 @@ describe("CopilotUsageService", () => {
     expect(result.sources.appActivity.message).toContain("existing Entra app");
     expect(result.sources.appActivity.message).toContain("Reports Reader");
     expect(JSON.stringify(result)).not.toContain("sensitive provider text");
+    const observations = vi.mocked(capabilities.observeOperation);
+    const index = observations.mock.calls.findIndex(([id]) => id === "reports.copilotUsage.read");
+    expect(observations.mock.calls.filter(([id]) => id === "reports.copilotUsage.read")).toHaveLength(1);
+    await expect(observations.mock.results[index].value).rejects.toMatchObject({ code: "Forbidden" });
   });
 
   it.each([

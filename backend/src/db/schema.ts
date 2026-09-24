@@ -7,6 +7,7 @@ import { unifiedAgentRegistryMigrationSql } from "./unifiedAgentRegistrySchema.j
 import { inventoryVerificationMigrationSql } from "./inventoryVerificationSchema.js";
 import { agentUsageMigrationSql } from "./agentUsageSchema.js";
 import { agentPeopleMigrationSql } from "./agentPeopleSchema.js";
+import { agentIdentityMigrationSql, agentIdentityOutcomeMigrationSql, agentIdentityClientIdMigrationSql } from "./agentIdentitySchema.js";
 
 export const migrations = [
   { version: 1, sql: `
@@ -1710,6 +1711,9 @@ UPDATE defender_hunting_rows
 SET row_data=(row_data-'actorUserKey'-'actorUserId') || '{"projectionVersion":2}'::jsonb
 WHERE source_table='CloudAppEvents' AND projection_version=2;
 ` },
+  { version: 41, sql: agentIdentityMigrationSql },
+  { version: 42, sql: agentIdentityOutcomeMigrationSql },
+  { version: 43, sql: agentIdentityClientIdMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {

@@ -151,7 +151,7 @@ export class GraphHuntingClient {
 
 export function validateDefenderHuntingFilters(value: unknown, options: { now?: Date; qualification?: boolean } = {}): DefenderHuntingFilters {
   if (!isObject(value)) throw new AppError(400, "invalid_hunting_filters", "Hunting filters must be a structured object.");
-  const allowedKeys = new Set(["templateId", "startDateTime", "endDateTime", "agentIds", "blueprintIds", "actorObjectIds", "operations"]);
+  const allowedKeys = new Set(["templateId", "startDateTime", "endDateTime", "agentIds", "entraAgentIds", "entraAgentApplicationIds", "blueprintIds", "actorObjectIds", "operations"]);
   if (Object.keys(value).some(key => !allowedKeys.has(key))) throw new AppError(400, "invalid_hunting_filters", "Hunting filters contain an unsupported field.");
   if (typeof value.templateId !== "string" || !defenderHuntingTemplateIds.includes(value.templateId as DefenderHuntingTemplateId)) {
     throw new AppError(400, "invalid_hunting_filters", "Select a supported code-owned hunting template.");
@@ -173,22 +173,33 @@ export function validateDefenderHuntingFilters(value: unknown, options: { now?: 
   }
   const actorObjectIds = stringList(value.actorObjectIds, "actorObjectIds", uuid, 128);
   if (templateId === "agents_inventory" && actorObjectIds.length) throw new AppError(400, "invalid_hunting_filters", "Actor filters are not available for the inventory template.");
-  return {
+  const filters: DefenderHuntingFilters = {
     templateId,
     startDateTime,
     endDateTime,
     agentIds: stringList(value.agentIds, "agentIds", () => true),
+    ...(value.entraAgentIds !== undefined ? { entraAgentIds: [...new Set(stringList(value.entraAgentIds, "entraAgentIds", uuid, 128).map(id => id.toLowerCase()))].sort() } : {}),
+    ...(value.entraAgentApplicationIds !== undefined ? { entraAgentApplicationIds: [...new Set(stringList(value.entraAgentApplicationIds, "entraAgentApplicationIds", uuid, 128).map(id => id.toLowerCase()))].sort() } : {}),
     blueprintIds: stringList(value.blueprintIds, "blueprintIds", () => true),
     actorObjectIds,
     operations,
   };
+  validateEntraNamespace(filters);
+  return filters;
 }
 
 export function createHuntingRequest(filters: DefenderHuntingFilters) {
+  validateEntraNamespace(filters);
   return {
     Query: filters.templateId === "agents_inventory" ? inventoryQuery(filters) : activityQuery(filters),
     Timespan: `${filters.startDateTime}/${filters.endDateTime}`,
   };
+}
+
+function validateEntraNamespace(filters: DefenderHuntingFilters) {
+  if (filters.templateId === "agents_inventory" ? filters.entraAgentApplicationIds?.length : filters.entraAgentIds?.length) {
+    throw new AppError(400, "invalid_hunting_filters", "Inventory requires enterprise-application object IDs; runtime activity requires application/client IDs. These namespaces cannot substitute.");
+  }
 }
 
 export function expectedHuntingSchema(templateId: DefenderHuntingTemplateId) {
@@ -221,6 +232,7 @@ const activityProjectionValid = [dateShape("Timestamp"), ...activityDirectFields
 function inventoryQuery(filters: DefenderHuntingFilters) {
   const predicates = [
     inPredicate("AgentId", filters.agentIds),
+    inPredicate("EntraAgentId", filters.entraAgentIds ?? [], true),
     inPredicate("EntraBlueprintId", filters.blueprintIds, true),
   ].filter(Boolean);
   return [
@@ -242,6 +254,7 @@ function activityQuery(filters: DefenderHuntingFilters) {
   const predicates = [
     inPredicate("ActionType", filters.operations),
     anyInPredicate(["tostring(Event.TargetAgentId)", "tostring(Event.AgentId)", 'iff(ActionType=="InvokeAgent",tostring(Event.PlatformTargetAgentId),tostring(Event.PlatformAgentId))'], filters.agentIds),
+    anyInPredicate(["tolower(tostring(Event.TargetAgentId))", "tolower(tostring(Event.AgentId))"], filters.entraAgentApplicationIds ?? []),
     anyInPredicate(["tostring(Event.TargetAgentBlueprintID)", "tostring(Event.AgentBlueprintId)"], filters.blueprintIds, true),
     inPredicate("AccountObjectId", filters.actorObjectIds, true),
   ].filter(Boolean);
@@ -425,6 +438,7 @@ function validateReturnedRow(row: DefenderHuntingRow, filters: DefenderHuntingFi
   if (row.sourceTable === "AgentsInfo") {
     if (filters.templateId !== "agents_inventory"
       || filters.agentIds.length && !filters.agentIds.includes(row.agentId)
+      || filters.entraAgentIds?.length && (!row.entraAgentObjectId || !filters.entraAgentIds.includes(row.entraAgentObjectId))
       || selectedBlueprintIds.length && (!row.entraBlueprintId || !selectedBlueprintIds.includes(row.entraBlueprintId))) throw scopeMismatch();
     return;
   }
@@ -437,6 +451,7 @@ function validateReturnedRow(row: DefenderHuntingRow, filters: DefenderHuntingFi
     || !row.operation || !expectedOperations.includes(row.operation)
     || tenantId && row.organizationId && row.organizationId !== tenantId.toLowerCase()
     || filters.agentIds.length && !agentIds.some(value => filters.agentIds.includes(value))
+    || filters.entraAgentApplicationIds?.length && ![row.targetAgentId, row.agentId].some(value => value && filters.entraAgentApplicationIds!.includes(value.toLowerCase()))
     || selectedBlueprintIds.length && !blueprintIds.some(value => selectedBlueprintIds.includes(value))
     || filters.actorObjectIds.length && !filters.actorObjectIds.some(value => value.toLowerCase() === row.actorAccountObjectId)) throw scopeMismatch();
 }

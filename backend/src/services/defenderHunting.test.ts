@@ -53,6 +53,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     revokeRetainedScope: vi.fn(async () => ({ id: retainedScope.id })), recoverInterrupted: vi.fn(async () => 0),
   };
   const dependencies = { delegatedToken: vi.fn(async () => "delegated-token"), applicationToken: vi.fn(async () => "application-token"),
+    observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     revalidateUser: vi.fn(async () => user),
     requireAvailable: vi.fn(async () => ({ authorized: true })),
     requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: 1 })), applicationIdentity: () => undefined,
@@ -63,6 +64,96 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Defender hunting worker", () => {
+  it("binds runtime client IDs separately and hides jobs that used the enterprise-object namespace", async () => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const applicationId = "22222222-2222-4222-8222-222222222222";
+    const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds: [], entraAgentApplicationIds: [applicationId] })) });
+    const runtimeFilters = { ...filters, templateId: "agent_activity" as const, operations: ["InvokeAgent"] };
+    await fixture.service.submit(user, { tokenMode: "delegated", filters: runtimeFilters, agentRecordId, idempotencyKey: "runtime-client" });
+    expect(fixture.repository.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      filters: { ...runtimeFilters, entraAgentApplicationIds: [applicationId] },
+    }));
+    fixture.setCurrent(job({ filters: { ...runtimeFilters, entraAgentIds: [applicationId] } }));
+    await expect(fixture.service.get(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+    await expect(fixture.service.start(user, job().id, "delegated", agentRecordId)).rejects.toMatchObject({ status: 404 });
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+    fixture.setCurrent(job({ filters: { ...runtimeFilters, entraAgentApplicationIds: [applicationId] } }));
+    await expect(fixture.service.get(user, job().id, agentRecordId)).resolves.toMatchObject({ filters: { entraAgentApplicationIds: [applicationId] } });
+    await fixture.service.list(user, 10, 0, agentRecordId);
+    expect(fixture.repository.listJobs).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds: [], entraAgentApplicationIds: [applicationId] }), 10, 0);
+  });
+
+  it("derives scoped submission filters from current inventory and preserves qualification bounds", async () => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
+    const agentScope = vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds }));
+    const fixture = setup({ agentScope });
+    const { agentIds: _ids, blueprintIds: _blueprints, ...input } = filters;
+    await fixture.service.submit(user, { tokenMode: "delegated", filters: input, idempotencyKey: "agent-scoped", agentRecordId });
+    expect(agentScope).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, agentRecordId);
+    expect(fixture.repository.submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ filters: { ...filters, entraAgentIds } }));
+    await fixture.service.approveQualification(user, { tokenMode: "delegated", filters: input, agentRecordId });
+    expect(fixture.repository.submit).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ filters: { ...filters, entraAgentIds }, qualification }));
+    await expect(fixture.service.approveQualification(user, { tokenMode: "delegated", agentRecordId,
+      filters: { ...input, startDateTime: new Date(Date.now() - 2 * 3_600_000).toISOString() } })).rejects.toMatchObject({ code: "invalid_hunting_range" });
+    await fixture.service.submit(user, { tokenMode: "delegated", filters: { ...filters, entraAgentIds }, idempotencyKey: "exact-context", agentRecordId });
+    await expect(fixture.service.submit(user, { tokenMode: "delegated", filters: { ...filters, agentIds: entraAgentIds }, idempotencyKey: "override", agentRecordId }))
+      .rejects.toMatchObject({ code: "agent_identity_override" });
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+  });
+
+  it("denies broad, foreign and multi-agent jobs on scoped lifecycle access before side effects", async () => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const selected = "22222222-2222-4222-8222-222222222222";
+    for (const entraAgentIds of [undefined, [], ["33333333-3333-4333-8333-333333333333"], [selected, "33333333-3333-4333-8333-333333333333"]]) {
+      const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds: [selected] })) });
+      fixture.setCurrent(job({ filters: { ...filters, ...(entraAgentIds ? { entraAgentIds } : {}) } }));
+      await expect(fixture.service.get(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.start(user, job().id, "delegated", agentRecordId)).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.startQualification(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.cancel(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+      await expect(fixture.service.delete(user, job().id, agentRecordId)).rejects.toMatchObject({ status: 404 });
+      expect(fixture.repository.begin).not.toHaveBeenCalled();
+      expect(fixture.repository.cancel).not.toHaveBeenCalled();
+      expect(fixture.repository.delete).not.toHaveBeenCalled();
+      expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+    }
+  });
+
+  it("scopes history, rows and catalog in the repository without running or authorizing a provider query", async () => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
+    const fixture = setup({ agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds })) });
+    await fixture.service.list(user, 10, 30, agentRecordId);
+    await fixture.service.rows(user, job().id, 10, 30, agentRecordId);
+    await fixture.service.qualificationEvidence(user, agentRecordId);
+    await fixture.service.retainedScopes(user, agentRecordId);
+    for (const method of [fixture.repository.listJobs, fixture.repository.listRows, fixture.repository.listQualificationEvidence, fixture.repository.listRetainedScopes]) {
+      expect(method).toHaveBeenCalledWith(expect.objectContaining({ entraAgentIds, tenantId: user.tenantId, authorizationPrincipalId: user.homeAccountId }), ...(
+        method === fixture.repository.listJobs ? [10, 30] : method === fixture.repository.listRows ? [job().id, 10, 30] : []));
+    }
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+    expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(fixture.dependencies.applicationToken).not.toHaveBeenCalled();
+    expect(fixture.dependencies.requireAvailable).not.toHaveBeenCalled();
+  });
+
+  it("revalidates current saved identities before provider work and before publishing scoped results", async () => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
+    let changed = false;
+    const agentScope = vi.fn(async () => {
+      if (changed) throw new AppError(409, "agent_investigation_unavailable", "Saved identity expired.");
+      return { recordId: agentRecordId, entraAgentIds };
+    });
+    const fixture = setup({ agentScope, runQuery: vi.fn(async () => { changed = true; return emptyResult; }) });
+    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds } }));
+    await fixture.service.start(user, job().id, "delegated", agentRecordId);
+    await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalled());
+    expect(fixture.repository.publish).not.toHaveBeenCalled();
+    expect(agentScope.mock.calls.length).toBeGreaterThan(2);
+  });
+
   it("binds saved inventory associations to the current Viewer even without directory-role claims", async () => {
     const fixture = setup();
     await fixture.service.list(user);
@@ -164,6 +255,9 @@ describe("Defender hunting worker", () => {
       "provider_error",
       expect.objectContaining({ category: "hunting_access_denied" }),
     );
+    expect(fixture.dependencies.runQuery).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.observeOperation).toHaveBeenCalledTimes(2);
+    await expect(fixture.dependencies.observeOperation.mock.results[1].value).rejects.toMatchObject({ code: "hunting_access_denied" });
   });
 
   it("allows Viewer delegated qualification and reserves application qualification for Admin", async () => {

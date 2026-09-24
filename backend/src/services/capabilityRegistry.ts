@@ -72,6 +72,18 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "provider_read", adapterRegistered: true, description: "Bounded directory lookup through the existing adapter." },
   },
   {
+    id: "graph.agentIdentity.read", displayName: "Agent identity resolution", purpose: "Explicitly verify one saved Copilot Studio Entra agent identity for scoped investigations.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
+    permissions: ["AgentIdentity.Read.All"], providerRoles: ["Agent ID Administrator (for nonowners)"], licenses: [],
+    configuration: ["Delegated consent", "An exact current source-declared Copilot Studio Entra agent identity"],
+    sources: ["https://learn.microsoft.com/en-us/graph/api/agentidentity-get?view=graph-rest-1.0",
+      "https://learn.microsoft.com/en-us/graph/api/resources/agentidentity?view=graph-rest-1.0",
+      "https://learn.microsoft.com/en-us/entra/agent-id/agent-identities#authorizing-agent-identities",
+      "https://learn.microsoft.com/en-us/microsoft-agent-365/developer/direct-open-telemetry-integration#s2s-blueprint-derived-agent-identity"],
+    dataClass: "directory", internalRoles: viewer, consentGroup: "graph.agentIdentity.read",
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Only an explicit resolve action reads the typed agentIdentity endpoint; context reads use saved mappings. Microsoft authorizes the delegated request when it runs." },
+  },
+  {
     id: "graph.licenses.read", displayName: "M365 Copilot licenses", purpose: "Read Copilot-capable product assignments and verify active paid Microsoft 365 Copilot features, separately from basic Copilot Chat access.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
     permissions: ["User.Read.All", "LicenseAssignment.Read.All"], providerRoles: ["Directory Readers", "Global Reader"], licenses: [], configuration: ["Delegated consent"],

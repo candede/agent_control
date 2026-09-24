@@ -27,6 +27,7 @@ type PackageRefreshDependencies = {
   applicationToken: typeof acquireApplicationToken;
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
   scan: PackageRefreshScan;
   applicationPrincipalId: () => string | undefined;
@@ -39,6 +40,7 @@ const defaultDependencies: PackageRefreshDependencies = {
   applicationToken: acquireApplicationToken,
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
   scan: (token, ids, signal, progress, options) => scanPackages(token, ids, signal, progress, graphPackages, options),
   applicationPrincipalId: () => config.clientId,
@@ -117,9 +119,9 @@ export class PackageInventoryService {
       signal.throwIfAborted();
       await this.dependencies.requireAvailable(capabilityId, freshUser, options);
       signal.throwIfAborted();
-      token = tokenMode === "delegated"
-        ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
-        : await this.dependencies.applicationToken(capabilityId);
+      token = await this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
+        ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
+        : this.dependencies.applicationToken(capabilityId), { signal, clearOnSuccess: false });
       signal.throwIfAborted();
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
@@ -199,7 +201,8 @@ export class PackageInventoryService {
     let stage = "inventory_collection";
     try {
       operationalLog("info", "package_refresh_started", { mode: current.scopeKind });
-      const result = await this.dependencies.scan(token, current.requestedIds, signal,
+      const result = await this.dependencies.observeOperation(capabilityForMode(current.tokenMode),
+        { tenantId: actor.tenantId, homeAccountId: actor.principalId }, () => this.dependencies.scan(token, current.requestedIds, signal,
         (pages, observedCount, totalRecords, message) => this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message), {
           retryThrottlingUntilAborted: true,
           getAccessToken: async () => {
@@ -211,7 +214,7 @@ export class PackageInventoryService {
             signal.throwIfAborted();
             return currentToken;
           },
-        });
+        }), { signal });
       signal.throwIfAborted();
       for (let attempt = 1; ; attempt += 1) {
         stage = "publication_authorization";

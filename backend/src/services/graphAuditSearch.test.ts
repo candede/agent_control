@@ -91,6 +91,19 @@ function studioRecord() {
 }
 
 describe("Graph Audit Search selected v1.0 contract", () => {
+  it("keeps saved Studio bot/environment metadata separate from prefixed runtime IDs and organization/object identifiers", async () => {
+    const explicit = studioRecord();
+    const missing = studioRecord();
+    missing.id = "wrapper-missing-bot";
+    missing.auditData.dynamicProperties = { ...missing.auditData.dynamicProperties, ID: "77777777-7777-4777-8777-777777777777",
+      BotId: undefined, EnvironmentId: undefined } as never;
+    const client = new GraphAuditSearchClient({ fetch: vi.fn(async () => response({ value: [record(), explicit, missing] })), wait: vi.fn(), random: () => 0 });
+    const result = await client.listRecords("token", "provider-1", tenantId);
+    expect(result.records[0]).toMatchObject({ agentId: "CopilotStudio.Declarative.44444444-4444-4444-8444-444444444444", botId: null, environmentId: null });
+    expect(result.records[1]).toMatchObject({ botId: "bot-1", environmentId: "environment-1", contentAvailable: false });
+    expect(result.records[2]).toMatchObject({ objectId: "bot-1", botId: null, environmentId: null });
+  });
+
   it("builds only the singular serviceFilter request contract", () => {
     expect(createProviderQueryBody(marker, filters)).toEqual({
       displayName: marker, filterStartDateTime: filters.startDateTime, filterEndDateTime: filters.endDateTime,

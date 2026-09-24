@@ -15,6 +15,7 @@ type InventoryRefreshDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   query: PowerPlatformResourceQueryClient["query"];
 };
 
@@ -23,6 +24,7 @@ const defaultDependencies: InventoryRefreshDependencies = {
   delegatedToken: acquireDelegatedToken,
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  observeOperation: capabilities.observeOperation.bind(capabilities),
   query: resourceQuery.query.bind(resourceQuery),
 };
 
@@ -94,7 +96,7 @@ export class PowerPlatformInventoryService {
       const freshUser = await this.dependencies.revalidateUser(scope.principalId);
       controller.signal.throwIfAborted();
       let token = "";
-      await commitAccountSessionValidation(validation, async () => {
+      await this.dependencies.observeOperation("powerPlatform.inventory.read", freshUser, () => commitAccountSessionValidation(validation, async () => {
         controller.signal.throwIfAborted();
         stage = "authorization";
         requireSamePrincipal(scope, freshUser);
@@ -108,7 +110,7 @@ export class PowerPlatformInventoryService {
         stage = "mark_running";
         markedRunning = await this.repository.markRunning(scope, id);
         if (!markedRunning) throw new AppError(409, "inventory_job_state", "Inventory refresh was already started or expired.");
-      });
+      }), { signal: controller.signal, clearOnSuccess: false });
       controller.signal.throwIfAborted();
       operationalLog("info", "inventory_refresh_started", {
         jobId: id, durationMs: Math.round(performance.now() - startedAt),
@@ -192,7 +194,8 @@ export class PowerPlatformInventoryService {
     let stage = "query";
     try {
       const queryTypes = inventoryQueryTypes(current.roleScope, current.requestedTypes);
-      const result = await this.dependencies.query(token, queryTypes, {
+      const result = await this.dependencies.observeOperation("powerPlatform.inventory.read",
+        { tenantId: scope.tenantId, homeAccountId: scope.principalId }, () => this.dependencies.query(token, queryTypes, {
         signal,
         expectedTenantId: scope.tenantId,
         environmentId: current.environmentScope ?? undefined,
@@ -200,7 +203,7 @@ export class PowerPlatformInventoryService {
           await this.repository.recordProgress(scope, id, progress.pages, progress.observedCount, progress.totalRecords);
           operationalLog("info", "inventory_refresh_progress", { jobId: id, ...progress });
         },
-      });
+      }), { signal });
       stage = "publication_authorization";
       signal.throwIfAborted();
       const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);

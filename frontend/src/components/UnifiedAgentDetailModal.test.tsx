@@ -709,6 +709,26 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
 
+  it("reloads saved details after the parent invalidates a completed package read", () => {
+    const { props, update } = renderDetail();
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    update({ packageDetail: { ...record.packages[0], longDescription: "Previous saved description" } });
+    update({ packageDetail: undefined });
+    expect(screen.queryByText("Previous saved description")).not.toBeInTheDocument();
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+    expect(props.onInspectPackage).toHaveBeenLastCalledWith(record.packages[0]);
+  });
+
+  it("requests the package again after returning from a resource-only agent", () => {
+    const { props, update } = renderDetail();
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ record: { ...record, id: "native-only", packages: [], presence: "power_platform" } });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ record });
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+    expect(props.onInspectPackage).toHaveBeenLastCalledWith(record.packages[0]);
+  });
+
   it("switches exact version details without another dialog and never shows the previous version's metadata", async () => {
     const first = record.packages[0];
     const second = { ...first, id: "second-package", displayName: "Second version", version: "2" };
@@ -1536,7 +1556,9 @@ describe("UnifiedAgentDetailModal", () => {
     }, { signal: expect.any(AbortSignal) });
     update({ record: next });
     expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
-    expect(await screen.findByText("Unavailable: Current target audit")).toBeVisible();
+    expect(await screen.findByText("Unavailable: Current target audit")).not.toBeVisible();
+    fireEvent.click(screen.getByText(`Saved observations for ${next.displayName}`));
+    expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
     await act(async () => { finish(); });
     expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
     expect(screen.queryByText(/Previous target/)).not.toBeInTheDocument();
@@ -1551,6 +1573,49 @@ describe("UnifiedAgentDetailModal", () => {
     expect(lookup).toHaveBeenCalledOnce();
     unmount();
     expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  });
+
+  it("preserves pending and completed activity reads across equivalent inventory rerenders", async () => {
+    const observed = observedRecord();
+    let complete!: (value: InventorySourceAwareDetail) => void;
+    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
+      .mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
+    const { update } = renderDetail({ record: observed, activeTab: "audit-security" });
+    expect(lookup).toHaveBeenCalledOnce();
+    const signal = lookup.mock.calls[0][1]?.signal;
+
+    update({ record: structuredClone(observed) });
+    expect(signal?.aborted).toBe(false);
+    expect(lookup).toHaveBeenCalledOnce();
+    await act(async () => complete({
+      ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Stable saved activity" },
+    }));
+    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
+    expect(screen.getByText("Unavailable: Stable saved activity")).toBeVisible();
+
+    update({ record: structuredClone(observed) });
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(screen.getByText("Unavailable: Stable saved activity")).toBeVisible();
+  });
+
+  it("does not retry failed activity reads on equivalent rerenders and supports explicit retry", async () => {
+    const observed = observedRecord();
+    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
+      .mockRejectedValueOnce(new Error("Saved activity unavailable"))
+      .mockResolvedValue({
+        ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Recovered saved activity" },
+      });
+    const { update } = renderDetail({ record: observed, activeTab: "audit-security" });
+    expect(await screen.findByText("Saved activity unavailable")).toBeVisible();
+    update({ record: structuredClone(observed) });
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(screen.getByText("Saved activity unavailable")).toBeVisible();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry activity" }));
+    expect(await screen.findByText("Unavailable: Recovered saved activity")).not.toBeVisible();
+    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
+    expect(screen.getByText("Unavailable: Recovered saved activity")).toBeVisible();
+    expect(lookup).toHaveBeenCalledTimes(2);
   });
 
   it("does not reuse a peer's pre-revision activity request for a fresh mutation follow-up", async () => {
@@ -1572,11 +1637,13 @@ describe("UnifiedAgentDetailModal", () => {
     await waitFor(() => expect(lookup).toHaveBeenCalledTimes(2));
     expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(false);
     const current = within(container).getByRole("dialog");
+    fireEvent.click(within(current).getByText(`Saved observations for ${observed.displayName}`));
     expect(within(current).getByText("Unavailable: Fresh revision activity")).toBeVisible();
     await act(async () => completeOld({
       ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Pre-revision activity" },
     }));
     expect(within(current).queryByText("Unavailable: Pre-revision activity")).not.toBeInTheDocument();
+    fireEvent.click(within(peer.container).getByText("Saved observations for Peer activity reader"));
     expect(within(within(peer.container).getByRole("dialog"))
       .getByText("Unavailable: Pre-revision activity")).toBeVisible();
   });
@@ -1606,6 +1673,9 @@ describe("UnifiedAgentDetailModal", () => {
     const summary = count === 0 ? "Authorized and queried; no exact associated records."
       : `${count} exact associated record${count === 1 ? "" : "s"}; showing ${shown}.`;
     expect(await screen.findAllByText(summary)).toHaveLength(2);
+    expect(screen.getAllByText(summary)[0]).not.toBeVisible();
+    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
+    expect(screen.getAllByText(summary)[0]).toBeVisible();
     expect(screen.queryAllByText(/^Audit operation \d+$/)).toHaveLength(shown);
     expect(screen.queryAllByText(/^Security record \d+$/)).toHaveLength(shown);
   });

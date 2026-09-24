@@ -7,7 +7,7 @@ export function reportHistoryFixture(sets: OfficialUsageSetSummary[] = [usageIns
       importCount: sets.length, uniqueObservationCount: 0, observationRowCount: 0, uniquePayloadCount: 0, repeatedRowsReused: 0,
       earliestObservedAt: null, latestObservedAt: null,
       activityDateRange: { earliestDateUtc: null, latestDateUtc: null, provenance: "last_activity_dates", provesReportingCoverage: false },
-      reportingWindows: { knownCount: 0, unknownCount: sets.length, overlappingKnownWindowCount: 0, additive: false },
+      reportingWindows: { earliestStartDateUtc: null, latestEndDateUtc: null, knownCount: 0, unknownCount: sets.length, overlappingKnownWindowCount: 0, additive: false },
       warning: { code: "rolling_snapshots_not_additive", message: "Rolling snapshots must not be summed." },
     },
     bundles: {

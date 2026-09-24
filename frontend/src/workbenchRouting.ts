@@ -6,7 +6,6 @@ export const workbenchViewIds = [
   "users",
   "sync",
   "audit",
-  "security",
   "permissions",
   "jobs",
 ] as const;
@@ -43,25 +42,10 @@ export type AgentRouteState = {
 };
 
 export type AuditRouteState = {
-  source: "local" | "purview";
   search: string;
   action: string;
   status: string;
   page: number;
-  jobId?: string;
-  userPrincipalName?: string;
-};
-
-export type SecurityRouteState = {
-  jobId?: string;
-  tokenMode?: "delegated" | "application";
-  templateId?: "agents_inventory" | "agent_activity" | "agent_tools";
-  operations?: string[];
-  startDateTime?: string;
-  endDateTime?: string;
-  agentIds?: string;
-  blueprintIds?: string;
-  actorObjectIds?: string;
 };
 
 export type SyncReportRouteState = {
@@ -96,7 +80,6 @@ const viewPaths: Record<WorkbenchViewId, string> = {
   users: "/users",
   sync: "/sync",
   audit: "/audit",
-  security: "/security",
   permissions: "/permissions",
   jobs: "/jobs",
 };
@@ -112,7 +95,11 @@ export function parseWorkbenchView(pathname: string): WorkbenchViewId {
 
 export function isWorkbenchPath(pathname: string) {
   const path = normalizePath(pathname);
-  return path === "/" || path === "/official-usage" || viewsByPath.has(path);
+  return path === "/" || path === "/official-usage" || path === "/security" || viewsByPath.has(path);
+}
+
+export function migrateSecurityRoute(pathname: string): string | undefined {
+  return normalizePath(pathname) === "/security" ? "/agents" : undefined;
 }
 
 export function workbenchUrl(
@@ -252,65 +239,22 @@ const localAuditStatuses = new Set([
 
 export function parseAuditRoute(search: string): AuditRouteState {
   const params = new URLSearchParams(search);
-  const jobId = bounded(params.get("job"), 512);
   const action = bounded(params.get("action"), 64);
   const status = bounded(params.get("status"), 64);
   return {
-    source: jobId || params.get("source") === "purview" ? "purview" : "local",
     search: bounded(params.get("q"), 256) ?? "",
     action: action && localAuditActions.has(action) ? action : "all",
     status: status && localAuditStatuses.has(status) ? status : "all",
     page: boundedPage(params.get("page")),
-    jobId,
-    userPrincipalName: bounded(params.get("user"), 320),
   };
 }
 
 export function auditRouteSearch(state: AuditRouteState) {
   const params = new URLSearchParams();
-  if (state.source === "purview") params.set("source", "purview");
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.action !== "all" && localAuditActions.has(state.action)) params.set("action", state.action);
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
   if (state.page > 0) params.set("page", String(state.page + 1));
-  if (state.jobId && validSelectedId(state.jobId)) params.set("job", state.jobId);
-  if (state.source === "purview" && state.userPrincipalName) params.set("user", state.userPrincipalName.slice(0, 320));
-  return params;
-}
-
-export function parseSecurityRoute(search: string): SecurityRouteState {
-  const params = new URLSearchParams(search);
-  const tokenMode = params.get("mode");
-  const templateId = params.get("template");
-  const operationValues = params.getAll("operation").filter(value => bounded(value, 128));
-  return {
-    jobId: bounded(params.get("job"), 512),
-    tokenMode: tokenMode === "delegated" || tokenMode === "application" ? tokenMode : undefined,
-    templateId: templateId === "agents_inventory" || templateId === "agent_activity" || templateId === "agent_tools"
-      ? templateId
-      : undefined,
-    operations: operationValues.length ? [...new Set(operationValues)].slice(0, 20) : undefined,
-    startDateTime: bounded(params.get("start"), 64),
-    endDateTime: bounded(params.get("end"), 64),
-    agentIds: bounded(params.get("agentIds"), 2_048),
-    blueprintIds: bounded(params.get("blueprintIds"), 2_048),
-    actorObjectIds: bounded(params.get("actorObjectIds"), 2_048),
-  };
-}
-
-export function securityRouteSearch(state: SecurityRouteState) {
-  const params = new URLSearchParams();
-  if (state.jobId && validSelectedId(state.jobId)) params.set("job", state.jobId);
-  if (state.tokenMode) params.set("mode", state.tokenMode);
-  if (state.templateId) params.set("template", state.templateId);
-  for (const operation of [...new Set(state.operations ?? [])].filter(value => bounded(value, 128)).slice(0, 20)) {
-    params.append("operation", operation);
-  }
-  if (state.startDateTime) params.set("start", state.startDateTime);
-  if (state.endDateTime) params.set("end", state.endDateTime);
-  if (state.agentIds?.trim()) params.set("agentIds", state.agentIds.trim().slice(0, 2_048));
-  if (state.blueprintIds?.trim()) params.set("blueprintIds", state.blueprintIds.trim().slice(0, 2_048));
-  if (state.actorObjectIds?.trim()) params.set("actorObjectIds", state.actorObjectIds.trim().slice(0, 2_048));
   return params;
 }
 

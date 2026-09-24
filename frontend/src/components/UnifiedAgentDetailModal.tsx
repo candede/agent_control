@@ -22,6 +22,7 @@ import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineContro
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
 import { AgentUsagePanel } from "./AgentUsagePanel";
+import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { WorkbenchActionGate, useWorkbenchAction } from "../workbenchActionContext";
 import "./agentInsights.css";
 
@@ -166,11 +167,11 @@ export function UnifiedAgentDetailModal({
   });
 
   useEffect(() => {
-    if (packageActionsBusy || hasPackageConfirmation) {
+    if (packageActionsBusy || hasPackageConfirmation || !selectedPackage || selectedDetail) {
       requestedPackage.current = undefined;
       return;
     }
-    if (!usesPackageDetails || !canInspectPackage || !selectedPackage || selectedDetail
+    if (!usesPackageDetails || !canInspectPackage
       || requestedPackage.current === packageKey) return;
     requestedPackage.current = packageKey;
     inspectSelectedPackage();
@@ -191,20 +192,19 @@ export function UnifiedAgentDetailModal({
     };
   }, []);
 
-  useEffect(() => {
+  const readRelated = useEffectEvent((signal: AbortSignal) => {
     if (!resource || !snapshot || !relatedKey) return;
-    const controller = new AbortController();
     const input = {
       snapshotId: snapshot.snapshotId,
       nativeId: resource.nativeId,
       environmentId: resource.environmentId,
     };
-    readSaved(["inventory-source-aware-detail", input, relatedRetry, dataRevision], signal => getInventorySourceAwareDetail(input, { signal }), controller.signal)
+    readSaved(["inventory-source-aware-detail", input, relatedRetry, dataRevision], signal => getInventorySourceAwareDetail(input, { signal }), signal)
       .then(result => {
-        if (!controller.signal.aborted) setRelatedState({ key: relatedKey, status: "available", value: result });
+        if (!signal.aborted) setRelatedState({ key: relatedKey, status: "available", value: result });
       })
       .catch(error => {
-        if (!controller.signal.aborted) {
+        if (!signal.aborted) {
           setRelatedState({
             key: relatedKey,
             status: "error",
@@ -212,8 +212,13 @@ export function UnifiedAgentDetailModal({
           });
         }
       });
+  });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    readRelated(controller.signal);
     return () => controller.abort();
-  }, [readSaved, relatedKey, relatedRetry, dataRevision, resource, snapshot]);
+  }, [readSaved, relatedKey]);
 
   function selectTab(tab: DetailTab) {
     setInternalTab(tab);
@@ -297,7 +302,11 @@ export function UnifiedAgentDetailModal({
           {resource ? <PowerPlatformPanel record={record} /> : null}
           <IdentityPanel record={record} />
         </details> : null}
-        {selectedTab === "audit-security" ? <AuditSecurityPanel agentName={record.displayName} related={related} error={relatedError} unavailable={relatedUnavailable} onRetry={() => setRelatedRetry(value => value + 1)} /> : null}
+        {selectedTab === "audit-security" ? <>
+          <AgentInvestigationsPanel recordId={record.id} agentName={record.displayName} roles={roles}
+            revision={JSON.stringify([inventoryRevision, dataRevision, relatedKey])} />
+          <AuditSecurityPanel agentName={record.displayName} related={related} error={relatedError} unavailable={relatedUnavailable} onRetry={() => setRelatedRetry(value => value + 1)} />
+        </> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage</h3>
           <p className="tab-description">Apply checks current settings before exact-target confirmation.</p>
@@ -404,24 +413,24 @@ function PowerPlatformPanel({ record }: { record: UnifiedAgentRecord }) {
 }
 
 function AuditSecurityPanel({ agentName, related, error, unavailable, onRetry }: { agentName: string; related?: InventorySourceAwareDetail; error: string; unavailable?: string; onRetry: () => void }) {
-  return <>
-    <h3>Activity for {agentName}</h3>
-    <p className="tab-description">Only saved audit events and security observations associated with this agent are shown. Missing evidence is not proof of inactivity or safety.</p>
-    {unavailable ? <p className="agent-insight-note">{unavailable}</p> : error ? <div className="error-banner" role="alert">{error} <button type="button" className="secondary" onClick={onRetry}>Retry activity</button></div> : <>
+  if (unavailable) return <p className="agent-insight-note">{unavailable}</p>;
+  if (error) return <div className="error-banner" role="alert">{error} <button type="button" className="secondary" onClick={onRetry}>Retry activity</button></div>;
+  return <details className="agent-saved-observations">
+    <summary>Saved observations for {agentName}</summary>
+    <p className="tab-description">Exact saved matches only. Missing evidence does not prove inactivity or safety.</p>
       <article className="agent-management-card">
         <RelatedState heading="Audit activity" source={related?.audit} />
         {related?.audit.status === "available" && related.audit.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Agent audit events" tabIndex={0}>
-          <table className="agent-insight-table"><thead><tr><th scope="col">Operation</th><th scope="col">Observed</th><th scope="col">Result</th><th scope="col">Investigation</th></tr></thead><tbody>
-            {related.audit.value.map(item => <tr key={`${item.jobId}:${item.wrapperId}`}><th scope="row">{item.operation}</th><td>{formatDate(item.observedAt)}</td><td>{item.resultStatus ?? "Not reported"}</td><td><a href={`/audit?${new URLSearchParams({ source: "purview", job: item.jobId })}`}>View audit search</a></td></tr>)}
+          <table className="agent-insight-table"><thead><tr><th scope="col">Operation</th><th scope="col">Observed</th><th scope="col">Result</th><th scope="col">Evidence</th></tr></thead><tbody>
+          {related.audit.value.map(item => <tr key={`${item.jobId}:${item.wrapperId}`}><th scope="row">{item.operation}</th><td>{formatDate(item.observedAt)}</td><td>{item.resultStatus ?? "Not reported"}</td><td><details><summary>Event reference</summary><p>Event: <code>{item.nativeEventId ?? item.wrapperId}</code></p><p>Correlation: <code>{item.correlationId ?? "Not supplied"}</code></p><p>Saved search: <code>{item.jobId}</code></p></details></td></tr>)}
           </tbody></table>
         </div> : null}
       </article>
       <article className="agent-management-card">
         <RelatedState heading="Security observations" source={related?.security} />
-        {related?.security.status === "available" && related.security.value.length ? <dl className="inventory-identifiers">{related.security.value.map(item => <div key={`${item.snapshotId}:${item.nativeRecordId}`}><dt>{item.nativeRecordId}</dt><dd>{formatDate(item.observedAt)} · {item.lifecycleStatus ?? "Lifecycle not supplied"} · <a href={`/security?${new URLSearchParams({ job: item.jobId })}`}>View security investigation</a></dd></div>)}</dl> : null}
+        {related?.security.status === "available" && related.security.value.length ? <dl className="inventory-identifiers">{related.security.value.map(item => <div key={`${item.snapshotId}:${item.nativeRecordId}`}><dt>{item.nativeRecordId}</dt><dd>{formatDate(item.observedAt)} · {item.lifecycleStatus ?? "Lifecycle not supplied"}<details><summary>Observation reference</summary><p>Snapshot: <code>{item.snapshotId}</code></p><p>Saved hunt: <code>{item.jobId}</code></p><p>Use Defender &amp; Agent 365 above for an exact agent-scoped investigation. Historical broad hunts are not opened as this agent's results.</p></details></dd></div>)}</dl> : null}
       </article>
-    </>}
-  </>;
+  </details>;
 }
 
 function RelatedState({ heading, source }: {

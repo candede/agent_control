@@ -58,6 +58,24 @@ test("collapsed disclosure contents are checked only after opening", async ({ pa
     .toContain(".summary-grid has unequal field/card widths: 80.0, 120.0");
 });
 
+test("modal surfaces may scroll vertically but cannot escape horizontally or rely on unclipped overflow", async ({ page }) => {
+  await renderLayout(page, `
+    <dialog open style="position:relative;width:100%;height:100px;margin:0;overflow:hidden">
+      <div class="modal-scroll" style="height:50px;overflow-y:auto">
+        <section class="defender-hunting" aria-label="Hunting" style="height:200px">Saved investigation</section>
+      </div>
+    </dialog>
+  `);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.locator(".modal-scroll").evaluate(element => { element.scrollTop = 100; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.locator(".modal-scroll").evaluate(element => { element.style.overflowY = "visible"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toContain("Hunting is outside dialog.");
+  await page.locator(".modal-scroll").evaluate(element => { element.style.overflowY = "auto"; });
+  await page.locator(".defender-hunting").evaluate(element => { element.style.width = "calc(100% + 200px)"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toContain("Hunting is outside dialog.");
+});
+
 test("select minimum width uses rendered word widths instead of character count", async ({ page }) => {
   await renderLayout(page, `
     <div class="fields" style="width:70px">
@@ -79,7 +97,55 @@ test("select minimum width uses rendered word widths instead of character count"
   expect(await page.evaluate(collectLayoutFailures, { fields: [".fields"] })).toEqual([]);
 });
 
-for (const wrapper of ["table-shell", "copilot-users-table-shell", "permission-table-scroll", "jobs-table-scroll"]) {
+test("permission issue actions cannot overlap or escape their issue", async ({ page }) => {
+  await renderLayout(page, `
+    <ul class="permission-issue-list" style="padding:0;list-style:none">
+      <li style="display:grid;gap:8px"><strong>Agent inventory</strong>
+        <div class="permission-actions" style="display:flex;gap:12px;position:relative">
+          <a aria-label="Admin setup" style="display:block;width:120px">Admin setup</a>
+          <button aria-label="Details: Agent inventory" style="position:absolute;left:50px">Details</button>
+        </div>
+      </li>
+    </ul>
+  `);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain(".permission-actions: Admin setup intersects Details: Agent inventory");
+  await page.getByRole("button", { name: "Details: Agent inventory" }).evaluate(element => { element.style.position = "static"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.locator(".permission-actions").evaluate(element => { element.style.width = "calc(100% + 20px)"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain("div.permission-actions is outside li.");
+});
+
+test("permission references allow unequal columns but detect clipped guidance only when expanded", async ({ page }) => {
+  await renderLayout(page, `
+    <details><summary>Required API permissions</summary>
+      <dl class="permission-feature-list" style="margin:0">
+        <div style="display:grid;grid-template-columns:80px 120px;gap:8px">
+          <dt style="margin:0">API scope</dt>
+          <dd style="margin:0">Read agent inventory</dd>
+        </div>
+      </dl>
+      <details class="permission-log-setup">
+        <summary>Log collection setup</summary>
+        <pre aria-label="Audit setup command" style="width:100px;overflow:hidden">Get-AdminAuditLogConfig</pre>
+      </details>
+    </details>
+  `);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.getByText("Required API permissions", { exact: true }).click();
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.getByText("Log collection setup", { exact: true }).click();
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toEqual(["Audit setup command clips its permission guidance"]);
+  await page.getByLabel("Audit setup command").evaluate(element => {
+    element.style.whiteSpace = "pre-wrap";
+    element.style.overflowWrap = "anywhere";
+  });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+});
+
+for (const wrapper of ["table-shell", "copilot-users-table-shell", "jobs-table-scroll"]) {
   test(`${wrapper} requires local scrolling for wide evidence`, async ({ page }) => {
     await renderLayout(page, `
       <div class="${wrapper}" style="overflow:hidden">

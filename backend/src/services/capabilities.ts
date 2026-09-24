@@ -1,17 +1,23 @@
 import type { AuthenticatedUser } from "../types/session.js";
-import { hasAppRole, supportsAutomaticCapabilityCheck, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityStatus } from "../types/capability.js";
+import { hasAppRole, supportsAutomaticCapabilityCheck, type CapabilityCheckProgress, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityOperationFailure, type CapabilityStatus } from "../types/capability.js";
+import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
 import { config } from "../config.js";
 import { acquireApplicationToken, acquireDelegatedToken } from "../auth/msal.js";
+import { adminManagedPermissionsMessage } from "../auth/flows.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision, type CapabilityConfiguration, type CapabilityEvidence, type EvidenceKey } from "../db/capabilities.js";
 import { capabilityDefinitions, getCapabilityDefinition, hasAnyRole } from "./capabilityRegistry.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { packageReadTimeoutMs, GraphPackagesClient } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import type { AuditAction } from "../types/audit.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { operationalLog } from "./telemetry.js";
 
 const evidenceTtlMs = 5 * 60 * 1000;
+const operationEvidenceTtlMs = 24 * 60 * 60 * 1000;
 const automaticCheckDeadlineMs = 10_000;
+type OperationPrincipal = Pick<AuthenticatedUser, "tenantId" | "homeAccountId">;
 type ProbeDependencies = {
   delegatedToken: typeof acquireDelegatedToken;
   applicationToken: typeof acquireApplicationToken;
@@ -23,54 +29,139 @@ type ProbeDependencies = {
 const defaultProbeDependencies: ProbeDependencies = {
   delegatedToken: acquireDelegatedToken,
   applicationToken: acquireApplicationToken,
-  packageProbe: (token, signal) => new GraphPackagesClient().checkCatalogAccess(token, signal),
+  packageProbe: (token, signal) => new GraphPackagesClient(undefined, { maxAttempts: 1 }).checkCatalogAccess(token, signal),
   directoryProbe: (token, signal) => new DirectoryPrincipalsClient().search(token, "agent-control-permission-check", 1, signal),
-  inventoryProbe: (token, signal) => new PowerPlatformResourceQueryClient().checkAccess(token, signal),
+  inventoryProbe: (token, signal) => new PowerPlatformResourceQueryClient(undefined, { maxAttempts: 1 }).checkAccess(token, signal),
 };
 
 export class CapabilityService {
+  private readonly probes: ProbeDependencies;
   private readonly inFlight = new Map<string, Promise<CapabilityDecision>>();
-  private readonly automaticInFlight = new Map<string, Promise<void>>();
+  private readonly automaticInFlight = new Map<string, { completion: Promise<void>; progress: CapabilityCheckProgress }>();
   private readonly generations = new Map<string, number>();
   private readonly pendingPrincipalInvalidations = new Map<string, number>();
   private mutationTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly repository = new CapabilityRepository(), private readonly probes: ProbeDependencies = defaultProbeDependencies) {}
+  constructor(private readonly repository = new CapabilityRepository(), probes: Partial<ProbeDependencies> = {}) {
+    this.probes = { ...defaultProbeDependencies, ...probes };
+  }
 
   async list(user: AuthenticatedUser) {
+    if (!user.tenantId || !user.homeAccountId) throw AppError.unauthorized("Capability reporting requires an exact account.");
+    const validation = beginAccountSessionValidation(user.tenantId, user.homeAccountId);
     const entries = capabilityDefinitions.map(definition => ({ definition, generation: this.generation(definition.id, user) }));
     const views = await Promise.all(entries.map(async ({ definition, generation }) => {
-      const [current, configuration] = await Promise.all([
+      const [current, configuration, operationFailure] = await Promise.all([
         this.decision(definition, user),
         definition.mode === "application" ? this.currentConfiguration(definition, user, generation) : undefined,
+        this.operationFailure(definition, user, generation),
       ]);
       return {
         definition,
         decision: current,
         enabled: configuration?.enabled ?? true,
+        ...(operationFailure ? { operationFailure } : {}),
         ...(configuration ? { configuration: { enabled: configuration.enabled, sharedDataScope: configuration.sharedDataScope } } : {}),
       };
     }));
     for (const { definition, generation } of entries) this.requireGeneration(definition.id, user, generation);
+    assertAccountSessionValidation(validation);
     return views;
   }
 
-  async check(user: AuthenticatedUser, options: { retryFailed?: boolean } = {}) {
-    if (!user.tenantId) throw AppError.unauthorized("Capability checks require a tenant scope.");
-    const generation = this.generations.get(this.principalGenerationKey(user.tenantId, user.homeAccountId)) ?? 0;
-    const key = `${user.tenantId}\0${user.homeAccountId}\0${generation}\0${hasAppRole(user.roles, "AgentControl.Admin")}\0${Boolean(options.retryFailed)}`;
+  async check(user: AuthenticatedUser, options: { retryFailed?: boolean; signal?: AbortSignal } = {}) {
+    options.signal?.throwIfAborted();
+    const key = this.automaticCheckKey(user, Boolean(options.retryFailed));
+    const generation = this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0;
     const current = this.automaticInFlight.get(key);
     if (current) {
-      await current;
+      await current.completion;
       return this.automaticViews(user, generation);
     }
-    const operation = this.runAutomaticCheck(user, generation, Boolean(options.retryFailed));
+    const progress: CapabilityCheckProgress = { checks: capabilityDefinitions
+      .filter(definition => supportsAutomaticCapabilityCheck(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
+      .map(definition => ({ capabilityId: definition.id, state: "reviewing" })) };
+    const operation = this.runAutomaticCheck(user, generation, Boolean(options.retryFailed), progress, options.signal);
     const shared: Promise<void> = operation.finally(() => {
-      if (this.automaticInFlight.get(key) === shared) this.automaticInFlight.delete(key);
+      if (this.automaticInFlight.get(key)?.completion === shared) this.automaticInFlight.delete(key);
     });
-    this.automaticInFlight.set(key, shared);
+    this.automaticInFlight.set(key, { completion: shared, progress });
     await shared;
     return this.automaticViews(user, generation);
+  }
+
+  checkProgress(user: AuthenticatedUser, retryFailed = false): CapabilityCheckProgress | null {
+    const active = this.automaticInFlight.get(this.automaticCheckKey(user, retryFailed));
+    return active ? { checks: active.progress.checks.map(check => ({ ...check })) } : null;
+  }
+
+  private automaticCheckKey(user: AuthenticatedUser, retryFailed: boolean) {
+    if (!user.tenantId || !user.homeAccountId) throw AppError.unauthorized("Capability checks require an exact account.");
+    if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Viewer role is required.");
+    const generation = this.generations.get(this.principalGenerationKey(user.tenantId, user.homeAccountId)) ?? 0;
+    return `${user.tenantId}\0${user.homeAccountId}\0${generation}\0${hasAppRole(user.roles, "AgentControl.Admin")}\0${retryFailed}`;
+  }
+
+  async observeOperation<T>(capabilityId: CapabilityId, user: OperationPrincipal, operation: (reportFailure: (error: unknown) => void) => Promise<T>,
+    options: { signal?: AbortSignal; clearOnSuccess?: boolean | ((result: T) => boolean); shouldRecordError?: () => boolean } = {}): Promise<T> {
+    const context = this.operationContext(capabilityId, { tenantId: user.tenantId, homeAccountId: user.homeAccountId }).catch(error => {
+      logOperationEvidenceFailure(capabilityId, error);
+      return undefined;
+    });
+    let captured: ReturnType<typeof operationError>;
+    const reportFailure = (error: unknown) => { captured = operationError(error) ?? captured; };
+    try {
+      const result = await operation(reportFailure);
+      const clear = typeof options.clearOnSuccess === "function" ? options.clearOnSuccess(result) : options.clearOnSuccess !== false;
+      if (captured) await this.publishOperation(await context, captured.status, captured.details, options.signal);
+      else if (clear) await this.publishOperation(await context, "available", {}, options.signal);
+      return result;
+    } catch (error) {
+      const failure = operationError(error) ?? captured;
+      if (failure && options.shouldRecordError?.() !== false) await this.publishOperation(await context, failure.status, failure.details, options.signal);
+      throw error;
+    }
+  }
+
+  private async operationContext(capabilityId: CapabilityId, user: OperationPrincipal) {
+    const definition = requiredDefinition(capabilityId);
+    if (!user.tenantId || !user.homeAccountId || definition.mode === "local" || !definition.probe.adapterRegistered) {
+      throw new AppError(400, "invalid_operation_evidence", "Operation evidence requires an implemented provider capability and exact account.");
+    }
+    const generation = this.generation(definition.id, user);
+    const validation = beginAccountSessionValidation(user.tenantId, user.homeAccountId);
+    const configuration = await this.currentConfiguration(definition, user, generation);
+    assertAccountSessionValidation(validation);
+    return { key: operationKey(this.evidenceKey(definition, user, configuration)), definition, generation, validation, user };
+  }
+
+  private async publishOperation(context: Awaited<ReturnType<CapabilityService["operationContext"]>> | undefined,
+    status: CapabilityStatus, details: Record<string, unknown>, signal?: AbortSignal) {
+    if (!context || signal?.aborted) return;
+    try {
+      await commitAccountSessionValidation(context.validation, () => this.mutate(async () => {
+        signal?.throwIfAborted();
+        this.requireGeneration(context.definition.id, context.user, context.generation);
+        assertAccountSessionValidation(context.validation);
+        await this.repository.recordEvidence(context.key, status, safeEvidenceDetails(details), operationEvidenceTtlMs);
+      }));
+    } catch (error) { logOperationEvidenceFailure(context.definition.id, error); }
+  }
+
+  private async operationFailure(definition: CapabilityDefinition, user: AuthenticatedUser, generation: string): Promise<CapabilityOperationFailure | undefined> {
+    if (definition.mode === "local" || !definition.probe.adapterRegistered || !hasAnyRole(user.roles, definition.internalRoles)) return undefined;
+    const configuration = await this.currentConfiguration(definition, user, generation);
+    if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) return undefined;
+    const saved = await this.repository.evidence(operationKey(this.evidenceKey(definition, user, configuration)));
+    this.requireGeneration(definition.id, user, generation);
+    if (!saved || !Number.isFinite(Date.parse(saved.expiresAt)) || Date.parse(saved.expiresAt) <= Date.now()
+      || !Number.isFinite(Date.parse(saved.observedAt))) return undefined;
+    const evidence = safeEvidenceView(saved.details);
+    if (!isOperationFailure(saved.status, evidence)) return undefined;
+    return { status: saved.status, checkedAt: saved.observedAt, expiresAt: saved.expiresAt, evidence,
+      remediation: saved.status === "provider_error"
+        ? ["Microsoft denied this operation. The response does not establish whether authentication, API permissions, provider role, licensing, or target access caused the denial. Use the safe provider diagnostics to investigate."]
+        : remediation(definition, saved.status, evidence?.category) };
   }
 
   async decision(capability: CapabilityId | CapabilityDefinition, user: AuthenticatedUser): Promise<CapabilityDecision> {
@@ -192,13 +283,18 @@ export class CapabilityService {
     return { contractRevision: capabilityContractRevision(definition), permissionRevision: capabilityPermissionRevision(definition), configurationRevision: configuration.revision };
   }
 
-  async refresh(capabilityId: CapabilityId, user: AuthenticatedUser) {
+  async refresh(capabilityId: CapabilityId, user: AuthenticatedUser, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const definition = requiredDefinition(capabilityId);
     const generation = this.generation(definition.id, user);
-    return this.refreshAtGeneration(definition, user, generation);
+    const current = await this.decision(definition, user);
+    this.requireGeneration(definition.id, user, generation);
+    if (current.fresh && current.evidence?.category === "provider_throttled") return current;
+    return this.refreshAtGeneration(definition, user, generation, signal);
   }
 
-  private async refreshAtGeneration(definition: CapabilityDefinition, user: AuthenticatedUser, generation: string) {
+  private async refreshAtGeneration(definition: CapabilityDefinition, user: AuthenticatedUser, generation: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     this.requireGeneration(definition.id, user, generation);
     if (!hasAnyRole(user.roles, definition.internalRoles)) return this.decision(definition, user);
     if (definition.mode === "local" || !definition.probe.adapterRegistered ||
@@ -207,10 +303,15 @@ export class CapabilityService {
     const configuration = await this.currentConfiguration(definition, user, generation);
     if (definition.mode === "application" && (!configuration.enabled || !configuration.sharedDataScope)) return this.decision(definition, user);
     const key = this.evidenceKey(definition, user, configuration);
+    const saved = await this.repository.evidence(key);
+    signal?.throwIfAborted();
+    this.requireGeneration(definition.id, user, generation);
+    const cooldown = boundedRetryAfter(saved?.details.retryAfterMs);
+    if (saved && cooldown !== undefined && Date.parse(saved.observedAt) + cooldown > Date.now()) return this.decision(definition, user);
     const serializedKey = `${JSON.stringify(key)}\0${generation}`;
     const current = this.inFlight.get(serializedKey);
     if (current) return current;
-    const operation = this.runProbe(definition, user, key, generation);
+    const operation = this.runProbe(definition, user, key, generation, signal);
     const shared = operation.finally(() => {
       if (this.inFlight.get(serializedKey) === shared) this.inFlight.delete(serializedKey);
     });
@@ -218,49 +319,60 @@ export class CapabilityService {
     return shared;
   }
 
-  private async runProbe(definition: CapabilityDefinition, user: AuthenticatedUser, key: EvidenceKey, generation: string) {
+  private async runProbe(definition: CapabilityDefinition, user: AuthenticatedUser, key: EvidenceKey, generation: string, cancellation?: AbortSignal) {
     let status: CapabilityStatus = "available";
     let details: Record<string, unknown> = { contract: definition.probe.description, verification: defaultVerification(definition) };
     let phase: "token_acquisition" | "provider_read" = "token_acquisition";
     let timeoutMs = automaticCheckDeadlineMs;
-    let signal = AbortSignal.timeout(timeoutMs);
+    const validation = beginAccountSessionValidation(user.tenantId!, user.homeAccountId);
+    const beforeRequest = () => {
+      cancellation?.throwIfAborted();
+      this.requireGeneration(definition.id, user, generation);
+      assertAccountSessionValidation(validation);
+    };
     this.requireGeneration(definition.id, user, generation);
     try {
-      const token = definition.mode === "delegated"
-        ? await abortable(this.probes.delegatedToken(user.homeAccountId, definition.id), signal)
-        : await abortable(this.probes.applicationToken(definition.id), signal);
+      const token = await retryReadiness(() => definition.mode === "delegated"
+        ? this.probes.delegatedToken(user.homeAccountId, definition.id)
+        : this.probes.applicationToken(definition.id), timeoutMs, cancellation, beforeRequest);
       this.requireGeneration(definition.id, user, generation);
       phase = "provider_read";
       timeoutMs = definition.id.startsWith("graph.package.read.") ? packageReadTimeoutMs : automaticCheckDeadlineMs;
-      signal = AbortSignal.timeout(timeoutMs);
-      if (definition.id.startsWith("graph.package.read.")) await abortable(this.probes.packageProbe(token, signal), signal);
-      else if (definition.id === "graph.directory.read") await abortable(this.probes.directoryProbe(token, signal), signal);
-      else if (definition.id === "powerPlatform.inventory.read") await abortable(this.probes.inventoryProbe(token, signal), signal);
+      if (definition.id.startsWith("graph.package.read.")) await retryReadiness(signal => this.probes.packageProbe(token, signal), timeoutMs, cancellation, beforeRequest);
+      else if (definition.id === "graph.directory.read") await retryReadiness(signal => this.probes.directoryProbe(token, signal), timeoutMs, cancellation, beforeRequest);
+      else if (definition.id === "powerPlatform.inventory.read") await retryReadiness(signal => this.probes.inventoryProbe(token, signal), timeoutMs, cancellation, beforeRequest);
     } catch (error) {
-      this.requireGeneration(definition.id, user, generation);
+      beforeRequest();
       status = probeStatus(error);
-      details = { ...safeProbeDetails(error), phase, timeoutMs, verification: defaultVerification(definition) };
+      details = { ...safeProbeDetails(error), phase, timeoutMs, verification: defaultVerification(definition),
+        ...(retryAfter(error) === undefined ? {} : { retryAfterMs: retryAfter(error) }) };
     }
-    this.requireGeneration(definition.id, user, generation);
+    beforeRequest();
     await this.mutate(async () => {
       this.requireGeneration(definition.id, user, generation);
-      await this.repository.recordEvidence(key, status, details, evidenceTtlMs);
+      beforeRequest();
+      const cooldown = boundedRetryAfter(details.retryAfterMs) ?? 0;
+      await this.repository.recordEvidence(key, status, details, Math.max(evidenceTtlMs, cooldown));
     });
-    this.requireGeneration(definition.id, user, generation);
+    beforeRequest();
     const current = await this.decision(definition, user);
-    this.requireGeneration(definition.id, user, generation);
+    beforeRequest();
     return current;
   }
 
-  private async runAutomaticCheck(user: AuthenticatedUser, generation: number, retryFailed: boolean) {
-    const eligible = capabilityDefinitions
-      .filter(definition => supportsAutomaticCapabilityCheck(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
-      .map(definition => ({ definition, refreshGeneration: this.generation(definition.id, user) }));
-    await Promise.all(eligible.map(async ({ definition, refreshGeneration }) => {
+  private async runAutomaticCheck(user: AuthenticatedUser, generation: number, retryFailed: boolean, progress: CapabilityCheckProgress, signal?: AbortSignal) {
+    const eligible = progress.checks.map(check => ({
+      check, definition: requiredDefinition(check.capabilityId), refreshGeneration: this.generation(check.capabilityId, user),
+    }));
+    await Promise.all(eligible.map(async ({ check, definition, refreshGeneration }) => {
       const current = await this.decision(definition, user);
       const reuseFresh = reuseCapabilityCheck(current, retryFailed);
-      if (reuseFresh || generation !== (this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0)) return;
-      await this.refreshAtGeneration(definition, user, refreshGeneration);
+      if (generation !== (this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0)) return;
+      if (!reuseFresh) {
+        check.state = "checking";
+        await this.refreshAtGeneration(definition, user, refreshGeneration, signal);
+      }
+      check.state = "complete";
     }));
     if (generation !== (this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0)) {
       throw new AppError(401, "authorization_expired", "The signed-in account changed during automatic capability checks.");
@@ -293,7 +405,7 @@ export class CapabilityService {
     });
   }
 
-  private async currentConfiguration(definition: CapabilityDefinition, user: AuthenticatedUser, generation = this.generation(definition.id, user)) {
+  private async currentConfiguration(definition: CapabilityDefinition, user: OperationPrincipal, generation = this.generation(definition.id, user)) {
     await this.mutationTail;
     this.requireGeneration(definition.id, user, generation);
     if (this.pendingPrincipalInvalidations.has(this.principalGenerationKey(user.tenantId!, user.homeAccountId))) {
@@ -322,7 +434,7 @@ export class CapabilityService {
     return current;
   }
 
-  private evidenceKey(definition: CapabilityDefinition, user: AuthenticatedUser, configuration: CapabilityConfiguration): EvidenceKey {
+  private evidenceKey(definition: CapabilityDefinition, user: OperationPrincipal, configuration: CapabilityConfiguration): EvidenceKey {
     return {
       tenantId: user.tenantId!,
       principalId: definition.mode === "application" ? config.clientId! : user.homeAccountId,
@@ -337,11 +449,11 @@ export class CapabilityService {
     };
   }
 
-  private generation(capabilityId: CapabilityId, user: AuthenticatedUser) {
+  private generation(capabilityId: CapabilityId, user: OperationPrincipal) {
     return `${this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0}:${this.generations.get(this.capabilityGenerationKey(user.tenantId!, capabilityId)) ?? 0}`;
   }
 
-  private requireGeneration(capabilityId: CapabilityId, user: AuthenticatedUser, generation: string) {
+  private requireGeneration(capabilityId: CapabilityId, user: OperationPrincipal, generation: string) {
     if (generation !== this.generation(capabilityId, user)) {
       throw new AppError(401, "authorization_expired", "The signed-in account changed during capability verification.");
     }
@@ -369,6 +481,92 @@ export class CapabilityService {
 }
 
 export const capabilities = new CapabilityService();
+
+function operationKey(key: EvidenceKey): EvidenceKey {
+  return { ...key, contractRevision: `operation-v1:${key.contractRevision}` };
+}
+
+function logOperationEvidenceFailure(capabilityId: CapabilityId, error: unknown) {
+  operationalLog("warn", "capability_operation_evidence_failed", {
+    capabilityId, errorCode: error instanceof AppError ? error.code : "evidence_storage_failed",
+  });
+}
+
+function isOperationFailure(status: CapabilityStatus, evidence: CapabilityDecision["evidence"]): status is CapabilityOperationFailure["status"] {
+  return ["missing_permission", "missing_role", "missing_license"].includes(status)
+    || status === "unknown" && ["interaction_required", "authorization_expired"].includes(evidence?.category ?? "")
+    || status === "provider_error" && [401, 403].includes(evidence?.httpStatus ?? 0);
+}
+
+function operationError(error: unknown): { status: CapabilityOperationFailure["status"]; details: Record<string, unknown> } | undefined {
+  if (!(error instanceof AppError)) return undefined;
+  if (error.details && typeof error.details === "object" && "capabilityId" in error.details && "authorized" in error.details) return undefined;
+  const details = { ...safeProbeDetails(error) };
+  const explicit = error.code === "missing_provider_scope" ? "missing_permission"
+    : error.code === "missing_provider_role" ? "missing_role"
+      : error.code === "conditional_access_required" ? "interaction_required" : error.code;
+  if (["missing_permission", "missing_role", "missing_license"].includes(explicit)) {
+    const status = explicit === "missing_permission" ? "missing_permission" : explicit === "missing_role" ? "missing_role" : "missing_license";
+    return { status, details: { ...details, category: status } };
+  }
+  if (explicit === "interaction_required" || explicit === "authorization_expired") {
+    return { status: "unknown", details: { ...details, category: explicit } };
+  }
+  if (["provider_authorization_error", "agent_identity_permission_required", "hunting_access_denied", "provider_denied"].includes(error.code)
+    && [401, 403].includes(error.status)) details.httpStatus = error.status;
+  if ([401, 403].includes(details.httpStatus ?? 0)) return { status: "provider_error", details: { ...details, category: "provider_error" } };
+  return undefined;
+}
+
+function probeSignal(timeoutMs: number, cancellation?: AbortSignal) {
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return cancellation ? AbortSignal.any([deadline, cancellation]) : deadline;
+}
+
+function retryAfter(error: unknown) {
+  if (!(error instanceof AppError) || !error.details || typeof error.details !== "object" || !("retryAfterMs" in error.details)) return undefined;
+  return boundedRetryAfter(error.details.retryAfterMs);
+}
+
+function boundedRetryAfter(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647 ? value : undefined;
+}
+
+function readinessRetryDelay(error: unknown) {
+  if (error instanceof AppError && (["missing_permission", "missing_provider_scope", "missing_role", "missing_provider_role", "missing_license",
+    "interaction_required", "authorization_expired", "unsupported", "provider_schema", "provider_result_limit", "auth_not_configured"].includes(error.code)
+    || [400, 401, 403, 404].includes(error.status))) return undefined;
+  const cooldown = retryAfter(error);
+  if (cooldown !== undefined && cooldown > 1_000) return undefined;
+  if (error instanceof AppError && safeProbeDetails(error)?.category === "provider_throttled") return cooldown === undefined ? undefined : Math.max(10, cooldown);
+  const tokenTransient = error instanceof AppError && error.code === "identity_provider_error"
+    && error.details !== null && typeof error.details === "object" && "retryable" in error.details && error.details.retryable === true;
+  const transient = error instanceof TypeError || error instanceof Error && error.name === "TimeoutError"
+    || error instanceof AppError && (["provider_network_error", "provider_timeout"].includes(error.code)
+      || tokenTransient || [500, 502, 503, 504].includes(error.status) && error.code !== "identity_provider_error"
+        && (error.code === "provider_error" || safeProbeDetails(error)?.httpStatus === error.status));
+  return transient ? Math.max(10, cooldown ?? 100) : undefined;
+}
+
+async function retryReadiness<T>(operation: (signal: AbortSignal) => Promise<T>, timeoutMs: number,
+  cancellation: AbortSignal | undefined, beforeRequest: () => void): Promise<T> {
+  const attempt = () => {
+    cancellation?.throwIfAborted();
+    beforeRequest();
+    const signal = probeSignal(timeoutMs, cancellation);
+    signal.throwIfAborted();
+    return abortable(operation(signal), signal);
+  };
+  try { return await attempt(); }
+  catch (error) {
+    cancellation?.throwIfAborted();
+    beforeRequest();
+    const waitMs = readinessRetryDelay(error);
+    if (waitMs === undefined) throw error;
+    await delay(waitMs, undefined, { signal: cancellation });
+    return attempt();
+  }
+}
 
 function reuseCapabilityCheck(current: CapabilityDecision, retryFailed: boolean) {
   return current.fresh && current.verification !== "on_demand"
@@ -422,7 +620,7 @@ function safeEvidenceView(details: Record<string, unknown>): CapabilityDecision[
   };
 }
 
-const evidenceCategories = new Set(["provider_error", "interaction_required", "authorization_expired", "missing_permission", "unsupported",
+const evidenceCategories = new Set(["provider_error", "interaction_required", "authorization_expired", "missing_permission", "missing_role", "missing_license", "unsupported",
   "authorization_not_yet_valid", "identity_provider_error",
   "provider_timeout", "provider_network_error", "provider_throttled", "provider_schema", "provider_result_limit"]);
 
@@ -466,7 +664,10 @@ function safeEvidenceDetails(details: Record<string, unknown>) {
 
 function remediation(definition: CapabilityDefinition, status: CapabilityStatus, category?: string) {
   const capabilityId = definition.id;
-  if (category === "interaction_required") return ["Sign in again or complete delegated consent before retrying."];
+  if (definition.mode === "application" && ["interaction_required", "authorization_expired"].includes(category ?? "")) {
+    return ["An administrator must verify the existing app registration's credentials and previously granted application API permissions. User sign-in does not repair app-only authorization."];
+  }
+  if (category === "interaction_required") return ["Sign in again to complete MFA or account verification. Contact your administrator if Conditional Access blocks sign-in; API permission grants are a separate admin prerequisite."];
   if (category === "authorization_expired") return ["Sign in again before retrying."];
   if (category === "authorization_not_yet_valid") return ["The Microsoft token is not yet valid. Check the application host clock and time synchronization before retrying; additional consent is not indicated."];
   if (category === "identity_provider_error") return ["Microsoft Entra ID could not complete valid token acquisition. Retry and use the sanitized error code and correlation ID for identity-provider troubleshooting; this does not establish missing consent."];
@@ -474,6 +675,9 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
   if (category === "provider_network_error") return ["The provider could not be reached. Check service connectivity and retry the bounded check without broadening consent."];
   if (category === "provider_throttled") return ["The provider throttled the bounded check. Wait before retrying without changing permissions."];
   if (category === "provider_schema" || category === "provider_result_limit") return ["The provider response did not satisfy the bounded adapter contract. Check the documented endpoint and sanitized diagnostics before retrying."];
+  if (status === "missing_permission") return [
+    `${adminManagedPermissionsMessage} Required ${definition.mode} permissions: ${definition.permissions.join(", ")}.`,
+  ];
   if (status === "unknown" && !supportsAutomaticCapabilityCheck(capabilityId)) {
     if (definition.mode === "application") return [definition.probe.kind === "live_qualification"
       ? "An Admin must explicitly approve a bounded application-scope operation; automatic delegated checks do not verify application access."
@@ -484,7 +688,6 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
     const auditValues: Partial<Record<CapabilityStatus, string[]>> = {
       missing_internal_role: ["Assign the AgentControl.Viewer role."],
       not_configured: ["Enable application mode and its shared data scope before approving an application qualification."],
-      missing_permission: ["Grant only AuditLogsQuery.Read.All, then retry the bounded search."],
       provider_error: ["Verify Purview Audit entitlement, unified auditing, and Audit Logs or View-Only Audit Logs role for delegated use, then retry the bounded search."],
       unsupported: ["Verify tenant rollout for the selected Microsoft Graph v1.0 Audit Search lifecycle."],
       unknown: ["Run the automatic delegated readiness check or submit one explicit bounded search."],
@@ -495,7 +698,6 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
     const huntingValues: Partial<Record<CapabilityStatus, string[]>> = {
       missing_internal_role: ["Assign AgentControl.Viewer."],
       not_configured: ["Enable application mode and approve its shared data scope before application qualification."],
-      missing_permission: ["Grant only ThreatHunting.Read.All, then retry the bounded investigation."],
       provider_error: ["Check Defender XDR RBAC/data-source scope, licensing, Agent 365 connectivity and table rollout separately, then retry the bounded investigation."],
       unsupported: ["Verify the Graph v1.0 hunting endpoint and AgentsInfo or CloudAppEvents rollout for this tenant."],
       unknown: ["Run the automatic delegated readiness check or submit one explicit bounded investigation."],
@@ -504,13 +706,12 @@ function remediation(definition: CapabilityDefinition, status: CapabilityStatus,
   }
   const values: Partial<Record<CapabilityStatus, string[]>> = {
     missing_internal_role: ["Ask an administrator to assign the required Agent Control app role."],
-    missing_permission: ["Grant consent for this capability using the signed-in account."],
     missing_role: ["Verify the documented provider role without broadening API consent."],
     missing_license: ["Verify the documented service license for the same account or application scope."],
     not_configured: ["Complete the listed configuration. An unregistered adapter remains unavailable until its documented contract and required safety controls are implemented."],
     provider_error: ["Retry the bounded probe; an ambiguous provider failure does not identify a missing role or license."],
     unsupported: ["Verify the documented cloud, endpoint, and resource support."],
-    unknown: ["Run the automatic non-mutating readiness check after consent and configuration are complete."],
+    unknown: ["Run the automatic non-mutating readiness check after an administrator has configured API permissions and granted admin consent in the existing Entra app registration."],
   };
   return values[status] ?? [];
 }

@@ -15,7 +15,11 @@ const mocks = vi.hoisted(() => {
 vi.mock("../services/unifiedAgents.js", () => ({ unifiedAgents: { list: mocks.list } }));
 vi.mock("../services/agentPeople.js", () => ({ agentPeople: { generation: mocks.generation, resolve: mocks.resolve } }));
 vi.mock("../services/savedAgentPeople.js", () => ({ savedAgentPeople: { project: mocks.project } }));
-vi.mock("../services/capabilities.js", () => ({ capabilities: { requireAvailable: mocks.requireAvailable } }));
+vi.mock("../services/purviewAudit.js", () => ({ purviewAudit: { agentRecords: vi.fn() } }));
+vi.mock("../services/capabilities.js", () => ({ capabilities: {
+  requireAvailable: mocks.requireAvailable,
+  observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
+} }));
 vi.mock("../services/telemetry.js", async original => ({
   ...await original<typeof import("../services/telemetry.js")>(), operationalLog: vi.fn(),
 }));

@@ -4,6 +4,59 @@
   min-width: 0;
 }
 
+.agent-investigations,
+.agent-investigation-records {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.agent-investigations {
+  padding-bottom: 24px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-investigations h3 {
+  margin: 0;
+}
+
+.agent-investigations summary,
+.agent-saved-observations > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  color: var(--ink);
+}
+
+.agent-saved-observations > summary {
+  font-weight: 600;
+}
+
+.agent-investigations label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-investigations .agent-insight-toolbar {
+  align-items: end;
+}
+
+.agent-investigations [aria-pressed="true"] {
+  color: #fff;
+  background: #254f48;
+}
+
+.agent-investigations code,
+.agent-investigations dd {
+  overflow-wrap: anywhere;
+}
+
+.agent-investigations .hunting-readiness,
+.agent-investigations .hunting-primary-fields {
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+}
+
 .agent-usage-insights {
   padding: 20px;
   border: 1px solid var(--border);

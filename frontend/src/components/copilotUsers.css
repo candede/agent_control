@@ -104,6 +104,8 @@
 .copilot-user-dialog section > p { font-size: 13px; margin-bottom: 12px; }
 .copilot-user-dialog .copilot-user-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .copilot-user-dialog .copilot-users-table { min-width: 600px; }
+.copilot-user-dialog .purview-search-primary,
+.copilot-user-dialog .purview-structured-filters > div { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .copilot-service-plans { list-style: none; padding: 0; margin: 0 0 12px; display: grid; gap: 8px; }
 .copilot-service-plans li { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
 .copilot-service-plans .copilot-user-badge { justify-self: start; }
@@ -119,6 +121,8 @@
   .copilot-user-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .copilot-users-provenance dl { grid-template-columns: minmax(0, 1fr); }
   .copilot-user-dialog { padding: 16px; }
+  .copilot-user-dialog .purview-search-primary,
+  .copilot-user-dialog .purview-structured-filters > div { grid-template-columns: minmax(0, 1fr); }
   .copilot-app-activity { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .copilot-user-dialog .copilot-user-metrics { grid-template-columns: minmax(0, 1fr); }
 }

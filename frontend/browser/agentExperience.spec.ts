@@ -224,7 +224,7 @@ test("fresh activity links keep their search, page and snapshot separate from ot
       importCount: 0, uniqueObservationCount: 0, observationRowCount: 0, uniquePayloadCount: 0, repeatedRowsReused: 0,
       earliestObservedAt: null, latestObservedAt: null,
       activityDateRange: { earliestDateUtc: null, latestDateUtc: null, provenance: "last_activity_dates", provesReportingCoverage: false },
-      reportingWindows: { knownCount: 0, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
+      reportingWindows: { earliestStartDateUtc: null, latestEndDateUtc: null, knownCount: 0, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
       warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
     },
     bundles: { value: [], count: 0, limit: 10, offset: 0 },

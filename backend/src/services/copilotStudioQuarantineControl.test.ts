@@ -23,6 +23,7 @@ function service(cached = false, currentUser = user) {
   const inventory = { resolveQuarantineTargets: vi.fn(async () => [target]) };
   const provider = { getStatus: vi.fn(async () => direct) };
   const dependencies = {
+    observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
     revalidateUser: vi.fn(async () => currentUser), delegatedToken: vi.fn(async () => "ephemeral-token"), requireAvailable: vi.fn(async () => undefined),
     authorityContext: vi.fn(async () => authority), launch: vi.fn(),
   };

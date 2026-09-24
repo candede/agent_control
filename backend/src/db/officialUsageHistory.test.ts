@@ -107,6 +107,8 @@ describe.sequential("official usage cumulative history", () => {
       uniquePayloadCount: 303,
       repeatedRowsReused: 297,
       reportingWindows: {
+        earliestStartDateUtc: "2026-06-02",
+        latestEndDateUtc: "2026-07-02",
         knownCount: 2,
         unknownCount: 0,
         overlappingKnownWindowCount: 2,
@@ -117,10 +119,58 @@ describe.sequential("official usage cumulative history", () => {
     expect(view.summary).not.toHaveProperty("totalResponses");
     expect(view.bundles).toMatchObject({ count: 2, limit: 1, offset: 0 });
     expect(view.bundles.value[0]).toMatchObject({ expiresAt: null });
-    expect((await history.getHistory(scope.tenantId, { limit: 1, offset: 1 })).bundles.value).toHaveLength(1);
+    const nextPage = await history.getHistory(scope.tenantId, { limit: 1, offset: 1 });
+    expect(nextPage.bundles.value).toHaveLength(1);
+    expect(nextPage.summary).toEqual(view.summary);
     expect((await repository.getPublished(scope.tenantId)).activeSet?.id).toBe(dayTwoSetId);
     expect((await repository.getPublished(scope.tenantId, dayOneSetId)).reports.agents?.rows[99].responsesSentToUsers).toBe(4);
     expect((await repository.getPublished(scope.tenantId, dayTwoSetId)).reports.agents?.rows[99].responsesSentToUsers).toBe(5);
+  });
+
+  it("updates the cumulative reporting envelope after deletion and excludes drafts, unknown windows and other tenants", async () => {
+    const owner = { tenantId: "tenant-report-envelope", principalId: "report-envelope-admin" };
+    const first = await (await importBundle({
+      owner, reportMetadata: metadata("2026-06-02", "2026-07-01", "2026-07-02T08:00:00Z"),
+      changedKinds: { agents: { count: 1 }, userAgents: { count: 1 }, users: { count: 1 } },
+    })).accept();
+    const second = await (await importBundle({
+      owner, reportMetadata: metadata("2026-08-01", "2026-08-30", "2026-08-31T08:00:00Z"),
+      changedKinds: { agents: { count: 0 }, userAgents: { count: 0 }, users: { count: 0 } },
+    })).accept();
+    await (await importBundle({
+      owner, changedKinds: {
+        agents: { count: 1, changedOrdinal: 0, changedActivityDate: "2026-05-01" },
+        userAgents: { count: 1, changedOrdinal: 0, changedActivityDate: "2026-05-01" },
+        users: { count: 1, changedOrdinal: 0, changedActivityDate: "2026-05-01" },
+      },
+    })).accept();
+    await importBundle({
+      owner, reportMetadata: metadata("2026-09-01", "2026-09-30", "2026-10-01T08:00:00Z"),
+      changedKinds: { agents: { count: 0 }, userAgents: { count: 0 }, users: { count: 0 } },
+    });
+    const view = await history.getHistory(owner.tenantId, { limit: 1, offset: 2 });
+    expect(view.summary).toMatchObject({
+      importCount: 3,
+      reportingWindows: {
+        earliestStartDateUtc: "2026-06-02", latestEndDateUtc: "2026-08-30",
+        knownCount: 2, unknownCount: 1, overlappingKnownWindowCount: 0, additive: false,
+      },
+    });
+    expect(view.summary.activityDateRange.earliestDateUtc).toMatch(/^2026-05-01/);
+    expect((await history.getHistory("tenant-no-reports")).summary.reportingWindows).toMatchObject({
+      earliestStartDateUtc: null, latestEndDateUtc: null, knownCount: 0, unknownCount: 0,
+    });
+
+    for (const setId of [first.setId, second.setId]) {
+      const preview = await repository.previewSetOperation(owner, "delete", setId);
+      await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "delete", setId });
+      const summary = (await history.getHistory(owner.tenantId)).summary;
+      expect(summary.reportingWindows).toMatchObject({
+        earliestStartDateUtc: setId === first.setId ? "2026-08-01" : null,
+        latestEndDateUtc: setId === first.setId ? "2026-08-30" : null,
+        knownCount: setId === first.setId ? 1 : 0, unknownCount: 1,
+      });
+    }
   });
 
   it("idempotently reuses semantic content across bundle IDs, administrators and CSV formatting", async () => {
@@ -235,7 +285,7 @@ describe.sequential("official usage cumulative history", () => {
 
     expect((await history.getHistory(unknownScope.tenantId)).summary).toMatchObject({
       importCount: 2,
-      reportingWindows: { knownCount: 0, unknownCount: 2, additive: false },
+      reportingWindows: { earliestStartDateUtc: null, latestEndDateUtc: null, knownCount: 0, unknownCount: 2, additive: false },
       activityDateRange: { provenance: "last_activity_dates", provesReportingCoverage: false },
     });
     expect((await repository.getPublished(unknownScope.tenantId, accepted.setId)).activeSet?.id).toBe(accepted.setId);

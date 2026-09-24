@@ -66,6 +66,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
   const agentRequests: URLSearchParams[] = [];
   const exportRequests: URLSearchParams[] = [];
   const apiRequests: string[] = [];
+  const historyRequests: string[] = [];
   const commands: string[] = [];
   function storeReport(report: ParsedOfficialUsageReport, index: number, target = reports) {
     if (report.kind === "agents") target.agents = accepted(report, index);
@@ -232,6 +233,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
       }, published()));
     }
     if (path === "/api/official-usage/history") {
+      historyRequests.push(url.searchParams.toString());
       const retained = [
         ...isAccepted ? [{ set: { ...activeSet, bundleId }, reports }] : [],
         ...options.historical ? [{ set: historicalSet, reports: historicalReports }] : [],
@@ -261,7 +263,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
             latestDateUtc: isAccepted ? "2026-09-12" : options.historical ? "2026-06-01" : null,
             provenance: "last_activity_dates", provesReportingCoverage: false,
           },
-          reportingWindows: { knownCount: 0, unknownCount: bundles.length, overlappingKnownWindowCount: 0, additive: false },
+          reportingWindows: { earliestStartDateUtc: null, latestEndDateUtc: null, knownCount: 0, unknownCount: bundles.length, overlappingKnownWindowCount: 0, additive: false },
           warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
         },
         bundles: {
@@ -276,7 +278,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     return route.fallback();
   });
-  return { uploadBodies, userRequests, agentRequests, exportRequests, apiRequests, commands };
+  return { uploadBodies, userRequests, agentRequests, exportRequests, apiRequests, historyRequests, commands };
 }
 
 async function expectReportPaneScrolling(page: Page, pane: Locator, name: string) {
@@ -630,7 +632,7 @@ test("allows closing during validation without dropping the staged result", asyn
 });
 
 test("snapshot inspection preserves raw source totals and read-only access", async ({ page }, info) => {
-  const { apiRequests } = await mockUsage(page, { role: "Viewer", active: true });
+  const { apiRequests, historyRequests } = await mockUsage(page, { role: "Viewer", active: true });
   await page.goto("/sync?reports=snapshot");
   const modal = page.locator("dialog.official-usage-modal");
   await expect(modal).toBeVisible();
@@ -647,7 +649,8 @@ test("snapshot inspection preserves raw source totals and read-only access", asy
   await expect(page.locator(".report-chart-panel")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Agent activity report" }).getByRole("link")).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/users");
-  expect(apiRequests).not.toContain("/api/official-usage/history");
+  expect(historyRequests).toEqual(["limit=1&offset=0"]);
+  await expect(modal.getByRole("heading", { name: "Report history" })).toHaveCount(0);
   if (info.project.name === "desktop") {
     const bounds = await table.boundingBox();
     expect(bounds!.y, "Source report rows should begin in the first desktop viewport").toBeLessThan(760);

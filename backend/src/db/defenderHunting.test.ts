@@ -68,6 +68,38 @@ async function qualifyScope(key: string, scope = principalScope, selectedFilters
 }
 
 describe.sequential("Defender hunting repository", () => {
+  it("isolates typed agent history before real database counts, pagination and lifecycle access", async () => {
+    const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "agent-history-reader",
+      resultScope: { kind: "principal", scopeId: "agent-history-reader", configurationRevision: null } };
+    const identity = "33333333-3333-4333-8333-333333333333";
+    const otherIdentity = "44444444-4444-4444-8444-444444444444";
+    const inventoryFilters = { ...filters, agentIds: [], entraAgentIds: [identity] };
+    const runtimeFilters: DefenderHuntingFilters = { ...filters, agentIds: [], templateId: "agent_activity",
+      operations: ["InvokeAgent"], entraAgentApplicationIds: [identity] };
+    const inventory = await repository.submit(scope, { idempotencyKey: "agent-inventory", filters: inventoryFilters });
+    const activity = await repository.submit(scope, { idempotencyKey: "agent-activity", filters: runtimeFilters });
+    const tools = await repository.submit(scope, { idempotencyKey: "agent-tools",
+      filters: { ...runtimeFilters, templateId: "agent_tools", operations: ["ExecuteToolBySDK"] } });
+    await repository.submit(scope, { idempotencyKey: "other-agent",
+      filters: { ...runtimeFilters, entraAgentApplicationIds: [otherIdentity] } });
+    await repository.submit(scope, { idempotencyKey: "legacy-mistyped-agent",
+      filters: { ...runtimeFilters, entraAgentApplicationIds: [], entraAgentIds: [identity] } });
+    const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
+      resultScopes: [scope.resultScope], qualifications: [], entraAgentIds: [], entraAgentApplicationIds: [identity] };
+    const page = await repository.listJobs(readScope, 1, 1);
+    expect(page).toMatchObject({ count: 2, limit: 1, offset: 1 });
+    expect(page.value).toHaveLength(1);
+    expect([activity.id, tools.id]).toContain(page.value[0].id);
+    expect(await repository.listJobs({ ...readScope, entraAgentIds: [identity], entraAgentApplicationIds: [] }))
+      .toMatchObject({ count: 1, value: [{ id: inventory.id }] });
+    expect(await repository.getJob(readScope, inventory.id)).toBeUndefined();
+    await expect(repository.cancel(readScope, inventory.id)).rejects.toMatchObject({ code: "hunting_job_state" });
+    expect(await repository.cancel(readScope, activity.id)).toMatchObject({ status: "cancelled" });
+    expect((await repository.listJobs({ ...readScope, tenantId: "different-tenant" })).count).toBe(0);
+    expect((await repository.listJobs({ ...readScope, authorizationPrincipalId: "different-reader",
+      resultScopes: [{ kind: "principal", scopeId: "different-reader", configurationRevision: null }] })).count).toBe(0);
+  });
+
   it("accepts bounded ordinary delegated jobs without weakening application retained scope", async () => {
     const delegated = await repository.submit(principalScope, { idempotencyKey: "ordinary-delegated", filters });
     expect(delegated).toMatchObject({ tokenMode: "delegated", qualification: null, retainedScopeId: null });
@@ -253,7 +285,7 @@ describe.sequential("Defender hunting repository", () => {
     expect((await repository.listRows(principalScope, success.job.id)).value).toHaveLength(1);
   });
 
-  it("associates only an explicit exact Entra agent ID and never treats a matching blueprint as child equivalence", async () => {
+  it("does not equate opaque saved Entra agent IDs with enterprise object IDs or blueprint parent identities", async () => {
     const inventoryJob = (await fixture.operator.query<{ id: string }>(`INSERT INTO power_platform_refresh_jobs
       (id,tenant_id,principal_id,idempotency_key,request_hash,role_scope,requested_types,status)
       VALUES(gen_random_uuid(),'tenant-a','security-a','defender-association',repeat('a',64),'full','["microsoft.copilotstudio/agents"]','succeeded') RETURNING id`)).rows[0].id;
@@ -270,7 +302,7 @@ describe.sequential("Defender hunting repository", () => {
     const readScope = { tenantId: "tenant-a", authorizationPrincipalId: "security-a", resultScopes: [principalScope.resultScope], qualifications: [{ resultScope: principalScope.resultScope,
       authority: { capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 } }], inventoryIdentityScope: {
       principalId: "security-a", resourceTypes: ["microsoft.copilotstudio/agents" as const] } };
-    expect((await repository.listRows(readScope, exact.job.id)).value[0].association).toMatchObject({ status: "resolved", nativeId: "power-agent", matchedKind: "entra_agent_id" });
+    expect((await repository.listRows(readScope, exact.job.id)).value[0].association).toMatchObject({ status: "unresolved", reason: "blueprint_is_parent_not_equivalence" });
 
     const activityFilters: DefenderHuntingFilters = { ...filters, templateId: "agent_activity", operations: ["InvokeAgent"],
       agentIds: [], blueprintIds: ["22222222-2222-4222-8222-222222222222"] };

@@ -20,6 +20,7 @@ import { CopilotServiceDetails } from "./CopilotServiceDetails";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportedUserAgents } from "./ReportedUserAgents";
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
+import { UserPurviewAudit } from "./UserPurviewAudit";
 import "./copilotUsers.css";
 
 type Cohort = "licensed" | "attention" | "unknown";
@@ -377,9 +378,7 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
       <p>{user.appActivity ? `Last known activity by app. Report refreshed ${formatDate(user.appActivity.reportRefreshDate)}${data.sources.appActivity.state === "stale" ? " (out of date)" : ""}; dates can fall outside the selected report period.` : "No uniquely matched app-usage report. Check reporting permissions and whether report identities are concealed."}</p>
       <ul className="copilot-app-activity">{appFields.map(([label, field]) => <li key={field}><strong>{label}</strong><small>{!user.appActivity ? "Unknown" : user.appActivity[field] ? formatDate(user.appActivity[field]) : "No date reported"}</small></li>)}</ul>
     </section>
-    <footer>
-      <p>For timestamped events, use Audit in the top navigation. Audit metadata is separate from usage totals and excludes prompt/response content.</p>
-    </footer>
+    <UserPurviewAudit userPrincipalName={directoryCurrent ? user.directory.userPrincipalName : undefined} />
   </dialog>;
 }
 

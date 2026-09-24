@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { appRoles, capabilityIds, hasAppRole } from "../types/capability.js";
+import { appRoles, capabilityIds, hasAppRole, supportsAutomaticCapabilityCheck } from "../types/capability.js";
 import { capabilityDefinitions, hasAnyRole, resolveCapabilityStatus } from "./capabilityRegistry.js";
+import { capabilityContractRevision, capabilityPermissionRevision } from "../db/capabilities.js";
 
 describe("capability registry", () => {
   it("defines every retained capability exactly once with source-linked requirements", () => {
     expect(capabilityDefinitions.map(definition => definition.id)).toEqual(capabilityIds);
-    expect(new Set(capabilityDefinitions.map(definition => definition.id)).size).toBe(16);
+    expect(new Set(capabilityDefinitions.map(definition => definition.id)).size).toBe(17);
     for (const definition of capabilityDefinitions) {
       expect(definition.sources, definition.id).not.toHaveLength(0);
       expect(definition.sources.every(source => source.startsWith("https://learn.microsoft.com/"))).toBe(true);
       expect(definition.internalRoles, definition.id).not.toHaveLength(0);
       expect(definition.internalRoles.every(role => appRoles.includes(role))).toBe(true);
       expect(definition.probe.adapterRegistered || definition.probe.kind === "not_registered").toBe(true);
+      expect(definition).not.toHaveProperty("consentOnSignIn");
     }
   });
 
@@ -26,7 +28,7 @@ describe("capability registry", () => {
   it("keeps application mode, preview writes, and local policy explicit", () => {
     expect(capabilityDefinitions.filter(definition => definition.mode === "application")).toHaveLength(3);
     expect(capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id)).toEqual([
-      "graph.package.access.manage", "graph.package.block.manage", "graph.licenses.read", "powerPlatform.quarantine.manage",
+      "graph.package.access.manage", "graph.package.block.manage", "graph.agentIdentity.read", "graph.licenses.read", "powerPlatform.quarantine.manage",
       "reports.copilotUsage.read",
     ]);
     expect(capabilityDefinitions.find(definition => definition.id === "reports.official.import")).toMatchObject({
@@ -57,5 +59,21 @@ describe("capability registry", () => {
     expect(resolveCapabilityStatus(["available", "missing_license"])).toBe("missing_license");
     expect(resolveCapabilityStatus(["provider_error", "missing_internal_role"])).toBe("missing_internal_role");
     expect(resolveCapabilityStatus([])).toBe("unknown");
+  });
+
+  it("declares only the narrow delegated agent identity permission without automatic target lookups", () => {
+    expect(capabilityDefinitions.find(definition => definition.id === "graph.agentIdentity.read")).toMatchObject({
+      permissions: ["AgentIdentity.Read.All"], mode: "delegated", internalRoles: ["AgentControl.Viewer"],
+      consentGroup: "graph.agentIdentity.read", probe: { kind: "on_demand", adapterRegistered: true },
+    });
+    expect(capabilityDefinitions.find(definition => definition.id === "graph.agentIdentity.read")?.acceptedPermissions).toBeUndefined();
+    expect(supportsAutomaticCapabilityCheck("graph.agentIdentity.read")).toBe(false);
+  });
+
+  it("preserves provider evidence revisions when retiring interactive-consent metadata", () => {
+    const definition = capabilityDefinitions.find(value => value.id === "graph.agentIdentity.read")!;
+    const previous = Object.assign({}, definition, { consentOnSignIn: false });
+    expect(capabilityContractRevision(definition)).toBe(capabilityContractRevision(previous));
+    expect(capabilityPermissionRevision(definition)).toBe(capabilityPermissionRevision(previous));
   });
 });

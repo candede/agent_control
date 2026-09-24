@@ -87,11 +87,11 @@ import { AgentInventoryOverview } from "./components/AgentInventoryOverview";
 import { CopilotUsersView } from "./components/CopilotUsersView";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
+import { CsvUsageReportsSection } from "./components/CsvUsageReportsSection";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
 import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { EnvironmentFilter } from "./components/EnvironmentFilter";
-import { DefenderHuntingView } from "./components/DefenderHuntingView";
 import { JobsView } from "./components/JobsView";
 import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
@@ -99,6 +99,7 @@ import {
   dataSyncRouteSearch,
   parseDataSyncRoute,
   migrateOfficialUsageRoute,
+  migrateSecurityRoute,
   parseAgentRoute,
   parseUsersRoute,
   usersRouteSearch,
@@ -169,6 +170,8 @@ function readViewSearch(...views: WorkbenchViewId[]) {
 }
 
 function readInitialAgentRoute() {
+  const securityRedirect = migrateSecurityRoute(window.location.pathname);
+  if (securityRedirect) window.history.replaceState({ view: "agents" }, "", securityRedirect);
   const reports = migrateOfficialUsageRoute(window.location.pathname, window.location.search);
   if (reports) window.history.replaceState({ view: "sync" }, "", workbenchUrl("sync", reports));
   const syncRoute = parseDataSyncRoute(window.location.search);
@@ -2435,7 +2438,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </button>
               </CapabilityGate>
               ) : null}
-              {visibleViews.includes("security") ? <CapabilityGate roles={["AgentControl.Viewer"]}><button type="button" className={visibleActiveView === "security" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "security" ? "page" : undefined} onClick={() => navigateToView("security")}>Security</button></CapabilityGate> : null}
               {visibleViews.includes("sync") ? <button type="button" className={visibleActiveView === "sync" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "sync" ? "page" : undefined} onClick={() => navigateToView("sync")}>Sync{syncSetupRequired ? <small className="sync-setup-hint">Setup needed</small> : null}</button> : null}
               <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
               {visibleViews.includes("jobs") ? <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button> : null}
@@ -2444,6 +2446,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       {error ? <div className="error-banner">{error}</div> : null}
       {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
+      {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? (
+        <CsvUsageReportsSection
+          key={`csv-summary:${principalKey}`}
+          principalKey={principalKey}
+          revision={officialUsageDashboardRevision}
+          canUploadUsage={canImportReports}
+          onOpenUsageImport={() => openUsageImport()}
+          onManageUsageReports={() => openUsageImport("manage")}
+        />
+      ) : null}
       {hasRole(user, "AgentControl.Viewer") ? (
         <DataSyncPanel
           ref={dataSyncPanelRef}
@@ -2454,7 +2466,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onRunsChanged={handleSyncRunsChanged}
           requestedRunId={requestedDataSyncRunId}
           onOpenUsageImport={() => openUsageImport()}
-          onManageUsageReports={() => openUsageImport("manage")}
           onRequestedRunChange={handleRequestedSyncRunChange}
           onSourcesChanged={handleDataSyncSourcesChanged}
         />
@@ -2806,8 +2817,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         />
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />
-      ) : visibleActiveView === "security" ? (
-        <DefenderHuntingView key={principalKey} />
       ) : visibleActiveView === "jobs" ? (
         <JobsView key={principalKey} user={user} onChanged={() => void dataSyncPanelRef.current?.refresh()} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}

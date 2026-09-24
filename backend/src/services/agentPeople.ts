@@ -21,6 +21,7 @@ type Dependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   admissions: typeof requireProviderAdmissions;
   now: () => Date;
 };
@@ -33,6 +34,7 @@ export class AgentPeopleService {
       repository: new AgentPeopleRepository(database), directory: new DirectoryPrincipalsClient(),
       saved: new DataSyncRepository(database), revalidateUser: revalidateAuthenticatedUser,
       delegatedToken: acquireDelegatedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, now: () => new Date(), ...dependencies,
     };
   }
@@ -78,6 +80,14 @@ export class AgentPeopleService {
     const signal = options.signal
       ? AbortSignal.any([options.signal, AbortSignal.timeout(120_000)])
       : AbortSignal.timeout(120_000);
+    return this.dependencies.observeOperation("graph.directory.read", user,
+      reportFailure => this.resolvePending(scope, pending, signal, options, result, reportFailure),
+      { signal, clearOnSuccess: result => result.failed === 0 });
+  }
+
+  private async resolvePending(scope: DataSyncScope, pending: string[], signal: AbortSignal,
+    options: { generation: string; publication?: UserSourcePublication }, result: { changed: boolean; resolved: number; notFound: number; failed: number },
+    reportFailure: (error: unknown) => void) {
     throwIfResolutionAborted(signal);
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const freshUser = await this.dependencies.revalidateUser(scope.principalId);
@@ -106,6 +116,7 @@ export class AgentPeopleService {
               displayName: boundedName(person.displayName.toLowerCase() === objectId ? null : person.displayName, 512),
               userPrincipalName: boundedName(person.userPrincipalName ?? null, 320) };
         } catch (error) {
+          reportFailure(error);
           throwIfResolutionAborted(signal);
           const telemetry = errorTelemetry(error, "directory_lookup_failed");
           const errorCode = telemetry.errorKind === "timeout" ? "provider_timeout"

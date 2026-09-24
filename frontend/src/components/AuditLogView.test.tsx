@@ -344,42 +344,45 @@ describe("AuditLogView routing", () => {
     }
   });
 
-  it("supports roving keyboard focus and activation for audit source tabs", async () => {
+  it.each(["", "&source=purview&job=older-job&user=employee%40example.invalid", "&job=older-job"])(
+    "shows only local actions and normalizes obsolete provider links %s", async legacy => {
+    window.history.replaceState({}, "", `/audit?q=saved+actor&action=block&status=failed${legacy}`);
     render(<AuditLogView agents={[]} />);
-    const local = screen.getByRole("tab", { name: "Local control audit" });
-    const purview = screen.getByRole("tab", { name: "Purview Audit Search" });
-    local.focus();
-    await userEvent.keyboard("{ArrowRight}");
-    expect(purview).toHaveFocus();
-    expect(purview).toHaveAttribute("aria-selected", "true");
-    expect(local).toHaveAttribute("tabindex", "-1");
-    expect(screen.getByRole("tabpanel", { name: "Purview Audit Search" })).toBeVisible();
-    await userEvent.keyboard("{Home}");
-    expect(local).toHaveFocus();
-    expect(local).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tabpanel", { name: "Local control audit" })).toBeVisible();
-    expect(downloadAdministrativeAuditCsv).not.toHaveBeenCalled();
-  });
-
-  it("restores saved local filters and preserves exact source selection through browser back and forward", async () => {
-    const user = userEvent.setup();
-    render(<AuditLogView agents={[]} />);
-
+    expect(screen.getByRole("heading", { name: "Local control audit" })).toBeVisible();
     expect(await screen.findByLabelText("Search")).toHaveValue("saved actor");
     expect(screen.getByLabelText("Action")).toHaveValue("block");
     expect(screen.getByLabelText("Result")).toHaveValue("failed");
+    expect(screen.queryByRole("tablist", { name: "Audit source" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Mock Purview" })).not.toBeInTheDocument();
+    expect(window.location.search).toBe("?q=saved+actor&action=block&status=failed");
+    await waitFor(() => expect(getAuditEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "saved actor", action: "block", status: "failed" }), expect.anything(),
+    ));
+    expect(downloadAdministrativeAuditCsv).not.toHaveBeenCalled();
+  });
 
-    await user.click(screen.getByRole("tab", { name: "Purview Audit Search" }));
-    await user.click(screen.getByRole("button", { name: "Select older job" }));
-    expect(window.location.search).toContain("job=older-job");
-    expect(screen.getByText("older-job")).toBeVisible();
-
+  it("restores local filters through browser back and forward without reviving provider search", async () => {
+    render(<AuditLogView agents={[]} />);
+    act(() => {
+      window.history.pushState({}, "", "/audit?source=purview&job=old&action=unblock&status=succeeded");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.getByLabelText("Action")).toHaveValue("unblock");
+    expect(window.location.search).toBe("?action=unblock&status=succeeded");
     window.history.back();
-    await waitFor(() => expect(window.location.search).not.toContain("job=older-job"));
-    expect(screen.getByText("No selected Purview job")).toBeVisible();
-
+    await waitFor(() => expect(screen.getByLabelText("Action")).toHaveValue("block"));
+    expect(screen.getByLabelText("Search")).toHaveValue("saved actor");
     window.history.forward();
-    await waitFor(() => expect(window.location.search).toContain("job=older-job"));
-    expect(screen.getByText("older-job")).toBeVisible();
+    await waitFor(() => expect(screen.getByLabelText("Action")).toHaveValue("unblock"));
+    expect(screen.queryByRole("region", { name: "Mock Purview" })).not.toBeInTheDocument();
+  });
+
+  it("does not rewrite a destination outside Audit before the view unmounts on browser navigation", () => {
+    render(<AuditLogView agents={[]} />);
+    act(() => {
+      window.history.pushState({}, "", "/users?view=activity&q=employee");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(`${window.location.pathname}${window.location.search}`).toBe("/users?view=activity&q=employee");
   });
 });

@@ -97,7 +97,9 @@ describe("package management UI", () => {
 
     expect(screen.getByRole("button", { name: "View details for Research assistant" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toHaveAccessibleDescription(/Requires delegated CopilotPackages.ReadWrite.All/i);
+    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toHaveAccessibleDescription(
+      "Admin prerequisite: add delegated CopilotPackages.ReadWrite.All for https://graph.microsoft.com in the app registration and grant admin consent.",
+    );
     expect(screen.getByRole("button", { name: "Block Research assistant" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toHaveAccessibleDescription(/Owner reassignment is not implemented in this app/i);

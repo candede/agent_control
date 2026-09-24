@@ -97,7 +97,7 @@ export function OfficialUsageImportModal({
             if (document.activeElement === action) return;
           }
         }
-        document.getElementById("data-sync-heading")?.focus({ preventScroll: true });
+        document.getElementById("sync-reports-heading")?.focus({ preventScroll: true });
       }}
     >
       <header className="usage-modal-header">

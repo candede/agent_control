@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
@@ -34,6 +35,67 @@ async function submitAndBegin(key: string, owner = scope) {
 }
 
 describe.sequential("Purview audit repository", () => {
+  it("scopes user history before counts and pagination, excluding broad, multi-user and unauthorized jobs", async () => {
+    const owner: PurviewAuditScope = { ...scope, authorizationPrincipalId: "user-history-reader",
+      resultScope: { kind: "principal", scopeId: "user-history-reader", configurationRevision: null } };
+    const upn = "employee+test@example.invalid";
+    const matching: string[] = [];
+    for (const [index, names] of [[upn], [upn.toUpperCase()], [], [upn, "other@example.invalid"], ["other@example.invalid"]].entries()) {
+      const job = await repository.submit(owner, { idempotencyKey: `user-history-${index}`, filters: { ...filters, userPrincipalNames: names } });
+      await repository.cancel(owner, job.id);
+      if (index < 2) matching.push(job.id);
+    }
+    const read = { tenantId: owner.tenantId, resultScopes: [owner.resultScope] };
+    const page = await repository.listJobs(read, 1, 1, upn);
+    expect(page).toMatchObject({ count: 2, limit: 1, offset: 1 });
+    expect(page.value).toHaveLength(1);
+    expect(matching).toContain(page.value[0].id);
+    expect((await repository.listJobs({ ...read, tenantId: "unrelated-tenant" }, 20, 0, upn)).count).toBe(0);
+    expect((await repository.listJobs({ ...read, resultScopes: [scope.resultScope] }, 20, 0, upn)).count).toBe(0);
+  });
+
+  it("filters exact saved agent evidence and authorized scopes before real database search, counts and pagination", async () => {
+    const target = { botId: "33333333-3333-4333-8333-333333333333", environmentId: "agent-environment" };
+    const reader: PurviewAuditScope = { ...scope, authorizationPrincipalId: "agent-audit-reader",
+      resultScope: { kind: "principal", scopeId: "agent-audit-reader", configurationRevision: null } };
+    const application: PurviewAuditScope = { ...reader, tokenMode: "application",
+      resultScope: { kind: "application", scopeId: "agent-audit-application", configurationRevision: 7 } };
+    const owners: PurviewAuditScope[] = [reader, application,
+      { ...application, resultScope: { ...application.resultScope, configurationRevision: 6 } },
+      { ...reader, authorizationPrincipalId: "other-reader", resultScope: { ...reader.resultScope, scopeId: "other-reader" } },
+      { ...reader, tenantId: "different-tenant" }];
+    for (const [index, owner] of owners.entries()) {
+      const job = await repository.submit(owner, { idempotencyKey: `agent-saved-audit-${index}`,
+        filters: { ...filters, presetId: "copilot_studio_admin", operations: ["BotCreate", "BotDelete"] } });
+      const execution = await repository.begin(owner, job.id);
+      await repository.recordProviderQuery(owner, job.id, execution, `agent-provider-${index}`, "succeeded");
+      const exact = record({ auditLogRecordType: "powerPlatformAdministratorActivity", operation: "BotCreate",
+        service: "PowerPlatform", botId: target.botId, environmentId: target.environmentId, agentId: null });
+      await repository.publish(owner, job.id, execution, result([
+        { ...exact, wrapperId: "exact-create", correlationId: "literal%actor" },
+        { ...exact, wrapperId: "exact-delete", operation: "BotDelete", correlationId: "literal-other-actor" },
+        { ...exact, wrapperId: "other-environment", environmentId: "another-environment" },
+        { ...exact, wrapperId: "other-bot", botId: "44444444-4444-4444-8444-444444444444" },
+        { ...exact, wrapperId: "prefixed-agent", botId: null, agentId: `CopilotStudio.CustomEngine.${target.botId}` },
+        { ...exact, wrapperId: "other-operation", operation: "UnrelatedOperation" },
+        { ...exact, wrapperId: "other-service", service: "Copilot" },
+      ].map(value => ({ ...value, nativeEventId: randomUUID() }))));
+    }
+    const readScope = { tenantId: reader.tenantId, resultScopes: [reader.resultScope, application.resultScope] };
+    const page = await repository.agentRecords(readScope, { ...target, environmentId: target.environmentId.toUpperCase() }, { limit: 1, offset: 1 });
+    expect(page).toMatchObject({ count: 4, limit: 1, offset: 1 });
+    expect(page.value).toHaveLength(1);
+    expect(page.value[0].jobId).toEqual(expect.any(String));
+    expect((await repository.agentRecords(readScope, target, { limit: 50, offset: 0, operation: "BotCreate" })).count).toBe(2);
+    const searched = await repository.agentRecords(readScope, target, { limit: 50, offset: 0, search: "LITERAL%" });
+    expect(searched.count).toBe(2);
+    expect(searched.value.every(value => value.wrapperId === "exact-create")).toBe(true);
+    expect((await repository.agentRecords({ ...readScope, resultScopes: [reader.resultScope] }, target, { limit: 50, offset: 0 })).count).toBe(2);
+    expect((await repository.agentRecords({ tenantId: reader.tenantId, resultScopes: [
+      { ...application.resultScope, configurationRevision: 8 },
+    ] }, target, { limit: 50, offset: 0 })).count).toBe(0);
+  });
+
   it("keeps delegated results private and shares application results only under the current configured scope", async () => {
     const job = await repository.submit(scope, { idempotencyKey: "private", filters });
     expect(job).toMatchObject({ status: "waiting_authorization", displayName: `agent-control-audit:${job.id}`, providerQueryId: null, attemptedAt: null });

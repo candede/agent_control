@@ -71,7 +71,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onRunsChanged?: () => void;
   requestedRunId?: string;
   onOpenUsageImport: () => void;
-  onManageUsageReports?: () => void;
   onRequestedRunChange: (runId: string | undefined) => void;
   onSourcesChanged: (sources: DataSyncSourceId[]) => void;
 }>(function DataSyncPanel({
@@ -82,7 +81,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onRunsChanged,
   requestedRunId,
   onOpenUsageImport,
-  onManageUsageReports,
   onRequestedRunChange,
   onSourcesChanged,
 }, ref) {
@@ -426,8 +424,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const cannotStart = !state || isProgressing(currentRun) || isProgressing(requestedRun) || Boolean(busy);
   const savedSources = state?.sources.filter(source => source.source !== "usage_reports") ?? [];
   const savedSourceCount = savedSources.filter(source => source.status === "succeeded").length;
-  const usage = state?.sources.find(source => source.source === "usage_reports");
-  const usageReady = usage?.status === "succeeded" && !state?.usageImportRequired;
 
   useEffect(() => {
     if (active && !wasActive.current) void refresh(false);
@@ -536,7 +532,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                   {savedSourceCount} of {automaticSyncSources.length} sources synced
                 </span>
               </div>
-              {savedSourceCount === 0 ? <p className="data-sync-empty">Start a sync to collect users and inventory. CSV reports are imported separately below.</p> : null}
+              {savedSourceCount === 0 ? <p className="data-sync-empty">Start a sync to collect users and inventory. Upload usage reports in the separate CSV usage reports section above.</p> : null}
               <div className="data-sync-sources" aria-label="Workspace sync sources">
                 {savedSources.map(source => (
                   <SavedSourceRow
@@ -558,23 +554,6 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                   </button>
                 </WorkbenchActionGate>
               </div>
-            </section>
-            <section className="data-sync-reports" aria-labelledby="sync-reports-heading">
-              <div className="data-sync-report-icon"><Upload size={22} aria-hidden="true" /></div>
-              <div>
-                <div className="sync-health-heading"><h3 id="sync-reports-heading">CSV usage reports</h3><span className={`data-sync-state state-${usageReady ? "success" : "attention"}`}>{usageReady ? "Available" : "Import needed"}</span></div>
-                <p>{usageReady
-                  ? `${usage.count?.toLocaleString() ?? "Validated"} report rows across three accepted CSVs.`
-                  : "Import Agents, Users & agents, and Users exports for the same 7- or 30-day selection."}</p>
-                {usageReady && usage.lastSuccessAt ? <p>Accepted <time dateTime={usage.lastSuccessAt}>{formatInstant(usage.lastSuccessAt)}</time>. Overlapping snapshots are not added together.</p>
-                  : <p>Manual import is separate from automatic sync and does not block collecting users or inventory.</p>}
-                <div className="data-sync-links">
-                  {onManageUsageReports ? <button type="button" className="sync-text-button" onClick={onManageUsageReports}>Manage reports</button> : null}
-                </div>
-              </div>
-              {canUploadUsage ? <button type="button" className="secondary" onClick={onOpenUsageImport}>
-                <Upload size={16} aria-hidden="true" />Add CSV reports
-              </button> : <p className="data-sync-admin-note">An AgentControl.Admin can import reports.</p>}
             </section>
           </>
         ) : null}

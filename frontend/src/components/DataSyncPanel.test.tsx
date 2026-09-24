@@ -94,7 +94,6 @@ function renderPanel(options: {
   active?: boolean;
   canUploadUsage?: boolean;
   onOpenUsageImport?: () => void;
-  onManageUsageReports?: () => void;
   onRequestedRunChange?: (runId: string | undefined) => void;
   onSetupRequiredChange?: (required: boolean) => void;
   onSourcesChanged?: (sources: DataSyncSourceId[]) => void;
@@ -110,7 +109,6 @@ function renderPanel(options: {
     canUploadUsage: options.canUploadUsage ?? true,
     requestedRunId: options.requestedRunId,
     onOpenUsageImport: options.onOpenUsageImport ?? vi.fn(),
-    onManageUsageReports: options.onManageUsageReports ?? vi.fn(),
     onRequestedRunChange: options.onRequestedRunChange ?? vi.fn(),
     onSetupRequiredChange: options.onSetupRequiredChange,
     onSourcesChanged: options.onSourcesChanged ?? vi.fn(),
@@ -138,15 +136,14 @@ describe("DataSyncPanel", () => {
     vi.useRealTimers();
   });
 
-  it.each([true, false])("provides one report-management entry with upload permission %s", async canUploadUsage => {
+  it.each([true, false])("keeps CSV management outside automatic sync with upload permission %s", async canUploadUsage => {
     api.getState.mockResolvedValue(syncState());
-    const onManageUsageReports = vi.fn();
-    renderPanel({ canUploadUsage, onManageUsageReports });
-    await userEvent.click(await screen.findByRole("button", { name: "Manage reports" }));
-    expect(onManageUsageReports).toHaveBeenCalledOnce();
+    renderPanel({ canUploadUsage });
+    await screen.findByRole("heading", { name: "Workspace data" });
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "View report history" })).not.toBeInTheDocument();
-    expect(screen.queryAllByRole("button", { name: "Manage reports" })).toHaveLength(1);
-    expect(screen.queryAllByRole("button", { name: "Add CSV reports" })).toHaveLength(canUploadUsage ? 1 : 0);
+    expect(screen.queryByRole("button", { name: "Manage reports" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
   });
 
   it("loads onboarding while initially inactive and reports the setup hint without exposing UI", async () => {
@@ -190,7 +187,7 @@ describe("DataSyncPanel", () => {
     expect(api.start).not.toHaveBeenCalled();
   });
 
-  it("renders the setup page by default, keeps it visible during report import, and accepts a zero-row successful sync", async () => {
+  it("renders setup separately from report import and accepts a zero-row successful sync", async () => {
     const initial = syncState();
     const queuedSources = initial.sources.map(item => source(item.source, "queued"));
     const started = run("running", queuedSources);
@@ -205,23 +202,17 @@ describe("DataSyncPanel", () => {
       sources: completedSources,
     });
     const onChanged = vi.fn();
-    const onUpload = vi.fn();
     api.getState.mockResolvedValueOnce(initial).mockResolvedValueOnce(completed);
     api.start.mockResolvedValue(started);
 
-    renderPanel({ onSourcesChanged: onChanged, onOpenUsageImport: onUpload });
+    renderPanel({ onSourcesChanged: onChanged });
 
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Data sync", level: 2 })).toBeVisible();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Data sync/i })).not.toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Workspace data" })).toBeVisible();
-    expect(screen.getByText(/Agents, Users & agents, and Users/)).toBeVisible();
-    expect(screen.getByText(/7- or 30-day selection/)).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
-    expect(onUpload).toHaveBeenCalledOnce();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
+    expect(screen.getByText(/separate CSV usage reports section above/)).toBeVisible();
 
     await userEvent.click(screen.getByRole("button", { name: "Start initial sync" }));
     expect(api.start).toHaveBeenCalledWith({ mode: "initial" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
@@ -242,8 +233,7 @@ describe("DataSyncPanel", () => {
     await screen.findByRole("heading", { name: "Workspace data" });
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
-    expect(screen.getByText("An AgentControl.Admin can import reports.")).toBeVisible();
-    expect(screen.getByText(/does not block collecting users or inventory/)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
   });
 
   it("starts nondestructive refresh and hidden users-only syncs without provider reads on navigation", async () => {
@@ -772,14 +762,13 @@ describe("DataSyncPanel", () => {
     expect(screen.getByText("reported, not a saved total")).toBeVisible();
   });
 
-  it("keeps current upload requirements visible when viewing a completed historical run", async () => {
+  it("keeps automatic setup available when viewing a completed historical run without CSV controls", async () => {
     api.getState.mockResolvedValue(syncState());
     api.getRun.mockResolvedValue(run("completed", sourceIds.map(id => source(id, "succeeded")), { id: "historical-run" }));
     renderPanel({ requestedRunId: "historical-run" });
     expect(await screen.findByText("Sync complete")).toBeVisible();
     expect(screen.getByText("historical-run", { selector: "code" })).toBeVisible();
-    expect(screen.getByText("Import needed")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Add CSV reports" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeInTheDocument();
   });
 
@@ -847,7 +836,7 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByText(/1 of 1/)).not.toBeInTheDocument();
     expect(within(screen.getByRole("article", { name: "Users" })).getByText("43")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).getByText("1,005")).toBeVisible();
-    expect(screen.getByText("1,061 report rows across three accepted CSVs.")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
     expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "incremental", sources: ["users"] }, expect.anything());
   });
 
@@ -858,11 +847,10 @@ describe("DataSyncPanel", () => {
     renderPanel({ onOpenUsageImport });
     await screen.findByText("3 of 3 sources synced");
     expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
-    expect(screen.getByText("Import needed")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Check status" }));
     expect(api.getState).toHaveBeenCalledTimes(2);
-    await userEvent.click(screen.getByRole("button", { name: "Add CSV reports" }));
-    expect(onOpenUsageImport).toHaveBeenCalledOnce();
+    expect(onOpenUsageImport).not.toHaveBeenCalled();
     expect(api.start).not.toHaveBeenCalled();
   });
 
@@ -920,7 +908,7 @@ describe("DataSyncPanel", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Status read failed.");
     expect(screen.getByText("0 of 3 sources synced")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).queryByText("44")).not.toBeInTheDocument();
-    expect(screen.getByText("44 report rows across three accepted CSVs.")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
     expect(onSourcesChanged).toHaveBeenCalledExactlyOnceWith(["users", "graph_packages", "power_platform"]);
   });
 
@@ -1042,14 +1030,14 @@ describe("DataSyncPanel", () => {
     expect(screen.getByRole("region", { name: "Data sync" }).querySelector("footer")).toBeNull();
     await userEvent.tab();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toHaveFocus();
-    screen.getByRole("button", { name: "Add CSV reports" }).focus();
+    screen.getByRole("button", { name: "Reset saved data..." }).focus();
     await userEvent.tab();
     expect(screen.getByRole("button", { name: "After sync" })).toHaveFocus();
     await userEvent.tab({ shift: true });
-    expect(screen.getByRole("button", { name: "Add CSV reports" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Reset saved data..." })).toHaveFocus();
     await userEvent.keyboard("{Escape}");
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Add CSV reports" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Reset saved data..." })).toHaveFocus();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(document.body.style.overflow).toBe(originalOverflow);
     expect(api.cancel).not.toHaveBeenCalled();
@@ -1159,7 +1147,7 @@ describe("DataSyncPanel", () => {
 
     expect((await screen.findAllByText("Import needed")).length).toBeGreaterThan(0);
     expect(screen.getByText("3 of 3 sources synced")).toBeVisible();
-    expect(within(screen.getByRole("region", { name: "CSV usage reports" })).queryByText("Available")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "CSV usage reports" })).not.toBeInTheDocument();
   });
 
   it("polls repeated progress and ignores a stale response after principal or role ownership changes", async () => {

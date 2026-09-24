@@ -40,6 +40,7 @@ const appReportStaleAfterDays = 3;
 
 type CopilotUsageDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   delegatedToken: typeof acquireDelegatedToken;
   revalidateUser: typeof revalidateAuthenticatedUser;
   graph: CopilotUsageGraphClient;
@@ -69,6 +70,7 @@ export class CopilotUsageService {
     const usageStore = new DataSyncRepository(database);
     this.dependencies = {
       requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      observeOperation: capabilities.observeOperation.bind(capabilities),
       delegatedToken: acquireDelegatedToken,
       revalidateUser: revalidateAuthenticatedUser,
       graph: new CopilotUsageGraphClient(),
@@ -216,23 +218,25 @@ export class CopilotUsageService {
   private async loadDirectory(user: AuthenticatedUser, signal: AbortSignal | undefined, onProgress: CopilotDirectoryProgress): Promise<Loaded<CopilotDirectoryUser[]>> {
     let progressFailure: { error: unknown } | undefined;
     try {
-      const scope = dataScope(user);
-      const token = await this.currentDelegatedToken(scope, "graph.licenses.read");
-      signal?.throwIfAborted();
-      const imported = await this.loadImported(scope.tenantId);
-      signal?.throwIfAborted();
-      if (!imported.ok) {
-        throw new AppError(502, "report_license_verification_unavailable", imported.message);
-      }
-      const value = await this.dependencies.graph.listCopilotUsers(token, signal, async count => {
-        try {
-          await onProgress(count);
-        } catch (error) {
-          progressFailure = { error };
-          throw error;
+      return await this.dependencies.observeOperation("graph.licenses.read", user, async () => {
+        const scope = dataScope(user);
+        const token = await this.currentDelegatedToken(scope, "graph.licenses.read");
+        signal?.throwIfAborted();
+        const imported = await this.loadImported(scope.tenantId);
+        signal?.throwIfAborted();
+        if (!imported.ok) {
+          throw new AppError(502, "report_license_verification_unavailable", imported.message);
         }
-      }, imported.value.users.value.filter(hasReportedAgentActivity).map(value => value.username));
-      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
+        const value = await this.dependencies.graph.listCopilotUsers(token, signal, async count => {
+          try {
+            await onProgress(count);
+          } catch (error) {
+            progressFailure = { error };
+            throw error;
+          }
+        }, imported.value.users.value.filter(hasReportedAgentActivity).map(value => value.username));
+        return { ok: true as const, value, fetchedAt: this.dependencies.now().toISOString() };
+      }, { signal, shouldRecordError: () => !progressFailure });
     } catch (error) {
       signal?.throwIfAborted();
       // A durable progress write failure is not a Microsoft provider failure.
@@ -243,9 +247,11 @@ export class CopilotUsageService {
 
   private async loadAppActivity(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotReportResult>> {
     try {
-      const token = await this.currentDelegatedToken(dataScope(user), "reports.copilotUsage.read");
-      const value = await this.dependencies.graph.listAppActivity(token, signal);
-      return { ok: true, value, fetchedAt: this.dependencies.now().toISOString() };
+      return await this.dependencies.observeOperation("reports.copilotUsage.read", user, async () => {
+        const token = await this.currentDelegatedToken(dataScope(user), "reports.copilotUsage.read");
+        const value = await this.dependencies.graph.listAppActivity(token, signal);
+        return { ok: true as const, value, fetchedAt: this.dependencies.now().toISOString() };
+      }, { signal });
     } catch (error) {
       signal?.throwIfAborted();
       return sourceFailure(error, "Microsoft 365 Copilot app activity", "Reports.Read.All");
@@ -628,7 +634,7 @@ function sourceErrorMessage(error: unknown, label: string, permission?: "User.Re
     }
     if (["capability_unavailable", "missing_permission", "Authorization_RequestDenied"].includes(error.code) || error.status === 403) {
       return permission
-        ? `${label} was denied. Check admin consent for Microsoft Graph delegated permission ${permission} on the existing Entra app. ${permission === "Reports.Read.All" ? "The signed-in user also needs Reports Reader or another supported Microsoft report-reader role. " : "The signed-in user also needs Directory Readers, Global Reader, or another supported license-catalog reader role. "}Sign out and sign in after changing access.`
+        ? `${label} was denied. An administrator must add Microsoft Graph delegated permission ${permission} under API permissions in the existing Entra app registration and select Grant admin consent. ${permission === "Reports.Read.All" ? "The signed-in user also needs Reports Reader or another supported Microsoft report-reader role. " : "The signed-in user also needs Directory Readers, Global Reader, or another supported license-catalog reader role. "}Sign out and sign in after changing access.`
         : `${label} is unavailable because the required permission was denied.`;
     }
     if (error.code === "provider_result_limit") return `${label} exceeded the bounded page or result limit; no truncated data was returned.`;

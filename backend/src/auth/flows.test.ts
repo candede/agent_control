@@ -34,4 +34,23 @@ describe("ephemeral authorization flows", () => {
     expect(() => consumeAuthFlow("session-a", firstHandle, first.state)).toThrow("did not match");
     expect(consumeAuthFlow("session-a", secondHandle, second.state)).toBe(second);
   });
+
+  it("refuses to store a permission flow without replacing a legitimate pending login", () => {
+    const login = createAuthFlow("login");
+    const handle = storeAuthFlow("session-a", undefined, login);
+    const legacy = createAuthFlow("login");
+    Object.assign(legacy, { kind: "consent" });
+    expect(() => storeAuthFlow("session-a", handle, legacy)).toThrow("Permissions cannot be requested or enabled");
+    expect(consumeAuthFlow("session-a", handle, login.state)).toBe(login);
+  });
+
+  it.each([{ kind: "consent" }, { extraScopesToConsent: ["https://graph.microsoft.com/AgentIdentity.Read.All"] }])(
+    "consumes and rejects an old pending permission flow instead of treating it as login: %j", change => {
+      const flow = createAuthFlow("login");
+      const handle = storeAuthFlow("session-a", undefined, flow);
+      Object.assign(flow, change);
+      expect(() => consumeAuthFlow("session-a", handle, flow.state)).toThrow("Permissions cannot be requested or enabled");
+      expect(() => consumeAuthFlow("session-a", handle, flow.state)).toThrow("did not match");
+    },
+  );
 });

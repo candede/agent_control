@@ -1,6 +1,8 @@
 import type { Request, RequestHandler, Response, Router } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
+import type { DefenderHuntingJob } from "../types/defenderHunting.js";
+import type { PurviewAuditJob } from "../types/purviewAudit.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { WorkbenchJobsResponse } from "../types/workbench.js";
 import type { RoutePolicy } from "./policy.js";
@@ -55,10 +57,33 @@ const packageJob = {
   id: "package-job", tokenMode: "delegated", scopeKind: "broad", requestedIds: [],
   authorizationPrincipalId: user.homeAccountId, status: "waiting_authorization", observedCount: 0, totalRecords: null, ...dates,
 };
-const investigation = {
+const purviewInvestigation: PurviewAuditJob = {
   id: "investigation", authorizationPrincipalId: "another-principal", tokenMode: "application",
+  resultScope: { kind: "application", scopeId: "application", configurationRevision: 1 },
   status: "waiting_authorization", canResume: true, providerRowCount: 0, storedRowCount: 0,
-  filters: { presetId: "copilot_interactions", templateId: "agents_inventory", startDateTime: dates.createdAt, endDateTime: dates.updatedAt },
+  filters: {
+    presetId: "copilot_interactions", startDateTime: dates.createdAt, endDateTime: dates.updatedAt,
+    operations: ["CopilotInteraction"], userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
+  },
+  displayName: "Audit search", providerQueryId: null, providerStatus: null,
+  localRequestId: "local-request", providerRequestId: null, projectionVersion: 1,
+  providerRequestCount: 0, activationCount: 0, pageCount: 0, byteCount: 0, unknownFieldCount: 0,
+  pageComplete: false, observedRange: null, unobservedRange: null,
+  qualificationId: null, cancelRequested: false, remoteWorkMayContinue: false,
+  expiresAt: "2026-10-20T08:00:00.000Z", ...dates,
+};
+const defenderInvestigation: DefenderHuntingJob = {
+  id: "investigation", authorizationPrincipalId: "another-principal", tokenMode: "application",
+  resultScope: { kind: "application", scopeId: "application", configurationRevision: 1 },
+  status: "waiting_authorization", canResume: true, providerRowCount: 0, storedRowCount: 0,
+  filters: {
+    templateId: "agents_inventory", startDateTime: dates.createdAt, endDateTime: dates.updatedAt,
+    agentIds: [], blueprintIds: [], actorObjectIds: [], operations: [],
+  },
+  queryVersion: 3, retainedScopeId: null, localRequestId: "local-request", providerRequestId: null,
+  providerRequestCount: 0, activationCount: 0, byteCount: 0,
+  complete: false, noData: false, partialReason: null, observedRange: null, unobservedRange: null,
+  snapshotId: null, priorSuccessfulJobId: null, qualification: null, cancelRequested: false,
   expiresAt: "2026-10-20T08:00:00.000Z", ...dates,
 };
 const controlJob = {
@@ -139,7 +164,7 @@ describe("workbench jobs aggregation", () => {
   it("reports each unavailable source once and preserves successful loaders", async () => {
     mocks.packages.mockRejectedValue(new Error("private database details"));
     mocks.defender.mockRejectedValue(new Error("private investigation details"));
-    mocks.purview.mockResolvedValue({ value: [investigation] });
+    mocks.purview.mockResolvedValue({ value: [purviewInvestigation] });
     const result = await jobs();
     expect(result.value.map(job => job.source)).toEqual(["purview"]);
     expect(result.unavailableSources).toEqual([
@@ -149,10 +174,26 @@ describe("workbench jobs aggregation", () => {
   });
 
   it.each(["purview", "defender"] as const)("does not offer resume for another principal's shared %s job", async source => {
+    const investigation = source === "purview" ? purviewInvestigation : defenderInvestigation;
     mocks[source].mockResolvedValue({ value: [investigation, { ...investigation, id: "owned", authorizationPrincipalId: user.homeAccountId }] });
     const result = await jobs();
     expect(result.value.find(job => job.id === "investigation")).toMatchObject({ canResume: false, canCancel: true });
     expect(result.value.find(job => job.id === "owned")).toMatchObject({ canResume: true, canCancel: true });
+    expect(result.unavailableSources).toEqual([]);
+  });
+
+  it.each([
+    { userPrincipalNames: [], href: "/agents" },
+    { userPrincipalNames: ["one@example.invalid"], href: "/users" },
+    { userPrincipalNames: ["one@example.invalid", "two@example.invalid"], href: "/agents" },
+  ])("routes Purview jobs with $userPrincipalNames to $href without exposing filters", async ({ userPrincipalNames, href }) => {
+    mocks.purview.mockResolvedValue({ value: [{
+      ...purviewInvestigation, filters: { ...purviewInvestigation.filters, userPrincipalNames },
+    }] });
+    const result = await jobs();
+    expect(result.value).toEqual([expect.objectContaining({ id: "investigation", source: "purview", href })]);
+    expect(result.unavailableSources).toEqual([]);
+    expect(JSON.stringify(result)).not.toMatch(/example\.invalid|filters|authorizationPrincipalId/);
   });
 
   it.each([
@@ -171,7 +212,7 @@ describe("workbench jobs aggregation", () => {
 
   it("bounds and deterministically orders metadata while retaining the Admin-only staging read", async () => {
     mocks.purview.mockResolvedValue({ value: Array.from({ length: 105 }, (_, index) => ({
-      ...investigation, id: String(index).padStart(3, "0"),
+      ...purviewInvestigation, id: String(index).padStart(3, "0"),
       updatedAt: index < 5 ? dates.createdAt : dates.updatedAt,
     })).reverse() });
     const result = await jobs({ ...user, roles: ["AgentControl.Admin"] });
@@ -179,5 +220,6 @@ describe("workbench jobs aggregation", () => {
     expect(result.value).toHaveLength(100);
     expect(result.value[0].id).toBe("005");
     expect(result.value[99].id).toBe("104");
+    expect(result.unavailableSources).toEqual([]);
   });
 });

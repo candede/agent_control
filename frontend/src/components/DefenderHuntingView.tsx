@@ -4,12 +4,11 @@ import { useWorkbenchAction, WorkbenchActionGate } from "../workbenchActionConte
 import { ApiError, approveDefenderHuntingQualification, cancelDefenderHunt, deleteDefenderHunt, downloadDefenderHuntingCsv,
 getDefenderHuntingCatalog, getDefenderHuntingJob, getDefenderHuntingJobs, getDefenderHuntingRows, resumeDefenderHunt, startDefenderHuntingQualification,
   submitDefenderHunt, revokeDefenderHuntingRetainedScope, type DefenderHuntingCatalog, type DefenderHuntingFilters, type DefenderHuntingJob, type DefenderHuntingRow,
-  type DefenderHuntingRowPage, type DefenderHuntingTokenMode, type DefenderInventoryDetailState } from "../api/client";
+  type DefenderHuntingRowPage, type DefenderHuntingTokenMode, type DefenderInventoryDetailState, type AgentInvestigationContext } from "../api/client";
 import { hasRole } from "../authorization";
 import { capabilityModeEnabled, providerActionAllowed } from "../capabilityState";
 import { useCapabilityContext } from "../capabilityContext";
 import { useSavedRead } from "../savedQueries";
-import { parseSecurityRoute, securityRouteSearch, workbenchUrl } from "../workbenchRouting";
 
 const historyPageSize = 20;
 const rowPageSize = 100;
@@ -28,14 +27,22 @@ function capabilityKey(views: ReturnType<typeof useCapabilityContext>["views"]) 
     .sort().join("|");
 }
 
-export function DefenderHuntingView() {
+type AgentHuntingProps = {
+  agentRecordId: string;
+  agentName: string;
+  entraAgentIds: string[];
+  entraAgentApplicationIds?: string[];
+  templates?: AgentInvestigationContext["defender"]["templates"];
+  initialJobId?: string;
+};
+
+export function DefenderHuntingView(props: AgentHuntingProps) {
   const capability = useCapabilityContext();
   const accountKey = JSON.stringify([capability.user?.tenantId, capability.user?.homeAccountId, [...(capability.user?.roles ?? [])].sort()]);
-  return <DefenderHuntingSession key={`${accountKey}:${capabilityKey(capability.views)}`} />;
+  return <DefenderHuntingSession key={JSON.stringify([accountKey, capabilityKey(capability.views), props])} {...props} accountKey={accountKey} />;
 }
 
-function DefenderHuntingSession() {
-  const [initialRoute] = useState(() => parseSecurityRoute(window.location.search));
+function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entraAgentApplicationIds = [], templates, initialJobId, accountKey }: AgentHuntingProps & { accountKey: string }) {
   const capability = useCapabilityContext();
   const readSaved = useSavedRead();
   const searchAction = useWorkbenchAction("defender.search");
@@ -58,16 +65,13 @@ function DefenderHuntingSession() {
   const [selected, setSelected] = useState<DefenderHuntingJob>();
   const [rows, setRows] = useState<DefenderHuntingRowPage>();
   const [rowOffset, setRowOffset] = useState(0);
-  const [tokenMode, setTokenMode] = useState<DefenderHuntingTokenMode>(initialRoute.tokenMode ?? "delegated");
-  const [templateId, setTemplateId] = useState<DefenderHuntingFilters["templateId"]>(initialRoute.templateId ?? "agents_inventory");
-  const [operations, setOperations] = useState<string[]>(initialRoute.operations ?? []);
-  const [startDateTime, setStartDateTime] = useState(() => initialRoute.startDateTime ?? localDateTime(new Date(Date.now() - 60 * 60_000)));
-  const [endDateTime, setEndDateTime] = useState(() => initialRoute.endDateTime ?? localDateTime(new Date()));
-  const [agentIds, setAgentIds] = useState(initialRoute.agentIds ?? "");
-  const [blueprintIds, setBlueprintIds] = useState(initialRoute.blueprintIds ?? "");
-  const [actorObjectIds, setActorObjectIds] = useState(initialRoute.actorObjectIds ?? "");
-  const [routeJobId, setRouteJobId] = useState(initialRoute.jobId);
-  const [routeRevision, setRouteRevision] = useState(0);
+  const [tokenMode, setTokenMode] = useState<DefenderHuntingTokenMode>("delegated");
+  const [templateId, setTemplateId] = useState<DefenderHuntingFilters["templateId"]>(() =>
+    fallbackTemplates.find(template => templates?.[template.id].status === "available")?.id ?? "agents_inventory");
+  const [operations, setOperations] = useState<string[]>(() => fallbackTemplates.find(template => template.id === templateId)?.operations.slice().sort() ?? []);
+  const [startDateTime, setStartDateTime] = useState(() => localDateTime(new Date(Date.now() - 60 * 60_000)));
+  const [endDateTime, setEndDateTime] = useState(() => localDateTime(new Date()));
+  const [routeJobId, setRouteJobId] = useState(initialJobId);
   const resolvedRouteJobId = useRef<string | undefined>(undefined);
   const [approvedJob, setApprovedJob] = useState<DefenderHuntingJob>();
   const [approvalAcknowledged, setApprovalAcknowledged] = useState(false);
@@ -80,8 +84,10 @@ function DefenderHuntingSession() {
   const capabilityId = tokenMode === "delegated" ? "defender.hunting.delegated" : "defender.hunting.application";
   const capabilityView = capability.views.find(view => view.definition.id === capabilityId);
   const applicationMode = tokenMode === "application";
-  const canQualify = applicationMode && hasRole(capability.user, "AgentControl.Admin");
-  const filters = makeFilters({ templateId, startDateTime, endDateTime, agentIds, blueprintIds, actorObjectIds, operations });
+  const scopedIds = templateId === "agents_inventory" ? entraAgentIds : entraAgentApplicationIds;
+  const identityAvailable = scopedIds.length === 1 && templates?.[templateId].status !== "unavailable";
+  const canQualify = identityAvailable && applicationMode && hasRole(capability.user, "AgentControl.Admin");
+  const filters = makeFilters({ templateId, startDateTime, endDateTime, entraAgentIds, entraAgentApplicationIds, operations });
   const qualification = filters && catalog?.qualifications.find(evidence => evidence.capabilityId === capabilityId
     && evidence.templateId === filters.templateId && equalQualificationScope(evidence.approvedScope, filters)
     && evidence.queryVersion === 3 && Date.parse(evidence.expiresAt) > capability.now);
@@ -93,14 +99,16 @@ function DefenderHuntingSession() {
       ? hasRole(capability.user, "AgentControl.Viewer")
       : hasRole(capability.user, "AgentControl.Admin")
     : false;
-  const available = applicationMode
+  const available = identityAvailable && (applicationMode
     ? Boolean(qualification && retainedScope && (!capabilityView || capabilityModeEnabled(capabilityView)
       && capabilityView.configuration?.sharedDataScope !== false))
-    : providerActionAllowed(capabilityView, false, capability.now);
+    : providerActionAllowed(capabilityView, false, capability.now));
   const rangeError = rangeMessage(filters, catalog);
   const operationError = templateId !== "agents_inventory" && operations.length === 0 ? "Select at least one operation." : undefined;
-  const qualificationTargetError = filters && !filters.agentIds.length && !filters.blueprintIds.length && !filters.actorObjectIds.length
-    ? "Select at least one exact agent, blueprint, or actor object ID for qualification."
+  const qualificationTargetError = !identityAvailable
+    ? templates?.[templateId].reason ?? (templateId === "agents_inventory"
+      ? "A verified enterprise-application object ID is required for Defender inventory. An opaque Entra agent ID is not substituted."
+      : "A source-verified runtime application/client ID is required. Package, bot, blueprint and enterprise-application object IDs are not substituted.")
     : undefined;
   const qualificationRangeError = applicationMode && !available && filters
     && Date.parse(filters.endDateTime) - Date.parse(filters.startDateTime) > (catalog?.limits.qualificationWindowHours ?? 1) * 3_600_000
@@ -164,12 +172,12 @@ function DefenderHuntingSession() {
     const revision = savedReadRevision.current;
     const currentKey = revision ? [...key, { revision }] : key;
     try {
-      return await readSaved(currentKey, read, currentSignal);
+      return await readSaved(["agent-investigation", accountKey, agentRecordId, ...currentKey], read, currentSignal);
     } catch (requestError) {
       if (!currentSignal.aborted && generation.current === requestGeneration) failSavedRead(requestError, context);
       throw requestError;
     }
-  }, [failSavedRead, readSaved]);
+  }, [accountKey, agentRecordId, failSavedRead, readSaved]);
 
   function clearPrivateSavedState(requestError: unknown) {
     if (requestError instanceof ApiError && (requestError.status === 401 || requestError.status === 403)
@@ -189,7 +197,7 @@ function DefenderHuntingSession() {
       setSelected(updated);
       if (!readableStatuses.has(updated.status) || updated.snapshotId !== current.snapshotId || updated.updatedAt !== current.updatedAt) setRows(undefined);
     } else if (selectionOrigin.current !== "route") {
-      selectJob(undefined, "history", false);
+      selectJob(undefined, "history");
     }
   }
 
@@ -197,7 +205,7 @@ function DefenderHuntingSession() {
     const historyRequest = ++historyGeneration.current;
     const result = await readSavedData(
       ["defender-hunting-jobs", { limit: historyPageSize, offset }, requestAction],
-      requestSignal => getDefenderHuntingJobs(historyPageSize, offset, { signal: requestSignal }),
+      requestSignal => getDefenderHuntingJobs(historyPageSize, offset, { signal: requestSignal, agentRecordId }),
       signal,
     );
     if (signal.aborted || generation.current !== requestGeneration || historyGeneration.current !== historyRequest
@@ -211,7 +219,7 @@ function DefenderHuntingSession() {
     const catalogRequest = ++catalogGeneration.current;
     const result = await readSavedData(
       ["defender-hunting-catalog", requestAction],
-      requestSignal => getDefenderHuntingCatalog({ signal: requestSignal }),
+      requestSignal => getDefenderHuntingCatalog({ signal: requestSignal, agentRecordId }),
       signal,
     );
     if (signal.aborted || generation.current !== requestGeneration || catalogGeneration.current !== catalogRequest
@@ -230,7 +238,7 @@ function DefenderHuntingSession() {
       if (signal.aborted || generation.current !== requestGeneration) return;
       const current = selectedRef.current;
       if (current && selectionOrigin.current === "route" && activeStatuses.has(current.status)) {
-        const job = await readSavedData(["defender-hunting-job", current.id], requestSignal => getDefenderHuntingJob(current.id, { signal: requestSignal }), signal);
+        const job = await readSavedData(["defender-hunting-job", current.id], requestSignal => getDefenderHuntingJob(current.id, { signal: requestSignal, agentRecordId }), signal);
         if (!signal.aborted && generation.current === requestGeneration && selectedRef.current?.id === job.id) {
           selectedRef.current = job;
           setSelected(job);
@@ -250,10 +258,10 @@ function DefenderHuntingSession() {
     savedController.current = new AbortController();
     const controller = new AbortController();
     Promise.all([
-      readSavedData(["defender-hunting-catalog"], signal => getDefenderHuntingCatalog({ signal }), controller.signal),
+      readSavedData(["defender-hunting-catalog"], signal => getDefenderHuntingCatalog({ signal, agentRecordId }), controller.signal),
       readSavedData(
         ["defender-hunting-jobs", { limit: historyPageSize, offset: 0 }],
-        signal => getDefenderHuntingJobs(historyPageSize, 0, { signal }),
+        signal => getDefenderHuntingJobs(historyPageSize, 0, { signal, agentRecordId }),
         controller.signal,
       ),
     ]).then(([catalogResult, history]) => {
@@ -273,51 +281,9 @@ function DefenderHuntingSession() {
       savedController.current.abort();
       generation.current += 1;
     };
-  }, [failSavedRead, readSavedData]);
+  }, [agentRecordId, failSavedRead, readSavedData]);
 
   useEffect(() => () => actionController.current?.abort(), []);
-
-  useEffect(() => {
-    const restoreRoute = () => {
-      const route = parseSecurityRoute(window.location.search);
-      resolvedRouteJobId.current = undefined;
-      selectedRef.current = undefined;
-      selectionOrigin.current = "route";
-      setRouteJobId(route.jobId);
-      setRouteRevision(current => current + 1);
-      setTokenMode(route.tokenMode ?? "delegated");
-      setTemplateId(route.templateId ?? "agents_inventory");
-      setOperations(route.operations ?? []);
-      if (route.startDateTime) setStartDateTime(route.startDateTime);
-      if (route.endDateTime) setEndDateTime(route.endDateTime);
-      setAgentIds(route.agentIds ?? "");
-      setBlueprintIds(route.blueprintIds ?? "");
-      setActorObjectIds(route.actorObjectIds ?? "");
-      setSelected(undefined);
-      setRows(undefined);
-      setRowOffset(0);
-      invalidateApproval(false);
-    };
-    window.addEventListener("popstate", restoreRoute);
-    return () => window.removeEventListener("popstate", restoreRoute);
-  }, []);
-
-  useEffect(() => {
-    const next = workbenchUrl("security", securityRouteSearch({
-      jobId: routeJobId,
-      tokenMode,
-      templateId,
-      operations,
-      startDateTime,
-      endDateTime,
-      agentIds,
-      blueprintIds,
-      actorObjectIds,
-    }));
-    if (`${window.location.pathname}${window.location.search}` !== next) {
-      window.history.replaceState({ view: "security" }, "", next);
-    }
-  }, [actorObjectIds, agentIds, blueprintIds, endDateTime, operations, routeJobId, startDateTime, templateId, tokenMode]);
 
   useEffect(() => {
     if (!routeJobId) return;
@@ -333,7 +299,7 @@ function DefenderHuntingSession() {
     if (savedController.current.signal.aborted) return () => controller.abort();
     void readSavedData(
       ["defender-hunting-job", routeJobId],
-      signal => getDefenderHuntingJob(routeJobId, { signal }),
+      signal => getDefenderHuntingJob(routeJobId, { signal, agentRecordId }),
       controller.signal,
       "The exact Defender job is expired, deleted, or unavailable to this account. ",
     )
@@ -349,7 +315,7 @@ function DefenderHuntingSession() {
         }
       });
     return () => controller.abort();
-  }, [failSavedRead, readSavedData, routeJobId, routeRevision]);
+  }, [agentRecordId, failSavedRead, readSavedData, routeJobId]);
 
   useEffect(() => {
     if (!hasProgressingJobs && pollCycle === 0) return;
@@ -390,7 +356,7 @@ function DefenderHuntingSession() {
     const controller = new AbortController();
     actionController.current = controller;
     if (key.startsWith("history:")) {
-      selectJob(undefined, "history", false);
+      selectJob(undefined, "history");
       setHistoryLoading(true);
     }
     setBusy(key);
@@ -422,11 +388,11 @@ function DefenderHuntingSession() {
     const exactId = selectionOrigin.current === "route" ? selectedRef.current?.id ?? routeJobId : undefined;
     setHistoryLoading(true);
     const [nextCatalog, history, exactJob] = await Promise.all([
-      readSavedData(["defender-hunting-catalog", requestAction], requestSignal => getDefenderHuntingCatalog({ signal: requestSignal }), signal),
+      readSavedData(["defender-hunting-catalog", requestAction], requestSignal => getDefenderHuntingCatalog({ signal: requestSignal, agentRecordId }), signal),
       readSavedData(["defender-hunting-jobs", { limit: historyPageSize, offset: historyOffset }, requestAction],
-        requestSignal => getDefenderHuntingJobs(historyPageSize, historyOffset, { signal: requestSignal }), signal),
+        requestSignal => getDefenderHuntingJobs(historyPageSize, historyOffset, { signal: requestSignal, agentRecordId }), signal),
       exactId ? readSavedData(["defender-hunting-job", exactId, requestAction],
-        requestSignal => getDefenderHuntingJob(exactId, { signal: requestSignal }), signal,
+        requestSignal => getDefenderHuntingJob(exactId, { signal: requestSignal, agentRecordId }), signal,
         "The exact Defender job is expired, deleted, or unavailable to this account. ") : undefined,
     ]);
     if (signal.aborted || !currentRequest(requestGeneration, requestAction)) return;
@@ -434,7 +400,7 @@ function DefenderHuntingSession() {
     const lastOffset = Math.max(Math.ceil(history.count / historyPageSize) - 1, 0) * historyPageSize;
     if (historyOffset > lastOffset) await loadHistory(lastOffset, requestGeneration, signal, requestAction);
     else commitHistory(history);
-    if (exactJob && currentRequest(requestGeneration, requestAction)) selectJob(exactJob, "route", false);
+    if (exactJob && currentRequest(requestGeneration, requestAction)) selectJob(exactJob, "route");
   }
 
   async function handleSearch(event: FormEvent) {
@@ -442,7 +408,7 @@ function DefenderHuntingSession() {
     if (!searchAction || !available || !catalog || !searchAction.roles.some(role => hasRole(capability.user, role))
       || busy || !filters || rangeError || operationError) return;
     await perform("search", async (requestGeneration, requestAction, signal) => {
-      const job = await submitDefenderHunt(tokenMode, filters, { signal });
+      const job = await submitDefenderHunt(tokenMode, filters, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       selectJob(job, "route"); await loadHistory(0, requestGeneration, signal, requestAction);
     });
@@ -452,7 +418,7 @@ function DefenderHuntingSession() {
     if (!canQualify || !approvalAcknowledged || !catalog || busy || !filters || rangeError || operationError || qualificationTargetError || qualificationRangeError) return;
     const approvalRequest = ++approvalGeneration.current;
     await perform("approve", async (requestGeneration, requestAction, signal) => {
-      const job = await approveDefenderHuntingQualification(tokenMode, filters, { signal });
+      const job = await approveDefenderHuntingQualification(tokenMode, filters, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction) || approvalGeneration.current !== approvalRequest) return;
       setApprovedJob(job); setApprovalAcknowledged(false); await loadHistory(0, requestGeneration, signal, requestAction);
     });
@@ -464,7 +430,7 @@ function DefenderHuntingSession() {
     await perform("qualification", async (requestGeneration, requestAction, signal) => {
       const currentApproval = await readSavedData(
         ["defender-hunting-job", approvedJob.id, requestAction],
-        requestSignal => getDefenderHuntingJob(approvedJob.id, { signal: requestSignal }),
+        requestSignal => getDefenderHuntingJob(approvedJob.id, { signal: requestSignal, agentRecordId }),
         signal,
       );
       if (!currentRequest(requestGeneration, requestAction) || approvalGeneration.current !== approvalRequest) return;
@@ -484,7 +450,7 @@ function DefenderHuntingSession() {
         setApprovedJob(undefined);
         throw new Error("Qualification approval is no longer current. Review the exact scope and approve again.");
       }
-      const job = await startDefenderHuntingQualification(approvedJob.id, { signal });
+      const job = await startDefenderHuntingQualification(approvedJob.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction) || approvalGeneration.current !== approvalRequest) return;
       setApprovedJob(job); selectJob(job, "route"); await loadHistory(0, requestGeneration, signal, requestAction);
       if (!currentRequest(requestGeneration, requestAction)) return;
@@ -495,7 +461,7 @@ function DefenderHuntingSession() {
   async function handleRevokeRetainedScope() {
     if (!retainedScope || !canRevokeRetainedScope || busy || !window.confirm("Revoke saved Defender hunting access for this exact retained scope? Existing provider data is unchanged.")) return;
     await perform("revoke-scope", async (requestGeneration, requestAction, signal) => {
-      await revokeDefenderHuntingRetainedScope(retainedScope.id, { signal });
+      await revokeDefenderHuntingRetainedScope(retainedScope.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       selectJob(undefined);
       await Promise.all([
@@ -507,11 +473,11 @@ function DefenderHuntingSession() {
 
   async function handleView(job: DefenderHuntingJob, offset = 0) {
     if (busy || historyLoading) return;
-    selectJob(job, selectedRef.current?.id === job.id ? selectionOrigin.current : "history", selectedRef.current?.id !== job.id);
+    selectJob(job, selectedRef.current?.id === job.id ? selectionOrigin.current : "history");
     await perform(`view:${job.id}`, async (requestGeneration, requestAction, signal) => {
       const page = await readSavedData(
         ["defender-hunting-rows", job.id, { limit: rowPageSize, offset }, requestAction],
-        requestSignal => getDefenderHuntingRows(job.id, rowPageSize, offset, { signal: requestSignal }),
+        requestSignal => getDefenderHuntingRows(job.id, rowPageSize, offset, { signal: requestSignal, agentRecordId }),
         signal,
       );
       if (!currentRequest(requestGeneration, requestAction)) return;
@@ -526,7 +492,7 @@ function DefenderHuntingSession() {
     await perform(`view:${id}`, async (requestGeneration, requestAction, signal) => {
       const page = await readSavedData(
         ["defender-hunting-rows", id, { limit: rowPageSize, offset: 0 }, requestAction],
-        requestSignal => getDefenderHuntingRows(id, rowPageSize, 0, { signal: requestSignal }),
+        requestSignal => getDefenderHuntingRows(id, rowPageSize, 0, { signal: requestSignal, agentRecordId }),
         signal,
       );
       if (!currentRequest(requestGeneration, requestAction)) return;
@@ -536,7 +502,7 @@ function DefenderHuntingSession() {
 
   async function handleResume(job: DefenderHuntingJob) {
     await perform(`resume:${job.id}`, async (requestGeneration, requestAction, signal) => {
-      const resumed = await resumeDefenderHunt(job.id, { signal });
+      const resumed = await resumeDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       selectJob(resumed, "route"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
     });
@@ -544,7 +510,7 @@ function DefenderHuntingSession() {
 
   async function handleCancel(job: DefenderHuntingJob) {
     await perform(`cancel:${job.id}`, async (requestGeneration, requestAction, signal) => {
-      const cancelled = await cancelDefenderHunt(job.id, { signal });
+      const cancelled = await cancelDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       selectJob(cancelled, "route"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
     });
@@ -553,7 +519,7 @@ function DefenderHuntingSession() {
   async function handleDelete(job: DefenderHuntingJob) {
     if (!window.confirm("Delete this minimized local hunting cache? Defender source data is unchanged.")) return;
     await perform(`delete:${job.id}`, async (requestGeneration, requestAction, signal) => {
-      await deleteDefenderHunt(job.id, { signal });
+      await deleteDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       if (selectedRef.current?.id === job.id || routeJobId === job.id) selectJob(undefined);
       await loadHistory(historyOffset, requestGeneration, signal, requestAction);
@@ -562,7 +528,7 @@ function DefenderHuntingSession() {
 
   async function handleExport(job: DefenderHuntingJob) {
     await perform(`export:${job.id}`, async (requestGeneration, requestAction, signal) => {
-      const blob = await downloadDefenderHuntingCsv(job.id, { signal });
+      const blob = await downloadDefenderHuntingCsv(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
@@ -572,9 +538,9 @@ function DefenderHuntingSession() {
   }
 
   const selectedTemplate = catalog?.templates.find(template => template.id === templateId);
-  const readiness = available ? "qualified_exact_scope" : "not_qualified_exact_scope";
+  const readiness = available ? qualification ? "qualified_exact_scope" : "ready_to_try" : "not_ready";
 
-  function selectJob(job: DefenderHuntingJob | undefined, origin: "history" | "route" = "history", push = true) {
+  function selectJob(job: DefenderHuntingJob | undefined, origin: "history" | "route" = "history") {
     resolvedRouteJobId.current = job?.id;
     selectedRef.current = job;
     selectionOrigin.current = origin;
@@ -582,43 +548,36 @@ function DefenderHuntingSession() {
     setRows(undefined);
     setRowOffset(0);
     setRouteJobId(job?.id);
-    const next = workbenchUrl("security", securityRouteSearch({
-      jobId: job?.id, tokenMode, templateId, operations, startDateTime, endDateTime,
-      agentIds, blueprintIds, actorObjectIds,
-    }));
-    if (push && `${window.location.pathname}${window.location.search}` !== next) {
-      window.history.pushState({ view: "security" }, "", next);
-    }
   }
 
   return (
     <section className="defender-hunting" aria-label="Microsoft Defender hunting">
       <header className="hunting-heading">
-        <div><p className="eyebrow">Microsoft Graph v1.0 / Defender advanced hunting</p><h2>Defender and Agent 365 hunting</h2>
-          <p>Curated investigation metadata, separate from Purview audit and official usage.</p></div>
+        <div><h3>Defender and Agent 365 hunting</h3><p>{agentName}</p></div>
         <div className="hunting-heading-actions">
-          <a className="primary-link secondary" href={catalog?.defenderPortalUrl ?? "https://security.microsoft.com/v2/advanced-hunting"} target="_blank" rel="noreferrer">Defender portal <ExternalLink aria-hidden="true" /></a>
+          <a className="primary-link secondary" href={catalog?.defenderPortalUrl ?? "https://security.microsoft.com/v2/advanced-hunting"} target="_blank" rel="noreferrer">Defender portal (not agent-scoped) <ExternalLink aria-hidden="true" /></a>
           <button type="button" className="secondary icon-button control-icon-button" aria-label="Refresh hunting history" title="Refresh hunting history" disabled={Boolean(busy)} onClick={() => void perform("refresh", refreshSaved)}><RefreshCw aria-hidden="true" /></button>
         </div>
       </header>
 
       {error ? <div className="error-banner" role="alert">{error}
         {routeJobId ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => {
-          selectJob(undefined, "history", false);
+          selectJob(undefined, "history");
           void perform("refresh", refreshSaved);
         }}>Return to hunting history</button> : null}
       </div> : null}
       {pollPaused ? <p role="status">Automatic history refresh paused. Refresh hunting history to retry saved reads.</p> : null}
 
-      <section className="hunting-readiness" aria-label="Hunting readiness">
-        <div><span>Provider authorization</span><strong>{statusLabel(readiness)}</strong><small>{tokenMode} / {qualification ? `proof expires ${formatDateTime(qualification.expiresAt)}` : "selected filters require current provider proof"}</small></div>
-        <div><span>Saved-data scope</span><strong>{retainedScope ? "Approved" : "Not approved"}</strong><small>{retainedScope ? `expires ${formatDateTime(retainedScope.expiresAt)}` : "No current exact retained scope"}</small></div>
-        <div><span>Source table</span><strong>{selectedTemplate?.sourceTable ?? "Not selected"}</strong><small>{selectedTemplate?.sourceTable === "AgentsInfo" ? "Preview table" : "Agent 365 activity metadata"}</small></div>
-        <div><span>Provider prerequisites</span><strong>Not independently proven</strong><small>{available ? "Authorization qualified; verify connector, license, rollout and table separately" : "Verify connector, license, rollout and table separately"}</small></div>
-        <div><span>Local retention</span><strong>30 days</strong><small>Provider retention is separate</small></div>
-      </section>
-
-      <div className="hunting-boundary" role="note"><ShieldCheck aria-hidden="true" /><span>{catalog?.contentNotice ?? "Messages and tool content are not retained or reconstructed."}</span></div>
+      <details className="hunting-filters"><summary>Access, scope &amp; limits</summary>
+        <section className="hunting-readiness" aria-label="Hunting readiness">
+          <div><span>Provider authorization</span><strong>{statusLabel(readiness)}</strong><small>{tokenMode} / {qualification ? `proof expires ${formatDateTime(qualification.expiresAt)}` : "token authorization only; operation access is checked when a hunt runs"}</small></div>
+          <div><span>Saved-data scope</span><strong>{retainedScope ? "Approved" : "Not approved"}</strong><small>{retainedScope ? `expires ${formatDateTime(retainedScope.expiresAt)}` : "No current exact retained scope"}</small></div>
+          <div><span>Source table</span><strong>{selectedTemplate?.sourceTable ?? "Not selected"}</strong><small>{selectedTemplate?.sourceTable === "AgentsInfo" ? "Preview table" : "Agent 365 activity metadata"}</small></div>
+          <div><span>Provider prerequisites</span><strong>Not independently proven</strong><small>See Log setup on Permissions</small></div>
+          <div><span>Local retention</span><strong>30 days</strong><small>Provider retention is separate</small></div>
+        </section>
+        <div className="hunting-boundary" role="note"><ShieldCheck aria-hidden="true" /><span>{catalog?.contentNotice ?? "Messages and tool content are not retained or reconstructed."}</span></div>
+      </details>
 
       {retainedScope ? <section className="hunting-qualification" aria-label="Retained hunting scope"><div><strong>Exact saved-data scope approved</strong>
         <p>Saved history remains readable until {formatDateTime(retainedScope.expiresAt)} while this local approval, current role and configuration remain valid.</p></div>
@@ -638,16 +597,15 @@ function DefenderHuntingSession() {
 
         {selectedTemplate?.operations.length ? <fieldset className="hunting-operations"><legend>Documented operations</legend><div>{selectedTemplate.operations.map(operation => <label key={operation}><input type="checkbox" checked={operations.includes(operation)} onChange={event => { setOperations(current => event.target.checked ? [...current, operation].sort() : current.filter(value => value !== operation)); invalidateApproval(); }} /><span>{operation}</span></label>)}</div></fieldset> : null}
 
-        <details className="hunting-filters"><summary>Typed identity filters</summary><div>
-          <TextFilter label="Agent IDs" value={agentIds} onChange={value => { setAgentIds(value); invalidateApproval(); }} />
-          <TextFilter label="Blueprint IDs" value={blueprintIds} onChange={value => { setBlueprintIds(value); invalidateApproval(); }} />
-          {templateId !== "agents_inventory" ? <TextFilter label="Actor object IDs" value={actorObjectIds} onChange={value => { setActorObjectIds(value); invalidateApproval(); }} /> : null}
-        </div></details>
+        <details className="hunting-filters"><summary>Agent scope (automatic)</summary>
+          <p>{templateId === "agents_inventory" ? "Enterprise-application object ID" : "Verified application/client ID"}: <code>{scopedIds.join(", ") || "Unavailable"}</code>. Package IDs, blueprint IDs, bot IDs and display names are not substituted for this identity.</p>
+          {templateId !== "agents_inventory" ? <p>The saved calling identity is an exact filter, not proof that every runtime emits telemetry under that identity. Missing matches do not prove inactivity.</p> : null}
+        </details>
 
-        {rangeError || operationError || qualificationRangeError || applicationMode && !available && qualificationTargetError
+        {rangeError || operationError || qualificationRangeError || qualificationTargetError
           ? <div className="error-banner" role="alert">{rangeError ?? operationError ?? qualificationRangeError ?? qualificationTargetError}</div> : null}
 
-        {!available && applicationMode ? <section className="hunting-qualification" aria-label="Hunting qualification required"><div><strong>Shared application hunting is not qualified</strong>
+        {!identityAvailable ? <p className="agent-insight-note">This template cannot run for the selected agent until its required identity is available. No broader query will be used.</p> : !available && applicationMode ? <section className="hunting-qualification" aria-label="Hunting qualification required"><div><strong>Shared application hunting is not qualified</strong>
           {(capabilityView?.decision.remediation ?? ["Open Permissions to review the exact Defender hunting contract."]).map(item => <p key={item}>{item}</p>)}</div>
           <div className="hunting-qualification-actions"><button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
             {canQualify ? <label><input type="checkbox" checked={approvalAcknowledged} onChange={event => setApprovalAcknowledged(event.target.checked)} /><span>Approve one bounded fixed-template provider query</span></label> : null}
@@ -675,14 +633,10 @@ function DefenderHuntingSession() {
             onClick={() => void perform("history:next", (requestGeneration, requestAction, signal) => loadHistory(historyOffset + historyPageSize, requestGeneration, signal, requestAction))}>Next</button></div> : null}
       </section>
 
-      {selected ? <HuntingDetail job={selected} rows={rows?.job.id === selected.id && readableStatuses.has(selected.status) ? rows : undefined} rowOffset={rowOffset} busy={Boolean(busy) || historyLoading}
+      {selected ? <HuntingDetail key={selected.id} job={selected} rows={rows?.job.id === selected.id && readableStatuses.has(selected.status) ? rows : undefined} rowOffset={rowOffset} busy={Boolean(busy) || historyLoading}
         onPageChange={offset => void handleView(selected, offset)} onViewPrior={id => void handleViewPrior(id)} /> : null}
     </section>
   );
-}
-
-function TextFilter({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return <label><span>{label}</span><textarea rows={2} value={value} onChange={event => onChange(event.target.value)} placeholder="One exact ID per line" /></label>;
 }
 
 function HistoryTable({ jobs, selectedId, busy, onView, onResume, onCancel, onDelete, onExport }: { jobs: DefenderHuntingJob[]; selectedId?: string; busy: boolean;
@@ -705,6 +659,11 @@ function HistoryTable({ jobs, selectedId, busy, onView, onResume, onCancel, onDe
 
 function HuntingDetail({ job, rows, rowOffset, busy, onPageChange, onViewPrior }: { job: DefenderHuntingJob; rows?: DefenderHuntingRowPage; rowOffset: number; busy: boolean;
   onPageChange: (offset: number) => void; onViewPrior: (id: string) => void }) {
+  const [search, setSearch] = useState("");
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const visibleRows = rows?.value.filter(row => (!errorsOnly || row.sourceTable === "CloudAppEvents" && row.outcome === "error")
+    && Object.values(row).filter(value => typeof value === "string" || typeof value === "number").join(" ").toLowerCase()
+      .includes(search.trim().toLowerCase())) ?? [];
   return <section className="hunting-results" aria-labelledby="hunting-results-title"><header><div><h3 id="hunting-results-title">{templateLabel(job.filters.templateId)} result</h3>
     <p>{job.filters.templateId === "agents_inventory" ? "Defender AgentsInfo preview snapshot. Package and Power Platform authority remain separate." : "Agent 365 CloudAppEvents investigation metadata. Child spans are not reconstructed into conversations."}</p></div>
     <span>{job.storedRowCount.toLocaleString()} rows</span></header>
@@ -725,7 +684,14 @@ function HuntingDetail({ job, rows, rowOffset, busy, onPageChange, onViewPrior }
       : `The saved result is partial${job.partialReason ? ` (${statusLabel(job.partialReason)})` : ""}.`} The requested interval remains incompletely observed; no complete total is claimed.</div> : null}
     {job.priorSuccessfulJobId && !readableStatuses.has(job.status) ? <div className="hunting-prior-result"><span>This attempt did not replace the prior successful minimized result.</span>
       <button type="button" className="secondary" disabled={busy} onClick={() => onViewPrior(job.priorSuccessfulJobId!)}><Eye aria-hidden="true" /> View prior successful result</button></div> : null}
-    {rows?.value.length ? <ResultTable value={rows.value} /> : !job.noData && readableStatuses.has(job.status) ? <button type="button" className="secondary" disabled={busy} onClick={() => onPageChange(0)}><Eye aria-hidden="true" /> Load minimized rows</button> : null}
+    {rows?.value.length ? <>
+      <div className="agent-insight-toolbar">
+        <label>Filter loaded metadata<input type="search" maxLength={256} value={search} onChange={event => setSearch(event.target.value)} placeholder="Tool, actor, conversation, span or error" /></label>
+        {job.filters.templateId !== "agents_inventory" ? <label><input type="checkbox" checked={errorsOnly} onChange={event => setErrorsOnly(event.target.checked)} /> Reported errors only</label> : null}
+        <span>{visibleRows.length} of {rows.value.length} loaded rows. Filters apply to this page only; CSV includes all saved rows.</span>
+      </div>
+      {visibleRows.length ? <ResultTable value={visibleRows} /> : <p>No loaded rows match these filters.</p>}
+    </> : !job.noData && readableStatuses.has(job.status) ? <button type="button" className="secondary" disabled={busy} onClick={() => onPageChange(0)}><Eye aria-hidden="true" /> Load minimized rows</button> : null}
     {rows && rows.count > rowPageSize ? <div className="hunting-page-actions"><button type="button" className="secondary" disabled={busy || rowOffset === 0} onClick={() => onPageChange(Math.max(0, rowOffset - rowPageSize))}>Previous</button>
       <span>{rowOffset + 1}-{Math.min(rowOffset + rows.value.length, rows.count)} of {rows.count}</span><button type="button" className="secondary" disabled={busy || rowOffset + rows.value.length >= rows.count} onClick={() => onPageChange(rowOffset + rowPageSize)}>Next</button></div> : null}
   </section>;
@@ -738,18 +704,29 @@ function ResultTable({ value }: { value: DefenderHuntingRow[] }) {
     <td>{inventoryDetail("Owners", row.detailStates.owners, row.ownerCount)}<small>{inventoryDetail("Permissions", row.detailStates.permissions, row.permissionMetadataKeyCount)}; {inventoryDetail("Authentication", row.detailStates.authentication, row.authenticationMetadataKeyCount)}; {inventoryDetail("Risk", row.detailStates.risk)}</small></td><td>{associationLabel(row.association)}</td></tr>
     : <tr key={`${row.reportId ?? row.spanId ?? index}:${index}`}><td>{formatDateTime(row.timestamp)}</td><td><strong>{row.actionType}</strong><small>{display(row.operation)}</small></td><td>{display(row.targetAgentName ?? row.agentName)}<small>{display(row.targetAgentId ?? row.agentId)} / {display(row.cloudApplication)}</small></td>
       <td><code>{display(row.actorAccountObjectId)}</code><small>{display(row.actorProviderAccountId)}</small></td><td><code>{display(row.spanId)}</code><small>{row.rootSpanObserved ? "Observed root span metadata" : row.parentSpanId ? `Child of ${row.parentSpanId}` : "Root span not observed"}</small></td>
-      <td>{display(row.toolName ?? row.errorType)}<small>{row.outcome} / {statusLabel(row.spanRole)} / {row.durationMilliseconds === null ? "duration not supplied" : `${row.durationMilliseconds} ms`}; content absent</small></td><td>{associationLabel(row.association)}</td></tr>)}</tbody></table></div>;
+      <td>{display(row.toolName ?? row.errorType)}<small>{row.outcome} / {statusLabel(row.spanRole)} / {row.durationMilliseconds === null ? "duration not supplied" : `${row.durationMilliseconds} ms`}; content absent</small>
+        <details><summary>Event metadata</summary><dl className="inventory-identifiers">
+          {([
+            ["Error", row.errorType], ["Conversation", row.conversationId], ["Thread", row.conversationThreadId],
+            ["Session", row.sessionIdentity], ["Channel", row.channelName], ["Tool type", row.toolType], ["Tool call", row.toolCallId],
+            ["Human actor", row.humanActorUserPrincipalName ?? row.humanActorUserObjectId],
+            ["Agent user", row.agentUserPrincipalName ?? row.agentUserObjectId], ["Target agent", row.targetAgentId],
+            ["Acting agent", row.agentId], ["Invoked from", row.invokeSource], ["Completed", row.completionTime],
+          ] as const).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{display(value)}</dd></div>)}
+        </dl><p>Missing error metadata is not proof of success. Conversation and span IDs are references, not reconstructed transcripts.</p></details>
+      </td><td>{associationLabel(row.association)}</td></tr>)}</tbody></table></div>;
 }
 
 function IconAction({ children, disabled, label, onClick, title }: { children: React.ReactNode; disabled: boolean; label: string; onClick: () => void; title: string }) {
   return <button type="button" className="secondary icon-button control-icon-button" aria-label={label} title={title} disabled={disabled} onClick={onClick}>{children}</button>;
 }
 
-function makeFilters(value: { templateId: DefenderHuntingFilters["templateId"]; startDateTime: string; endDateTime: string; agentIds: string; blueprintIds: string; actorObjectIds: string; operations: string[] }): DefenderHuntingFilters | undefined {
+function makeFilters(value: { templateId: DefenderHuntingFilters["templateId"]; startDateTime: string; endDateTime: string; entraAgentIds: string[]; entraAgentApplicationIds: string[]; operations: string[] }): DefenderHuntingFilters | undefined {
   const start = toUtc(value.startDateTime); const end = toUtc(value.endDateTime);
   if (!start || !end) return undefined;
-  return { templateId: value.templateId, startDateTime: start, endDateTime: end, agentIds: lines(value.agentIds), blueprintIds: lines(value.blueprintIds),
-    actorObjectIds: value.templateId === "agents_inventory" ? [] : lines(value.actorObjectIds), operations: [...value.operations].sort() };
+  return { templateId: value.templateId, startDateTime: start, endDateTime: end, agentIds: [], blueprintIds: [],
+    actorObjectIds: [], ...(value.templateId === "agents_inventory" ? { entraAgentIds: [...value.entraAgentIds].sort() }
+      : { entraAgentApplicationIds: [...value.entraAgentApplicationIds].sort() }), operations: [...value.operations].sort() };
 }
 
 function rangeMessage(filters: DefenderHuntingFilters | undefined, catalog?: DefenderHuntingCatalog) {
@@ -760,9 +737,10 @@ function rangeMessage(filters: DefenderHuntingFilters | undefined, catalog?: Def
   return undefined;
 }
 
-function lines(value: string) { return [...new Set(value.split(/\r?\n/).map(item => item.trim()).filter(Boolean))].sort(); }
 function equalQualificationScope(approved: Omit<DefenderHuntingFilters, "startDateTime" | "endDateTime">, filters: DefenderHuntingFilters) {
   return approved.templateId === filters.templateId && equalStrings(approved.agentIds, filters.agentIds) && equalStrings(approved.blueprintIds, filters.blueprintIds)
+    && equalStrings(approved.entraAgentIds ?? [], filters.entraAgentIds ?? [])
+    && equalStrings(approved.entraAgentApplicationIds ?? [], filters.entraAgentApplicationIds ?? [])
     && equalStrings(approved.actorObjectIds, filters.actorObjectIds) && equalStrings(approved.operations, filters.operations);
 }
 function equalStrings(left: string[], right: string[]) { return left.length === right.length && left.every((value, index) => value === right[index]); }
@@ -770,7 +748,7 @@ function toUtc(value: string) { const parsed = new Date(value); return Number.is
 function localDateTime(value: Date) { const offset = value.getTimezoneOffset() * 60_000; return new Date(value.getTime() - offset).toISOString().slice(0, 19); }
 function formatDateTime(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); }
 function formatRange(startDateTime: string, endDateTime: string) { return `${formatDateTime(startDateTime)} to ${formatDateTime(endDateTime)}`; }
-function filterSummary(filters: DefenderHuntingFilters) { const values = [...filters.agentIds.map(value => `agent ${value}`), ...filters.blueprintIds.map(value => `blueprint ${value}`),
+function filterSummary(filters: DefenderHuntingFilters) { const values = [...(filters.entraAgentIds ?? []).map(value => `Entra object ${value}`), ...(filters.entraAgentApplicationIds ?? []).map(value => `Application/client ${value}`), ...filters.agentIds.map(value => `agent ${value}`), ...filters.blueprintIds.map(value => `blueprint ${value}`),
   ...filters.actorObjectIds.map(value => `actor ${value}`), ...filters.operations.map(value => `operation ${value}`)]; return values.length ? values.join("; ") : "No target filters"; }
 function inventoryDetail(label: string, state: DefenderInventoryDetailState, count?: number | null) { return state === "empty" ? `${label}: empty` : state === "not_exposed" ? `${label}: not exposed`
   : state === "present_unqualified_shape" ? `${label}: present, shape not qualified` : count === null || count === undefined ? `${label}: not supplied` : `${label}: ${count}`; }

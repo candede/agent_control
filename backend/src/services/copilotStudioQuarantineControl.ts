@@ -15,6 +15,7 @@ type ControlDependencies = {
   revalidateUser: typeof revalidateAuthenticatedUser;
   delegatedToken: typeof acquireDelegatedToken;
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   authorityContext: typeof capabilities.quarantineAuthorityContext;
   launch: typeof launchCopilotStudioQuarantineJob;
 };
@@ -23,6 +24,7 @@ const defaultDependencies: ControlDependencies = {
   revalidateUser: revalidateAuthenticatedUser,
   delegatedToken: acquireDelegatedToken,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  observeOperation: capabilities.observeOperation.bind(capabilities),
   authorityContext: capabilities.quarantineAuthorityContext.bind(capabilities),
   launch: launchCopilotStudioQuarantineJob,
 };
@@ -95,23 +97,25 @@ export class CopilotStudioQuarantineControlService {
     }
     if (!missing.length) return results as Array<NonNullable<typeof results[number]>>;
 
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-    const current = await this.authorize(scope, capabilityId);
-    const token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
-    const providerResults: Array<FrozenQuarantineTarget["directStatus"]> = [];
-    for (const value of missing) {
-      providerResults.push(await this.provider.getStatus(token, value.target, { correlationId: randomUUID() }));
-    }
-    const publishUser = await this.authorize(scope, capabilityId);
-    if (publishUser.homeAccountId !== current.homeAccountId) throw AppError.unauthorized("The quarantine status actor changed before publication.");
-    await commitAccountSessionValidation(validation, async () => {
-      for (const [resultIndex, value] of missing.entries()) {
-        const directStatus = providerResults[resultIndex];
-        await this.repository.recordObservation(scope, value.target, directStatus);
-        results[value.index] = { target: value.target, directStatus, source: "provider" };
+    return this.dependencies.observeOperation(capabilityId, user, async () => {
+      const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+      const current = await this.authorize(scope, capabilityId);
+      const token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
+      const providerResults: Array<FrozenQuarantineTarget["directStatus"]> = [];
+      for (const value of missing) {
+        providerResults.push(await this.provider.getStatus(token, value.target, { correlationId: randomUUID() }));
       }
-    });
-    return results as Array<NonNullable<typeof results[number]>>;
+      const publishUser = await this.authorize(scope, capabilityId);
+      if (publishUser.homeAccountId !== current.homeAccountId) throw AppError.unauthorized("The quarantine status actor changed before publication.");
+      await commitAccountSessionValidation(validation, async () => {
+        for (const [resultIndex, value] of missing.entries()) {
+          const directStatus = providerResults[resultIndex];
+          await this.repository.recordObservation(scope, value.target, directStatus);
+          results[value.index] = { target: value.target, directStatus, source: "provider" };
+        }
+      });
+      return results as Array<NonNullable<typeof results[number]>>;
+    }, { clearOnSuccess: capabilityId === "powerPlatform.quarantine.read" });
   }
 
   private async authorize(scope: QuarantineScope, capabilityId: CapabilityId) {

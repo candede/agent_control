@@ -55,7 +55,7 @@ function jobs(): WorkbenchJobsResponse {
         source: "defender", label: "Defender fixed-template investigation",
         target: "agents_inventory · 2026-09-12T08:47:39Z to 2026-09-12T09:47:39Z",
         status: "inconclusive", total: null, completed: 0, createdAt: undefined, startedAt: undefined, completedAt: undefined,
-        href: "/security?job=old-inconclusive-hunt",
+        href: "/agents",
       }),
       ...Array.from({ length: 17 }, (_, index) => job(`exact-${index}`, new Date(Date.UTC(2026, 8, 16, 12, index)).toISOString(), {
         label: `Exact package refresh ${index + 1}`, target: "1 exact Graph package target", total: 1, completed: 1,

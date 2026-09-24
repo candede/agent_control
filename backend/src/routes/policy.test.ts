@@ -8,12 +8,14 @@ describe("route policy declarations", () => {
   it("covers every application route and requires CSRF on unsafe authenticated methods", () => {
     createApp({} as never, "artifacts/not-used");
     const expected = [
-      "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}",
+      "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}", "GET /security",
       "GET /auth/login", "POST /auth/consent", "GET /auth/callback", "POST /auth/logout", "GET /me",
-      "GET /capabilities", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
+      "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
       "GET /agent-inventory", "POST /agent-inventory/export.csv", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
       "POST /agent-inventory/people/resolve", "GET /agent-responsibility",
+      "GET /agent-inventory/investigations/context", "GET /agent-inventory/investigations/purview",
+      "POST /agent-inventory/investigations/resolve",
       "GET /agent-inventory/:recordId/usage-candidates", "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
       "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry", "POST /data-sync/runs/:id/cancel",
@@ -52,10 +54,30 @@ describe("route policy declarations", () => {
     });
   });
 
+  it("keeps the retired consent endpoint session-, Viewer- and CSRF-protected without a provider capability", () => {
+    expect(declaredRoutePolicies.get("POST /auth/consent")).toEqual({
+      access: "authenticated", dataClass: "identity", roles: ["AgentControl.Viewer"], csrf: true,
+    });
+    expect(declaredRoutePolicies.get("GET /auth/login")).toEqual({ access: "public", dataClass: "identity" });
+    expect(declaredRoutePolicies.get("GET /auth/callback")).toEqual({ access: "public", dataClass: "identity" });
+  });
+
   it("requires only saved private Viewer authorization for responsibility, not provider lookup capability", () => {
     expect(declaredRoutePolicies.get("GET /agent-responsibility")).toEqual({
       access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
     });
+  });
+
+  it("keeps investigation reads private and Viewer-authorized without provider calls", () => {
+    expect(declaredRoutePolicies.get("POST /agent-inventory/investigations/resolve")).toEqual({
+      access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], csrf: true, capabilityId: "graph.agentIdentity.read",
+    });
+    for (const route of ["context", "purview"]) {
+      expect(declaredRoutePolicies.get(`GET /agent-inventory/investigations/${route}`)).toMatchObject({
+        access: "authenticated", roles: ["AgentControl.Viewer"],
+      });
+      expect(declaredRoutePolicies.get(`GET /agent-inventory/investigations/${route}`)?.capabilityId).toBeUndefined();
+    }
   });
 
   it("does not allow direct route registration outside the policy helper", () => {

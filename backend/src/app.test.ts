@@ -49,12 +49,14 @@ const inventoryProviderFixture = vi.hoisted(() => ({ queries: 0 }));
 vi.mock("./auth/msal.js", () => ({
   acquireDelegatedToken: vi.fn(async () => "fixture-token"),
   acquireApplicationToken: vi.fn(async () => "fixture-application-token"),
-  createAuthFlow: (kind:string, options:Record<string,unknown> = {}) => ({kind,state:"fixture-state",nonce:"fixture-nonce",codeVerifier:"fixture-verifier",scopes:["openid","profile"],createdAt:Date.now(),...options,returnTo:typeof options.returnTo === "string" ? options.returnTo : "/"}),
+  createAuthFlow: (kind:string, options:Record<string,unknown> = {}) => ({kind,state:"fixture-state",nonce:"fixture-nonce",codeVerifier:"fixture-verifier",scopes:["openid","profile","offline_access"],createdAt:Date.now(),...options,returnTo:typeof options.returnTo === "string" ? options.returnTo : "/"}),
   createAuthorizationUrl: async () => "https://login.microsoftonline.com/fixture", redeemAuthorizationCode: async () => { authFixture.redemptions += 1; return {}; },
   toAuthenticatedUser: () => ({...authFixture.user,roles:[...authFixture.user.roles]}),
   matchesAuthState: (left:string,right:string) => left === right, evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
 }));
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
+  checkProgress: vi.fn(() => null),
+  observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
   requireAvailable: vi.fn(async () => undefined), requireApplicationDataScope: vi.fn(async () => ({ enabled: true, sharedDataScope: true, revision: huntingCapabilityFixture.applicationRevision })), invalidatePrincipal: vi.fn(async () => undefined), list: vi.fn(async () => []), check: vi.fn(async () => []), refresh: vi.fn(), configureApplication: vi.fn(),
   packageQualificationIdentity: vi.fn(async (action: string) => ({ capabilityId: action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage", contractRevision: "a".repeat(64), configurationRevision: 1, authMode: "delegated" })),
   auditQualificationContext: vi.fn(async (capabilityId: string) => ({ capabilityId, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 })),
@@ -223,7 +225,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/api/auth/callback")).status).toBe(400);
     expect((await request("/assets/missing.js")).status).toBe(404);
     expect((await request("/missing.css")).status).toBe(404);
-    for (const route of ["/agents", "/users", "/sync", "/audit", "/security", "/permissions", "/jobs"]) {
+    for (const route of ["/agents", "/users", "/sync", "/audit", "/permissions", "/jobs"]) {
       const deepLink = await request(route);
       expect(deepLink.status).toBe(200);
       expect(deepLink.headers.get("cache-control")).toContain("no-store");
@@ -277,15 +279,30 @@ describe.sequential("packaged API/session contracts", () => {
     const stored=await fixture.runtime.query("SELECT sess::text AS value FROM sessions");
     expect(JSON.stringify(stored.rows)).not.toContain("fixture-token");
   });
-  it("removes stale roles when consent returns an authoritative empty assignment", async () => {
+  it.each(["graph.package.read.delegated", "graph.agentIdentity.read", "defender.hunting.application", "unknown"])("retires permission consent for %s without creating an authorization transaction", async capabilityId => {
     const originalCookie=cookie;
     cookie=await roleCookie("fixture-principal",["AgentControl.Viewer"]);
     try {
-      expect((await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":"wrong"},body:JSON.stringify({capabilityId:"graph.package.read.delegated"})})).status).toBe(403);
-      const consent=await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({capabilityId:"graph.package.read.delegated"})});
-      expect(consent.status).toBe(200);
+      expect((await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":"wrong"},body:JSON.stringify({capabilityId})})).status).toBe(403);
+      const consent=await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({capabilityId})});
+      expect(consent.status).toBe(410);
+      const body = await consent.json();
+      expect(body).toMatchObject({ code: "admin_managed_permissions", detail: expect.stringContaining("Grant admin consent") });
+      expect(body).not.toHaveProperty("authorizationUrl");
+      const redemptions = authFixture.redemptions;
+      expect((await request("/api/auth/callback?code=fixture&state=fixture-state")).status).toBe(400);
+      expect(authFixture.redemptions).toBe(redemptions);
+    } finally { cookie=originalCookie; }
+  });
+  it("removes stale roles when normal sign-in returns an authoritative empty assignment", async () => {
+    const originalCookie=cookie;
+    cookie=await roleCookie("fixture-principal",["AgentControl.Viewer"]);
+    try {
+      expect((await request("/api/auth/login")).status).toBe(302);
       authFixture.user.roles=[];
-      expect((await request("/api/auth/callback?code=fixture&state=fixture-state")).status).toBe(302);
+      const callback=await request("/api/auth/callback?code=fixture&state=fixture-state");
+      expect(callback.status).toBe(302);
+      cookie=callback.headers.get("set-cookie")!.split(";")[0];
       const me=await request("/api/me");
       expect(me.status).toBe(200);
       expect(await me.json()).toMatchObject({user:{roles:[]},roleAssignmentRequired:true});
@@ -294,12 +311,13 @@ describe.sequential("packaged API/session contracts", () => {
       cookie=originalCookie;
     }
   });
-  it("returns safe cancellation and conditional-access outcomes only after consuming the flow", async () => {
+  it("returns safe normal sign-in cancellation and conditional-access outcomes only after consuming the flow", async () => {
     const originalCookie = cookie;
     try {
       cookie = await roleCookie("fixture-principal", ["AgentControl.Viewer"]);
       for (const [providerError, outcome] of [["access_denied", "cancelled"], ["interaction_required", "interaction_required"], ["unrecognized-error", "failed"]]) {
-        await request("/api/auth/consent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/?view=permissions" }) });
+        const login = await request("/api/auth/login?returnTo=%2F%3Fview%3Dpermissions");
+        expect(login.status).toBe(302);
         const redemptions = authFixture.redemptions;
         const result = await request(`/api/auth/callback?state=fixture-state&error=${providerError}&error_description=private-provider-text`);
         expect(result.status).toBe(302);
@@ -872,17 +890,29 @@ describe.sequential("packaged API/session contracts", () => {
     expect(me.status).toBe(200);
     expect((await me.json()).roleAssignmentRequired).toBe(true);
     expect((await request("/api/capabilities",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
+    expect((await request("/api/capabilities/check-progress",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
     expect((await request("/api/capabilities/check",{method:"POST",headers:{Cookie:noRoleCookie}})).status).toBe(403);
     expect((await request("/api/diagnostics",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
     const viewerCookie = await roleCookie("viewer-no-write", ["AgentControl.Viewer"]);
+    const beforeProgress = vi.mocked(capabilities.check).mock.calls.length;
+    const progress = await request("/api/capabilities/check-progress?retry=failed", { headers: { Cookie: viewerCookie } });
+    expect(progress.status).toBe(200);
+    expect(progress.headers.get("cache-control")).toBe("no-store");
+    expect(await progress.json()).toEqual({ progress: null });
+    expect(capabilities.checkProgress).toHaveBeenLastCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }), true);
+    expect(vi.mocked(capabilities.check).mock.calls).toHaveLength(beforeProgress);
+    expect((await request("/api/capabilities/check-progress?retry=all", { headers: { Cookie: viewerCookie } })).status).toBe(400);
+    expect((await request("/api/capabilities/check-progress?principalId=another-account", { headers: { Cookie: viewerCookie } })).status).toBe(400);
     expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie, "x-csrf-token": "wrong" } })).status).toBe(403);
     expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId: "graph.package.read.delegated" }) })).status).toBe(400);
     expect((await request("/api/capabilities/check", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(200);
     expect((await request("/api/capabilities/check?retry=failed", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(200);
-    expect(capabilities.check).toHaveBeenLastCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }), { retryFailed: true });
+    expect(capabilities.check).toHaveBeenLastCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }),
+      { retryFailed: true, signal: expect.any(AbortSignal) });
     expect((await request("/api/capabilities/check?retry=failed", { method: "POST", headers: { Cookie: viewerCookie, "x-csrf-token": "wrong" } })).status).toBe(403);
     expect((await request("/api/capabilities/check?retry=all", { method: "POST", headers: { Cookie: viewerCookie } })).status).toBe(400);
-    expect(vi.mocked(capabilities.check)).toHaveBeenCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }));
+    expect(vi.mocked(capabilities.check)).toHaveBeenCalledWith(expect.objectContaining({ homeAccountId: "viewer-no-write" }),
+      { retryFailed: false, signal: expect.any(AbortSignal) });
     expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
     expect((await request("/api/official-usage/staging/not-owned", { method: "DELETE", headers: { Cookie: viewerCookie } })).status).toBe(403);
     const legacyCookie = await roleCookie("legacy-role-only", ["AgentControl.Reader" as AppRole]);

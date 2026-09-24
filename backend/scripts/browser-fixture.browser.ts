@@ -34,8 +34,7 @@ vi.mock("../src/auth/msal.js", async original => {
     createAuthorizationUrl: async (flow: ReturnType<typeof actual.createAuthFlow>) => {
       const scenario = new URL(flow.returnTo, process.env.FRONTEND_ORIGIN).searchParams.get("fixture") ?? "available";
       identity.scenarios.set(flow.state, scenario);
-      return flow.kind === "consent" ? `/api/auth/callback?state=${flow.state}&error=access_denied&error_description=never-render-provider-text`
-        : `/api/auth/callback?state=${flow.state}&code=${flow.state}`;
+      return `/api/auth/callback?state=${flow.state}&code=${flow.state}`;
     },
     redeemAuthorizationCode: async (code: string) => ({ scenario: identity.scenarios.get(code) }),
     toAuthenticatedUser: (result: { scenario: string }) => {

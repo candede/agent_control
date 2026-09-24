@@ -2,7 +2,6 @@ import {
   useDeferredValue,
   useEffect,
   useEffectEvent,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -26,8 +25,7 @@ import {
 import { downloadBlob } from "../agentExport";
 import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { auditRouteSearch, parseAuditRoute, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
-import { PurviewAuditView } from "./PurviewAuditView";
+import { auditRouteSearch, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
@@ -66,9 +64,6 @@ const auditActionLabels: Record<LocalAuditAction, string> = {
 
 export function AuditLogView({ agents }: AuditLogViewProps) {
   const [route, setRoute] = useState(() => parseAuditRoute(window.location.search));
-  const sourceId = useId();
-  const localTab = useRef<HTMLButtonElement>(null);
-  const purviewTab = useRef<HTMLButtonElement>(null);
 
   function commitRoute(next: AuditRouteState, push = false) {
     setRoute(next);
@@ -79,57 +74,27 @@ export function AuditLogView({ agents }: AuditLogViewProps) {
   }
 
   useEffect(() => {
-    const restore = () => setRoute(parseAuditRoute(window.location.search));
+    const restore = () => {
+      if (parseWorkbenchView(window.location.pathname) !== "audit") return;
+      const next = parseAuditRoute(window.location.search);
+      setRoute(next);
+      const url = workbenchUrl("audit", auditRouteSearch(next));
+      if (`${window.location.pathname}${window.location.search}` !== url) {
+        window.history.replaceState({ view: "audit" }, "", url);
+      }
+    };
+    restore();
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
   }, []);
 
   return (
     <section className="audit-source-view" aria-label="Audit evidence">
-      <div className="audit-source-tabs" role="tablist" aria-label="Audit source" onKeyDown={event => {
-        if (event.altKey || event.ctrlKey || event.metaKey || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-        event.preventDefault();
-        const source = event.key === "Home" ? "local" : event.key === "End" ? "purview" : route.source === "local" ? "purview" : "local";
-        commitRoute({ ...route, source, jobId: source === "local" ? undefined : route.jobId }, true);
-        (source === "local" ? localTab : purviewTab).current?.focus();
-      }}>
-        <button
-          ref={localTab}
-          id={`${sourceId}-local`}
-          type="button"
-          role="tab"
-          aria-selected={route.source === "local"}
-          aria-controls={`${sourceId}-local-panel`}
-          tabIndex={route.source === "local" ? 0 : -1}
-          className={route.source === "local" ? "active" : undefined}
-          onClick={() => commitRoute({ ...route, source: "local", jobId: undefined }, true)}
-        >
-          Local control audit
-        </button>
-        <button
-          ref={purviewTab}
-          id={`${sourceId}-purview`}
-          type="button"
-          role="tab"
-          aria-selected={route.source === "purview"}
-          aria-controls={`${sourceId}-purview-panel`}
-          tabIndex={route.source === "purview" ? 0 : -1}
-          className={route.source === "purview" ? "active" : undefined}
-          onClick={() => commitRoute({ ...route, source: "purview" }, true)}
-        >
-          Purview Audit Search
-        </button>
-      </div>
-      <div id={`${sourceId}-local-panel`} role="tabpanel" aria-labelledby={`${sourceId}-local`} hidden={route.source !== "local"}>
-        {route.source === "local" ? <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} /> : null}
-      </div>
-      <div id={`${sourceId}-purview-panel`} role="tabpanel" aria-labelledby={`${sourceId}-purview`} hidden={route.source !== "purview"}>
-        {route.source === "purview" ? <PurviewAuditView
-          initialJobId={route.jobId}
-          initialUserPrincipalName={route.userPrincipalName}
-          onSelectedJobChange={jobId => commitRoute({ ...route, source: "purview", jobId }, true)}
-        /> : null}
-      </div>
+      <header>
+        <h2>Local control audit</h2>
+        <p>Actions taken from this app, including blocking and unblocking agents. For provider records, open an individual agent or user in Agents or Users.</p>
+      </header>
+      <LocalAuditLogView agents={agents} route={route} onRouteChange={commitRoute} />
     </section>
   );
 }

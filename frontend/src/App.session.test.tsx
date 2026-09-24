@@ -528,10 +528,10 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await screen.findByText("Provider check succeeded");
+    await screen.findByText("No issues reported.");
     await revalidateTransportSession(transport);
     expect(catalogReads).toBe(2);
-    expect(screen.queryByText("Provider check succeeded")).not.toBeInTheDocument();
+    expect(screen.queryByText("No issues reported.")).not.toBeInTheDocument();
     await act(async () => pending.resolve(Response.json({ value: [] })));
   });
 
@@ -1643,7 +1643,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(transport.fetchMock.mock.calls
       .filter(([, init]) => init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method]))
       .toEqual([["/api/capabilities/check", "POST"]]));
-    await screen.findByRole("button", { name: "0 provider-verified / 0 local / 0 ready to try / 0 degraded / 0 blocked" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
     const beforeExpansion = transport.fetchMock.mock.calls.length;
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(transport.fetchMock.mock.calls.slice(beforeExpansion)
@@ -1693,7 +1693,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await within(await screen.findByRole("region", { name: "Inventory health" })).findByText("Verified");
-    expect(screen.getByRole("button", { name: "Checking permissions" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "true");
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(nonGetRequests()).toEqual([]);
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
@@ -1704,7 +1704,7 @@ describe("App session revalidation", () => {
     expect(nonGetRequests()).toEqual([]);
     await act(async () => permissionCatalog.resolve(await base("/api/capabilities")));
     await waitFor(() => expect(nonGetRequests()).toEqual([["/api/capabilities/check", "POST"]]));
-    await screen.findByRole("button", { name: "0 provider-verified / 0 local / 0 ready to try / 0 degraded / 0 blocked" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     await act(async () => verification.resolve(Response.json({ ...page, revision: "b".repeat(64) })));
     await receipt.findByText("Saved inventory verified");
@@ -1743,7 +1743,7 @@ describe("App session revalidation", () => {
     const base = transport.fetchMock.getMockImplementation()!;
     let verificationRequested = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input === "/api/capabilities") {
+      if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
         return Response.json({ value: [{ definition, decision: {
           capabilityId: definition.id, status: "available", authorized: true, fresh: true, verification: "provider",
@@ -2140,9 +2140,21 @@ describe("App session revalidation", () => {
     expect(screen.queryByText(/Bulk-reference filters require/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Users" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Audit" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Security" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Manage access for/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Block Sensitive/ })).not.toBeInTheDocument();
+  });
+
+  it("retires Security bookmarks to Agents without restoring tenant hunt filters or running a hunt", async () => {
+    window.history.replaceState({}, "", "/security?job=legacy-job&mode=application&agentIds=not-an-inventory-identity");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/agents");
+    expect(window.location.search).toBe("");
+    expect(screen.queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/hunting/"))).toBe(false);
   });
 
   it("lets Admin inherit every view while exposing supported mutation controls", async () => {
@@ -2154,7 +2166,7 @@ describe("App session revalidation", () => {
     render(<App />);
 
     expect(await screen.findByText("Sensitive cached agent")).toBeInTheDocument();
-    for (const name of ["Agents", "Users", "Audit", "Security", "Permissions", "Jobs"]) {
+    for (const name of ["Agents", "Users", "Audit", "Permissions", "Jobs"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument();
     }
     expect(screen.queryByRole("button", { name: "Official usage" })).not.toBeInTheDocument();
@@ -2605,7 +2617,7 @@ describe("App session revalidation", () => {
       finishedAt: completedAt,
     };
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input === "/api/capabilities") {
+      if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
         const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.inventory.read")!;
         return Response.json({ value: [{
           definition,
@@ -3910,13 +3922,14 @@ describe("App session revalidation", () => {
     expect(overview.getByText("Reported active · 30 days").parentElement).toHaveTextContent("Unknown");
   });
 
-  it("loads report history only on demand and keeps person-level data out of report inspection", async () => {
+  it("loads the cumulative summary on Sync but opens report history only on demand without person-level data", async () => {
     window.history.replaceState({}, "", "/official-usage?view=snapshot");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeEnabled());
-    expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/history"))).toBe(false);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/official-usage/history?limit=1&offset=0")).toBe(true));
+    expect(screen.queryByRole("heading", { name: "Report history" })).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(false);
     expect(screen.getByRole("region", { name: "Report agent rows" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
@@ -4668,7 +4681,7 @@ function appTransport({
       if (currentUserCalls === 1) return Response.json({ user: { ...viewer, roles: initialRoles }, csrfToken: "csrf-1", roleAssignmentRequired: false });
       return deferRevalidation ? revalidation : revalidatedResponse();
     }
-    if (input === "/api/capabilities") {
+    if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
       const definition = capabilityDefinitions.find(item => item.id === "powerPlatform.inventory.read")!;
       return Response.json({ value: inventoryReadAuthorized ? [{
         definition,
@@ -4720,6 +4733,8 @@ function appTransport({
           provesReportingCoverage: false,
         },
         reportingWindows: {
+          earliestStartDateUtc: null,
+          latestEndDateUtc: null,
           knownCount: 0,
           unknownCount: 0,
           overlappingKnownWindowCount: 0,
@@ -4852,7 +4867,7 @@ function initialCatalogTransport(options: Partial<Parameters<typeof appTransport
   transport.fetchMock.mockImplementation(async (input, init) => {
     if (input.startsWith("/api/official-usage/overview")) return Response.json(usageOverviewFixture());
     if (input.startsWith("/api/official-usage/aggregate")) return Response.json(null);
-    if (input === "/api/capabilities" || input === "/api/capabilities/check") {
+    if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
       const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
       return Response.json({ value: [{
         definition,
@@ -4954,7 +4969,7 @@ function accessEditorTransport() {
       });
     }
     const response = await base.fetchMock(input, init);
-    if (input === "/api/capabilities" || input === "/api/capabilities/check") {
+    if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
       const body = await response.json();
       const definition = capabilityDefinitions.find(item => item.id === "graph.package.access.manage")!;
       const blockDefinition = capabilityDefinitions.find(item => item.id === "graph.package.block.manage")!;

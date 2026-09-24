@@ -10,6 +10,8 @@ import type { PurviewAuditJob, PurviewAuditTokenMode, PurviewProviderQuery } fro
 import { capabilities } from "./capabilities.js";
 import { GraphAuditSearchClient, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
 import { operationalLog } from "./telemetry.js";
+import { agentInvestigations } from "./agentInvestigations.js";
+import type { AgentPurviewQuery, AgentPurviewRecordPage } from "../types/agentInvestigations.js";
 
 type CapabilityId = "purview.audit.search.delegated" | "purview.audit.search.application";
 type AuditDependencies = {
@@ -17,6 +19,7 @@ type AuditDependencies = {
   applicationToken: typeof acquireApplicationToken;
   revalidateUser: typeof revalidateAuthenticatedUser;
   requireAvailable: typeof capabilities.requireAvailable;
+  observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
   applicationIdentity: () => string | undefined;
   qualificationContext: typeof capabilities.auditQualificationContext;
@@ -27,6 +30,7 @@ type AuditDependencies = {
   listRecords: GraphAuditSearchClient["listRecords"];
   wait: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   random: () => number;
+  agentContext?: typeof agentInvestigations.resolve;
 };
 
 const graphAudit = new GraphAuditSearchClient();
@@ -35,6 +39,7 @@ const defaultDependencies: AuditDependencies = {
   applicationToken: acquireApplicationToken,
   revalidateUser: revalidateAuthenticatedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
+  observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
   applicationIdentity: () => config.clientId,
   qualificationContext: capabilities.auditQualificationContext.bind(capabilities),
@@ -53,6 +58,7 @@ const defaultDependencies: AuditDependencies = {
     signal?.addEventListener("abort", onAbort, { once: true });
   }),
   random: Math.random,
+  agentContext: agentInvestigations.resolve.bind(agentInvestigations),
 };
 
 type ActiveSearch = { actor: { tenantId: string; principalId: string }; tokenMode: PurviewAuditTokenMode; controller: AbortController; started: Promise<PurviewAuditJob>; operation: Promise<void> };
@@ -174,9 +180,13 @@ export class PurviewAuditService {
     return job;
   }
 
-  async list(user: AuthenticatedUser, limit = 20, offset = 0) {
+  async list(user: AuthenticatedUser, limit = 20, offset = 0, userPrincipalName?: unknown) {
     requireViewer(user);
-    return this.repository.listJobs(await this.readScope(user), limit, offset);
+    if (userPrincipalName !== undefined && (typeof userPrincipalName !== "string"
+      || !userPrincipalName.includes("@") || userPrincipalName.length > 320 || /[\s\0]/.test(userPrincipalName))) {
+      throw new AppError(400, "invalid_request", "A single valid user principal name is required for user-scoped Audit Search history.");
+    }
+    return this.repository.listJobs(await this.readScope(user), limit, offset, userPrincipalName);
   }
 
   async records(user: AuthenticatedUser, id: string, limit = 100, offset = 0) {
@@ -187,6 +197,23 @@ export class PurviewAuditService {
   async relatedInventoryRecords(user: AuthenticatedUser, target: { environmentId: string; botId: string }, limit = 20) {
     requireViewer(user);
     return this.repository.relatedInventoryRecords(await this.readScope(user), target, limit);
+  }
+
+  async agentRecords(user: AuthenticatedUser, recordId: string, query: AgentPurviewQuery): Promise<AgentPurviewRecordPage> {
+    requireViewer(user);
+    const resolve = this.dependencies.agentContext ?? agentInvestigations.resolve.bind(agentInvestigations);
+    const current = await resolve(actorScope(user), recordId);
+    if (!current.purviewTarget) throw new AppError(409, "agent_investigation_unavailable", current.context.purview.reason!);
+    const readScope = await this.readScope(user);
+    const result = await this.repository.agentRecords(readScope, current.purviewTarget, query);
+    const latest = await resolve(actorScope(user), recordId);
+    if (!latest.purviewTarget || JSON.stringify(latest.purviewTarget) !== JSON.stringify(current.purviewTarget)) {
+      throw new AppError(409, "agent_identity_changed", "The saved agent identity changed during this read. Refresh Agents.");
+    }
+    if (JSON.stringify((await this.readScope(user)).resultScopes) !== JSON.stringify(readScope.resultScopes)) {
+      throw new AppError(409, "audit_scope_changed", "Authorized saved Audit Search scopes changed during this read. Refresh the investigation.");
+    }
+    return { ...result, recordId: latest.context.recordId, mode: "saved_only" };
   }
 
   async cancel(user: AuthenticatedUser, id: string) {
@@ -239,9 +266,9 @@ export class PurviewAuditService {
     try {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal);
-      const token = await abortable(scope.tokenMode === "delegated"
+      const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(capabilityId), signal);
+        : this.dependencies.applicationToken(capabilityId), signal), { signal, clearOnSuccess: false });
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
       if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
@@ -260,22 +287,27 @@ export class PurviewAuditService {
       let pollCount = 0;
       if (action === "create") {
         try {
-          query = await this.dependencies.createQuery(token, current.displayName, current.filters, providerOptions);
+          query = await this.dependencies.observeOperation(capabilityId, freshUser,
+            () => this.dependencies.createQuery(token, current.displayName, current.filters, providerOptions), { signal, clearOnSuccess: false });
           requireBoundQuery(query, current);
           await this.repository.recordProviderQuery(scope, current.id, execution, query.id, query.status);
         } catch (error) {
           if (!(error instanceof AppError && error.code === "audit_create_inconclusive")) throw error;
-          query = await this.reconcile(token, scope, current, execution, signal);
+          query = await this.dependencies.observeOperation(capabilityId, freshUser,
+            () => this.reconcile(token, scope, current, execution, signal), { signal, clearOnSuccess: false });
           if (!query) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
           await this.repository.recordProviderQuery(scope, current.id, execution, query.id, query.status);
         }
       } else if (action === "reconcile") {
-        query = await this.reconcile(token, scope, current, execution, signal);
+        query = await this.dependencies.observeOperation(capabilityId, freshUser,
+          () => this.reconcile(token, scope, current, execution, signal), { signal, clearOnSuccess: false });
         if (!query) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
         await this.repository.recordProviderQuery(scope, current.id, execution, query.id, query.status);
       } else {
         if (!current.providerQueryId) throw new AppError(409, "audit_job_state", "Audit Search lost its provider query identity.");
-        query = await this.dependencies.getQuery(token, current.providerQueryId, providerOptions);
+        const providerQueryId = current.providerQueryId;
+        query = await this.dependencies.observeOperation(capabilityId, freshUser,
+          () => this.dependencies.getQuery(token, providerQueryId, providerOptions), { signal, clearOnSuccess: false });
         pollCount += 1;
         requireBoundQuery(query, current, current.providerQueryId);
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
@@ -287,13 +319,16 @@ export class PurviewAuditService {
         if (pollCount >= maximumPollsPerActivation) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
         if (!qualificationPollRequired) await this.dependencies.wait(1_000 + Math.floor(this.dependencies.random() * 2_000), signal);
         qualificationPollRequired = false;
-        const providerQueryId = query.id;
-        query = await this.dependencies.getQuery(token, providerQueryId, providerOptions);
+        const providerQueryId: string = query.id;
+        query = await this.dependencies.observeOperation(capabilityId, freshUser,
+          () => this.dependencies.getQuery(token, providerQueryId, providerOptions), { signal, clearOnSuccess: false });
         pollCount += 1;
         requireBoundQuery(query, current, providerQueryId);
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
-      const result = await this.dependencies.listRecords(token, query.id, actor.tenantId, providerOptions);
+      const completedQueryId = query.id;
+      const result = await this.dependencies.observeOperation(capabilityId, freshUser,
+        () => this.dependencies.listRecords(token, completedQueryId, actor.tenantId, providerOptions), { signal, clearOnSuccess: result => result.complete });
       throwIfCancelled(signal);
       if (signal.aborted) {
         result.complete = false;

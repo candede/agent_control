@@ -49,9 +49,16 @@ export function commitAccountSessionValidation<T>(validation: SessionValidation,
   const state = accountMutations.get(validation.key);
   if (!state) return Promise.reject(AppError.unauthorized("The session was revoked."));
   return enqueueAccountMutation(state, async () => {
-    if (state.revoked || state.generation !== validation.generation) throw AppError.unauthorized("The session was revoked or superseded.");
+    assertAccountSessionValidation(validation);
     return operation();
   });
+}
+
+export function assertAccountSessionValidation(validation: SessionValidation) {
+  const state = accountMutations.get(validation.key);
+  if (!state || state.revoked || state.generation !== validation.generation) {
+    throw AppError.unauthorized("The session was revoked or superseded.");
+  }
 }
 
 export async function assertCurrentStoredSession(

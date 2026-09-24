@@ -130,7 +130,7 @@ export function AgentSyncTools({
               </WorkbenchActionGate>
             </div>
           </section>
-          <p className="data-sync-run-meta">Sync collects inventory, not unlimited logs or transcripts. Investigate activity separately with <a href="/audit">Audit searches</a> or <a href="/security">Security hunts</a>.</p>
+          <p className="data-sync-run-meta">Sync collects inventory, not unlimited logs or transcripts. For agent event evidence, open <a href="/agents">Agents</a>, select an agent, and use its Activity tab.</p>
       </SyncDialog>
     </section>
   );

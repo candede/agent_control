@@ -6,7 +6,6 @@ import { requestScope } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import { agentCapabilityExport, agentCapabilityExportColumns } from "../services/agentContextExport.js";
-import { defenderHunting } from "../services/defenderHunting.js";
 import { powerPlatformInventory } from "../services/powerPlatformInventory.js";
 import { purviewAudit } from "../services/purviewAudit.js";
 import { powerPlatformResourceTypes, type PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
@@ -59,7 +58,6 @@ policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
   const exact = await inventoryRepository.getResource(requestScope(request), snapshotId, "microsoft.copilotstudio/agents", environmentId, exactNativeId(request.params.nativeId));
   const identifierValues = (kind: string) => exact.resource.identifiers.filter(identifier => identifier.kind === kind).map(identifier => identifier.value);
   const botIds = identifierValues("cds_bot_id");
-  const entraAgentIds = identifierValues("entra_agent_id");
   const hasSecurityRole = hasAppRole(request.session.user!.roles, "AgentControl.Viewer");
   const audit: InventorySourceAwareDetail["audit"] = !hasSecurityRole
     ? { status: "unauthorized", reason: "Viewer is required; no audit lookup or count was performed." }
@@ -68,9 +66,7 @@ policyRoute(inventoryRouter, "get", "/inventory/resources/:nativeId/related", {
       : await sourceResult(() => purviewAudit.relatedInventoryRecords(request.session.user!, { environmentId: exact.resource.environmentId!, botId: botIds[0] }));
   const security: InventorySourceAwareDetail["security"] = !hasSecurityRole
     ? { status: "unauthorized", reason: "Viewer is required; no Defender lookup or count was performed." }
-    : entraAgentIds.length !== 1
-      ? { status: "unmatched", reason: "No single exact Entra agent ID association is available." }
-      : await sourceResult(() => defenderHunting.relatedInventoryRows(request.session.user!, entraAgentIds[0]));
+    : { status: "unmatched", reason: "Saved Entra agent metadata does not establish the enterprise-application object ID required for a Defender inventory association." };
   const body: InventorySourceAwareDetail = {
     source: "power_platform", nativeId: exact.resource.nativeId, resourceType: exact.resource.type,
     environmentId: exact.resource.environmentId, snapshotId: exact.snapshot.id, observedAt: exact.snapshot.observedAt,

@@ -233,7 +233,7 @@ function recordPage(job = partialJob, actor = "Selected record actor"): PurviewA
 describe("PurviewAuditView", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    window.history.replaceState({}, "", "/audit?source=purview");
+    window.history.replaceState({}, "", "/users");
     vi.mocked(getPurviewAuditCatalog).mockResolvedValue(catalog);
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
     vi.mocked(getPurviewAuditRecords).mockResolvedValue({
@@ -297,7 +297,9 @@ describe("PurviewAuditView", () => {
     }
   });
 
-  it("prefills an employee interaction log without starting an investigation", async () => {
+  it("locks searches and paginated history to the selected user without starting an investigation", async () => {
+    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [], count: 0, offset: 0, limit: 20 });
+    vi.mocked(submitPurviewAuditSearch).mockImplementation(async (_mode, filters) => ({ ...partialJob, filters }));
     render(
       <CapabilityContext value={context(viewer, true)}>
         <PurviewAuditView initialUserPrincipalName="employee@example.invalid" />
@@ -306,9 +308,26 @@ describe("PurviewAuditView", () => {
     const identity = await screen.findByRole("textbox", { name: "User principal names" });
     expect(identity).toBeVisible();
     expect(identity).toHaveValue("employee@example.invalid");
+    expect(identity).toHaveAttribute("readonly");
+    expect(getPurviewAuditJobs).toHaveBeenCalledWith(20, 0, expect.objectContaining({ userPrincipalName: "employee@example.invalid" }));
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled();
     expect(submitPurviewAuditSearch).not.toHaveBeenCalled();
     expect(startPurviewAuditQualification).not.toHaveBeenCalled();
+    await userEvent.type(identity, "other@example.invalid");
+    expect(identity).toHaveValue("employee@example.invalid");
+    await userEvent.click(screen.getByRole("button", { name: "Run Audit Search" }));
+    expect(submitPurviewAuditSearch).toHaveBeenCalledWith("delegated",
+      expect.objectContaining({ userPrincipalNames: ["employee@example.invalid"] }), expect.anything());
+  });
+
+  it("rejects unrelated saved jobs in a user-scoped history rather than displaying or exporting them", async () => {
+    vi.mocked(getPurviewAuditJobs).mockResolvedValue({ value: [partialJob], count: 1, offset: 0, limit: 20 });
+    render(<CapabilityContext value={context(viewer, true)}>
+      <PurviewAuditView initialUserPrincipalName="employee@example.invalid" />
+    </CapabilityContext>);
+    expect(await screen.findByRole("alert")).toHaveTextContent("did not match the selected user");
+    expect(screen.queryByRole("button", { name: /View results/ })).not.toBeInTheDocument();
+    expect(downloadPurviewAuditCsv).not.toHaveBeenCalled();
   });
 
   it("keeps explicit Admin application qualification approval and start", async () => {

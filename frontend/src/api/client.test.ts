@@ -4,7 +4,6 @@ import { createUnifiedVerification } from "../test/inventoryVerification";
 
 import {
   ApiError,
-  beginCapabilityConsent,
   blockAgent,
   cancelDataSyncRun,
   cancelInventoryRefresh,
@@ -12,10 +11,14 @@ import {
   cancelPurviewAuditSearch,
   cancelDefenderHunt,
   checkCapabilities,
+  getCapabilityCheckProgress,
   getBulkActionJob,
   getDefenderHuntingJob,
   getAgents,
   getAgentDetails,
+  getAgentInvestigationContext,
+  resolveAgentInvestigationIdentity,
+  getAgentPurviewRecords,
   getCurrentUser,
   getUnifiedAgents,
   getAgentUsageCandidates,
@@ -99,28 +102,30 @@ afterEach(() => {
 });
 
 describe("access API client", () => {
-  it("starts consent with CSRF, the requested return path, and cancellation", async () => {
-    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "consent-csrf", roleAssignmentRequired: false });
-    await getCurrentUser();
-    const result = { authorizationUrl: "https://login.microsoftonline.com/fixture/authorize" };
-    fetchMock.mockResolvedValue(Response.json(result));
+  it.each([false, true])("reads live permission progress without starting checks (retry=%s)", async retryFailed => {
+    const progress = { checks: [{ capabilityId: "graph.directory.read", state: "checking" }] };
+    const fetchMock = mockJsonResponse({ progress });
     const controller = new AbortController();
-    await expect(beginCapabilityConsent("graph.package.read.delegated", "/permissions", { signal: controller.signal })).resolves.toEqual(result);
-    expect(fetchMock).toHaveBeenLastCalledWith("/api/auth/consent", expect.objectContaining({
-      method: "POST",
-      body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/permissions" }),
-      signal: controller.signal,
-      credentials: "include",
-      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "consent-csrf" }),
-    }));
+    await expect(getCapabilityCheckProgress({ retryFailed, signal: controller.signal })).resolves.toEqual({ progress });
+    expect(fetchMock).toHaveBeenCalledWith(`/api/capabilities/check-progress${retryFailed ? "?retry=failed" : ""}`,
+      expect.objectContaining({ signal: controller.signal }));
+    expect(fetchMock.mock.calls[0][1]?.method).toBeUndefined();
   });
 
-  it("preserves the default consent return path when cancellation is omitted", async () => {
-    const fetchMock = mockJsonResponse({ authorizationUrl: "https://login.microsoftonline.com/fixture/authorize" });
-    await beginCapabilityConsent("graph.package.read.delegated");
-    expect(fetchMock).toHaveBeenCalledWith("/api/auth/consent", expect.objectContaining({
-      method: "POST", body: JSON.stringify({ capabilityId: "graph.package.read.delegated", returnTo: "/" }),
-    }));
+  it("accepts an idle progress response", async () => {
+    mockJsonResponse({ progress: null });
+    await expect(getCapabilityCheckProgress()).resolves.toEqual({ progress: null });
+  });
+
+  it.each([
+    {}, { progress: "invalid" }, { progress: { checks: [{ capabilityId: "graph.directory.read", state: "available" }] } },
+    { progress: { checks: [{ capabilityId: "graph.directory.read", state: ["checking"] }] } },
+    { progress: { checks: [{ capabilityId: "graph.licenses.read", state: "checking" }] } },
+    { progress: { checks: [{ capabilityId: "defender.hunting.application", state: "checking" }] } },
+    { progress: { checks: Array.from({ length: 2 }, () => ({ capabilityId: "graph.directory.read", state: "checking" })) } },
+  ])("rejects malformed or ineligible progress rather than inventing activity: %j", result => {
+    mockJsonResponse(result);
+    return expect(getCapabilityCheckProgress()).rejects.toMatchObject({ code: "invalid_response" });
   });
 
   it.each([false, true])("persists record-scoped people with CSRF, cancellation and force=%s", async force => {
@@ -680,6 +685,14 @@ describe("access API client", () => {
     }
   });
 
+  it("encodes exact user scope and paging for Purview history without losing cancellation", async () => {
+    const fetchMock = mockJsonResponse({});
+    const controller = new AbortController();
+    await getPurviewAuditJobs(20, 40, { signal: controller.signal, userPrincipalName: "employee+test@example.invalid" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/audit-search/jobs?limit=20&offset=40&userPrincipalName=employee%2Btest%40example.invalid",
+      expect.objectContaining({ signal: controller.signal }));
+  });
+
   it("passes cancellation through all saved audit and hunting reads", async () => {
     const fetchMock = mockJsonResponse({});
     const controller = new AbortController();
@@ -770,8 +783,9 @@ describe("investigation request cancellation", () => {
   const confirmationBody = JSON.stringify({ confirmation: id });
   const requests: Array<{
     name: string; path: string; method?: "POST" | "DELETE"; body?: string;
-    send: (options?: { signal?: AbortSignal }) => Promise<unknown>;
+    send: (options?: { signal?: AbortSignal; agentRecordId?: string }) => Promise<unknown>;
   }> = [
+    { name: "Agent identity resolution", path: "/api/agent-inventory/investigations/resolve", method: "POST", body: JSON.stringify({ recordId: "power_platform:env/one:agent%one" }), send: options => resolveAgentInvestigationIdentity("power_platform:env/one:agent%one", options) },
     { name: "Purview submit", path: "/api/audit-search/jobs", method: "POST", body: auditBody, send: options => submitPurviewAuditSearch("delegated", auditFilters, options) },
     { name: "Purview resume", path: "/api/audit-search/jobs/job%2Fone/resume", method: "POST", send: options => resumePurviewAuditSearch(id, options) },
     { name: "Purview cancel", path: "/api/audit-search/jobs/job%2Fone/cancel", method: "POST", send: options => cancelPurviewAuditSearch(id, options) },
@@ -789,6 +803,18 @@ describe("investigation request cancellation", () => {
     { name: "Defender CSV", path: "/api/hunting/jobs/job%2Fone/export.csv", send: options => downloadDefenderHuntingCsv(id, options) },
   ];
 
+  it("protects explicit identity resolution with CSRF and sends only the saved agent reference", async () => {
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "identity-csrf", roleAssignmentRequired: false });
+    await getCurrentUser();
+    fetchMock.mockResolvedValue(Response.json({}));
+    await resolveAgentInvestigationIdentity("power_platform:env/one:agent%one");
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/investigations/resolve", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ recordId: "power_platform:env/one:agent%one" }),
+      headers: expect.objectContaining({ "X-CSRF-Token": "identity-csrf", "Content-Type": "application/json" }),
+      credentials: "include",
+    }));
+  });
+
   describe.each(requests)("$name", ({ path, method, body, send }) => {
     it.each([false, true])("preserves exact request intent with cancellation supplied: %s", async cancellable => {
       const fetchMock = mockJsonResponse({});
@@ -801,6 +827,48 @@ describe("investigation request cancellation", () => {
       expect(init.signal).toBe(cancellable ? controller.signal : undefined);
       expect(init.method ?? "GET").toBe(method ?? "GET");
       expect(init.body).toBe(body);
+    });
+
+    it.each(requests.filter(item => item.name.startsWith("Defender")))("binds $name to the exact selected agent on every lifecycle request", async ({ path, send }) => {
+      const fetchMock = mockJsonResponse({});
+      const agentRecordId = "power_platform:env/id:opaque%agent";
+      await send({ agentRecordId });
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(`${path}?${new URLSearchParams({ agentRecordId })}`,
+        expect.objectContaining({ credentials: "include" }));
+    });
+
+    it("sends only investigation choices, never client-supplied identities, for an agent-scoped hunt or approval", async () => {
+      const fetchMock = mockJsonResponse({});
+      const choices = { ...huntingFilters, agentIds: ["untrusted-agent"], entraAgentIds: ["untrusted-object"],
+        entraAgentApplicationIds: ["untrusted-application"], blueprintIds: ["untrusted-blueprint"], actorObjectIds: ["untrusted-actor"] };
+      await submitDefenderHunt("delegated", choices, { agentRecordId: "graph_packages:agent" });
+      await approveDefenderHuntingQualification("application", choices, { agentRecordId: "graph_packages:agent" });
+      for (const [, init] of fetchMock.mock.calls) {
+        expect(JSON.parse(init.body as string).filters).toEqual({
+          templateId: choices.templateId, startDateTime: choices.startDateTime, endDateTime: choices.endDateTime, operations: choices.operations,
+        });
+      }
+    });
+
+    it("binds saved context, history, details, rows and Purview paging to their agent", async () => {
+      const fetchMock = mockJsonResponse({});
+      const recordId = "power_platform:env/id:opaque%agent";
+      const options = { agentRecordId: recordId };
+      const agentQuery = new URLSearchParams({ agentRecordId: recordId }).toString();
+      await getDefenderHuntingCatalog(options);
+      await getDefenderHuntingJobs(20, 40, options);
+      await getDefenderHuntingJob("job/one", options);
+      await getDefenderHuntingRows("job/one", 100, 100, options);
+      await getAgentInvestigationContext(recordId);
+      await getAgentPurviewRecords(recordId, { limit: 50, offset: 50, search: "actor+correlation", operation: "InvokeAgent" });
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        `/api/hunting/catalog?${agentQuery}`,
+        `/api/hunting/jobs?limit=20&offset=40&${agentQuery}`,
+        `/api/hunting/jobs/job%2Fone?${agentQuery}`,
+        `/api/hunting/jobs/job%2Fone/rows?limit=100&offset=100&${agentQuery}`,
+        `/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`,
+        `/api/agent-inventory/investigations/purview?${new URLSearchParams({ recordId, limit: "50", offset: "50", search: "actor+correlation", operation: "InvokeAgent" })}`,
+      ]);
     });
 
     it("rejects an aborted response even when the transport completes late", async () => {

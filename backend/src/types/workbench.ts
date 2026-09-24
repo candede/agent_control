@@ -6,7 +6,6 @@ export const workbenchViewIds = [
   "users",
   "sync",
   "audit",
-  "security",
   "permissions",
   "jobs",
 ] as const;

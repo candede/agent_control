@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { CapabilityId } from "../types/capability.js";
+import { capabilityIds, type CapabilityId } from "../types/capability.js";
 import type { CapabilityConfiguration, CapabilityEvidence, EvidenceKey } from "../db/capabilities.js";
 import { AppError } from "../errors.js";
 import { CapabilityService } from "./capabilities.js";
 import { GraphPackagesClient } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
+import { capabilityDefinitions } from "./capabilityRegistry.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 
 vi.hoisted(() => { process.env.CLIENT_ID = "22222222-2222-2222-2222-222222222222"; });
 
@@ -50,8 +52,380 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe("live automatic check progress", () => {
+  it("is read-only and empty when no check is running", () => {
+    const { value, repository, probes } = service();
+    expect(value.checkProgress(reader)).toBeNull();
+    expect(repository.evidence).not.toHaveBeenCalled();
+    for (const probe of Object.values(probes)) expect(probe).not.toHaveBeenCalled();
+    expect(() => value.checkProgress({ ...reader, roles: [] })).toThrow(/Viewer/);
+  });
+
+  it("reports real active checks, completed reviews and only the matching account, role and retry scope", async () => {
+    const held = deferred<unknown>();
+    const packageProbe = vi.fn(() => held.promise);
+    const { value, probes } = service(new MemoryRepository(), { packageProbe });
+    const pending = value.check(reader, { retryFailed: true });
+    await vi.waitFor(() => expect(value.checkProgress(reader, true)?.checks.filter(check => check.state !== "complete"))
+      .toEqual([{ capabilityId: "graph.package.read.delegated", state: "checking" }]));
+    const snapshot = value.checkProgress(reader, true)!;
+    expect(snapshot.checks.some(check => check.capabilityId === "graph.licenses.read")).toBe(false);
+    expect(snapshot.checks.some(check => check.capabilityId === "reports.copilotUsage.read")).toBe(false);
+    expect(snapshot.checks.some(check => check.capabilityId.endsWith(".application"))).toBe(false);
+    expect(value.checkProgress({ ...reader, homeAccountId: "another" }, true)).toBeNull();
+    expect(value.checkProgress({ ...reader, tenantId: "another" }, true)).toBeNull();
+    expect(value.checkProgress({ ...reader, roles: ["AgentControl.Admin"] }, true)).toBeNull();
+    expect(value.checkProgress(reader, false)).toBeNull();
+    snapshot.checks[0].state = "complete";
+    expect(value.checkProgress(reader, true)?.checks[0].state).toBe("checking");
+    const coalesced = value.check(reader, { retryFailed: true });
+    held.resolve([]);
+    await Promise.all([pending, coalesced]);
+    expect(packageProbe).toHaveBeenCalledOnce();
+    expect(probes.applicationToken).not.toHaveBeenCalled();
+    expect(value.checkProgress(reader, true)).toBeNull();
+  });
+
+  it("counts reused evidence as reviewed without calling its provider again", async () => {
+    const held = deferred<unknown>();
+    const { value, probes } = service(new MemoryRepository(), { packageProbe: vi.fn(() => held.promise) });
+    await value.refresh("graph.directory.read", reader);
+    const pending = value.check(reader);
+    await vi.waitFor(() => expect(value.checkProgress(reader)?.checks.find(check => check.capabilityId === "graph.directory.read")?.state).toBe("complete"));
+    expect(probes.directoryProbe).toHaveBeenCalledOnce();
+    held.resolve([]);
+    await pending;
+  });
+
+  it.each(["cancel", "invalidate"] as const)("discards live progress on %s", async action => {
+    const held = deferred<unknown>();
+    const controller = new AbortController();
+    const { value, probes } = service(new MemoryRepository(), { packageProbe: vi.fn(() => held.promise) });
+    const pending = value.check(reader, { signal: controller.signal });
+    const failure = expect(pending).rejects.toBeInstanceOf(AppError);
+    await vi.waitFor(() => expect(probes.packageProbe).toHaveBeenCalledOnce());
+    if (action === "cancel") controller.abort(new AppError(499, "request_cancelled", "Cancelled"));
+    else {
+      await value.invalidatePrincipal(reader);
+      expect(value.checkProgress(reader)).toBeNull();
+      held.resolve([]);
+    }
+    await failure;
+    expect(value.checkProgress(reader)).toBeNull();
+  });
+});
+
+describe("recent actual operation failures", () => {
+  const id = "graph.licenses.read";
+  const denied = () => new AppError(403, "missing_permission", "private provider text", {
+    httpStatus: 403, providerErrorCode: "Authorization_RequestDenied", accessToken: "private-token", body: "private-body",
+  });
+  const failure = async (value: CapabilityService, user = reader) =>
+    (await value.list(user)).find(view => view.definition.id === id)?.operationFailure;
+
+  it("keeps untouched on-demand capabilities issue-free without provider calls", async () => {
+    const { value, probes, repository } = service();
+    expect(await failure(value)).toBeUndefined();
+    expect(await value.decision(id, reader)).toMatchObject({ authorized: true, verification: "on_demand" });
+    for (const probe of Object.values(probes)) expect(probe).not.toHaveBeenCalled();
+    expect(repository.recordEvidence).not.toHaveBeenCalled();
+  });
+
+  it("persists a separate failure across service instances and clears it only after an actual success", async () => {
+    const { value, repository } = service();
+    const original = denied();
+    await expect(value.observeOperation(id, reader, async () => { throw original; })).rejects.toBe(original);
+    const observed = await failure(value);
+    expect(observed).toMatchObject({ status: "missing_permission", evidence: { httpStatus: 403 } });
+    expect(Date.parse(observed!.expiresAt) - Date.parse(observed!.checkedAt)).toBe(86_400_000);
+    expect(observed!.remediation.join(" ")).toContain("Grant admin consent");
+    expect(JSON.stringify([...repository.evidenceRows.values()])).not.toContain("private");
+    expect(await value.decision(id, reader)).toMatchObject({ authorized: true, verification: "on_demand" });
+    const restarted = service(repository).value;
+    expect(await failure(restarted)).toEqual(observed);
+    await restarted.refresh(id, reader);
+    await restarted.observeOperation(id, reader, async () => "token only", { clearOnSuccess: false });
+    expect(await failure(restarted)).toEqual(observed);
+    await expect(restarted.observeOperation(id, reader, async () => ["actual result"])).resolves.toEqual(["actual result"]);
+    expect(await failure(restarted)).toBeUndefined();
+    expect(repository.evidenceRows.size).toBe(2);
+  });
+
+  it.each([
+    [new AppError(403, "missing_role", "private"), "missing_role"],
+    [new AppError(403, "missing_license", "private"), "missing_license"],
+    [new AppError(403, "missing_provider_scope", "private"), "missing_permission"],
+    [new AppError(403, "missing_provider_role", "private"), "missing_role"],
+    [new AppError(401, "interaction_required", "private"), "unknown"],
+    [new AppError(401, "authorization_expired", "private"), "unknown"],
+    [new AppError(403, "conditional_access_required", "private"), "unknown"],
+    [new AppError(403, "provider_authorization_error", "private"), "provider_error"],
+    [new AppError(403, "agent_identity_permission_required", "private"), "provider_error"],
+    [new AppError(403, "provider_denied", "private"), "provider_error"],
+    [new AppError(502, "graph_error", "private", { httpStatus: 403 }), "provider_error"],
+  ] as const)("reports only explicit provider/authentication evidence from %s", async (error, status) => {
+    const { value } = service();
+    const operation = vi.fn(async () => { throw error; });
+    await expect(value.observeOperation(id, reader, operation)).rejects.toBe(error);
+    expect(operation).toHaveBeenCalledOnce();
+    expect(await failure(value)).toMatchObject({ status });
+    expect(await value.decision(id, reader)).toMatchObject({ authorized: true, verification: "on_demand" });
+    if (status === "unknown") expect((await failure(value))!.remediation.join(" ")).toContain("Sign in again");
+  });
+
+  it.each([
+    new TypeError("network failed"), new DOMException("deadline", "TimeoutError"),
+    new AppError(503, "provider_error", "private", { httpStatus: 503 }),
+    new AppError(429, "provider_throttled", "private", { httpStatus: 429 }),
+    new AppError(401, "unauthorized", "local account mismatch"),
+    new AppError(401, "interaction_required", "cached readiness failure", { capabilityId: id, authorized: false }),
+    new AppError(403, "missing_internal_role", "local role"), new AppError(403, "scope_mismatch", "local scope"),
+    new AppError(400, "unsupported", "unsupported mapping"),
+  ])("does not invent a permission issue or overwrite existing evidence for %s", async error => {
+    const { value, repository } = service();
+    await expect(value.observeOperation(id, reader, async () => { throw error; })).rejects.toBe(error);
+    expect(await failure(value)).toBeUndefined();
+    await expect(value.observeOperation(id, reader, async () => { throw denied(); })).rejects.toMatchObject({ code: "missing_permission" });
+    const previous = await failure(value);
+    await expect(value.observeOperation(id, reader, async () => { throw error; })).rejects.toBe(error);
+    expect(await failure(value)).toEqual(previous);
+    expect(repository.recordEvidence).toHaveBeenCalledOnce();
+  });
+
+  it.each(["tenant", "principal", "role", "configuration", "contract", "expired", "invalid-expiry"] as const)(
+    "does not disclose a failure outside its current %s scope", async change => {
+      const { value, repository } = service();
+      await expect(value.observeOperation(id, reader, async () => { throw denied(); })).rejects.toThrow();
+      const user = { ...reader };
+      if (change === "tenant") user.tenantId = "another-tenant";
+      if (change === "principal") user.homeAccountId = "another-reader";
+      if (change === "role") user.roles = [];
+      if (change === "configuration") repository.configurations.set(id, { enabled: false, sharedDataScope: false, previewQualified: false, revision: 2 });
+      const [key, row] = [...repository.evidenceRows][0];
+      if (change === "contract") {
+        repository.evidenceRows.delete(key);
+        repository.evidenceRows.set(JSON.stringify({ ...JSON.parse(key), contractRevision: "old-contract" }), row);
+      }
+      if (change === "expired") row.expiresAt = new Date(0).toISOString();
+      if (change === "invalid-expiry") row.expiresAt = "invalid";
+      expect(await failure(value, user)).toBeUndefined();
+    },
+  );
+
+  it("keeps application failures private to the initiating principal and current shared-scope configuration", async () => {
+    const { value, repository } = service();
+    const applicationId = "graph.package.read.application";
+    repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 1 });
+    await expect(value.observeOperation(applicationId, reader, async () => { throw denied(); })).rejects.toThrow();
+    expect((await value.list(reader)).find(view => view.definition.id === applicationId)?.operationFailure?.status).toBe("missing_permission");
+    expect((await value.list({ ...reader, homeAccountId: "another-initiator" })).find(view => view.definition.id === applicationId)?.operationFailure).toBeUndefined();
+    expect(repository.recordEvidence.mock.calls[0][0]).toMatchObject({
+      principalId: "22222222-2222-2222-2222-222222222222", authorizationPrincipalId: reader.homeAccountId,
+    });
+    await expect(value.observeOperation(applicationId, reader, async () => {
+      throw new AppError(401, "authorization_expired", "Application authorization expired");
+    })).rejects.toThrow();
+    const authenticationFailure = (await value.list(reader)).find(view => view.definition.id === applicationId)!.operationFailure!;
+    expect(authenticationFailure.remediation.join(" ")).toContain("administrator");
+    expect(authenticationFailure.remediation.join(" ")).not.toContain("Sign in again");
+    repository.configurations.set(applicationId, { enabled: true, sharedDataScope: false, previewQualified: false, revision: 2 });
+    expect((await value.list(reader)).find(view => view.definition.id === applicationId)?.operationFailure).toBeUndefined();
+  });
+
+  it.each(["invalidation", "session-revocation", "cancellation"] as const)("rejects stale operation publication after %s", async change => {
+    const { value, repository } = service();
+    const user = { ...reader, homeAccountId: `operation-${change}` };
+    const held = deferred<number>();
+    const controller = new AbortController();
+    const pending = value.observeOperation(id, user, () => held.promise, { signal: controller.signal });
+    await vi.waitFor(() => expect(repository.configuration).toHaveBeenCalled());
+    if (change === "invalidation") await value.invalidatePrincipal(user);
+    if (change === "session-revocation") await revokeAccountSessionMutations(user.tenantId, user.homeAccountId, async () => undefined);
+    if (change === "cancellation") controller.abort();
+    held.resolve(7);
+    await expect(pending).resolves.toBe(7);
+    expect(repository.recordEvidence).not.toHaveBeenCalled();
+    if (change === "session-revocation") await activateAccountSession(user.tenantId, user.homeAccountId, async () => undefined);
+  });
+
+  it("never retries business writes and never turns reporting-storage errors into a failed write", async () => {
+    const { value, repository } = service();
+    repository.recordEvidence.mockRejectedValue(new Error("storage unavailable"));
+    const write = vi.fn(async () => "written");
+    await expect(value.observeOperation("graph.package.block.manage", reader, write)).resolves.toBe("written");
+    expect(write).toHaveBeenCalledOnce();
+    const original = denied();
+    const deniedWrite = vi.fn(async () => { throw original; });
+    await expect(value.observeOperation("graph.package.block.manage", reader, deniedWrite)).rejects.toBe(original);
+    expect(deniedWrite).toHaveBeenCalledOnce();
+  });
+
+  it("excludes local progress failures and does not clear a write failure after a no-op read", async () => {
+    const { value, repository } = service();
+    await expect(value.observeOperation(id, reader, async () => { throw denied(); }, { shouldRecordError: () => false })).rejects.toThrow();
+    expect(repository.recordEvidence).not.toHaveBeenCalled();
+    await expect(value.observeOperation(id, reader, async () => { throw denied(); })).rejects.toThrow();
+    await value.observeOperation(id, reader, async () => "already in requested state", { clearOnSuccess: () => false });
+    expect(await failure(value)).toMatchObject({ status: "missing_permission" });
+  });
+
+  it("retains real errors that a partial-result operation handles internally without retrying the operation", async () => {
+    const { value, repository } = service();
+    const operation = vi.fn(async (reportFailure: (error: unknown) => void) => {
+      reportFailure(denied());
+      reportFailure(new TypeError("a later unrelated network failure"));
+      return { failed: 2 };
+    });
+    await expect(value.observeOperation(id, reader, operation)).resolves.toEqual({ failed: 2 });
+    expect(operation).toHaveBeenCalledOnce();
+    expect(repository.recordEvidence).toHaveBeenCalledOnce();
+    expect(await failure(value)).toMatchObject({ status: "missing_permission" });
+    await value.observeOperation(id, reader, async () => ({ complete: false }), { clearOnSuccess: result => result.complete });
+    expect(await failure(value)).toMatchObject({ status: "missing_permission" });
+  });
+});
+
+describe("bounded safe-readiness retries", () => {
+  it("limits the real catalog adapter to two total GET attempts rather than multiplying nested retries", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ error: { code: "InternalServerError" } }, { status: 503 }));
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      const repository = new MemoryRepository();
+      const value = new CapabilityService(repository as never, { delegatedToken: async () => "fixture-token" });
+      await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({ status: "provider_error" });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      expect(fetcher.mock.calls.every(([, options]) => (options?.method ?? "GET") === "GET")).toBe(true);
+      expect(repository.recordEvidence).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each([new TypeError("network"), new DOMException("request timeout", "TimeoutError"),
+    new AppError(503, "provider_error", "unavailable", { httpStatus: 503 })])("retries %s once before publishing", async error => {
+    const packageProbe = vi.fn().mockRejectedValueOnce(error).mockResolvedValue([]);
+    const { value, repository } = service(new MemoryRepository(), { packageProbe });
+    await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({ status: "available" });
+    expect(packageProbe).toHaveBeenCalledTimes(2);
+    expect(repository.recordEvidence).toHaveBeenCalledOnce();
+    expect([...repository.evidenceRows.values()][0].status).toBe("available");
+  });
+
+  it("retries only explicitly transient token failures", async () => {
+    const delegatedToken = vi.fn().mockRejectedValueOnce(new AppError(502, "identity_provider_error", "temporary", { retryable: true })).mockResolvedValue("token");
+    const { value, probes } = service(new MemoryRepository(), { delegatedToken });
+    await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({ status: "available" });
+    expect(delegatedToken).toHaveBeenCalledTimes(2);
+    expect(probes.packageProbe).toHaveBeenCalledOnce();
+  });
+
+  it.each([new AppError(403, "missing_permission", "denied"), new AppError(403, "missing_role", "denied"),
+    new AppError(403, "missing_license", "denied"), new AppError(502, "provider_schema", "unsupported"),
+    new AppError(502, "identity_provider_error", "not proven transient")])("never retries %s", async error => {
+    const delegatedToken = vi.fn().mockRejectedValue(error);
+    const { value, probes } = service(new MemoryRepository(), { delegatedToken });
+    await value.refresh("graph.package.read.delegated", reader);
+    expect(delegatedToken).toHaveBeenCalledOnce();
+    expect(probes.packageProbe).not.toHaveBeenCalled();
+  });
+
+  it("honors short Retry-After and preserves a long throttle cooldown without another request", async () => {
+    const shortProbe = vi.fn().mockRejectedValueOnce(new AppError(429, "provider_throttled", "wait", { retryAfterMs: 100 })).mockResolvedValue([]);
+    const short = service(new MemoryRepository(), { packageProbe: shortProbe });
+    const started = performance.now();
+    await expect(short.value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({ status: "available" });
+    expect(performance.now() - started).toBeGreaterThanOrEqual(95);
+    expect(shortProbe).toHaveBeenCalledTimes(2);
+    const packageProbe = vi.fn().mockRejectedValue(new AppError(429, "provider_throttled", "wait", { retryAfterMs: 600_000 }));
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    const result = await value.refresh("graph.package.read.delegated", reader);
+    expect(Date.parse(result.expiresAt!) - Date.parse(result.checkedAt!)).toBeGreaterThanOrEqual(600_000);
+    await value.refresh("graph.package.read.delegated", reader);
+    await value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true }).catch(error => {
+      expect(error).toMatchObject({ code: "provider_throttled" });
+    });
+    expect(packageProbe).toHaveBeenCalledOnce();
+  });
+
+  it("honors a Retry-After on temporary server failures without relabeling them as missing permissions", async () => {
+    const packageProbe = vi.fn().mockRejectedValue(new AppError(503, "provider_error", "maintenance", { httpStatus: 503, retryAfterMs: 600_000 }));
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    await expect(value.refresh("graph.package.read.delegated", reader)).resolves.toMatchObject({
+      status: "provider_error", evidence: { category: "provider_error", httpStatus: 503 },
+    });
+    await value.refresh("graph.package.read.delegated", reader);
+    await expect(value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true })).rejects.toMatchObject({ code: "provider_error" });
+    expect(packageProbe).toHaveBeenCalledOnce();
+  });
+
+  it.each(["cancellation", "session-revocation"] as const)("does not retry or publish after %s during backoff", async change => {
+    const user = { ...reader, homeAccountId: `readiness-${change}` };
+    const controller = new AbortController();
+    const packageProbe = vi.fn(async () => { throw new TypeError("network"); });
+    const { value, repository } = service(new MemoryRepository(), { packageProbe });
+    const result = expect(value.refresh("graph.package.read.delegated", user, controller.signal)).rejects.toBeInstanceOf(AppError);
+    await vi.waitFor(() => expect(packageProbe).toHaveBeenCalledOnce());
+    if (change === "cancellation") controller.abort(new AppError(499, "request_cancelled", "cancelled"));
+    else await revokeAccountSessionMutations(user.tenantId, user.homeAccountId, async () => undefined);
+    await result;
+    expect(packageProbe).toHaveBeenCalledOnce();
+    expect(repository.recordEvidence).not.toHaveBeenCalled();
+    if (change === "session-revocation") await activateAccountSession(user.tenantId, user.homeAccountId, async () => undefined);
+  });
+});
+
 describe("capability decisions", () => {
-  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+  it.each(capabilityDefinitions.filter(definition => definition.mode !== "local" && definition.probe.adapterRegistered))(
+    "directs missing $id grants to external administrator prerequisites", async definition => {
+      const denied = async () => { throw new AppError(403, "missing_permission", "Synthetic missing grant"); };
+      const { value, repository } = service(new MemoryRepository(), { delegatedToken: denied, applicationToken: denied });
+      const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
+      if (definition.mode === "application") {
+        repository.configurations.set(definition.id, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 1 });
+      }
+      const decision = definition.id === "purview.audit.search.application"
+        ? await value.recordAuditQualificationEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
+        : definition.id === "defender.hunting.application"
+          ? await value.recordHuntingQualificationEvidence(definition.id, admin, "missing_permission", { category: "missing_permission" }, 1)
+          : await value.refresh(definition.id, admin);
+      expect(decision.status).toBe("missing_permission");
+      const message = decision.remediation.join(" ");
+      expect(message).toContain("API permissions");
+      expect(message).toContain("existing Entra app registration");
+      expect(message).toContain("Grant admin consent");
+      expect(message).toContain(`Required ${definition.mode} permissions: ${definition.permissions.join(", ")}`);
+      expect(message).not.toContain("using the signed-in account");
+    },
+  );
+
+  it("keeps MFA and Conditional Access recovery separate from missing API grants", async () => {
+    const { value } = service(new MemoryRepository(), {
+      delegatedToken: async () => { throw new AppError(401, "interaction_required", "Synthetic MFA required"); },
+    });
+    const decision = await value.refresh("graph.agentIdentity.read", reader);
+    expect(decision.remediation.join(" ")).toContain("Sign in again");
+    expect(decision.remediation.join(" ")).toContain("MFA");
+    expect(decision.remediation.join(" ")).toContain("Conditional Access");
+    expect(decision.remediation.join(" ")).not.toContain("Grant admin consent");
+  });
+
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)(
+    "lists the complete registry for %s without implicitly resolving agent identities", async role => {
+      const { value, probes, repository } = service();
+      const user: AuthenticatedUser = { ...reader, roles: [role] };
+      const views = await value.list(user);
+      expect(views.map(view => view.definition.id)).toEqual(capabilityIds);
+      expect(views.find(view => view.definition.id === "graph.agentIdentity.read")).toMatchObject({
+        definition: { consentGroup: "graph.agentIdentity.read", permissions: ["AgentIdentity.Read.All"] },
+        decision: { status: "available", authorized: true, verification: "on_demand" },
+      });
+      for (const probe of Object.values(probes)) expect(probe).not.toHaveBeenCalled();
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+
+      expect((await value.check(user)).map(view => view.definition.id)).toEqual(capabilityIds);
+      expect(probes.delegatedToken).not.toHaveBeenCalledWith(user.homeAccountId, "graph.agentIdentity.read");
+    },
+  );
+
+  it.each(["graph.agentIdentity.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)(
     "describes an on-demand %s read without target confirmation", async id => {
       const { value, probes, repository } = service();
       const decision = await value.decision(id, reader);
@@ -79,7 +453,7 @@ describe("capability decisions", () => {
     },
   );
 
-  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+  it.each(["graph.agentIdentity.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)(
     "directs expired %s evidence to an explicit read rather than Check status", async id => {
       const delegatedToken = vi.fn(async () => "delegated-token");
       const { value, repository } = service(new MemoryRepository(), { delegatedToken });
@@ -105,7 +479,7 @@ describe("capability decisions", () => {
     },
   );
 
-  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)(
+  it.each(["graph.agentIdentity.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)(
     "preserves fresh %s failures and rechecks expired failures only for an explicit read", async id => {
       const delegatedToken = vi.fn(async () => "delegated-token");
       const { value, repository, probes } = service(new MemoryRepository(), { delegatedToken });
@@ -358,7 +732,7 @@ describe("capability decisions", () => {
   it("identifies a stalled catalog provider read separately from token acquisition", async () => {
     const controller = new AbortController();
     const timeout = vi.spyOn(AbortSignal, "timeout")
-      .mockReturnValueOnce(new AbortController().signal).mockReturnValueOnce(controller.signal);
+      .mockReturnValue(controller.signal).mockReturnValueOnce(new AbortController().signal);
     const { value, probes } = service(new MemoryRepository(), { packageProbe: vi.fn(() => new Promise(() => {})) });
     try {
       const pending = value.refresh("graph.package.read.delegated", reader);
@@ -371,16 +745,46 @@ describe("capability decisions", () => {
     } finally { timeout.mockRestore(); }
   });
 
+  it.each([
+    ["token", true], ["token", false], ["provider", true], ["provider", false],
+  ] as const)("retries a real %s deadline with a fresh budget (recovery: %s)", async (phase, recover) => {
+    const firstDeadline = new AbortController();
+    const secondDeadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    if (phase === "provider") timeout.mockReturnValueOnce(new AbortController().signal);
+    timeout.mockReturnValueOnce(firstDeadline.signal).mockReturnValueOnce(secondDeadline.signal);
+    const held = deferred<string>();
+    const operation = vi.fn().mockImplementationOnce(() => new Promise<string>(() => {})).mockImplementationOnce(() => held.promise);
+    const { value, repository } = service(new MemoryRepository(), phase === "token"
+      ? { delegatedToken: operation } : { packageProbe: operation });
+    try {
+      const pending = value.refresh("graph.package.read.delegated", reader);
+      await vi.waitFor(() => expect(operation).toHaveBeenCalledTimes(1));
+      firstDeadline.abort(new DOMException("first attempt deadline", "TimeoutError"));
+      await vi.waitFor(() => expect(operation).toHaveBeenCalledTimes(2));
+      expect(repository.recordEvidence).not.toHaveBeenCalled();
+      if (recover) held.resolve("successful second attempt");
+      else secondDeadline.abort(new DOMException("second attempt deadline", "TimeoutError"));
+      await expect(pending).resolves.toMatchObject(recover ? { status: "available" }
+        : { status: "provider_error", evidence: { category: "provider_timeout", phase: phase === "token" ? "token_acquisition" : "provider_read" } });
+      expect(repository.recordEvidence).toHaveBeenCalledOnce();
+      expect(operation).toHaveBeenCalledTimes(2);
+      const budget = phase === "token" ? 10_000 : 30_000;
+      expect(timeout.mock.calls.filter(([duration]) => duration === budget)).toHaveLength(2);
+    } finally { timeout.mockRestore(); }
+  });
+
   it("explicitly retries a fresh failed check without repeating successful or write probes", async () => {
     const packageProbe = vi.fn()
+      .mockRejectedValueOnce(new DOMException("private", "TimeoutError"))
       .mockRejectedValueOnce(new DOMException("private", "TimeoutError"))
       .mockResolvedValue([]);
     const { value, probes } = service(new MemoryRepository(), { packageProbe });
     await value.check(reader);
     await value.check(reader);
-    expect(packageProbe).toHaveBeenCalledTimes(1);
-    const result = await value.check(reader, { retryFailed: true });
     expect(packageProbe).toHaveBeenCalledTimes(2);
+    const result = await value.check(reader, { retryFailed: true });
+    expect(packageProbe).toHaveBeenCalledTimes(3);
     expect(probes.directoryProbe).toHaveBeenCalledTimes(1);
     expect(probes.inventoryProbe).toHaveBeenCalledTimes(1);
     expect(probes.applicationToken).not.toHaveBeenCalled();
@@ -402,19 +806,20 @@ describe("capability decisions", () => {
     await expect(value.requireAvailable("graph.package.read.delegated", reader)).rejects.toMatchObject({
       status, code, details: { authorized: false },
     });
-    expect(packageProbe).toHaveBeenCalledOnce();
+    expect(packageProbe).toHaveBeenCalledTimes(error instanceof TypeError || error.name === "TimeoutError" ? 2 : 1);
   });
 
   it("rechecks only the requested capability on an explicit failed-read retry", async () => {
-    const packageProbe = vi.fn().mockRejectedValueOnce(new DOMException("private", "TimeoutError")).mockResolvedValue([]);
+    const packageProbe = vi.fn().mockRejectedValueOnce(new DOMException("private", "TimeoutError"))
+      .mockRejectedValueOnce(new DOMException("private", "TimeoutError")).mockResolvedValue([]);
     const { value, probes } = service(new MemoryRepository(), { packageProbe });
     await value.refresh("graph.package.read.delegated", reader);
     await expect(value.requireAvailable("graph.package.read.delegated", reader)).rejects.toMatchObject({ code: "provider_timeout" });
-    expect(packageProbe).toHaveBeenCalledOnce();
+    expect(packageProbe).toHaveBeenCalledTimes(2);
     await expect(value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true }))
       .resolves.toMatchObject({ authorized: true });
     await value.requireAvailable("graph.package.read.delegated", reader, { retryFailed: true });
-    expect(packageProbe).toHaveBeenCalledTimes(2);
+    expect(packageProbe).toHaveBeenCalledTimes(3);
     expect(probes.directoryProbe).not.toHaveBeenCalled();
     expect(probes.inventoryProbe).not.toHaveBeenCalled();
     expect(probes.applicationToken).not.toHaveBeenCalled();

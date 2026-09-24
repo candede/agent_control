@@ -31,11 +31,13 @@ function harness() {
   const delegatedToken = vi.fn(async () => "fixture-token");
   const requireAvailable = vi.fn();
   const admissions = vi.fn();
+  const reportedFailures = vi.fn();
   const service = new AgentPeopleService({} as pg.Pool, {
+    observeOperation: async (_id, _user, operation) => operation(reportedFailures),
     repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
     now: () => new Date(observedAt),
   });
-  return { service, user, repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions };
+  return { service, user, repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions, reportedFailures };
 }
 
 describe("persistent agent people resolution", () => {
@@ -106,6 +108,8 @@ describe("persistent agent people resolution", () => {
     const value = harness();
     value.directory.resolve.mockRejectedValue(new AppError(403, "Authorization_RequestDenied", "Denied"));
     expect((await value.service.resolve(value.user, [id], options)).failed).toBe(1);
+    expect(value.reportedFailures).toHaveBeenCalledOnce();
+    expect(value.reportedFailures).toHaveBeenCalledWith(expect.objectContaining({ code: "Authorization_RequestDenied" }));
     expect(value.repository.save.mock.calls[0][1][0]).toMatchObject({ status: "lookup_failed", errorCode: "missing_permission" });
     value.directory.resolve.mockClear();
     await expect(value.service.resolve(value.user, Array.from({ length: 20 }, () => randomUUID()), options))

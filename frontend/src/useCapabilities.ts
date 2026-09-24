@@ -2,9 +2,38 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, checkCapabilities, getCapabilities, type CapabilityView, type SessionUser } from "./api/client";
 import { hasRole } from "./authorization";
 import { useSavedRead } from "./savedQueries";
+import { isTransientPermissionCheck } from "./permissionIssues";
 
 const expiryRetryDelayMs = 30_000;
+const transportRetryDelayMs = 1_000;
 const maximumTimerDelayMs = 2_147_483_647;
+
+function transientTransportFailure(cause: unknown) {
+  return cause instanceof ApiError && (cause.kind === "network" || [408, 500, 502, 503, 504].includes(cause.status));
+}
+
+export async function retryPermissionRead<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  try {
+    return await read();
+  } catch (cause) {
+    if (signal.aborted || !transientTransportFailure(cause)) throw cause;
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        reject(new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" }));
+      };
+      const timer = window.setTimeout(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      }, transportRetryDelayMs);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+    if (signal.aborted) throw new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
+    return read();
+  }
+}
 
 function principalKey(user: SessionUser | undefined, sessionEpoch: number) {
   if (!user || !hasRole(user, "AgentControl.Viewer")) return undefined;
@@ -16,10 +45,11 @@ function accessDenied(cause: unknown) {
     && cause.code !== "invalid_origin" && cause.code !== "invalid_csrf";
 }
 
-function evidenceExpiries(views: CapabilityView[]) {
+function evidenceExpiries(views: CapabilityView[], includeOperationFailures = false) {
   return views
     .filter(view => view.definition.mode !== "local")
-    .map(view => Date.parse(view.decision.expiresAt ?? ""))
+    .flatMap(view => includeOperationFailures ? [view.decision.expiresAt, view.operationFailure?.expiresAt] : [view.decision.expiresAt])
+    .map(expiry => Date.parse(expiry ?? ""))
     .filter(Number.isFinite)
     .sort((left, right) => left - right);
 }
@@ -35,9 +65,13 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
   const [stateKey, setStateKey] = useState(key);
   const [views, setViews] = useState<CapabilityView[]>([]);
   const [owner, setOwner] = useState<string>();
+  const [checkedOwner, setCheckedOwner] = useState<string>();
+  const checkedOwnerRef = useRef<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const [pending, setPending] = useState(false);
+  const [activeCheck, setActiveCheck] = useState<{ id: number; retryFailed: boolean }>();
+  const checkSequence = useRef(0);
   const [now, setNow] = useState(Date.now);
   const generation = useRef(0);
   const request = useRef<{ generation: number; controller: AbortController; promise: Promise<void> } | undefined>(undefined);
@@ -51,14 +85,16 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
     setStateKey(key);
     setViews([]);
     setOwner(undefined);
+    setCheckedOwner(undefined);
     setLoading(false);
     setPending(false);
+    setActiveCheck(undefined);
     setError(undefined);
   }
 
   const discardDeniedEvidence = useCallback(() => {
     setViews([]);
-    setError("Capability access was denied. Verify the current account and app roles, then use Check status to retry.");
+    setError("Permission checks were denied. Sign in again or ask your administrator to check your app role.");
     initialCheckRequired.current = false;
     attemptedExpiry.current = undefined;
     expiryRetryCounts.current.clear();
@@ -76,6 +112,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
     }
     activeController.current = controller;
     setPending(true);
+    setActiveCheck({ id: ++checkSequence.current, retryFailed });
     const scheduleExpiryRetry = (signature: string | undefined) => {
       if (expiryRetryTimer.current?.signature === signature) return;
       if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
@@ -92,11 +129,13 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
         }, expiryRetryDelayMs),
       };
     };
-    const promise = checkCapabilities({ signal: controller.signal, retryFailed })
+    const promise = retryPermissionRead(() => checkCapabilities({ signal: controller.signal, retryFailed }), controller.signal)
       .then(result => {
         if (generation.current !== current) return;
         setViews(result.value);
         setOwner(key);
+        setCheckedOwner(key);
+        checkedOwnerRef.current = key;
         setError(undefined);
         const currentTime = Date.now();
         setNow(currentTime);
@@ -119,7 +158,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
           return;
         }
         const detail = cause instanceof ApiError && cause.code === "invalid_origin" ? ` ${cause.message}` : "";
-        setError(`Automatic permission check failed.${detail} Existing decisions and saved-data permissions are unchanged. Use Check status to retry.`);
+        setError(`Permission checks failed${transientTransportFailure(cause) ? " after retrying" : ""}.${detail} Use Check status to retry.`);
         setNow(Date.now());
         scheduleExpiryRetry(expirySignature);
       })
@@ -136,6 +175,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
     activeController.current?.abort();
     request.current = undefined;
     initialCheckRequired.current = false;
+    checkedOwnerRef.current = undefined;
     attemptedExpiry.current = undefined;
     expiryRetryCounts.current.clear();
     if (expiryRetryTimer.current !== undefined) window.clearTimeout(expiryRetryTimer.current.id);
@@ -148,7 +188,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
         generation.current += 1;
       };
     }
-    void readSaved(["capabilities", key], signal => getCapabilities({ signal }), controller.signal)
+    void readSaved(["capabilities", key], signal => retryPermissionRead(() => getCapabilities({ signal }), signal), controller.signal)
       .then(result => {
         if (generation.current !== current) return;
         initialCheckRequired.current = true;
@@ -163,7 +203,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
         setViews([]);
         setOwner(key);
         if (accessDenied(cause)) discardDeniedEvidence();
-        else setError("Capability status could not be loaded. Saved-data permissions are unchanged.");
+        else setError("Permission checks could not be loaded. Use Check status to retry.");
         setLoading(false);
         setPending(false);
       });
@@ -178,7 +218,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
 
   useEffect(() => {
     if (!key || owner !== key) return;
-    const expiries = evidenceExpiries(views);
+    const expiries = evidenceExpiries(views, true);
     if (!expiries.length && !initialCheckRequired.current) return;
     let timer: number | undefined;
     const checkExpired = () => {
@@ -190,7 +230,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
       initialCheckRequired.current = false;
       attemptedExpiry.current = signature;
       const controller = new AbortController();
-      void runCheck(generation.current, controller, signature);
+      void runCheck(generation.current, controller, signature, views.some(isTransientPermissionCheck));
     };
     const currentTime = Date.now();
     const nextExpiry = expiries.find(expiry => expiry > currentTime);
@@ -207,7 +247,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
     };
   }, [key, loading, now, owner, pending, runCheck, views]);
 
-  async function reload() {
+  const reload = useCallback(async () => {
     if (!key) return;
     const current = ++generation.current;
     activeController.current?.abort();
@@ -223,7 +263,7 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
     setPending(false);
     try {
       const result = await readSaved(["capabilities", key, current],
-        signal => getCapabilities({ signal }), controller.signal);
+        signal => retryPermissionRead(() => getCapabilities({ signal }), signal), controller.signal);
       if (current !== generation.current) return;
       setViews(result.value);
       setOwner(key);
@@ -237,16 +277,23 @@ export function useCapabilities(user: SessionUser | undefined, sessionEpoch = 0)
       if (current === generation.current && !controller.signal.aborted) {
         setOwner(key);
         if (accessDenied(cause)) discardDeniedEvidence();
-        else setError("Capability status could not be loaded. Existing decisions and saved-data permissions are unchanged.");
+        else setError("Permission checks could not be loaded. Use Check status to retry.");
       }
     } finally { if (current === generation.current) setLoading(false); }
-  }
+  }, [discardDeniedEvidence, key, readSaved, runCheck]);
+
+  const refreshOnOpen = useCallback(async () => {
+    if (key && checkedOwnerRef.current === key && !request.current) await reload();
+  }, [key, reload]);
 
   return {
     views: key && owner === key ? views : [],
     loading: Boolean(key) && (loading || owner !== key),
     error: !key || owner === key ? error : undefined,
     pending: Boolean(key && owner === key && pending),
+    ...(key && owner === key && pending && activeCheck ? { activeCheck } : {}),
+    ...(key && checkedOwner !== key ? { awaitingInitialCheck: true } : {}),
+    ...(key ? { refreshOnOpen } : {}),
     now,
     reload,
     user,

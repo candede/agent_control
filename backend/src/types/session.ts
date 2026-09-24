@@ -1,4 +1,4 @@
-import type { AppRole, CapabilityId } from "./capability.js";
+import type { AppRole } from "./capability.js";
 
 export type AuthenticatedUser = {
   displayName: string;
@@ -10,16 +10,13 @@ export type AuthenticatedUser = {
 };
 
 export type AuthFlow = {
-  kind: "login" | "consent";
+  kind: "login";
   state: string;
   nonce: string;
   codeVerifier: string;
   scopes: string[];
-  extraScopesToConsent?: string[];
   createdAt: number;
   returnTo: string;
-  capabilityId?: CapabilityId;
-  accountId?: string;
 };
 
 declare module "express-session" {

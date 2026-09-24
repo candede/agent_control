@@ -93,13 +93,13 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
   const permissions = definition.permissions.join(" and ");
   if (!capabilityModeEnabled(view)) return "This optional application mode is disabled. Previous checks do not establish current availability.";
   if (decision.evidence?.category === "interaction_required") {
-    return "Microsoft Entra requires interactive authorization, which may include consent, MFA, or Conditional Access. Continue sign-in or consent when you are ready.";
+    return "Microsoft Entra requires interaction. Sign in again for MFA or Conditional Access; an administrator must configure any missing API permissions and admin consent outside this app.";
   }
   if (decision.evidence?.category === "authorization_expired") {
     return "Microsoft authorization expired. Sign in again to reauthorize this delegated capability.";
   }
   switch (decision.status) {
-    case "missing_permission": return `Requires ${definition.mode} ${permissions} for ${definition.audience}.`;
+    case "missing_permission": return `Admin prerequisite: add ${definition.mode} ${permissions} for ${definition.audience} in the app registration and grant admin consent.`;
     case "missing_internal_role": return `Requires ${definition.internalRoles.join(" or ")}.`;
     case "missing_role": return definition.providerRoles.length ? `Requires ${definition.providerRoles.join(" or ")}.` : "Microsoft role requirements are not fully visible; verify the documented provider contract.";
     case "missing_license": return `Requires ${definition.licenses.join(" or ") || "the documented service license"}.`;
@@ -158,10 +158,18 @@ export function capabilityStatusLabel(view: CapabilityView, now = Date.now()) {
 }
 
 export function capabilityNextStep(view: CapabilityView, now = Date.now()): { text: string; href?: string; label?: string } | undefined {
+  if (view.decision.status === "missing_permission") return {
+    text: "Ask your administrator to add the required API permissions and grant admin consent in the existing Entra app registration. Then sign in again and check status.",
+    href: "https://entra.microsoft.com/", label: "Admin setup",
+  };
+  if (["interaction_required", "authorization_expired"].includes(view.decision.evidence?.category ?? "")) return {
+    text: "Normal sign-in can complete MFA or refresh your session. It does not configure feature permissions; those remain administrator prerequisites.",
+    href: "/api/auth/login?returnTo=%2Fpermissions", label: "Sign in again",
+  };
   const verification = currentVerification(view, now);
   if (verification !== "token" && verification !== "on_demand") return undefined;
   if (view.definition.probe.kind === "on_demand" && view.definition.id.startsWith("graph.package.")) return {
-    text: "Package changes use delegated CopilotPackages.ReadWrite.All, requested during normal sign-in. Open Agents to review and confirm the exact package targets. Microsoft validates access on each operation.",
+    text: "Package changes require administrator-pregranted delegated CopilotPackages.ReadWrite.All. Open Agents to review and confirm the exact package targets. Microsoft validates access on each operation.",
     href: "/agents", label: "Open Agents",
   };
   if (view.definition.id.startsWith("powerPlatform.quarantine.")) return {
@@ -173,8 +181,8 @@ export function capabilityNextStep(view: CapabilityView, now = Date.now()): { te
     href: "/audit", label: "Open Audit",
   };
   if (view.definition.id.startsWith("defender.hunting.")) return {
-    text: "Open Security and explicitly run a curated, bounded investigation to verify operation access. Permission checks do not run hunting queries.",
-    href: "/security", label: "Open Security",
+    text: "Open Agents, select an agent, and use its Activity tab to run a bounded Defender investigation. The agent identity is filled automatically. Permission checks do not run hunting queries.",
+    href: "/agents", label: "Open Agents",
   };
   return undefined;
 }

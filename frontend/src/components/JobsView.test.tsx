@@ -81,7 +81,7 @@ describe("JobsView", () => {
     expect(screen.queryByText("Package mutation")).not.toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "Package controls" })).not.toBeInTheDocument();
     expect(screen.queryByText(/authorized source.*temporarily unavailable/)).not.toBeInTheDocument();
-    expect(screen.getByRole("table", { name: "Sync run history" })).toBeVisible();
+    expect(screen.getByRole("table", { name: "Sync history" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Retry incomplete" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("link", { name: /View details for Retained sync/ }));
     expect(onOpenSyncRun).toHaveBeenCalledWith("sync-history");
@@ -879,7 +879,7 @@ describe("JobsView", () => {
     completed = true;
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(fetchMock).toHaveBeenCalledTimes(5);
-    expect(screen.getByRole("table", { name: "Sync run history" })).toHaveTextContent("Complete");
+    expect(screen.getByRole("table", { name: "Sync history" })).toHaveTextContent("Complete");
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(fetchMock).toHaveBeenCalledTimes(5);
     view.unmount();

@@ -10,6 +10,8 @@ import { getBuiltWithLabel } from "../agentDisplay";
 import { getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetails";
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
+import { unifiedAgentRecordId } from "../../../backend/src/types/unifiedAgents";
 
 const detailTabs = ["identities", "package", "power-platform", "reports", "audit-security", "controls"] as const;
 type DetailTab = typeof detailTabs[number];
@@ -321,7 +323,9 @@ export function AgentDetailModal({
           </section>
         ) : selectedTab === "power-platform" ? <UnavailablePanel id="power-platform" title="Power Platform data">No documented package-to-Power-Platform identifier equivalence exists. Names, app IDs, manifest IDs, asset IDs, owners, and timestamps were not used as joins. Power Platform records remain usable in their authorized inventory view.</UnavailablePanel>
           : selectedTab === "reports" ? <UnavailablePanel id="reports" title="Official reports">Official report agent IDs are report-only under the retained three-file contract. No documented exact relation to a Graph package ID exists, so no report lookup, metric substitution, or count was performed.</UnavailablePanel>
-          : selectedTab === "audit-security" ? <UnavailablePanel id="audit-security" title="Audit and security">{hasAppRole(roles, "AgentControl.Viewer") ? "Viewer access includes the source views, but Purview and Defender define exact Power Platform identifier associations only. No documented exact relation to this Graph package exists, so names were not queried." : "Viewer is not assigned. Audit and Defender records and counts were not requested."}</UnavailablePanel>
+          : selectedTab === "audit-security" ? <section id="agent-audit-security-panel" role="tabpanel" aria-labelledby="agent-tab-audit-security" tabIndex={0}>
+            <AgentInvestigationsPanel recordId={unifiedAgentRecordId({ source: "graph_packages", packageId: agent.id })} agentName={agent.displayName} roles={roles} />
+          </section>
           : <section id="agent-controls-panel" className="detail-section metadata" role="tabpanel" aria-labelledby="agent-tab-controls" tabIndex={0}><div className="detail-section-header"><h3>Native package controls</h3><span>{agent.id}</span></div><p>Block state and package access target only this exact Graph package ID. Copilot Studio quarantine remains a separate environment/CDS bot control.</p>
             {hasAppRole(roles, "AgentControl.Admin") && onSetBlocked ? <WorkbenchActionGate actionId={agent.isBlocked ? "packages.unblock" : "packages.block"}><button type="button" className="secondary" onClick={() => void onSetBlocked(!agent.isBlocked)}>{agent.isBlocked ? "Unblock exact package" : "Block exact package"}</button></WorkbenchActionGate> : null}
             {hasAppRole(roles, "AgentControl.Admin") ? <WorkbenchActionGate actionId="packages.access"><button type="button" className="secondary" disabled={preparingAccess} onClick={() => editAccess("availability")}>Manage package availability</button></WorkbenchActionGate> : <p>Admin is required for package mutations.</p>}

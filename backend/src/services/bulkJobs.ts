@@ -76,14 +76,17 @@ export async function runBulkJob(
   if (!jobSummary) throw new AppError(404, "not_found", "Job was not found.");
   if (jobSummary.tokenMode !== "delegated") throw new AppError(409, "invalid_token_mode", "The delegated worker cannot execute an application-mode job.");
   requireProviderAdmissions();
+  const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
   let accessToken: string;
-  try { accessToken = await authorize(scope, jobSummary.capabilityId); }
+  try { accessToken = await capabilities.observeOperation(jobSummary.capabilityId, principal,
+    () => authorize(scope, jobSummary.capabilityId), { signal: externalSignal, clearOnSuccess: false }); }
   catch (error) { await repository.waitForAuthorization(id, scope); throw error; }
   const lease = await repository.claim(id, scope, processOwner, resume);
   if (!lease) return;
   try {
     for (let index = 0; index < 5000 && !maintenanceActive(); index += 1) {
-      try { accessToken = await authorize(scope, jobSummary.capabilityId); }
+      try { accessToken = await capabilities.observeOperation(jobSummary.capabilityId, principal,
+        () => authorize(scope, jobSummary.capabilityId), { signal: externalSignal, clearOnSuccess: false }); }
       catch {
         await repository.pauseForAuthorization(lease);
         return;
@@ -102,7 +105,7 @@ export async function runBulkJob(
       };
       let sent = false;
       try {
-        await repository.withTargetLock(lease, item, async () => {
+        await capabilities.observeOperation(job.capability, principal, () => repository.withTargetLock(lease, item, async () => {
           const readOptions = { correlationId: item.correlation_id!, signal };
           const before = await getPackageDetails(accessToken, item.target_id, readOptions);
           if (before.id !== item.target_id) throw new AppError(502,"target_mismatch","Provider returned a different package identity.");
@@ -121,7 +124,7 @@ export async function runBulkJob(
               requireProviderAdmissions();
               signal.throwIfAborted();
               await repository.markSent(lease, item.id, packageMutationStateHash(immediateState));
-            });
+                });
             sent = true;
             requireProviderAdmissions();
             readbackToken = dispatchToken;
@@ -154,7 +157,7 @@ export async function runBulkJob(
           requireProviderAdmissions();
           const verified = await verifyPackageMutationConverged({ getPackageDetails }, dispatchToken, item.target_id, blockAction, expected, readOptions);
           await finishAuthorized(repository, lease, item.id, "succeeded", { poststate: verified.state, readbackCount: verified.readbackCount, readback: verified.details, inventoryGeneration }, scope, job.capability, authorize, signal);
-        });
+        }), { signal, clearOnSuccess: () => sent });
       } catch (error) {
         if (error instanceof AppError && error.code === "lease_lost") throw error;
         if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error) || error instanceof AppError && [401, 403].includes(error.status))) {

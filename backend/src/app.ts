@@ -74,6 +74,10 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   });
   policyRoute(app, "get", "/api/auth/status", { access: "public", dataClass: "identity" }, (_request, response) => response.json({ authConfigured, callback: config.redirectUri,
     setup: authConfigured ? undefined : "Configure tenant/client IDs and the client secret, and register the displayed callback in Entra." }));
+  policyRoute(app, "get", "/security", { access: "public", dataClass: "public" }, (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.redirect(302, "/agents");
+  });
   app.use(express.json({ limit: "512kb" }));
   const store = createSessionStore(database, config.tenantId ?? "unconfigured");
   app.use(session({ name: "agent-control.sid", store, secret: config.sessionSecret, resave: false, saveUninitialized: false,

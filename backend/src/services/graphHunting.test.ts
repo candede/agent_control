@@ -85,6 +85,47 @@ function row(templateId: DefenderHuntingTemplateId, overrides: Record<string, un
 }
 
 describe("Microsoft Graph v1.0 curated hunting contract", () => {
+  it("compiles typed Entra scopes without using platform/native aliases as identity predicates", () => {
+    for (const template of ["agents_inventory", "agent_activity", "agent_tools"] as const) {
+      const selected = { ...filters(template), ...(template === "agents_inventory" ? { entraAgentIds: [agentId] } : { entraAgentApplicationIds: [agentId] }) };
+      const query = createHuntingRequest(selected).Query;
+      const compiled = compileKusto(query, publishedHuntingTables);
+      expect(compiled.diagnostics).toEqual([]);
+      expect(compiled.columns).toEqual(publishedProjectionColumns[template].map(name => ({ name, type: "string" })));
+      const targetPredicate = query.split("\n").find(line => line.includes(agentId));
+      if (template === "agents_inventory") expect(targetPredicate).toBe(`| where EntraAgentId in~ (@'${agentId}')`);
+      else {
+        expect(targetPredicate).toContain("Event.TargetAgentId");
+        expect(targetPredicate).toContain("Event.AgentId");
+        expect(targetPredicate).not.toContain("Platform");
+      }
+    }
+  });
+
+  it("normalizes optional typed Entra filters while preserving absent legacy filters", () => {
+    expect(validateDefenderHuntingFilters(filters(), { now })).not.toHaveProperty("entraAgentIds");
+    expect(validateDefenderHuntingFilters({ ...filters("agents_inventory"), entraAgentIds: [agentId.toUpperCase()] }, { now }).entraAgentIds).toEqual([agentId]);
+    expect(validateDefenderHuntingFilters({ ...filters(), entraAgentApplicationIds: [agentId.toUpperCase()] }, { now }).entraAgentApplicationIds).toEqual([agentId]);
+    expect(() => validateDefenderHuntingFilters({ ...filters(), entraAgentIds: [agentId] }, { now })).toThrow();
+    expect(() => validateDefenderHuntingFilters({ ...filters("agents_inventory"), entraAgentApplicationIds: [agentId] }, { now })).toThrow();
+    expect(() => createHuntingRequest({ ...filters(), entraAgentIds: [agentId] })).toThrow();
+    expect(() => createHuntingRequest({ ...filters("agents_inventory"), entraAgentApplicationIds: [agentId] })).toThrow();
+    expect(() => validateDefenderHuntingFilters({ ...filters(), entraAgentIds: ["platform-id"] }, { now })).toThrow();
+  });
+
+  it("rejects rows matching only the platform/native alias rather than the exact Entra identity", async () => {
+    const inventory = new GraphHuntingClient({ fetch: vi.fn(async () => response("agents_inventory", [row("agents_inventory", { AgentId: agentId, EntraAgentId: blueprintId })])),
+      wait: vi.fn(), random: () => 0 });
+    await expect(inventory.runQuery("token", { ...filters("agents_inventory"), entraAgentIds: [agentId] })).rejects.toMatchObject({ code: "provider_scope_mismatch" });
+    const activity = new GraphHuntingClient({ fetch: vi.fn(async () => response("agent_activity", [row("agent_activity", {
+      TargetAgentId: blueprintId, AgentId: "", PlatformTargetAgentId: agentId, PlatformAgentIdState: "value",
+    })])), wait: vi.fn(), random: () => 0 });
+    await expect(activity.runQuery("token", { ...filters(), entraAgentApplicationIds: [agentId] })).rejects.toMatchObject({ code: "provider_scope_mismatch" });
+    const exact = new GraphHuntingClient({ fetch: vi.fn(async () => response("agents_inventory", [row("agents_inventory", { AgentId: "different-platform-id", EntraAgentId: agentId })])),
+      wait: vi.fn(), random: () => 0 });
+    await expect(exact.runQuery("token", { ...filters("agents_inventory"), entraAgentIds: [agentId] })).resolves.toMatchObject({ storedRowCount: 1 });
+  });
+
   it("semantically compiles every generated template against independent published table schemas", () => {
     const literalAgentIds = ["agent\\name", "agent'one", "agent\\'); union CloudAppEvents //"];
     for (const templateId of ["agents_inventory", "agent_activity", "agent_tools"] as const) {

@@ -217,7 +217,8 @@ describe("capability UX decisions", () => {
         expect(providerActionAllowed(unavailable, true)).toBe(false);
         expect(currentVerification(unavailable)).toBeUndefined();
         expect(capabilityStatusLabel(unavailable)).toBe(statusLabels[status]);
-        expect(capabilityNextStep(unavailable)).toBeUndefined();
+        if (status === "missing_permission") expect(capabilityNextStep(unavailable)).toMatchObject({ label: "Admin setup", href: "https://entra.microsoft.com/" });
+        else expect(capabilityNextStep(unavailable)).toBeUndefined();
       }
     },
   );
@@ -258,7 +259,7 @@ describe("capability UX decisions", () => {
   it("uses evidence categories for interactive authorization states", () => {
     const interaction = view("unknown");
     interaction.decision.evidence = { category: "interaction_required" };
-    expect(capabilityExplanation(interaction)).toContain("consent, MFA, or Conditional Access");
+    expect(capabilityExplanation(interaction)).toContain("Sign in again for MFA or Conditional Access");
 
     const expired = view("unknown");
     expired.decision.evidence = { category: "authorization_expired" };

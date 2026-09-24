@@ -24,6 +24,8 @@ export type DefenderHuntingFilters = {
   startDateTime: string;
   endDateTime: string;
   agentIds: string[];
+  entraAgentIds?: string[];
+  entraAgentApplicationIds?: string[];
   blueprintIds: string[];
   actorObjectIds: string[];
   operations: string[];

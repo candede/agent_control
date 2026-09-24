@@ -107,30 +107,41 @@ function Show-LocalRegistrationGuidance {
 Registered app permissions and setup
 ===================================
 Use an approved single-tenant Entra Web application.
-Normal sign-in requests all implemented delegated permissions up front, including package changes.
-Approve the intended permissions below; consent does not assign roles or licenses.
+API permissions and tenant administrator consent are prerequisites.
+Configure them before admitting users; the app does not request or grant permissions.
 
 Entra admin center > App registrations > your app > API permissions >
 Add a permission. Select the API and Delegated permissions for user-driven features.
 
 Microsoft Graph - Delegated permissions:
+  openid                         Sign-in: authenticate the account.
+  profile                        Sign-in: account identity and display name.
+  offline_access                 Session renewal without repeated sign-in.
   CopilotPackages.Read.All       Read the Copilot package catalog.
   CopilotPackages.ReadWrite.All  Block/unblock and other package controls.
                                 Also satisfies package-read permission checks.
   User.ReadBasic.All             Look up users.
   Group.Read.All                 Look up groups.
+  User.Read.All                  Discover Copilot-capable users.
+  LicenseAssignment.Read.All     Check paid Copilot service assignments.
+  Reports.Read.All               Read Microsoft 365 Copilot usage reports.
+  AgentIdentity.Read.All         Verify newer Studio log identities.
   AuditLogsQuery.Read.All        Search Microsoft Purview audit records.
   ThreatHunting.Read.All         Run Defender advanced hunting queries.
+
+User.Read is not used by Agent Control.
+Keep CopilotPackages.Read.All and User.ReadBasic.All alongside broader grants:
+the current app requests these read scopes separately.
 
 Power Platform - Delegated permissions:
   ResourceQuery.Resources.Read   Read Power Platform inventory.
   CopilotStudio.AdminActions.Invoke  Read/change Copilot Studio quarantine.
   Resource/application ID: 8578e004-a5c6-46e7-913e-12f58912df43
 
-Obtain the required tenant administrator consent for the selected permissions.
+Select Grant admin consent in the existing app registration.
 After sign-in, the app checks delegated access automatically without requiring
-probe-button clicks. Interactive consent, MFA or Conditional Access may still
-require the user's participation; the app cannot grant those permissions itself.
+probe-button clicks. Normal sign-in, MFA or Conditional Access may still require
+the user's participation; feature permission grants remain administrator-managed.
 Automatic checks never change packages, quarantine agents or run investigations.
 Token acquisition alone does not prove provider access, roles or licensing.
 Optional Microsoft Graph Application permissions, ONLY for separately enabled

@@ -28,6 +28,8 @@ type SummaryRow = {
   latest_observed_at: Date | null;
   earliest_activity_date: string | null;
   latest_activity_date: string | null;
+  earliest_reporting_start: string | null;
+  latest_reporting_end: string | null;
   known_window_count: number;
   unknown_window_count: number;
   overlapping_known_window_count: number;
@@ -210,6 +212,12 @@ const historySummarySql = `WITH retained_sets AS MATERIALIZED (
     (SELECT min(accepted_at) FROM retained_sets) AS earliest_observed_at,
     (SELECT max(accepted_at) FROM retained_sets) AS latest_observed_at,
     activity.earliest_activity_date,activity.latest_activity_date,
+    (SELECT min(reporting_start)::text FROM retained_sets
+      WHERE period_provenance<>'activity_range'
+        AND reporting_start IS NOT NULL AND reporting_end IS NOT NULL) AS earliest_reporting_start,
+    (SELECT max(reporting_end)::text FROM retained_sets
+      WHERE period_provenance<>'activity_range'
+        AND reporting_start IS NOT NULL AND reporting_end IS NOT NULL) AS latest_reporting_end,
     (SELECT count(*)::int FROM retained_sets
       WHERE period_provenance<>'activity_range'
         AND reporting_start IS NOT NULL AND reporting_end IS NOT NULL) AS known_window_count,
@@ -244,6 +252,8 @@ function projectSummary(row: SummaryRow): OfficialUsageHistoryView["summary"] {
       provesReportingCoverage: false,
     },
     reportingWindows: {
+      earliestStartDateUtc: row.earliest_reporting_start,
+      latestEndDateUtc: row.latest_reporting_end,
       knownCount: row.known_window_count,
       unknownCount: row.unknown_window_count,
       overlappingKnownWindowCount: row.overlapping_known_window_count,

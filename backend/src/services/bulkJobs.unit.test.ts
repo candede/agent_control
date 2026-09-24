@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { packageMutationStateHash } from "./packageMutationState.js";
 
@@ -12,6 +12,10 @@ vi.mock("./operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }))
 import { runBulkJob } from "./bulkJobs.js";
 import { GraphPackagesClient, type FetchLike } from "./graphPackages.js";
 import { requireProviderAdmissions } from "./operationalState.js";
+import { capabilities } from "./capabilities.js";
+
+beforeEach(() => { vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined)); });
+afterEach(() => vi.restoreAllMocks());
 
 const scope = { tenantId: "tenant", principalId: "principal" };
 const prestate = { kind: "block" as const, isBlocked: false };

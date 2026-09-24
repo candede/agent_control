@@ -9,7 +9,7 @@ import { syncSourceDetails, syncStatusLabel } from "./syncPresentation";
 import "./dataSync.css";
 
 const pageSize = 10;
-const sourceJobs = new Set(["package-refresh", "power-platform"]);
+const syncHistorySources = new Set(["data-sync", "package-refresh", "power-platform"]);
 const defaultSorting: SortingState = [{ id: "started", desc: true }];
 
 export function SyncHistoryTable({ state, error, loading = false, onRefresh, onOpenSyncRun }: {
@@ -19,12 +19,10 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
   onRefresh: () => void;
   onOpenSyncRun?: (runId: string) => void;
 }) {
-  const [view, setView] = useState<"runs" | "sources">("runs");
   const [outcome, setOutcome] = useState("all");
   const [page, setPage] = useState(0);
   const [sorting, setSorting] = useState<SortingState>(defaultSorting);
-  const inView = (source: string) => view === "runs" ? source === "data-sync" : sourceJobs.has(source);
-  const jobs = state?.value.filter(job => inView(job.source) && matchesOutcome(job, outcome))
+  const jobs = state?.value.filter(job => syncHistorySources.has(job.source) && matchesOutcome(job, outcome))
     .sort((left, right) => left.id.localeCompare(right.id))
     ?? [];
   const columns = useMemo<ListColumn<WorkbenchJobSummary>[]>(() => [
@@ -34,7 +32,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
       sortDescFirst: true,
     },
     {
-      id: "scope", header: view === "runs" ? "Scope" : "Source job",
+      id: "scope", header: "Scope",
       accessorFn: job => job.source === "data-sync" && job.syncSources?.length
         ? job.syncSources.map(source => syncSourceDetails[source].label).join(", ")
         : job.label,
@@ -47,7 +45,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
       sortDescFirst: true,
     },
     { id: "details", header: "Details", enableSorting: false },
-  ], [view]);
+  ], []);
   const table = useListTable({
     data: jobs,
     columns,
@@ -59,7 +57,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
     },
   });
   const sortedRows = table.getRowModel().rows;
-  const unavailable = state?.unavailableSources.filter(source => inView(source.source)) ?? [];
+  const unavailable = state?.unavailableSources.filter(source => syncHistorySources.has(source.source)) ?? [];
   const lastPage = Math.max(0, Math.ceil(jobs.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
   const rows = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
@@ -76,10 +74,6 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
         </button>
       </div>
       <div className="sync-history-controls">
-        <div className="sync-history-tabs" role="group" aria-label="History type">
-          <button type="button" aria-pressed={view === "runs"} onClick={() => { setView("runs"); setPage(0); }}>Sync runs</button>
-          <button type="button" aria-pressed={view === "sources"} onClick={() => { setView("sources"); setPage(0); }}>Source jobs</button>
-        </div>
         <label className="sync-history-filter">
           Outcome
           <select value={outcome} onChange={event => { setOutcome(event.target.value); setPage(0); }}>
@@ -90,19 +84,16 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
           </select>
         </label>
       </div>
-      {view === "sources" ? <p className="jobs-note">Standalone refreshes and underlying Graph / Power Platform jobs, including older collection workflows. These are not additional full sync runs.</p> : null}
       {error ? <div className="error-banner" role="alert">{error}</div> : null}
       {!state && !error ? <p role="status">Loading sync history...</p> : null}
       {unavailable.length ? <p className="notice" role="status">History is temporarily unavailable for {unavailable.map(source => source.source === "data-sync" ? "sync runs" : source.source === "package-refresh" ? "Graph packages" : "Power Platform").join(" and ")}. Displayed rows may be incomplete.</p> : null}
       {state && !error && !unavailable.length && !rows.length ? <p className="screen-state">{outcome !== "all"
         ? "No recent records match this outcome."
-        : view === "runs" ? "No retained sync runs yet. Your next sync will appear here." : "No retained source jobs."}</p> : null}
+        : "No recent sync history. Your next sync or refresh will appear here."}</p> : null}
       {rows.length ? (
         <div className="sync-table-scroll" role="region" aria-label="Scrollable sync history" tabIndex={0}>
-          <table className="sync-history-table" aria-label={view === "runs" ? "Sync run history" : "Source job history"}>
-            <ListTableHead table={table} titles={{ duration: view === "runs"
-              ? "Time since the original start, including waits and retries"
-              : "Time from the latest source-job attempt to completion" }} />
+          <table className="sync-history-table" aria-label="Sync history">
+            <ListTableHead table={table} titles={{ duration: "Time from the recorded start to completion" }} />
             <tbody>
               {rows.map(row => {
                 const job = row.original;
@@ -137,8 +128,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
       ) : null}
       {state ? <div className="sync-history-pagination">
         <p className="jobs-note">{jobs.length ? `${currentPage * pageSize + 1}-${Math.min((currentPage + 1) * pageSize, jobs.length)} of ${jobs.length} recent records. ` : ""}
-          {view === "runs" ? "Up to 20 sync runs retained for 30 days." : "Up to 20 recent Graph jobs per authorization mode and 20 Power Platform jobs."}
-          {" "}Filters apply to these recent records.</p>
+          Recent history only; filters apply to the loaded records.</p>
         {lastPage > 0 ? <div>
           <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
           <button type="button" className="secondary" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>Next</button>

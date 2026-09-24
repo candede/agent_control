@@ -9,11 +9,20 @@ function primarySync(page: Page) {
 
 async function expectAccessibleSyncPage(page: Page) {
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
+  const reports = page.getByRole("region", { name: "CSV usage reports", exact: true });
+  const history = page.getByRole("region", { name: "Sync history", exact: true });
+  await expect(reports.getByRole("heading", { name: "CSV usage reports", level: 2 })).toBeVisible();
+  await expect(panel.getByRole("region", { name: "CSV usage reports" })).toHaveCount(0);
+  expect(await reports.evaluate((element, next) => Boolean(next && element.parentElement === next.parentElement
+    && (element.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING)), await panel.elementHandle())).toBe(true);
+  expect(await panel.evaluate((element, next) => Boolean(next
+    && (element.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING)), await history.elementHandle())).toBe(true);
   await expect(panel.getByRole("heading", { name: "Data sync", level: 2 })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await reports.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   const sourceCounts = page.locator(".sync-inventory-counts");
   if (await sourceCounts.isVisible()) {
     expect(await sourceCounts.evaluate(element => getComputedStyle(element).display)).toBe("grid");
@@ -25,7 +34,7 @@ async function expectAccessibleSyncPage(page: Page) {
   expect(bounds!.x).toBeGreaterThanOrEqual(0);
   expect(bounds!.width + bounds!.x).toBeLessThanOrEqual(page.viewportSize()!.width);
   const accessibility = await new AxeBuilder({ page })
-    .include(".data-sync-panel").include(".sync-inventory-tools").include(".jobs-view").analyze();
+    .include(".data-sync-reports").include(".data-sync-panel").include(".sync-inventory-tools").include(".jobs-view").analyze();
   expect(accessibility.violations).toEqual([]);
 }
 
@@ -80,7 +89,7 @@ test("Sync status, run details and history remain live beyond thirty minutes wit
   await page.clock.runFor(2_100);
   await expect(dialog.getByText("Sync complete", { exact: true })).toBeVisible();
   await expect(page.locator(".data-sync-last-run")).toContainText("Sync complete");
-  await expect(page.getByRole("table", { name: "Sync run history", includeHidden: true })).toContainText("Complete");
+  await expect(page.getByRole("table", { name: "Sync history", includeHidden: true })).toContainText("Complete");
   await expect(page.locator(".data-sync-panel")).toHaveAttribute("aria-busy", "false");
   await expect(page.locator(".sync-history")).toHaveAttribute("aria-busy", "false");
   const finalReads = { state: stateReads(), run: runReads(), history: historyReads };
@@ -156,15 +165,19 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(panel.getByRole("button", { name: "Check progress" })).toHaveCount(0);
   await expect(panel.getByText(/Closing this window does not cancel sync/)).toHaveCount(0);
   await expect(panel.getByText("Sync all sources", { exact: true })).toHaveCount(1);
-  await expect(panel.getByRole("button", { name: "Add CSV reports" })).toBeVisible();
-  await expect(panel.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
+  const reports = page.getByRole("region", { name: "CSV usage reports", exact: true });
+  await expect(reports.getByRole("button", { name: "Add CSV reports" })).toBeVisible();
+  await expect(reports.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
+  await expect(panel.getByRole("button", { name: "Add CSV reports" })).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
   await expect(panel.getByText("3 of 3 sources synced", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Import needed", { exact: true })).toBeVisible();
+  await expect(reports.getByText("Reports available", { exact: true })).toBeVisible();
+  await expect(reports.locator("time[datetime='2026-08-01']")).toHaveCount(2);
+  await expect(reports.locator("time[datetime='2026-08-30']")).toHaveCount(2);
   await expectAccessibleSyncPage(page);
   await page.screenshot({ path: info.outputPath("sync-complete.png") });
   await expect(panel.locator("details")).toHaveCount(0);
-  await panel.getByRole("button", { name: "Add CSV reports" }).click();
+  await reports.getByRole("button", { name: "Add CSV reports" }).click();
   await expect(panel).toBeVisible();
   await expect(page).toHaveURL(/\/sync\?reports=import$/);
   const importer = page.getByRole("dialog", { name: "Import CSV reports" });
@@ -176,8 +189,8 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(panel).toBeVisible();
   await expect(page).toHaveURL(/\/sync$/);
-  await expect(panel.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
-  await panel.getByRole("button", { name: "Manage reports", exact: true }).click();
+  await expect(reports.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
+  await reports.getByRole("button", { name: "Manage reports", exact: true }).click();
   await expect(page).toHaveURL(/\/sync\?reports=manage$/);
   const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
   await expect(manager).toBeVisible();
@@ -185,7 +198,7 @@ test("setup stays out of Agents and the responsive Sync page continues live prog
   await expect(manager.getByRole("list", { name: "Import progress" })).toHaveCount(0);
   await manager.getByRole("button", { name: "Close reports" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(panel.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
+  await expect(reports.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
   expect(fixture.starts).toHaveLength(1);
   expect(fixture.unexpected).toEqual([]);
@@ -396,9 +409,8 @@ test("direct Sync navigation keeps diagnostics optional and history restricted t
   await expect(history.getByText(/CSV imports are retained in Manage reports above/)).toBeVisible();
   await expect(history.getByRole("link", { name: /reports|report history/i })).toHaveCount(0);
   await expect(history.getByRole("button", { name: /reports|report history/i })).toHaveCount(0);
-  await expect(history.getByText("Power Platform inventory refresh", { exact: true })).toHaveCount(0);
-  await history.getByRole("button", { name: "Source jobs" }).click();
-  await expect(history.getByRole("table", { name: "Source job history" })).toBeVisible();
+  await expect(history.getByRole("button", { name: /Sync runs|Source jobs/ })).toHaveCount(0);
+  await expect(history.getByRole("table", { name: "Sync history" })).toBeVisible();
   await expect(history.getByText("Power Platform inventory refresh", { exact: true })).toBeVisible();
   await expect(history.getByText("Package access recovery")).toHaveCount(0);
   await expect(history.getByText("Saved Purview compliance search")).toHaveCount(0);
@@ -517,7 +529,7 @@ for (const entryPath of ["/sync", "/agents"]) {
   });
 }
 
-test("sync history rewrites legacy sync-run links and opens retained details in place", async ({ page }, info) => {
+test("one chronological sync history combines runs and refreshes, filters outcomes and preserves exact detail links", async ({ page }, info) => {
   const state = completedState();
   const retained: DataSyncRun = { ...state.run!, id: "33333333-3333-4333-8333-333333333333" };
   const fixture = await mockSync(page, state, [retained]);
@@ -527,15 +539,48 @@ test("sync history rewrites legacy sync-run links and opens retained details in 
       status: "completed", total: 4, completed: 4, partial: false, canResume: false, canCancel: false, canReconcile: false,
       startedAt: retained.startedAt, completedAt: retained.completedAt, syncSources: retained.sources.map(source => source.source),
       updatedAt: retained.updatedAt, href: `/agents?syncRun=${retained.id}`,
+    }, {
+      id: "history-package", source: "package-refresh", label: "Graph package refresh", target: "Current principal Graph package catalog",
+      status: "succeeded", total: 120, completed: 120, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      startedAt: "2026-09-15T10:00:20.000Z", completedAt: "2026-09-15T10:01:00.000Z",
+      updatedAt: retained.updatedAt, href: "/sync?refreshJob=history-package",
+    }, {
+      id: "history-platform", source: "power-platform", label: "Power Platform refresh", target: "Agents and environments",
+      status: "failed", total: 10, completed: 4, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      startedAt: "2026-09-15T10:00:30.000Z", completedAt: "2026-09-15T10:01:00.000Z",
+      updatedAt: retained.updatedAt, href: "/sync?powerPlatformJob=history-platform",
     }],
     unavailableSources: [], polledAt: retained.updatedAt, requestId: "sync-history-request",
   } }));
   await page.goto("/sync");
   const history = page.getByRole("region", { name: "Sync history", exact: true });
-  const table = history.getByRole("table", { name: "Sync run history" });
+  const table = history.getByRole("table", { name: "Sync history" });
   await expect(table).toBeVisible();
+  await expect(history.getByRole("group", { name: "History type" })).toHaveCount(0);
+  await expect(history.getByRole("button", { name: /Sync runs|Source jobs/ })).toHaveCount(0);
+  await expect(table.getByRole("row")).toHaveCount(4);
+  await expect(table.getByRole("row").nth(1)).toContainText("Power Platform refresh");
+  await expect(table.getByRole("row").nth(2)).toContainText("Graph package refresh");
+  await expect(table.getByRole("row").nth(3)).toContainText("Retained initial sync");
+  await expect(table.getByText("120 records saved")).toBeVisible();
+  await expect(table.getByText("4 reported so far")).toBeVisible();
+  await expect(table.getByText("4 of 4 sources complete")).toBeVisible();
+  await expect(table.getByRole("link", { name: /View details for Graph package refresh/ })).toHaveAttribute("href", "/sync?refreshJob=history-package");
+  await expect(table.getByRole("link", { name: /View details for Power Platform refresh/ })).toHaveAttribute("href", "/sync?powerPlatformJob=history-platform");
+  const outcome = history.getByRole("combobox", { name: "Outcome" });
+  await outcome.selectOption("complete");
+  await expect(table.getByRole("row")).toHaveCount(3);
+  await expect(table).not.toContainText("Power Platform refresh");
+  await outcome.selectOption("incomplete");
   await expect(table.getByRole("row")).toHaveCount(2);
+  await expect(table).toContainText("Power Platform refresh");
+  await outcome.selectOption("active");
+  await expect(history.getByText("No recent records match this outcome.")).toBeVisible();
+  await outcome.selectOption("all");
+  await expect(table.getByRole("row")).toHaveCount(4);
   await expect(table.getByRole("button", { name: /Retry|Cancel|Resume/ })).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include(".sync-history").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await history.scrollIntoViewIfNeeded();
   await history.screenshot({ path: info.outputPath("sync-history-table.png") });
   const link = history.getByRole("link", { name: /View details for Retained initial sync/ });

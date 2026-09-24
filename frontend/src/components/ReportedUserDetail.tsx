@@ -6,6 +6,7 @@ import { CopilotServiceDetails } from "./CopilotServiceDetails";
 import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { ReportedUserAgents, type UserRelationshipFilters } from "./ReportedUserAgents";
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
+import { UserPurviewAudit } from "./UserPurviewAudit";
 
 export function ReportedUserDetail({ user, directoryUser, hasRelationships, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision }: {
   user: OfficialUsageUserSummary;
@@ -58,6 +59,7 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
       : user.hasReportMismatch ? <p className="copilot-users-notice">Report totals differ. The Users total and Users &amp; agents breakdown are shown separately, never added or reconciled by guessing.</p> : null}
     <ReportedUserAgents user={user} filters={filters} onFocusAgent={onFocusAgent} />
     <UserAgentResponsibility objectId={directoryUser?.directory.objectId} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
+    <UserPurviewAudit userPrincipalName={directoryUser?.directory.userPrincipalName} />
     <details className="copilot-users-provenance">
       <summary>Identity and report coverage</summary>
       <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}.</p>

@@ -8,10 +8,9 @@ import {
   parseAuditRoute,
   parseSyncReportRoute,
   migrateOfficialUsageRoute,
-  parseSecurityRoute,
+  migrateSecurityRoute,
   parseUsersRoute,
   parseWorkbenchView,
-  securityRouteSearch,
   usersRouteSearch,
   workbenchUrl,
   maximumInlinePackageRouteBytes,
@@ -37,7 +36,9 @@ describe("workbench routing", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
     expect(parseWorkbenchView("/power-platform/")).toBe("agents");
     expect(parseWorkbenchView("/official-usage")).toBe("sync");
-    expect(parseWorkbenchView("/security")).toBe("security");
+    expect(parseWorkbenchView("/security")).toBe("agents");
+    expect(migrateSecurityRoute("/security/")).toBe("/agents");
+    expect(migrateSecurityRoute("/agents")).toBeUndefined();
     expect(parseWorkbenchView("/jobs")).toBe("jobs");
     expect(parseWorkbenchView("/sync")).toBe("sync");
     expect(parseWorkbenchView("/unknown")).toBe("agents");
@@ -224,13 +225,10 @@ describe("workbench routing", () => {
     expect(parseAgentRoute("source=power_platform&environment=env-a&detail=graph_packages%3Apackage-a").detailId).toBe("graph_packages:package-a");
   });
 
-  it("round trips source-specific audit, security and Sync report state", () => {
+  it("round trips source-specific audit and Sync report state", () => {
     const audit = parseAuditRoute("source=purview&job=older&q=actor&action=block&status=failed&page=3");
-    expect(audit).toEqual({ source: "purview", jobId: "older", search: "actor", action: "block", status: "failed", page: 2 });
+    expect(audit).toEqual({ search: "actor", action: "block", status: "failed", page: 2 });
     expect(parseAuditRoute(auditRouteSearch(audit).toString())).toEqual(audit);
-
-    const security = parseSecurityRoute("job=older&mode=application&template=agent_activity&operation=InvokeAgent&agentIds=agent-a");
-    expect(parseSecurityRoute(securityRouteSearch(security).toString())).toEqual(security);
 
     const sync = parseDataSyncRoute("reports=snapshot&snapshot=11111111-1111-4111-8111-111111111111&window=90");
     expect(parseDataSyncRoute(dataSyncRouteSearch(sync).toString())).toEqual(sync);
@@ -314,11 +312,10 @@ describe("workbench routing", () => {
     expect(parseSyncReportRoute("reports=snapshot&window=90")).toMatchObject({ view: "snapshot", activityWindowDays: 90 });
   });
 
-  it("carries an exact employee identity into an explicit Purview search", () => {
+  it("drops obsolete provider source, job and user parameters from local Audit", () => {
     const route = parseAuditRoute("source=purview&user=employee%2Btest%40example.invalid");
-    expect(route.userPrincipalName).toBe("employee+test@example.invalid");
-    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
-    expect(auditRouteSearch({ ...route, source: "local" }).has("user")).toBe(false);
-    expect(parseAuditRoute(`source=purview&user=${"a".repeat(500)}`).userPrincipalName).toBeUndefined();
+    expect(route).toEqual({ search: "", action: "all", status: "all", page: 0 });
+    expect(auditRouteSearch(route).toString()).toBe("");
+    expect(auditRouteSearch(parseAuditRoute("job=old&source=purview&action=block")).toString()).toBe("action=block");
   });
 });

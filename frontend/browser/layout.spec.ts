@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { huntingJob, layoutTime, mockLayoutApi, purviewJob } from "./layoutFixtures";
+import { layoutTime, mockLayoutApi } from "./layoutFixtures";
 import { collectLayoutFailures } from "./layoutGeometry";
 
 const viewports = [360, 768, 1280, 1920];
@@ -12,11 +12,11 @@ const cases = [
     fields: [".usage-agent-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
-  { name: "audit-purview", path: `/audit?source=purview&job=${purviewJob.id}`, ready: ".purview-history-table tbody tr",
+  { name: "user-purview", path: "/users", ready: ".copilot-users-table tbody tr",
     fields: [".purview-search-primary", ".purview-structured-filters > div"] },
-  { name: "security", path: `/security?job=${huntingJob.id}`, ready: ".hunting-history-table tbody tr",
-    fields: [".hunting-primary-fields", ".hunting-filters > div"] },
-  { name: "permissions", path: "/permissions", ready: ".permission-table tbody tr",
+  { name: "agent-investigation", path: "/agents?detail=graph_packages%3Alayout-package-1&detailTab=audit-security", ready: ".hunting-history-table tbody tr",
+    fields: [".hunting-primary-fields"] },
+  { name: "permissions", path: "/permissions", ready: ".permission-issue-list > li",
     fields: [] },
   { name: "jobs", path: "/jobs", ready: ".job-history-table tbody tr",
     fields: [] },
@@ -41,29 +41,36 @@ for (const scenario of cases) {
     const unexpectedRequests = await mockLayoutApi(page);
     await page.goto(scenario.path);
     await expect(page.locator(scenario.ready).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: /provider-verified.*degraded/, includeHidden: scenario.name === "report-snapshot" })).toBeVisible();
+    if (scenario.name !== "agent-investigation") await expect(page.getByRole("button", { name: /^Permissions: \d+ issues?$/, includeHidden: scenario.name === "report-snapshot" })).toBeVisible();
     if (scenario.name === "agents") {
       await page.getByRole("checkbox", { name: "Advanced filters" }).check();
     }
 
-    if (scenario.name === "audit-purview") {
-      await page.getByText("Structured identity filters", { exact: true }).click();
-      await expect(page.getByLabel("User principal names", { exact: true })).toBeVisible();
-      await expect(page.locator(".purview-results")).toBeVisible();
+    if (scenario.name === "user-purview") {
+      await page.getByRole("button", { name: "Ada", exact: true }).click();
+      await page.getByRole("button", { name: "Open Purview audit search", exact: true }).click();
+      await expect(page.locator(".purview-history-table tbody tr")).toBeVisible();
+      await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toBeVisible();
       await page.locator(".purview-history-table").getByRole("button", { name: /View/ }).click();
       await expect(page.locator(".purview-results tbody tr").first()).toBeVisible();
     }
-    if (scenario.name === "security") {
-      await page.getByText("Typed identity filters", { exact: true }).click();
-      await expect(page.getByLabel("Agent IDs", { exact: true })).toBeVisible();
-      await expect(page.locator(".hunting-results")).toBeVisible();
-      const loadRows = page.getByRole("button", { name: "Load minimized rows", exact: true });
-      if (await loadRows.count()) await loadRows.click();
+    if (scenario.name === "agent-investigation") {
+      await page.getByText("Agent scope (automatic)", { exact: true }).click();
+      await expect(page.getByLabel("Agent IDs", { exact: true })).toHaveCount(0);
+      await page.getByRole("button", { name: /View hunt/ }).click();
       await expect(page.getByText("Saved service desk security observation", { exact: true })).toBeVisible();
+      await expect(page).toHaveURL(/\/agents\?.*detailTab=audit-security/);
     }
     if (scenario.name === "permissions") {
-      await page.getByRole("button", { name: "Shared application modes (3)" }).click();
-      await expect(page.getByRole("table", { name: "Shared application permissions" })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Issues", exact: true }).getByRole("button", { name: "Details: Agent inventory", exact: true })).toBeVisible();
+      const prerequisites = page.getByRole("region", { name: "App prerequisites" });
+      await prerequisites.getByText("Required API permissions", { exact: true }).click();
+      await prerequisites.getByText("Optional application permissions", { exact: true }).click();
+      await expect(prerequisites.getByRole("region", { name: "Microsoft Graph / Application", exact: true })).toBeVisible();
+      const logs = page.getByRole("region", { name: "Log setup" });
+      await logs.getByText("Log collection setup", { exact: true }).click();
+      await logs.getByText("Steps & permissions", { exact: true }).nth(2).click();
+      await expect(logs.getByText(/Get-AdminAuditLogConfig \| Format-List UnifiedAuditLogIngestionEnabled/)).toBeVisible();
     }
     if (scenario.name === "report-snapshot") {
       await expect(page.locator(".usage-report-context")).toContainText("2026-08-30");
@@ -103,13 +110,12 @@ for (const scenario of cases) {
           const columns = await page.locator(selector).evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
           expect.soft(columns, `${selector} column contract at ${width}px`).toBe(expectedColumns);
         }
-        if (scenario.name === "security") {
-          const columns = await page.locator(".hunting-readiness").evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length);
-          expect.soft(columns, `Five readiness facts at ${width}px`).toBe(width === 360 ? 1 : width === 768 ? 2 : 5);
+        if (scenario.name === "agent-investigation") {
+          await expect(page.locator(".hunting-readiness > div")).toHaveCount(5);
           await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agent_activity");
-          await expect(page.getByLabel("Actor object IDs", { exact: true })).toBeVisible();
-          await page.screenshot({ path: info.outputPath(`security-${width}-activity-filters.png`), fullPage: true, animations: "disabled" });
-          await assertLayout(page, scenario.fields, `security three-field activity form at ${width}px`);
+          await expect(page.getByLabel("Actor object IDs", { exact: true })).toHaveCount(0);
+          await page.screenshot({ path: info.outputPath(`agent-investigation-${width}-activity-filters.png`), fullPage: true, animations: "disabled" });
+          await assertLayout(page, scenario.fields, `agent-scoped activity form at ${width}px`);
           await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agents_inventory");
         }
         if (scenario.name === "report-snapshot") {

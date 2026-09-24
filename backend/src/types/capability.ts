@@ -16,6 +16,7 @@ export const capabilityIds = [
   "graph.package.block.manage",
   "graph.package.reassign.manage",
   "graph.directory.read",
+  "graph.agentIdentity.read",
   "graph.licenses.read",
   "powerPlatform.inventory.read",
   "powerPlatform.quarantine.read",
@@ -29,6 +30,10 @@ export const capabilityIds = [
 ] as const;
 
 export type CapabilityId = (typeof capabilityIds)[number];
+
+export type CapabilityCheckProgress = {
+  checks: Array<{ capabilityId: CapabilityId; state: "reviewing" | "checking" | "complete" }>;
+};
 
 const automaticCapabilityIds = new Set<CapabilityId>([
   "graph.package.read.delegated",
@@ -117,9 +122,19 @@ export type CapabilityDecision = {
 export type CapabilityView = {
   definition: CapabilityDefinition;
   decision: CapabilityDecision;
+  // Recent real operation failures do not change the authorization decision.
+  operationFailure?: CapabilityOperationFailure;
   enabled?: boolean;
   configuration?: {
     enabled: boolean;
     sharedDataScope: boolean;
   };
+};
+
+export type CapabilityOperationFailure = {
+  status: Extract<CapabilityStatus, "missing_permission" | "missing_role" | "missing_license" | "provider_error" | "unknown">;
+  checkedAt: string;
+  expiresAt: string;
+  evidence?: CapabilityDecision["evidence"];
+  remediation: string[];
 };

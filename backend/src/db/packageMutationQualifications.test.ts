@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
 import { bootstrap, grantRuntime, migrate, retain } from "../../scripts/database.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { runBulkJob } from "../services/bulkJobs.js";
+import { capabilities } from "../services/capabilities.js";
+
+beforeEach(() => { vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined)); });
+afterEach(() => vi.restoreAllMocks());
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
 import { assessCanaryRestoration, packageCanaryMutation, PackageMutationQualificationRepository } from "./packageMutationQualifications.js";

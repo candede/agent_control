@@ -23,7 +23,7 @@ const actor: SessionUser = {
   username: "layout.administrator@example.invalid",
   homeAccountId: "layout-principal", tenantId: "layout-tenant", roles: ["AgentControl.Admin"],
 };
-const capabilityViews: CapabilityView[] = capabilityDefinitions.map(definition => {
+export const capabilityViews: CapabilityView[] = capabilityDefinitions.map(definition => {
   const local = definition.mode === "local";
   return {
     definition,
@@ -195,7 +195,7 @@ const usageHistory: OfficialUsageHistoryView = {
     importCount: 1, uniqueObservationCount: 3, observationRowCount: 6, uniquePayloadCount: 6, repeatedRowsReused: 0,
     earliestObservedAt: observedAt, latestObservedAt: observedAt,
     activityDateRange: { earliestDateUtc: "2026-08-01", latestDateUtc: "2026-08-30", provenance: "last_activity_dates", provesReportingCoverage: false },
-    reportingWindows: { knownCount: 1, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
+    reportingWindows: { earliestStartDateUtc: "2026-08-01", latestEndDateUtc: "2026-08-30", knownCount: 1, unknownCount: 0, overlappingKnownWindowCount: 0, additive: false },
     warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
   },
   bundles: {
@@ -225,7 +225,7 @@ export const purviewJob: PurviewAuditJob = {
   filters: {
     presetId: "copilot_interactions", operations: ["CopilotInteraction"],
     startDateTime: "2026-09-12T09:00:00.000Z", endDateTime: observedAt,
-    userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
+    userPrincipalNames: [copilotUsageFixture.users[0].directory.userPrincipalName], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
   },
   displayName: "Saved Copilot compliance investigation", providerQueryId: "layout-query", providerStatus: "succeeded",
   localRequestId: "layout-purview-request", providerRequestId: "layout-provider-request", projectionVersion: 1,
@@ -316,10 +316,10 @@ const jobs: WorkbenchJobsResponse = {
       updatedAt: observedAt, href: "/agents" },
     { id: purviewJob.id, source: "purview", label: "Saved Purview compliance search", target: "Copilot interactions · delegated",
       status: "succeeded", total: 1, completed: 1, partial: false, canResume: false, canCancel: false, canReconcile: false,
-      updatedAt: observedAt, href: `/audit?source=purview&job=${purviewJob.id}` },
+      updatedAt: observedAt, href: "/users" },
     { id: huntingJob.id, source: "defender", label: "Saved Defender agent inventory", target: "AgentsInfo · delegated",
       status: "succeeded", total: 1, completed: 1, partial: false, canResume: false, canCancel: false, canReconcile: false,
-      updatedAt: observedAt, href: `/security?job=${huntingJob.id}` },
+      updatedAt: observedAt, href: "/agents" },
   ],
   unavailableSources: [{ source: "quarantine", code: "temporarily_unavailable" }], polledAt: observedAt, requestId: "layout-jobs-request",
 };
@@ -335,9 +335,15 @@ export async function mockLayoutApi(page: Page) {
     "/api/me": { user: actor, csrfToken: "layout-csrf", roleAssignmentRequired: false },
     "/api/workbench/metadata": { views: workbenchViews, actions: workbenchActions },
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
+    "/api/capabilities/check-progress": { progress: null },
     "/api/agents": packages,
     ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}`, item])),
     "/api/agent-inventory": { ...unifiedAgents, inventoryOverview: summarizeAgentAvailability(unifiedAgents.value) },
+    "/api/agent-inventory/investigations/context": {
+      recordId: unifiedAgents.value[0].id, displayName: unifiedAgents.value[0].displayName,
+      defender: { status: "available", entraAgentIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] },
+      purview: { status: "unavailable", mode: "saved_only", reason: "No exact saved audit bot identity." },
+    },
     "/api/data-sync/state": {
       onboardingRequired: false, usageImportRequired: false, run: null,
       sources: ["users", "graph_packages", "power_platform", "usage_reports"].map(source => ({
@@ -361,6 +367,14 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === "/api/agent-inventory" && route.request().method() === "GET") {
+      const recordId = new URL(route.request().url()).searchParams.get("recordId");
+      if (recordId) {
+        const value = unifiedAgents.value.filter(record => record.id === recordId);
+        return route.fulfill({ json: { ...unifiedAgents, value, count: value.length, offset: 0,
+          inventoryOverview: summarizeAgentAvailability(value) } });
+      }
+    }
     if (path === "/api/agent-responsibility" && route.request().method() === "GET") {
       const query = new URL(route.request().url()).searchParams;
       const objectId = query.get("objectId") ?? undefined;

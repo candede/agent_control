@@ -1,4 +1,5 @@
-import type { AppRole, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
+import type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
+import { capabilityIds, supportsAutomaticCapabilityCheck } from "../../../backend/src/types/capability";
 import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
@@ -11,6 +12,8 @@ import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput }
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
+import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
+export type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
 import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 export type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
 import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
@@ -18,7 +21,7 @@ export type { AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssoc
 import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventoryExportAction } from "../../../backend/src/types/audit";
 export type { InventorySourceAwareDetail, WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
-export type { AppRole, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
+export type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
 export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export type { InventoryRefreshJobList } from "../../../backend/src/types/powerPlatformInventory";
 export type {
@@ -523,18 +526,35 @@ export function checkCapabilities(options: { signal?: AbortSignal; retryFailed?:
   });
 }
 
+export async function getCapabilityCheckProgress(options: { signal?: AbortSignal; retryFailed?: boolean } = {}) {
+  const result = await request<{ progress: unknown }>(`/api/capabilities/check-progress${options.retryFailed ? "?retry=failed" : ""}`, {
+    signal: options.signal,
+  });
+  if (!result || result.progress !== null && !validCheckProgress(result.progress)) {
+    throw new ApiError(200, "invalid_response", "The server returned invalid permission-check progress.");
+  }
+  return { progress: result.progress };
+}
+
+function validCheckProgress(value: unknown): value is CapabilityCheckProgress {
+  if (!value || typeof value !== "object" || !("checks" in value) || !Array.isArray(value.checks)
+    || value.checks.length > capabilityIds.length) return false;
+  const ids = new Set<string>();
+  return value.checks.every((check: unknown) => {
+    if (!check || typeof check !== "object" || !("capabilityId" in check) || typeof check.capabilityId !== "string"
+      || !("state" in check) || typeof check.state !== "string" || !["reviewing", "checking", "complete"].includes(check.state)
+      || !capabilityIds.some(id => id === check.capabilityId && supportsAutomaticCapabilityCheck(id)) || ids.has(check.capabilityId)) return false;
+    ids.add(check.capabilityId);
+    return true;
+  });
+}
+
 export function getWorkbenchMetadata(options: { signal?: AbortSignal } = {}) {
   return request<WorkbenchMetadata>("/api/workbench/metadata", { signal: options.signal });
 }
 
 export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
   return request<WorkbenchJobsResponse>("/api/workbench/jobs", { signal: options.signal });
-}
-
-export function beginCapabilityConsent(capabilityId: CapabilityId, returnTo = "/", options: { signal?: AbortSignal } = {}) {
-  return request<{ authorizationUrl: string }>("/api/auth/consent", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capabilityId, returnTo }), signal: options.signal,
-  });
 }
 
 export function configureApplicationCapability(capabilityId: CapabilityId, enabled: boolean, sharedDataScope: boolean) {
@@ -964,8 +984,9 @@ export function getPurviewAuditCatalog(options: { signal?: AbortSignal } = {}) {
   return request<PurviewAuditCatalog>("/api/audit-search/catalog", { signal: options.signal });
 }
 
-export function getPurviewAuditJobs(limit = 20, offset = 0, options: { signal?: AbortSignal } = {}) {
+export function getPurviewAuditJobs(limit = 20, offset = 0, options: { signal?: AbortSignal; userPrincipalName?: string } = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (options.userPrincipalName) params.set("userPrincipalName", options.userPrincipalName);
   return request<PurviewAuditHistory>(`/api/audit-search/jobs?${params}`, { signal: options.signal });
 }
 
@@ -1020,56 +1041,85 @@ export type DefenderHuntingCatalog = {
   defenderPortalUrl: string;
 };
 
-export function getDefenderHuntingCatalog(options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingCatalog>("/api/hunting/catalog", { signal: options.signal });
+type AgentHuntingOptions = { signal?: AbortSignal; agentRecordId?: string };
+
+export function getAgentInvestigationContext(recordId: string, options: { signal?: AbortSignal } = {}) {
+  return request<AgentInvestigationContext>(`/api/agent-inventory/investigations/context?${new URLSearchParams({ recordId })}`, { signal: options.signal });
 }
 
-export function getDefenderHuntingJobs(limit = 20, offset = 0, options: { signal?: AbortSignal } = {}) {
+export function resolveAgentInvestigationIdentity(recordId: string, options: { signal?: AbortSignal } = {}) {
+  return request<AgentInvestigationContext>("/api/agent-inventory/investigations/resolve", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ recordId }), signal: options.signal,
+  });
+}
+
+export function getAgentPurviewRecords(recordId: string, query: { limit: number; offset: number; search?: string; operation?: string }, options: { signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams({ recordId, limit: String(query.limit), offset: String(query.offset) });
+  if (query.search) params.set("search", query.search);
+  if (query.operation) params.set("operation", query.operation);
+  return request<AgentPurviewRecordPage>(`/api/agent-inventory/investigations/purview?${params}`, { signal: options.signal });
+}
+
+function agentHuntingUrl(path: string, options: AgentHuntingOptions) {
+  if (!options.agentRecordId) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}${new URLSearchParams({ agentRecordId: options.agentRecordId })}`;
+}
+
+function huntingSubmissionFilters(filters: DefenderHuntingFilters, options: AgentHuntingOptions) {
+  if (!options.agentRecordId) return filters;
+  return { templateId: filters.templateId, startDateTime: filters.startDateTime, endDateTime: filters.endDateTime, operations: filters.operations };
+}
+
+export function getDefenderHuntingCatalog(options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingCatalog>(agentHuntingUrl("/api/hunting/catalog", options), { signal: options.signal });
+}
+
+export function getDefenderHuntingJobs(limit = 20, offset = 0, options: AgentHuntingOptions = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<DefenderHuntingHistory>(`/api/hunting/jobs?${params}`, { signal: options.signal });
+  return request<DefenderHuntingHistory>(agentHuntingUrl(`/api/hunting/jobs?${params}`, options), { signal: options.signal });
 }
 
-export function getDefenderHuntingJob(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}`, { signal: options.signal });
+export function getDefenderHuntingJob(id: string, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}`, options), { signal: options.signal });
 }
 
-export function submitDefenderHunt(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>("/api/hunting/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
+export function submitDefenderHunt(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl("/api/hunting/jobs", options), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters: huntingSubmissionFilters(filters, options) }), signal: options.signal });
 }
 
-export function getDefenderHuntingRows(id: string, limit = 100, offset = 0, options: { signal?: AbortSignal } = {}) {
+export function getDefenderHuntingRows(id: string, limit = 100, offset = 0, options: AgentHuntingOptions = {}) {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
-  return request<DefenderHuntingRowPage>(`/api/hunting/jobs/${encodeURIComponent(id)}/rows?${params}`, { signal: options.signal });
+  return request<DefenderHuntingRowPage>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/rows?${params}`, options), { signal: options.signal });
 }
 
-export function resumeDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/resume`, { method: "POST", signal: options.signal });
+export function resumeDefenderHunt(id: string, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/resume`, options), { method: "POST", signal: options.signal });
 }
 
-export function cancelDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>(`/api/hunting/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", signal: options.signal });
+export function cancelDefenderHunt(id: string, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/cancel`, options), { method: "POST", signal: options.signal });
 }
 
-export function deleteDefenderHunt(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<void>(`/api/hunting/jobs/${encodeURIComponent(id)}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal });
+export function deleteDefenderHunt(id: string, options: AgentHuntingOptions = {}) {
+  return request<void>(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}`, options), { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal });
 }
 
-export function approveDefenderHuntingQualification(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>("/api/hunting/qualifications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters }), signal: options.signal });
+export function approveDefenderHuntingQualification(tokenMode: DefenderHuntingTokenMode, filters: DefenderHuntingFilters, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl("/api/hunting/qualifications", options), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tokenMode, filters: huntingSubmissionFilters(filters, options) }), signal: options.signal });
 }
 
-export function startDefenderHuntingQualification(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingJob>(`/api/hunting/qualifications/${encodeURIComponent(id)}/start`, { method: "POST", signal: options.signal });
+export function startDefenderHuntingQualification(id: string, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingJob>(agentHuntingUrl(`/api/hunting/qualifications/${encodeURIComponent(id)}/start`, options), { method: "POST", signal: options.signal });
 }
 
-export function revokeDefenderHuntingRetainedScope(id: string, options: { signal?: AbortSignal } = {}) {
-  return request<DefenderHuntingRetainedScope>(`/api/hunting/retained-scopes/${encodeURIComponent(id)}/revoke`, {
+export function revokeDefenderHuntingRetainedScope(id: string, options: AgentHuntingOptions = {}) {
+  return request<DefenderHuntingRetainedScope>(agentHuntingUrl(`/api/hunting/retained-scopes/${encodeURIComponent(id)}/revoke`, options), {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmation: id }), signal: options.signal,
   });
 }
 
-export async function downloadDefenderHuntingCsv(id: string, options: { signal?: AbortSignal } = {}) {
-  return requestBlob(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, { headers: { Accept: "text/csv" }, signal: options.signal });
+export async function downloadDefenderHuntingCsv(id: string, options: AgentHuntingOptions = {}) {
+  return requestBlob(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, options), { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
 export async function downloadOfficialUsageCsv(kind: "aggregate" | "users", query: Record<string, string | number | boolean | undefined> = {}, signal?: AbortSignal) {
