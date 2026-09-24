@@ -5,8 +5,21 @@ import { dataSync, type DataSyncService } from "../services/dataSync.js";
 import { dataSyncSourceIds, type DataSyncSourceId, type StartDataSyncInput } from "../types/dataSync.js";
 import { policyRoute } from "./policy.js";
 
-export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "getRun" | "start" | "retry" | "cancel"> = dataSync) {
+export function createDataSyncRouter(service: Pick<DataSyncService, "state" | "getRun" | "start" | "retry" | "cancel" | "automaticRefresh"> = dataSync) {
   const router = Router();
+
+  policyRoute(router, "post", "/data-sync/auto-refresh", {
+    access: "authenticated",
+    dataClass: "private_data_sync_job",
+    roles: ["AgentControl.Viewer"],
+    csrf: true,
+  }, async (request, response) => {
+    requestScope(request);
+    requireEmptyBody(request.body, "Automatic refresh does not accept options.");
+    if (Object.keys(request.query).length) throw new AppError(400, "invalid_data_sync_query", "Automatic refresh does not accept query parameters.");
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await service.automaticRefresh(request.session.user!, request.session.signedInAt));
+  });
 
   policyRoute(router, "get", "/data-sync/state", {
     access: "authenticated",

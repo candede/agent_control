@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 import type { UnifiedAgentRecord } from "../src/api/client";
 import { createInventoryVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const creator = "52bff06b-5db5-42cd-9919-28f95e3c07af";
@@ -47,7 +48,7 @@ async function open(page: Page, value: UnifiedAgentRecord) {
   await page.clock.setFixedTime(new Date(layoutTime));
   const writes: string[] = [];
   page.on("request", request => {
-    if (request.method() !== "GET") writes.push(new URL(request.url()).pathname);
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(new URL(request.url()).pathname);
   });
   const summary = { total: 1, linked: 0, graphOnly: value.packages.length ? 1 : 0, powerPlatformOnly: value.packages.length ? 0 : 1, ambiguous: 0, conflicting: 0 };
   await page.route("**/api/agent-inventory*", route => route.fulfill({ json: {

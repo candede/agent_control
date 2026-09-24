@@ -11,6 +11,7 @@ import {
   cancelPurviewAuditSearch,
   cancelDefenderHunt,
   checkCapabilities,
+  checkAutomaticRefresh,
   getCapabilityCheckProgress,
   getBulkActionJob,
   getDefenderHuntingJob,
@@ -96,6 +97,20 @@ const accessUpdate: PackageAccessReplacement = {
     { resourceId: "group-1", resourceType: "group" },
   ],
 };
+
+it("checks automatic refresh with an empty JSON body and the current session CSRF token", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ user: {}, csrfToken: "auto-csrf", roleAssignmentRequired: false }))
+    .mockResolvedValueOnce(Response.json({ run: null, detailJob: null, revisions: {}, nextCheckAt: "next" }));
+  vi.stubGlobal("fetch", fetchMock);
+  await getCurrentUser();
+  const controller = new AbortController();
+  await checkAutomaticRefresh({ signal: controller.signal });
+  expect(fetchMock).toHaveBeenLastCalledWith("/api/data-sync/auto-refresh", expect.objectContaining({
+    method: "POST", body: "{}", credentials: "include", signal: controller.signal,
+    headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "auto-csrf" }),
+  }));
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();

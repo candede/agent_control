@@ -26,13 +26,16 @@ describe("data sync persistence integration", () => {
         SELECT $1,$2,$3,source,'succeeded',0,'Saved a legacy source.',false
         FROM jsonb_array_elements_text($4::jsonb) source`,
       [legacy.rows[0].id, scope.tenantId, scope.principalId, JSON.stringify(legacySources)]);
-      const repository = new DataSyncRepository(fixture.runtime);
-      await expect(repository.submit(scope, { mode: "full", clearSavedData: true })).rejects.toMatchObject({
+      await expect(fixture.runtime.query(`INSERT INTO data_sync_runs
+        (id,tenant_id,principal_id,mode,source_ids,request_hash,clear_saved_data)
+        VALUES(gen_random_uuid(),$1,$2,'full','["users","graph_packages","power_platform"]',repeat('b',64),true)`,
+      [scope.tenantId, scope.principalId])).rejects.toMatchObject({
         code: "23514", constraint: "data_sync_cleanup_full_scope",
       });
 
       await migrate(fixture.operator);
       await verifySchema(fixture.runtime);
+      const repository = new DataSyncRepository(fixture.runtime);
       expect((await fixture.runtime.query("SELECT version,checksum FROM schema_migrations ORDER BY version")).rows.slice(0, prior.length)).toEqual(prior);
       expect((await repository.getRun(scope, legacy.rows[0].id))?.sources).toHaveLength(4);
       const current = await repository.submit(scope, { mode: "full", clearSavedData: true });

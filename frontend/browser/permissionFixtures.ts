@@ -31,6 +31,7 @@ export function isUnexpectedPermissionCommand(method: string, pathname: string) 
   if (!["POST", "PUT", "PATCH", "DELETE"].includes(method) || !/^\/api\//i.test(pathname)) return false;
   return method !== "POST" || ![
     "/api/capabilities/check",
+    "/api/data-sync/auto-refresh",
     "/api/auth/consent",
     "/api/auth/logout",
   ].includes(pathname);

@@ -8,6 +8,7 @@ import { usageDate } from "../usageInsights";
 import { AgentAuthoringTools, AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
 import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 import { CapabilityContext } from "../capabilityContext";
+import { PackageDetailFreshnessStatus } from "./PackageDetailFreshnessStatus";
 
 const connectorPageSize = 10;
 
@@ -76,6 +77,7 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
     {record.packages.length > 1 ? <p className="agent-insight-note">Status, end-user access and installation cover all {record.packages.length} published versions. Package description and version are for the selected package; native configuration has its own Power Platform observation.</p> : null}
     {descriptionHtml ? <div className="agent-overview-description rich-description" aria-label="Agent description" dangerouslySetInnerHTML={{ __html: descriptionHtml }} />
       : <p className="agent-overview-description">{description}</p>}
+    <PackageDetailFreshnessStatus freshness={packageDetail?.detailFreshness ?? selectedPackage?.detailFreshness} now={now} />
     {missingName ? <p className="agent-insight-note">The saved inventory did not supply an agent name, so its resource ID is shown. This does not establish whether the agent was deleted.</p> : null}
     <section className="agent-overview-section" aria-label="Agent information">
       <h3>Responsibility</h3>

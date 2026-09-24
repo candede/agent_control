@@ -56,7 +56,9 @@ describe("canonical agent registry", () => {
       const auditBefore = await upgrade.runtime.query("SELECT to_jsonb(event) AS value,xmin::text AS row_version FROM audit_events event ORDER BY id");
       await migrate(upgrade.operator);
       await grantRuntime(upgrade.operator);
-      expect((await upgrade.runtime.query(`SELECT to_jsonb(snapshot) AS value FROM package_inventory_snapshots snapshot`)).rows).toEqual(before.rows);
+      expect((await upgrade.runtime.query(`SELECT to_jsonb(snapshot)
+        - ARRAY['observation_kind','control_state','identity_revalidation_required','read_started_at','catalog_only'] AS value
+        FROM package_inventory_snapshots snapshot`)).rows).toEqual(before.rows);
       expect((await upgrade.runtime.query("SELECT to_jsonb(resource) AS value,xmin::text AS row_version FROM package_inventory_resources resource")).rows).toEqual(resourcesBefore.rows);
       expect((await upgrade.runtime.query("SELECT to_jsonb(event) AS value,xmin::text AS row_version FROM audit_events event ORDER BY id")).rows).toEqual(auditBefore.rows);
       const constraintsAfter = new Map((await boundaries()).rows.map(row => [row.conname, row.definition]));
@@ -173,6 +175,7 @@ describe("canonical agent registry", () => {
     expect(result.rows[0].bytes).toBeGreaterThan(1_048_576);
     expect(result.rows[0].bytes).toBeLessThanOrEqual(2_097_152);
     expect(result.rows[0].package_data.elementDetails?.[0]?.elements[0]?.definition).toBe(definition);
+    expect((await packages.get(scope, value.id))?.package?.elementDetails?.[0]?.elements[0]?.definition).toBe(definition);
   });
 
   it("stores many opaque packages and one PP agent under one UUID without persisting provider payloads", async () => {
@@ -697,8 +700,10 @@ describe("canonical agent registry", () => {
     const exactId = `eeeeeeee-${randomUUID().slice(9)}`;
     const insert = async (id: string, exact: boolean) => {
       await fixture.runtime.query(`INSERT INTO package_inventory_snapshots(
-        id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count,observed_at)
-        VALUES($1,$2,$3,'delegated',$4,$5,$6::jsonb,1,1,1,$7::timestamptz+CASE WHEN $8 THEN interval '900 microseconds' ELSE interval '100 microseconds' END)`,
+        id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count,observed_at,read_started_at)
+        VALUES($1,$2,$3,'delegated',$4,$5,$6::jsonb,1,1,1,
+          $7::timestamptz+CASE WHEN $8 THEN interval '900 microseconds' ELSE interval '100 microseconds' END,
+          $7::timestamptz+CASE WHEN $8 THEN interval '900 microseconds' ELSE interval '100 microseconds' END)`,
       [id, scope.tenantId, scope.principalId, (exact ? "d" : "c").repeat(64), exact ? "exact" : "broad",
         JSON.stringify(exact ? ["same-millisecond"] : []), stamp, exact]);
       await fixture.runtime.query(`INSERT INTO package_inventory_resources(

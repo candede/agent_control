@@ -4,7 +4,9 @@ import { pool } from "../db/pool.js";
 import { DataSyncRepository, type DataSyncScope } from "../db/dataSync.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
 import { AppError, errorTelemetry } from "../errors.js";
-import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncSourceStatus, type DataSyncState, type StartDataSyncInput } from "../types/dataSync.js";
+import { automaticDataSyncSourceIds, dataSyncFailureStatus, type AutomaticRefreshResult, type DataSyncRun, type DataSyncSourceId, type DataSyncSourceStatus, type DataSyncState, type StartDataSyncInput } from "../types/dataSync.js";
+import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 import { hasAppRole } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { PublishedOfficialUsage } from "../types/officialUsage.js";
@@ -21,9 +23,9 @@ type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>
 type DataSyncDependencies = {
   repository: Pick<DataSyncRepository,
     "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listMarkers" | "attachJob" | "updateSource"
-    | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted">;
+    | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted" | "submitDue" | "automaticRevisions" | "finishAutomatic">;
   officialUsage: Pick<OfficialUsageRepository, "getPublished">;
-  packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
+  packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization" | "refreshDueDetails">;
   powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
   copilotUsage: Pick<CopilotUsageService, "refreshUsers">;
   agentPeople: Pick<AgentPeopleService, "refreshReferences">;
@@ -45,11 +47,11 @@ type TrackedChild = {
   jobId: string;
 };
 
-type RunAdmission = {
+type RunAdmission<T = unknown> = {
   scope: DataSyncScope;
   runId?: string;
   controller: AbortController;
-  operation: Promise<DataSyncRun>;
+  operation: Promise<T>;
 };
 
 const maximumActiveRuns = 4;
@@ -88,6 +90,38 @@ export class DataSyncService {
 
   listRuns(scope: DataSyncScope, limit = 20) {
     return this.dependencies.repository.listRuns(scope, limit);
+  }
+
+  async automaticRefresh(user: AuthenticatedUser, signedInAt?: number): Promise<AutomaticRefreshResult> {
+    requireViewer(user);
+    requireProviderAdmissions();
+    const scope = dataScope(user);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const run = await this.admit(user, undefined, async (owner, signal) => {
+      const previous = await this.dependencies.repository.getLatestRun(owner);
+      signal.throwIfAborted();
+      if (previous?.automatic && previous.status !== "running" && !this.active.has(previous.id)) {
+        const failures = await this.cancelChildJobs(user, previous);
+        if (failures.length) throw failures[0];
+      }
+      const submitted = await commitAccountSessionValidation(validation, () => this.dependencies.repository.submitDue(owner, signedInAt));
+      signal.throwIfAborted();
+      if (submitted.created && submitted.run) {
+        this.launch(user, owner, submitted.run.id, submitted.run.sources.filter(executableSource).map(source => source.source), false, true, signedInAt);
+      }
+      return submitted.run;
+    });
+    // Enrichment has its own durable admission and must not hold the fast sync run open.
+    const detailJob = run && !run.automatic && ["running", "waiting"].includes(run.status)
+      ? null : await this.dependencies.packages.refreshDueDetails(user, signedInAt);
+    return commitAccountSessionValidation(validation, async () => ({
+      run,
+      detailJob: detailJob ? { id: detailJob.id, status: detailJob.status, updatedAt: detailJob.updatedAt,
+        ...(detailJob.errorCode ? { errorCode: detailJob.errorCode } : {}),
+        ...(detailJob.message ? { message: detailJob.message } : {}) } : null,
+      revisions: await this.dependencies.repository.automaticRevisions(scope),
+      nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
   }
 
   async getRun(scope: DataSyncScope, id: string) {
@@ -133,7 +167,7 @@ export class DataSyncService {
       signal.throwIfAborted();
       const selected = await this.dependencies.repository.retry(scope, id, requested);
       signal.throwIfAborted();
-      this.launch(user, scope, id, selected.filter(source => source !== "usage_reports"), true);
+      this.launch(user, scope, id, selected.filter(source => source !== "usage_reports"), true, current.automatic);
       const run = (await this.dependencies.repository.getRun(scope, id))!;
       signal.throwIfAborted();
       return run;
@@ -212,10 +246,10 @@ export class DataSyncService {
     if (failure?.status === "rejected") throw failure.reason;
   }
 
-  private admit(
+  private admit<T>(
     user: AuthenticatedUser,
     runId: string | undefined,
-    operation: (scope: DataSyncScope, signal: AbortSignal) => Promise<DataSyncRun>,
+    operation: (scope: DataSyncScope, signal: AbortSignal) => Promise<T>,
   ) {
     if (this.draining) throw new AppError(503, "data_sync_shutdown", "Data sync is stopping for application shutdown.");
     if (runId && (this.active.has(runId) || this.cancelling.has(runId)
@@ -227,7 +261,7 @@ export class DataSyncService {
     }
     const scope = dataScope(user);
     const controller = new AbortController();
-    const admission: RunAdmission = {
+    const admission: RunAdmission<T> = {
       scope, runId, controller,
       operation: Promise.resolve().then(() => {
         controller.signal.throwIfAborted();
@@ -271,6 +305,8 @@ export class DataSyncService {
     runId: string,
     sources: readonly DataSyncSourceId[],
     incompleteOnly: boolean,
+    automatic = false,
+    signedInAt?: number,
   ) {
     if (this.active.has(runId) || !sources.length) return;
     const controller = new AbortController();
@@ -285,7 +321,7 @@ export class DataSyncService {
     };
     this.active.set(runId, activeRun);
     const operation = Promise.resolve()
-      .then(() => this.run(user, scope, runId, sources, incompleteOnly, controller.signal, activeRun))
+      .then(() => this.run(user, scope, runId, sources, incompleteOnly, controller.signal, activeRun, automatic, signedInAt))
       .catch(async error => {
         operationalLog("error", "data_sync_worker_failed", { runId, ...errorTelemetry(error) });
         const current = await this.dependencies.repository.getRun(scope, runId);
@@ -299,8 +335,9 @@ export class DataSyncService {
           }
         }
       })
-      .finally(() => {
+      .finally(async () => {
         if (this.active.get(runId)?.operation === operation) this.active.delete(runId);
+        if (automatic) await this.dependencies.repository.finishAutomatic(scope, runId);
       });
     activeRun.operation = operation;
     void operation.catch(error => {
@@ -316,17 +353,26 @@ export class DataSyncService {
     incompleteOnly: boolean,
     signal: AbortSignal,
     activeRun: ActiveRun,
+    automatic: boolean,
+    signedInAt?: number,
   ) {
     const inventoryReady = sources.includes("power_platform")
       ? this.runPowerPlatform(user, scope, runId, signal, activeRun, incompleteOnly) : undefined;
     const results = await Promise.allSettled(sources.map(source => {
-      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal, inventoryReady);
-      if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun, incompleteOnly);
+      if (source === "users") return this.runUsers(user, scope, runId, incompleteOnly, signal, inventoryReady, automatic, signedInAt);
+      if (source === "graph_packages") return this.runPackages(user, scope, runId, signal, activeRun, incompleteOnly, automatic);
       if (source === "power_platform") return inventoryReady;
       return Promise.resolve();
     }));
     const failure = results.find(result => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
+    if (automatic) {
+      const current = await this.dependencies.repository.getRun(scope, runId);
+      if (current) {
+        const failures = await this.cancelChildJobs(user, current);
+        if (failures.length) throw failures[0];
+      }
+    }
   }
 
   private async runUsers(
@@ -336,6 +382,8 @@ export class DataSyncService {
     incompleteOnly: boolean,
     signal: AbortSignal,
     inventoryReady: Promise<void> | undefined,
+    automatic: boolean,
+    signedInAt?: number,
   ) {
     const jobId = randomUUID();
     let observedCount: number | null = null;
@@ -355,9 +403,12 @@ export class DataSyncService {
       await progress("Checking M365 Copilot feature eligibility and app-activity sources, not all tenant accounts.");
       let result = await this.dependencies.copilotUsage.refreshUsers(user, signal, {
         incompleteOnly, publication: { runId, jobId },
+        ...(automatic ? { automatic: true, signedInAt } : {}),
         onDirectoryProgress: async count => {
           observedCount = count;
-          await progress(`Checked ${count} directory users from Copilot-capable products and active report identities. License verification and app-activity collection are in progress.`, count);
+          await progress(`Checked ${count} directory users from Copilot-capable products and active report identities. ${
+            automatic ? "License verification is in progress; app activity refreshes on its own cadence."
+              : "License verification and app-activity collection are in progress."}`, count);
         },
       });
       signal.throwIfAborted();
@@ -367,7 +418,8 @@ export class DataSyncService {
       }
       await progress("Directory checks and app-activity collection finished. Resolving agent people from saved inventory references.");
       try {
-        const people = await this.dependencies.agentPeople.refreshReferences(user, signal, { runId, jobId }, { incompleteOnly });
+        const people = await this.dependencies.agentPeople.refreshReferences(user, signal, { runId, jobId },
+          { incompleteOnly, ...(automatic ? { useCache: true } : {}) });
         result = {
           ...result,
           status: people.failed && result.status === "succeeded" ? "partial" : result.status,
@@ -391,7 +443,7 @@ export class DataSyncService {
     }
   }
 
-  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun, retryFailed: boolean) {
+  private async runPackages(user: AuthenticatedUser, scope: DataSyncScope, runId: string, signal: AbortSignal, activeRun: ActiveRun, retryFailed: boolean, automatic: boolean) {
     let jobId: string | null = null;
     try {
       signal.throwIfAborted();
@@ -400,6 +452,7 @@ export class DataSyncService {
       const job = await this.dependencies.packages.submit(user, {
         tokenMode: "delegated",
         requestedIds: [],
+        ...(automatic ? { catalogOnly: true } : {}),
         idempotencyKey: childIdempotencyKey(runId, "graph-packages", attempt),
       });
       jobId = job.id;
@@ -408,11 +461,13 @@ export class DataSyncService {
       await this.dependencies.repository.attachJob(scope, runId, "graph_packages", jobId);
       signal.throwIfAborted();
       await this.dependencies.repository.updateSource(scope, runId, "graph_packages", {
-        status: "waiting_authorization",
+        status: "running",
         jobId,
         count: job.observedCount,
-        message: "Waiting for delegated authorization to collect the agent list and matching identities.",
-        canRetry: true,
+        message: automatic
+          ? "Checking delegated authorization to collect the agent list. Package details refresh separately."
+          : "Checking delegated authorization to collect the agent list and matching identities.",
+        canRetry: false,
       });
       signal.throwIfAborted();
       const started = job.status === "waiting_authorization"
@@ -442,11 +497,11 @@ export class DataSyncService {
       await this.dependencies.repository.attachJob(scope, runId, "power_platform", jobId);
       signal.throwIfAborted();
       await this.dependencies.repository.updateSource(scope, runId, "power_platform", {
-        status: "waiting_authorization",
+        status: "running",
         jobId,
         count: job.observedCount,
-        message: "Waiting for explicit delegated authorization to read Power Platform agents and supporting environment metadata.",
-        canRetry: true,
+        message: "Checking delegated authorization to read Power Platform agents and supporting environment metadata.",
+        canRetry: false,
       });
       signal.throwIfAborted();
       const started = job.status === "waiting_authorization"
@@ -748,7 +803,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
     };
   }
   return {
-    status: "failed" as const,
+    status: dataSyncFailureStatus(job.errorCode ?? ""),
     jobId: job.id,
     count: job.observedCount,
     message: job.message ?? `${label} source failed before complete publication.`,
@@ -757,13 +812,7 @@ function childSourceUpdate(label: string, job: PackageJob | PowerPlatformJob) {
 }
 
 function authorizationStatus(error: unknown): Extract<DataSyncSourceStatus["status"], "waiting_authorization" | "permission_required" | "failed"> {
-  if (error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "unauthorized"].includes(error.code))) {
-    return "waiting_authorization";
-  }
-  if (error instanceof AppError && (error.status === 403 || ["missing_permission", "missing_internal_role", "capability_unavailable", "not_configured"].includes(error.code))) {
-    return "permission_required";
-  }
-  return "failed";
+  return error instanceof AppError ? dataSyncFailureStatus(error.code, error.status) : "failed";
 }
 
 function safeSyncFailure(error: unknown) {

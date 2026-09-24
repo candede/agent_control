@@ -102,12 +102,35 @@ describe("AgentSyncTools", () => {
       inventory: saved,
       inventoryError: state === "read_error" ? "Saved total and normalized identities disagree." : undefined,
     })} />);
-    const notice = screen.getByText("Saved inventory checks need attention. View diagnostics for the cause and recovery options.");
+    const notice = screen.getByRole(state === "read_error" ? "alert" : "status", { name: "" });
+    expect(notice).toHaveTextContent(state === "read_error"
+      ? "Saved total and normalized identities disagree."
+      : "Saved source coverage is incomplete.");
     expect(notice).toBeVisible();
-    expect(notice).toHaveAttribute("role", state === "read_error" ? "alert" : "status");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Verify saved inventory" })).not.toBeInTheDocument();
+  });
+
+  it("explains pending detail enrichment even when catalog collection and source counts are verified", () => {
+    const saved = inventory();
+    saved.identityCollection = { checkedPackages: 1000, pendingPackages: 10 };
+    render(<AgentSyncTools {...props({ inventory: saved })} />);
+    expect(screen.getByText("Needs attention")).toBeVisible();
+    expect(screen.getByText(/10 packages awaiting identity metadata/)).toBeVisible();
+    expect(screen.getByText(/enriched separately in the background after catalog sync/)).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("lists actual source limitations and recovery guidance before diagnostics are opened", () => {
+    const saved = inventory();
+    saved.errors = [{ source: "power_platform", code: "coverage_unknown", message: "Copilot Studio agent coverage is incomplete." }];
+    saved.partial = true;
+    saved.identityCollection = { checkedPackages: 1010, pendingPackages: 0, invalidPackages: 2 };
+    render(<AgentSyncTools {...props({ inventory: saved })} />);
+    expect(screen.getByText("Copilot Studio agent coverage is incomplete.")).toBeVisible();
+    expect(screen.getByText(/2 packages with invalid matching metadata/)).toHaveTextContent("Use diagnostics to refresh matching details");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it.each([0, 1, 100, 101])("requires 1-100 exact targets for matching refresh, with %s selected", async count => {
@@ -168,10 +191,13 @@ describe("AgentSyncTools", () => {
     saved.identityCollection = { checkedPackages: 1008, pendingPackages: 2, invalidPackages: 1 };
     saved.verification = createUnifiedVerification(saved.verification, { sourceScopes: false, packageMetadata: false, identityLinks: false });
     render(<AgentSyncTools {...props({ inventory: saved })} />);
+    expect(screen.getByText(error.message)).toBeVisible();
+    expect(screen.getByText(/14 conflicting and 2 ambiguous identity links/)).toBeVisible();
+    expect(screen.getByText(/2 packages awaiting identity metadata/)).toBeVisible();
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(screen.getByText("Saved inventory needs attention")).toBeVisible();
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
-    expect(screen.getByText(/The saved request is restricted to environment finance-only/)).toBeVisible();
+    expect(within(screen.getByRole("dialog")).getByText(/The saved request is restricted to environment finance-only/)).toBeVisible();
     expect(screen.getByText("Environment request scope").nextElementSibling).toHaveTextContent("Environment requested: finance-only");
     expect(screen.getByText(/14 conflicting and 2 ambiguous agent records require review/)).toBeVisible();
     expect(screen.getByText("1,008 package identities checked; 2 still need collection.")).toBeVisible();

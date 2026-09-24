@@ -95,7 +95,7 @@ describe("workbench metadata", () => {
       recovery: "reauthorize",
     });
     expect(metadata.actions.filter(action => action.source === "data_sync").map(action => action.id)).toEqual([
-      "data-sync.read", "data-sync.start", "data-sync.retry", "data-sync.cancel",
+      "data-sync.auto-refresh", "data-sync.read", "data-sync.start", "data-sync.retry", "data-sync.cancel",
     ]);
     expect(metadata.actions.find(action => action.id === "data-sync.retry")).toMatchObject({
       nativeTarget: "sync_run", roles: ["AgentControl.Viewer"], recovery: "reauthorize",

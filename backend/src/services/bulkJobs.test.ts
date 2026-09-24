@@ -32,6 +32,9 @@ afterAll(async () => { await fixture?.close(); });
 
 async function savedReadbackInventory(owner: { tenantId: string; principalId: string }) {
   const packages = new PackageInventoryRepository(fixture.runtime);
+  const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+  const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const manifestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const refresh = await packages.submit(owner, {
     authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(),
   });
@@ -40,11 +43,31 @@ async function savedReadbackInventory(owner: { tenantId: string; principalId: st
     packages: ["readback-package", "untouched-package"].map(id => allowlistedPackage({
       id, displayName: id === "readback-package" ? "Reviewed package" : "Untouched package",
       isBlocked: false, availableTo: "some", deployedTo: "some",
+      ...(id === "readback-package" ? {
+        manifestId, platform: "Microsoft 365 Copilot Agent Builder", elementTypes: ["DeclarativeCopilots"],
+        elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "", definition: "{}" }] }],
+      } : {}),
     })),
     totalRecords: 2, pages: 1,
   });
+  const native = await powerPlatform.submit(owner, {
+    idempotencyKey: randomUUID(), roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"],
+  });
+  await powerPlatform.markRunning(owner, native.id);
+  await powerPlatform.publish(owner, native.id, {
+    resources: [{
+      tenantId: owner.tenantId, nativeId: manifestId, type: "microsoft.copilotstudio/agents", environmentId,
+      displayName: "Reviewed package", location: null, createdAt: null,
+      createdBy: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", lastPublishedAt: null,
+      sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown", agentKind: "agent",
+      lifecycle: "published", identityConfidence: "exact_native",
+      identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "power_platform_resource_id", value: manifestId }],
+      provenance: {}, details: { schemaName: manifestId, isQuarantined: false }, unknownFieldCount: 0,
+    }],
+    queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null, totalRecords: 1, pages: 1, unknownFieldCount: 0,
+  });
   const service = new UnifiedAgentsService({
-    packages, powerPlatform: new PowerPlatformInventoryRepository(fixture.runtime),
+    packages, powerPlatform,
     usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
     resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
     readRevision: (scope, database = fixture.runtime) => readUnifiedInventoryRevision(scope, database),
@@ -96,7 +119,18 @@ describe("Durable bulk execution", () => {
     const after = await saved.service.list(owner);
     expect(after.revision).not.toBe(before.revision);
     const changed = after.value.flatMap(row => row.packages).find(item => item.id === providerState.id)!;
-    expect((await saved.packages.get(owner, providerState.id))?.package).toMatchObject(allowlistedPackage(providerState));
+    const stored = (await saved.packages.get(owner, providerState.id))?.package;
+    if (operation === "availability" || operation === "installation") {
+      expect(stored).toMatchObject({
+        allowedUsersAndGroups: providerState.allowedUsersAndGroups,
+        acquireUsersAndGroups: providerState.acquireUsersAndGroups,
+      });
+    } else {
+      expect(stored).not.toHaveProperty("allowedUsersAndGroups");
+      expect(stored).not.toHaveProperty("acquireUsersAndGroups");
+    }
+    expect(after.count).toBe(before.count);
+    expect(after.value.find(row => row.presence === "both")?.id).toBe(before.value.find(row => row.presence === "both")?.id);
     expect(changed).toMatchObject({
       id: providerState.id, isBlocked: providerState.isBlocked,
       availableTo: providerState.availableTo, deployedTo: providerState.deployedTo,
@@ -116,6 +150,61 @@ describe("Durable bulk execution", () => {
     expect((await saved.packages.listJobs(owner, owner.principalId)).value).toHaveLength(1);
     const receipt = await fixture.runtime.query("SELECT metadata FROM audit_events WHERE operation_id=$1 AND status=$2", [job.id, operation === "skipped" ? "skipped" : "succeeded"]);
     expect(receipt.rows[0].metadata.snapshotId).toMatch(/^[a-f0-9-]{36}$/);
+  });
+
+  it("keeps one canonical agent through sparse block and unblock readbacks across all saved views", async () => {
+    const owner = { tenantId: "block-cycle-tenant", principalId: randomUUID() };
+    const saved = await savedReadbackInventory(owner);
+    const before = await saved.service.list(owner, { search: "Reviewed" });
+    expect(before.count).toBe(1);
+    const original = before.value[0];
+    let blocked = false;
+    const provider = new GraphPackagesClient(async (url, request) => {
+      if (request?.method === "POST") {
+        blocked = String(url).endsWith("/block");
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({ id: "readback-package", displayName: "Reviewed package", isBlocked: blocked, elementDetails: [], elementTypes: [] });
+    });
+    for (const action of ["block", "unblock"] as const) {
+      const job = await jobs.submit(owner, confirmedInput({
+        action, targets: [{ id: "readback-package", displayName: "Reviewed package", prestate: { kind: "block", isBlocked: blocked } }],
+        scope: "single", actor: { tenantId: owner.tenantId, homeAccountId: owner.principalId, username: "cycle@example.invalid", displayName: "Cycle" },
+        requestPath: `/api/agents/readback-package/${action}`,
+      }));
+      await runBulkJob(job.id, owner, false, jobs, provider, async () => "synthetic-token");
+      expect(await jobs.get(job.id, owner)).toMatchObject({ status: "succeeded", succeeded: 1 });
+      const membership = await fixture.runtime.query(`SELECT package_snapshot_id,matching_evidence FROM unified_agent_sources
+        WHERE tenant_id=$1 AND principal_id=$2 AND source='graph_packages' AND native_id='readback-package'`,
+      [owner.tenantId, owner.principalId]);
+      expect(membership.rows[0]).toMatchObject({
+        package_snapshot_id: original.observations.packageSnapshots["readback-package"].snapshotId,
+        matching_evidence: original.identity.packageEvidence[0].evidence,
+      });
+      const page = await saved.service.list(owner, { search: "Reviewed" });
+      expect(page.count).toBe(1);
+      expect(page.value[0]).toMatchObject({
+        id: original.id, presence: "both", identity: original.identity,
+        powerPlatformResource: original.powerPlatformResource,
+        packages: [{ isBlocked: action === "block", manifestId: original.packages[0].manifestId }],
+      });
+      expect(page.value[0].observations.packageSnapshots).toEqual(original.observations.packageSnapshots);
+      expect((await saved.service.list(owner, { recordId: original.id })).count).toBe(1);
+      const expected = { id: "readback-package", isBlocked: action === "block", manifestId: original.packages[0].manifestId };
+      expect((await saved.packages.get(owner, expected.id))?.package).toMatchObject(expected);
+      expect((await saved.packages.getMany(owner, [expected.id]))[0].package).toMatchObject(expected);
+      const list = await saved.packages.list(owner, { search: "Reviewed", blocked: action === "block" });
+      expect(list).toMatchObject({ count: 1, value: [expected], summary: { total: 2, blocked: action === "block" ? 1 : 0 } });
+      const exported = await saved.service.forExport(owner, page.revision!);
+      expect(exported.value.filter(row => row.packages.some(pkg => pkg.id === expected.id))).toHaveLength(1);
+      expect(exported.value.find(row => row.id === original.id)?.packages[0]).toMatchObject(expected);
+    }
+    const baseline = await fixture.runtime.query(`SELECT resource.package_data FROM package_inventory_resources resource
+      JOIN package_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
+      WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.observation_kind='inventory'
+        AND resource.native_id='readback-package'`, [owner.tenantId, owner.principalId]);
+    expect(baseline.rows[0].package_data).not.toHaveProperty("controlObservations");
+    expect(baseline.rows[0].package_data.isBlocked).toBe(false);
   });
 
   it("rolls back readback inventory and revisions when the success audit cannot be stored", async () => {

@@ -53,6 +53,8 @@ function fixture(overrides: Record<string, unknown> = {}) {
   };
   const repository = {
     submit: vi.fn(async () => job),
+    claimDueDetails: vi.fn(async () => null as typeof job | null),
+    latestAutomaticDetailsJob: vi.fn(async () => null as typeof job | null),
     getJob: vi.fn(async (_scope?: unknown, id = job.id) => ({ ...job, id })),
     markRunning: vi.fn(async () => true),
     recordProgress: vi.fn(async () => undefined),
@@ -91,6 +93,102 @@ describe("Package refresh service", () => {
     await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledTimes(1));
     expect(dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.delegated", user, { retryFailed: true });
     expect(repository.markRunning).toHaveBeenCalledBefore(dependencies.scan);
+  });
+
+  it("passes persisted catalog-only mode to resumed execution", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.getJob.mockResolvedValue({ ...job, catalogOnly: true } as typeof job);
+    await service.start(user, job.id, "delegated");
+    await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+    expect(dependencies.scan.mock.calls[0][4]).toMatchObject({ catalogOnly: true });
+  });
+
+  it("does nothing when another tab owns enrichment or no package is due", async () => {
+    const { service, repository, dependencies } = fixture();
+    await expect(service.refreshDueDetails(user)).resolves.toBeNull();
+    expect(repository.claimDueDetails).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, user.homeAccountId, undefined);
+    expect(repository.latestAutomaticDetailsJob).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, user.homeAccountId);
+    expect(dependencies.scan).not.toHaveBeenCalled();
+  });
+
+  it.each(["waiting_authorization", "running", "failed", "succeeded", "cancelled"])(
+    "returns the latest %s automatic job without starting more provider work when nothing can be claimed", async status => {
+      const { service, repository, dependencies, job } = fixture();
+      const latest = { ...job, autoDetails: true, status } as typeof job;
+      repository.latestAutomaticDetailsJob.mockResolvedValue(latest);
+      await expect(service.refreshDueDetails(user)).resolves.toBe(latest);
+      expect(dependencies.scan).not.toHaveBeenCalled();
+      expect(repository.markRunning).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the latest detail history available during drain without admitting more work", async () => {
+    const { service, repository, job } = fixture();
+    repository.latestAutomaticDetailsJob.mockResolvedValue(job);
+    await service.drain();
+    await expect(service.refreshDueDetails(user)).resolves.toBe(job);
+    expect(repository.claimDueDetails).not.toHaveBeenCalled();
+  });
+
+  it("authorizes automatic details and executes the persisted low-impact enrichment mode", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const details = { ...job, requestedIds: ["one"], scopeKind: "exact", autoDetails: true };
+    repository.claimDueDetails.mockResolvedValue(details as typeof job);
+    repository.getJob.mockResolvedValue(details as typeof job);
+    await service.refreshDueDetails(user);
+    await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledOnce());
+    expect(repository.markRunning).toHaveBeenCalledWith(expect.anything(), job.id, true);
+    expect(dependencies.scan.mock.calls[0][4]).toMatchObject({ autoDetails: true, retryThrottlingUntilAborted: false });
+    expect(dependencies.revalidateUser).toHaveBeenCalled();
+  });
+
+  it("backs off an auto-detail admission that cannot obtain current authorization", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    const details = { ...job, autoDetails: true };
+    repository.claimDueDetails.mockResolvedValue(details);
+    repository.getJob.mockResolvedValue(details);
+    const failed = { ...details, status: "failed", errorCode: "interaction_required" };
+    repository.markFailed.mockResolvedValue(failed as never);
+    dependencies.revalidateUser.mockRejectedValue(new AppError(401, "interaction_required", "Sign in."));
+    await expect(service.refreshDueDetails(user)).resolves.toBe(failed);
+    expect(repository.markFailed).toHaveBeenCalledWith(expect.anything(), job.id, "interaction_required", expect.any(String));
+    expect(dependencies.scan).not.toHaveBeenCalled();
+  });
+
+  it("preserves automatic detail permission failures instead of asking the user to sign in", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.claimDueDetails.mockResolvedValue({ ...job, autoDetails: true });
+    repository.markFailed.mockResolvedValue({ ...job, status: "failed" } as never);
+    dependencies.requireAvailable.mockRejectedValue(new AppError(403, "missing_permission", "Administrator consent required."));
+    await service.refreshDueDetails(user);
+    expect(repository.markFailed).toHaveBeenCalledWith(expect.anything(), job.id, "missing_permission",
+      expect.stringContaining("permission"));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("package_detail_admission_failed"));
+  });
+
+  it.each(["missing_permission", "capability_unavailable", "provider_error"])(
+    "does not turn a package read 403 (%s) into an expired sign-in", async code => {
+      const { service, repository, dependencies, job } = fixture();
+      dependencies.scan.mockRejectedValue(new AppError(403, code, "Permission denied."));
+      await service.start(user, job.id, "delegated");
+      await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalled());
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+      expect(repository.markFailed).toHaveBeenCalledWith(expect.anything(), job.id,
+        code === "provider_error" ? "missing_permission" : code, expect.stringContaining("permission"));
+    },
+  );
+
+  it("never logs success for an automatic batch containing failed detail reads", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.getJob.mockResolvedValue({ ...job, autoDetails: true } as typeof job);
+    dependencies.scan.mockResolvedValue({
+      packages: [], totalRecords: 0, pages: 1,
+      detailFailures: [{ id: "one", missing: false, errorCode: "provider_error" }],
+    });
+    await service.start(user, job.id, "delegated", { autoDetails: true });
+    await vi.waitFor(() => expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toContain("package_detail_read_failed"));
+    expect(repository.publish).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.log).mock.calls.flat().join("\n")).not.toContain("package_refresh_succeeded");
   });
 
   it.each(["provider_timeout", "provider_network_error", "provider_throttled"])(
@@ -295,6 +393,17 @@ describe("Package refresh service", () => {
   describe("bounded identity detail refresh", () => {
     const packageValue = (id: string) => allowlistedPackage({ id, displayName: id, isBlocked: false });
 
+    it.each([401, 403])("stops automatic detail batches on HTTP %s rather than retrying every remaining target", async status => {
+      const failure = new AppError(status, "provider_error", "Read authorization failed.");
+      const client = {
+        listCopilotAgents: vi.fn(),
+        getPackageDetails: vi.fn(async () => { throw failure; }),
+      };
+      await expect(scanPackages("token", Array.from({ length: 20 }, (_, index) => `package-${index}`),
+        new AbortController().signal, async () => undefined, client, { autoDetails: true })).rejects.toBe(failure);
+      expect(client.getPackageDetails).toHaveBeenCalledTimes(2);
+    });
+
     it("completes a 1,010-package identity scan through the real client despite transient detail failures", async () => {
       const listed = Array.from({ length: 1010 }, (_, index) => ({ id: `package-${index}`, displayName: `Agent ${index}`, isBlocked: false }));
       const definition = JSON.stringify({ SourceIds: { EnvironmentId: "environment", CdsBotId: "bot", SchemaName: "agent_schema" } });
@@ -381,6 +490,43 @@ describe("Package refresh service", () => {
       expect(client.getPackageDetails).toHaveBeenCalledTimes(105);
       expect(maximumActive).toBe(4);
       expect(progress).toHaveBeenLastCalledWith(1, 105, 105, "Matching agent records (105/105 identities checked).");
+    });
+
+    it("publishes a catalog scan without issuing any per-package detail reads", async () => {
+      const client = {
+        listCopilotAgents: vi.fn(async () => [packageValue("one"), packageValue("two")]),
+        getPackageDetails: vi.fn(async () => { throw new Error("Catalog-only must not hydrate details."); }),
+      };
+      const result = await scanPackages("token", [], new AbortController().signal, async () => undefined, client, { catalogOnly: true });
+      expect(result).toMatchObject({ totalRecords: 2, pages: 1 });
+      expect(result.packages.every(value => !value.identityDetailsCollected)).toBe(true);
+      expect(client.getPackageDetails).not.toHaveBeenCalled();
+    });
+
+    it("isolates automatic detail failures, limits concurrency to two and never lists packages", async () => {
+      let active = 0;
+      let maximum = 0;
+      const client = {
+        listCopilotAgents: vi.fn(async () => []),
+        getPackageDetails: vi.fn(async (_token: string, id: string) => {
+          active += 1;
+          maximum = Math.max(maximum, active);
+          await Promise.resolve();
+          active -= 1;
+          if (id === "missing") throw new AppError(404, "not_found", "Missing.");
+          if (id === "failed") throw new AppError(429, "provider_throttled", "Retry later.");
+          return packageValue(id);
+        }),
+      };
+      const result = await scanPackages("token", ["one", "missing", "failed", "two"], new AbortController().signal,
+        async () => undefined, client, { autoDetails: true });
+      expect(client.listCopilotAgents).not.toHaveBeenCalled();
+      expect(maximum).toBe(2);
+      expect(result.packages.map(value => value.id)).toEqual(["one", "two"]);
+      expect(result.detailFailures).toEqual([
+        { id: "missing", missing: true, errorCode: "not_found" },
+        { id: "failed", missing: false, errorCode: "provider_throttled" },
+      ]);
     });
 
     it("distinguishes a completed detail read with no metadata from a broad summary", async () => {
@@ -1029,7 +1175,11 @@ describe("Package refresh service", () => {
     const { service, repository, dependencies, job } = fixture();
     dependencies.revalidateUser.mockResolvedValueOnce(user).mockResolvedValueOnce(freshUser);
     await service.start(user, job.id, "delegated");
-    await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce());
+    if (!freshUser.roles.length) {
+      await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledWith(
+        expect.anything(), job.id, "missing_internal_role", expect.stringContaining("permission")));
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+    } else await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce());
     expect(repository.publish).not.toHaveBeenCalled();
     await service.drain();
   });

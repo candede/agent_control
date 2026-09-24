@@ -44,14 +44,14 @@ export class AgentPeopleService {
   }
 
   async refreshReferences(user: AuthenticatedUser, signal: AbortSignal, publication: UserSourcePublication,
-    options: { incompleteOnly: boolean }) {
+    options: { incompleteOnly: boolean; useCache?: boolean }) {
     throwIfResolutionAborted(signal);
     const scope = userScope(user);
     const generation = await this.generation(scope);
     throwIfResolutionAborted(signal);
     const ids = await this.dependencies.repository.referencedIds(scope);
     throwIfResolutionAborted(signal);
-    return this.resolve(user, ids, { generation, publication, signal, force: true, skipLicensed: true, ...options });
+    return this.resolve(user, ids, { generation, publication, signal, force: !options.useCache, skipLicensed: true, ...options });
   }
 
   async resolve(user: AuthenticatedUser, ids: readonly string[], options: {

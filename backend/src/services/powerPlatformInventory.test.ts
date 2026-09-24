@@ -59,6 +59,18 @@ describe("Power Platform inventory refresh service", () => {
   });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
+  it.each(["missing_permission", "capability_unavailable", "provider_error"])(
+    "does not turn a Power Platform read 403 (%s) into an expired sign-in", async code => {
+      const { service, repository, dependencies, job } = fixture();
+      dependencies.query.mockRejectedValue(new AppError(403, code, "Permission denied."));
+      await service.start(user, job.id);
+      await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalled());
+      expect(repository.markWaitingAuthorization).not.toHaveBeenCalled();
+      expect(repository.markFailed).toHaveBeenCalledWith(expect.anything(), job.id,
+        code === "provider_error" ? "missing_permission" : code, expect.stringContaining("permission"));
+    },
+  );
+
   it("starts only after current authorization and publishes complete results", async () => {
     const { service, repository, dependencies } = fixture();
     await expect(service.start(user, "11111111-1111-1111-1111-111111111111")).resolves.toMatchObject({ status: "waiting_authorization" });
@@ -216,7 +228,9 @@ describe("Power Platform inventory refresh service", () => {
       .mockResolvedValueOnce(user)
       .mockResolvedValueOnce({ ...user, roles: [] });
     await fenced.service.start(user, fenced.job.id);
-    await vi.waitFor(() => expect(fenced.repository.markWaitingAuthorization).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(fenced.repository.markFailed).toHaveBeenCalledWith(
+      expect.anything(), fenced.job.id, "missing_internal_role", expect.stringContaining("permission")));
+    expect(fenced.repository.markWaitingAuthorization).not.toHaveBeenCalled();
     expect(fenced.repository.publish).not.toHaveBeenCalled();
   });
 

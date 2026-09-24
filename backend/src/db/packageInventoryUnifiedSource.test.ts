@@ -14,11 +14,13 @@ const broad = {
   total_records: 0,
   page_count: 1,
   observed_at: new Date("2026-09-22T00:00:00.000Z"),
+  read_started_at: new Date("2026-09-22T00:00:00.000Z"),
   expires_at: new Date("2026-10-22T00:00:00.000Z"),
 };
 const exact = {
   snapshot_id: "22222222-2222-4222-8222-222222222222",
   observed_at: new Date("2026-09-23T00:00:00.000Z"),
+  read_started_at: new Date("2026-09-23T00:00:00.000Z"),
   expires_at: new Date("2026-10-23T00:00:00.000Z"),
 };
 const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
@@ -37,7 +39,7 @@ function fixture(base: CopilotPackageDetail[], overlays: { native_id: string; pa
     .mockResolvedValueOnce({ ...emptyResult, rows: [
       { id: broad.id, observed_count: base.length, total_records: base.length, stored_count: base.length, page_count: 1 },
       ...(overlays.length ? [{ id: exact.snapshot_id, observed_count: exactCount, total_records: exactCount, stored_count: exactCount, page_count: 1 }] : []),
-    ] });
+    ] }).mockResolvedValueOnce(emptyResult);
   return { query, repository: new PackageInventoryRepository() };
 }
 
@@ -51,7 +53,7 @@ describe("unified package observation keys", () => {
 
       const result = await repository.readUnifiedSource(scope);
 
-      expect(result.packages).toEqual([value]);
+      expect(result.packages).toEqual([{ ...value, detailFreshness: { state: "missing", observedAt: null, expiresAt: null } }]);
       expect(Object.keys(result.observations)).toEqual([id]);
       expect(Object.hasOwn(result.observations, id)).toBe(true);
       expect(result.observations[id]).toEqual({
@@ -62,7 +64,7 @@ describe("unified package observation keys", () => {
         Object.fromEntries([[id, result.observations[id]]]),
       );
       expect(Object.getPrototypeOf(result.observations)).toBe(Object.prototype);
-      expect(query).toHaveBeenCalledTimes(5);
+      expect(query).toHaveBeenCalledTimes(6);
     },
   );
 
@@ -76,7 +78,9 @@ describe("unified package observation keys", () => {
 
     const result = await repository.readUnifiedSource(scope);
 
-    expect(result.packages).toEqual([replacement, retained]);
+    expect(result.packages).toEqual([replacement, retained].map(value => ({
+      ...value, detailFreshness: { state: "missing", observedAt: null, expiresAt: null },
+    })));
     expect(Object.keys(result.observations).sort()).toEqual(["__proto__", "retained"]);
     expect(result.observations.retained).toMatchObject({ snapshotId: broad.id, scopeKind: "broad" });
     expect(result.observations["__proto__"]).toMatchObject({ snapshotId: exact.snapshot_id, scopeKind: "exact" });

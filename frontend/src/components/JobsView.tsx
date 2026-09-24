@@ -35,11 +35,12 @@ const pollIntervalMs = 2_000;
 const pollBudgetMs = 5 * 60_000;
 const syncJobSources = new Set<WorkbenchJobSource>(["data-sync", "package-refresh", "power-platform", "official-usage"]);
 
-export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revision = 0 }: {
+export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, onCollectionCancel, revision = 0 }: {
   user: SessionUser;
   scope?: "all" | "sync";
   onOpenSyncRun?: (runId: string) => void;
   onChanged?: () => void;
+  onCollectionCancel?: () => void;
   revision?: number;
 }) {
   const [state, setState] = useState<WorkbenchJobsResponse>();
@@ -204,6 +205,7 @@ export function JobsView({ user, scope = "all", onOpenSyncRun, onChanged, revisi
   }
 
   function cancel(job: WorkbenchJobSummary) {
+    if (["data-sync", "package-refresh", "power-platform"].includes(job.source)) onCollectionCancel?.();
     if (job.source === "data-sync") return cancelDataSyncRun(job.id);
     if (job.source === "package-refresh") return cancelPackageRefreshJob(job.id, job.tokenMode);
     if (job.source === "power-platform") return cancelInventoryRefresh(job.id);

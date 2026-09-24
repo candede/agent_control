@@ -213,6 +213,7 @@ describe("explicit package-to-agent identity", () => {
       { ...observation, observedAt: "2026-09-17T11:00:00.000Z" },
       { ...observation, expiresAt: "2026-09-16T11:59:59.000Z" },
       { ...observation, identityDetails: { ...observation, observedAt: "2026-09-14T12:00:00.000Z" } },
+      { ...observation, observedAt: "2026-09-14T12:00:00.000Z", identityDetails: observation },
     ]) expect(withVerifiedControlIdentities([saved], links, { [value.id]: stale }, now)[0]).toBe(saved);
     expect(withVerifiedControlIdentities([saved], links, {}, now)[0]).toBe(saved);
   });

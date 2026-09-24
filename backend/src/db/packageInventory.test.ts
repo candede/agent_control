@@ -228,6 +228,7 @@ describe.sequential("Package inventory repository", () => {
       authorizationPrincipalId: unifiedScope.principalId,
       tokenMode: "delegated",
       idempotencyKey: "unified-newer-broad",
+      catalogOnly: true,
     });
     expect(await repository.markRunning(unifiedScope, newerBroad.id)).toBe(true);
     await repository.publish(unifiedScope, newerBroad.id, {
@@ -255,6 +256,7 @@ describe.sequential("Package inventory repository", () => {
       authorizationPrincipalId: unifiedScope.principalId,
       tokenMode: "delegated",
       idempotencyKey: "unified-changed-broad",
+      catalogOnly: true,
     });
     expect(await repository.markRunning(unifiedScope, changedBroad.id)).toBe(true);
     await repository.publish(unifiedScope, changedBroad.id, {

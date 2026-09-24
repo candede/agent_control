@@ -23,13 +23,14 @@ describe("PostgreSQL sessions", () => {
   it("persists across store recreation, excludes tokens and isolates tenant reads", async () => {
     const store = createSessionStore(fixture.runtime,"tenant");
     const data = { cookie: new session.Cookie({maxAge:60000}), accountId:"principal", authFlowHandle:"a".repeat(43), csrfToken:"fixture-csrf", rolesValidatedAt:1234, user:{tenantId:"tenant",homeAccountId:"principal",username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Viewer","untrusted-role"],providerRoleIds:[inventoryProviderRoleIds.aiReader,"00000000-0000-0000-0000-000000000000","must-not-persist-role-name"]}, authFlow:{state:"must-not-persist-state",nonce:"must-not-persist-nonce",codeVerifier:"must-not-persist-verifier"}, accessToken:"must-not-persist-token", refreshToken:"must-not-persist-refresh", tokenCache:"must-not-persist-cache", code:"must-not-persist-code", clientSecret:"must-not-persist-secret" };
-    await new Promise<void>((resolve,reject) => store.set("fixture-session",data,error => error ? reject(error) : resolve()));
+    await new Promise<void>((resolve,reject) => store.set("fixture-session", { ...data, signedInAt: 1000 }, error => error ? reject(error) : resolve()));
     store.close();
     const recreated = createSessionStore(fixture.runtime,"tenant");
     const other = createSessionStore(fixture.runtime,"other");
     try {
       const found = await new Promise((resolve,reject) => recreated.get("fixture-session",(error,value) => error ? reject(error) : resolve(value)));
       expect(found).toMatchObject({accountId:"principal",tenantId:"tenant",authFlowHandle:"a".repeat(43),csrfToken:"fixture-csrf",rolesValidatedAt:1234,user:{roles:["AgentControl.Viewer"],providerRoleIds:[inventoryProviderRoleIds.aiReader]}});
+      expect(found).toMatchObject({ signedInAt: 1000 });
       const serialized = (await fixture.runtime.query<{ value: string }>("SELECT sess::text AS value FROM sessions WHERE sid='fixture-session'")).rows[0].value;
       for (const secret of ["must-not-persist-state","must-not-persist-nonce","must-not-persist-verifier","must-not-persist-token","must-not-persist-refresh","must-not-persist-cache","must-not-persist-code","must-not-persist-secret","must-not-persist-role-name","00000000-0000-0000-0000-000000000000"]) expect(serialized).not.toContain(secret);
       expect(await new Promise(resolve => other.get("fixture-session",(_error,value) => resolve(value)))).toBeNull();

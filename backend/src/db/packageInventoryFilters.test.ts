@@ -15,6 +15,7 @@ const snapshot = {
   total_records: 1,
   page_count: 1,
   observed_at: new Date("2026-09-15T00:00:00.000Z"),
+  read_started_at: new Date("2026-09-15T00:00:00.000Z"),
   expires_at: new Date("2026-09-22T00:00:00.000Z"),
 };
 const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
@@ -25,11 +26,12 @@ function mockList(values: CopilotPackageDetail[]) {
     if (statement.startsWith("SELECT * FROM package_inventory_snapshots")) {
       return { ...emptyResult, rowCount: 1, rows: [snapshot] };
     }
+    if (statement.includes("WITH latest_controls")) return emptyResult;
     if (statement.includes("SELECT count(*)::int AS total")) {
       return { ...emptyResult, rowCount: 1, rows: [{ total: values.length, allowed: values.length, blocked: 0 }] };
     }
-    if (statement.includes("SELECT package_data")) {
-      return { ...emptyResult, rowCount: values.length, rows: values.map(package_data => ({ package_data })) };
+    if (statement.includes("SELECT native_id FROM scoped") || statement.includes("resource.package_data")) {
+      return { ...emptyResult, rowCount: values.length, rows: values.map(package_data => ({ native_id: package_data.id, package_data, read_started_at: snapshot.read_started_at })) };
     }
     throw new Error("Unexpected saved package query.");
   });
@@ -61,15 +63,16 @@ describe("saved package authoring filters", () => {
     expect(normalizePackageAuthoringTool(platform)).toBe(canonical);
     expect(result.facets.platforms).toEqual([{ value: label, label }]);
     expect(normalizePackageAuthoringTool(result.facets.platforms[0].value)).toBe(canonical);
-    expect(query).toHaveBeenCalledTimes(4);
+    expect(query).toHaveBeenCalledTimes(5);
     const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
     expect(filtered).toHaveLength(2);
     for (const call of filtered) {
       expect(call[0]).toContain("native_id=ANY($4::text[])");
-      expect(call[0]).toContain("tenant_id=$2 AND principal_id=$3");
+      expect(call[0]).toContain("$2::text AS tenant_id,$3::text AS principal_id");
+      expect(call[0]).toContain("jsonb_to_recordset($5::jsonb)");
     }
-    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id]]);
-    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id], 25, 5]);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id], expect.any(String)]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, [value.id], expect.any(String), 25, 5]);
   });
 
   it.each([
@@ -94,8 +97,8 @@ describe("saved package authoring filters", () => {
     await new PackageInventoryRepository().list(scope, { platform, limit: 25, offset: 5 });
     const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
     expect(filtered).toHaveLength(2);
-    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds]);
-    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds, 25, 5]);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds, expect.any(String)]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, expectedIds, expect.any(String), 25, 5]);
   });
 
   it.each([
@@ -135,19 +138,19 @@ describe("saved package availability filters", () => {
 
     const result = await new PackageInventoryRepository().list(scope, { availableTo, limit: 25, offset: 5 });
     expect(result.count).toBe(1);
-    expect(result.value).toEqual([value]);
-    expect(query).toHaveBeenCalledTimes(4);
+    expect(result.value).toEqual([{ ...value, detailFreshness: { state: "missing", observedAt: null, expiresAt: null } }]);
+    expect(query).toHaveBeenCalledTimes(5);
     const filtered = query.mock.calls.filter(([statement]) => String(statement).includes("FROM scoped"));
     expect(filtered).toHaveLength(2);
     for (const call of filtered) {
       expect(call[0]).toContain("regexp_replace(lower(available_to),'[^a-z0-9]','','g')=ANY($4::text[])");
-      expect(call[0]).toContain("tenant_id=$2 AND principal_id=$3");
+      expect(call[0]).toContain("$2::text AS tenant_id,$3::text AS principal_id");
     }
     const aliases = [
       "all", "everyone", "allowedforall", "availabletoall", "deployedtoall", "installedforall",
       "some", "allowedforsome", "availabletosome", "deployedtosome", "installedforsome",
     ];
-    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases]);
-    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases, 25, 5]);
+    expect(filtered[0][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases, expect.any(String)]);
+    expect(filtered[1][1]).toEqual([snapshot.id, scope.tenantId, scope.principalId, aliases, expect.any(String), 25, 5]);
   });
 });

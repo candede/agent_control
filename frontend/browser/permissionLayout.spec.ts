@@ -5,6 +5,7 @@ import type { CapabilityView } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
 import { permissionLayoutRequestKind, type PermissionLayoutRequestKind } from "./permissionFixtures";
 import { collectLayoutFailures } from "./layoutGeometry";
+import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 
 function permissions(): CapabilityView[] {
   return capabilityDefinitions.map(definition => {
@@ -35,6 +36,7 @@ async function mockPermissions(page: Page, views: (kind: PermissionLayoutRequest
   const posts: string[] = [];
   page.on("request", request => {
     const url = new URL(request.url());
+    if (isAutomaticRefreshRequest(request)) return;
     if (request.method() === "POST") posts.push(`${url.pathname}${url.search}`);
     if (url.pathname === "/api/auth/consent" || url.pathname.startsWith("/api/")
       && request.method() !== "GET" && !permissionLayoutRequestKind(request.method(), url)) {

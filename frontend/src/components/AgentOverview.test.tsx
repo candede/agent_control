@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { UnifiedAgentRecord } from "../api/client";
+import type { CopilotPackage, UnifiedAgentRecord } from "../api/client";
 import { AgentOverview } from "./AgentOverview";
 
 const resource: NonNullable<UnifiedAgentRecord["powerPlatformResource"]> = {
@@ -25,6 +25,20 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
 };
 
 describe("purposeful saved agent context", () => {
+  it("shows separately retained detail freshness from a package summary before a full detail read", () => {
+    const selectedPackage: CopilotPackage = {
+      id: "package", displayName: "Agent", isBlocked: false,
+      sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown",
+      agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
+      detailFreshness: { state: "invalidated", observedAt: "2026-09-01T12:00:00Z", expiresAt: "2026-09-01T13:00:00Z" },
+    };
+    render(<AgentOverview record={{ ...record, packages: [selectedPackage] }} selectedPackage={selectedPackage} peopleState={peopleState} />);
+    const freshness = screen.getByRole("complementary", { name: "Package detail freshness" });
+    expect(freshness).toHaveTextContent("Refresh required after inventory change");
+    expect(freshness.querySelector('time[datetime="2026-09-01T12:00:00Z"]')).toBeVisible();
+    expect(screen.queryByText("Inventory observed", { selector: "dt" })).not.toBeInTheDocument();
+  });
+
   it("opens only exact resolved responsibility identities, never unresolved or invalid people", () => {
     const open = vi.fn();
     render(<AgentOverview record={record} onOpenPerson={open} peopleState={{ ...peopleState, people: {

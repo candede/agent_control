@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
 import { fixtureLoginUrl, isExternalFixtureRequest } from "./permissionFixtures";
+import { mockAutomaticRefresh } from "./automaticRefreshFixtures";
 
 async function uploadBundle(page: Page, dates: [string, string, string], identity: string) {
   const section = page.getByRole("region", { name: "CSV usage reports", exact: true });
@@ -44,6 +45,7 @@ async function deleteBundle(page: Page, setId: string) {
 test("CSV section reflects cumulative persisted dates after uploads, reload and deletions", async ({ page, context }, info) => {
   test.setTimeout(45_000);
   await context.route(isExternalFixtureRequest, route => route.abort());
+  await mockAutomaticRefresh(page);
   await page.goto(fixtureLoginUrl("available"));
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
@@ -56,7 +58,9 @@ test("CSV section reflects cumulative persisted dates after uploads, reload and 
   await expect(reports).toContainText("2 retained report sets");
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();
-  await expect(reports.getByText("Reporting dates not supplied")).toBeVisible();
+  await expect(reports.getByText("Reporting dates (UTC)")).toBeVisible();
+  await expect(reports.getByText("Reporting dates not supplied")).toHaveCount(0);
+  await expect(reports).toContainText("No manual dates are needed");
   await page.reload();
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();

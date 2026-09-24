@@ -17,7 +17,7 @@ describe("route policy declarations", () => {
       "GET /agent-inventory/investigations/context", "GET /agent-inventory/investigations/purview",
       "POST /agent-inventory/investigations/resolve",
       "GET /agent-inventory/:recordId/usage-candidates", "POST /agent-inventory/:recordId/usage-associations", "DELETE /agent-inventory/:recordId/usage-associations",
-      "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs",
+      "GET /data-sync/state", "GET /data-sync/runs/:id", "POST /data-sync/runs", "POST /data-sync/auto-refresh",
       "POST /data-sync/runs/:id/retry", "POST /data-sync/runs/:id/cancel",
       "POST /agents/refresh-jobs", "POST /agents/:id/refresh-jobs", "GET /agents/refresh-jobs", "GET /agents/refresh-jobs/:id", "POST /agents/refresh-jobs/:id/resume", "POST /agents/refresh-jobs/:id/cancel", "GET /agents/snapshots", "GET /agents/export.csv", "POST /agents/export.csv",
       "GET /agents/bulk-jobs", "GET /agents/bulk-jobs/:id", "POST /agents/bulk-jobs/:id/cancel", "POST /agents/bulk-jobs/:id/reconcile", "POST /agents/bulk-jobs/:id/resume", "GET /agents/:id",

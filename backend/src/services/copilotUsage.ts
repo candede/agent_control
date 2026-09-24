@@ -21,7 +21,7 @@ import type {
 import { copilotUsagePeriod, isCopilotServiceActive } from "../types/copilotUsage.js";
 import type { OfficialUsageUserSummary, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { DataSyncSourceState } from "../types/dataSync.js";
+import { dataSyncFailureStatus, type DataSyncSourceState } from "../types/dataSync.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import {
@@ -119,20 +119,34 @@ export class CopilotUsageService {
   async refreshUsers(
     user: AuthenticatedUser,
     signal: AbortSignal | undefined,
-    options: { incompleteOnly?: boolean; publication: UserSourcePublication; onDirectoryProgress?: CopilotDirectoryProgress },
+    options: { incompleteOnly?: boolean; automatic?: boolean; signedInAt?: number; publication: UserSourcePublication; onDirectoryProgress?: CopilotDirectoryProgress },
   ): Promise<CopilotUsageRefreshResult> {
     const scope = dataScope(user);
     signal?.throwIfAborted();
     const before = await this.dependencies.usageStore.getUserSources(scope);
     signal?.throwIfAborted();
-    const requested: CopilotUsageSnapshotSource[] = options.incompleteOnly
+    const requested: CopilotUsageSnapshotSource[] = options.automatic
+      ? [
+        ...(userSourceDue(before.directory, this.dependencies.now(), 15 * 60_000) ? ["directory" as const] : []),
+        ...(userSourceDue(before.appActivity, this.dependencies.now(), 6 * 60 * 60_000) ? ["app_activity" as const] : []),
+      ]
+      : options.incompleteOnly
       ? [
         ...(hasAvailableUserSource(before.directory) ? [] : ["directory" as const]),
         ...(hasAvailableUserSource(before.appActivity) ? [] : ["app_activity" as const]),
       ]
       : ["directory", "app_activity"];
     if (!requested.length) {
+      if (options.automatic) return userRefreshResult(before, before.directory.rowCount);
       return { status: "succeeded", count: before.directory.rowCount, message: "All saved user sources already completed successfully." };
+    }
+
+    function userSourceDue(source: SavedCopilotUsageSource<unknown>, now: Date, freshnessMs: number) {
+      if (source.attemptStatus === "waiting_authorization" && source.attemptedAt
+        && options.signedInAt !== undefined && Date.parse(source.attemptedAt) < options.signedInAt) return true;
+      if (source.attemptedAt && source.attemptStatus !== "available"
+        && now.getTime() - Date.parse(source.attemptedAt) < 15 * 60_000) return false;
+      return source.value === null || !source.observedAt || now.getTime() - Date.parse(source.observedAt) >= freshnessMs;
     }
     this.dependencies.requireProviderAdmissions();
     let observedCount: number | null = null;
@@ -464,13 +478,7 @@ function sourceFailure(
   permission?: "User.Read.All and LicenseAssignment.Read.All" | "Reports.Read.All",
 ): Extract<Loaded<never>, { ok: false }> {
   const message = sourceErrorMessage(error, label, permission);
-  const status = error instanceof AppError && (
-    error.status === 401 || ["interaction_required", "authorization_expired", "unauthorized"].includes(error.code)
-  ) ? "waiting_authorization"
-    : error instanceof AppError && (
-      error.status === 403 || ["capability_unavailable", "missing_permission", "missing_internal_role", "Authorization_RequestDenied"].includes(error.code)
-    ) ? "permission_required"
-      : "failed";
+  const status = error instanceof AppError ? dataSyncFailureStatus(error.code, error.status) : "failed";
   return { ok: false, message, status };
 }
 

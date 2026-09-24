@@ -1,4 +1,5 @@
 import type { Page } from "@playwright/test";
+import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
@@ -367,6 +368,9 @@ export async function mockLayoutApi(page: Page) {
   };
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
+    if (isAutomaticRefreshRequest(route.request())) {
+      return route.fulfill({ json: automaticRefreshFixture({ users: observedAt, graph_packages: observedAt, power_platform: observedAt }) });
+    }
     if (path === "/api/agent-inventory" && route.request().method() === "GET") {
       const recordId = new URL(route.request().url()).searchParams.get("recordId");
       if (recordId) {

@@ -91,7 +91,7 @@ describe("permission layout request contract", () => {
 });
 
 describe("permission browser request sentinels", () => {
-  it.each(["/api/capabilities/check", "/api/auth/consent", "/api/auth/logout"])("permits only the expected POST command %s", path => {
+  it.each(["/api/capabilities/check", "/api/data-sync/auto-refresh", "/api/auth/consent", "/api/auth/logout"])("permits only the expected POST command %s", path => {
     expect(isUnexpectedPermissionCommand("POST", path)).toBe(false);
     expect(isUnexpectedPermissionCommand("DELETE", path)).toBe(true);
   });

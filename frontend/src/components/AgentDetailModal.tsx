@@ -11,6 +11,7 @@ import { getAgentDescription, getSanitizedDescriptionHtml } from "../agentDetail
 import { AccessAssignmentModal } from "./AccessAssignmentModal";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
+import { PackageDetailFreshnessStatus } from "./PackageDetailFreshnessStatus";
 import { unifiedAgentRecordId } from "../../../backend/src/types/unifiedAgents";
 
 const detailTabs = ["identities", "package", "power-platform", "reports", "audit-security", "controls"] as const;
@@ -257,6 +258,7 @@ export function AgentDetailModal({
                 { label: "Asset ID", value: agent.assetId, variant: "code" },
               ]}
             />
+            <PackageDetailFreshnessStatus freshness={agent.detailFreshness} />
             {elementDetails.length ? (
               <ul className="detail-list compact-list package-elements-list">
                 {elementDetails.map((detail, index) => (

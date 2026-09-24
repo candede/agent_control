@@ -21,7 +21,7 @@ export function createSessionStore(database: pg.Pool, tenantId: string) {
     }
     const sanitized: SessionData = {
       cookie: data.cookie, tenantId, authFlowHandle: typeof data.authFlowHandle === "string" && /^[a-zA-Z0-9_-]{43}$/.test(data.authFlowHandle) ? data.authFlowHandle : undefined, accountId: data.accountId,
-      csrfToken: data.csrfToken, rolesValidatedAt: data.rolesValidatedAt,
+      csrfToken: data.csrfToken, rolesValidatedAt: data.rolesValidatedAt, signedInAt: data.signedInAt,
       user: data.user ? { tenantId, homeAccountId: data.user.homeAccountId, displayName: data.user.displayName.slice(0,256), username: data.user.username.slice(0,256), roles: [...new Set(data.user.roles.filter(isAppRole))].sort(), providerRoleIds: normalizeInventoryProviderRoleIds(data.user.providerRoleIds) } : undefined,
     };
     set(id, sanitized, callback);

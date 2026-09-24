@@ -33,6 +33,62 @@ beforeEach(() => { vi.spyOn(capabilities, "observeOperation").mockImplementation
 afterEach(() => vi.restoreAllMocks());
 
 describe("CopilotUsageService", () => {
+  it("refreshes automatic directory evidence at 15 minutes and activity only at six hours", async () => {
+    const harness = refreshHarness([]);
+    const sources = await harness.usageStore.getUserSources();
+    sources.appActivity = savedSource("app_activity", { users: [], reportRefreshDate: null });
+    await harness.value.refreshUsers(user, undefined, { publication, automatic: true });
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+    expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
+    sources.directory.observedAt = new Date(now.getTime() - 15 * 60_000 + 1).toISOString();
+    await harness.value.refreshUsers(user, undefined, { publication, automatic: true });
+    expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+    sources.directory.observedAt = new Date(now.getTime() - 15 * 60_000).toISOString();
+    sources.appActivity.observedAt = new Date(now.getTime() - 6 * 60 * 60_000 + 1).toISOString();
+    await harness.value.refreshUsers(user, undefined, { publication, automatic: true });
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
+    expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
+    sources.appActivity.observedAt = new Date(now.getTime() - 6 * 60 * 60_000).toISOString();
+    await harness.value.refreshUsers(user, undefined, { publication, automatic: true });
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
+    expect(harness.graph.listAppActivity).toHaveBeenCalledOnce();
+  });
+
+  it("collects missing automatic snapshots and backs off errors without reporting false success", async () => {
+    const harness = refreshHarness();
+    harness.graph.listAppActivity.mockRejectedValueOnce(new AppError(403, "missing_permission", "Report read denied."));
+    expect(await harness.value.refreshUsers(user, undefined, { publication, automatic: true })).toMatchObject({ status: "partial" });
+    expect(harness.graph.listCopilotUsers).toHaveBeenCalledOnce();
+    expect(harness.graph.listAppActivity).toHaveBeenCalledOnce();
+    expect(await harness.value.refreshUsers(user, undefined, { publication, automatic: true })).toMatchObject({ status: "partial" });
+    expect(harness.graph.listAppActivity).toHaveBeenCalledOnce();
+    const saved = await harness.usageStore.getUserSources();
+    saved.appActivity.attemptedAt = new Date(now.getTime() - 15 * 60_000).toISOString();
+    expect(await harness.value.refreshUsers(user, undefined, { publication, automatic: true })).toMatchObject({ status: "succeeded" });
+    expect(harness.graph.listAppActivity).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["directory", "appActivity"] as const)(
+    "retries an authentication-blocked %s subsource after sign-in without bypassing permission cooldowns", async source => {
+      const harness = refreshHarness([]);
+      const saved = await harness.usageStore.getUserSources();
+      saved.appActivity = savedSource("app_activity", { users: [], reportRefreshDate: null });
+      saved[source].attemptedAt = new Date(now.getTime() - 1000).toISOString();
+      saved[source].attemptStatus = "permission_required";
+      await harness.value.refreshUsers(user, undefined, { publication, automatic: true, signedInAt: now.getTime() });
+      expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+      expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
+      saved[source].attemptStatus = "waiting_authorization";
+      await harness.value.refreshUsers(user, undefined, { publication, automatic: true });
+      expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
+      expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
+      await harness.value.refreshUsers(user, undefined, { publication, automatic: true, signedInAt: now.getTime() });
+      expect(source === "directory" ? harness.graph.listCopilotUsers : harness.graph.listAppActivity).toHaveBeenCalledOnce();
+      await harness.value.refreshUsers(user, undefined, { publication, automatic: true, signedInAt: now.getTime() });
+      expect(source === "directory" ? harness.graph.listCopilotUsers : harness.graph.listAppActivity).toHaveBeenCalledOnce();
+    },
+  );
+
   it("verifies active report identities during sync and moves a newly paid user out of unpaid activity", async () => {
     const published = importedPublished([
       { username: "person@example.com", displayName: "Person", numberOfAgentsUsed: 1, agentResponsesReceived: 8 },

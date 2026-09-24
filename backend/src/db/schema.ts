@@ -8,6 +8,9 @@ import { inventoryVerificationMigrationSql } from "./inventoryVerificationSchema
 import { agentUsageMigrationSql } from "./agentUsageSchema.js";
 import { agentPeopleMigrationSql } from "./agentPeopleSchema.js";
 import { agentIdentityMigrationSql, agentIdentityOutcomeMigrationSql, agentIdentityClientIdMigrationSql } from "./agentIdentitySchema.js";
+import { packageControlMigrationSql } from "./packageControlSchema.js";
+import { packageEnrichmentMigrationSql, verifyPackageEnrichmentSchema } from "./packageEnrichmentSchema.js";
+import { automaticDataSyncMigrationSql } from "./automaticDataSyncSchema.js";
 
 export const migrations = [
   { version: 1, sql: `
@@ -1714,6 +1717,9 @@ WHERE source_table='CloudAppEvents' AND projection_version=2;
   { version: 41, sql: agentIdentityMigrationSql },
   { version: 42, sql: agentIdentityOutcomeMigrationSql },
   { version: 43, sql: agentIdentityClientIdMigrationSql },
+  { version: 44, sql: packageControlMigrationSql },
+  { version: 45, sql: packageEnrichmentMigrationSql },
+  { version: 46, sql: automaticDataSyncMigrationSql },
 ] as const;
 
 export function migrationChecksum(sql: string) {
@@ -1752,4 +1758,5 @@ export async function verifySchema(database: Pick<pg.Pool, "query">) {
       AND NOT has_any_column_privilege(current_user,'agent_usage_state','INSERT,UPDATE')
     ) AS valid`)).rows[0];
   if (!permissions?.valid) throw new Error("Database usage association runtime grants are invalid; operator recovery required.");
+  await verifyPackageEnrichmentSchema(database);
 }

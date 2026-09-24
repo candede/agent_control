@@ -24,6 +24,7 @@ describe("Data sync route contract", () => {
       roles: ["AgentControl.Viewer"],
     });
     for (const path of [
+      "POST /data-sync/auto-refresh",
       "POST /data-sync/runs",
       "POST /data-sync/runs/:id/retry",
       "POST /data-sync/runs/:id/cancel",
@@ -53,6 +54,7 @@ describe("Data sync route contract", () => {
       { mode: "full", sources: ["users", "users"] },
       { mode: "full", sources: ["unknown"] },
       { mode: "full", extra: true },
+      { mode: "incremental", automatic: true },
     ]) {
       expect(() => parseStartDataSyncInput(value)).toThrowError(AppError);
     }

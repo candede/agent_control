@@ -5,6 +5,7 @@ import type { UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/c
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 
 const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const other = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -49,7 +50,7 @@ async function fixture(page: Page, records = [record]) {
   page.on("request", request => {
     const path = new URL(request.url()).pathname;
     requests.push(path);
-    if (request.method() !== "GET") writes.push(path);
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(path);
   });
   await page.route("**/api/agent-inventory*", route => {
     const exact = new URL(route.request().url()).searchParams.get("recordId");

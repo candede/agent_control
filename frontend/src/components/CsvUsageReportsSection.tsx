@@ -20,7 +20,6 @@ export function CsvUsageReportsSection({
   });
   const loading = read.isPending || read.isFetching;
   const summary = loading || read.isError ? undefined : read.data?.summary;
-  const windows = summary?.reportingWindows;
   const activity = summary?.activityDateRange;
   const hasReports = Boolean(summary?.importCount);
 
@@ -58,24 +57,15 @@ export function CsvUsageReportsSection({
           {hasReports ? <>
             <dl className="csv-usage-range">
               <div>
-                <dt>Known reporting windows (UTC)</dt>
-                <dd>{windows?.earliestStartDateUtc && windows.latestEndDateUtc
-                  ? <DateRange start={windows.earliestStartDateUtc} end={windows.latestEndDateUtc} />
-                  : "Reporting dates not supplied"}</dd>
-              </div>
-              <div>
-                <dt>Observed activity (UTC)</dt>
+                <dt>Reporting dates (UTC)</dt>
                 <dd>{activity?.earliestDateUtc && activity.latestDateUtc
                   ? <DateRange start={activity.earliestDateUtc.slice(0, 10)} end={activity.latestDateUtc.slice(0, 10)} />
-                  : "No dated activity in retained reports"}</dd>
+                  : "No dates found in imported reports"}</dd>
               </div>
             </dl>
-            <p>Across all retained, complete CSV report sets, not just the current selection or latest upload.</p>
-            {windows && windows.unknownCount > 0 ? <p>
-              {windows.unknownCount.toLocaleString()} of {summary.importCount.toLocaleString()} report sets have no known reporting window.
-              {" "}Their last-activity dates do not establish reporting coverage.
-            </p> : null}
-            <p>The range may contain gaps. Observed activity shows reported last-activity dates, not complete daily coverage.
+            <p>Automatically calculated from the earliest and latest activity dates across all retained, complete CSV report sets,
+              {" "}not just the current selection or latest upload. No manual dates are needed.</p>
+            <p>The range may contain gaps; it does not imply activity on every day.
               {" "}Overlapping snapshots are not added together.</p>
           </> : <p>No complete CSV report sets are retained. Import Agents, Users &amp; agents, and Users exports
             for the same 7- or 30-day selection to make usage reports available.</p>}

@@ -6,6 +6,7 @@ import type { AgentInvestigationContext, CapabilityView, OfficialUsageAdminState
 import { capabilityViews, mockLayoutApi } from "./layoutFixtures";
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
+import { isAutomaticRefreshRequest, mockAutomaticRefresh } from "./automaticRefreshFixtures";
 
 async function login(page: Page, scenario: string) {
   const checked = page.waitForResponse(response => response.request().method() === "POST"
@@ -51,8 +52,9 @@ function savedPackagePage(observedAt: string, expiresAt: string) {
     snapshot: { id: "44444444-4444-4444-4444-444444444444", tokenMode: "delegated", requestedIds: [], observedCount: 1, totalRecords: 1, pageCount: 1, observedAt, expiresAt, scopeKind: "broad" },
   };
 }
-test.beforeEach(async ({ context }) => {
+test.beforeEach(async ({ context, page }) => {
   await context.route(isExternalFixtureRequest, route => route.abort());
+  await mockAutomaticRefresh(page);
 });
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
@@ -205,7 +207,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
   }
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
-    if (route.request().method() === "POST") posts.push(path);
+    if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request())) posts.push(path);
     if (path === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic administrator", username: "fixture@example.invalid", homeAccountId: "consent-fixture", roles: ["AgentControl.Admin"] },
       csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
@@ -817,6 +819,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   try {
     await other.route(isExternalFixtureRequest, route => route.abort());
     const otherPage = await other.newPage();
+    await mockAutomaticRefresh(otherPage);
     await otherPage.route(url => url.pathname === "/api/capabilities/check", route => route.fulfill({ status: 503, json: { code: "provider_error" } }));
     await otherPage.goto(fixtureLoginUrl("unprobed-principal"));
     await expect(otherPage.getByRole("region", { name: "Issues", exact: true }).getByRole("alert")).toContainText("Permission checks failed after retrying.");

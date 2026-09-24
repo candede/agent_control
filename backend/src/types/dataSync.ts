@@ -14,6 +14,17 @@ export type DataSyncSourceState =
   | "failed"
   | "cancelled";
 
+export function dataSyncFailureStatus(code: string, status?: number): Extract<DataSyncSourceState, "waiting_authorization" | "permission_required" | "failed"> {
+  if (status === 401 || ["interaction_required", "authorization_expired", "unauthorized", "conditional_access_required", "graph_http_401"].includes(code.toLowerCase())) {
+    return "waiting_authorization";
+  }
+  if (status === 403 || ["missing_permission", "missing_internal_role", "missing_provider_role", "missing_provider_scope",
+    "missing_role", "missing_license", "capability_unavailable", "not_configured", "authorization_requestdenied", "graph_http_403"].includes(code.toLowerCase())) {
+    return "permission_required";
+  }
+  return "failed";
+}
+
 export type DataSyncSourceStatus = {
   source: DataSyncSourceId;
   status: DataSyncSourceState;
@@ -29,6 +40,7 @@ export type DataSyncSourceStatus = {
 export type DataSyncRun = {
   id: string;
   mode: DataSyncMode;
+  automatic?: boolean;
   status: "running" | "waiting" | "completed" | "partial" | "cancelled";
   startedAt: string;
   updatedAt: string;
@@ -49,4 +61,17 @@ export type StartDataSyncInput = {
   /** Defaults to automatic sources; usage_reports is manual and must be explicitly requested. */
   sources?: DataSyncSourceId[];
   clearSavedData?: boolean;
+};
+
+export type AutomaticRefreshResult = {
+  run: DataSyncRun | null;
+  detailJob: {
+    id: string;
+    status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
+    updatedAt: string;
+    message?: string;
+    errorCode?: string;
+  } | null;
+  revisions: Record<(typeof automaticDataSyncSourceIds)[number], string>;
+  nextCheckAt: string;
 };

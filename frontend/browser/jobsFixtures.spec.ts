@@ -30,6 +30,21 @@ test("Jobs status reads return the latest fixture state without commands", async
   expect(commands).toEqual([]);
 });
 
+test("records automatic due checks separately from manual job commands", async ({ page }) => {
+  const { unexpected, commands, automaticChecks } = await mockJobs(page, () => initialState);
+  const response = await page.evaluate(async () => {
+    const result = await fetch("/api/data-sync/auto-refresh", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    return { status: result.status, body: await result.json() };
+  });
+  expect(response.status).toBe(200);
+  expect(response.body.run).toBeNull();
+  expect(automaticChecks).toHaveLength(1);
+  expect(commands).toEqual([]);
+  expect(unexpected).toEqual([]);
+});
+
 for (const method of ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]) {
   test(`Jobs status fixtures reject ${method} rather than masking a client contract regression`, async ({ page }) => {
     let reads = 0;

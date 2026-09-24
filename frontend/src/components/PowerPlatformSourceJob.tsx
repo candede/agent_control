@@ -3,10 +3,11 @@ import { cancelInventoryRefresh, getInventoryRefreshJob, refreshInventory, resum
 import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 
-export function PowerPlatformSourceJob({ jobId, onSelect, onChanged }: {
+export function PowerPlatformSourceJob({ jobId, onSelect, onChanged, onCancelRequested }: {
   jobId: string;
   onSelect: (id: string | undefined) => void;
   onChanged: () => void;
+  onCancelRequested?: () => void;
 }) {
   const [job, setJob] = useState<InventoryRefreshJob>();
   const [error, setError] = useState<string>();
@@ -50,6 +51,7 @@ export function PowerPlatformSourceJob({ jobId, onSelect, onChanged }: {
 
   async function act(action: "resume" | "cancel" | "retry") {
     if (!selected || busy || error) return;
+    if (action === "cancel") onCancelRequested?.();
     generation.current += 1;
     const owner = lifetime.current;
     setBusy(true);

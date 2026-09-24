@@ -8,6 +8,7 @@ function migrationHistory(): Array<{ version: number; checksum: string }> {
 const usageContract = {
   associations: "agent_usage_associations", revision: "agent_usage_state", triggers: 3, cascade: true,
 };
+const enrichmentContract = { present: true, triggers: 3, columns: 4 };
 
 function databaseWithResults(...rows: unknown[][]) {
   const query = vi.fn();
@@ -39,9 +40,9 @@ WHERE source_table='CloudAppEvents' AND projection_version=2;
 
 describe("schema verification without a database", () => {
   it("accepts matching history, usage structures and runtime grants using read-only queries", async () => {
-    const database = databaseWithResults(migrationHistory(), [usageContract], [{ valid: true }]);
+    const database = databaseWithResults(migrationHistory(), [usageContract], [{ valid: true }], [enrichmentContract], [{ valid: true }]);
     await expect(verifySchema(database)).resolves.toBeUndefined();
-    expect(database.query).toHaveBeenCalledTimes(3);
+    expect(database.query).toHaveBeenCalledTimes(5);
     for (const [sql] of database.query.mock.calls) expect(sql.trim()).toMatch(/^SELECT /);
   });
 
@@ -73,8 +74,23 @@ describe("schema verification without a database", () => {
     await expect(verifySchema(database)).rejects.toThrow("Database usage association runtime grants are invalid");
   });
 
-  it.each([0, 1, 2])("propagates a query failure at step %i without returning success", async failedQuery => {
-    const results = [migrationHistory(), [usageContract], [{ valid: true }]];
+  it.each([
+    [],
+    [{ ...enrichmentContract, present: false }],
+    [{ ...enrichmentContract, triggers: 2 }],
+    [{ ...enrichmentContract, columns: 3 }],
+  ])("rejects incomplete enrichment structures: %j", async (...contract) => {
+    const database = databaseWithResults(migrationHistory(), [usageContract], [{ valid: true }], contract);
+    await expect(verifySchema(database)).rejects.toThrow("Package detail enrichment schema is missing or incomplete");
+  });
+
+  it.each([[], [{ valid: false }]])("rejects missing or invalid enrichment grants: %j", async (...permissions) => {
+    const database = databaseWithResults(migrationHistory(), [usageContract], [{ valid: true }], [enrichmentContract], permissions);
+    await expect(verifySchema(database)).rejects.toThrow("Package detail enrichment runtime grants are invalid");
+  });
+
+  it.each([0, 1, 2, 3, 4])("propagates a query failure at step %i without returning success", async failedQuery => {
+    const results = [migrationHistory(), [usageContract], [{ valid: true }], [enrichmentContract], [{ valid: true }]];
     const database = databaseWithResults(...results.slice(0, failedQuery));
     const failure = new Error("Database query failed");
     database.query.mockRejectedValueOnce(failure);

@@ -173,7 +173,9 @@ export class UnifiedAgentsService {
     const usablePowerPlatform = powerPlatformStatus.state === "unavailable" ? [] : powerPlatformSource.resources;
     const usablePackages = graphStatus.state === "unavailable" ? [] : packageSource.packages.map(value => {
       const observation = packageSource.observations[value.id];
-      return !value.identityDetailsCollected && (observation?.scopeKind === "exact" || observation?.identityDetails)
+      return !value.identityRevalidationRequired && !value.identityDetailsCollected
+        && (!value.detailFreshness || value.detailFreshness.state === "fresh")
+        && (observation?.scopeKind === "exact" || observation?.identityDetails)
         ? { ...value, identityDetailsCollected: true as const }
         : value;
     });
@@ -421,6 +423,7 @@ function packageSummary(value: CopilotPackageDetail): CopilotPackage {
     acquireUsersAndGroups: _acquireUsersAndGroups,
     elementDetails: _elementDetails,
     identityDetailsCollected: _identityDetailsCollected,
+    identityRevalidationRequired: _identityRevalidationRequired,
     ...summary
   } = value;
   return summary;

@@ -69,9 +69,12 @@ import { projectVerifiedAccessScope } from "./packageMutationState";
 import { clearPackageSelection, restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
+import { useAutomaticRefresh } from "./useAutomaticRefresh";
+import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 import { agentSortOptions, agentViewOptions } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
+import { inventoryAttentionReasons } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
 import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
 import { findUnifiedAgentRecord } from "./unifiedAgentIdentity";
@@ -305,7 +308,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const verificationOnlyAgentReload = useRef(false);
   const bulkJobPollRequestId = useRef(0);
   const packageRefreshRequestId = useRef(0);
-  const identityBackfills = useRef(new Set<string>());
   const inventoryRefreshRequestId = useRef(0);
   const linkedPackageRefreshRequestId = useRef(0);
   const dataSyncPanelRef = useRef<DataSyncPanelHandle>(null);
@@ -336,9 +338,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     followBulkJob(jobId, undefined, false));
   const loadSavedAgents = useEffectEvent((forceCurrentSnapshot = false) => {
     void loadAgents(forceCurrentSnapshot);
-  });
-  const collectMissingAgentIdentities = useEffectEvent((snapshotId: string) => {
-    void handleRefreshAgents(`agent-identities-${snapshotId}`);
   });
   const reloadPublishedPackages = useEffectEvent(() => {
     handleDataSyncSourcesChanged(["graph_packages"]);
@@ -948,23 +947,26 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
-  const canCollectIdentities = canReadSensitiveUsage
-    && providerActionAllowed(capabilityState.views.find(view => view.definition.id === "graph.package.read.delegated"));
-  const identitySnapshotId = savedAgentPageOwner?.principalKey === principalKey
-    && !savedAgentPageOwner.verificationOnly
-    && !loadingAgents
-    && !unifiedAgentReadError
-    && unifiedAgentPage?.identityCollection?.pendingPackages
-    && unifiedAgentPage.sources.powerPlatform.state !== "unavailable"
-    ? unifiedAgentPage.sources.graphPackages.observation?.snapshotId : undefined;
-
-  useEffect(() => {
-    if (!identitySnapshotId || !canCollectIdentities || visibleActiveView !== "agents" || refreshingAgents) return;
-    const key = `${principalKey}:${identitySnapshotId}`;
-    if (identityBackfills.current.has(key)) return;
-    identityBackfills.current.add(key);
-    collectMissingAgentIdentities(identitySnapshotId);
-  }, [canCollectIdentities, identitySnapshotId, principalKey, refreshingAgents, visibleActiveView]);
+  const automaticAction = workbenchMetadata?.actions.find(action => action.id === "data-sync.auto-refresh");
+  const automaticCapabilities = capabilityState.views.filter(view =>
+    ["graph.package.read.delegated", "powerPlatform.inventory.read", "graph.directory.read", "reports.copilotUsage.read"].includes(view.definition.id));
+  const automaticRefresh = useAutomaticRefresh({
+    principalKey,
+    authorizationKey: JSON.stringify(automaticCapabilities.map(view => [
+      view.definition.id, view.decision.authorized, view.decision.status, view.decision.evidence?.category,
+    ]).sort()),
+    enabled: Boolean(user && hasRole(user, "AgentControl.Viewer") && !loadingSession && !signingOut
+      && automaticAction && (automaticAction.roles.length === 0 || automaticAction.roles.some(role => hasRole(user, role)))
+      && (!automaticAction.capabilityId || providerActionAllowed(capabilityState.views.find(view => view.definition.id === automaticAction.capabilityId)))),
+    onSourcesChanged: sources => {
+      if (ownsAgentScope(principalKey)) handleDataSyncSourcesChanged(sources);
+    },
+    onRunsChanged: () => {
+      if (!ownsAgentScope(principalKey)) return;
+      handleSyncRunsChanged();
+      void dataSyncPanelRef.current?.refresh();
+    },
+  });
 
   useEffect(() => {
     if (!user || visibleActiveView === activeView) return;
@@ -1075,16 +1077,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   const displayedUnifiedAgents = unifiedAgentPage?.value ?? [];
-  const invalidMatchingPackageCount = unifiedAgentPage?.identityCollection?.invalidPackages ?? 0;
-  const pendingMatchingPackageCount = unifiedAgentPage?.identityCollection?.pendingPackages ?? 0;
-  const agentInventoryIssueSummary = [
-    unifiedAgentPage?.verification?.status === "needs_attention" ? "Saved inventory needs attention" : "",
-    unifiedAgentPage?.partial ? "Saved source limitations" : "",
-    pendingMatchingPackageCount > 0 ? `${pendingMatchingPackageCount.toLocaleString()} packages awaiting identity metadata` : "",
-    invalidMatchingPackageCount > 0
-      ? `${invalidMatchingPackageCount.toLocaleString()} package${invalidMatchingPackageCount === 1 ? "" : "s"} with invalid matching metadata`
-      : "",
-  ].filter(Boolean).join(" · ");
+  const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const advancedFilterCount = countAdvancedAgentFilters({
     environmentId: agentEnvironmentFilter,
     publisher: publisherFilter,
@@ -2444,8 +2437,33 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         </nav>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? <AutomaticRefreshStatus
+        status={automaticRefresh}
+        onOpenSync={() => navigateToView("sync")}
+        onOpenPermissions={() => navigateToView("permissions")}
+      /> : null}
+      {error && !(visibleActiveView === "sync" && error === unifiedAgentReadError) ? <div className="error-banner">{error}</div> : null}
       {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
+      {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? (
+        <AgentSyncTools
+          inventory={unifiedAgentPage}
+          verifyingInventory={loadingAgents || deferredQuery !== query}
+          inventoryError={unifiedAgentReadError}
+          onVerifyInventory={verifySavedAgentInventory}
+          selectedPackageCount={selectedAgentIds.size}
+          refreshingPackages={refreshingAgents}
+          refreshingPowerPlatform={refreshingPowerPlatformAgents}
+          exportingPowerPlatform={exportingPowerPlatformCsv}
+          powerPlatformJob={powerPlatformAgentRefreshJob}
+          onInspectPowerPlatformJob={setRequestedPowerPlatformJobId}
+          onRefreshPackages={() => void handleRefreshAgents()}
+          onRefreshMatchingDetails={() => void handleRefreshMatchingDetails()}
+          onRefreshPowerPlatform={() => void handleRefreshPowerPlatformAgents()}
+          onResumePowerPlatform={() => void handleResumePowerPlatformAgentRefresh()}
+          onExportPowerPlatform={() => void handleExportPowerPlatformAgentCsv()}
+          onOpenAgents={() => navigateToView("agents")}
+        />
+      ) : null}
       {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? (
         <CsvUsageReportsSection
           key={`csv-summary:${principalKey}`}
@@ -2468,33 +2486,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onOpenUsageImport={() => openUsageImport()}
           onRequestedRunChange={handleRequestedSyncRunChange}
           onSourcesChanged={handleDataSyncSourcesChanged}
+          onCancelRequested={() => automaticRefresh.setPaused(true)}
         />
       ) : null}
       {visibleActiveView === "sync" ? (
         <>
           {requestedPowerPlatformJobId ? <PowerPlatformSourceJob key={`${principalKey}:${requestedPowerPlatformJobId}`}
             jobId={requestedPowerPlatformJobId} onSelect={setRequestedPowerPlatformJobId}
+            onCancelRequested={() => automaticRefresh.setPaused(true)}
             onChanged={() => handleDataSyncSourcesChanged(["power_platform"])} /> : null}
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
-          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} />
-          <AgentSyncTools
-            inventory={unifiedAgentPage}
-            verifyingInventory={loadingAgents || deferredQuery !== query}
-            inventoryError={unifiedAgentReadError}
-            onVerifyInventory={hasRole(user, "AgentControl.Viewer") ? verifySavedAgentInventory : undefined}
-            selectedPackageCount={selectedAgentIds.size}
-            refreshingPackages={refreshingAgents}
-            refreshingPowerPlatform={refreshingPowerPlatformAgents}
-            exportingPowerPlatform={exportingPowerPlatformCsv}
-            powerPlatformJob={powerPlatformAgentRefreshJob}
-            onInspectPowerPlatformJob={setRequestedPowerPlatformJobId}
-            onRefreshPackages={() => void handleRefreshAgents()}
-            onRefreshMatchingDetails={() => void handleRefreshMatchingDetails()}
-            onRefreshPowerPlatform={() => void handleRefreshPowerPlatformAgents()}
-            onResumePowerPlatform={() => void handleResumePowerPlatformAgentRefresh()}
-            onExportPowerPlatform={() => void handleExportPowerPlatformAgentCsv()}
-            onOpenAgents={() => navigateToView("agents")}
-          />
+          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} onCollectionCancel={() => automaticRefresh.setPaused(true)} />
         </>
       ) : null}
       {hasRole(user, "AgentControl.Viewer") ? (
@@ -2544,7 +2546,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </span>
             </div>
             <div className="agent-catalog-actions">
-              {!loadingAgents && (unifiedAgentReadError || agentInventoryIssueSummary) ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={unifiedAgentReadError || unifiedAgentPage?.errors.map(item => item.message).join(" ") || agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
+              {!loadingAgents && agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
               <button
                 type="button"
                 className="secondary icon-button control-icon-button"
@@ -2818,7 +2820,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />
       ) : visibleActiveView === "jobs" ? (
-        <JobsView key={principalKey} user={user} onChanged={() => void dataSyncPanelRef.current?.refresh()} />
+        <JobsView key={principalKey} user={user} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} onCollectionCancel={() => automaticRefresh.setPaused(true)} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
       {loadingAgentDetailId ? (

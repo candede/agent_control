@@ -10,6 +10,9 @@ export async function readUnifiedInventoryRevision(scope: PackageDataScope, data
     SELECT 'graph_packages' AS source,id,observed_at,expires_at FROM package_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND is_current AND expires_at>clock_timestamp()
     UNION ALL
+    SELECT 'graph_package_details' AS source,generation AS id,observed_at,expires_at FROM package_detail_cache
+      WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND observed_at IS NOT NULL AND expires_at>clock_timestamp()
+    UNION ALL
     SELECT 'power_platform' AS source,id,observed_at,expires_at FROM power_platform_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
     UNION ALL
@@ -24,5 +27,5 @@ export async function readUnifiedInventoryRevision(scope: PackageDataScope, data
     SELECT 'agent_people' AS source,revision AS id,checked_at AS observed_at,expires_at FROM agent_people_cache
       WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
     ORDER BY source,id`, [scope.tenantId, scope.principalId]);
-  return createHash("sha256").update(JSON.stringify(["unified-agent-inventory-v4", scope.tenantId, scope.principalId, rows])).digest("hex");
+  return createHash("sha256").update(JSON.stringify(["unified-agent-inventory-v5", scope.tenantId, scope.principalId, rows])).digest("hex");
 }

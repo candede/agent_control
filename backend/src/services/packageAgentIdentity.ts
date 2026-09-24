@@ -69,6 +69,14 @@ export function resolvePackageAgentLinks(
   }
   const identities = new Map<string, PackageAgentMetadata>();
   const resolutions: PackageAgentLinkResolution[] = packages.map(value => {
+    if (value.detailFreshness && value.detailFreshness.state !== "fresh") return {
+      packageId: value.id, status: "unmatched",
+      reason: "Package identity details are missing, expired, or changed. Refresh this package's identity before linking it to a Power Platform agent.",
+    };
+    if (value.identityRevalidationRequired) return {
+      packageId: value.id, status: "unmatched",
+      reason: "A control readback reported changed identity evidence. Refresh this package's identity before linking it to a Power Platform agent.",
+    };
     const observation = readPackageAgentMetadata(value);
     if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
       return { packageId: value.id, ...observation };
@@ -330,7 +338,9 @@ export function withVerifiedControlIdentities(
     const identityObservation = observation?.identityDetails ?? observation;
     if (!identityObservation) continue;
     const observedAt = Date.parse(identityObservation.observedAt);
+    const catalogObservedAt = Date.parse(observation.observedAt);
     if (!Number.isFinite(observedAt) || observedAt > now || observedAt < now - maximumAgeMs
+      || !Number.isFinite(catalogObservedAt) || catalogObservedAt > now || catalogObservedAt < now - maximumAgeMs
       || !(Date.parse(identityObservation.expiresAt) > now) || !(Date.parse(observation.expiresAt) > now)) continue;
     verified.set(powerPlatformAgentKey(link.resource.environmentId, link.resource.nativeId), link.controlBotId);
   }

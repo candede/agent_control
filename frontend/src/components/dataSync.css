@@ -378,6 +378,10 @@
 .sync-inventory-summary > svg { flex-shrink: 0; color: var(--ink); }
 .sync-inventory-summary > div { flex: 1; min-width: 0; }
 .sync-inventory-summary > button { flex-shrink: 0; }
+.sync-inventory-issues { margin-top: 14px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.sync-inventory-issues h3 { margin: 0; font-size: 14px; }
+.sync-inventory-issues ul { margin: 8px 0 0; padding-left: 20px; }
+.sync-inventory-issues li + li { margin-top: 6px; }
 .sync-source-tools { display: grid; gap: 12px; min-width: 0; padding-top: 16px; border-top: 1px solid var(--border); }
 .sync-source-tools h3 { margin: 0; }
 .sync-source-tools p { margin: 0; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }

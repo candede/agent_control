@@ -7,6 +7,7 @@ import { AppError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { dataSyncFailureStatus } from "../types/dataSync.js";
 import { capabilities } from "./capabilities.js";
 import { GraphPackagesClient, graphErrorTelemetry, graphResponseDiagnostics, packageInventoryReadPolicy, type PackageReadOptions } from "./graphPackages.js";
 import { mapWithConcurrency } from "./mapWithConcurrency.js";
@@ -17,7 +18,10 @@ import { operationalLog, withTelemetryContext } from "./telemetry.js";
 
 type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
 type PackageScanClient = Pick<GraphPackagesClient, "listCopilotAgents" | "getPackageDetails">;
-export type PackageScanOptions = Pick<PackageReadOptions, "getAccessToken" | "retryThrottlingUntilAborted">;
+export type PackageScanOptions = Pick<PackageReadOptions, "getAccessToken" | "retryThrottlingUntilAborted"> & {
+  catalogOnly?: boolean;
+  autoDetails?: boolean;
+};
 export type PackageRefreshScan = (
   token: string, requestedIds: readonly string[], signal: AbortSignal, onProgress: PackageRefreshProgress, options?: PackageScanOptions,
 ) => Promise<PackageScanResult>;
@@ -48,7 +52,7 @@ const defaultDependencies: PackageRefreshDependencies = {
 };
 
 type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
-type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void> };
+type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void>; autoDetails?: boolean };
 type StartingRefresh = Omit<ActiveRefresh, "operation"> & {
   operation: Promise<NonNullable<Awaited<ReturnType<PackageInventoryRepository["getJob"]>>>>;
 };
@@ -72,7 +76,27 @@ export class PackageInventoryService {
     return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
   }
 
-  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
+  async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number) {
+    requireRefreshRole(user);
+    const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId());
+    if (this.draining || [...new Map<string, Pick<ActiveRefresh, "autoDetails">>([...this.starting, ...this.active]).values()].filter(value => value.autoDetails).length >= 2) {
+      return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+    }
+    const job = await this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
+    if (!job) return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+    try {
+      return await this.start(user, job.id, "delegated", { autoDetails: true });
+    } catch (error) {
+      operationalLog("warn", "package_detail_admission_failed", { jobId: job.id, ...graphErrorTelemetry(error) });
+      const failed = await this.repository.markFailed(scope, job.id, syncFailureCode(error),
+        isAuthorizationFailure(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
+          : safeFailureMessage(error));
+      if (failed) return failed;
+      throw error;
+    }
+  }
+
+  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean; autoDetails?: boolean } = {}) {
     const actor = actorScope(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
     id = id.toLowerCase();
@@ -84,12 +108,14 @@ export class PackageInventoryService {
       }
       throw new AppError(409, "package_refresh_state", "Package refresh is already starting or running.");
     }
-    if (new Set([...this.active.keys(), ...this.starting.keys()]).size >= maximumActiveRefreshes) {
+    const laneCount = [...new Map<string, Pick<ActiveRefresh, "autoDetails">>([...this.starting, ...this.active]).values()]
+      .filter(value => Boolean(value.autoDetails) === Boolean(options.autoDetails)).length;
+    if (laneCount >= (options.autoDetails ? 2 : maximumActiveRefreshes)) {
       throw new AppError(429, "package_refresh_capacity", "At most four package refreshes can run at once.");
     }
     const controller = new AbortController();
     const starting: StartingRefresh = {
-      actor, controller,
+      actor, controller, autoDetails: options.autoDetails,
       operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, options))
         .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
     };
@@ -126,7 +152,7 @@ export class PackageInventoryService {
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
         signal.throwIfAborted();
-        markedRunning = await this.repository.markRunning(scope, id);
+        markedRunning = current!.autoDetails ? await this.repository.markRunning(scope, id, true) : await this.repository.markRunning(scope, id);
         if (!markedRunning) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
       });
       signal.throwIfAborted();
@@ -141,13 +167,13 @@ export class PackageInventoryService {
       signal.throwIfAborted();
       throw error;
     }
-    const execution = createRefreshExecutionSignal(signal, packageRefreshExecutionDeadlineMs);
+    const execution = createRefreshExecutionSignal(signal, current.autoDetails ? 5 * 60_000 : packageRefreshExecutionDeadlineMs);
     const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal))
       .finally(() => {
         execution.dispose();
         if (this.active.get(id)?.operation === operation) this.active.delete(id);
       });
-    this.active.set(id, { actor, controller, operation });
+    this.active.set(id, { actor, controller, operation, autoDetails: current.autoDetails });
     void operation.catch(error => {
       operationalLog("error", "package_refresh_status_failed", { jobId: id, ...graphErrorTelemetry(error) });
     });
@@ -204,7 +230,9 @@ export class PackageInventoryService {
       const result = await this.dependencies.observeOperation(capabilityForMode(current.tokenMode),
         { tenantId: actor.tenantId, homeAccountId: actor.principalId }, () => this.dependencies.scan(token, current.requestedIds, signal,
         (pages, observedCount, totalRecords, message) => this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message), {
-          retryThrottlingUntilAborted: true,
+          retryThrottlingUntilAborted: !current.autoDetails,
+          ...(current.catalogOnly ? { catalogOnly: true } : {}),
+          ...(current.autoDetails ? { autoDetails: true } : {}),
           getAccessToken: async () => {
             signal.throwIfAborted();
             const capabilityId = capabilityForMode(current.tokenMode);
@@ -249,8 +277,9 @@ export class PackageInventoryService {
           await this.dependencies.wait(retryDelayMs, signal);
         }
       }
-      operationalLog("info", "package_refresh_succeeded", {
-        status: "succeeded", count: result.packages.length, pages: result.pages,
+      const detailsFailed = current.autoDetails && Boolean(result.detailFailures?.length);
+      operationalLog(detailsFailed ? "warn" : "info", detailsFailed ? "package_detail_read_failed" : "package_refresh_succeeded", {
+        status: detailsFailed ? "failed" : "succeeded", count: result.packages.length, pages: result.pages,
         durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
@@ -263,15 +292,20 @@ export class PackageInventoryService {
         return;
       }
       if (isAuthorizationFailure(failure)) {
-        await this.repository.markWaitingAuthorization(scope, id);
+        if (current.autoDetails) await this.repository.markFailed(scope, id, "interaction_required", "Automatic enrichment needs renewed authorization and will retry after backoff.");
+        else await this.repository.markWaitingAuthorization(scope, id);
         return;
       }
       const timedOut = signal.aborted && signal.reason instanceof Error && signal.reason.name === "TimeoutError";
       const diagnostics = graphResponseDiagnostics(failure);
-      const code = timedOut ? "package_refresh_timeout" : diagnostics ? `graph_http_${diagnostics.status}`
-        : failure instanceof AppError ? failure.code : "provider_error";
+      const code = timedOut ? "package_refresh_timeout"
+        : failure instanceof AppError && dataSyncFailureStatus(failure.code, failure.status) === "permission_required"
+          ? syncFailureCode(failure) : diagnostics ? `graph_http_${diagnostics.status}` : syncFailureCode(failure);
       await this.repository.markFailed(scope, id, code,
-        timedOut ? "Package refresh reached its four-hour execution deadline. The previous complete inventory is unchanged; retry from Sync." : safeFailureMessage(failure));
+        timedOut ? current.autoDetails
+          ? "Automatic detail enrichment reached its five-minute deadline. Saved details are unchanged; a later authorized check may retry after backoff."
+          : "Package refresh reached its four-hour execution deadline. The previous complete inventory is unchanged; retry from Sync."
+          : safeFailureMessage(failure));
       operationalLog("error", "package_refresh_failed", { stage, ...graphErrorTelemetry(failure), errorCode: code });
     }
   }
@@ -333,6 +367,7 @@ async function collectPackages(
   let listPages = 0;
   let ids = requestedIds;
   const summaries = new Map<string, CopilotPackageDetail>();
+  const detailFailures: NonNullable<PackageScanResult["detailFailures"]> = [];
   if (broad) {
     const listed = await client.listCopilotAgents(token, {
       ...options,
@@ -340,7 +375,8 @@ async function collectPackages(
       diagnostics,
       onProgress: async progress => {
         listPages = progress.pages;
-        await onProgress(progress.pages, progress.observedCount, progress.observedCount, "Reading the agent list before identity collection.");
+        await onProgress(progress.pages, progress.observedCount, progress.observedCount,
+          options.catalogOnly ? "Reading the package catalog; detail enrichment runs separately." : "Reading the agent list before identity collection.");
       },
     });
     for (const value of listed) {
@@ -348,6 +384,7 @@ async function collectPackages(
       summaries.set(value.id, value);
     }
     ids = [...summaries.keys()];
+    if (options.catalogOnly) return { packages: [...summaries.values()], totalRecords: summaries.size, pages: Math.max(1, listPages) };
     await onProgress(Math.max(1, listPages), 0, ids.length, `Matching agent records (0/${ids.length} identities checked).`);
   }
   if (!broad && ids.length > 100) throw new AppError(400, "invalid_targets", "An exact package refresh accepts at most 100 native IDs.");
@@ -376,7 +413,8 @@ async function collectPackages(
     });
     return progress;
   };
-  const results = await mapWithConcurrency(ids, exactReadConcurrency, async id => {
+  const concurrency = options.autoDetails ? 2 : exactReadConcurrency;
+  const results = await mapWithConcurrency(ids, concurrency, async id => {
     try {
       readSignal.throwIfAborted();
       let value: CopilotPackageDetail | null;
@@ -396,14 +434,17 @@ async function collectPackages(
           provenance: { ...summary?.provenance, ...detail.provenance },
         };
       } catch (error) {
-        if (!(error instanceof AppError && error.status === 404)) throw error;
+        const missing = error instanceof AppError && error.status === 404;
+        if (options.autoDetails && !(error instanceof AppError && dataSyncFailureStatus(error.code, error.status) !== "failed")) {
+          detailFailures.push({ id, missing, errorCode: error instanceof AppError ? error.code : "provider_error" });
+        } else if (!missing) throw error;
         value = null;
       }
       readSignal.throwIfAborted();
       completed += 1;
       if (value) observedCount += 1;
       diagnostics.completeDetail(value !== null);
-      if (completed % exactReadConcurrency === 0 || completed === ids.length) {
+      if (completed % concurrency === 0 || completed === ids.length) {
         await reportProgress();
       }
       return value;
@@ -414,7 +455,8 @@ async function collectPackages(
   });
   signal.throwIfAborted();
   const packages = results.filter(value => value !== null);
-  return { packages, totalRecords: packages.length, pages: Math.max(1, broad ? listPages : completed) };
+  return { packages, totalRecords: packages.length, pages: Math.max(1, broad ? listPages : completed),
+    ...(options.autoDetails ? { detailFailures } : {}) };
 }
 
 function capabilityForMode(mode: RefreshInput["tokenMode"]): CapabilityId {
@@ -441,10 +483,19 @@ function requireSamePrincipal(scope: PackageDataScope, user: AuthenticatedUser) 
 }
 
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && (error.status === 401 || error.status === 403 || ["interaction_required", "authorization_expired", "missing_internal_role", "missing_permission", "capability_unavailable", "not_configured"].includes(error.code));
+  return error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "waiting_authorization";
+}
+
+function syncFailureCode(error: unknown) {
+  if (!(error instanceof AppError)) return "provider_error";
+  if (dataSyncFailureStatus(error.code) !== "failed") return error.code;
+  return error.status === 401 ? "interaction_required" : error.status === 403 ? "missing_permission" : error.code;
 }
 
 function safeFailureMessage(error: unknown) {
+  if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
+    return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
+  }
   const diagnostics = graphResponseDiagnostics(error);
   if (diagnostics) {
     return `${diagnostics.throttled ? "Microsoft Graph is throttling package reads" : "Microsoft Graph package read failed"} (HTTP ${diagnostics.status}${diagnostics.providerCode ? `, ${diagnostics.providerCode}` : ""}). The previous complete inventory is unchanged; ${diagnostics.throttled ? "allow the provider cooldown to finish, then retry" : "retry"} from Sync.${diagnostics.requestId ? ` Graph request ID: ${diagnostics.requestId}.` : ""}`;

@@ -9,6 +9,7 @@ import {
   getAgents,
   powerPlatformResourceTypes,
   type BulkActionJob,
+  type AutomaticRefreshResult,
   type CopilotPackage,
   type InventoryRefreshJob,
   type PackagePage,
@@ -37,6 +38,15 @@ const viewer: SessionUser = {
   tenantId: "tenant-1",
   roles: ["AgentControl.Viewer"],
 };
+
+function automaticRefreshResponse(overrides: Partial<AutomaticRefreshResult> = {}): AutomaticRefreshResult {
+  return {
+    run: null, detailJob: null,
+    revisions: { users: "users-1", graph_packages: "packages-1", power_platform: "power-platform-1" },
+    nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+    ...overrides,
+  };
+}
 
 const agent: CopilotPackage = {
   id: "package-private",
@@ -305,6 +315,121 @@ describe("App session revalidation", () => {
     vi.unstubAllGlobals();
   });
 
+  it("refreshes Users, Agents and Sync history on automatic publications without opening a workflow", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/users");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let version = 1;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { users: `users-${version}`, graph_packages: `packages-${version}`, power_platform: `pp-${version}` },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        const page = structuredClone(unifiedPage);
+        page.value[0].displayName = `Published agent ${version}`;
+        return Response.json(page);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const count = (path: string) => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === path).length;
+    const usersBefore = count("/api/copilot-usage/users");
+    expect(usersBefore).toBeGreaterThan(0);
+    expect(count("/api/data-sync/auto-refresh")).toBe(1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    version = 2;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(count("/api/copilot-usage/users")).toBe(usersBefore + 1);
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText("Published agent 2")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const historyBefore = count("/api/workbench/jobs");
+    version = 3;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(count("/api/workbench/jobs")).toBeGreaterThan(historyBefore);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(refreshRequests(transport.fetchMock)).toEqual([]);
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")
+      .every(([input]) => ["/api/data-sync/auto-refresh", "/api/capabilities/check"].includes(input))).toBe(true);
+  });
+
+  it("pauses automatic work before a manual cancellation and keeps manual sync available", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const run = {
+      id: "auto-run", automatic: true, mode: "incremental", status: "running", sources: [],
+      startedAt: "2026-09-24T10:00:00Z", updatedAt: "2026-09-24T10:00:00Z", completedAt: null,
+    };
+    let cancelled = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/state") {
+        const state = await (await base(input, init)).json();
+        return Response.json({ ...state, run: { ...run, status: cancelled ? "cancelled" : "running" } });
+      }
+      if (input === "/api/data-sync/runs/auto-run/cancel") {
+        cancelled = true;
+        return Response.json({ ...run, status: "cancelled" });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(cancelled).toBe(true);
+    expect(screen.getByText("Automatic refresh · Paused for this session")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
+    const checks = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh").length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(10 * 60_000); });
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(checks);
+  });
+
+  it.each(["missing_permission", "interaction_required"] as const)("keeps automatic due checks eligible with one %s provider and unverified detail metadata", async category => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    transport.page = packagePage;
+    transport.readAuthorized = false;
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
+        const capabilities = await (await base(input, init)).json();
+        capabilities.value[0].decision.evidence = { category };
+        return Response.json(capabilities);
+      }
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+        ...unifiedPage, identityCollection: { checkedPackages: 0, pendingPackages: 1 },
+      });
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        run: {
+          id: "partially-authorized-run", automatic: true, mode: "incremental", status: "partial",
+          startedAt: "2026-09-24T10:00:00Z", updatedAt: "2026-09-24T10:01:00Z", completedAt: "2026-09-24T10:01:00Z",
+          sources: [
+            { source: "users", status: "succeeded", jobId: null, count: 42, lastSuccessAt: "2026-09-24T10:01:00Z", updatedAt: "2026-09-24T10:01:00Z", message: "", canRetry: false },
+            { source: "graph_packages", status: category === "interaction_required" ? "waiting_authorization" : "permission_required", jobId: null, count: null, lastSuccessAt: null, updatedAt: "2026-09-24T10:01:00Z", message: "", canRetry: false },
+          ],
+        },
+      }));
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText(agent.displayName)).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(2);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it.each((["power_platform", "graph_packages"] as const).flatMap(source => [
     ...(["responsibility", "licenses", "activity"] as const).map(surface => ({ source, surface, event: "completion" as const })),
     { source, surface: "responsibility" as const, event: "reset" as const },
@@ -350,10 +475,12 @@ describe("App session revalidation", () => {
       });
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
+      await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
       if (surface !== "responsibility") await userEvent.click(await screen.findByRole("button", {
         name: surface === "licenses" ? "Ada" : `View reported details for ${reportUser.displayName}`,
       }));
       await screen.findByText("Previous responsibility");
+      const beforeResponsibilityReads = responsibilityReads;
       const dialog = surface === "responsibility" ? undefined : screen.getByRole("dialog", { name: surface === "licenses" ? "Ada" : reportUser.displayName! });
       const directoryReads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/copilot-usage/users").length;
       const reportReads = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/users")).length;
@@ -364,7 +491,7 @@ describe("App session revalidation", () => {
       expect(screen.getByText("Created by", { exact: true })).toBeVisible();
       expect(screen.getByRole("combobox", { name: "User cohort" })).toHaveValue(surface);
       expect(window.location.pathname + window.location.search).toBe(url);
-      expect(responsibilityReads).toBe(2);
+      expect(responsibilityReads).toBe(beforeResponsibilityReads + 1);
       expect([directoryReads(), reportReads()]).toEqual(beforeReads);
       if (surface === "responsibility") expect(beforeReads).toEqual([0, 0]);
       if (dialog) {
@@ -374,7 +501,7 @@ describe("App session revalidation", () => {
           .toHaveTextContent(String(surface === "licenses" ? directory.users[0].importedUsage!.reportedResponsesReceived : reportUser.reportedResponsesReceived));
       }
       expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method && init.method !== "GET").map(([input]) => input))
-        .toEqual(["/api/capabilities/check"]);
+        .toEqual(expect.arrayContaining(["/api/capabilities/check", "/api/data-sync/auto-refresh"]));
       await userEvent.click(screen.getByRole("button", { name: "Open agent Current responsibility after sync" }));
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) =>
         input.startsWith("/api/agent-inventory?") && new URL(input, "http://localhost").searchParams.get("recordId") === "agent:dddddddd-dddd-4ddd-8ddd-dddddddddddd")).toBe(true));
@@ -626,7 +753,7 @@ describe("App session revalidation", () => {
     const base = transport.fetchMock.getMockImplementation()!;
     const denied = deferredResponse();
     transport.fetchMock.mockImplementation((input, init) =>
-      new URL(input, "http://localhost").pathname === "/api/agents" ? denied.promise : base(input, init));
+      new URL(input, "http://localhost").pathname === "/api/agents" ? denied.promise.then(response => response.clone()) : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     const summary = await screen.findByRole("region", { name: "Snapshot tenant totals" });
@@ -758,7 +885,7 @@ describe("App session revalidation", () => {
     await screen.findByRole("heading", { name: "Permissions" });
   });
 
-  it("collects missing identities once and replaces duplicate source rows with one agent", async () => {
+  it("uses the automatic due check to replace duplicate source rows without a second identity scanner", async () => {
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", agent.displayName);
     const merged: UnifiedAgentRecord = {
       ...native, presence: "both", packages: [agent],
@@ -774,24 +901,27 @@ describe("App session revalidation", () => {
         ...unifiedRecordsPage(collected ? [merged] : [unifiedPage.value[0], native]),
         identityCollection: { checkedPackages: collected ? 1 : 0, pendingPackages: collected ? 0 : 1 },
       });
-      if (input === "/api/agents/refresh-jobs" && init?.method === "POST") collected = true;
+      if (input === "/api/data-sync/auto-refresh") {
+        collected = true;
+        return Response.json(automaticRefreshResponse());
+      }
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<StrictMode><App /></StrictMode>);
-    await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
+    await waitFor(() => expect(collected).toBe(true));
     await waitFor(() => expect(within(screen.getByRole("region", { name: "Unified agents" })).getAllByText(agent.displayName)).toHaveLength(1));
-    expect(refreshRequests(transport.fetchMock)[0][1]).toMatchObject({
-      headers: expect.objectContaining({ "Idempotency-Key": `agent-identities-${packagePage.snapshot!.id}` }),
-    });
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.find(([input]) => input === "/api/data-sync/auto-refresh")?.[1]).toMatchObject({ method: "POST", body: "{}" });
     expect(screen.getAllByRole("checkbox", { name: `Select ${agent.displayName}` })).toHaveLength(1);
     expect(window.location.pathname).toBe("/agents");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await userEvent.type(screen.getByRole("searchbox", { name: "Search" }), "Sensitive");
-    expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("follows an existing identity refresh across tabs without dispatching another collection", async () => {
+    vi.useFakeTimers();
     const transport = initialCatalogTransport();
     transport.page = packagePage;
     transport.jobs = [{ ...completedRefreshJob(), status: "running", snapshotId: null, message: "Matching agent records (0/1 identities checked)." }];
@@ -802,24 +932,33 @@ describe("App session revalidation", () => {
         ...unifiedRecordsPage(unifiedPage.value),
         identityCollection: { checkedPackages: finished ? 1 : 0, pendingPackages: finished ? 0 : 1 },
       });
-      if (input.startsWith("/api/agents/refresh-jobs/refresh-first-load?")) {
-        finished = true;
-        return Response.json(completedRefreshJob());
-      }
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        detailJob: { id: "details-1", status: finished ? "succeeded" : "running", updatedAt: String(finished) },
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: finished ? "packages-2" : "packages-1" },
+      }));
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await screen.findByText("Matching agent records (0/1 identities checked).");
-    await userEvent.click(screen.getByRole("button", { name: "Users" }));
-    await waitFor(() => expect(finished).toBe(true), { timeout: 3_000 });
-    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByRole("region", { name: "Automatic refresh" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(screen.getByText("Automatic refresh · Refreshing in the background")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Users" }));
+    finished = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(screen.queryByRole("region", { name: "Automatic refresh" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(screen.getByText("Automatic refresh · On")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText(agent.displayName)).toBeInTheDocument();
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("keeps automatic package collection monitored for three hours and reloads its completed result", async () => {
     vi.useFakeTimers();
+    window.history.replaceState({}, "", "/sync");
     const transport = initialCatalogTransport();
     transport.page = packagePage;
     transport.jobs = [{ ...completedRefreshJob(), status: "running", snapshotId: null, message: "Matching agent records (0/1 identities checked)." }];
@@ -831,23 +970,28 @@ describe("App session revalidation", () => {
         ...unifiedRecordsPage(unifiedPage.value),
         identityCollection: { checkedPackages: completed ? 1 : 0, pendingPackages: completed ? 0 : 1 },
       });
-      if (input.startsWith("/api/agents/refresh-jobs/refresh-first-load?")) {
+      if (input === "/api/data-sync/auto-refresh") {
         reads += 1;
-        return Response.json(completed ? completedRefreshJob() : transport.jobs[0]);
+        return Response.json(automaticRefreshResponse({
+          detailJob: { id: "details-1", status: completed ? "succeeded" : "running", updatedAt: String(completed) },
+          revisions: { ...automaticRefreshResponse().revisions, graph_packages: completed ? "packages-2" : "packages-1" },
+        }));
       }
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     const mounted = render(<App />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-    expect(screen.getByText("Matching agent records (0/1 identities checked).")).toBeVisible();
+    expect(screen.getByText("Automatic refresh · Refreshing in the background")).toBeVisible();
     vi.setSystemTime(Date.now() + 3 * 60 * 60_000);
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_250); });
-    expect(reads).toBeGreaterThanOrEqual(3);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(reads).toBeGreaterThanOrEqual(2);
     expect(screen.queryByText(/reached its.*minute bound/)).not.toBeInTheDocument();
     completed = true;
-    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
-    expect(screen.queryByText("Matching agent records (0/1 identities checked).")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(screen.getByText("Automatic refresh · On")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText(agent.displayName)).toBeVisible();
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     const finalReads = reads;
@@ -856,14 +1000,18 @@ describe("App session revalidation", () => {
     mounted.unmount();
   });
 
-  it("does not start identity collection without current read authorization and surfaces collection failure", async () => {
+  it("delegates automatic source authorization to the due check and surfaces failures without a second scanner", async () => {
     const transport = initialCatalogTransport();
     transport.page = packagePage;
     transport.readAuthorized = false;
     const base = transport.fetchMock.getMockImplementation()!;
-    transport.fetchMock.mockImplementation(async (input, init) => input.startsWith("/api/agent-inventory")
-      ? Response.json({ ...unifiedRecordsPage(unifiedPage.value), identityCollection: { checkedPackages: 0, pendingPackages: 1 } })
-      : base(input, init));
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input.startsWith("/api/agent-inventory")) return Response.json({ ...unifiedRecordsPage(unifiedPage.value), identityCollection: { checkedPackages: 0, pendingPackages: 1 } });
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        detailJob: transport.failRefresh ? { id: "failed-details", status: "failed", updatedAt: "now" } : null,
+      }));
+      return base(input, init);
+    });
     vi.stubGlobal("fetch", transport.fetchMock);
     const mounted = render(<App />);
     await screen.findByText(agent.displayName);
@@ -872,9 +1020,12 @@ describe("App session revalidation", () => {
     transport.readAuthorized = true;
     transport.failRefresh = true;
     render(<App />);
-    expect(await screen.findByText(/Synthetic initial refresh failed/)).toBeVisible();
+    await screen.findByText(agent.displayName);
+    expect(screen.queryByRole("region", { name: "Automatic refresh" })).not.toBeInTheDocument();
     await userEvent.type(screen.getByRole("searchbox", { name: "Search" }), "Sensitive");
-    expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    expect(await screen.findByText("Automatic refresh · Some sources need attention")).toBeVisible();
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("routes invalid metadata diagnostics to explicit recovery without treating checked packages as matches or retrying automatically", async () => {
@@ -1215,18 +1366,18 @@ describe("App session revalidation", () => {
           identityCollection: { checkedPackages: reconciled ? 1 : 0, pendingPackages: reconciled ? 0 : 1 },
         });
       }
-      if (input === "/api/agents/refresh-jobs" && init?.method === "POST") return refresh.promise;
+      if (input === "/api/data-sync/auto-refresh") return refresh.promise;
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
 
-    await waitFor(() => expect(refreshRequests(transport.fetchMock)).toHaveLength(1));
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: "View details for Reconciled detail" }));
     await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Manage" }));
     expect(screen.getByText(/No published version is available for these controls/)).toBeInTheDocument();
     reconciled = true;
-    await act(async () => refresh.resolve(Response.json(completedRefreshJob())));
+    await act(async () => refresh.resolve(Response.json(automaticRefreshResponse())));
 
     const dialog = screen.getByRole("dialog", { name: "Reconciled detail" });
     const versions = await within(dialog).findByRole("combobox", { name: "Published version details" });
@@ -1271,6 +1422,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
+    await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
     await act(async () => {
       window.history.pushState({}, "", `/agents?detail=${encodeURIComponent(record.id)}&detailTab=reports`);
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -1566,7 +1718,7 @@ describe("App session revalidation", () => {
     expect(screen.queryByText("Optional directory-role hint")).not.toBeInTheDocument();
   });
 
-  it("shows only a concise issue notice on Agents and keeps troubleshooting collapsed on Sync", async () => {
+  it("shows a concise issue notice on Agents and immediately explains it near the top of Sync", async () => {
     const transport = appTransport({
       initialRoles: ["AgentControl.Admin"],
       revalidatedRoles: ["AgentControl.Admin"],
@@ -1591,7 +1743,7 @@ describe("App session revalidation", () => {
     expect(screen.queryByText(/Copilot Studio agent coverage is incomplete\./)).not.toBeInTheDocument();
     const issue = screen.getByRole("button", { name: /Inventory needs attention.*Open Sync/ });
     expect(issue).toBeVisible();
-    expect(issue).toHaveAttribute("title", "Copilot Studio agent coverage is incomplete.");
+    expect(issue).toHaveAttribute("title", expect.stringContaining("Copilot Studio agent coverage is incomplete."));
     expect(screen.queryByRole("button", { name: "Refresh agents" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
     expect(screen.getByRole("button", { name: "Block selected packages" })).toBeVisible();
@@ -1600,9 +1752,11 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("region", { name: "Data sync" })).toBeVisible();
     expect(screen.queryByRole("dialog", { name: "Inventory diagnostics" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Saved agent inventory verification" })).not.toBeInTheDocument();
-    expect(screen.getByText("Saved inventory checks need attention. View diagnostics for the cause and recovery options.")).toBeVisible();
+    expect(screen.getByText("Copilot Studio agent coverage is incomplete.")).toBeVisible();
+    const health = screen.getByRole("region", { name: "Inventory health" });
+    expect(health.compareDocumentPosition(screen.getByRole("region", { name: "CSV usage reports" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     await userEvent.click(screen.getByText("View diagnostics"));
-    expect(screen.getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
+    expect(within(screen.getByRole("dialog", { name: "Inventory diagnostics" })).getByText(/Copilot Studio agent coverage is incomplete\./)).toBeVisible();
     expect(screen.getByText("Source-metadata links")).toBeVisible();
     expect(screen.getByText(/1 published target selected/)).toBeVisible();
     expect(screen.getByRole("heading", { name: "Sync history" })).toBeVisible();
@@ -1642,7 +1796,7 @@ describe("App session revalidation", () => {
     await act(async () => permissionCatalog.resolve(await base("/api/capabilities")));
     await waitFor(() => expect(transport.fetchMock.mock.calls
       .filter(([, init]) => init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method]))
-      .toEqual([["/api/capabilities/check", "POST"]]));
+      .toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]])));
     await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
     const beforeExpansion = transport.fetchMock.mock.calls.length;
     await userEvent.click(screen.getByText("View diagnostics"));
@@ -1695,21 +1849,21 @@ describe("App session revalidation", () => {
     await within(await screen.findByRole("region", { name: "Inventory health" })).findByText("Verified");
     expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "true");
     await userEvent.click(screen.getByText("View diagnostics"));
-    expect(nonGetRequests()).toEqual([]);
+    expect(nonGetRequests()).toEqual([["/api/data-sync/auto-refresh", "POST"]]);
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
     verificationRequested = true;
     const beforeVerification = transport.fetchMock.mock.calls.length;
     await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
-    expect(nonGetRequests()).toEqual([]);
+    expect(nonGetRequests()).toEqual([["/api/data-sync/auto-refresh", "POST"]]);
     await act(async () => permissionCatalog.resolve(await base("/api/capabilities")));
-    await waitFor(() => expect(nonGetRequests()).toEqual([["/api/capabilities/check", "POST"]]));
+    await waitFor(() => expect(nonGetRequests()).toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]])));
     await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     await act(async () => verification.resolve(Response.json({ ...page, revision: "b".repeat(64) })));
     await receipt.findByText("Saved inventory verified");
     expect(transport.fetchMock.mock.calls.slice(beforeVerification).filter(([input]) => input.startsWith("/api/agent-inventory?"))).toHaveLength(1);
-    expect(nonGetRequests()).toEqual([["/api/capabilities/check", "POST"]]);
+    expect(nonGetRequests()).toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]]));
   });
 
   it("keeps the full verified receipt under search, environment filtering and a later result page", async () => {
@@ -3685,6 +3839,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     const download = mockCsvDownload();
     render(<App />);
+    await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
     const exportButton = await screen.findByRole("button", { name: kind === "users" ? "Export users CSV" : "Export agents CSV" });
     await waitFor(() => expect(exportButton).toBeEnabled());
     await userEvent.click(exportButton);
@@ -4018,7 +4173,7 @@ describe("App session revalidation", () => {
     expect(new URLSearchParams(window.location.search).get("mode")).toBe("application");
     const collectionRequests = transport.fetchMock.mock.calls.filter(([input]) =>
       input.startsWith("/api/agents") || input.startsWith("/api/data-sync") || input.startsWith("/api/inventory"));
-    expect(collectionRequests.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+    expect(collectionRequests.every(([input, init]) => input === "/api/data-sync/auto-refresh" || (init?.method ?? "GET") === "GET")).toBe(true);
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     expect(window.location.search).not.toContain("refreshJob");
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
@@ -4082,12 +4237,12 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     const view = render(<App />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-    expect(inventoryReads).toBe(initiallyComplete ? 2 : 1);
+    expect(inventoryReads).toBe(initiallyComplete ? 3 : 2);
     expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent(initiallyComplete ? "succeeded" : "running");
     completed = true;
     await act(async () => { await vi.advanceTimersByTimeAsync(750); });
     expect(screen.getByRole("region", { name: "Selected package refresh job" })).toHaveTextContent("succeeded");
-    expect(inventoryReads).toBe(2);
+    expect(inventoryReads).toBe(3);
     fireEvent.click(screen.getByRole("button", { name: "Agents" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText("Newly published agent")).toBeVisible();
@@ -4699,6 +4854,7 @@ function appTransport({
       }] : [] });
     }
     if (input === "/api/workbench/metadata") return Response.json({ views: workbenchViews, actions: workbenchActions });
+    if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse());
     if (input === "/api/workbench/jobs") return Response.json({
       value: [], unavailableSources: [], polledAt: "2026-09-15T08:00:00.000Z", requestId: "sync-history",
     });

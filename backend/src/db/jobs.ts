@@ -229,12 +229,12 @@ export class JobRepository {
       if (!result.rowCount) throw new AppError(409, "terminal_item", "Terminal items cannot be overwritten.");
       let snapshotId: string | undefined;
       if (evidence.readback) {
-        if (!["succeeded", "skipped"].includes(outcome)
+        if (!["succeeded", "skipped"].includes(outcome) || !evidence.poststate
           || evidence.readback.id !== result.rows[0].target_id
           || packageMutationStateHash(capturePackageMutationState(evidence.readback, job.action)) !== poststateHash) {
           throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact target and verified mutation state.");
         }
-        snapshotId = await publishPackageReadback(lease.scope, evidence.readback, client, evidence.inventoryGeneration);
+        snapshotId = await publishPackageReadback(lease.scope, evidence.readback, client, evidence.inventoryGeneration, evidence.poststate);
       }
       await client.query("UPDATE job_attempts SET finished_at=clock_timestamp(),outcome=$3,readback_count=$4 WHERE item_id=$1 AND lease_version=$2", [itemId, lease.version, outcome, Math.min(Math.max(evidence.readbackCount ?? 0, 0), 20)]);
       await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: outcome, message: evidence.message, errorCode: evidence.errorCode, metadata: { poststateHash: poststateHash ?? "", readbackCount: evidence.readbackCount ?? 0, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required", verification: outcome === "succeeded" || snapshotId ? "provider_readback" : "not_verified", ...(snapshotId ? { snapshotId } : {}) } });
@@ -294,7 +294,7 @@ export class JobRepository {
           || packageMutationStateHash(capturePackageMutationState(observation.details, item.rows[0].action)) !== poststateHash) {
           throw new AppError(409, "mutation_readback_mismatch", "The saved readback must match the exact reconciled target and observed state.");
         }
-        snapshotId = await publishPackageReadback(scope, observation.details, client, observation.inventoryGeneration);
+        snapshotId = await publishPackageReadback(scope, observation.details, client, observation.inventoryGeneration, observed);
       }
       await client.query(`UPDATE job_items SET status=CASE WHEN $2='verified_applied' THEN 'succeeded' ELSE status END,
         poststate=$3,poststate_hash=$4,reconciliation_status=$2,reconciled_at=clock_timestamp(),message=$5,updated_at=clock_timestamp() WHERE id=$1`, [itemId, status, observed, poststateHash, message.slice(0,1024)]);

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { CircleAlert, Download, RefreshCw, ShieldCheck } from "lucide-react";
 import type { InventoryRefreshJob, UnifiedAgentInventoryPage } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
+import { inventoryAttentionReasons } from "../inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 import { SyncDialog } from "./SyncDialog";
 
@@ -47,7 +48,8 @@ export function AgentSyncTools({
   const snapshotId = observation?.snapshotId;
   const currentInventory = !verifyingInventory && !inventoryError ? inventory : undefined;
   const invalidPackages = currentInventory?.identityCollection?.invalidPackages ?? 0;
-  const needsAttention = !verifyingInventory && Boolean(inventoryError || currentInventory?.verification.status === "needs_attention" || currentInventory?.partial || invalidPackages);
+  const attentionReasons = verifyingInventory ? [] : inventoryAttentionReasons(currentInventory, inventoryError);
+  const needsAttention = attentionReasons.length > 0;
   const health = verifyingInventory ? "Checking"
     : needsAttention ? "Needs attention" : currentInventory ? "Verified" : "Not checked";
   return (
@@ -55,14 +57,18 @@ export function AgentSyncTools({
       <div className="sync-inventory-summary">
         {needsAttention ? <CircleAlert size={22} aria-hidden="true" /> : <ShieldCheck size={22} aria-hidden="true" />}
         <div>
-          <div className="sync-health-heading"><h3 id="sync-inventory-heading">Inventory health</h3><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory ? "success" : "progress"}`}>{health}</span></div>
-          <p role={!verifyingInventory && inventoryError ? "alert" : "status"}>{verifyingInventory
+          <div className="sync-health-heading"><h2 id="sync-inventory-heading">Inventory health</h2><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory ? "success" : "progress"}`}>{health}</span></div>
+          <p role={needsAttention ? undefined : "status"}>{verifyingInventory
             ? "Checking saved inventory. Previous results are not the result of this check."
-            : needsAttention ? "Saved inventory checks need attention. View diagnostics for the cause and recovery options."
+            : needsAttention ? "Catalog sync and inventory health are separate. The issues below explain what still needs attention."
               : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
         </div>
         <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setDiagnosticsOpen(true)}>View diagnostics</button>
       </div>
+      {needsAttention ? <div className="sync-inventory-issues" role={inventoryError ? "alert" : "status"}>
+        <h3>What needs attention</h3>
+        <ul>{attentionReasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+      </div> : null}
       <SyncDialog open={diagnosticsOpen} title="Inventory diagnostics"
         description="Technical checks and recovery tools for saved inventory. These checks do not collect new Microsoft data."
         onClose={() => setDiagnosticsOpen(false)}>

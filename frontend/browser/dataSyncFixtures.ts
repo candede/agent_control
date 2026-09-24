@@ -1,4 +1,5 @@
 import type { Page, Route } from "@playwright/test";
+import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { automaticDataSyncSourceIds, type DataSyncRun, type DataSyncSourceId, type DataSyncState, type StartDataSyncInput } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
 import { createUnifiedVerification } from "../src/test/inventoryVerification";
@@ -40,6 +41,16 @@ export async function mockSync(page: Page, firstState: DataSyncState, retainedRu
     const url = new URL(route.request().url());
     const path = url.pathname;
     if (url.search) return rejectRequest(route);
+    if (isAutomaticRefreshRequest(route.request())) {
+      return route.fulfill({ json: {
+        run: state.run, detailJob: null,
+        revisions: Object.fromEntries(automaticDataSyncSourceIds.map(id => {
+          const source = state.sources.find(source => source.source === id);
+          return [id, JSON.stringify([source?.lastSuccessAt, source?.count])];
+        })),
+        nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+      } });
+    }
     if (route.request().method() === "GET") {
       if (path !== "/api/data-sync/state" && !/^\/api\/data-sync\/runs\/[^/]+$/.test(path)) return rejectRequest(route);
       reads.push(path);

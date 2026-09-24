@@ -1,14 +1,14 @@
 import type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
 import { capabilityIds, supportsAutomaticCapabilityCheck } from "../../../backend/src/types/capability";
-import type { PackageStatus } from "../../../backend/src/types/copilotPackage";
-export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
+import type { PackageDetailFreshness, PackageStatus } from "../../../backend/src/types/copilotPackage";
+export type { PackageDetailFreshness, PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
-import type { DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+import type { AutomaticRefreshResult, DataSyncRun, DataSyncSourceId, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
@@ -39,8 +39,8 @@ export type { CopilotAppActivity, CopilotServicePlan, CopilotServiceState, Copil
 export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
-export type { DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
-export { automaticDataSyncSourceIds } from "../../../backend/src/types/dataSync";
+export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
+export { automaticDataSyncSourceIds, dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
 export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus } from "../../../backend/src/types/copilotStudioQuarantine";
 
 export type QuarantineStatusView = {
@@ -126,6 +126,7 @@ export type SessionUser = {
 
 export type CopilotPackage = {
   id: string;
+  detailFreshness?: PackageDetailFreshness;
   displayName: string;
   type?: string;
   shortDescription?: string;
@@ -940,6 +941,15 @@ export function getCopilotUsageUsers(options: { signal?: AbortSignal } = {}) {
 
 export function getDataSyncState(options: { signal?: AbortSignal } = {}) {
   return request<DataSyncState>("/api/data-sync/state", { signal: options.signal });
+}
+
+export function checkAutomaticRefresh(options: { signal?: AbortSignal } = {}) {
+  return request<AutomaticRefreshResult>("/api/data-sync/auto-refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    signal: options.signal,
+  });
 }
 
 export function getDataSyncRun(id: string, options: { signal?: AbortSignal } = {}) {

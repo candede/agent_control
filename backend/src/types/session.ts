@@ -27,5 +27,6 @@ declare module "express-session" {
     user?: AuthenticatedUser;
     csrfToken?: string;
     rolesValidatedAt?: number;
+    signedInAt?: number;
   }
 }

@@ -199,6 +199,38 @@ describe.sequential("official usage cumulative history", () => {
       .toEqual(acceptedAt);
   });
 
+  it("calculates reporting dates from all report kinds without manual metadata and recalculates after deletion", async () => {
+    const owner = { tenantId: "tenant-automatic-report-dates", principalId: "report-dates-admin" };
+    const datedBundle = (dates: [string, string, string]) => importBundle({
+      owner,
+      changedKinds: {
+        agents: { count: 1, changedOrdinal: 0, changedActivityDate: dates[0] },
+        userAgents: { count: 1, changedOrdinal: 0, changedActivityDate: dates[1] },
+        users: { count: 1, changedOrdinal: 0, changedActivityDate: dates[2] },
+      },
+    });
+    const first = await (await datedBundle(["2026-01-15", "2026-01-01", "2026-02-01"])).accept();
+    const second = await (await datedBundle(["2026-09-20", "2026-03-01", "2026-09-10"])).accept();
+    await datedBundle(["2025-01-01", "2025-01-01", "2025-01-01"]);
+
+    for (const offset of [0, 1]) {
+      const view = await history.getHistory(owner.tenantId, { limit: 1, offset });
+      expect(view.bundles.value).toHaveLength(1);
+      expect(view.summary.importCount).toBe(2);
+      expect(view.summary.reportingWindows.knownCount).toBe(0);
+      expect(view.summary.activityDateRange.earliestDateUtc).toMatch(/^2026-01-01/);
+      expect(view.summary.activityDateRange.latestDateUtc).toMatch(/^2026-09-20/);
+      expect(view.summary.activityDateRange.provesReportingCoverage).toBe(false);
+    }
+    const preview = await repository.previewSetOperation(owner, "delete", first.setId);
+    await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "delete", setId: first.setId });
+    const remaining = (await history.getHistory(owner.tenantId)).summary;
+    expect(remaining.importCount).toBe(1);
+    expect(remaining.activityDateRange.earliestDateUtc).toMatch(/^2026-03-01/);
+    expect(remaining.activityDateRange.latestDateUtc).toMatch(/^2026-09-20/);
+    expect((await repository.getPublished(owner.tenantId)).activeSet?.id).toBe(second.setId);
+  });
+
   it("requires correction for a known-window revision even when source-as-of advances", async () => {
     const changedKinds = {
       agents: { changedOrdinal: 99, changedResponses: 6 },

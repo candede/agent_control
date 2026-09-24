@@ -16,6 +16,101 @@ const user: AuthenticatedUser = {
 };
 
 describe("DataSyncService", () => {
+  it("starts a fast automatic run while admitting details independently and reuses the people cache", async () => {
+    const harness = serviceHarness();
+    const result = await harness.service.automaticRefresh(user);
+    expect(result.run).toMatchObject({ automatic: true, mode: "incremental" });
+    expect(result.revisions).toEqual({ users: "users-revision", graph_packages: "inventory-revision", power_platform: "inventory-revision" });
+    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, undefined);
+    await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
+    expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({ catalogOnly: true, requestedIds: [] }));
+    expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.objectContaining({ automatic: true }));
+    expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.any(Object),
+      { incompleteOnly: false, useCache: true });
+    await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalled());
+  });
+
+  it("does not relaunch fresh or already admitted automatic collection", async () => {
+    const harness = serviceHarness();
+    harness.run.automatic = true;
+    harness.repository.submitDue.mockResolvedValue({ run: harness.run, created: false });
+    await harness.service.automaticRefresh(user);
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    expect(harness.packages.refreshDueDetails).toHaveBeenCalledOnce();
+  });
+
+  it("passes the server's sign-in time to both automatic admission lanes", async () => {
+    const harness = serviceHarness();
+    const signedInAt = Date.now();
+    await harness.service.automaticRefresh(user, signedInAt);
+    expect(harness.repository.submitDue).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, signedInAt);
+    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, signedInAt);
+    await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
+    expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal),
+      expect.objectContaining({ automatic: true, signedInAt }));
+  });
+
+  it.each(["graph_packages", "power_platform"] as const)(
+    "reports %s startup as running until authorization actually fails", async sourceId => {
+      const harness = serviceHarness();
+      const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+      const pending = deferred<never>();
+      provider.start.mockReturnValueOnce(pending.promise);
+      await harness.service.start(user, { mode: "incremental", sources: [sourceId] });
+      await vi.waitFor(() => expect(provider.start).toHaveBeenCalled());
+      expect(harness.run.sources[0]).toMatchObject({ status: "running", canRetry: false });
+      pending.reject(new AppError(401, "interaction_required", "MFA required."));
+      await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("waiting_authorization"));
+    },
+  );
+
+  it.each(["graph_packages", "power_platform"] as const)(
+    "keeps a %s child's permission denial distinct from an expired sign-in", async sourceId => {
+      const harness = serviceHarness();
+      const source = harness.run.sources.find(value => value.source === sourceId)!;
+      source.status = "running";
+      source.jobId = randomUUID();
+      const provider = sourceId === "graph_packages" ? harness.packages : harness.powerPlatform;
+      const job = sourceId === "graph_packages" ? packageJob(source.jobId, "failed", 0) : powerPlatformJob(source.jobId, "failed", 0);
+      provider.get.mockResolvedValueOnce({ ...job, errorCode: "missing_permission", message: "Read permission required." } as never);
+      const state = await harness.service.state(user);
+      expect(state.run?.sources.find(value => value.source === sourceId)).toMatchObject({
+        status: "permission_required", message: "Read permission required.", canRetry: true,
+      });
+    },
+  );
+
+  it("defers automatic detail work during an explicit active sync", async () => {
+    const harness = serviceHarness();
+    harness.repository.submitDue.mockResolvedValue({ run: harness.run, created: false });
+    expect((await harness.service.automaticRefresh(user)).detailJob).toBeNull();
+    expect(harness.packages.refreshDueDetails).not.toHaveBeenCalled();
+  });
+
+  it("rejects automatic work without Viewer before either admission", async () => {
+    const harness = serviceHarness();
+    await expect(harness.service.automaticRefresh({ ...user, roles: [] })).rejects.toMatchObject({ code: "missing_internal_role" });
+    expect(harness.repository.submitDue).not.toHaveBeenCalled();
+    expect(harness.packages.refreshDueDetails).not.toHaveBeenCalled();
+  });
+
+  it("joins automatic admission on sign-out and never starts enrichment after cancellation", async () => {
+    const harness = serviceHarness();
+    const admission = deferred<{ run: DataSyncRun; created: boolean }>();
+    harness.repository.submitDue.mockReturnValueOnce(admission.promise);
+    const starting = harness.service.automaticRefresh(user);
+    const rejected = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
+    await vi.waitFor(() => expect(harness.repository.submitDue).toHaveBeenCalled());
+    const signingOut = harness.service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+    admission.resolve({ run: harness.run, created: true });
+    await signingOut;
+    await rejected;
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.packages.refreshDueDetails).not.toHaveBeenCalled();
+  });
+
   it("exposes bounded principal-scoped runs for the shared Jobs view", async () => {
     const harness = serviceHarness();
     const scope = { tenantId: user.tenantId!, principalId: user.homeAccountId };
@@ -148,7 +243,7 @@ describe("DataSyncService", () => {
         }
         await harness.service.start(user, { mode: "incremental", sources: [sourceId] });
         await vi.waitFor(() => expect(provider.start).toHaveBeenCalledOnce());
-        expect((await harness.service.state(user)).run?.sources[0].status).toBe("waiting_authorization");
+        expect((await harness.service.state(user)).run?.sources[0].status).toBe("running");
         expect(provider.get).not.toHaveBeenCalled();
         starting.reject(failure);
         await vi.waitFor(() => expect(harness.run.sources[0].status).toBe(status));
@@ -285,7 +380,7 @@ describe("DataSyncService", () => {
     await harness.service.start(user, { mode: "incremental", sources: [sourceId] });
     await vi.waitFor(() => expect(harness.run.sources[0]).toMatchObject({ status: "failed", count: 4 }));
     expect(harness.repository.updateSource).toHaveBeenCalledWith(
-      expect.anything(), harness.run.id, sourceId, expect.objectContaining({ status: "waiting_authorization", count: 0 }),
+      expect.anything(), harness.run.id, sourceId, expect.objectContaining({ status: "running", count: 0 }),
     );
   });
 
@@ -892,6 +987,14 @@ function serviceHarness() {
     });
   };
   const repository = {
+    submitDue: vi.fn(async () => {
+      run.automatic = true;
+      run.mode = "incremental";
+      run.sources = run.sources.filter(source => source.source !== "usage_reports");
+      return { run, created: true };
+    }),
+    finishAutomatic: vi.fn(async () => undefined),
+    automaticRevisions: vi.fn(async () => ({ users: "users-revision", graph_packages: "inventory-revision", power_platform: "inventory-revision" })),
     submit: vi.fn(async (_scope, input) => {
       const requested = new Set<DataSyncSourceId>(input.sources ?? ["users", "graph_packages", "power_platform"]);
       run.mode = input.mode;
@@ -929,6 +1032,7 @@ function serviceHarness() {
     recoverInterrupted: vi.fn(async () => 0),
   };
   const packages = {
+    refreshDueDetails: vi.fn(async () => null),
     submit: vi.fn(async () => packageJob(randomUUID(), "waiting_authorization", 0)),
     start: vi.fn(async (_user, id) => packageJob(id, "succeeded", 0)),
     get: vi.fn(async (_user, id) => packageJob(id, "succeeded", 0)),

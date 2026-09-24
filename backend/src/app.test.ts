@@ -31,6 +31,7 @@ import type { AppRole } from "./types/capability.js";
 import type { PowerPlatformResource, PowerPlatformResourceType } from "./types/powerPlatformInventory.js";
 import { clearAdmissionForTest } from "./middleware/admission.js";
 import { AgentPeopleRepository } from "./db/agentPeople.js";
+import { dataSync } from "./services/dataSync.js";
 
 vi.hoisted(() => {
   process.env.TENANT_ID="11111111-1111-1111-1111-111111111111";
@@ -177,6 +178,44 @@ describe.sequential("packaged API/session contracts", () => {
   afterEach(async () => {
     await Promise.all([defenderHunting.drain(), purviewAudit.drain()]);
   });
+  it("admits automatic refresh only for the current Viewer session with CSRF and no client-selected scope", async () => {
+    const originalCsrf = csrfToken;
+    csrfToken = "automatic-refresh-fixture-csrf";
+    const responseBody = { run: null, detailJob: null,
+      revisions: { users: "u", graph_packages: "g", power_platform: "p" },
+      nextCheckAt: new Date(Date.now() + 60_000).toISOString() };
+    const refresh = vi.spyOn(dataSync, "automaticRefresh").mockResolvedValue(responseBody);
+    try {
+      const viewerCookie = await roleCookie("automatic-viewer", ["AgentControl.Viewer"]);
+      const headers = { Cookie: viewerCookie, "Content-Type": "application/json" };
+      const send = (body: unknown = {}, query = "") => request(`/api/data-sync/auto-refresh${query}`,
+        { method: "POST", headers, body: JSON.stringify(body) });
+      const result = await send();
+      expect(result.status).toBe(200);
+      expect(result.headers.get("cache-control")).toBe("no-store");
+      expect(await result.json()).toEqual(responseBody);
+      expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        homeAccountId: "automatic-viewer", tenantId: config.tenantId, roles: ["AgentControl.Viewer"],
+      }), undefined);
+      for (const body of [{ tenantId: "other" }, { principalId: "other" }, { signedInAt: Date.now() }, { clearSavedData: true }, { sources: ["usage_reports"] }, { mode: "full" }]) {
+        expect((await send(body)).status).toBe(400);
+      }
+      expect((await send({}, "?tenantId=other")).status).toBe(400);
+      expect((await request("/api/data-sync/auto-refresh", {
+        method: "POST", headers: { ...headers, "x-csrf-token": "wrong" }, body: "{}",
+      })).status).toBe(403);
+      expect((await request("/api/data-sync/auto-refresh", {
+        method: "POST", headers: { ...headers, Cookie: await roleCookie("no-auto-role", []) }, body: "{}",
+      })).status).toBe(403);
+      expect((await request("/api/data-sync/auto-refresh", {
+        method: "POST", headers: { ...headers, Cookie: "" }, body: "{}",
+      })).status).toBe(401);
+      expect(refresh).toHaveBeenCalledOnce();
+    } finally {
+      refresh.mockRestore();
+      csrfToken = originalCsrf;
+    }
+  });
   it("requires the preserved public origin for tunnel permission checks and logout", async () => {
     const previousOrigin = config.frontendOrigin;
     config.frontendOrigin = "https://fixture-3002.euw.devtunnels.ms";
@@ -269,6 +308,7 @@ describe.sequential("packaged API/session contracts", () => {
     const pendingSession=await fixture.runtime.query("SELECT sess::text AS value FROM sessions");
     for (const secret of ["fixture-state","fixture-nonce","fixture-verifier"]) expect(JSON.stringify(pendingSession.rows)).not.toContain(secret);
     const redemptions=authFixture.redemptions;
+    const signInStartedAt = Date.now();
     const callback=await request("/api/auth/callback?code=fixture&state=fixture-state");
     expect(callback.status).toBe(302); cookie=callback.headers.get("set-cookie")!.split(";")[0];
     expect(cookie).not.toBe(previousCookie);
@@ -278,6 +318,22 @@ describe.sequential("packaged API/session contracts", () => {
     expect(authFixture.redemptions).toBe(redemptions+1);
     const stored=await fixture.runtime.query("SELECT sess::text AS value FROM sessions");
     expect(JSON.stringify(stored.rows)).not.toContain("fixture-token");
+    const signedInAt = (await fixture.runtime.query<{ signed_in_at: string }>(
+      "SELECT (sess->>'signedInAt')::bigint AS signed_in_at FROM sessions WHERE principal_id=$1",
+      [authFixture.user.homeAccountId])).rows.map(row => Number(row.signed_in_at)).find(value => value >= signInStartedAt);
+    expect(signedInAt).toBeGreaterThanOrEqual(signInStartedAt);
+    const refresh = vi.spyOn(dataSync, "automaticRefresh").mockResolvedValue({
+      run: null, detailJob: null, revisions: { users: "u", graph_packages: "g", power_platform: "p" },
+      nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    try {
+      expect((await request("/api/data-sync/auto-refresh", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      })).status).toBe(200);
+      expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        homeAccountId: authFixture.user.homeAccountId,
+      }), signedInAt);
+    } finally { refresh.mockRestore(); }
   });
   it.each(["graph.package.read.delegated", "graph.agentIdentity.read", "defender.hunting.application", "unknown"])("retires permission consent for %s without creating an authorization transaction", async capabilityId => {
     const originalCookie=cookie;

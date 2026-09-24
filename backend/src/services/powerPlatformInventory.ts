@@ -3,6 +3,7 @@ import { PowerPlatformInventoryRepository, type InventoryDataScope, type Invento
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { dataSyncFailureStatus } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
 import type { InventoryRefreshJob } from "../types/powerPlatformInventory.js";
 import { capabilities } from "./capabilities.js";
@@ -241,7 +242,9 @@ export class PowerPlatformInventoryService {
         operationalLog("warn", "inventory_refresh_waiting_authorization", { jobId: id, ...errorTelemetry(failure), status: "waiting_authorization" });
         return;
       }
-      const code = failure instanceof AppError ? failure.code : "provider_error";
+      const code = failure instanceof AppError
+        ? failure.status === 403 && dataSyncFailureStatus(failure.code) === "failed" ? "missing_permission" : failure.code
+        : "provider_error";
       await this.repository.markFailed(scope, id, code, safeFailureMessage(failure));
       operationalLog("error", "inventory_refresh_failed", { jobId: id, status: "failed", errorCode: code, stage });
     }
@@ -272,10 +275,13 @@ function requireSamePrincipal(scope: InventoryDataScope, user: AuthenticatedUser
 }
 
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && (error.status === 401 || error.status === 403 || ["interaction_required", "authorization_expired", "missing_internal_role", "missing_permission"].includes(error.code));
+  return error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "waiting_authorization";
 }
 
 function safeFailureMessage(error: unknown) {
+  if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
+    return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
+  }
   if (error instanceof AppError && ["provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit", "incomplete_inventory_coverage", "scope_mismatch", "inventory_scope_changed"].includes(error.code)) return error.message.slice(0, 1024);
   return "Power Platform inventory refresh failed before complete publication.";
 }

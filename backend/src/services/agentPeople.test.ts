@@ -65,6 +65,15 @@ describe("persistent agent people resolution", () => {
     expect(value.directory.resolve).toHaveBeenCalledTimes(1);
   });
 
+  it("uses existing reference identities during automatic sync rather than forcing all lookups", async () => {
+    const value = harness();
+    value.repository.read.mockResolvedValueOnce([{ objectId: id, status: "resolved" }] as never);
+    await value.service.refreshReferences(value.user, new AbortController().signal,
+      { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false, useCache: true });
+    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
+      [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal));
+  });
+
   it("keeps 404 not-found distinct from lookup failure and does not claim deletion", async () => {
     const value = harness();
     value.directory.resolve.mockResolvedValueOnce([{ resourceId: id, resourceType: "user", displayName: id, principalKind: "unknown" }])

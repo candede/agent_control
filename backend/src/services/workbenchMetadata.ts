@@ -14,6 +14,8 @@ export const workbenchViews: WorkbenchViewDefinition[] = [
 ];
 
 export const workbenchActions: WorkbenchActionDefinition[] = [
+  { id: "data-sync.auto-refresh", label: "Automatically refresh due source data", roles: ["AgentControl.Viewer"], capabilityId: null,
+    nativeTarget: "none", preview: "none", confirmation: "none", recovery: "reauthorize", method: "POST", route: "/api/data-sync/auto-refresh", source: "data_sync" },
   { id: "data-sync.read", label: "Read saved data sync status", roles: ["AgentControl.Viewer"], capabilityId: null,
     nativeTarget: "none", preview: "none", confirmation: "none", recovery: "none", method: "GET", route: "/api/data-sync/state", source: "data_sync" },
   { id: "data-sync.start", label: "Sync authorized source data", roles: ["AgentControl.Viewer"], capabilityId: null,

@@ -123,6 +123,13 @@ export async function grantRuntime(database: pg.Pool) {
       GRANT SELECT,INSERT ON data_sync_source_jobs TO agentcontrol_app;
     `);
   }
+  if ((await database.query("SELECT to_regclass('public.package_detail_cache') AS table_name")).rows[0].table_name) {
+    await database.query(`
+      GRANT SELECT,INSERT,UPDATE,DELETE ON package_detail_cache TO agentcontrol_app;
+      GRANT EXECUTE ON FUNCTION package_detail_revision(jsonb),package_detail_has_evidence(jsonb),
+        package_detail_current_catalog(text,text,text) TO agentcontrol_app;
+    `);
+  }
   if ((await database.query("SELECT to_regclass('public.unified_agents') AS table_name")).rows[0].table_name) {
     await database.query(`
       GRANT SELECT,INSERT,DELETE ON unified_agents,unified_agent_sources TO agentcontrol_app;
@@ -237,6 +244,15 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
       "status='running' AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())",
       "status='failed',error_code='package_refresh_expired',message='The package refresh expired during retention.',finished_at=clock_timestamp(),updated_at=clock_timestamp()");
     await remove("packageSnapshots", "package_inventory_snapshots", "expires_at<clock_timestamp()");
+    if ((await client.query("SELECT to_regclass('public.package_detail_cache') AS name")).rows[0].name) {
+      await remove("packageDetails", "package_detail_cache",
+        `COALESCE(observed_at,next_attempt_at)<clock_timestamp()-interval '30 days'
+          OR NOT EXISTS (SELECT 1 FROM package_inventory_resources resource
+            JOIN package_inventory_snapshots snapshot ON snapshot.id=resource.snapshot_id
+            WHERE resource.tenant_id=package_detail_cache.tenant_id AND resource.principal_id=package_detail_cache.principal_id
+              AND resource.native_id=package_detail_cache.native_id AND snapshot.token_mode=package_detail_cache.token_mode
+              AND snapshot.observation_kind='inventory' AND snapshot.is_current AND snapshot.expires_at>clock_timestamp())`);
+    }
     if ((await client.query("SELECT to_regclass('public.agent_people_cache') AS name")).rows[0].name) {
       await remove("agentPeople", "agent_people_cache", "expires_at<clock_timestamp()");
     }

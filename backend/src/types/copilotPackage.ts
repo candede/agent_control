@@ -59,6 +59,18 @@ export type PackageElementDetail = {
   }>;
 };
 
+export type PackageControlObservation = {
+  snapshotId: string;
+  observedAt: string;
+  expiresAt: string;
+};
+
+export type PackageDetailFreshness = {
+  state: "fresh" | "stale" | "missing" | "invalidated";
+  observedAt: string | null;
+  expiresAt: string | null;
+};
+
 export type CopilotPackage = {
   id: string;
   displayName: string;
@@ -85,10 +97,13 @@ export type CopilotPackage = {
   lifecycle: "unknown";
   identityConfidence: "exact_native";
   provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: "ga" | "preview" }>;
+  controlObservations?: Partial<Record<"block" | "access", PackageControlObservation>>;
+  detailFreshness?: PackageDetailFreshness;
 };
 
 export type CopilotPackageDetail = CopilotPackage & {
   identityDetailsCollected?: true;
+  identityRevalidationRequired?: true;
   longDescription?: string;
   categories?: string[];
   sensitivity?: string;

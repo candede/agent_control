@@ -73,6 +73,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onOpenUsageImport: () => void;
   onRequestedRunChange: (runId: string | undefined) => void;
   onSourcesChanged: (sources: DataSyncSourceId[]) => void;
+  onCancelRequested?: () => void;
 }>(function DataSyncPanel({
   principalKey,
   canUploadUsage,
@@ -83,6 +84,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   onOpenUsageImport,
   onRequestedRunChange,
   onSourcesChanged,
+  onCancelRequested,
 }, ref) {
   const [state, setState] = useState<DataSyncState>();
   const [requestedRun, setRequestedRun] = useState<DataSyncRun>();
@@ -456,7 +458,10 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
         {isProgressing(run) ? (
           <WorkbenchActionGate actionId="data-sync.cancel">
             <button type="button" className="secondary data-sync-cancel" disabled={Boolean(busy)} aria-busy={busy === "cancel"}
-              onClick={() => void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }))}>
+              onClick={() => {
+                onCancelRequested?.();
+                void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }));
+              }}>
               {busy === "cancel"
                 ? <LoaderCircle size={16} className="data-sync-spinning" aria-hidden="true" />
                 : <CircleStop size={16} aria-hidden="true" />}
@@ -570,7 +575,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
           <>
             <dl className="data-sync-run-facts">
               <div><dt>Run</dt><dd><code>{requestedRun.id}</code></dd></div>
-              <div><dt>Collection</dt><dd>{modeLabel(requestedRun.mode)}</dd></div>
+              <div><dt>Collection</dt><dd>{requestedRun.automatic ? "Automatic refresh" : modeLabel(requestedRun.mode)}</dd></div>
               <div><dt>Started</dt><dd>{formatInstant(requestedRun.startedAt)}</dd></div>
               <div><dt>{requestedRun.completedAt ? "Duration (including waits)" : "Last update"}</dt><dd>{requestedRun.completedAt
                 ? syncDuration(requestedRun.startedAt, requestedRun.completedAt) : formatInstant(requestedRun.updatedAt)}</dd></div>
@@ -635,7 +640,7 @@ function SyncProgress({ run, showJobIds = false }: { run: DataSyncRun; showJobId
         <div>
           <strong>{heading}</strong>
           <p>{automatic.length ? `${completed} of ${automatic.length} automatic sources complete` : "Manual report step"}
-            {" · "}{modeLabel(run.mode)}</p>
+            {" · "}{run.automatic ? "Automatic refresh" : modeLabel(run.mode)}</p>
         </div>
       </div>
       {!complete && automatic.length > 0 ? <progress aria-label="Completed sync sources" value={completed} max={automatic.length} /> : null}

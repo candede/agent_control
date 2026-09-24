@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
+import { dataSyncFailureStatus } from "../types/dataSync.js";
 import { packageInventoryIdentity } from "../services/inventoryIdentity.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import { refreshCancellation, type RefreshCancellationReason } from "../services/refreshExecution.js";
 import { packageRefreshExecutionDeadlineMs } from "../services/packageRefreshPolicy.js";
+import { packageControlIdentityChanged, projectPackageControl, type SavedPackageControl } from "../services/packageControlProjection.js";
+import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "../services/packageMutationState.js";
+import { packageDetailRevision, projectPackageDetails } from "../services/packageDetailProjection.js";
 import {
   formatAgentAuthoringTool, formatPackageFacetLabel as formatFacetLabel, normalizePackageAuthoringTool as normalizeBuiltWith,
   normalizePackageStatus, packageStatusAliases,
@@ -18,6 +22,7 @@ export type PackageRefreshInput = {
   tokenMode: "delegated" | "application";
   idempotencyKey: string;
   requestedIds?: readonly string[];
+  catalogOnly?: boolean;
 };
 export type PackageListQuery = {
   snapshotId?: string;
@@ -70,6 +75,7 @@ export type PackageScanResult = {
   packages: CopilotPackageDetail[];
   totalRecords: number;
   pages: number;
+  detailFailures?: Array<{ id: string; missing: boolean; errorCode: string }>;
 };
 
 type JobRow = {
@@ -80,6 +86,9 @@ type JobRow = {
   query_hash: string;
   scope_kind: "broad" | "exact";
   requested_ids: string[];
+  catalog_only: boolean;
+  auto_details: boolean;
+  detail_targets: Array<{ id: string; generation: string }>;
   status: "waiting_authorization" | "running" | "succeeded" | "failed" | "cancelled";
   page_count: number;
   observed_count: number;
@@ -103,6 +112,8 @@ type SnapshotRow = {
   total_records: number;
   page_count: number;
   observed_at: Date;
+  read_started_at: Date;
+  catalog_only?: boolean;
   expires_at: Date;
 };
 
@@ -110,7 +121,7 @@ type ResourceRow = {
   package_data: CopilotPackageDetail;
 };
 
-type SnapshotQuery = Pick<JobRow, "token_mode" | "query_hash" | "scope_kind" | "requested_ids">;
+type SnapshotQuery = Pick<JobRow, "token_mode" | "query_hash" | "scope_kind" | "requested_ids"> & { catalog_only?: boolean };
 
 export async function lockPackageInventoryScope(scope: PackageDataScope, client: pg.PoolClient) {
   validateScope(scope);
@@ -126,16 +137,23 @@ export async function readPackageInventoryGeneration(scope: PackageDataScope, da
 }
 
 // The caller's transaction also commits the fenced job outcome and its audit receipt.
-export async function publishPackageReadback(scope: PackageDataScope, detail: CopilotPackageDetail, client: pg.PoolClient, inventoryGeneration: string | null) {
+export async function publishPackageReadback(scope: PackageDataScope, detail: CopilotPackageDetail, client: pg.PoolClient,
+  inventoryGeneration: string | null, state: PackageMutationState) {
   await lockPackageInventoryScope(scope, client);
   if (await readPackageInventoryGeneration(scope, client) !== inventoryGeneration) {
     throw new AppError(409, "package_readback_superseded", "Saved inventory was cleared during package work. Reconcile the exact target before publishing a new observation.");
   }
+  if (!packageMutationStatesEqual(capturePackageMutationState(detail, state.kind === "block" ? "block" : "update-availability"), state)) {
+    throw new AppError(409, "mutation_readback_mismatch", "Only verified package control state can be published.");
+  }
   const requestedIds = normalizeRequestedIds([detail.id]);
+  const previous = await readSavedPackageTarget(client, scope, detail.id, "delegated");
+  const identityRevalidationRequired = Boolean(previous?.package
+    && (previous.package.identityRevalidationRequired || packageControlIdentityChanged(previous.package, detail)));
   return writePackageSnapshot(client, scope, {
     token_mode: "delegated", scope_kind: "exact", requested_ids: requestedIds,
-    query_hash: hash({ tokenMode: "delegated", scopeKind: "exact", requestedIds }),
-  }, null, { packages: [detail], totalRecords: 1, pages: 1 });
+    query_hash: hash({ tokenMode: "delegated", scopeKind: "exact", requestedIds, observationKind: state.kind }),
+  }, null, { packages: [detail], totalRecords: 1, pages: 1 }, { controlState: state, identityRevalidationRequired });
 }
 
 export class PackageInventoryRepository {
@@ -152,8 +170,12 @@ export class PackageInventoryRepository {
     }
     const requestedIds = normalizeRequestedIds(input.requestedIds);
     const scopeKind = requestedIds.length ? "exact" : "broad";
+    if (input.catalogOnly !== undefined && typeof input.catalogOnly !== "boolean"
+      || input.catalogOnly && scopeKind !== "broad") {
+      throw new AppError(400, "invalid_package_refresh_mode", "Catalog-only refresh is supported only for broad package inventory.");
+    }
     const queryHash = hash({ tokenMode: input.tokenMode, scopeKind, requestedIds });
-    const requestHash = hash({ authorizationPrincipalId: input.authorizationPrincipalId, queryHash });
+    const requestHash = hash({ authorizationPrincipalId: input.authorizationPrincipalId, queryHash, ...(input.catalogOnly ? { catalogOnly: true } : {}) });
     const id = await transaction(this.database, async client => {
       await lockPackageInventoryScope(scope, client);
       const existing = await client.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM package_refresh_jobs job
@@ -166,18 +188,76 @@ export class PackageInventoryRepository {
       }
       const outstanding = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM package_refresh_jobs
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running')
+          AND NOT auto_details
           AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [scope.tenantId, scope.principalId]);
       if (outstanding.rows[0].count >= 5) {
         throw new AppError(429, "job_limit", "At most five unfinished package refreshes are allowed per principal.");
       }
       const jobId = randomUUID();
-      await client.query(`INSERT INTO package_refresh_jobs(id,tenant_id,principal_id,authorization_principal_id,token_mode,idempotency_key,request_hash,query_hash,scope_kind,requested_ids)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, [jobId, scope.tenantId, scope.principalId, input.authorizationPrincipalId, input.tokenMode, input.idempotencyKey, requestHash, queryHash, scopeKind, JSON.stringify(requestedIds)]);
+      await client.query(`INSERT INTO package_refresh_jobs(id,tenant_id,principal_id,authorization_principal_id,token_mode,idempotency_key,request_hash,query_hash,scope_kind,requested_ids,catalog_only)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)`, [jobId, scope.tenantId, scope.principalId, input.authorizationPrincipalId, input.tokenMode, input.idempotencyKey, requestHash, queryHash, scopeKind, JSON.stringify(requestedIds), input.catalogOnly ?? false]);
       return jobId;
     });
     const job = await this.getJob(scope, id);
     if (!job) throw new AppError(409, "package_refresh_expired", "The package refresh is no longer available. Submit a new refresh with a new idempotency key.");
     return job;
+  }
+
+  async claimDueDetails(scope: PackageDataScope, authorizationPrincipalId: string, signedInAt?: number) {
+    requireProviderAdmissions();
+    validateScope(scope);
+    if (authorizationPrincipalId !== scope.principalId) throw new AppError(403, "scope_mismatch", "Automatic details require the signed-in delegated scope.");
+    const id = await transaction(this.database, async client => {
+      await lockPackageInventoryScope(scope, client);
+      await client.query(`UPDATE package_refresh_jobs SET status='failed',error_code='package_refresh_expired',
+        message='Automatic detail enrichment expired; the next authorized check may retry after backoff.',
+        finished_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE tenant_id=$1 AND principal_id=$2 AND auto_details AND status IN ('waiting_authorization','running')
+          AND (deadline_at<=clock_timestamp() OR expires_at<=clock_timestamp())`, [scope.tenantId, scope.principalId]);
+      const outstanding = await client.query(`SELECT 1 FROM package_refresh_jobs
+        WHERE tenant_id=$1 AND principal_id=$2 AND auto_details AND status IN ('waiting_authorization','running')
+          AND deadline_at>clock_timestamp() AND expires_at>clock_timestamp() LIMIT 1`, [scope.tenantId, scope.principalId]);
+      if (outstanding.rowCount) return null;
+      const latest = await client.query<Pick<JobRow, "error_code" | "created_at" | "requested_ids"> & { cooling_down: boolean }>(`
+        SELECT error_code,created_at,requested_ids,
+          status='failed' AND updated_at>clock_timestamp()-interval '1 hour' AS cooling_down
+        FROM package_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND auto_details
+        ORDER BY created_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+      const previous = latest.rows[0];
+      const failure = dataSyncFailureStatus(previous?.error_code ?? "");
+      const renewed = previous?.cooling_down && failure === "waiting_authorization"
+        && signedInAt !== undefined && previous.created_at.getTime() < signedInAt;
+      if (previous?.cooling_down && failure !== "failed" && !renewed) return null;
+      const due = await client.query<{ native_id: string; package_data: CopilotPackageDetail }>(`
+        SELECT current.native_id,current.package_data
+        FROM package_detail_current_catalog($1,$2,'delegated') current
+        LEFT JOIN package_detail_cache cache ON cache.tenant_id=$1 AND cache.principal_id=$2
+          AND cache.token_mode='delegated' AND cache.native_id=current.native_id
+        WHERE (cache.native_id IS NULL OR cache.next_attempt_at<=clock_timestamp() OR current.native_id=ANY($3::text[]))
+        ORDER BY CASE WHEN cache.native_id IS NULL OR cache.catalog_revision<>package_detail_revision(current.package_data)
+          OR cache.observed_at IS NULL OR cache.package_data IS NULL THEN 0 ELSE 1 END,
+          cache.observed_at NULLS FIRST,current.native_id COLLATE "C"
+        LIMIT 20`, [scope.tenantId, scope.principalId, renewed ? previous.requested_ids : []]);
+      if (!due.rows.length) return null;
+      const reservations = await client.query<{ id: string; generation: string }>(`
+        INSERT INTO package_detail_cache(tenant_id,principal_id,token_mode,native_id,catalog_revision,next_attempt_at)
+        SELECT $1,$2,'delegated',target.id,target.revision,clock_timestamp()+interval '10 minutes'
+        FROM jsonb_to_recordset($3::jsonb) target(id text,revision jsonb)
+        ON CONFLICT(tenant_id,principal_id,token_mode,native_id) DO UPDATE SET next_attempt_at=EXCLUDED.next_attempt_at
+        RETURNING native_id AS id,generation`, [scope.tenantId, scope.principalId, JSON.stringify(due.rows.map(row => ({
+          id: row.native_id, revision: packageDetailRevision(row.package_data),
+        })))]);
+      const jobId = randomUUID();
+      const requestedIds = due.rows.map(target => target.native_id);
+      const queryHash = hash({ tokenMode: "delegated", scopeKind: "exact", requestedIds, autoDetails: true });
+      await client.query(`INSERT INTO package_refresh_jobs(id,tenant_id,principal_id,authorization_principal_id,
+        token_mode,idempotency_key,request_hash,query_hash,scope_kind,requested_ids,auto_details,detail_targets,deadline_at)
+        VALUES($1,$2,$3,$3,'delegated',$4,$5,$6,'exact',$7::jsonb,true,$8::jsonb,clock_timestamp()+interval '10 minutes')`,
+      [jobId, scope.tenantId, scope.principalId, `auto_details_${jobId}`,
+        hash({ authorizationPrincipalId, queryHash }), queryHash, JSON.stringify(requestedIds), JSON.stringify(reservations.rows)]);
+      return jobId;
+    });
+    return id ? (await this.getJob(scope, id)) ?? null : null;
   }
 
   async getJob(scope: PackageDataScope, id: string) {
@@ -186,6 +266,15 @@ export class PackageInventoryRepository {
       LEFT JOIN package_inventory_snapshots snapshot ON snapshot.job_id=job.id
       WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.expires_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId]);
     return rows[0] ? projectJob(rows[0]) : undefined;
+  }
+
+  async latestAutomaticDetailsJob(scope: PackageDataScope, authorizationPrincipalId: string) {
+    validateScope(scope);
+    const { rows } = await this.database.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM package_refresh_jobs job
+      WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3
+        AND job.token_mode='delegated' AND job.auto_details AND job.expires_at>clock_timestamp()
+      ORDER BY job.created_at DESC,job.id DESC LIMIT 1`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
+    return rows[0] ? projectJob(rows[0]) : null;
   }
 
   async listJobs(scope: PackageDataScope, authorizationPrincipalId: string, limit = 20) {
@@ -213,10 +302,10 @@ export class PackageInventoryRepository {
     return { value: rows.map(projectSnapshot) };
   }
 
-  async markRunning(scope: PackageDataScope, id: string) {
+  async markRunning(scope: PackageDataScope, id: string, autoDetails = false) {
     const result = await this.database.query(`UPDATE package_refresh_jobs SET status='running',attempted_at=clock_timestamp(),updated_at=clock_timestamp(),error_code=NULL,message=NULL,
       deadline_at=clock_timestamp()+($4::int*interval '1 millisecond')
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId, packageRefreshExecutionDeadlineMs]);
+      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting_authorization' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId, autoDetails ? 10 * 60_000 : packageRefreshExecutionDeadlineMs]);
     return result.rowCount === 1;
   }
 
@@ -256,7 +345,7 @@ export class PackageInventoryRepository {
 
   async recoverInterrupted() {
     const waiting = await this.database.query(`WITH candidates AS (
-      SELECT id FROM package_refresh_jobs WHERE status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() ORDER BY updated_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)
+      SELECT id FROM package_refresh_jobs WHERE status='running' AND NOT auto_details AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() ORDER BY updated_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)
       UPDATE package_refresh_jobs job SET status='waiting_authorization',error_code='interaction_required',message='Explicit resume with current authorization is required.',updated_at=clock_timestamp()
       FROM candidates WHERE job.id=candidates.id`);
     const expired = await this.database.query(`WITH candidates AS (
@@ -274,13 +363,18 @@ export class PackageInventoryRepository {
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() FOR UPDATE`, [id, scope.tenantId, scope.principalId]);
       const job = jobResult.rows[0];
       if (!job) throw new AppError(409, "package_refresh_state", "Package refresh is not running for this principal.");
-      const newer = await client.query(`SELECT 1 FROM package_refresh_jobs
+      const newer = job.auto_details ? { rowCount: 0 } : await client.query(`SELECT 1 FROM package_refresh_jobs
         WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND query_hash=$4 AND status IN ('running','succeeded') AND id<>$5
           AND (created_at,id)>(SELECT created_at,id FROM package_refresh_jobs WHERE id=$5) LIMIT 1`, [scope.tenantId, scope.principalId, job.token_mode, job.query_hash, job.id]);
       if (newer.rowCount) throw new AppError(409, "package_refresh_superseded", "A newer package refresh for this scope superseded publication.");
-      const createdSnapshotId = await writePackageSnapshot(client, scope, job, id, result);
-      const completion = await client.query(`UPDATE package_refresh_jobs SET status='succeeded',page_count=$4,observed_count=$5,total_records=$6,error_code=NULL,message=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId, result.pages, result.packages.length, result.totalRecords]);
+      const createdSnapshotId = job.auto_details ? await publishAutomaticDetails(client, scope, job, result)
+        : await writePackageSnapshot(client, scope, job, id, result, { readStartedAt: job.attempted_at ?? job.created_at });
+      const detailsFailed = job.auto_details && Boolean(result.detailFailures?.length);
+      const completion = await client.query(`UPDATE package_refresh_jobs SET status='${detailsFailed ? "failed" : "succeeded"}',page_count=$4,observed_count=$5,total_records=$6,
+        error_code=${detailsFailed ? "'package_detail_read_failed'" : "NULL"},message=${job.auto_details ? "$7" : "NULL"},finished_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`,
+      [id, scope.tenantId, scope.principalId, result.pages, result.packages.length, result.totalRecords,
+        ...(job.auto_details ? [`Automatic detail enrichment: ${result.packages.length} read; ${result.detailFailures?.length ?? 0} deferred. Catalog membership and control state are unchanged.`] : [])]);
       if (completion.rowCount !== 1) throw new AppError(409, "package_refresh_expired", "Package refresh expired or stopped before publication completed.");
       return createdSnapshotId;
     });
@@ -297,26 +391,57 @@ export class PackageInventoryRepository {
       filteredSummary: { total: 0, allowed: 0, blocked: 0 },
       facets: { publishers: [], availability: [], hosts: [], platforms: [] },
     };
-    const allResources = await this.database.query<ResourceRow>(`SELECT package_data FROM package_inventory_resources
-      WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
-      ORDER BY native_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId]);
-    const packages = allResources.rows.map(row => row.package_data);
+    const allResources = await this.database.query<PackageProjectionRow & { native_id: string }>(`WITH selected AS (
+      SELECT native_id FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3
+    )
+    SELECT selected.native_id,resource.package_data,candidate.id,candidate.read_started_at,candidate.scope_kind,candidate.catalog_only,
+      ${savedDetailColumns} FROM selected
+    JOIN LATERAL (
+      SELECT id,read_started_at,scope_kind,catalog_only FROM package_inventory_snapshots
+      WHERE tenant_id=$2 AND principal_id=$3 AND token_mode=$4 AND observation_kind='inventory'
+        AND is_current AND expires_at>clock_timestamp() AND (scope_kind='broad' OR requested_ids ? selected.native_id)
+      ORDER BY date_trunc('milliseconds',read_started_at) DESC,id DESC LIMIT 1
+    ) candidate ON true
+    LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=candidate.id
+      AND resource.tenant_id=$2 AND resource.principal_id=$3 AND resource.native_id=selected.native_id
+    ${savedIdentityJoin("selected.native_id", "$4", "$2", "$3")}
+    ORDER BY selected.native_id COLLATE "C"`, [snapshot.id, scope.tenantId, scope.principalId, snapshot.token_mode]);
+    const controls = controlsByTarget(snapshot.token_mode === "delegated"
+      ? await readPackageControls(this.database, scope, allResources.rows.map(row => row.native_id)) : []);
+    const packages = allResources.rows.flatMap(row => {
+      const value = applyPackageControls(withSavedIdentity(row), row.read_started_at, controls.get(row.native_id) ?? []);
+      return value ? [value] : [];
+    });
+    const packageById = new Map(packages.map(value => [value.id, value]));
     const { sql, values } = listFilters(snapshot.id, scope, query, packages);
+    values.push(JSON.stringify(packages.map(package_data => ({
+      native_id: package_data.id, display_name: package_data.displayName, is_blocked: package_data.isBlocked,
+      publisher: package_data.publisher, available_to: package_data.availableTo, deployed_to: package_data.deployedTo,
+      last_modified_at: package_data.lastModifiedDateTime,
+      package_data: { supportedHosts: package_data.supportedHosts, createdDateTime: package_data.createdDateTime },
+    }))));
+    const projected = `SELECT projected.*,$2::text AS tenant_id,$3::text AS principal_id
+      FROM jsonb_to_recordset($${values.length}::jsonb) AS projected(native_id text,display_name text,is_blocked boolean,
+        publisher text,available_to text,deployed_to text,last_modified_at timestamptz,package_data jsonb)
+      WHERE $1::uuid IS NOT NULL`;
     const sortColumn = { displayName: `display_name COLLATE "C"`, publisher: `publisher COLLATE "C"`, lastModifiedAt: "last_modified_at" }[query.sortBy ?? "displayName"];
     const direction = query.sortDirection === "desc" ? "DESC" : "ASC";
     const limit = Math.min(Math.max(query.limit ?? 100, 1), 5000);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const [counts, rows] = await Promise.all([
-      this.database.query<{ total: number; allowed: number; blocked: number }>(`WITH scoped AS (
-          SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
+      this.database.query<{ total: number; allowed: number; blocked: number }>(`WITH scoped AS (${projected})
         SELECT count(*)::int AS total,count(*) FILTER (WHERE NOT is_blocked)::int AS allowed,
           count(*) FILTER (WHERE is_blocked)::int AS blocked FROM scoped WHERE ${sql}`, values),
-      this.database.query<ResourceRow>(`WITH scoped AS (SELECT * FROM package_inventory_resources WHERE snapshot_id=$1 AND tenant_id=$2 AND principal_id=$3)
-        SELECT package_data FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]),
+      this.database.query<{ native_id: string }>(`WITH scoped AS (${projected})
+        SELECT native_id FROM scoped WHERE ${sql} ORDER BY ${sortColumn} ${direction} NULLS LAST,native_id COLLATE "C" ASC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset]),
     ]);
     const filteredSummary = counts.rows[0] ?? { total: 0, allowed: 0, blocked: 0 };
     return {
-      value: rows.rows.map(row => row.package_data),
+      value: rows.rows.map(row => {
+        const value = packageById.get(row.native_id);
+        if (!value) throw packageVerificationFailed();
+        return value;
+      }),
       count: filteredSummary.total,
       snapshot: projectSnapshot(snapshot),
       summary: summarizePackages(packages),
@@ -329,7 +454,7 @@ export class PackageInventoryRepository {
     validateScope(scope);
     const snapshotResult = await database.query<SnapshotRow>(`SELECT * FROM package_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND scope_kind='broad'
-        AND is_current AND expires_at>clock_timestamp()
+        AND observation_kind='inventory' AND is_current AND expires_at>clock_timestamp()
       ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
     const snapshot = snapshotResult.rows[0];
     if (!snapshot) return { packages: [], observations: {}, snapshot: null };
@@ -344,18 +469,20 @@ export class PackageInventoryRepository {
       package_data: CopilotPackageDetail | null;
       snapshot_id: string;
       observed_at: Date;
+      read_started_at: Date;
       expires_at: Date;
     }>(`WITH exact_targets AS (
-        SELECT snapshot.id,snapshot.observed_at,snapshot.expires_at,target.native_id
+        SELECT snapshot.id,snapshot.observed_at,snapshot.read_started_at,snapshot.expires_at,target.native_id
         FROM package_inventory_snapshots snapshot
         CROSS JOIN LATERAL jsonb_array_elements_text(snapshot.requested_ids) target(native_id)
         WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current
           AND snapshot.expires_at>clock_timestamp() AND snapshot.token_mode='delegated' AND snapshot.scope_kind='exact'
+          AND snapshot.observation_kind='inventory'
       ), latest AS (
-        SELECT DISTINCT ON (native_id) id,native_id,observed_at,expires_at FROM exact_targets
-        ORDER BY native_id,observed_at DESC,id DESC
+        SELECT DISTINCT ON (native_id) id,native_id,observed_at,read_started_at,expires_at FROM exact_targets
+        ORDER BY native_id,date_trunc('milliseconds',read_started_at) DESC,id DESC
       )
-      SELECT latest.native_id,latest.id AS snapshot_id,latest.observed_at,latest.expires_at,resource.package_data FROM latest
+      SELECT latest.native_id,latest.id AS snapshot_id,latest.observed_at,latest.read_started_at,latest.expires_at,resource.package_data FROM latest
       LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=latest.id
         AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=latest.native_id
       ORDER BY latest.native_id COLLATE "C" LIMIT 5001`,
@@ -365,24 +492,33 @@ export class PackageInventoryRepository {
     }
     const details = await database.query<{
       native_id: string;
-      package_data: CopilotPackageDetail;
+      package_data: CopilotPackageDetail | null;
       snapshot_id: string;
-      observed_at: Date;
-      expires_at: Date;
+      observed_at: Date | null;
+      expires_at: Date | null;
+      from_cache?: boolean;
     }>(`WITH detailed AS (
-        SELECT snapshot.id,snapshot.observed_at,snapshot.expires_at,resource.native_id,resource.package_data
+        SELECT snapshot.id,snapshot.read_started_at AS observed_at,
+          LEAST(snapshot.expires_at,snapshot.read_started_at+interval '1 hour') AS expires_at,
+          resource.native_id,resource.package_data || '{"identityDetailsCollected":true}'::jsonb AS package_data,false AS from_cache
         FROM package_inventory_snapshots snapshot
         JOIN package_inventory_resources resource ON resource.snapshot_id=snapshot.id
           AND resource.tenant_id=$1 AND resource.principal_id=$2
         WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current
-          AND snapshot.expires_at>clock_timestamp() AND snapshot.token_mode='delegated'
-          AND CASE WHEN jsonb_typeof(resource.package_data->'elementDetails')='array'
-            THEN jsonb_array_length(resource.package_data->'elementDetails')>0 ELSE false END
+          AND snapshot.expires_at>clock_timestamp() AND snapshot.token_mode='delegated' AND snapshot.observation_kind='inventory'
+          AND NOT snapshot.catalog_only
+          AND (package_detail_has_evidence(resource.package_data) OR (snapshot.scope_kind='exact' AND snapshot.job_id IS NOT NULL))
+          AND NOT EXISTS (SELECT 1 FROM package_detail_cache cache WHERE cache.tenant_id=$1 AND cache.principal_id=$2
+            AND cache.token_mode='delegated' AND cache.native_id=resource.native_id)
+        UNION ALL
+        SELECT cache.detail_snapshot_id,cache.observed_at,cache.expires_at,cache.native_id,cache.package_data,true AS from_cache
+        FROM package_detail_cache cache WHERE cache.tenant_id=$1 AND cache.principal_id=$2
+          AND cache.token_mode='delegated'
       ), latest AS (
         SELECT DISTINCT ON (native_id) * FROM detailed
-        ORDER BY native_id,observed_at DESC,id DESC
+        ORDER BY native_id,date_trunc('milliseconds',observed_at) DESC,id DESC
       )
-      SELECT native_id,package_data,id AS snapshot_id,observed_at,expires_at FROM latest
+      SELECT native_id,package_data,id AS snapshot_id,observed_at,expires_at,from_cache FROM latest
       ORDER BY native_id COLLATE "C" LIMIT 5001`, [scope.tenantId, scope.principalId]);
     if (details.rows.length > 5000) {
       throw new AppError(409, "source_result_limit", "Saved detailed Graph package observations exceed the 5,000-row unified inventory limit.");
@@ -391,7 +527,8 @@ export class PackageInventoryRepository {
       || [...base.rows, ...overlays.rows, ...details.rows].some(row => row.package_data && row.package_data.id !== row.native_id)) {
       throw packageVerificationFailed();
     }
-    const snapshotIds = [...new Set([snapshot.id, ...overlays.rows.map(row => row.snapshot_id), ...details.rows.map(row => row.snapshot_id)])];
+    const snapshotIds = [...new Set([snapshot.id, ...overlays.rows.map(row => row.snapshot_id),
+      ...details.rows.filter(row => !row.from_cache).map(row => row.snapshot_id)])];
     const verified = await database.query<{
       id: string; observed_count: number; total_records: number; page_count: number; stored_count: number;
     }>(`WITH counts AS (
@@ -409,43 +546,32 @@ export class PackageInventoryRepository {
       || !Number.isSafeInteger(row.page_count) || row.page_count < 1 || row.page_count > 100)) {
       throw packageVerificationFailed();
     }
-    const packages = new Map(base.rows.map(row => [row.package_data.id, row.package_data]));
+    const packages = new Map(base.rows.map(row => [row.package_data.id, projectPackageDetails(row.package_data, undefined)]));
+    const readStarted = new Map<string, Date>();
     const observations = new Map<string, UnifiedPackageSourceResult["observations"][string]>(base.rows.map(row => [row.package_data.id, {
       snapshotId: snapshot.id,
       scopeKind: "broad",
       observedAt: snapshot.observed_at.toISOString(),
       expiresAt: snapshot.expires_at.toISOString(),
-      ...(row.package_data.elementDetails?.length ? {
-        identityDetails: {
-          snapshotId: snapshot.id,
-          observedAt: snapshot.observed_at.toISOString(),
-          expiresAt: snapshot.expires_at.toISOString(),
-        },
-      } : {}),
     }]));
     for (const overlay of overlays.rows) {
       const overlayIsNewer = newerObservation(
-        overlay.observed_at,
+        overlay.read_started_at,
         overlay.snapshot_id,
-        snapshot.observed_at,
+        snapshot.read_started_at,
         snapshot.id,
       );
       if (overlay.package_data && overlayIsNewer) {
-        packages.set(overlay.native_id, overlay.package_data);
+        readStarted.set(overlay.native_id, overlay.read_started_at);
+        packages.set(overlay.native_id, projectPackageDetails(overlay.package_data, undefined));
         observations.set(overlay.native_id, {
           snapshotId: overlay.snapshot_id,
           scopeKind: "exact",
           observedAt: overlay.observed_at.toISOString(),
           expiresAt: overlay.expires_at.toISOString(),
-          ...(overlay.package_data.elementDetails?.length ? {
-            identityDetails: {
-              snapshotId: overlay.snapshot_id,
-              observedAt: overlay.observed_at.toISOString(),
-              expiresAt: overlay.expires_at.toISOString(),
-            },
-          } : {}),
         });
       } else if (!overlay.package_data && overlayIsNewer) {
+        readStarted.set(overlay.native_id, overlay.read_started_at);
         packages.delete(overlay.native_id);
         observations.delete(overlay.native_id);
       }
@@ -454,20 +580,29 @@ export class PackageInventoryRepository {
       const current = packages.get(detail.native_id);
       const observation = observations.get(detail.native_id);
       if (!current || !observation) continue;
-      if (observation.scopeKind === "exact" || !canReuseDetailedIdentity(current, detail.package_data)) continue;
-      const currentDetails = observation.identityDetails;
-      if (currentDetails && !newerObservation(
-        detail.observed_at,
-        detail.snapshot_id,
-        new Date(currentDetails.observedAt),
-        currentDetails.snapshotId,
-      )) continue;
-      packages.set(detail.native_id, { ...current, elementDetails: detail.package_data.elementDetails });
-      observation.identityDetails = {
-        snapshotId: detail.snapshot_id,
-        observedAt: detail.observed_at.toISOString(),
-        expiresAt: detail.expires_at.toISOString(),
-      };
+      const value = projectPackageDetails(current, detail.observed_at && detail.expires_at ? {
+        package: detail.package_data, observedAt: detail.observed_at.toISOString(), expiresAt: detail.expires_at.toISOString(),
+      } : undefined, detail.snapshot_id === observation.snapshotId && (observation.scopeKind === "exact" || !snapshot.catalog_only));
+      packages.set(detail.native_id, value);
+      delete observation.identityDetails;
+      if (value.detailFreshness?.state === "fresh" && value.elementDetails?.length && detail.observed_at && detail.expires_at) observation.identityDetails = {
+          snapshotId: detail.snapshot_id,
+          observedAt: detail.observed_at.toISOString(),
+          expiresAt: detail.expires_at.toISOString(),
+        };
+    }
+    const controls = controlsByTarget(await readPackageControls(database, scope));
+    for (const [id, values] of controls) {
+      const boundary = readStarted.get(id) ?? snapshot.read_started_at;
+      const current = packages.get(id);
+      const projected = applyPackageControls(current ?? null, boundary, values);
+      if (!projected) continue;
+      packages.set(id, projected);
+      const latest = values.at(-1)!.observation;
+      if (!current) observations.set(id, {
+        snapshotId: latest.snapshotId, scopeKind: "exact",
+        observedAt: latest.observedAt, expiresAt: latest.expiresAt,
+      });
     }
     if (packages.size > 5000) {
       throw new AppError(409, "source_result_limit", "Combined saved Graph package observations exceed the 5,000-row unified inventory limit.");
@@ -481,20 +616,7 @@ export class PackageInventoryRepository {
 
   async get(scope: PackageDataScope, id: string) {
     validateScope(scope);
-    const result = await this.database.query<{ package_data: CopilotPackageDetail | null; observed_at: Date; expires_at: Date; scope_kind: "broad" | "exact" }>(`WITH candidate AS (
-      SELECT snapshot.id,snapshot.observed_at,snapshot.expires_at,snapshot.scope_kind FROM package_inventory_snapshots snapshot
-      WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-        AND (snapshot.scope_kind='broad' OR snapshot.requested_ids ? $3)
-      ORDER BY snapshot.observed_at DESC,snapshot.id DESC LIMIT 1)
-      SELECT resource.package_data,candidate.observed_at,candidate.expires_at,candidate.scope_kind FROM candidate
-      LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=candidate.id AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=$3`, [scope.tenantId, scope.principalId, id]);
-    return result.rows[0] ? {
-      package: result.rows[0].package_data,
-      targetState: result.rows[0].package_data ? "present" as const : "absent" as const,
-      scopeKind: result.rows[0].scope_kind,
-      observedAt: result.rows[0].observed_at.toISOString(),
-      expiresAt: result.rows[0].expires_at.toISOString(),
-    } : undefined;
+    return readSavedPackageTarget(this.database, scope, id);
   }
 
   async getMany(scope: PackageDataScope, ids: readonly string[]) {
@@ -503,19 +625,23 @@ export class PackageInventoryRepository {
       throw new AppError(400, "invalid_targets", "Exact package reads require 1-5,000 distinct native IDs.");
     }
 
-    const result = await this.database.query<{ requested_id: string; package_data: CopilotPackageDetail | null }>(`WITH requested AS (
+    const result = await this.database.query<Omit<PackageProjectionRow, "read_started_at"> & { requested_id: string; read_started_at: Date | null; token_mode: string | null }>(`WITH requested AS (
       SELECT requested_id,ordinal FROM unnest($3::text[]) WITH ORDINALITY AS requested(requested_id,ordinal))
-      SELECT requested.requested_id,resource.package_data FROM requested
+      SELECT requested.requested_id,resource.package_data,snapshot.id,snapshot.read_started_at,snapshot.token_mode,snapshot.scope_kind,snapshot.catalog_only,
+        ${savedDetailColumns} FROM requested
       LEFT JOIN LATERAL (
-        SELECT snapshot.id FROM package_inventory_snapshots snapshot
+        SELECT snapshot.id,snapshot.read_started_at,snapshot.token_mode,snapshot.scope_kind,snapshot.catalog_only FROM package_inventory_snapshots snapshot
         WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
-          AND (snapshot.scope_kind='broad' OR snapshot.requested_ids ? requested.requested_id)
-        ORDER BY snapshot.observed_at DESC,snapshot.id DESC LIMIT 1
+          AND snapshot.observation_kind='inventory' AND (snapshot.scope_kind='broad' OR snapshot.requested_ids ? requested.requested_id)
+        ORDER BY date_trunc('milliseconds',snapshot.read_started_at) DESC,snapshot.id DESC LIMIT 1
       ) snapshot ON true
       LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=snapshot.id
         AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=requested.requested_id
+      ${savedIdentityJoin("requested.requested_id", "snapshot.token_mode", "$1", "$2")}
       ORDER BY requested.ordinal`, [scope.tenantId, scope.principalId, ids]);
-    return result.rows.map(row => ({ id: row.requested_id, package: row.package_data }));
+    const controls = controlsByTarget(await readPackageControls(this.database, scope, ids));
+    return result.rows.map(row => ({ id: row.requested_id, package: row.token_mode === "application" ? withSavedIdentity(row)
+      : applyPackageControls(withSavedIdentity(row), row.read_started_at ?? undefined, controls.get(row.requested_id) ?? []) }));
   }
 
   async assertSnapshotCurrent(scope: PackageDataScope, snapshotId: string) {
@@ -530,6 +656,7 @@ export class PackageInventoryRepository {
   private async resolveSnapshot(scope: PackageDataScope, snapshotId?: string) {
     const { rows } = await this.database.query<SnapshotRow>(`SELECT * FROM package_inventory_snapshots
       WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
+        AND observation_kind='inventory'
         AND (($3::uuid IS NOT NULL AND id=$3) OR ($3::uuid IS NULL AND scope_kind='broad'))
       ORDER BY observed_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId, snapshotId ?? null]);
     return rows[0];
@@ -541,12 +668,178 @@ function packageVerificationFailed() {
     "Saved Graph package inventory failed verification of collected totals or source identities. Refresh package inventory before using these snapshots.");
 }
 
-async function writePackageSnapshot(client: pg.PoolClient, scope: PackageDataScope, query: SnapshotQuery, jobId: string | null, result: PackageScanResult) {
+async function readPackageControls(database: Pick<pg.Pool, "query">, scope: PackageDataScope, ids?: readonly string[]): Promise<SavedPackageControl[]> {
+  if (ids?.length === 0) return [];
+  const { rows } = await database.query<{
+    id: string; native_id: string; package_data: CopilotPackageDetail | null; control_state: PackageMutationState;
+    observed_at: Date; expires_at: Date;
+    identity_revalidation_required: boolean;
+  }>(`WITH latest_controls AS (
+    SELECT DISTINCT ON (requested_ids->>0,observation_kind) id,requested_ids->>0 AS native_id,control_state,observed_at,expires_at,identity_revalidation_required
+    FROM package_inventory_snapshots
+    WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND observation_kind IN ('block','access')
+      AND is_current AND expires_at>clock_timestamp() AND ($3::text[] IS NULL OR requested_ids->>0=ANY($3::text[]))
+    ORDER BY requested_ids->>0,observation_kind,observed_at DESC,id DESC
+  )
+  SELECT control.*,resource.package_data FROM latest_controls control
+  LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=control.id
+    AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=control.native_id
+  ORDER BY control.observed_at,control.id LIMIT 10001`, [scope.tenantId, scope.principalId, ids ?? null]);
+  if (rows.length > 10_000) throw new AppError(409, "source_result_limit", "Saved package control observations exceed the 5,000-target inventory limit.");
+  return rows.map(row => {
+    if (!row.package_data || row.package_data.id !== row.native_id) throw packageVerificationFailed();
+    return {
+      detail: row.package_data, state: row.control_state,
+      identityRevalidationRequired: row.identity_revalidation_required,
+      observation: { snapshotId: row.id, observedAt: row.observed_at.toISOString(), expiresAt: row.expires_at.toISOString() },
+    };
+  });
+}
+
+async function readSavedPackageTarget(database: Pick<pg.Pool, "query">, scope: PackageDataScope, id: string, tokenMode?: PackageRefreshInput["tokenMode"]) {
+  const result = await database.query<PackageProjectionRow & Pick<SnapshotRow, "observed_at" | "expires_at" | "token_mode">>(`WITH candidate AS (
+    SELECT snapshot.id,snapshot.observed_at,snapshot.read_started_at,snapshot.expires_at,snapshot.scope_kind,snapshot.token_mode,snapshot.catalog_only FROM package_inventory_snapshots snapshot
+    WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
+      AND snapshot.observation_kind='inventory'
+      AND ($4::text IS NULL OR snapshot.token_mode=$4)
+      AND (snapshot.scope_kind='broad' OR snapshot.requested_ids ? $3)
+    ORDER BY date_trunc('milliseconds',snapshot.read_started_at) DESC,snapshot.id DESC LIMIT 1)
+    SELECT resource.package_data,candidate.*,${savedDetailColumns} FROM candidate
+    LEFT JOIN package_inventory_resources resource ON resource.snapshot_id=candidate.id AND resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.native_id=$3
+    ${savedIdentityJoin("$3", "candidate.token_mode", "$1", "$2")}`,
+  [scope.tenantId, scope.principalId, id, tokenMode ?? null]);
+  const saved = result.rows[0];
+  const controls = saved?.token_mode === "application" ? [] : await readPackageControls(database, scope, [id]);
+  const value = applyPackageControls(saved ? withSavedIdentity(saved) : null, saved?.read_started_at, controls);
+  const observation = saved
+    ? { observedAt: saved.observed_at.toISOString(), expiresAt: saved.expires_at.toISOString() }
+    : controls.at(-1)?.observation;
+  if (!observation) return undefined;
+  return {
+    package: value, targetState: value ? "present" as const : "absent" as const,
+    scopeKind: saved?.scope_kind ?? "exact" as const,
+    observedAt: observation.observedAt, expiresAt: observation.expiresAt,
+  };
+}
+
+type PackageProjectionRow = {
+  package_data: CopilotPackageDetail | null;
+  identity_data: CopilotPackageDetail | null;
+  read_started_at: Date;
+  scope_kind: "broad" | "exact";
+  id?: string;
+  catalog_only?: boolean;
+  identity_snapshot_id?: string;
+  identity_observed_at?: Date;
+  identity_expires_at?: Date;
+};
+
+const savedDetailColumns = `identity_detail.package_data AS identity_data,
+  identity_detail.snapshot_id AS identity_snapshot_id,identity_detail.observed_at AS identity_observed_at,
+  identity_detail.expires_at AS identity_expires_at`;
+
+function savedIdentityJoin(nativeId: string, tokenMode: string, tenant: string, principal: string) {
+  return `LEFT JOIN LATERAL (
+    SELECT saved.* FROM (
+      SELECT detail.package_data || '{"identityDetailsCollected":true}'::jsonb AS package_data,
+        identity_snapshot.id AS snapshot_id,identity_snapshot.read_started_at AS observed_at,
+        LEAST(identity_snapshot.expires_at,identity_snapshot.read_started_at+interval '1 hour') AS expires_at
+      FROM package_inventory_snapshots identity_snapshot
+      LEFT JOIN package_inventory_resources detail ON detail.snapshot_id=identity_snapshot.id
+        AND detail.tenant_id=${tenant} AND detail.principal_id=${principal} AND detail.native_id=${nativeId}
+      WHERE identity_snapshot.tenant_id=${tenant} AND identity_snapshot.principal_id=${principal}
+        AND identity_snapshot.token_mode=${tokenMode} AND identity_snapshot.observation_kind='inventory'
+        AND NOT identity_snapshot.catalog_only AND identity_snapshot.is_current AND identity_snapshot.expires_at>clock_timestamp()
+        AND (package_detail_has_evidence(detail.package_data)
+          OR (identity_snapshot.scope_kind='exact' AND identity_snapshot.job_id IS NOT NULL))
+        AND (identity_snapshot.scope_kind='broad' OR identity_snapshot.requested_ids ? ${nativeId})
+        AND NOT EXISTS (SELECT 1 FROM package_detail_cache cache WHERE cache.tenant_id=${tenant}
+          AND cache.principal_id=${principal} AND cache.token_mode=${tokenMode} AND cache.native_id=${nativeId})
+      UNION ALL
+      SELECT cache.package_data,cache.detail_snapshot_id,cache.observed_at,cache.expires_at
+      FROM package_detail_cache cache WHERE cache.tenant_id=${tenant} AND cache.principal_id=${principal}
+        AND cache.token_mode=${tokenMode} AND cache.native_id=${nativeId}
+    ) saved
+    ORDER BY date_trunc('milliseconds',saved.observed_at) DESC,saved.snapshot_id DESC LIMIT 1
+  ) identity_detail ON true`;
+}
+
+function withSavedIdentity(row: Omit<PackageProjectionRow, "read_started_at">) {
+  if (!row.package_data) return null;
+  return projectPackageDetails(row.package_data, row.identity_observed_at && row.identity_expires_at ? {
+    package: row.identity_data,
+    observedAt: row.identity_observed_at.toISOString(),
+    expiresAt: row.identity_expires_at.toISOString(),
+  } : undefined, !row.catalog_only && Boolean(row.id && row.id === row.identity_snapshot_id));
+}
+
+function applyPackageControls(value: CopilotPackageDetail | null, readStartedAt: Date | undefined, controls: readonly SavedPackageControl[]) {
+  const applicable = controls.filter(control => (!value || control.detail.id === value.id)
+    && (!readStartedAt || Date.parse(control.observation.observedAt) >= readStartedAt.getTime()));
+  let result = value ?? applicable.at(-1)?.detail ?? null;
+  if (!result) return null;
+  for (const control of applicable) {
+    result = projectPackageControl(result, control);
+  }
+  return result;
+}
+
+function controlsByTarget(controls: readonly SavedPackageControl[]) {
+  const result = new Map<string, SavedPackageControl[]>();
+  for (const control of controls) {
+    const values = result.get(control.detail.id) ?? [];
+    values.push(control);
+    result.set(control.detail.id, values);
+  }
+  return result;
+}
+
+async function publishAutomaticDetails(client: pg.PoolClient, scope: PackageDataScope, job: JobRow, result: PackageScanResult) {
+  validatePublication(job, result);
+  const failures = result.detailFailures ?? [];
+  const completed = [...result.packages.map(value => value.id), ...failures.map(value => value.id)];
+  if (completed.length !== job.requested_ids.length || new Set(completed).size !== completed.length
+    || completed.some(id => !job.requested_ids.includes(id))) {
+    throw new AppError(409, "incomplete_package_coverage", "Automatic enrichment must account for every reserved target.");
+  }
+  const targets = new Map(job.detail_targets.map(target => [target.id, target.generation]));
+  const observations = [
+    ...result.packages.map(value => ({ id: value.id, package_data: { ...value, identityDetailsCollected: true }, failed: false, missing: false })),
+    ...failures.map(value => ({ id: value.id, package_data: null, failed: true, missing: value.missing })),
+  ].map(value => ({ ...value, generation: targets.get(value.id) }));
+  if (observations.some(value => !value.generation)) throw packageVerificationFailed();
+  await client.query(`WITH current AS MATERIALIZED (SELECT * FROM package_detail_current_catalog($1,$2,'delegated'))
+    UPDATE package_detail_cache cache SET
+      package_data=CASE WHEN result.failed AND NOT result.missing THEN cache.package_data ELSE result.package_data END,
+      detail_snapshot_id=CASE WHEN result.failed AND NOT result.missing THEN cache.detail_snapshot_id ELSE $4::uuid END,
+      observed_at=CASE WHEN result.failed AND NOT result.missing THEN cache.observed_at ELSE $5::timestamptz END,
+      read_started_at=CASE WHEN result.failed AND NOT result.missing THEN cache.read_started_at ELSE $5::timestamptz END,
+      expires_at=CASE WHEN result.failed AND NOT result.missing THEN cache.expires_at ELSE $5::timestamptz+interval '1 hour' END,
+      failure_count=CASE WHEN result.failed THEN LEAST(cache.failure_count+1,10) ELSE 0 END,
+      next_attempt_at=CASE WHEN result.failed
+        THEN clock_timestamp()+LEAST(60,5*power(2,LEAST(cache.failure_count,4)))*interval '1 minute'
+        ELSE $5::timestamptz+interval '1 hour' END
+    FROM jsonb_to_recordset($3::jsonb) result(id text,generation uuid,package_data jsonb,failed boolean,missing boolean)
+    WHERE cache.tenant_id=$1 AND cache.principal_id=$2 AND cache.token_mode='delegated'
+      AND cache.native_id=result.id AND cache.generation=result.generation
+      AND (cache.read_started_at IS NULL OR cache.read_started_at<=$5::timestamptz)
+      AND EXISTS (SELECT 1 FROM current
+        WHERE current.native_id=cache.native_id AND package_detail_revision(current.package_data)=cache.catalog_revision)`,
+  [scope.tenantId, scope.principalId, JSON.stringify(observations), job.id, job.attempted_at ?? job.created_at]);
+  return null;
+}
+
+async function writePackageSnapshot(client: pg.PoolClient, scope: PackageDataScope, query: SnapshotQuery, jobId: string | null, result: PackageScanResult,
+  observation: { controlState?: PackageMutationState; readStartedAt?: Date; identityRevalidationRequired?: boolean } = {}) {
   validatePublication(query, result);
   await client.query("UPDATE package_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND token_mode=$3 AND query_hash=$4 AND is_current", [scope.tenantId, scope.principalId, query.token_mode, query.query_hash]);
   const snapshotId = randomUUID();
-  await client.query(`INSERT INTO package_inventory_snapshots(id,job_id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)`, [snapshotId, jobId, scope.tenantId, scope.principalId, query.token_mode, query.query_hash, query.scope_kind, JSON.stringify(query.requested_ids), result.packages.length, result.totalRecords, result.pages]);
+  await client.query(`INSERT INTO package_inventory_snapshots(id,job_id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,observed_count,total_records,page_count,
+      observation_kind,control_state,read_started_at,expires_at,identity_revalidation_required,catalog_only)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,COALESCE($14,clock_timestamp()),COALESCE($14,clock_timestamp())+interval '30 days',$15,$16)`,
+  [snapshotId, jobId, scope.tenantId, scope.principalId, query.token_mode, query.query_hash, query.scope_kind, JSON.stringify(query.requested_ids),
+    result.packages.length, result.totalRecords, result.pages, observation.controlState?.kind ?? "inventory", observation.controlState ?? null,
+    observation.readStartedAt ?? null, observation.identityRevalidationRequired ?? false, query.catalog_only ?? false]);
   if (result.packages.length) {
     const rows = result.packages.map(value => ({
       native_id: value.id, display_name: value.displayName, is_blocked: value.isBlocked,
@@ -708,6 +1001,8 @@ function projectJob(row: JobRow) {
     tokenMode: row.token_mode,
     scopeKind: row.scope_kind,
     requestedIds: row.requested_ids,
+    catalogOnly: row.catalog_only ?? false,
+    autoDetails: row.auto_details ?? false,
     status: row.status,
     pageCount: row.page_count,
     observedCount: row.observed_count,
@@ -752,27 +1047,4 @@ function ordinal(left: string, right: string) {
 function newerObservation(leftAt: Date, leftId: string, rightAt: Date, rightId: string) {
   const difference = leftAt.getTime() - rightAt.getTime();
   return difference > 0 || difference === 0 && ordinal(leftId, rightId) > 0;
-}
-
-function canReuseDetailedIdentity(current: CopilotPackageDetail, detailed: CopilotPackageDetail) {
-  if (current.identityDetailsCollected) return false;
-  const currentModifiedAt = current.lastModifiedDateTime;
-  const detailedModifiedAt = detailed.lastModifiedDateTime;
-  if (!currentModifiedAt || currentModifiedAt !== detailedModifiedAt || !Number.isFinite(Date.parse(currentModifiedAt))) {
-    return false;
-  }
-  const markers = ["appId", "manifestId", "assetId", "version", "manifestVersion"] as const;
-  let matchedMarker = false;
-  for (const marker of markers) {
-    const currentValue = nonemptyMarker(current[marker]);
-    const detailedValue = nonemptyMarker(detailed[marker]);
-    if (currentValue === undefined && detailedValue === undefined) continue;
-    if (currentValue === undefined || detailedValue === undefined || currentValue !== detailedValue) return false;
-    matchedMarker = true;
-  }
-  return matchedMarker;
-}
-
-function nonemptyMarker(value: string | undefined) {
-  return typeof value === "string" && value.trim() ? value : undefined;
 }

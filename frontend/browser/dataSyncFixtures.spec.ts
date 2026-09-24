@@ -42,6 +42,24 @@ test("automatic completion leaves manual reports outstanding", async ({ page }) 
   expect(fixture.unexpected).toEqual([]);
 });
 
+test("automatic due checks publish revision observations without masquerading as manual starts", async ({ page }) => {
+  const fixture = await mockSync(page, completedState());
+  const check = () => page.evaluate(async () => {
+    const response = await fetch("/api/data-sync/auto-refresh", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    return response.json();
+  });
+  const first = await check();
+  expect(Object.keys(first.revisions)).toEqual(["users", "graph_packages", "power_platform"]);
+  expect(first.run.id).toBe(completedState().run!.id);
+  fixture.finish();
+  const next = await check();
+  expect(next.revisions.users).not.toBe(first.revisions.users);
+  expect(fixture.starts).toEqual([]);
+  expect(fixture.unexpected).toEqual([]);
+});
+
 test("users-only completion cannot finish onboarding for unsynced sources", async ({ page }) => {
   const fixture = await mockSync(page, initial);
   await startRun(page, { mode: "initial", sources: ["users"] });

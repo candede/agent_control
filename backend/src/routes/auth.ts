@@ -97,6 +97,7 @@ policyRoute(authRouter, "get", "/auth/callback", { access: "public", dataClass: 
       request.session.user = user;
       request.session.csrfToken = randomBytes(32).toString("base64url");
       request.session.rolesValidatedAt = Date.now();
+      request.session.signedInAt = Date.now();
       await saveSession(request);
     });
 
