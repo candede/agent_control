@@ -52,6 +52,31 @@ beforeEach(() => {
 });
 
 describe("AuditLogView routing", () => {
+  it("bounds typed searches to the accepted audit search length", async () => {
+    window.history.replaceState({}, "", "/audit");
+    render(<AuditLogView agents={[]} />);
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    expect(search).toHaveAttribute("maxlength", "200");
+    await userEvent.click(search);
+    await userEvent.paste("a".repeat(201));
+    expect(search).toHaveValue("a".repeat(200));
+    await waitFor(() => expect(getAuditEvents).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: "a".repeat(200) }), expect.anything(),
+    ));
+  });
+
+  it("stops at the last supported offset and explains how to reach older matches", async () => {
+    window.history.replaceState({}, "", "/audit?page=1002");
+    vi.mocked(getAuditEvents).mockResolvedValue({ count: 200_000, value: [associationEvent] });
+    render(<AuditLogView agents={[]} />);
+    await screen.findByRole("region", { name: "Audit events" });
+    expect(getAuditEvents).toHaveBeenCalledWith(expect.objectContaining({ offset: 100_000 }), expect.anything());
+    expect(screen.getByRole("combobox", { name: "Audit page" })).toHaveValue("1000");
+    expect(screen.getByRole("button", { name: "Next audit page" })).toBeDisabled();
+    expect(screen.getByText(/Refine the filters to view older matching events/)).toBeVisible();
+    expect(window.location.search).toBe("?page=1001");
+  });
+
   it.each([
     ["reassign", "Reassign owner"],
     ["approve-hunting", "Approve Defender hunting qualification"],

@@ -1,11 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { DataSyncRun, DataSyncSourceId, DataSyncSourceStatus } from "../types/dataSync.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { CopilotUsageRefreshResult, CopilotUsageService } from "./copilotUsage.js";
 import { DataSyncService } from "./dataSync.js";
+import * as operationalState from "./operationalState.js";
+
+vi.mock("../db/pool.js", () => ({
+  pool: {},
+  secretValue: vi.fn(),
+  transaction: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
+}));
 
 const user: AuthenticatedUser = {
   tenantId: "tenant-data-sync",
@@ -16,12 +24,108 @@ const user: AuthenticatedUser = {
 };
 
 describe("DataSyncService", () => {
+  it("checks derived retry sources before reopening provider work", async () => {
+    const harness = serviceHarness();
+    harness.run.status = "partial";
+    harness.run.sources = [{ ...harness.run.sources[0], status: "failed", canRetry: true }];
+    const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+      throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+    });
+    try {
+      await expect(harness.service.retry(user, harness.run.id)).rejects.toMatchObject({ code: "provider_requalification_required" });
+      expect(harness.repository.retry).not.toHaveBeenCalled();
+      expect(harness.packages.submit).not.toHaveBeenCalled();
+      expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    } finally {
+      admission.mockRestore();
+    }
+  });
+
+  it("still blocks upload-only sync during maintenance", async () => {
+    const harness = serviceHarness();
+    vi.stubEnv("MAINTENANCE_MODE", "true");
+    try {
+      await expect(harness.service.start(user, { mode: "initial", sources: ["usage_reports"] }))
+        .rejects.toMatchObject({ code: "maintenance" });
+      expect(harness.repository.submit).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("keeps upload-only sync and retry available while providers await requalification", async () => {
+    const harness = serviceHarness();
+    const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+      throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+    });
+    try {
+      await expect(harness.service.start(user, { mode: "initial", sources: ["usage_reports"] }))
+        .resolves.toMatchObject({ sources: [expect.objectContaining({ source: "usage_reports", status: "awaiting_upload" })] });
+      harness.run.status = "cancelled";
+      Object.assign(harness.run.sources[0], { status: "cancelled", canRetry: true });
+      await expect(harness.service.retry(user, harness.run.id)).resolves.toMatchObject({ id: harness.run.id });
+      expect(harness.repository.retry).toHaveBeenCalledWith(expect.anything(), harness.run.id, ["usage_reports"]);
+      expect(admission).not.toHaveBeenCalled();
+      expect(harness.packages.submit).not.toHaveBeenCalled();
+      expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+      expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    } finally {
+      admission.mockRestore();
+    }
+  });
+
+  it("pauses admitted sync without launching children if provider admissions close during submission", async () => {
+    const harness = serviceHarness();
+    let closed = false;
+    const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+      if (closed) throw new AppError(503, "provider_requalification_required", "Provider admissions are closed.");
+    });
+    harness.repository.submit.mockImplementationOnce(async () => {
+      closed = true;
+      return { run: harness.run, created: true };
+    });
+    try {
+      await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "provider_requalification_required" });
+      expect(harness.packages.submit).not.toHaveBeenCalled();
+      expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+      expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+      expect(harness.repository.pausePrincipal).toHaveBeenCalledWith(
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, expect.any(String), harness.run.id,
+      );
+    } finally {
+      await harness.service.drain();
+      admission.mockRestore();
+    }
+  });
+
+  it.each(["maintenance", "provider_requalification_required"])(
+    "rejects manual admission before saved-data cleanup or retry while %s", async code => {
+      const admission = vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+        throw new AppError(503, code, "Provider admissions are closed.");
+      });
+      try {
+        const harness = serviceHarness();
+        await expect(harness.service.start(user, { mode: "full", clearSavedData: true })).rejects.toMatchObject({ status: 503, code });
+        await expect(harness.service.retry(user, harness.run.id, ["users"])).rejects.toMatchObject({ status: 503, code });
+        expect(harness.repository.submit).not.toHaveBeenCalled();
+        expect(harness.repository.retry).not.toHaveBeenCalled();
+        expect(harness.repository.getRun).not.toHaveBeenCalled();
+        expect(harness.packages.submit).not.toHaveBeenCalled();
+        expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+        await expect(harness.service.getRun({ tenantId: user.tenantId!, principalId: user.homeAccountId }, harness.run.id))
+          .resolves.toMatchObject({ id: harness.run.id });
+      } finally {
+        admission.mockRestore();
+      }
+    },
+  );
+
   it("starts a fast automatic run while admitting details independently and reuses the people cache", async () => {
     const harness = serviceHarness();
     const result = await harness.service.automaticRefresh(user);
     expect(result.run).toMatchObject({ automatic: true, mode: "incremental" });
     expect(result.revisions).toEqual({ users: "users-revision", graph_packages: "inventory-revision", power_platform: "inventory-revision" });
-    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, undefined);
+    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, undefined, expect.any(AbortSignal));
     await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
     expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({ catalogOnly: true, requestedIds: [] }));
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.objectContaining({ automatic: true }));
@@ -40,13 +144,132 @@ describe("DataSyncService", () => {
     expect(harness.packages.refreshDueDetails).toHaveBeenCalledOnce();
   });
 
+  it("keeps automatic detail admission owned until shutdown has joined it", async () => {
+    const harness = serviceHarness();
+    harness.repository.submitDue.mockResolvedValue({ run: null, created: false });
+    const details = deferred<null>();
+    harness.packages.refreshDueDetails.mockReturnValueOnce(details.promise);
+    const request = harness.service.automaticRefresh(user).catch(error => error);
+    await vi.waitFor(() => expect(harness.packages.refreshDueDetails).toHaveBeenCalled());
+    let stopped = false;
+    const draining = harness.service.drain().then(() => { stopped = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    details.resolve(null);
+    await draining;
+    expect(await request).toMatchObject({ code: "interaction_required" });
+    expect(harness.repository.automaticRevisions).not.toHaveBeenCalled();
+  });
+
+  it("counts an automatic run and its pending detail admission as one coordinator reservation", async () => {
+    const harness = serviceHarness();
+    const details = deferred<null>();
+    const users = deferred<CopilotUsageRefreshResult>();
+    const admissions = deferred<never>();
+    harness.packages.refreshDueDetails.mockReturnValueOnce(details.promise);
+    harness.copilotUsage.refreshUsers.mockReturnValueOnce(users.promise);
+    const automatic = harness.service.automaticRefresh(user);
+    await vi.waitFor(() => expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled());
+    harness.repository.submit.mockReturnValue(admissions.promise);
+    const starting = Array.from({ length: 3 }, () => harness.service.start(
+      { ...user, homeAccountId: randomUUID() }, { mode: "initial" },
+    ).catch(error => error));
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalledTimes(3));
+    await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "data_sync_capacity" });
+    admissions.reject(new Error("Admission unavailable."));
+    details.resolve(null);
+    users.resolve({ status: "succeeded", count: 0, message: "Saved users." });
+    await Promise.all([automatic, ...starting]);
+    await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
+  });
+
+  it.each(["start", "retry"] as const)("rejects a revoked session before %s can admit durable work", async action => {
+    const harness = serviceHarness();
+    const owner = { ...user, homeAccountId: randomUUID() };
+    await revokeAccountSessionMutations(owner.tenantId!, owner.homeAccountId, async () => undefined);
+    await expect(action === "start"
+      ? harness.service.start(owner, { mode: "full", clearSavedData: true })
+      : harness.service.retry(owner, harness.run.id)).rejects.toMatchObject({ code: "unauthorized" });
+    expect(harness.repository.submit).not.toHaveBeenCalled();
+    expect(harness.repository.getRun).not.toHaveBeenCalled();
+    expect(harness.repository.retry).not.toHaveBeenCalled();
+    expect(harness.repository.pausePrincipal).not.toHaveBeenCalled();
+  });
+
+  it("does not launch an admitted run using a replacement session", async () => {
+    const harness = serviceHarness();
+    const owner = { ...user, homeAccountId: randomUUID() };
+    const submitted = deferred<{ run: DataSyncRun; created: boolean }>();
+    harness.repository.submit.mockReturnValueOnce(submitted.promise);
+    const request = harness.service.start(owner, { mode: "initial" }).catch(error => error);
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalled());
+    const signingIn = activateAccountSession(owner.tenantId!, owner.homeAccountId, async () => undefined);
+    submitted.resolve({ run: harness.run, created: true });
+    await signingIn;
+    expect(await request).toMatchObject({ code: "unauthorized" });
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    expect(harness.repository.pausePrincipal).toHaveBeenCalledWith(
+      { tenantId: owner.tenantId, principalId: owner.homeAccountId }, expect.any(String), harness.run.id,
+    );
+  });
+
+  it("does not pause another session's existing run when a stale start only deduplicates it", async () => {
+    const harness = serviceHarness();
+    const owner = { ...user, homeAccountId: randomUUID() };
+    const submitted = deferred<{ run: DataSyncRun; created: boolean }>();
+    harness.repository.submit.mockReturnValueOnce(submitted.promise);
+    const request = harness.service.start(owner, { mode: "initial" }).catch(error => error);
+    await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalled());
+    const signingIn = activateAccountSession(owner.tenantId!, owner.homeAccountId, async () => undefined);
+    submitted.resolve({ run: harness.run, created: false });
+    await signingIn;
+    expect(await request).toMatchObject({ code: "unauthorized" });
+    expect(harness.repository.pausePrincipal).not.toHaveBeenCalled();
+  });
+
+  it("pins the Users phase to its original session while waiting for inventory", async () => {
+    const harness = serviceHarness();
+    const owner = { ...user, homeAccountId: randomUUID() };
+    const inventory = deferred<ReturnType<typeof powerPlatformJob>>();
+    harness.powerPlatform.start.mockReturnValueOnce(inventory.promise);
+    await harness.service.start(owner, { mode: "initial", sources: ["users", "power_platform"] });
+    await vi.waitFor(() => expect(harness.run.sources[0].message).toContain("Waiting for Power Platform"));
+    await activateAccountSession(owner.tenantId!, owner.homeAccountId, async () => undefined);
+    inventory.resolve(powerPlatformJob(harness.powerPlatform.start.mock.calls[0][1], "succeeded", 0));
+    await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("waiting_authorization"));
+    expect(harness.agentPeople.refreshReferences).not.toHaveBeenCalled();
+    expect(harness.markers[0].status).toBe("not_started");
+  });
+
+  it("canonicalizes run IDs before reserving retries or cancelling active work", async () => {
+    const harness = serviceHarness();
+    harness.run.id = "abcdefab-cdef-4abc-8abc-abcdefabcdef";
+    const reading = deferred<CopilotUsageRefreshResult>();
+    harness.copilotUsage.refreshUsers.mockReturnValueOnce(reading.promise);
+    await harness.service.start(user, { mode: "initial", sources: ["users"] });
+    await vi.waitFor(() => expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled());
+    await expect(harness.service.retry(user, harness.run.id.toUpperCase(), ["users"]))
+      .rejects.toMatchObject({ code: "data_sync_active" });
+    const cancellation = harness.service.cancel(user, harness.run.id.toUpperCase());
+    await vi.waitFor(() => expect(harness.repository.cancel).toHaveBeenCalled());
+    expect(harness.copilotUsage.refreshUsers.mock.calls[0][1]?.aborted).toBe(true);
+    reading.resolve({ status: "succeeded", count: 0, message: "Late result." });
+    await cancellation;
+    expect(harness.agentPeople.refreshReferences).not.toHaveBeenCalled();
+    expect(harness.repository.cancel).toHaveBeenCalledWith(
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, harness.run.id,
+    );
+  });
+
   it("passes the server's sign-in time to both automatic admission lanes", async () => {
     const harness = serviceHarness();
     const signedInAt = Date.now();
     await harness.service.automaticRefresh(user, signedInAt);
     expect(harness.repository.submitDue).toHaveBeenCalledWith(
       { tenantId: user.tenantId, principalId: user.homeAccountId }, signedInAt);
-    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, signedInAt);
+    expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, signedInAt, expect.any(AbortSignal));
     await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal),
       expect.objectContaining({ automatic: true, signedInAt }));
@@ -704,6 +927,69 @@ describe("DataSyncService", () => {
     });
   });
 
+  it("joins and cleans live children even when persisting cancellation fails", async () => {
+    const harness = serviceHarness();
+    const starting = deferred<ReturnType<typeof packageJob>>();
+    harness.packages.start.mockReturnValueOnce(starting.promise);
+    await harness.service.start(user, { mode: "initial", sources: ["graph_packages"] });
+    await vi.waitFor(() => expect(harness.packages.start).toHaveBeenCalled());
+    const failure = new Error("Cancellation persistence unavailable.");
+    harness.repository.cancel.mockRejectedValueOnce(failure);
+    let stopped = false;
+    const cancellation = harness.service.cancel(user, harness.run.id).catch(error => error)
+      .finally(() => { stopped = true; });
+    await vi.waitFor(() => expect(harness.repository.cancel).toHaveBeenCalled());
+    expect(stopped).toBe(false);
+    starting.resolve(packageJob(harness.packages.start.mock.calls[0][1], "running", 0));
+    expect(await cancellation).toBe(failure);
+    expect(harness.packages.cancel).toHaveBeenCalled();
+  });
+
+  it("retains failed child cleanup after the worker settles so shutdown retries it", async () => {
+    const harness = serviceHarness();
+    const failure = new Error("Cleanup temporarily unavailable.");
+    harness.packages.start.mockRejectedValueOnce(new AppError(401, "interaction_required", "Renew sign-in."));
+    harness.packages.cancel.mockRejectedValue(failure);
+    await harness.service.start(user, { mode: "initial", sources: ["graph_packages"] });
+    await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("waiting_authorization"));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const attempts = harness.packages.cancel.mock.calls.length;
+    harness.packages.cancel.mockImplementation(async (_user, id) => packageJob(id, "cancelled", 0));
+    await harness.service.drain();
+    expect(harness.packages.cancel.mock.calls.length).toBeGreaterThan(attempts);
+  });
+
+  it("keeps automatic finalization owned until shutdown joins its persistence", async () => {
+    const harness = serviceHarness();
+    const finished = deferred<void>();
+    harness.repository.finishAutomatic.mockReturnValueOnce(finished.promise);
+    await harness.service.automaticRefresh(user);
+    await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalled());
+    let stopped = false;
+    const draining = harness.service.drain().then(() => { stopped = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    finished.resolve();
+    await draining;
+  });
+
+  it("reconciles a retried manual report source before returning instead of leaving it queued", async () => {
+    const harness = serviceHarness();
+    harness.run.sources = [harness.run.sources.find(source => source.source === "usage_reports")!];
+    Object.assign(harness.run.sources[0], { status: "cancelled", canRetry: true });
+    harness.run.status = "cancelled";
+    harness.repository.retry.mockImplementation(async () => {
+      harness.run.status = "running";
+      Object.assign(harness.run.sources[0], { status: "queued", canRetry: false });
+      return ["usage_reports"];
+    });
+    expect(await harness.service.retry(user, harness.run.id)).toMatchObject({
+      status: "waiting", sources: [{ source: "usage_reports", status: "awaiting_upload", canRetry: false }],
+    });
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["start", "sign-out"], ["start", "shutdown"], ["retry", "sign-out"], ["retry", "shutdown"],
   ] as const)("joins a pending %s admission on %s", async (action, stopping) => {
@@ -904,7 +1190,7 @@ describe("DataSyncService", () => {
       return submit(...args);
     });
     const requests = Promise.allSettled(Array.from({ length: 4 }, () =>
-      harness.service.start(user, { mode: "initial", sources: ["users"] })));
+      harness.service.start({ ...user, homeAccountId: randomUUID() }, { mode: "initial", sources: ["users"] })));
     await vi.waitFor(() => expect(harness.repository.submit).toHaveBeenCalledTimes(4));
     await expect(harness.service.start(user, { mode: "initial" })).rejects.toMatchObject({ code: "data_sync_capacity" });
     const failure = new Error("Admission unavailable.");
@@ -987,7 +1273,7 @@ function serviceHarness() {
     });
   };
   const repository = {
-    submitDue: vi.fn(async () => {
+    submitDue: vi.fn(async (): Promise<{ run: DataSyncRun | null; created: boolean }> => {
       run.automatic = true;
       run.mode = "incremental";
       run.sources = run.sources.filter(source => source.source !== "usage_reports");

@@ -5,6 +5,8 @@ import { DataSyncRepository, type SavedCopilotUsageSource } from "../db/dataSync
 import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { agentColumnValue } from "../types/agentPresentation.js";
+import { isDirectoryObjectId } from "../types/copilotPackage.js";
+import { AppError } from "../errors.js";
 import { SavedAgentPeopleService } from "./savedAgentPeople.js";
 
 const scope = { tenantId: "people-tenant", principalId: "people-reader" };
@@ -253,6 +255,70 @@ describe("saved directory repository query", () => {
 });
 
 describe("saved agent people cache precedence", () => {
+  it("filters native user IDs before applying the reference limit", async () => {
+    const database = new pg.Pool();
+    const query = vi.spyOn(database, "query").mockResolvedValue({
+      rows: [{ id: firstId }], rowCount: 1, command: "SELECT", oid: 0, fields: [],
+    });
+    try {
+      expect(await new AgentPeopleRepository(database).referencedIds(scope)).toEqual([firstId]);
+      const [sql, parameters] = query.mock.calls[0];
+      expect(String(sql)).toMatch(/AND person\.id ~\* \$3\s+ORDER BY id LIMIT 10001/);
+      expect(parameters?.slice(0, 2)).toEqual([scope.tenantId, scope.principalId]);
+      const allowedId = new RegExp(String(parameters?.[2]), "i");
+      expect(allowedId.test(firstId.toUpperCase())).toBe(true);
+      for (const invalid of ["Creator", "creator@example.invalid", "", `{${firstId}}`, firstId.slice(1)]) {
+        expect(allowedId.test(invalid)).toBe(false);
+      }
+      for (const version of "0123456789abcdef") {
+        for (const variant of "0123456789abcdef") {
+          const id = `aaaaaaaa-aaaa-${version}aaa-${variant}aaa-aaaaaaaaaaaa`;
+          for (const candidate of [id, id.toUpperCase()]) {
+            expect(allowedId.test(candidate), candidate).toBe(isDirectoryObjectId(candidate));
+          }
+        }
+      }
+    } finally { await database.end(); }
+  });
+
+  it.each([10_000, 10_001])("enforces the reference limit for %i accepted directory IDs", async count => {
+    const database = new pg.Pool();
+    const ids = Array.from({ length: count }, (_, index) => `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, "0")}`);
+    vi.spyOn(database, "query").mockResolvedValue({
+      rows: ids.map(id => ({ id })), rowCount: count, command: "SELECT", oid: 0, fields: [],
+    });
+    try {
+      const result = new AgentPeopleRepository(database).referencedIds(scope);
+      if (count === 10_000) expect(await result).toEqual(ids);
+      else await expect(result).rejects.toMatchObject({ status: 413, code: "agent_people_limit" });
+    } finally { await database.end(); }
+  });
+
+  it.each(["lock", "insert"] as const)("rolls back publication when its fence closes during the %s query", async phase => {
+    const database = new pg.Pool();
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockResolvedValue(client);
+    let closed = false;
+    const query = vi.spyOn(client, "query").mockImplementation(async sql => {
+      const text = String(sql);
+      if (text.includes(phase === "lock" ? "pg_advisory_xact_lock" : "INSERT INTO agent_people_cache")) closed = true;
+      const rows = text.includes("AS generation") ? [{ generation: "initial" }]
+        : text.includes("count(*)") ? [{ count: 0 }] : [];
+      return { rows, rowCount: rows.length, command: "SELECT", oid: 0, fields: [] };
+    });
+    try {
+      await expect(new AgentPeopleRepository(database).save(scope, [{
+        objectId: firstId, status: "resolved", displayName: "Person", userPrincipalName: null, checkedAt: observedAt,
+      }], { generation: "initial", fence: () => {
+        if (closed) throw new AppError(401, "unauthorized", "Publication was revoked");
+      } })).rejects.toMatchObject({ code: "unauthorized" });
+      expect(query).not.toHaveBeenCalledWith("COMMIT");
+      expect(query).toHaveBeenLastCalledWith("ROLLBACK");
+      expect(client.release).toHaveBeenCalledOnce();
+      if (phase === "lock") expect(query.mock.calls.some(call => String(call[0]).includes("INSERT INTO agent_people_cache"))).toBe(false);
+    } finally { await database.end(); }
+  });
+
   it("retains the prior not-found check time when a failed lookup replaces the cache result", async () => {
     const database = new pg.Pool();
     const client = Object.assign(new pg.Client(), { release: vi.fn() });

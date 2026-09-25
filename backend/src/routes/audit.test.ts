@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { parseAuditEventsQuery } from "./audit.js";
+
+vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn() }));
 
 describe("parseAuditEventsQuery", () => {
   it("parses valid audit event filters", () => {
@@ -44,6 +46,8 @@ describe("parseAuditEventsQuery", () => {
   it("rejects malformed offsets", () => {
     expect(() => parseAuditEventsQuery({ offset: "10abc" })).toThrow(AppError);
     expect(() => parseAuditEventsQuery({ offset: "-1" })).toThrow(AppError);
+    expect(() => parseAuditEventsQuery({ offset: "100001" })).toThrow(AppError);
+    expect(parseAuditEventsQuery({ offset: "100000" }).offset).toBe(100000);
   });
 
   it("rejects unsupported actions, statuses, and scopes", () => {
@@ -58,7 +62,12 @@ describe("parseAuditEventsQuery", () => {
     ).toThrow(AppError);
   });
 
+  it("accepts the same literal operation prefix grammar as inventory reference filters", () => {
+    expect(parseAuditEventsQuery({ operationIdPrefix: " REF_CASE-1 " }).operationIdPrefix).toBe("REF_CASE-1");
+  });
+
   it("rejects overlong search values", () => {
+    expect(parseAuditEventsQuery({ search: "a".repeat(200) }).search).toHaveLength(200);
     expect(() => parseAuditEventsQuery({ search: "a".repeat(201) })).toThrow(
       AppError,
     );

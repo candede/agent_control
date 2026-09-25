@@ -191,6 +191,140 @@ describe("Copilot Studio quarantine control", () => {
     expect(dependencies.launch).not.toHaveBeenCalled();
   });
 
+  it.each(["status", "preview", "submit"] as const)(
+    "keeps %s in its initiating session across inventory resolution", async operation => {
+      const current = { ...user, homeAccountId: `inventory-session-${operation}` };
+      const { value, inventory, repository, provider, dependencies } = service(false, current);
+      inventory.resolveQuarantineTargets.mockImplementationOnce(async () => {
+        await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+        await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+        return [target];
+      });
+      const input = { action: "quarantine" as const, snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+        confirmationHash: "e".repeat(64), idempotencyKey: "inventory-session" };
+      const result = operation === "status" ? value.status(current, input.snapshotId, target.resourceNativeId)
+        : operation === "preview" ? value.preview(current, input) : value.submit(current, input);
+      await expect(result).rejects.toMatchObject({ code: "unauthorized" });
+      expect(provider.getStatus).not.toHaveBeenCalled();
+      expect(repository.recordObservation).not.toHaveBeenCalled();
+      expect(repository.submit).not.toHaveBeenCalled();
+      expect(dependencies.launch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, false])("fences a status read during cache lookup, cached=%s", async cached => {
+    const current = { ...user, homeAccountId: `cache-session-${cached}` };
+    const { value, repository, provider } = service(cached, current);
+    repository.latestObservation.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return cached ? direct : undefined;
+    });
+    await expect(value.status(current, target.snapshotId, target.resourceNativeId)).rejects.toMatchObject({ code: "unauthorized" });
+    expect(provider.getStatus).not.toHaveBeenCalled();
+    expect(repository.recordObservation).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch a provider read after token acquisition crosses sessions", async () => {
+    const current = { ...user, homeAccountId: "token-session" };
+    const { value, repository, provider, dependencies } = service(false, current);
+    dependencies.delegatedToken.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return "ephemeral-token";
+    });
+    await expect(value.status(current, target.snapshotId, target.resourceNativeId)).rejects.toMatchObject({ code: "unauthorized" });
+    expect(provider.getStatus).not.toHaveBeenCalled();
+    expect(repository.recordObservation).not.toHaveBeenCalled();
+  });
+
+  it("stops bulk reads after the initiating session is revoked", async () => {
+    const current = { ...user, homeAccountId: "bulk-status-session" };
+    const { value, inventory, repository, provider } = service(false, current);
+    const other = { ...target, resourceNativeId: "other-agent", botId: "66666666-6666-4666-8666-666666666666" };
+    inventory.resolveQuarantineTargets.mockResolvedValue([target, other]);
+    provider.getStatus.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return direct;
+    });
+    await expect(value.preview(current, { action: "quarantine", snapshotId: target.snapshotId,
+      resourceNativeIds: [target.resourceNativeId, other.resourceNativeId] })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(provider.getStatus).toHaveBeenCalledTimes(1);
+    expect(repository.recordObservation).not.toHaveBeenCalled();
+  });
+
+  it("does not return a preview if authority lookup crosses sessions", async () => {
+    const current = { ...user, homeAccountId: "preview-authority-session" };
+    const { value, dependencies } = service(true, current);
+    dependencies.authorityContext.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return authority;
+    });
+    await expect(value.preview(current, { action: "quarantine", snapshotId: target.snapshotId,
+      resourceNativeIds: [target.resourceNativeId] })).rejects.toMatchObject({ code: "unauthorized" });
+  });
+
+  it("stops publishing a bulk observation batch when the session is revoked", async () => {
+    const current = { ...user, homeAccountId: "observation-session" };
+    const { value, inventory, repository, provider } = service(false, current);
+    const other = { ...target, resourceNativeId: "other-agent", botId: "66666666-6666-4666-8666-666666666666" };
+    inventory.resolveQuarantineTargets.mockResolvedValue([target, other]);
+    provider.getStatus.mockResolvedValueOnce(direct).mockResolvedValueOnce({ ...direct, botId: other.botId });
+    let revocation: Promise<void> | undefined;
+    repository.recordObservation.mockImplementationOnce(async () => {
+      revocation = revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      return direct;
+    });
+    await expect(value.preview(current, { action: "quarantine", snapshotId: target.snapshotId,
+      resourceNativeIds: [target.resourceNativeId, other.resourceNativeId] })).rejects.toMatchObject({ code: "unauthorized" });
+    await revocation;
+    expect(provider.getStatus).toHaveBeenCalledTimes(2);
+    expect(repository.recordObservation).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not return status if capability evidence publication crosses sessions", async () => {
+    const current = { ...user, homeAccountId: "operation-evidence-session" };
+    const { value, dependencies } = service(false, current);
+    dependencies.observeOperation.mockImplementationOnce(async (_id, _user, operation) => {
+      const result = await operation(() => undefined);
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return result;
+    });
+    await expect(value.status(current, target.snapshotId, target.resourceNativeId)).rejects.toMatchObject({ code: "unauthorized" });
+  });
+
+  it("does not return a saved terminal receipt across sessions", async () => {
+    const current = { ...user, homeAccountId: "terminal-receipt-session" };
+    const { value, repository, inventory, dependencies } = service(false, current);
+    repository.existingSubmission.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      await activateAccountSession(current.tenantId!, current.homeAccountId, async () => undefined);
+      return { id: "55555555-5555-4555-8555-555555555555", status: "succeeded" };
+    });
+    await expect(value.submit(current, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "terminal-receipt-session" })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(inventory.resolveQuarantineTargets).not.toHaveBeenCalled();
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
+  it("does not launch a new queued job if its session is revoked during persistence", async () => {
+    const current = { ...user, homeAccountId: "persist-session" };
+    const { value, repository, dependencies } = service(true, current);
+    let revocation: Promise<void> | undefined;
+    repository.submit.mockImplementationOnce(async () => {
+      revocation = revokeAccountSessionMutations(current.tenantId!, current.homeAccountId, async () => undefined);
+      return { id: "55555555-5555-4555-8555-555555555555", status: "queued", isCanary: false };
+    });
+    await expect(value.submit(current, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
+      confirmationHash: "e".repeat(64), idempotencyKey: "persist-session" })).rejects.toMatchObject({ code: "unauthorized" });
+    await revocation;
+    expect(repository.submit).toHaveBeenCalledTimes(1);
+    expect(dependencies.launch).not.toHaveBeenCalled();
+  });
+
   it("retries dispatch of an existing queued receipt after worker capacity recovers", async () => {
     const { value, repository, inventory, provider, dependencies } = service(true);
     const receipt: Pick<QuarantineJob, "id" | "status"> = { id: "55555555-5555-4555-8555-555555555555", status: "queued" };

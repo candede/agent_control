@@ -140,12 +140,12 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "live_qualification", adapterRegistered: true, description: "Token readiness never runs hunting KQL; explicit Admin approval remains required for the bounded application-scope qualification lifecycle." },
   },
   {
-    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D30 per-user Microsoft 365 Copilot app activity report on explicit dashboard load.",
+    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D30 per-user Microsoft 365 Copilot app activity report during Users sync.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
     permissions: ["Reports.Read.All"], providerRoles: ["Company Administrator", "AI Administrator", "Exchange Administrator", "SharePoint Administrator", "Lync Administrator", "Teams Service Administrator", "Teams Communications Administrator", "Reports Reader"], licenses: [],
     configuration: ["Delegated consent", "Microsoft 365 usage report privacy settings can conceal user identities"],
     sources: [copilotUsageReportSource], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "reports.copilotUsage.read",
-    probe: { kind: "on_demand", adapterRegistered: true, description: "The explicit dashboard load validates the bounded report request; no report is scanned by background capability checks." },
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Users sync validates the bounded report request; saved dashboard reads and background capability checks never scan the report." },
   },
   {
     id: "reports.official.import", displayName: "Import reports", purpose: "Validate and import administrator-supplied Microsoft 365 usage CSV reports in Sync > Import reports; manage retained reports in Sync > Manage reports.",

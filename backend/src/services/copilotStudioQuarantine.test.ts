@@ -1,9 +1,11 @@
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import {
   buildCopilotStudioQuarantineUrl,
   CopilotStudioQuarantineClient,
   type CopilotStudioQuarantineTarget,
+  verifyCopilotStudioQuarantineConverged,
 } from "./copilotStudioQuarantine.js";
 
 const target: CopilotStudioQuarantineTarget = {
@@ -148,6 +150,60 @@ describe("CopilotStudioQuarantineClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it.each(["unexpected-status", "redirected", "foreign"].flatMap(kind =>
+    ["stalled", "rejected"].map(cleanup => ({ kind, cleanup })),
+  ))("rejects $kind responses without waiting for $cleanup cleanup", async ({ kind, cleanup }) => {
+    const disposal = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => cleanup === "stalled" ? disposal.promise : Promise.reject(new Error("private cleanup details")));
+    const response = new Response(new ReadableStream({ cancel }), { status: kind === "unexpected-status" ? 201 : 200 });
+    if (kind === "redirected") Object.defineProperty(response, "redirected", { value: true });
+    if (kind === "foreign") Object.defineProperty(response, "url", { value: "https://other.invalid/status" });
+    const fetcher = vi.fn(async () => response);
+    const pending = new CopilotStudioQuarantineClient(fetcher).getStatus("token", target).catch(error => error);
+    try {
+      const result = await Promise.race([pending, setImmediate("still pending")]);
+      expect(result).toMatchObject({ status: 502, code: kind === "unexpected-status" ? "provider_unexpected_status" : "invalid_provider_link" });
+      expect(String(result)).not.toContain("private cleanup details");
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally {
+      disposal.resolve();
+      await pending;
+    }
+  });
+
+  it.each(["read", "write"])("does not publish a %s cancelled after the final body read", async operation => {
+    const controller = new AbortController();
+    const reason = new DOMException("deadline", "TimeoutError");
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) { stream.enqueue(new TextEncoder().encode(JSON.stringify(providerStatus))); },
+      pull(stream) {
+        stream.close();
+        // Cancel after the body helper completes but before the adapter resumes.
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => controller.abort(reason))));
+      },
+    }, { highWaterMark: 0 });
+    const fetcher = vi.fn(async () => new Response(body));
+    const client = new CopilotStudioQuarantineClient(fetcher);
+    const options = { signal: controller.signal, correlationId: "cancelled-body" };
+    const pending = operation === "read"
+      ? client.getStatus("token", target, options)
+      : client.setQuarantine("token", target, true, options);
+    await expect(pending).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["read", "write"])("normalizes an expired %s deadline before dispatch", async operation => {
+    const fetcher = vi.fn();
+    const client = new CopilotStudioQuarantineClient(fetcher);
+    const options = { signal: AbortSignal.abort(new DOMException("deadline", "TimeoutError")), correlationId: "expired-operation" };
+    const pending = operation === "read"
+      ? client.getStatus("token", target, options)
+      : client.setQuarantine("token", target, true, options);
+    await expect(pending).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("bounds the complete GET retry operation including retry waits", async () => {
     const fetcher = vi.fn(async () => Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 }));
     const never = () => new Promise<never>(() => undefined);
@@ -183,5 +239,59 @@ describe("CopilotStudioQuarantineClient", () => {
   ])("maps explicit provider code %s to fixed safe error %s", async (providerCode, expectedCode) => {
     const client = new CopilotStudioQuarantineClient(async () => Response.json({ error: { code: providerCode, message: "not retained" } }, { status: 403 }), { maxAttempts: 1 });
     await expect(client.getStatus("token", target)).rejects.toMatchObject({ code: expectedCode, details: { retryAfterMs: undefined } });
+  });
+});
+
+describe("Copilot Studio quarantine convergence", () => {
+  const status = { ...target, ...providerStatus, observedAt: "2026-09-09T19:01:00.000Z", correlationId: "readback" };
+
+  it("returns only a converged GET and counts bounded readbacks", async () => {
+    const converged = { ...status, isBotQuarantined: true };
+    const client = { getStatus: vi.fn().mockResolvedValueOnce(status).mockResolvedValueOnce(converged) };
+    const wait = vi.fn(async () => undefined);
+    await expect(verifyCopilotStudioQuarantineConverged(client, "token", target, true, { delay: wait }))
+      .resolves.toEqual({ status: converged, readbackCount: 2 });
+    expect(client.getStatus).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledWith(500);
+  });
+
+  it("retains the last direct observation without claiming success when the window is exhausted", async () => {
+    const client = { getStatus: vi.fn(async () => status) };
+    await expect(verifyCopilotStudioQuarantineConverged(client, "token", target, true, { maxAttempts: 2, delayMs: 0 }))
+      .rejects.toMatchObject({ status: 409, code: "verification_inconclusive", details: { lastStatus: status, readbackCount: 2 } });
+    expect(client.getStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not start readback after cancellation", async () => {
+    const reason = new AppError(409, "cancelled", "The job was cancelled.");
+    const client = { getStatus: vi.fn(async () => status) };
+    await expect(verifyCopilotStudioQuarantineConverged(client, "token", target, false, { signal: AbortSignal.abort(reason) }))
+      .rejects.toBe(reason);
+    expect(client.getStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not confirm convergence after cancellation at the GET completion boundary", async () => {
+    const controller = new AbortController();
+    const reason = new AppError(409, "cancelled", "The job was cancelled.");
+    const provider = new CopilotStudioQuarantineClient(async () => Response.json(providerStatus));
+    const client = { getStatus: vi.fn(async (...args: Parameters<typeof provider.getStatus>) => {
+      const observed = await provider.getStatus(...args);
+      controller.abort(reason);
+      return observed;
+    }) };
+    await expect(verifyCopilotStudioQuarantineConverged(client, "token", target, false, { signal: controller.signal }))
+      .rejects.toBe(reason);
+    expect(client.getStatus).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes a readback deadline that expires during the retry wait", async () => {
+    const controller = new AbortController();
+    const client = { getStatus: vi.fn(async () => status) };
+    const wait = vi.fn(async () => { controller.abort(new DOMException("deadline", "TimeoutError")); });
+    await expect(verifyCopilotStudioQuarantineConverged(client, "token", target, true, { signal: controller.signal, delay: wait }))
+      .rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+    expect(client.getStatus).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledOnce();
   });
 });

@@ -10,7 +10,7 @@ import {
   type UserSourcePublication,
 } from "../db/dataSync.js";
 import { OfficialUsageRepository } from "../db/officialUsage.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type {
   CopilotUsageAttention,
@@ -34,7 +34,7 @@ import {
 import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
-import { hasReportedAgentActivity, identityIndex, matchImportedUsage } from "./copilotUsageIdentity.js";
+import { hasReportedAgentActivity, matchCopilotIdentities, matchImportedUsage } from "./copilotUsageIdentity.js";
 
 const appReportStaleAfterDays = 3;
 
@@ -54,6 +54,12 @@ type CopilotUsageDependencies = {
 type Loaded<T> =
   | { ok: true; value: T; fetchedAt: string }
   | { ok: false; message: string; status: Exclude<CopilotUsageAttemptStatus, "available"> };
+
+type UserSourceRefreshContext = {
+  scope: DataSyncScope;
+  validation: ReturnType<typeof beginAccountSessionValidation>;
+  signal?: AbortSignal;
+};
 
 export type CopilotUsageRefreshResult = {
   status: Extract<DataSyncSourceState, "succeeded" | "partial" | "waiting_authorization" | "permission_required" | "failed">;
@@ -122,9 +128,12 @@ export class CopilotUsageService {
     options: { incompleteOnly?: boolean; automatic?: boolean; signedInAt?: number; publication: UserSourcePublication; onDirectoryProgress?: CopilotDirectoryProgress },
   ): Promise<CopilotUsageRefreshResult> {
     const scope = dataScope(user);
-    signal?.throwIfAborted();
+    const context: UserSourceRefreshContext = {
+      scope, signal, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId),
+    };
+    assertCurrentRefresh(context);
     const before = await this.dependencies.usageStore.getUserSources(scope);
-    signal?.throwIfAborted();
+    assertCurrentRefresh(context);
     const requested: CopilotUsageSnapshotSource[] = options.automatic
       ? [
         ...(userSourceDue(before.directory, this.dependencies.now(), 15 * 60_000) ? ["directory" as const] : []),
@@ -151,39 +160,42 @@ export class CopilotUsageService {
     this.dependencies.requireProviderAdmissions();
     let observedCount: number | null = null;
     const onDirectoryProgress: CopilotDirectoryProgress = async count => {
-      signal?.throwIfAborted();
+      assertCurrentRefresh(context);
       observedCount = count;
       await options.onDirectoryProgress?.(count);
-      signal?.throwIfAborted();
+      assertCurrentRefresh(context);
     };
-    await Promise.all(requested.map(sourceId => this.refreshUserSource(scope, user, sourceId, options.publication, onDirectoryProgress, signal)));
-    signal?.throwIfAborted();
+    const results = await Promise.allSettled(requested.map(sourceId => this.refreshUserSource(context, user, sourceId, options.publication, onDirectoryProgress)));
+    assertCurrentRefresh(context);
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
     const after = await this.dependencies.usageStore.getUserSources(scope);
-    signal?.throwIfAborted();
+    assertCurrentRefresh(context);
     return userRefreshResult(after, requested.includes("directory") && hasAvailableUserSource(after.directory)
       ? after.directory.rowCount : observedCount);
   }
 
   private async refreshUserSource(
-    scope: DataSyncScope,
+    context: UserSourceRefreshContext,
     user: AuthenticatedUser,
     sourceId: CopilotUsageSnapshotSource,
     publication: UserSourcePublication,
     onDirectoryProgress: CopilotDirectoryProgress,
-    signal?: AbortSignal,
   ) {
+    const { scope } = context;
+    assertCurrentRefresh(context);
     const attemptedAt = this.dependencies.now().toISOString();
     const loaded = sourceId === "directory"
-      ? await this.loadDirectory(user, signal, onDirectoryProgress)
-      : await this.loadAppActivity(user, signal);
-    signal?.throwIfAborted();
+      ? await this.loadDirectory(user, context, onDirectoryProgress)
+      : await this.loadAppActivity(user, context);
+    assertCurrentRefresh(context);
     if (!loaded.ok) {
       await this.dependencies.usageStore.recordUserSourceFailure(scope, sourceId, loaded.status, loaded.message, attemptedAt, publication);
       return;
     }
     try {
-      await this.publishWithCurrentAuthorization(scope, user, capabilityForUserSource(sourceId), async () => {
-        signal?.throwIfAborted();
+      await this.publishWithCurrentAuthorization(context, user, capabilityForUserSource(sourceId), async () => {
+        assertCurrentRefresh(context);
         if (sourceId === "directory") {
           const value = loaded.value as CopilotDirectoryUser[];
           await this.dependencies.usageStore.publishDirectory(
@@ -205,7 +217,7 @@ export class CopilotUsageService {
         }
       });
     } catch (error) {
-      signal?.throwIfAborted();
+      assertCurrentRefresh(context);
       if (error instanceof AppError && error.code === "data_sync_publication_superseded") throw error;
       const failure = sourceFailure(error, sourceId === "directory" ? "Directory license data" : "Microsoft 365 Copilot app activity");
       await this.dependencies.usageStore.recordUserSourceFailure(scope, sourceId, failure.status, failure.message, attemptedAt, publication);
@@ -213,31 +225,35 @@ export class CopilotUsageService {
   }
 
   private async publishWithCurrentAuthorization(
-    scope: DataSyncScope,
+    context: UserSourceRefreshContext,
     user: AuthenticatedUser,
     capabilityId: CapabilityId,
     publish: () => Promise<void>,
   ) {
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const { scope, validation } = context;
+    assertCurrentRefresh(context);
     const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    assertCurrentRefresh(context);
     await commitAccountSessionValidation(validation, async () => {
+      assertCurrentRefresh(context);
       requireSamePrincipal(scope, freshUser);
       requireViewer(freshUser);
       await this.dependencies.requireAvailable(capabilityId, freshUser);
+      assertCurrentRefresh(context);
       requireSamePrincipal(scope, user);
       await publish();
     });
   }
 
-  private async loadDirectory(user: AuthenticatedUser, signal: AbortSignal | undefined, onProgress: CopilotDirectoryProgress): Promise<Loaded<CopilotDirectoryUser[]>> {
+  private async loadDirectory(user: AuthenticatedUser, context: UserSourceRefreshContext, onProgress: CopilotDirectoryProgress): Promise<Loaded<CopilotDirectoryUser[]>> {
+    const { scope, signal } = context;
     let progressFailure: { error: unknown } | undefined;
     try {
       return await this.dependencies.observeOperation("graph.licenses.read", user, async () => {
-        const scope = dataScope(user);
-        const token = await this.currentDelegatedToken(scope, "graph.licenses.read");
-        signal?.throwIfAborted();
+        const token = await this.currentDelegatedToken(context, "graph.licenses.read");
+        assertCurrentRefresh(context);
         const imported = await this.loadImported(scope.tenantId);
-        signal?.throwIfAborted();
+        assertCurrentRefresh(context);
         if (!imported.ok) {
           throw new AppError(502, "report_license_verification_unavailable", imported.message);
         }
@@ -249,39 +265,49 @@ export class CopilotUsageService {
             throw error;
           }
         }, imported.value.users.value.filter(hasReportedAgentActivity).map(value => value.username));
+        assertCurrentRefresh(context);
         return { ok: true as const, value, fetchedAt: this.dependencies.now().toISOString() };
       }, { signal, shouldRecordError: () => !progressFailure });
     } catch (error) {
-      signal?.throwIfAborted();
+      assertCurrentRefresh(context);
       // A durable progress write failure is not a Microsoft provider failure.
       if (progressFailure) throw progressFailure.error;
       return sourceFailure(error, "Directory license data", "User.Read.All and LicenseAssignment.Read.All");
     }
   }
 
-  private async loadAppActivity(user: AuthenticatedUser, signal?: AbortSignal): Promise<Loaded<CopilotReportResult>> {
+  private async loadAppActivity(user: AuthenticatedUser, context: UserSourceRefreshContext): Promise<Loaded<CopilotReportResult>> {
+    const { signal } = context;
     try {
       return await this.dependencies.observeOperation("reports.copilotUsage.read", user, async () => {
-        const token = await this.currentDelegatedToken(dataScope(user), "reports.copilotUsage.read");
+        const token = await this.currentDelegatedToken(context, "reports.copilotUsage.read");
+        assertCurrentRefresh(context);
         const value = await this.dependencies.graph.listAppActivity(token, signal);
+        assertCurrentRefresh(context);
         return { ok: true as const, value, fetchedAt: this.dependencies.now().toISOString() };
       }, { signal });
     } catch (error) {
-      signal?.throwIfAborted();
+      assertCurrentRefresh(context);
       return sourceFailure(error, "Microsoft 365 Copilot app activity", "Reports.Read.All");
     }
   }
 
-  private async currentDelegatedToken(scope: DataSyncScope, capabilityId: CapabilityId) {
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  private async currentDelegatedToken(context: UserSourceRefreshContext, capabilityId: CapabilityId) {
+    const { scope, validation } = context;
+    assertCurrentRefresh(context);
     const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    assertCurrentRefresh(context);
     let token = "";
     await commitAccountSessionValidation(validation, async () => {
+      assertCurrentRefresh(context);
       requireSamePrincipal(scope, freshUser);
       requireViewer(freshUser);
       await this.dependencies.requireAvailable(capabilityId, freshUser);
+      assertCurrentRefresh(context);
       token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
+      assertCurrentRefresh(context);
     });
+    assertCurrentRefresh(context);
     return token;
   }
 
@@ -423,8 +449,8 @@ function savedSourceSummary<T>(saved: SavedCopilotUsageSource<T>, current: Copil
   const reason = saved.message ?? "The latest refresh did not complete.";
   return {
     ...current,
-    state: "partial",
-    message: `${reason} Retained saved data from ${saved.observedAt ?? "the prior successful sync"} is still shown.`,
+    state: current.state === "stale" ? "stale" : "partial",
+    message: `${reason} Retained saved data from ${saved.observedAt ?? "the prior successful sync"} is still shown.${current.state === "stale" ? ` ${current.message}` : ""}`,
     fetchedAt: saved.observedAt,
   };
 }
@@ -454,6 +480,11 @@ function snapshotMetadata(saved: {
 function dataScope(user: AuthenticatedUser): DataSyncScope {
   if (!user.tenantId) throw AppError.unauthorized("Copilot usage requires a tenant-scoped session.");
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
+}
+
+function assertCurrentRefresh(context: UserSourceRefreshContext) {
+  context.signal?.throwIfAborted();
+  assertAccountSessionValidation(context.validation);
 }
 
 function capabilityForUserSource(sourceId: CopilotUsageSnapshotSource): CapabilityId {
@@ -486,28 +517,8 @@ function matchAppActivity(
   directoryUsers: readonly CopilotDirectoryUser[],
   reportUsers: readonly CopilotReportUser[],
 ) {
-  const directoryKeys = identityIndex(directoryUsers);
-  const reportKeys = new Map<string, CopilotReportUser[]>();
-  for (const report of reportUsers) {
-    const rows = reportKeys.get(report.normalizedUserPrincipalName) ?? [];
-    rows.push(report);
-    reportKeys.set(report.normalizedUserPrincipalName, rows);
-  }
-  const matched = new Map<string, CopilotReportUser["activity"]>();
-  const candidates = new Map<string, CopilotReportUser[]>();
-  for (const [key, reports] of reportKeys) {
-    const directoryMatches = directoryKeys.get(key) ?? [];
-    if (reports.length === 1 && directoryMatches.length === 1) {
-      const objectId = directoryMatches[0].identity.objectId;
-      const values = candidates.get(objectId) ?? [];
-      values.push(reports[0]);
-      candidates.set(objectId, values);
-    }
-  }
-  for (const [objectId, values] of candidates) {
-    if (values.length === 1) matched.set(objectId, values[0].activity);
-  }
-  return matched;
+  const matching = matchCopilotIdentities(directoryUsers, reportUsers, report => report.normalizedUserPrincipalName);
+  return new Map([...matching.byObjectId].map(([objectId, report]) => [objectId, report.activity]));
 }
 
 function buildUser(

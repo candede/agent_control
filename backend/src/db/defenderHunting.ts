@@ -252,10 +252,12 @@ export class DefenderHuntingRepository {
     if (result.rowCount !== 1) throw executionLost();
   }
 
-  async publish(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, result: DefenderHuntingQueryResult) {
+  async publish(scope: DefenderHuntingScope, id: string, execution: DefenderHuntingExecution, result: DefenderHuntingQueryResult,
+    publicationFence?: () => void) {
     validatePublicationEnvelope(result);
     await transaction(this.database, async client => {
       const job = await this.fence(client, scope, id, execution);
+      publicationFence?.();
       if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting results arrived after its deadline.");
       validatePublicationRows(result.rows, job.filters, scope.tenantId);
       const snapshotId = randomUUID();
@@ -326,6 +328,8 @@ export class DefenderHuntingRepository {
           job.qualification_configuration_revision, job.approved_by, id, job.created_at, evidence.rows[0].qualified_at]);
         await client.query("UPDATE defender_hunting_jobs SET retained_scope_id=$2 WHERE id=$1", [id, retained.rows[0].id]);
       }
+      publicationFence?.();
+      if (job.deadline_at <= new Date()) throw new AppError(409, "hunting_job_expired", "Hunting publication exceeded its durable deadline.");
     });
     return (await this.getJob(scope, id))!;
   }
@@ -709,6 +713,8 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
   if (filters.templateId === "agents_inventory" ? filters.entraAgentApplicationIds?.length : filters.entraAgentIds?.length) throw invalidPublication();
   const expectedSource = defenderHuntingTemplates[filters.templateId].sourceTable;
   const start = Date.parse(filters.startDateTime); const end = Date.parse(filters.endDateTime);
+  const selectedBlueprintIds = filters.blueprintIds.map(value => value.toLowerCase());
+  const selectedActorIds = filters.actorObjectIds.map(value => value.toLowerCase());
   for (const row of rows) {
     const keys = row.sourceTable === "AgentsInfo" ? inventoryPublicationKeys : activityPublicationKeys;
     if (!isPlainObject(row) || row.projectionVersion !== 3 || row.sourceTable !== expectedSource
@@ -720,7 +726,7 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
       if (!row.agentId || row.agentId.length > 512 || !isExactStateRecord(row.detailStates, inventoryDetailStateKeys, inventoryDetailStates)
         || filters.agentIds.length && !filters.agentIds.includes(row.agentId)
         || filters.entraAgentIds?.length && (!row.entraAgentObjectId || !filters.entraAgentIds.includes(row.entraAgentObjectId.toLowerCase()))
-        || filters.blueprintIds.length && (!row.entraBlueprintId || !filters.blueprintIds.includes(row.entraBlueprintId))) throw invalidPublication();
+        || selectedBlueprintIds.length && (!row.entraBlueprintId || !selectedBlueprintIds.includes(row.entraBlueprintId.toLowerCase()))) throw invalidPublication();
       continue;
     }
     const expectedOperations = row.actionType === "InvokeAgent" ? ["invoke_agent"] : row.actionType === "InferenceCall" ? ["chat", "output_messages"] : ["execute_tool"];
@@ -731,8 +737,8 @@ function validatePublicationRows(rows: DefenderHuntingRow[], filters: DefenderHu
       || row.organizationId && row.organizationId !== tenantId.toLowerCase()
       || filters.agentIds.length && !agents.some(value => value && filters.agentIds.includes(value))
       || filters.entraAgentApplicationIds?.length && ![row.targetAgentId, row.agentId].some(value => value && filters.entraAgentApplicationIds!.includes(value.toLowerCase()))
-      || filters.blueprintIds.length && !blueprints.some(value => value && filters.blueprintIds.includes(value))
-      || filters.actorObjectIds.length && ![row.actorAccountObjectId, row.humanActorUserObjectId].some(value => value && filters.actorObjectIds.includes(value))
+      || selectedBlueprintIds.length && !blueprints.some(value => value && selectedBlueprintIds.includes(value.toLowerCase()))
+      || selectedActorIds.length && (!row.actorAccountObjectId || !selectedActorIds.includes(row.actorAccountObjectId.toLowerCase()))
       || row.rootSpanObserved !== rootSpanObserved || row.spanRole !== (rootSpanObserved ? "root_invoke_agent" : row.parentSpanId ? "child" : "unresolved")
       || row.contentAvailable !== false || !isExactStateRecord(row.fieldStates, activityFieldStateKeys, activityFieldStates)) throw invalidPublication();
   }

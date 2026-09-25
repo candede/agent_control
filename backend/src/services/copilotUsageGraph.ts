@@ -140,10 +140,10 @@ export class CopilotUsageGraphClient {
             throw providerLimit("Directory users exceeded the result limit.");
           }
         }
+        if (page["@odata.count"] !== undefined && page["@odata.count"] !== expectedCount) {
+          throw providerSchema("Directory users response returned an inconsistent total count.");
+        }
         if (filter.kind === "reported") {
-          if (page["@odata.count"] !== undefined && page["@odata.count"] !== expectedCount) {
-            throw providerSchema("Directory identity verification returned an inconsistent total count.");
-          }
           if (expectedCount > filter.identities.length) {
             throw new AppError(502, "provider_count_mismatch", "Directory identity totals exceed the requested batch; refresh usage.");
           }
@@ -249,7 +249,10 @@ export class CopilotUsageGraphClient {
   }
 
   async listAppActivity(accessToken: string, signal?: AbortSignal): Promise<CopilotReportResult> {
-    const text = await this.requestText(buildCopilotReportUrl(), accessToken, signal);
+    const timeout = AbortSignal.timeout(requestTimeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const text = await this.requestText(buildCopilotReportUrl(), accessToken, requestSignal);
+    requestSignal.throwIfAborted();
     const users = parseReportCsv(text);
     const refreshDates = new Set(users.map(row => row.activity.reportRefreshDate));
     if (refreshDates.size > 1) throw providerSchema("Copilot usage report contains inconsistent refresh dates.");
@@ -283,10 +286,8 @@ export class CopilotUsageGraphClient {
     }
   }
 
-  private async requestText(url: string, accessToken: string, signal?: AbortSignal) {
+  private async requestText(url: string, accessToken: string, requestSignal: AbortSignal) {
     validateGraphUrl(url, "report");
-    const timeout = AbortSignal.timeout(requestTimeoutMs);
-    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
     requestSignal.throwIfAborted();
     let response = await this.fetcher(url, {
       method: "GET",
@@ -493,7 +494,11 @@ function assignedPlans(value: unknown): CopilotPlanObservation[] {
 function parseReportCsv(text: string): CopilotReportUser[] {
   let records: string[][];
   try {
-    records = parseCsv(text, { bom: true, skip_empty_lines: true, relax_column_count: false }) as string[][];
+    records = parseCsv(text, {
+      bom: true, skip_empty_lines: true, relax_column_count: false,
+      // Include the header and one excess row so the bound rejects, never truncates.
+      to: maximumReportRows + 2,
+    }) as string[][];
   } catch {
     throw providerSchema("Copilot usage report is not valid CSV.");
   }

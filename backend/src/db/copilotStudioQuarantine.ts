@@ -231,7 +231,6 @@ export class CopilotStudioQuarantineRepository {
     await transaction(this.database, async client => {
       const job = await client.query("UPDATE copilot_quarantine_jobs SET cancel_requested=true,updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp() RETURNING id", [id, scope.tenantId, scope.principalId]);
       if (!job.rowCount) return;
-      await client.query("UPDATE copilot_quarantine_job_items SET status='cancelled',error_code='cancelled',message='Cancelled before provider dispatch.',updated_at=clock_timestamp() WHERE job_id=$1 AND status='queued'", [id]);
       await this.aggregate(client, id);
     });
     return this.get(scope, id);
@@ -255,6 +254,7 @@ export class CopilotStudioQuarantineRepository {
       if (!selected.rows[0]) return undefined;
       const item = selected.rows[0];
       const correlationId = randomUUID();
+      await client.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()+interval '120 seconds',updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
       await client.query("UPDATE copilot_quarantine_job_items SET status='running',correlation_id=$2,updated_at=clock_timestamp() WHERE id=$1", [item.id, correlationId]);
       await client.query(`INSERT INTO copilot_quarantine_attempts(id,job_id,item_id,lease_owner,lease_version,correlation_id)
         VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)`, [lease.jobId, item.id, lease.owner, lease.version, correlationId]);
@@ -347,6 +347,7 @@ export class CopilotStudioQuarantineRepository {
       if (result.rowCount !== 1) throw new AppError(409, "already_dispatched", "Sent quarantine work cannot return to authorization wait.");
       await client.query("UPDATE copilot_quarantine_attempts SET finished_at=clock_timestamp(),outcome='cancelled' WHERE item_id=$1 AND lease_version=$2", [item.id, lease.version]);
       await client.query("UPDATE copilot_quarantine_jobs SET status='waiting_authorization',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
+      await this.aggregate(client, lease.jobId);
     });
   }
 
@@ -419,6 +420,8 @@ export class CopilotStudioQuarantineRepository {
   }
 
   private async aggregate(client: pg.PoolClient, id: string) {
+    await client.query(`UPDATE copilot_quarantine_job_items SET status='cancelled',error_code='cancelled',message='Cancelled before provider dispatch.',updated_at=clock_timestamp()
+      WHERE job_id=$1 AND status='queued' AND EXISTS(SELECT 1 FROM copilot_quarantine_jobs WHERE id=$1 AND cancel_requested)`, [id]);
     await client.query(`UPDATE copilot_quarantine_jobs SET status=CASE
       WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='inconclusive' AND reconciliation_status='required') THEN 'inconclusive'
       WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status IN ('queued','running')) THEN 'waiting_authorization'
@@ -492,7 +495,7 @@ function projectJob(job: QuarantineJobRow, items: QuarantineItemRow[]): Quaranti
     isCanary: job.is_canary, total: items.length, completed: terminal.length, succeeded: terminal.filter(item => item.status === "succeeded").length,
     failed: terminal.filter(item => item.status === "failed").length, skipped: terminal.filter(item => item.status === "skipped").length,
     inconclusive: terminal.filter(item => item.status === "inconclusive").length, cancelled: terminal.filter(item => item.status === "cancelled").length,
-    canResume: job.status === "waiting_authorization" && job.deadline_at.getTime() > Date.now() && job.attempts < 10 && items.some(item => item.status === "queued"),
+    canResume: !job.cancel_requested && job.status === "waiting_authorization" && job.deadline_at.getTime() > Date.now() && job.attempts < 10 && items.some(item => item.status === "queued"),
     canReconcile: items.some(item => item.status === "inconclusive" && item.reconciliation_status === "required"),
     createdAt: job.created_at.toISOString(), updatedAt: job.updated_at.toISOString(), results };
 }
@@ -549,7 +552,7 @@ function requireMatchingSubmission(job: QuarantineJobRow, items: QuarantineItemR
   const expectedNativeIds = [...identity.resourceNativeIds].sort(ordinal);
   const actualNativeIds = items.map(item => item.resource_native_id).sort(ordinal);
   if (job.action !== identity.action || job.confirmation_hash !== identity.confirmationHash
-    || items.some(item => item.snapshot_id !== identity.snapshotId) || expectedNativeIds.length !== actualNativeIds.length
+    || items.some(item => item.snapshot_id.toLowerCase() !== identity.snapshotId.toLowerCase()) || expectedNativeIds.length !== actualNativeIds.length
     || expectedNativeIds.some((value, index) => value !== actualNativeIds[index])) {
     throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different quarantine request.");
   }

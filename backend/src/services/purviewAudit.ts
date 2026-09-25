@@ -2,7 +2,7 @@ import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticated
 import { config } from "../config.js";
 import { PurviewAuditRepository, type PurviewAuditExecution, type PurviewAuditReadScope, type PurviewAuditScope } from "../db/purviewAudit.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { hasAppRole, type CapabilityStatus } from "../types/capability.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
@@ -12,6 +12,7 @@ import { GraphAuditSearchClient, providerQueryMatches, validatePurviewAuditFilte
 import { operationalLog } from "./telemetry.js";
 import { agentInvestigations } from "./agentInvestigations.js";
 import type { AgentPurviewQuery, AgentPurviewRecordPage } from "../types/agentInvestigations.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 
 type CapabilityId = "purview.audit.search.delegated" | "purview.audit.search.application";
 type AuditDependencies = {
@@ -68,6 +69,7 @@ const maximumPollsPerActivation = 6;
 
 export class PurviewAuditService {
   private readonly active = new Map<string, ActiveSearch>();
+  private draining = false;
 
   constructor(
     private readonly repository = new PurviewAuditRepository(),
@@ -76,6 +78,7 @@ export class PurviewAuditService {
 
   async submit(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown; idempotencyKey: string }) {
     requireViewer(user);
+    requireProviderAdmissions();
     const filters = validatePurviewAuditFilters(input.filters);
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
@@ -121,6 +124,8 @@ export class PurviewAuditService {
 
   start(user: AuthenticatedUser, id: string, tokenMode: PurviewAuditTokenMode): Promise<PurviewAuditJob> {
     requireViewer(user);
+    if (this.draining) throw new AppError(503, "audit_shutdown", "Audit Search is stopping for application shutdown.");
+    requireProviderAdmissions();
     id = id.toLowerCase();
     const actor = actorScope(user);
     const existing = this.active.get(id);
@@ -134,8 +139,13 @@ export class PurviewAuditService {
     const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal);
     const started = prepared.then(value => value.job);
     let operation: Promise<void>;
-    operation = prepared.then(value => value.run?.()).then(() => undefined).catch(() => undefined)
+    operation = prepared.then(value => value.run?.(), error => {
+      if (signal.aborted && error !== signal.reason) throw error;
+    }).then(() => undefined).catch(error => {
+      if (!(error instanceof AppError && error.code === "audit_execution_lost")) throw error;
+    })
       .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
+    void operation.catch(error => operationalLog("error", "audit_worker_failed", { jobId: id, ...errorTelemetry(error, "audit_worker_failed") }));
     this.active.set(id, { actor, tokenMode, controller, started, operation });
     return started;
   }
@@ -149,19 +159,20 @@ export class PurviewAuditService {
     const qualification = current.qualificationId
       ? await abortable(this.repository.getQualification(actor.tenantId, current.qualificationId), signal)
       : undefined;
-    const reservation = this.repository.begin(scope, id);
-    const activation = await abortable(reservation, signal).catch(error => {
-      if (signal.aborted) {
-        // Release even if the transaction commits after the caller observed cancellation.
-        void reservation.then(reserved => this.repository.markWaitingAuthorization(scope, id, reserved), () => undefined)
-          .catch(releaseError => {
-            if (!(releaseError instanceof AppError && releaseError.code === "audit_execution_lost")) {
-              operationalLog("warn", "audit_activation_release_failed", { jobId: id });
-            }
-          });
+    signal.throwIfAborted();
+    requireProviderAdmissions();
+    // Activation owns a database write; cancellation must join it and its release.
+    const activation = await this.repository.begin(scope, id);
+    try {
+      signal.throwIfAborted();
+      requireProviderAdmissions();
+    } catch (error) {
+      try { await this.repository.markWaitingAuthorization(scope, id, activation); }
+      catch (cleanupError) {
+        if (!(cleanupError instanceof AppError && cleanupError.code === "audit_execution_lost")) throw cleanupError;
       }
       throw error;
-    });
+    }
     return { job: activation.job, run: () => this.run(actor, scope, activation.job, qualification, activation.action, activation, signal, cancellationSignal) };
   }
 
@@ -240,9 +251,12 @@ export class PurviewAuditService {
   }
 
   async drain() {
+    this.draining = true;
     const active = [...this.active.values()];
     for (const search of active) search.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit Audit Search resume."));
-    await Promise.allSettled(active.map(search => search.operation));
+    const results = await Promise.allSettled(active.map(search => search.operation));
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   async waitForPrincipalAuthorization(scope: { tenantId: string; principalId: string }) {
@@ -263,6 +277,7 @@ export class PurviewAuditService {
     signal: AbortSignal,
     cancellationSignal: AbortSignal,
   ) {
+    let authorizationSignal = signal;
     try {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal);
@@ -273,6 +288,7 @@ export class PurviewAuditService {
       if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
         signal.throwIfAborted();
+        requireProviderAdmissions();
         requireSamePrincipal(actor, freshUser);
         if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
         else requireViewer(freshUser);
@@ -280,7 +296,7 @@ export class PurviewAuditService {
       const providerOptions = {
         signal,
         correlationId: current.localRequestId,
-        beforeRequest: () => this.repository.authorizeProviderRequest(scope, current.id, execution),
+        beforeRequest: () => this.authorizeProviderRequest(scope, current.id, execution, signal),
         onResponse: (providerRequestId: string | null) => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId),
       };
       let query: PurviewProviderQuery | undefined;
@@ -313,12 +329,12 @@ export class PurviewAuditService {
         await this.repository.recordProviderStatus(scope, current.id, execution, query.status);
       }
 
-      let qualificationPollRequired = Boolean(qualification && action !== "poll");
-      while (query.status !== "succeeded" || qualificationPollRequired) {
+      let lifecyclePollRequired = Boolean((qualification || scope.tokenMode === "delegated") && action !== "poll");
+      while (query.status !== "succeeded" || lifecyclePollRequired) {
         if (["failed", "cancelled", "unknownFutureValue"].includes(query.status)) throw new AppError(502, "provider_query_failed", `Microsoft Graph Audit Search ended with status ${query.status}.`);
         if (pollCount >= maximumPollsPerActivation) { await this.repository.markWaitingAuthorization(scope, current.id, execution); return; }
-        if (!qualificationPollRequired) await this.dependencies.wait(1_000 + Math.floor(this.dependencies.random() * 2_000), signal);
-        qualificationPollRequired = false;
+        if (!lifecyclePollRequired) await this.dependencies.wait(1_000 + Math.floor(this.dependencies.random() * 2_000), signal);
+        lifecyclePollRequired = false;
         const providerQueryId: string = query.id;
         query = await this.dependencies.observeOperation(capabilityId, freshUser,
           () => this.dependencies.getQuery(token, providerQueryId, providerOptions), { signal, clearOnSuccess: false });
@@ -335,28 +351,34 @@ export class PurviewAuditService {
         result.partialReason = "audit_activation_timeout";
       }
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
+      authorizationSignal = publicationSignal;
       const publicationValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, qualification, publicationSignal);
-      const job = await abortable(commitAccountSessionValidation(publicationValidation, async () => {
+      const job = await commitAccountSessionValidation(publicationValidation, async () => {
         publicationSignal.throwIfAborted();
+        requireProviderAdmissions();
         requireSamePrincipal(actor, publicationUser);
         if (qualification) requireQualificationRole(publicationUser, scope.tokenMode);
         else requireViewer(publicationUser);
         return this.repository.publish(scope, current.id, execution, result);
-      }), publicationSignal);
+      });
       const evidenceCapabilityId = qualification?.capabilityId ??
         (scope.tokenMode === "delegated" ? capabilityForMode(scope.tokenMode) : undefined);
       if (evidenceCapabilityId && job.status === "succeeded") {
         try {
-          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available",
-            { providerRequestId: job.providerRequestId }, qualification?.configurationRevision), publicationSignal);
+          await commitAccountSessionValidation(publicationValidation, async () => {
+            publicationSignal.throwIfAborted();
+            requireProviderAdmissions();
+            await this.dependencies.recordQualificationEvidence(evidenceCapabilityId, publicationUser, "available",
+              { providerRequestId: job.providerRequestId }, qualification?.configurationRevision);
+          });
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_success" });
         }
       }
     } catch (error) {
       if (error instanceof AppError && error.code === "audit_execution_lost") return;
-      if (signal.aborted || isAuthorizationFailure(error)) {
+      if (signal.aborted || authorizationSignal.aborted || isAuthorizationFailure(error)) {
         await this.repository.markWaitingAuthorization(scope, current.id, execution);
         return;
       }
@@ -367,10 +389,19 @@ export class PurviewAuditService {
       if (evidenceCapabilityId) {
         try {
           const evidenceSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
+          evidenceSignal.throwIfAborted();
+          const evidenceValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
           const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), evidenceSignal);
-          await abortable(this.dependencies.recordQualificationEvidence(evidenceCapabilityId, evidenceUser, qualificationEvidenceStatus(error), {
-            category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
-          }, qualification?.configurationRevision), evidenceSignal);
+          await commitAccountSessionValidation(evidenceValidation, async () => {
+            evidenceSignal.throwIfAborted();
+            requireProviderAdmissions();
+            requireSamePrincipal(actor, evidenceUser);
+            if (qualification) requireQualificationRole(evidenceUser, scope.tokenMode);
+            else requireViewer(evidenceUser);
+            await this.dependencies.recordQualificationEvidence(evidenceCapabilityId, evidenceUser, qualificationEvidenceStatus(error), {
+              category: error instanceof AppError ? error.code : "provider_error", providerRequestId: job?.providerRequestId ?? null,
+            }, qualification?.configurationRevision);
+          });
         } catch {
           operationalLog("warn", "capability_evidence_record_failed", { capabilityId: evidenceCapabilityId, outcome: "provider_failure" });
         }
@@ -384,8 +415,11 @@ export class PurviewAuditService {
     qualification: Awaited<ReturnType<PurviewAuditRepository["getQualification"]>>,
     signal: AbortSignal,
   ) {
+    signal.throwIfAborted();
+    requireProviderAdmissions();
     const freshUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
     signal.throwIfAborted();
+    requireProviderAdmissions();
     requireSamePrincipal(actor, freshUser);
     if (qualification) requireQualificationRole(freshUser, scope.tokenMode);
     else requireViewer(freshUser);
@@ -394,7 +428,16 @@ export class PurviewAuditService {
     if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
     else await abortable(this.dependencies.requireAvailable(capabilityId, freshUser), signal);
     signal.throwIfAborted();
+    requireProviderAdmissions();
     return { user: freshUser, capabilityId };
+  }
+
+  private async authorizeProviderRequest(scope: PurviewAuditScope, id: string, execution: PurviewAuditExecution, signal: AbortSignal) {
+    signal.throwIfAborted();
+    requireProviderAdmissions();
+    await this.repository.authorizeProviderRequest(scope, id, execution);
+    signal.throwIfAborted();
+    requireProviderAdmissions();
   }
 
   private async requireExactApplicationScope(scope: PurviewAuditScope, user: AuthenticatedUser, capabilityId: CapabilityId, signal: AbortSignal) {
@@ -408,7 +451,7 @@ export class PurviewAuditService {
   private async reconcile(token: string, scope: PurviewAuditScope, current: NonNullable<Awaited<ReturnType<PurviewAuditRepository["getJob"]>>>, execution: PurviewAuditExecution, signal: AbortSignal) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const listed = await this.dependencies.listQueries(token, { signal, correlationId: current.localRequestId, maximumPages: 5,
-        beforeRequest: () => this.repository.authorizeProviderRequest(scope, current.id, execution),
+        beforeRequest: () => this.authorizeProviderRequest(scope, current.id, execution, signal),
         onResponse: (providerRequestId: string | null) => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId) });
       const matches = listed.value.filter(query => providerQueryMatches(query, current.displayName, current.filters));
       if (matches.length > 1) throw new AppError(409, "audit_create_ambiguous", "More than one provider query matched the durable Audit Search operation marker.");
@@ -503,7 +546,7 @@ function requireSamePrincipal(scope: { tenantId: string; principalId: string }, 
 }
 
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "provider_denied", "missing_internal_role", "capability_unavailable", "not_configured", "application_scope_changed", "qualification_mismatch", "qualification_superseded"].includes(error.code));
+  return error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "provider_denied", "missing_internal_role", "capability_unavailable", "not_configured", "application_scope_changed", "qualification_mismatch", "qualification_superseded", "maintenance", "provider_requalification_required"].includes(error.code));
 }
 
 function qualificationEvidenceStatus(error: unknown): CapabilityStatus {

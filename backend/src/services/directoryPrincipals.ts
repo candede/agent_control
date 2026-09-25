@@ -40,7 +40,7 @@ export type DirectoryPrincipal = PackageAccessEntity & {
 export class DirectoryPrincipalsClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
-  async search(accessToken: string, query: string, limit = defaultSearchLimit, signal?: AbortSignal) {
+  async search(accessToken: string, query: string, limit = defaultSearchLimit, signal?: AbortSignal, assertCurrent?: () => void) {
     const normalizedQuery = query.trim();
 
     if (normalizedQuery.length < 2) {
@@ -63,39 +63,38 @@ export class DirectoryPrincipalsClient {
       Math.max(Math.trunc(limit) || defaultSearchLimit, 1),
       maxSearchLimit,
     );
-    const [users, groups] = await Promise.all([
-      this.request<GraphCollection<GraphUser>>(
-        buildUserSearchUrl(normalizedQuery, normalizedLimit),
-        accessToken,
-        { ConsistencyLevel: "eventual" },
-        signal,
-      ),
-      this.request<GraphCollection<GraphGroup>>(
-        buildGroupSearchUrl(normalizedQuery, normalizedLimit),
-        accessToken,
-        { ConsistencyLevel: "eventual" },
-        signal,
-      ),
-    ]);
-
-    if (!users || !groups || !Array.isArray(users.value) || !Array.isArray(groups.value) || users.value.length > maxSearchLimit || groups.value.length > maxSearchLimit) {
-      throw new AppError(502, "provider_schema", "Directory collection is invalid or oversized.");
+    const controller = new AbortController();
+    const batchSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    try {
+      const [users, groups] = await Promise.all([
+        this.searchCollection<GraphUser>(
+          buildUserSearchUrl(normalizedQuery, normalizedLimit), accessToken, batchSignal, assertCurrent,
+        ),
+        this.searchCollection<GraphGroup>(
+          buildGroupSearchUrl(normalizedQuery, normalizedLimit), accessToken, batchSignal, assertCurrent,
+        ),
+      ]);
+      batchSignal.throwIfAborted();
+      assertCurrent?.();
+      return [
+        ...users.map(mapUser),
+        ...groups.filter(isAssignableGroup).map(mapGroup),
+      ]
+        .sort((left, right) =>
+          left.displayName.localeCompare(right.displayName, undefined, {
+            sensitivity: "base",
+          }),
+        )
+        .slice(0, normalizedLimit);
+    } catch (error) {
+      controller.abort(error);
+      throw error;
     }
-    [...users.value, ...groups.value].forEach(validatePrincipal);
-
-    return [
-      ...users.value.map(mapUser),
-      ...groups.value.filter(isAssignableGroup).map(mapGroup),
-    ]
-      .sort((left, right) =>
-        left.displayName.localeCompare(right.displayName, undefined, {
-          sensitivity: "base",
-        }),
-      )
-      .slice(0, normalizedLimit);
   }
 
-  async resolve(accessToken: string, entities: PackageAccessEntity[], signal?: AbortSignal) {
+  async resolve(accessToken: string, entities: PackageAccessEntity[], signal?: AbortSignal, assertCurrent?: () => void) {
+    signal?.throwIfAborted();
+    assertCurrent?.();
     const unique = deduplicateEntities(entities);
 
     if (unique.length > maxResolveCount) {
@@ -108,37 +107,56 @@ export class DirectoryPrincipalsClient {
 
     const controller = new AbortController();
     const batchSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-    return mapWithConcurrency(
+    const results = await mapWithConcurrency(
       unique,
       resolveConcurrency,
       async (entity): Promise<DirectoryPrincipal> => {
         batchSignal.throwIfAborted();
         try {
           if (entity.resourceType === "user") {
-            return await this.resolveUser(accessToken, entity.resourceId, batchSignal);
+            return await this.resolveUser(accessToken, entity.resourceId, batchSignal, assertCurrent);
           }
-          return await this.resolveGroup(accessToken, entity.resourceId, batchSignal);
+          return await this.resolveGroup(accessToken, entity.resourceId, batchSignal, assertCurrent);
         } catch (error) {
           controller.abort(error);
           throw error;
         }
       },
     );
+    batchSignal.throwIfAborted();
+    assertCurrent?.();
+    return results;
   }
 
-  private async resolveUser(accessToken: string, id: string, signal?: AbortSignal) {
+  private async searchCollection<T extends GraphUser | GraphGroup>(
+    url: string, accessToken: string, signal: AbortSignal, assertCurrent?: () => void,
+  ) {
+    const collection = await this.request<GraphCollection<T>>(
+      url, accessToken, { ConsistencyLevel: "eventual" }, signal, assertCurrent,
+    );
+    signal.throwIfAborted();
+    if (!collection || !Array.isArray(collection.value) || collection.value.length > maxSearchLimit) {
+      throw new AppError(502, "provider_schema", "Directory collection is invalid or oversized.");
+    }
+    collection.value.forEach(validatePrincipal);
+    return collection.value;
+  }
+
+  private async resolveUser(accessToken: string, id: string, signal?: AbortSignal, assertCurrent?: () => void) {
     try {
       const user = await this.request<GraphUser>(
         `${graphV1}/users/${encodeURIComponent(id)}?$select=id,displayName,mail,userPrincipalName`,
         accessToken,
         {},
         signal,
+        assertCurrent,
       );
       const principal = mapUser(user);
       requireResolvedIdentity(principal.resourceId, id);
       return principal;
     } catch (error) {
       signal?.throwIfAborted();
+      assertCurrent?.();
       if (error instanceof AppError && error.status === 404) {
         return fallbackPrincipal({ resourceType: "user", resourceId: id });
       }
@@ -146,19 +164,21 @@ export class DirectoryPrincipalsClient {
     }
   }
 
-  private async resolveGroup(accessToken: string, id: string, signal?: AbortSignal) {
+  private async resolveGroup(accessToken: string, id: string, signal?: AbortSignal, assertCurrent?: () => void) {
     try {
       const group = await this.request<GraphGroup>(
         `${graphV1}/groups/${encodeURIComponent(id)}?$select=id,displayName,description,mail,groupTypes,securityEnabled`,
         accessToken,
         {},
         signal,
+        assertCurrent,
       );
       const principal = mapGroup(group);
       requireResolvedIdentity(principal.resourceId, id);
       return principal;
     } catch (error) {
       signal?.throwIfAborted();
+      assertCurrent?.();
       if (error instanceof AppError && error.status === 404) {
         return fallbackPrincipal({ resourceType: "group", resourceId: id });
       }
@@ -171,10 +191,12 @@ export class DirectoryPrincipalsClient {
     accessToken: string,
     extraHeaders: Record<string, string> = {},
     signal?: AbortSignal,
+    assertCurrent?: () => void,
   ) {
     validateDirectoryUrl(url);
     const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
     requestSignal.throwIfAborted();
+    assertCurrent?.();
     const response = await this.fetcher(url, {
       signal: requestSignal,
       redirect: "error",
@@ -186,10 +208,16 @@ export class DirectoryPrincipalsClient {
     });
 
     if (!response.ok) {
-      throw await graphError(response, requestSignal);
+      const error = await graphError(response, requestSignal);
+      requestSignal.throwIfAborted();
+      assertCurrent?.();
+      throw error;
     }
 
-    return boundedProviderJson<T>(response, requestSignal);
+    const result = await boundedProviderJson<T>(response, requestSignal);
+    requestSignal.throwIfAborted();
+    assertCurrent?.();
+    return result;
   }
 }
 

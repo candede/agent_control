@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import { assertCurrentStoredSession, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, assertCurrentStoredSession, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
 import { hasAppRole, type AppRole } from "../types/capability.js";
@@ -11,21 +11,33 @@ export type CsvExportBudget = {
 };
 
 export function createExportPublicationValidator(request: Request, requiredRole: AppRole) {
-  const user = request.session.user;
+  const user = request.session?.user;
   const tenantId = user?.tenantId;
-  const principalId = request.session.accountId;
+  const principalId = request.session?.accountId;
   const sessionId = request.sessionID;
   if (!user || !tenantId || !principalId || user.homeAccountId !== principalId || !hasAppRole(user.roles, requiredRole)) {
     throw AppError.unauthorized("The export requires a current authorized session.");
   }
   const validation = beginAccountSessionValidation(tenantId, principalId);
-  return () => commitAccountSessionValidation(validation, async () => {
-    if (request.session.accountId !== principalId || request.session.user?.tenantId !== tenantId
-      || request.session.user.homeAccountId !== principalId || !hasAppRole(request.session.user.roles, requiredRole)) {
+  const assertCurrent = () => {
+    assertAccountSessionValidation(validation);
+    const session = request.session;
+    if (request.sessionID !== sessionId || session?.accountId !== principalId || session.user?.tenantId !== tenantId
+      || session.user.homeAccountId !== principalId || !hasAppRole(session.user.roles, requiredRole)) {
       throw AppError.unauthorized("The export session or required role is no longer current.");
     }
-    await assertCurrentStoredSession(pool, sessionId, tenantId, principalId, requiredRole);
-  });
+  };
+  return async (validateSource?: () => Promise<void>) => {
+    await commitAccountSessionValidation(validation, async () => {
+      assertCurrent();
+      await assertCurrentStoredSession(pool, sessionId, tenantId, principalId, requiredRole);
+      assertCurrent();
+    });
+    assertCurrent();
+    // Source reads must not hold the account lock needed by logout.
+    await validateSource?.();
+    assertCurrent();
+  };
 }
 
 export function buildBoundedCsv(
@@ -45,9 +57,17 @@ export function buildBoundedCsv(
     if (Date.now() >= budget.deadlineAt) throw new AppError(408, "export_deadline", "The export exceeded its processing deadline.");
     rowCount += 1;
     if (rowCount > budget.maximumRows) throw new AppError(413, "export_row_limit", `The export exceeds the ${budget.maximumRows.toLocaleString("en-US")} row limit.`);
-    const chunk = Buffer.from(`${columns.map(column => csvValue(row[column])).join(",")}\r\n`, "utf8");
-    byteCount += chunk.byteLength;
+    const cells: string[] = [];
+    byteCount += columns.length - 1 + 2;
     if (byteCount > budget.maximumBytes) throw new AppError(413, "export_byte_limit", `The export exceeds the ${budget.maximumBytes.toLocaleString("en-US")} byte limit.`);
+    for (const column of columns) {
+      const cell = csvValue(row[column]);
+      if (Date.now() >= budget.deadlineAt) throw new AppError(408, "export_deadline", "The export exceeded its processing deadline.");
+      byteCount += Buffer.byteLength(cell, "utf8");
+      if (byteCount > budget.maximumBytes) throw new AppError(413, "export_byte_limit", `The export exceeds the ${budget.maximumBytes.toLocaleString("en-US")} byte limit.`);
+      cells.push(cell);
+    }
+    const chunk = Buffer.from(`${cells.join(",")}\r\n`, "utf8");
     chunks.push(chunk);
   }
   const buffer = Buffer.concat(chunks, byteCount);

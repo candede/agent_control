@@ -92,6 +92,9 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
   const { definition, decision } = view;
   const permissions = definition.permissions.join(" and ");
   if (!capabilityModeEnabled(view)) return "This optional application mode is disabled. Previous checks do not establish current availability.";
+  if (definition.mode === "application" && ["interaction_required", "authorization_expired"].includes(decision.evidence?.category ?? "")) {
+    return "An administrator must verify the app registration's credentials and application API permissions. User sign-in does not repair app-only authorization.";
+  }
   if (decision.evidence?.category === "interaction_required") {
     return "Microsoft Entra requires interaction. Sign in again for MFA or Conditional Access; an administrator must configure any missing API permissions and admin consent outside this app.";
   }
@@ -162,7 +165,10 @@ export function capabilityNextStep(view: CapabilityView, now = Date.now()): { te
     text: "Ask your administrator to add the required API permissions and grant admin consent in the existing Entra app registration. Then sign in again and check status.",
     href: "https://entra.microsoft.com/", label: "Admin setup",
   };
-  if (["interaction_required", "authorization_expired"].includes(view.decision.evidence?.category ?? "")) return {
+  if (["interaction_required", "authorization_expired"].includes(view.decision.evidence?.category ?? "")) return view.definition.mode === "application" ? {
+    text: "Ask an administrator to verify the app registration's credentials and previously granted application API permissions. Then retry the explicit application-scope operation.",
+    href: "https://entra.microsoft.com/", label: "Admin setup",
+  } : {
     text: "Normal sign-in can complete MFA or refresh your session. It does not configure feature permissions; those remain administrator prerequisites.",
     href: "/api/auth/login?returnTo=%2Fpermissions", label: "Sign in again",
   };

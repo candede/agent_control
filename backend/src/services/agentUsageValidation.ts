@@ -71,8 +71,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function boundedText(value: unknown, name: string, maximum: number, empty = false) {
+  // Unicode mode rejects lone surrogates without rejecting valid supplementary characters.
   if (typeof value !== "string" || value.length > maximum || (!empty && (!value.trim() || value !== value.trim()))
-    || /[\u0000-\u001f\u007f]/.test(value)) invalid(`${name} must be bounded, exact text without control characters.`);
+    || /[\u0000-\u001f\u007f-\u009f\uD800-\uDFFF]/u.test(value)) invalid(`${name} must be bounded, exact Unicode text without control characters.`);
   return value;
 }
 

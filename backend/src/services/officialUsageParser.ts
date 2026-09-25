@@ -248,7 +248,7 @@ function requiredText(record: Record<string, string>, field: string, index: numb
 
 function requiredAgentId(record: Record<string, string>, index: number) {
   const value = requiredText(record, "agent id", index, 512);
-  if (/[\r\n]/.test(value)) {
+  if (/[\t\r\n]/.test(value)) {
     throw rowError(index, "invalid_identifier", "has an invalid agent id value");
   }
   return value;

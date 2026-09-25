@@ -80,10 +80,9 @@ policyRoute(purviewAuditRouter, "get", "/audit-search/jobs/:id/export.csv", { ac
   const id = uuid(request.params.id);
   const scope = requestScope(request);
   const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-  const validatePublication = async () => {
-    await validateSession();
+  const validatePublication = () => validateSession(async () => {
     await purviewAudit.get(request.session.user!, id);
-  };
+  });
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({ operationId: `export-audit-search:${id}:${randomUUID()}`, scope: "single", action: "export-audit-search", agentId: id,
     actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });

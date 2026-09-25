@@ -44,6 +44,44 @@ describe("typed package control projection", () => {
     },
   );
 
+  it.each(["manifestId", "appId", "assetId", "version", "manifestVersion"] as const)(
+    "requires identity revalidation when %s is newly supplied", key => {
+      for (const before of [undefined, ""]) {
+        const current = { ...original, [key]: before };
+        const value = projectPackageControl(current, block(true, { [key]: "new-evidence" }));
+        expect(value).toMatchObject({ isBlocked: true, identityRevalidationRequired: true });
+        expect(value).not.toHaveProperty("identityDetailsCollected");
+        expect(value[key]).toBe(before);
+      }
+    },
+  );
+
+  it("requires revalidation for newly supplied element types", () => {
+    for (const elementTypes of [undefined, []]) {
+      expect(projectPackageControl({ ...original, elementTypes }, block(true, {
+        elementTypes: ["DeclarativeCopilots"],
+      }))).toMatchObject({ identityRevalidationRequired: true });
+    }
+  });
+
+  it("requires revalidation when positive declarative details add identity constraints", () => {
+    const single = [{ id: "declarative", definition: "{}" }];
+    for (const extra of [
+      { current: original, elements: [...single, { id: "second-agent", definition: "{}" }] },
+      { current: { ...original, elementTypes: undefined, elementDetails: [] }, elements: single },
+    ]) {
+      const value = projectPackageControl(extra.current, block(true, {
+        elementDetails: [{ elementType: "declarativecopilots", elements: extra.elements }],
+      }));
+      expect(value).toMatchObject({ isBlocked: true, identityRevalidationRequired: true });
+      expect(value).not.toHaveProperty("identityDetailsCollected");
+      expect(value.elementDetails).toEqual(extra.current.elementDetails);
+    }
+    expect(projectPackageControl(original, block(true, {
+      elementDetails: [{ elementType: "declarativecopilots", elements: single }],
+    }))).not.toHaveProperty("identityRevalidationRequired");
+  });
+
   it("does not treat empty optional control metadata as an authoritative inventory deletion", () => {
     expect(projectPackageControl(original, block(true))).not.toHaveProperty("identityRevalidationRequired");
     expect(projectPackageControl(original, block(true, { elementDetails: [], elementTypes: [] }))).toEqual({
@@ -51,10 +89,88 @@ describe("typed package control projection", () => {
     });
   });
 
+  it("does not treat empty native metadata groups as malformed positive identity evidence", () => {
+    const current = { ...original, elementDetails: [
+      ...original.elementDetails!,
+      { elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
+        SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      }) }] },
+    ] };
+    for (const elementDetails of [
+      [{ elementType: "AgentMetadatas", elements: [] }],
+      [{ elementType: "AgentMetadatas", elements: [] }, ...original.elementDetails!],
+      [{ elementType: "agentmetadatas", elements: [] }, ...current.elementDetails!],
+    ]) {
+      expect(projectPackageControl(current, block(true, { elementDetails }))).toEqual({
+        ...current, isBlocked: true, controlObservations: { block: observation },
+      });
+    }
+  });
+
   it("does not confuse identifier casing or element type casing with identity changes", () => {
     expect(projectPackageControl(original, block(true, {
       manifestId: original.manifestId!.toUpperCase(), elementTypes: ["declarativecopilots"],
     }))).not.toHaveProperty("identityRevalidationRequired");
+  });
+
+  it.each([
+    { SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } },
+    { SourceIds: { CdsBotId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } },
+    { SourceIds: { SchemaName: "cr_agent" } },
+    { SourceIds: { ManifestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } },
+    { SourceIds: { EntraApplicationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } },
+    { AgentIdentityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+  ])("requires revalidation for newly supplied native metadata (%j)", metadata => {
+    for (const current of [
+      original,
+      { ...original, elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: "{}" }] }] },
+    ]) {
+      const value = projectPackageControl(current, block(true, {
+        elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }] }],
+      }));
+      expect(value).toMatchObject({ isBlocked: true, identityRevalidationRequired: true });
+      expect(value).not.toHaveProperty("identityDetailsCollected");
+      expect(value.elementDetails).toEqual(current.elementDetails);
+      expect(resolvePackageAgentLinks("tenant", [value], [])[0].status).toBe("unmatched");
+    }
+  });
+
+  it("preserves omitted and case-equivalent native metadata during sparse readbacks", () => {
+    const environmentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const cdsBotId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const metadata = { SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" } };
+    const current = { ...original, elementDetails: [{
+      elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }],
+    }] };
+    for (const incoming of [{}, { SourceIds: { EnvironmentId: environmentId.toUpperCase() } }, {
+      SourceIds: { EnvironmentId: environmentId.toUpperCase(), CdsBotId: cdsBotId.toUpperCase(), SchemaName: "CR_AGENT" },
+    }]) {
+      expect(projectPackageControl(current, block(true, {
+        elementDetails: [{ elementType: "agentmetadatas", elements: [{ id: "metadata", definition: JSON.stringify(incoming) }] }],
+      }))).toEqual({ ...current, isBlocked: true, controlObservations: { block: observation } });
+    }
+  });
+
+  it.each(["Bots", "CustomEngineCopilots"])("checks changed %s even if the other bot element type is omitted", elementType => {
+    const botId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const definition = (id: string) => JSON.stringify(elementType === "Bots" ? { botId: id } : { type: "bot", id });
+    const current = { ...original, elementDetails: [
+      { elementType: "Bots", elements: [{ id: "bot", definition: JSON.stringify({ botId }) }] },
+      { elementType: "CustomEngineCopilots", elements: [{ id: "engine", definition: JSON.stringify({ type: "bot", id: botId }) }] },
+    ] };
+    for (const incoming of [definition("cccccccc-cccc-4ccc-8ccc-cccccccccccc"), "{invalid"]) {
+      const value = projectPackageControl(current, block(true, {
+        elementDetails: [{ elementType: elementType.toLowerCase(), elements: [{ id: "changed", definition: incoming }] }],
+      }));
+      expect(value).toMatchObject({ isBlocked: true, identityRevalidationRequired: true });
+      expect(value).not.toHaveProperty("identityDetailsCollected");
+      expect(value.elementDetails).toEqual(current.elementDetails);
+    }
+    for (const elements of [[], [{ id: "unchanged", definition: definition(botId.toUpperCase()) }]]) {
+      expect(projectPackageControl(current, block(true, {
+        elementDetails: [{ elementType: elementType.toLowerCase(), elements }],
+      }))).toEqual({ ...current, isBlocked: true, controlObservations: { block: observation } });
+    }
   });
 
   it("does not let an unrelated control update erase a previous identity conflict", () => {

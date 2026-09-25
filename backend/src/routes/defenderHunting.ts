@@ -90,10 +90,9 @@ policyRoute(defenderHuntingRouter, "get", "/hunting/jobs/:id/export.csv", { acce
   const id = uuid(request.params.id);
   const scope = requestScope(request);
   const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-  const validatePublication = async () => {
-    await validateSession();
+  const validatePublication = () => validateSession(async () => {
     await defenderHunting.get(request.session.user!, id, huntingAgentRecordId(request));
-  };
+  });
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({ operationId: `export-hunting:${id}:${randomUUID()}`, scope: "single", action: "export-hunting", agentId: id,
     actor: request.session.user!, requestPath: request.path, metadata: { source: "microsoft_defender_hunting" } });

@@ -3,7 +3,7 @@ import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal
 import { AgentPeopleRepository, type AgentPersonObservation } from "../db/agentPeople.js";
 import { DataSyncRepository, type DataSyncScope, type UserSourcePublication } from "../db/dataSync.js";
 import { pool } from "../db/pool.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import { hasAppRole } from "../types/capability.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
@@ -26,6 +26,11 @@ type Dependencies = {
   now: () => Date;
 };
 
+type ResolutionOptions = {
+  generation: string; publication?: UserSourcePublication; force?: boolean; skipLicensed?: boolean; incompleteOnly?: boolean;
+};
+type ResolutionContext = ReturnType<typeof resolutionContext>;
+
 export class AgentPeopleService {
   private readonly dependencies: Dependencies;
 
@@ -45,29 +50,34 @@ export class AgentPeopleService {
 
   async refreshReferences(user: AuthenticatedUser, signal: AbortSignal, publication: UserSourcePublication,
     options: { incompleteOnly: boolean; useCache?: boolean }) {
-    throwIfResolutionAborted(signal);
-    const scope = userScope(user);
-    const generation = await this.generation(scope);
-    throwIfResolutionAborted(signal);
-    const ids = await this.dependencies.repository.referencedIds(scope);
-    throwIfResolutionAborted(signal);
-    return this.resolve(user, ids, { generation, publication, signal, force: !options.useCache, skipLicensed: true, ...options });
+    const context = resolutionContext(user, signal);
+    return awaitResolution(context.signal, async () => {
+      assertCurrent(context);
+      const generation = await this.generation(context.scope);
+      assertCurrent(context);
+      const ids = await this.dependencies.repository.referencedIds(context.scope);
+      assertCurrent(context);
+      return this.resolveCurrent(user, ids, { generation, publication, force: !options.useCache, skipLicensed: true, ...options }, context);
+    });
   }
 
-  async resolve(user: AuthenticatedUser, ids: readonly string[], options: {
-    generation: string; signal?: AbortSignal; publication?: UserSourcePublication; force?: boolean; skipLicensed?: boolean; incompleteOnly?: boolean;
-  }) {
-    if (options.signal) throwIfResolutionAborted(options.signal);
-    const scope = userScope(user);
+  async resolve(user: AuthenticatedUser, ids: readonly string[], options: ResolutionOptions & { signal?: AbortSignal }) {
+    const context = resolutionContext(user, options.signal);
+    return awaitResolution(context.signal, () => this.resolveCurrent(user, ids, options, context));
+  }
+
+  private async resolveCurrent(user: AuthenticatedUser, ids: readonly string[], options: ResolutionOptions, context: ResolutionContext) {
+    assertCurrent(context);
+    const { scope, signal } = context;
     if (ids.length > 10_000 || ids.some(id => !isDirectoryObjectId(id))) {
       throw new AppError(400, "invalid_agent_people", "Resolve at most 10,000 exact agent user IDs.");
     }
     const directorySource = await this.dependencies.saved.getDirectorySource(scope);
-    if (options.signal) throwIfResolutionAborted(options.signal);
+    assertCurrent(context);
     const saved = directoryPeople(directorySource);
     const unique = [...new Set(ids.map(id => id.toLowerCase()))];
     const cachedPeople = await this.dependencies.repository.read(scope, unique);
-    if (options.signal) throwIfResolutionAborted(options.signal);
+    assertCurrent(context);
     const cached = new Map(cachedPeople.map(person => [person.objectId, person]));
     const pending = unique.filter(id => {
       if (options.skipLicensed && saved.has(id)) return false;
@@ -77,34 +87,41 @@ export class AgentPeopleService {
     const result = { changed: false, resolved: 0, notFound: 0, failed: 0 };
     if (!pending.length) return result;
     this.dependencies.admissions();
-    const signal = options.signal
-      ? AbortSignal.any([options.signal, AbortSignal.timeout(120_000)])
-      : AbortSignal.timeout(120_000);
-    return this.dependencies.observeOperation("graph.directory.read", user,
-      reportFailure => this.resolvePending(scope, pending, signal, options, result, reportFailure),
+    const resolved = await this.dependencies.observeOperation("graph.directory.read", user,
+      reportFailure => this.resolvePending(context, pending, options, result, reportFailure),
       { signal, clearOnSuccess: result => result.failed === 0 });
+    assertCurrent(context);
+    this.dependencies.admissions();
+    return resolved;
   }
 
-  private async resolvePending(scope: DataSyncScope, pending: string[], signal: AbortSignal,
+  private async resolvePending(context: ResolutionContext, pending: string[],
     options: { generation: string; publication?: UserSourcePublication }, result: { changed: boolean; resolved: number; notFound: number; failed: number },
     reportFailure: (error: unknown) => void) {
-    throwIfResolutionAborted(signal);
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-    const freshUser = await this.dependencies.revalidateUser(scope.principalId);
-    throwIfResolutionAborted(signal);
+    const { scope, signal, validation } = context;
+    const fence = () => {
+      assertCurrent(context);
+      this.dependencies.admissions();
+    };
+    const wait = <T>(operation: () => Promise<T>) => awaitResolution(signal, operation);
+    fence();
+    const freshUser = await wait(() => this.dependencies.revalidateUser(scope.principalId));
+    fence();
     requireSameUser(scope, freshUser);
-    const token = await commitAccountSessionValidation(validation, async () => {
-      throwIfResolutionAborted(signal);
-      await this.dependencies.requireAvailable("graph.directory.read", freshUser);
-      throwIfResolutionAborted(signal);
-      return this.dependencies.delegatedToken(scope.principalId, "graph.directory.read");
-    });
+    const token = await wait(() => commitAccountSessionValidation(validation, async () => {
+      fence();
+      await wait(() => this.dependencies.requireAvailable("graph.directory.read", freshUser));
+      fence();
+      return wait(() => this.dependencies.delegatedToken(scope.principalId, "graph.directory.read"));
+    }));
     for (let offset = 0; offset < pending.length; offset += 8) {
-      throwIfResolutionAborted(signal);
+      fence();
       const observations = await Promise.all(pending.slice(offset, offset + 8).map(async (objectId): Promise<AgentPersonObservation> => {
+        fence();
         const checkedAt = this.dependencies.now().toISOString();
         try {
           const values = await this.dependencies.directory.resolve(token, [{ resourceId: objectId, resourceType: "user" }], signal);
+          fence();
           const person = values[0];
           if (values.length !== 1 || person.resourceId.toLowerCase() !== objectId || person.resourceType !== "user"
             || !["user", "unknown"].includes(person.principalKind)) {
@@ -116,8 +133,8 @@ export class AgentPeopleService {
               displayName: boundedName(person.displayName.toLowerCase() === objectId ? null : person.displayName, 512),
               userPrincipalName: boundedName(person.userPrincipalName ?? null, 320) };
         } catch (error) {
+          fence();
           reportFailure(error);
-          throwIfResolutionAborted(signal);
           const telemetry = errorTelemetry(error, "directory_lookup_failed");
           const errorCode = telemetry.errorKind === "timeout" ? "provider_timeout"
             : telemetry.status === 403 ? "missing_permission" : telemetry.status === 401 ? "unauthorized"
@@ -128,17 +145,20 @@ export class AgentPeopleService {
             errorCode };
         }
       }));
-      throwIfResolutionAborted(signal);
-      const current = await this.dependencies.revalidateUser(scope.principalId);
-      throwIfResolutionAborted(signal);
+      fence();
+      const current = await wait(() => this.dependencies.revalidateUser(scope.principalId));
+      fence();
       requireSameUser(scope, current);
-      await commitAccountSessionValidation(validation, async () => {
-        throwIfResolutionAborted(signal);
-        this.dependencies.admissions();
-        await this.dependencies.requireAvailable("graph.directory.read", current);
-        throwIfResolutionAborted(signal);
-        await this.dependencies.repository.save(scope, observations, { ...options, signal });
-      });
+      await wait(() => commitAccountSessionValidation(validation, async () => {
+        fence();
+        await wait(() => this.dependencies.requireAvailable("graph.directory.read", current));
+        fence();
+        // Hold account serialization until the transaction commits or rolls back, even after the caller times out.
+        await this.dependencies.repository.save(scope, observations, { generation: options.generation,
+          publication: options.publication, signal, fence });
+        fence();
+      }));
+      fence();
       result.changed = true;
       for (const observation of observations) {
         if (observation.status === "resolved") result.resolved += 1;
@@ -155,6 +175,40 @@ export class AgentPeopleService {
 }
 
 export const agentPeople = new AgentPeopleService();
+
+function resolutionContext(user: AuthenticatedUser, abortSignal?: AbortSignal) {
+  const signal = AbortSignal.any([AbortSignal.timeout(120_000), ...(abortSignal ? [abortSignal] : [])]);
+  throwIfResolutionAborted(signal);
+  const scope = userScope(user);
+  return { signal, scope, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId) };
+}
+
+function assertCurrent(context: ResolutionContext) {
+  throwIfResolutionAborted(context.signal);
+  assertAccountSessionValidation(context.validation);
+}
+
+async function awaitResolution<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  throwIfResolutionAborted(signal);
+  const work = operation();
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      try { throwIfResolutionAborted(signal); } catch (error) { reject(error); }
+    };
+    work.then(value => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+      else resolve(value);
+    }, error => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+      else reject(error);
+    });
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  });
+}
 
 function userScope(user: AuthenticatedUser): DataSyncScope {
   if (!user.tenantId || !user.homeAccountId || !hasAppRole(user.roles, "AgentControl.Viewer")) {

@@ -94,6 +94,7 @@ export class DataSyncRepository {
       await lockScope(client, scope);
       const active = await client.query<{ id: string }>(`SELECT id FROM data_sync_runs
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting')
+          AND expires_at>clock_timestamp()
         ORDER BY started_at DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
       if (active.rows[0]) return { id: active.rows[0].id, created: false };
       const due = await client.query<{ source_id: DataSyncSourceId }>(`
@@ -388,9 +389,11 @@ export class DataSyncRepository {
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting')
           AND expires_at>clock_timestamp() RETURNING id`, [id, scope.tenantId, scope.principalId]);
       if (!run.rows[0]) {
-        const exists = await client.query("SELECT 1 FROM data_sync_runs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp()", [id, scope.tenantId, scope.principalId]);
+        const exists = await client.query<{ status: DataSyncRun["status"] }>("SELECT status FROM data_sync_runs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp()", [id, scope.tenantId, scope.principalId]);
         if (!exists.rows[0]) throw new AppError(404, "not_found", "Data sync run was not found.");
-        throw new AppError(409, "data_sync_run_state", "Only an active data sync run can be cancelled.");
+        if (exists.rows[0].status !== "cancelled") {
+          throw new AppError(409, "data_sync_run_state", "Only an active data sync run can be cancelled.");
+        }
       }
       await client.query(`UPDATE data_sync_run_sources SET status='cancelled',
           message='Cancelled by the requesting principal.',can_retry=true,updated_at=clock_timestamp()
@@ -400,7 +403,7 @@ export class DataSyncRepository {
     return (await this.getRun(scope, id))!;
   }
 
-  async pausePrincipal(scope: DataSyncScope, message = "Explicit resume with current authorization is required.") {
+  async pausePrincipal(scope: DataSyncScope, message = "Explicit resume with current authorization is required.", runId?: string) {
     validateScope(scope);
     const result = await transaction(this.database, async client => {
       await lockScope(client, scope);
@@ -409,14 +412,16 @@ export class DataSyncRepository {
         FROM data_sync_runs run
         WHERE source.run_id=run.id AND source.tenant_id=$1 AND source.principal_id=$2
           AND run.tenant_id=$1 AND run.principal_id=$2 AND run.status IN ('running','waiting')
+          AND ($4::uuid IS NULL OR run.id=$4::uuid)
           AND source.source_id<>'usage_reports' AND source.status IN ('queued','running')
-        RETURNING source.run_id`, [scope.tenantId, scope.principalId, message]);
+        RETURNING source.run_id`, [scope.tenantId, scope.principalId, message, runId ?? null]);
       await client.query(`UPDATE data_sync_runs SET status=CASE WHEN automatic THEN 'partial' ELSE 'waiting' END,
           completed_at=CASE WHEN automatic THEN clock_timestamp() ELSE NULL END,updated_at=clock_timestamp()
         WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('running','waiting')
+          AND ($3::uuid IS NULL OR id=$3::uuid)
           AND EXISTS (SELECT 1 FROM data_sync_run_sources source
             WHERE source.run_id=data_sync_runs.id AND source.status='waiting_authorization')`,
-      [scope.tenantId, scope.principalId]);
+      [scope.tenantId, scope.principalId, runId ?? null]);
       return sources.rowCount ?? 0;
     });
     return result;

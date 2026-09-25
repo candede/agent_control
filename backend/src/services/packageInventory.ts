@@ -2,7 +2,7 @@ import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticated
 import { setTimeout as delay } from "node:timers/promises";
 import { config } from "../config.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageRefreshInput, type PackageScanResult } from "../db/packageInventory.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
@@ -15,6 +15,7 @@ import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { createRefreshExecutionSignal, type RefreshCancellationReason } from "./refreshExecution.js";
 import { operationalLog, withTelemetryContext } from "./telemetry.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 
 type PackageRefreshProgress = (pages: number, observedCount: number, totalRecords: number, message?: string) => Promise<void>;
 type PackageScanClient = Pick<GraphPackagesClient, "listCopilotAgents" | "getPackageDetails">;
@@ -52,11 +53,13 @@ const defaultDependencies: PackageRefreshDependencies = {
 };
 
 type RefreshInput = Omit<PackageRefreshInput, "authorizationPrincipalId">;
-type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void>; autoDetails?: boolean };
-type StartingRefresh = Omit<ActiveRefresh, "operation"> & {
+type ActiveRefresh = { actor: PackageDataScope; controller: AbortController; operation: Promise<void>; autoDetails: boolean };
+type StartingRefresh = Omit<ActiveRefresh, "operation" | "autoDetails"> & {
+  autoDetails?: boolean;
   operation: Promise<NonNullable<Awaited<ReturnType<PackageInventoryRepository["getJob"]>>>>;
 };
 const maximumActiveRefreshes = 4;
+const maximumAutomaticRefreshes = 2;
 const exactReadConcurrency = 4;
 
 export class PackageInventoryService {
@@ -71,36 +74,59 @@ export class PackageInventoryService {
 
   async submit(user: AuthenticatedUser, input: RefreshInput) {
     requireRefreshRole(user);
+    requireProviderAdmissions();
     if (input.tokenMode === "application") await this.dependencies.requireApplicationDataScope("graph.package.read.application", user);
     const scope = dataScope(user, input.tokenMode, this.dependencies.applicationPrincipalId());
     return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
   }
 
-  async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number) {
+  async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number, signal?: AbortSignal) {
     requireRefreshRole(user);
     const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId());
-    if (this.draining || [...new Map<string, Pick<ActiveRefresh, "autoDetails">>([...this.starting, ...this.active]).values()].filter(value => value.autoDetails).length >= 2) {
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const assertCurrent = () => {
+      signal?.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      requireProviderAdmissions();
+    };
+    assertCurrent();
+    if (this.draining || this.laneCount(true) >= maximumAutomaticRefreshes) {
       return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
     }
-    const job = await this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
+    const job = await commitAccountSessionValidation(validation, async () => {
+      assertCurrent();
+      return this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
+    });
     if (!job) return this.repository.latestAutomaticDetailsJob(scope, user.homeAccountId);
+    const abort = () => {
+      this.starting.get(job.id)?.controller.abort(signal?.reason);
+      this.active.get(job.id)?.controller.abort(signal?.reason);
+    };
     try {
-      return await this.start(user, job.id, "delegated", { autoDetails: true });
+      assertCurrent();
+      signal?.addEventListener("abort", abort, { once: true });
+      const started = await this.start(user, job.id, "delegated");
+      assertCurrent();
+      return started;
     } catch (error) {
       operationalLog("warn", "package_detail_admission_failed", { jobId: job.id, ...graphErrorTelemetry(error) });
       const failed = await this.repository.markFailed(scope, job.id, syncFailureCode(error),
-        isAuthorizationFailure(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
+        isAuthorizationFailure(error) && !isAdmissionPause(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
           : safeFailureMessage(error));
+      assertCurrent();
       if (failed) return failed;
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", abort);
     }
   }
 
-  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean; autoDetails?: boolean } = {}) {
+  async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
     const actor = actorScope(user);
     const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
     id = id.toLowerCase();
     if (this.draining) throw new AppError(503, "package_refresh_shutdown", "Package refreshes are stopping for application shutdown.");
+    requireProviderAdmissions();
     const reserved = this.active.get(id) ?? this.starting.get(id);
     if (reserved) {
       if (reserved.actor.tenantId !== actor.tenantId || reserved.actor.principalId !== actor.principalId) {
@@ -108,72 +134,92 @@ export class PackageInventoryService {
       }
       throw new AppError(409, "package_refresh_state", "Package refresh is already starting or running.");
     }
-    const laneCount = [...new Map<string, Pick<ActiveRefresh, "autoDetails">>([...this.starting, ...this.active]).values()]
-      .filter(value => Boolean(value.autoDetails) === Boolean(options.autoDetails)).length;
-    if (laneCount >= (options.autoDetails ? 2 : maximumActiveRefreshes)) {
-      throw new AppError(429, "package_refresh_capacity", "At most four package refreshes can run at once.");
+    if (new Set([...this.starting.keys(), ...this.active.keys()]).size >= maximumActiveRefreshes + maximumAutomaticRefreshes) {
+      throw refreshCapacityError();
     }
     const controller = new AbortController();
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
     const starting: StartingRefresh = {
-      actor, controller, autoDetails: options.autoDetails,
-      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, options))
+      actor, controller,
+      operation: Promise.resolve().then(() => this.startRefresh(user, actor, scope, id, tokenMode, controller, validation, options))
         .finally(() => { if (this.starting.get(id) === starting) this.starting.delete(id); }),
     };
     this.starting.set(id, starting);
     return starting.operation;
   }
 
-  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, options: { retryFailed?: boolean }) {
+  private laneCount(autoDetails: boolean) {
+    return [...new Map<string, Pick<StartingRefresh, "autoDetails">>([...this.starting, ...this.active]).values()]
+      .filter(value => value.autoDetails === autoDetails).length;
+  }
+
+  private async startRefresh(user: AuthenticatedUser, actor: PackageDataScope, scope: PackageDataScope, id: string, tokenMode: RefreshInput["tokenMode"], controller: AbortController, validation: ReturnType<typeof beginAccountSessionValidation>, options: { retryFailed?: boolean }) {
     const signal = controller.signal;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      requireProviderAdmissions();
+    };
     let current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>>;
     let token = "";
+    let ownedWaitingJob = false;
     let markedRunning = false;
     try {
-      signal.throwIfAborted();
+      assertCurrent();
       current = await this.repository.getJob(scope, id);
-      signal.throwIfAborted();
+      assertCurrent();
       if (!current || current.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
       if (current.status !== "waiting_authorization") throw new AppError(409, "package_refresh_state", "Only a waiting package refresh can be started.");
+      ownedWaitingJob = true;
       requireRefreshRole(user);
-      const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+      const autoDetails = Boolean(current.autoDetails);
+      if (this.laneCount(autoDetails) >= (autoDetails ? maximumAutomaticRefreshes : maximumActiveRefreshes)) {
+        throw refreshCapacityError();
+      }
+      // Persisted mode, not a caller hint, owns the lane before provider authorization begins.
+      this.starting.get(id)!.autoDetails = autoDetails;
       const freshUser = await this.dependencies.revalidateUser(actor.principalId);
-      signal.throwIfAborted();
+      assertCurrent();
       requireSamePrincipal(actor, freshUser);
       requireRefreshRole(freshUser);
       const capabilityId = capabilityForMode(tokenMode);
       if (tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
-      signal.throwIfAborted();
+      assertCurrent();
       await this.dependencies.requireAvailable(capabilityId, freshUser, options);
-      signal.throwIfAborted();
+      assertCurrent();
       token = await this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
         ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
         : this.dependencies.applicationToken(capabilityId), { signal, clearOnSuccess: false });
-      signal.throwIfAborted();
+      assertCurrent();
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
-        signal.throwIfAborted();
+        assertCurrent();
         markedRunning = current!.autoDetails ? await this.repository.markRunning(scope, id, true) : await this.repository.markRunning(scope, id);
         if (!markedRunning) throw new AppError(409, "package_refresh_state", "Package refresh was already started or expired.");
       });
-      signal.throwIfAborted();
+      assertCurrent();
     } catch (error) {
-      if (markedRunning && signal.aborted) {
+      let failure = error;
+      try { assertCurrent(); } catch (currentError) { failure = currentError; }
+      if (markedRunning && (signal.aborted || isAuthorizationFailure(failure))) {
         if (signal.reason instanceof AppError && signal.reason.code === "read_job_cancelled") {
           await this.repository.cancel(scope, id, actor.principalId);
         } else {
           await this.repository.markWaitingAuthorization(scope, id);
         }
+      } else if (ownedWaitingJob && failure instanceof AppError && dataSyncFailureStatus(failure.code, failure.status) === "permission_required") {
+        await this.repository.markFailed(scope, id, syncFailureCode(failure), safeFailureMessage(failure));
       }
-      signal.throwIfAborted();
-      throw error;
+      assertCurrent();
+      throw failure;
     }
     const execution = createRefreshExecutionSignal(signal, current.autoDetails ? 5 * 60_000 : packageRefreshExecutionDeadlineMs);
-    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal))
+    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal, validation))
       .finally(() => {
         execution.dispose();
         if (this.active.get(id)?.operation === operation) this.active.delete(id);
       });
-    this.active.set(id, { actor, controller, operation, autoDetails: current.autoDetails });
+    this.active.set(id, { actor, controller, operation, autoDetails: Boolean(current.autoDetails) });
     void operation.catch(error => {
       operationalLog("error", "package_refresh_status_failed", { jobId: id, ...graphErrorTelemetry(error) });
     });
@@ -222,50 +268,58 @@ export class PackageInventoryService {
     }
   }
 
-  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>> & {}, id: string, token: string, signal: AbortSignal) {
+  private async run(actor: PackageDataScope, scope: PackageDataScope, current: Awaited<ReturnType<PackageInventoryRepository["getJob"]>> & {}, id: string, token: string, signal: AbortSignal, validation: ReturnType<typeof beginAccountSessionValidation>) {
     const startedAt = performance.now();
     let stage = "inventory_collection";
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      assertAccountSessionValidation(validation);
+      requireProviderAdmissions();
+    };
     try {
+      assertCurrent();
       operationalLog("info", "package_refresh_started", { mode: current.scopeKind });
       const result = await this.dependencies.observeOperation(capabilityForMode(current.tokenMode),
         { tenantId: actor.tenantId, homeAccountId: actor.principalId }, () => this.dependencies.scan(token, current.requestedIds, signal,
-        (pages, observedCount, totalRecords, message) => this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message), {
+        (pages, observedCount, totalRecords, message) => {
+          assertCurrent();
+          return this.repository.recordProgress(scope, id, pages, observedCount, totalRecords, message);
+        }, {
           retryThrottlingUntilAborted: !current.autoDetails,
           ...(current.catalogOnly ? { catalogOnly: true } : {}),
           ...(current.autoDetails ? { autoDetails: true } : {}),
           getAccessToken: async () => {
-            signal.throwIfAborted();
+            assertCurrent();
             const capabilityId = capabilityForMode(current.tokenMode);
             const currentToken = current.tokenMode === "delegated"
               ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
               : await this.dependencies.applicationToken(capabilityId);
-            signal.throwIfAborted();
+            assertCurrent();
             return currentToken;
           },
         }), { signal });
-      signal.throwIfAborted();
+      assertCurrent();
       for (let attempt = 1; ; attempt += 1) {
         stage = "publication_authorization";
         try {
-          signal.throwIfAborted();
-          const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+          assertCurrent();
           const freshUser = await this.dependencies.revalidateUser(actor.principalId);
-          signal.throwIfAborted();
+          assertCurrent();
           requireSamePrincipal(actor, freshUser);
           requireRefreshRole(freshUser);
           const capabilityId = capabilityForMode(current.tokenMode);
           if (current.tokenMode === "application") await this.dependencies.requireApplicationDataScope(capabilityId, freshUser);
-          signal.throwIfAborted();
+          assertCurrent();
           await this.dependencies.requireAvailable(capabilityId, freshUser, { retryFailed: true });
-          signal.throwIfAborted();
+          assertCurrent();
           await commitAccountSessionValidation(validation, async () => {
-            signal.throwIfAborted();
+            assertCurrent();
             stage = "publication";
             await this.repository.publish(scope, id, result);
           });
           break;
         } catch (error) {
-          signal.throwIfAborted();
+          assertCurrent();
           if (stage !== "publication_authorization" || !transientPublicationReadinessFailure(error)) throw error;
           const retryDelayMs = publicationReadinessRetryDelay(error, attempt);
           operationalLog("warn", "package_publication_readiness_retry", {
@@ -283,7 +337,8 @@ export class PackageInventoryService {
         durationMs: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
-      const failure = signal.aborted ? signal.reason : error;
+      let failure = error;
+      try { assertCurrent(); } catch (currentError) { failure = currentError; }
       operationalLog("warn", "package_refresh_execution_failed", {
         stage, ...graphErrorTelemetry(failure), durationMs: Math.round(performance.now() - startedAt),
       });
@@ -292,7 +347,9 @@ export class PackageInventoryService {
         return;
       }
       if (isAuthorizationFailure(failure)) {
-        if (current.autoDetails) await this.repository.markFailed(scope, id, "interaction_required", "Automatic enrichment needs renewed authorization and will retry after backoff.");
+        if (current.autoDetails) await this.repository.markFailed(scope, id,
+          isAdmissionPause(failure) ? failure.code : "interaction_required",
+          isAdmissionPause(failure) ? safeFailureMessage(failure) : "Automatic enrichment needs renewed authorization and will retry after backoff.");
         else await this.repository.markWaitingAuthorization(scope, id);
         return;
       }
@@ -312,6 +369,10 @@ export class PackageInventoryService {
 }
 
 export const packageInventory = new PackageInventoryService();
+
+function refreshCapacityError() {
+  return new AppError(429, "package_refresh_capacity", "At most four foreground package refreshes and two automatic detail refreshes can run at once.");
+}
 
 function transientPublicationReadinessFailure(error: unknown): error is AppError {
   if (!(error instanceof AppError) || error.status === 401 || error.status === 403) return false;
@@ -483,7 +544,12 @@ function requireSamePrincipal(scope: PackageDataScope, user: AuthenticatedUser) 
 }
 
 function isAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "waiting_authorization";
+  return error instanceof AppError && (dataSyncFailureStatus(error.code, error.status) === "waiting_authorization"
+    || isAdmissionPause(error));
+}
+
+function isAdmissionPause(error: unknown): error is AppError {
+  return error instanceof AppError && ["maintenance", "provider_requalification_required"].includes(error.code);
 }
 
 function syncFailureCode(error: unknown) {
@@ -493,6 +559,7 @@ function syncFailureCode(error: unknown) {
 }
 
 function safeFailureMessage(error: unknown) {
+  if (isAdmissionPause(error)) return `${error.message} Saved package data is unchanged.`;
   if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
     return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";
   }

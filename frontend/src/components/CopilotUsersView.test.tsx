@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers } from "../api/client";
+import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers, type CopilotUsageUsersResponse } from "../api/client";
 import { downloadBlob } from "../agentExport";
 import { copilotUsageFixture, licensedUser } from "../test/copilotUsageFixture";
 import { activeWithoutPaidUsersFixture, usageAgentDetailFixture, usageUsersFixture } from "../test/usageInsightsFixture";
@@ -685,6 +685,46 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText("Offer adoption help")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(screen.getByText("No users match")).toBeVisible();
+  });
+
+  it.each([false, true])("uses matched app attention from the backend independently of unjoined rows, stale=%s", async stale => {
+    const ada = licensedUser(1, "Ada", null);
+    const activity = { ...ada.appActivity!, lastActivityDate: "2026-07-01" };
+    const input = {
+      generatedAt: stale ? "2026-09-20T00:00:00.000Z" : copilotUsageFixture.generatedAt,
+      directory: { ok: true as const, value: [{
+        serviceEvidenceVersion: 1 as const, identity: ada.directory,
+        copilotServiceState: ada.copilotServiceState, servicePlans: ada.servicePlans,
+      }], fetchedAt: copilotUsageFixture.generatedAt },
+      appActivity: { ok: true as const, fetchedAt: copilotUsageFixture.generatedAt, value: {
+        reportRefreshDate: activity.reportRefreshDate,
+        users: [
+          { normalizedUserPrincipalName: ada.directory.userPrincipalName, activity },
+          { normalizedUserPrincipalName: "hidden-report-identity", activity },
+        ],
+      } },
+      imported: { ok: false as const, status: "failed" as const, message: "No imported report." },
+    };
+    // Exercise the Node producer without compiling its dependencies as browser code.
+    const { composeCopilotUsageUsers } = await vi.importActual<{
+      composeCopilotUsageUsers(source: typeof input): CopilotUsageUsersResponse;
+    }>("../../../backend/src/services/copilotUsage");
+    const data = composeCopilotUsageUsers(input);
+    expect(data.sources.appActivity.state).toBe(stale ? "stale" : "partial");
+    expect(data.counts.needsAttentionUsers).toBe(stale ? 0 : 1);
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
+    render(<CopilotUsersView />);
+    const trigger = await screen.findByRole("button", { name: "Ada" });
+    expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Needs attention").parentElement)
+      .toHaveTextContent(stale ? "0" : "1");
+    expect(userRows()[0]).toHaveTextContent(stale ? "Usage unknown" : "Review app activity");
+    await userEvent.click(trigger);
+    const detail = screen.getByRole("dialog", { name: "Ada" });
+    expect(within(detail).getByText(stale ? "Usage unknown" : "Review app activity")).toBeVisible();
+    await userEvent.click(within(detail).getByRole("button", { name: "Close user details" }));
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    if (stale) expect(screen.getByText("No users match")).toBeVisible();
+    else expect(userRows()).toHaveLength(1);
   });
 
   it("shows separate agent/app dates and restores focus without cross-page links", async () => {

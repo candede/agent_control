@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { AppError } from "../errors.js";
 
 export class ProviderResponseLimitError extends AppError {
@@ -45,7 +46,9 @@ export async function boundedProviderText(response: Response, maximumBytes = 2_0
     signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
-  return Buffer.concat(chunks).toString("utf8");
+  const body = Buffer.concat(chunks);
+  if (!isUtf8(body)) throw new AppError(502, "provider_schema", "Provider response was not valid UTF-8.");
+  return body.toString("utf8");
 }
 
 export async function boundedProviderJson<T>(response: Response, signal?: AbortSignal, maximumBytes?: number): Promise<T> {

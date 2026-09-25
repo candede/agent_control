@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -39,17 +39,21 @@ export class CopilotStudioQuarantineControlService {
 
   async status(user: AuthenticatedUser, snapshotId: string, resourceNativeId: string, force = false) {
     const scope = controlScope(user, "AgentControl.Viewer");
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const targets = await this.inventory.resolveQuarantineTargets(scope, snapshotId, [resourceNativeId]);
-    const observed = await this.observe(user, targets, force, "powerPlatform.quarantine.read");
+    const observed = await this.observe(user, targets, force, "powerPlatform.quarantine.read", validation);
+    assertAccountSessionValidation(validation);
     return statusView(targets[0], observed[0].directStatus, observed[0].source);
   }
 
   async preview(user: AuthenticatedUser, input: { action: QuarantineAction; snapshotId: string; resourceNativeIds: string[]; forceStatus?: boolean }) {
     const scope = controlScope(user, "AgentControl.Admin");
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
-    const frozen = (await this.observe(user, targets, Boolean(input.forceStatus), "powerPlatform.quarantine.manage")).map(value => ({ ...value.target, directStatus: value.directStatus }));
+    const frozen = (await this.observe(user, targets, Boolean(input.forceStatus), "powerPlatform.quarantine.manage", validation)).map(value => ({ ...value.target, directStatus: value.directStatus }));
     const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
     const authority = await this.dependencies.authorityContext(current);
+    assertAccountSessionValidation(validation);
     const confirmation = createQuarantineConfirmation({ action: input.action, targets: frozen, actor: userActor(current), authority, requestPath: "/api/quarantine/jobs" });
     return {
       confirmationHash: confirmation.confirmationHash,
@@ -62,15 +66,17 @@ export class CopilotStudioQuarantineControlService {
     const scope = controlScope(user, "AgentControl.Admin");
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const existing = await this.repository.existingSubmission(scope, input);
+    assertAccountSessionValidation(validation);
     if (existing) {
       if (existing.status === "queued" && !existing.isCanary) {
         await this.authorize(scope, "powerPlatform.quarantine.manage");
         await commitAccountSessionValidation(validation, async () => this.dependencies.launch(existing.id, scope));
       }
+      assertAccountSessionValidation(validation);
       return existing;
     }
     const targets = await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, input.resourceNativeIds);
-    const frozen = (await this.observe(user, targets, false, "powerPlatform.quarantine.manage")).map(value => ({ ...value.target, directStatus: value.directStatus }));
+    const frozen = (await this.observe(user, targets, false, "powerPlatform.quarantine.manage", validation)).map(value => ({ ...value.target, directStatus: value.directStatus }));
     const current = await this.authorize(scope, "powerPlatform.quarantine.manage");
     const authority = await this.dependencies.authorityContext(current);
     const job = await commitAccountSessionValidation(validation, () => this.repository.submit(scope, {
@@ -82,33 +88,44 @@ export class CopilotStudioQuarantineControlService {
       idempotencyKey: input.idempotencyKey,
       confirmationHash: input.confirmationHash,
     }));
-    if (job.status === "queued" && !job.isCanary) this.dependencies.launch(job.id, scope);
+    if (job.status === "queued" && !job.isCanary) {
+      await commitAccountSessionValidation(validation, async () => this.dependencies.launch(job.id, scope));
+    }
+    assertAccountSessionValidation(validation);
     return job;
   }
 
-  private async observe(user: AuthenticatedUser, targets: InventoryQuarantineTarget[], force: boolean, capabilityId: CapabilityId) {
+  private async observe(
+    user: AuthenticatedUser, targets: InventoryQuarantineTarget[], force: boolean, capabilityId: CapabilityId,
+    validation: ReturnType<typeof beginAccountSessionValidation>,
+  ) {
+    assertAccountSessionValidation(validation);
     const scope = controlScope(user, capabilityId === "powerPlatform.quarantine.read" ? "AgentControl.Viewer" : "AgentControl.Admin");
     const results: Array<{ target: InventoryQuarantineTarget; directStatus: FrozenQuarantineTarget["directStatus"]; source: "cache" | "provider" } | undefined> = [];
     const missing: Array<{ target: InventoryQuarantineTarget; index: number }> = [];
     for (const [index, target] of targets.entries()) {
       const cached = force ? undefined : await this.repository.latestObservation(scope, target, 60_000);
+      assertAccountSessionValidation(validation);
       if (cached) results[index] = { target, directStatus: cached, source: "cache" };
       else missing.push({ target, index });
     }
     if (!missing.length) return results as Array<NonNullable<typeof results[number]>>;
 
-    return this.dependencies.observeOperation(capabilityId, user, async () => {
-      const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const observed = await this.dependencies.observeOperation(capabilityId, user, async () => {
       const current = await this.authorize(scope, capabilityId);
+      assertAccountSessionValidation(validation);
       const token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
       const providerResults: Array<FrozenQuarantineTarget["directStatus"]> = [];
       for (const value of missing) {
+        assertAccountSessionValidation(validation);
         providerResults.push(await this.provider.getStatus(token, value.target, { correlationId: randomUUID() }));
       }
+      assertAccountSessionValidation(validation);
       const publishUser = await this.authorize(scope, capabilityId);
       if (publishUser.homeAccountId !== current.homeAccountId) throw AppError.unauthorized("The quarantine status actor changed before publication.");
       await commitAccountSessionValidation(validation, async () => {
         for (const [resultIndex, value] of missing.entries()) {
+          assertAccountSessionValidation(validation);
           const directStatus = providerResults[resultIndex];
           await this.repository.recordObservation(scope, value.target, directStatus);
           results[value.index] = { target: value.target, directStatus, source: "provider" };
@@ -116,6 +133,8 @@ export class CopilotStudioQuarantineControlService {
       });
       return results as Array<NonNullable<typeof results[number]>>;
     }, { clearOnSuccess: capabilityId === "powerPlatform.quarantine.read" });
+    assertAccountSessionValidation(validation);
+    return observed;
   }
 
   private async authorize(scope: QuarantineScope, capabilityId: CapabilityId) {

@@ -298,19 +298,21 @@ export class GraphPackagesClient {
       let phase: "token" | "admission" | "request" = "token";
       let pacingGeneration = this.pacingGeneration;
       try {
-        let currentToken: string;
-        for (;;) {
-          phase = "token";
-          currentToken = await this.tokenForRead(accessToken, options);
-          phase = "admission";
-          const queuedAt = this.retryPolicy.now();
-          try {
-            await this.waitForReadSlot(options.signal);
-          } finally {
-            options.diagnostics?.recordWait(stage, "admissionWaitMs", this.retryPolicy.now() - queuedAt);
-          }
-          if (!options.getAccessToken || this.retryPolicy.now() - queuedAt < packageReadTimeoutMs) break;
-          // A shared cooldown may outlast the token. Renew, then re-enter pacing instead of bursting.
+        let currentToken = await this.tokenForRead(accessToken, options);
+        let tokenObtainedAt = this.retryPolicy.now();
+        phase = "admission";
+        const queuedAt = this.retryPolicy.now();
+        try {
+          await this.waitForReadSlot(options.signal, options.getAccessToken ? async () => {
+            if (this.retryPolicy.now() - tokenObtainedAt < packageReadTimeoutMs) return;
+            // Keep the queue position: rejoining a busy queue can age every renewed token.
+            phase = "token";
+            currentToken = await this.tokenForRead(accessToken, options);
+            tokenObtainedAt = this.retryPolicy.now();
+            phase = "admission";
+          } : undefined);
+        } finally {
+          options.diagnostics?.recordWait(stage, "admissionWaitMs", this.retryPolicy.now() - queuedAt);
         }
         phase = "request";
         dispatchedAttempts += 1;
@@ -413,7 +415,7 @@ export class GraphPackagesClient {
     });
   }
 
-  private async waitForReadSlot(signal?: AbortSignal) {
+  private async waitForReadSlot(signal?: AbortSignal, beforeAdmission?: () => Promise<void>) {
     if (this.readIntervalMs === 0 && this.retryPolicy.throttledReadIntervalMs === 0) return;
     const admission = this.readQueue.then(async () => {
       signal?.throwIfAborted();
@@ -421,8 +423,14 @@ export class GraphPackagesClient {
         const now = this.retryPolicy.now();
         if (this.cooldownUntil - now > this.retryPolicy.maxRetryAfterMs && this.cooldownError) throw this.cooldownError;
         const waitMs = Math.max(this.nextReadAt, this.cooldownUntil) - now;
-        if (waitMs <= 0) break;
-        await waitForReadRetry(this.retryPolicy.delay, waitMs, signal);
+        if (waitMs > 0) {
+          await waitForReadRetry(this.retryPolicy.delay, waitMs, signal);
+          continue;
+        }
+        await beforeAdmission?.();
+        signal?.throwIfAborted();
+        // An in-flight response may extend the shared cooldown during token renewal.
+        if (Math.max(this.nextReadAt, this.cooldownUntil) <= this.retryPolicy.now()) break;
       }
       signal?.throwIfAborted();
       this.nextReadAt = this.retryPolicy.now() + this.readIntervalMs;
@@ -438,7 +446,7 @@ export class GraphPackagesClient {
 }
 
 export async function updatePackageAccess(
-  client: GraphPackagesClient,
+  client: Pick<GraphPackagesClient, "getPackageDetails" | "patchPackageAccess">,
   accessToken: string,
   id: string,
   update: PackageAccessUpdate,
@@ -1080,7 +1088,7 @@ export async function graphError(response: Response, signal?: AbortSignal) {
   return graphResponseError(response, body);
 }
 
-function graphResponseError(response: Response, body = "") {
+export function graphResponseError(response: Response, body = "") {
   const message = `Microsoft Graph request failed with status ${response.status}.`;
   let code = "graph_error";
   let providerErrorCode: string | undefined;

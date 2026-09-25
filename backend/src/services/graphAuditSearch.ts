@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 import { AppError } from "../errors.js";
-import { boundedProviderText } from "./providerJson.js";
+import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
 import {
   purviewAuditPresetIds,
   purviewAuditPresets,
@@ -85,7 +85,8 @@ export class GraphAuditSearchClient {
     if (response.status !== 201) throw providerFailure(response);
     let value: unknown;
     try {
-      value = await responseJson(response, attempt.signal);
+      value = await responseJson(response, attempt.signal, options.signal);
+      if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
     } catch (error) {
       if (isResponseConsumptionFailure(error)) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create response was interrupted and must be reconciled before any new create.");
       throw error;
@@ -97,7 +98,9 @@ export class GraphAuditSearchClient {
     const attempt = await this.request(token, queryUrl(providerQueryId), { method: "GET", ...options, retry: true });
     const { response } = attempt;
     if (response.status !== 200) throw providerFailure(response);
-    return parseDirectQuery(await responseJson(response, attempt.signal), "get");
+    const value = await responseJson(response, attempt.signal, options.signal);
+    if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
+    return parseDirectQuery(value, "get");
   }
 
   async listQueries(token: string, options: ProviderRequestOptions & { maximumPages?: number } = {}) {
@@ -113,7 +116,9 @@ export class GraphAuditSearchClient {
         beforeRequest: options.beforeRequest, onResponse: options.onResponse, retry: true });
       const { response } = attempt;
       if (response.status !== 200) throw providerFailure(response);
-      const envelope = parseCollection(await responseJson(response, attempt.signal), "query");
+      const value = await responseJson(response, attempt.signal, options.signal);
+      if (attempt.signal.aborted) throw responseConsumptionError(attempt.signal.reason, options.signal);
+      const envelope = parseCollection(value, "query");
       validateNextLink(envelope.nextLink, queryPath, seen);
       result.push(...envelope.value.map(value => parseDirectQuery(value, "list")));
       next = envelope.nextLink;
@@ -144,10 +149,12 @@ export class GraphAuditSearchClient {
         const { response } = attempt;
         if (response.status !== 200) throw providerFailure(response);
         text = await boundedProviderText(response, maximumResponseBytes, attempt.signal);
+        attempt.signal.throwIfAborted();
       } catch (error) {
-        const partialReason = safePartialPageReason(error);
+        const failure = responseConsumptionError(error, options.signal);
+        const partialReason = safePartialPageReason(failure);
         if (pageCount > 0 && partialReason) return finishResult(records, pageCount, providerRowCount, byteCount, unknownFieldCount, false, next, partialReason);
-        throw error;
+        throw failure;
       }
       byteCount += Buffer.byteLength(text);
       if (byteCount > purviewMaximumResultBytes) {
@@ -215,32 +222,32 @@ export class GraphAuditSearchClient {
         try {
           await requestCallback(() => options.onResponse?.(responseRequestId(response)), signal);
         } catch (error) {
-          await cancelResponse(response);
+          cancelResponse(response);
           throw error;
         }
         if (isRedirect(response.status)) {
-          await cancelResponse(response);
+          cancelResponse(response);
           throw new AppError(502, "invalid_provider_link", "Microsoft Graph returned an unexpected redirect.");
         }
         if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
           const delay = retryDelay(response.headers.get("retry-after"), response.headers.get("date"), attempt, this.dependencies.random());
           if (delay >= maximumRequestBudgetMs - (this.now() - startedAt)) {
-            await cancelResponse(response);
+            cancelResponse(response);
             return { response, signal };
           }
-          await cancelResponse(response);
+          cancelResponse(response);
           await this.dependencies.wait(delay, options.signal);
           continue;
         }
-        if (response.status !== (options.create ? 201 : 200)) await cancelResponse(response);
+        if (response.status !== (options.create ? 201 : 200)) cancelResponse(response);
         return { response, signal };
       } catch (error) {
         if (options.signal?.aborted) throw options.signal.reason;
+        if (error instanceof AppError) throw error;
         if (signal.aborted) {
           if (options.create) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create outcome is unknown and must be reconciled before any new create.");
           throw new AppError(502, "provider_error", "Microsoft Graph Audit Search exhausted its request time budget.");
         }
-        if (error instanceof AppError) throw error;
         if (options.create) throw new AppError(409, "audit_create_inconclusive", "The Audit Search create outcome is unknown and must be reconciled before any new create.");
         if (attempt === maximumAttempts) throw new AppError(502, "provider_error", "Microsoft Graph Audit Search failed within its bounded network retry budget.");
         const delay = retryDelay(null, null, attempt, this.dependencies.random());
@@ -424,13 +431,18 @@ function parseCollection(value: unknown, kind: "query" | "record") {
   return { value: value.value, nextLink: nextLink ?? null as string | null };
 }
 
-async function responseJson(response: Response, signal?: AbortSignal) {
+async function responseJson(response: Response, signal?: AbortSignal, cancellationSignal?: AbortSignal) {
   try {
-    return parseJson(await boundedProviderText(response, maximumResponseBytes, signal));
+    return await boundedProviderJson<unknown>(response, signal, maximumResponseBytes);
   } catch (error) {
-    if (error instanceof AppError) throw error;
-    throw new AppError(502, "provider_error", "Microsoft Graph Audit Search response consumption failed within its attempt deadline.");
+    throw responseConsumptionError(error, cancellationSignal);
   }
+}
+
+function responseConsumptionError(error: unknown, cancellationSignal?: AbortSignal) {
+  if (cancellationSignal?.aborted) return cancellationSignal.reason;
+  return error instanceof AppError ? error
+    : new AppError(502, "provider_error", "Microsoft Graph Audit Search response consumption failed within its attempt deadline.");
 }
 
 function parseJson(text: string) {
@@ -469,7 +481,7 @@ async function requestCallback(callback: () => Promise<void> | undefined, signal
   try {
     await Promise.race([callback(), aborted]);
   } catch (error) {
-    if (signal.aborted || error instanceof AppError) throw error;
+    if (error instanceof AppError) throw error;
     throw new AppError(500, "internal_error", "Audit Search request bookkeeping failed.");
   } finally {
     signal.removeEventListener("abort", onAbort);
@@ -486,8 +498,9 @@ function retryDelay(retryAfter: string | null, responseDate: string | null, atte
   return Math.min(250 * 2 ** (attempt - 1) + Math.floor(random * 250), 5_000);
 }
 
-async function cancelResponse(response: Response) {
-  try { await response.body?.cancel(); }
+function cancelResponse(response: Response) {
+  // Cleanup may never settle; it must not hold up status handling or bounded retries.
+  try { void response.body?.cancel().catch(() => undefined); }
   catch { /* Preserve the request outcome when response disposal fails. */ }
 }
 
@@ -501,7 +514,6 @@ function safePartialPageReason(error: unknown): PurviewAuditPartialReason | null
     return error.code as PurviewAuditPartialReason;
   }
   if (error instanceof DOMException && error.name === "TimeoutError") return "audit_activation_timeout";
-  if (error instanceof TypeError) return "provider_error";
   return null;
 }
 

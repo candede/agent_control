@@ -40,25 +40,40 @@ export function packageControlIdentityChanged(current: CopilotPackageDetail, inc
   for (const key of ["manifestId", "appId", "assetId", "version", "manifestVersion"] as const) {
     const before = current[key];
     const after = incoming[key];
-    if (before && after && (normalizedGuid(before) ?? before) !== (normalizedGuid(after) ?? after)) return true;
+    if (after && (normalizedGuid(before) ?? before) !== (normalizedGuid(after) ?? after)) return true;
   }
   const types = (values: string[]) => JSON.stringify([...new Set(values.map(value => value.toLowerCase()))].sort());
-  if (incoming.elementTypes?.length && current.elementTypes?.length
-    && types(incoming.elementTypes) !== types(current.elementTypes)) return true;
+  if (incoming.elementTypes?.length && types(incoming.elementTypes) !== types(current.elementTypes ?? [])) return true;
   if (incoming.elementDetails === undefined) return false;
+  const incomingDetails = incoming.elementDetails.filter(group => group.elements.length);
+  const declarativeCount = (value: CopilotPackageDetail) => value.elementDetails?.reduce((count, group) =>
+    count + (isPackageElementType(group.elementType, "DeclarativeCopilots") ? group.elements.length : 0), 0) ?? 0;
+  const nextDeclarativeCount = declarativeCount(incoming);
+  if (nextDeclarativeCount) {
+    const previousDeclarativeCount = declarativeCount(current);
+    const previouslyDeclarative = previousDeclarativeCount > 0
+      || current.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots"));
+    if (!previouslyDeclarative || nextDeclarativeCount > 1 && nextDeclarativeCount !== previousDeclarativeCount) return true;
+  }
   const previous = readPackageAgentMetadata(current);
-  const next = readPackageAgentMetadata(incoming);
+  const next = readPackageAgentMetadata({ ...incoming, elementDetails: incomingDetails });
   if (next.status === "conflicting" || next.status === "unmatched" && next.invalidMetadata) return true;
-  if (previous.identity && next.identity) {
+  if (next.identity) {
     for (const key of ["environmentId", "cdsBotId", "schemaName", "manifestId", "entraApplicationId"] as const) {
-      if (previous.identity[key] !== undefined && next.identity[key] !== undefined && previous.identity[key] !== next.identity[key]) return true;
+      if (next.identity[key] !== undefined && previous.identity?.[key] !== next.identity[key]) return true;
     }
-    if (previous.identity.graphAgentIds.length && next.identity.graphAgentIds.length
-      && JSON.stringify(previous.identity.graphAgentIds.slice().sort()) !== JSON.stringify(next.identity.graphAgentIds.slice().sort())) return true;
+    if (next.identity.graphAgentIds.length
+      && JSON.stringify(previous.identity?.graphAgentIds ?? []) !== JSON.stringify(next.identity.graphAgentIds)) return true;
   }
   const previousBot = readPackageCustomEngineBotIdentity(current);
-  const suppliesBotIdentity = ["Bots", "CustomEngineCopilots"].every(type =>
-    incoming.elementDetails?.some(group => isPackageElementType(group.elementType, type) && group.elements.length));
-  return Boolean(previousBot && suppliesBotIdentity
-    && readPackageCustomEngineBotIdentity(incoming)?.botApplicationId !== previousBot.botApplicationId);
+  const incomingBotGroups = incomingDetails.filter(group =>
+    ["Bots", "CustomEngineCopilots"].some(type => isPackageElementType(group.elementType, type)));
+  if (!previousBot || !incomingBotGroups.length) return false;
+  // Compare positive readback evidence with the retained complementary type; omissions are not deletions.
+  const elementDetails = [
+    ...current.elementDetails?.filter(group =>
+      !incomingBotGroups.some(incomingGroup => isPackageElementType(group.elementType, incomingGroup.elementType))) ?? [],
+    ...incomingBotGroups,
+  ];
+  return readPackageCustomEngineBotIdentity({ ...current, elementDetails })?.botApplicationId !== previousBot.botApplicationId;
 }

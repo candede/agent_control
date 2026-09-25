@@ -297,6 +297,33 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     await expect(client.runQuery("token", filters())).rejects.toMatchObject({ code: "provider_schema" });
   });
 
+  it.each([
+    ["agent_activity", "InvokeAgent", "invoke_agent"],
+    ["agent_activity", "InferenceCall", "chat"],
+    ["agent_tools", "ExecuteToolBySDK", "execute_tool"],
+  ] as const)("preserves empty optional completion dates for %s / %s", async (templateId, actionType, operation) => {
+    const selected = filters(templateId);
+    const query = createHuntingRequest(selected).Query;
+    const guard = query.split("\n").find(line => line.startsWith("| extend ProjectionValid="));
+    for (const source of ["Event.CreationTime", "Event.CompletionTime", "CopilotEventData.CompletionTime"]) {
+      expect(guard).toContain(`or (gettype(${source})=="string" and tostring(${source})=="")`);
+      expect(guard).toContain(`isnotnull(todatetime(${source}))`);
+    }
+    expect(guard).not.toContain('tostring(Timestamp)==""');
+    const client = new GraphHuntingClient({ fetch: vi.fn(async () => response(templateId, [row(templateId, {
+      ActionType: actionType, Operation: operation, CreationTime: "", CompletionTime: "", CompletionTimeState: "empty",
+      ThreadIdState: actionType === "InferenceCall" ? "null" : "unavailable",
+      ChannelNameState: actionType === "InferenceCall" ? "unavailable" : "null",
+      HumanUserKeyState: actionType === "InvokeAgent" ? "null" : "unavailable",
+      AgentUserKeyState: actionType === "InvokeAgent" ? "unavailable" : "null",
+      TargetAgentUserKeyState: actionType === "InvokeAgent" ? "null" : "unavailable",
+      ErrorTypeState: templateId === "agent_tools" ? "unavailable" : "null",
+    })])), wait: vi.fn(), random: () => 0 });
+    await expect(client.runQuery("token", selected)).resolves.toMatchObject({ rows: [{
+      creationTime: null, completionTime: null, durationMilliseconds: null, fieldStates: { completionTime: "empty" },
+    }] });
+  });
+
   it("rejects oversized exact identifiers instead of silently truncating them", async () => {
     const client = new GraphHuntingClient({ fetch: vi.fn(async () => response("agents_inventory", [row("agents_inventory", { AgentId: "a".repeat(513) })])) as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(client.runQuery("token", filters("agents_inventory"))).rejects.toMatchObject({ code: "provider_schema" });
@@ -409,6 +436,40 @@ describe("Microsoft Graph v1.0 curated hunting contract", () => {
     const client = new GraphHuntingClient({ fetch: vi.fn(async () => new Response(body, { status: 200 })) as typeof fetch, wait: vi.fn(), random: () => 0, requestTimeoutMs: 5 });
     await expect(client.runQuery("token", filters())).rejects.toMatchObject({ code: "provider_error" });
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([3, 4].flatMap(depth =>
+    ["caller", "attempt", "query"].map(source => ({ depth, source })),
+  ))("honors $source cancellation after body completion ($depth microtasks)", async ({ depth, source }) => {
+    const controller = new AbortController();
+    const reason = new DOMException("query stopped", source === "caller" ? "AbortError" : "TimeoutError");
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = source === "caller" ? undefined : vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds =>
+      milliseconds === (source === "attempt" ? 10_000 : 30_000) ? controller.signal : timeout(milliseconds));
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode(JSON.stringify({ schema: expectedHuntingSchema("agent_activity"), results: [] })));
+      },
+      pull(stream) {
+        stream.close();
+        const abortAfterMicrotasks = (remaining: number) => {
+          if (remaining === 0) controller.abort(reason);
+          else queueMicrotask(() => abortAfterMicrotasks(remaining - 1));
+        };
+        abortAfterMicrotasks(depth);
+      },
+    }, { highWaterMark: 0 });
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(body));
+    const wait = vi.fn();
+    const client = new GraphHuntingClient({ fetch: fetcher, wait, random: () => 0 });
+    try {
+      const pending = client.runQuery("token", filters(), source === "caller" ? { signal: controller.signal } : {});
+      if (source === "caller") await expect(pending).rejects.toBe(reason);
+      else await expect(pending).rejects.toMatchObject({ status: 502, code: "provider_error" });
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(wait).not.toHaveBeenCalled();
+      expect(body.locked).toBe(false);
+    } finally { timeoutSpy?.mockRestore(); }
   });
 
   it("applies the attempt deadline when an injected transport ignores its abort signal", async () => {

@@ -1,6 +1,6 @@
 import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
-import { boundedProviderJson, ProviderResponseLimitError } from "./providerJson.js";
+import { boundedProviderJson, boundedProviderText, ProviderResponseLimitError } from "./providerJson.js";
 import { GraphPackagesClient, graphError, type FetchLike } from "./graphPackages.js";
 import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { allowlistedPackage } from "./packageObservation.js";
@@ -22,6 +22,13 @@ describe("bounded provider observations", () => {
   });
 
   describe("bounded report download cleanup", () => {
+    it("rejects malformed UTF-8 reports before CSV parsing", async () => {
+      const fetcher = vi.fn<FetchLike>(async () => new Response(Uint8Array.of(0xff)));
+      await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token"))
+        .rejects.toMatchObject({ status: 502, code: "provider_schema", message: "Provider response was not valid UTF-8." });
+      expect(fetcher).toHaveBeenCalledOnce();
+    });
+
     it.each(["stalled", "rejected"])("does not let %s redirect cleanup block an allowed report request", async mode => {
       const cleanup = Promise.withResolvers<void>();
       const cancel = vi.fn(() => mode === "stalled" ? cleanup.promise : Promise.reject(new Error("cleanup failed")));
@@ -76,6 +83,32 @@ describe("bounded provider observations", () => {
       await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token", AbortSignal.abort(reason))).rejects.toBe(reason);
       expect(fetcher).not.toHaveBeenCalled();
     });
+
+    it.each([3, 4].flatMap(depth => ["cancellation", "deadline"].map(mode => ({ depth, mode }))))(
+      "preserves report $mode between body completion and CSV parsing ($depth microtasks)", async ({ depth, mode }) => {
+        const controller = new AbortController();
+        const reason = new DOMException(mode, mode === "cancellation" ? "AbortError" : "TimeoutError");
+        const body = new ReadableStream<Uint8Array>({
+          start(stream) { stream.enqueue(new TextEncoder().encode("CSV must not be parsed")); },
+          pull(stream) {
+            stream.close();
+            const abortAfterMicrotasks = (remaining: number) => {
+              if (remaining === 0) controller.abort(reason);
+              else queueMicrotask(() => abortAfterMicrotasks(remaining - 1));
+            };
+            abortAfterMicrotasks(depth);
+          },
+        }, { highWaterMark: 0 });
+        const fetcher = vi.fn<FetchLike>(async () => new Response(body));
+        const timeout = mode === "deadline" ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal) : undefined;
+        try {
+          await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token", mode === "cancellation" ? controller.signal : undefined))
+            .rejects.toBe(reason);
+          expect(fetcher).toHaveBeenCalledOnce();
+          expect(body.locked).toBe(false);
+        } finally { timeout?.mockRestore(); }
+      },
+    );
   });
 
   it("cancels a response body even when its deadline elapsed before consumption", async () => {
@@ -97,6 +130,26 @@ describe("bounded provider observations", () => {
     await expect(boundedProviderJson(new Response("{"))).rejects.toMatchObject({ code: "provider_schema" });
     const error = await graphError(Response.json({ error: { code: "Forbidden", message: "denied", token: "never-return" }, raw: "never-return" }, { status: 403 }));
     expect(JSON.stringify(error.details)).not.toContain("never-return");
+  });
+
+  it.each([
+    { label: "invalid leading byte", bytes: [0xff] },
+    { label: "overlong encoding", bytes: [0xc0, 0xaf] },
+    { label: "incomplete sequence", bytes: [0xe2, 0x82] },
+    { label: "encoded surrogate", bytes: [0xed, 0xa0, 0x80] },
+    { label: "out-of-range code point", bytes: [0xf4, 0x90, 0x80, 0x80] },
+  ])("rejects an $label without replacement-decoding native identifiers", async ({ bytes }) => {
+    const body = Buffer.concat([Buffer.from('{"id":"private-'), Buffer.from(bytes), Buffer.from('"}')]);
+    const expected = { status: 502, code: "provider_schema", message: "Provider response was not valid UTF-8." };
+    await expect(boundedProviderText(new Response(body))).rejects.toMatchObject(expected);
+    await expect(boundedProviderJson(new Response(body))).rejects.toMatchObject(expected);
+  });
+
+  it.each([403, 429])("retains HTTP %s diagnostics when its error body has malformed UTF-8", async status => {
+    const error = await graphError(new Response(Uint8Array.of(0xff), { status }));
+    expect(error).toMatchObject({ status, code: "graph_error", details: { httpStatus: status } });
+    expect(error.details).not.toHaveProperty("providerErrorCode");
+    if (status === 429) expect(error.details).toMatchObject({ throttled: true });
   });
 
   it("allows an explicit larger JSON budget without changing the shared 2 MB default", async () => {
@@ -169,7 +222,7 @@ describe("bounded provider observations", () => {
   });
 
   it("counts UTF-8 bytes across chunk boundaries without corrupting split characters", async () => {
-    const value = { value: "é😀" };
+    const value = { value: "é😀\uFFFD" };
     const bytes = new TextEncoder().encode(JSON.stringify(value));
     const response = () => new Response(new ReadableStream<Uint8Array>({
       start(controller) {
@@ -180,6 +233,10 @@ describe("bounded provider observations", () => {
     await expect(boundedProviderJson(response(), undefined, bytes.length)).resolves.toEqual(value);
     await expect(boundedProviderJson(response(), undefined, bytes.length - 1))
       .rejects.toEqual(new ProviderResponseLimitError(bytes.length - 1, bytes.length));
+  });
+
+  it("preserves the UTF-8 byte-order mark in text responses", async () => {
+    await expect(boundedProviderText(new Response("\uFEFFheader,value"))).resolves.toBe("\uFEFFheader,value");
   });
 
   it("omits unknown package fields with value-free diagnostics", () => {

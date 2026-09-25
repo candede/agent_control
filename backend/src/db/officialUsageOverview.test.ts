@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { retainUntilConverged } from "../../scripts/database.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
 import { OfficialUsageOverviewService } from "../services/officialUsageOverview.js";
@@ -368,5 +369,45 @@ describe.sequential("cumulative official agent/activity overview SQL", () => {
       },
       agents: { count: 0, value: [], limit: 1, offset: 10 },
     });
+  });
+
+  it("keeps corrected originals excluded after deleted correction payloads are purged", async () => {
+    const owner = scope();
+    const metadata = window("2026-07-09", "2026-07-15");
+    const original = await importBundle(owner, {
+      metadata, agents: [{ id: "incorrect", date: "2026-07-15" }],
+    });
+    const corrected = await importBundle(owner, {
+      metadata, correctionOfSetId: original.setId, agents: [{ id: "correct", date: "2026-07-14" }],
+    });
+    await deleteSet(owner, corrected.setId);
+    await fixture.operator.query(`UPDATE official_usage_sets
+      SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1`, [corrected.setId]);
+    await fixture.operator.query(`UPDATE official_usage_versions
+      SET deleted_at=clock_timestamp()-interval '91 days'
+      WHERE tenant_id=$1 AND deleted_at IS NOT NULL`, [owner.tenantId]);
+    await retainUntilConverged(fixture.operator);
+
+    expect((await overview.getOverview(owner.tenantId)).summary).toMatchObject({
+      retainedSets: 0, reportedAgents: 0, usedAgents: 0, activeAgents30Days: 0,
+    });
+    expect((await repository.getPublished(owner.tenantId, original.setId)).reports.agents?.rows[0].agentId)
+      .toBe("incorrect");
+    expect((await fixture.runtime.query(`SELECT supersedes_set_id,complete FROM official_usage_sets
+      WHERE id=$1`, [corrected.setId])).rows).toEqual([{ supersedes_set_id: original.setId, complete: true }]);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_set_versions
+      WHERE set_id=$1`, [corrected.setId])).rows[0].count).toBe(0);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_row_facts
+      WHERE tenant_id=$1 AND row_data->>'agentId'='correct'`, [owner.tenantId])).rows[0].count).toBe(0);
+
+    await deleteSet(owner, original.setId);
+    await fixture.operator.query(`UPDATE official_usage_sets
+      SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1`, [original.setId]);
+    await fixture.operator.query(`UPDATE official_usage_versions
+      SET deleted_at=clock_timestamp()-interval '91 days'
+      WHERE tenant_id=$1 AND deleted_at IS NOT NULL`, [owner.tenantId]);
+    await retainUntilConverged(fixture.operator);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM official_usage_sets
+      WHERE tenant_id=$1`, [owner.tenantId])).rows[0].count).toBe(0);
   });
 });

@@ -495,6 +495,41 @@ describe("explicit package-to-agent identity", () => {
     })])[0].status).toBe("unmatched");
   });
 
+  it.each(["stale", "missing", "invalidated", "revalidation_required"] as const)(
+    "does not reuse %s custom-engine details for links or source-only groups",
+    state => {
+      const native = customEnginePackage("native", {
+        SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+      });
+      const alias = customEnginePackage("alias");
+      const rejected = {
+        ...customEnginePackage("rejected"),
+        detailFreshness: {
+          state: state === "revalidation_required" ? "fresh" as const : state,
+          observedAt: null, expiresAt: null,
+        },
+        ...(state === "revalidation_required" ? { identityRevalidationRequired: true as const } : {}),
+      };
+      const expectedRejection = resolvePackageAgentLinks("tenant-a", [rejected], [])[0];
+      const packages = [native, alias, rejected];
+      for (const resources of [[], [resource({ details: { schemaName: "cr_agent" } })]]) {
+        for (const ordered of [packages, [...packages].reverse()]) {
+          const links = resolvePackageAgentLinks("tenant-a", ordered, resources);
+          expect(links.find(link => link.packageId === rejected.id)).toEqual(expectedRejection);
+          const accepted = links.filter(link => link.packageId !== rejected.id);
+          if (resources.length) expect(accepted.map(link => link.status)).toEqual(["matched", "matched"]);
+          else {
+            expect(accepted).toMatchObject(accepted.map(() => ({
+              status: "unmatched", grouping: { environmentId },
+            })));
+            const groups = accepted.map(link => link.status === "unmatched" ? link.grouping?.key : undefined);
+            expect(new Set(groups).size).toBe(1);
+          }
+        }
+      }
+    },
+  );
+
   it("does not let a shared bot application collapse distinct native agents or environments", () => {
     const values = [
       customEnginePackage("first", { SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_one" } }),

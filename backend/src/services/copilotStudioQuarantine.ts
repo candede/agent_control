@@ -68,7 +68,9 @@ export class CopilotStudioQuarantineClient {
 
     for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
       try {
-        return await this.requestStatus(url, accessToken, { method: "GET" }, validatedTarget, correlationId, operationSignal);
+        const status = await this.requestStatus(url, accessToken, { method: "GET" }, validatedTarget, correlationId, operationSignal);
+        operationSignal.throwIfAborted();
+        return status;
       } catch (error) {
         if (operationSignal.aborted) throw normalizedAbort(operationSignal);
         if (attempt === this.retryPolicy.maxAttempts || !isRetryableReadError(error)) throw error;
@@ -112,10 +114,10 @@ export class CopilotStudioQuarantineClient {
     correlationId: string,
     callerSignal?: AbortSignal,
   ): Promise<CopilotStudioQuarantineStatus> {
-    callerSignal?.throwIfAborted();
     const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
     const signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
     try {
+      signal.throwIfAborted();
       const response = await this.fetcher(url, {
         ...init,
         signal,
@@ -127,15 +129,16 @@ export class CopilotStudioQuarantineClient {
         },
       });
       if (response.redirected || response.url && !isQuarantineProviderUrl(response.url)) {
-        await disposeResponse(response);
+        disposeResponse(response);
         throw new AppError(502, "invalid_provider_link", "Copilot Studio quarantine refused a redirected or foreign provider response.");
       }
       if (!response.ok) throw await quarantineProviderError(response, signal);
       if (response.status !== 200) {
-        await disposeResponse(response);
+        disposeResponse(response);
         throw new AppError(502, "provider_unexpected_status", "Copilot Studio quarantine returned an unexpected success status.");
       }
       const text = await boundedProviderText(response, maximumResponseBytes, signal);
+      signal.throwIfAborted();
       return {
         ...target,
         ...parseQuarantineStatus(text),
@@ -161,10 +164,17 @@ export async function verifyCopilotStudioQuarantineConverged(
   const delayMs = Math.min(Math.max(Math.trunc(options.delayMs ?? 500), 0), 5_000);
   const wait = options.delay ?? delay;
   let lastStatus: CopilotStudioQuarantineStatus | undefined;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    lastStatus = await client.getStatus(accessToken, target, options);
-    if (lastStatus.isBotQuarantined === requestedState) return { status: lastStatus, readbackCount: attempt };
-    if (attempt < maxAttempts && delayMs > 0) await waitForRetry(wait, delayMs, options.signal);
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      options.signal?.throwIfAborted();
+      lastStatus = await client.getStatus(accessToken, target, options);
+      options.signal?.throwIfAborted();
+      if (lastStatus.isBotQuarantined === requestedState) return { status: lastStatus, readbackCount: attempt };
+      if (attempt < maxAttempts && delayMs > 0) await waitForRetry(wait, delayMs, options.signal);
+    }
+  } catch (error) {
+    if (options.signal?.aborted) throw normalizedAbort(options.signal);
+    throw error;
   }
   throw new AppError(409, "verification_inconclusive", "Copilot Studio accepted the request but the expected quarantine state did not converge within the bounded readback window.", { lastStatus, readbackCount: maxAttempts });
 }
@@ -296,8 +306,9 @@ function isQuarantineProviderUrl(value: string) {
   return url.origin === quarantineOrigin && /^\/copilotstudio\/environments\/[^/]+\/bots\/[^/]+\/api\/botQuarantine(?:\/(?:SetAsQuarantined|SetAsUnquarantined))?$/.test(url.pathname) && url.searchParams.get("api-version") === quarantineApiVersion;
 }
 
-async function disposeResponse(response: Response) {
-  await response.body?.cancel().catch(() => undefined);
+function disposeResponse(response: Response) {
+  // Provider cleanup must not hold the request open beyond its deadline.
+  void response.body?.cancel().catch(() => undefined);
 }
 
 function normalizedAbort(signal: AbortSignal) {

@@ -74,6 +74,23 @@ describe("actual permission issues", () => {
     expect(issue?.action).toEqual({ label: "Sign in again", href: "/api/auth/login?returnTo=%2Fpermissions" });
     expect(issue?.message).not.toMatch(/permission|consent/);
   });
+  it.each(["interaction_required", "authorization_expired"])("routes app-only %s checks and operation failures to administrator recovery", category => {
+    const view = fixture("unknown");
+    view.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
+    view.decision.capabilityId = view.definition.id;
+    view.decision.evidence = { category };
+    for (const operation of [false, true]) {
+      if (operation) {
+        view.operationFailure = { status: "unknown", checkedAt: view.decision.checkedAt!, expiresAt: view.decision.expiresAt!,
+          evidence: { category }, remediation: [] };
+        view.decision = { ...view.decision, status: "available", authorized: true, evidence: undefined };
+      }
+      const issue = permissionIssue(view, now);
+      expect(issue?.action).toEqual({ label: "Admin setup", href: "https://entra.microsoft.com/" });
+      expect(issue?.message).toMatch(/administrator.*application/i);
+      expect(issue?.message).not.toMatch(/sign in/i);
+    }
+  });
   it.each(["graph.licenses.read", "reports.copilotUsage.read", "graph.agentIdentity.read"] as const)(
     "reports a real %s operation failure separately from its admission decision and clears it on recovery", id => {
       const view = fixture("available");

@@ -207,6 +207,8 @@ export type UnifiedAgentInventoryVerification = {
 
 export type UnifiedAgentInventoryPage = {
   revision?: string;
+  /** Earliest known current evidence expiry across the complete inventory, before filtering or paging. */
+  expiresAt?: string | null;
   usageContext?: AgentUsageContext;
   inventoryOverview?: {
     availableToUsers: number;

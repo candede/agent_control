@@ -25,7 +25,8 @@ import {
 import { downloadBlob } from "../agentExport";
 import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { auditRouteSearch, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
+import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
+import { auditDefaultPageSize, auditMaximumSearchLength } from "../../../backend/src/types/audit";
 
 type AuditFilter = "all" | LocalAuditAction;
 type StatusFilter = "all" | AuditStatus;
@@ -34,7 +35,7 @@ type AuditLogViewProps = {
   agents: Pick<CopilotPackage, "id" | "displayName">[];
 };
 
-const auditPageSize = 100;
+const auditPageSize = auditDefaultPageSize;
 const auditActionLabels: Record<LocalAuditAction, string> = {
   block: "Block",
   unblock: "Unblock",
@@ -135,7 +136,7 @@ function LocalAuditLogView({
     queryFn: ({ signal }) => getAuditEvents(auditQuery, { signal }),
   });
   const lastPageIndex = auditRead.data
-    ? Math.max(Math.ceil(auditRead.data.count / auditPageSize) - 1, 0)
+    ? Math.min(Math.max(Math.ceil(auditRead.data.count / auditPageSize) - 1, 0), maximumAuditPageIndex)
     : 0;
   const deferredMatches = query.trim() === deferredQuery.trim();
   const exportDenial = exportError?.key === key && exportError.denied ? exportError.message : undefined;
@@ -178,7 +179,7 @@ function LocalAuditLogView({
   ).length;
   const hasActiveAuditFilters =
     query.trim().length > 0 || actionFilter !== "all" || statusFilter !== "all";
-  const totalPages = Math.max(Math.ceil(totalCount / auditPageSize), 1);
+  const totalPages = Math.min(Math.max(Math.ceil(totalCount / auditPageSize), 1), maximumAuditPageIndex + 1);
   const pageStart = totalCount === 0 ? 0 : pageIndex * auditPageSize + 1;
   const pageEnd = Math.min((pageIndex + 1) * auditPageSize, totalCount);
 
@@ -233,7 +234,7 @@ function LocalAuditLogView({
           <input
             type="search"
             value={query}
-            maxLength={256}
+            maxLength={auditMaximumSearchLength}
             onChange={(event) => {
               updateRoute({ search: event.target.value, page: 0 });
             }}
@@ -322,6 +323,9 @@ function LocalAuditLogView({
         </div>
       ) : (
         <>
+          {totalCount > (maximumAuditPageIndex + 1) * auditPageSize ? (
+            <p>Audit pagination is bounded. Refine the filters to view older matching events.</p>
+          ) : null}
           <AuditPagination
             pageIndex={pageIndex}
             totalPages={totalPages}

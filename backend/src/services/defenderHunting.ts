@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { config } from "../config.js";
 import { DefenderHuntingRepository, type DefenderHuntingExecution, type DefenderHuntingReadScope, type DefenderHuntingScope } from "../db/defenderHunting.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { DefenderHuntingJob, DefenderHuntingQualificationBinding, DefenderHuntingTokenMode } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -12,6 +12,7 @@ import { capabilities } from "./capabilities.js";
 import { getAuditLog } from "./auditLog.js";
 import { GraphHuntingClient, validateDefenderHuntingFilters } from "./graphHunting.js";
 import { operationalLog } from "./telemetry.js";
+import { requireProviderAdmissions } from "./operationalState.js";
 import { agentInvestigations, assertAgentHuntingScope, bindAgentHuntingFilters } from "./agentInvestigations.js";
 
 type CapabilityId = "defender.hunting.delegated" | "defender.hunting.application";
@@ -46,13 +47,15 @@ const defaultDependencies: Dependencies = {
   agentScope: agentInvestigations.defenderScope.bind(agentInvestigations),
 };
 
-type ActiveHunt = { actor: { tenantId: string; principalId: string }; tokenMode: DefenderHuntingTokenMode;
+type SessionValidation = ReturnType<typeof beginAccountSessionValidation>;
+type ActiveHunt = { actor: { tenantId: string; principalId: string }; tokenMode: DefenderHuntingTokenMode | undefined; qualificationOnly: boolean;
   controller: AbortController; started: Promise<DefenderHuntingJob>; operation: Promise<void> };
 const maximumActiveHunts = 4;
 const activationDeadlineMs = 60_000;
 
 export class DefenderHuntingService {
   private readonly active = new Map<string, ActiveHunt>();
+  private draining = false;
 
   constructor(private readonly repository = new DefenderHuntingRepository(), private readonly dependencies: Dependencies = defaultDependencies) {}
 
@@ -90,38 +93,43 @@ export class DefenderHuntingService {
 
   async startQualification(user: AuthenticatedUser, id: string, agentRecordId?: string) {
     requireViewer(user);
-    const job = await this.get(user, id, agentRecordId);
-    if (!job?.qualification || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Hunting qualification was not found.");
-    requireQualificationRole(user, job.tokenMode);
-    await this.validateQualification(job.qualification, user);
-    return job.status === "waiting_authorization" ? this.start(user, job.id, job.tokenMode, agentRecordId) : job;
+    return this.startAuthorized(user, id, undefined, agentRecordId, true);
   }
 
   start(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, agentRecordId?: string): Promise<DefenderHuntingJob> {
     requireViewer(user);
-    return agentRecordId === undefined ? this.startAuthorized(user, id, tokenMode)
-      : this.get(user, id, agentRecordId).then(() => this.startAuthorized(user, id, tokenMode, agentRecordId));
+    return this.startAuthorized(user, id, tokenMode, agentRecordId);
   }
 
-  private startAuthorized(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, agentRecordId?: string): Promise<DefenderHuntingJob> {
+  private startAuthorized(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
+    agentRecordId?: string, qualificationOnly = false): Promise<DefenderHuntingJob> {
+    id = id.toLowerCase();
+    if (this.draining) throw new AppError(503, "hunting_shutdown", "Hunting is stopping for application shutdown.");
+    requireProviderAdmissions();
     const actor = actorScope(user);
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
+    assertAccountSessionValidation(validation);
     const existing = this.active.get(id);
     if (existing) {
-      return existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId && existing.tokenMode === tokenMode
-        ? existing.started : this.currentJobForStart(user, id, tokenMode, agentRecordId);
+      return existing.actor.tenantId === actor.tenantId && existing.actor.principalId === actor.principalId
+        && existing.tokenMode === tokenMode && existing.qualificationOnly === qualificationOnly && agentRecordId === undefined
+        ? existing.started : this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly);
     }
-    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, agentRecordId);
+    if (this.active.size >= maximumActiveHunts) return this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(activationDeadlineMs)]);
-    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, agentRecordId);
+    const prepared = this.prepareStart(user, actor, id, tokenMode, signal, controller.signal, validation, agentRecordId, qualificationOnly);
     const started = prepared.then(value => value.job);
     let operation: Promise<void>;
-    operation = prepared.then(value => value.run?.(), () => undefined).catch(error => {
-      operationalLog("error", "hunting_worker_failed", { jobId: id,
-        errorCode: error instanceof AppError ? error.code : "hunting_worker_failed" });
+    operation = prepared.then(value => value.run?.(), error => {
+      if (signal.aborted && error !== signal.reason) throw error;
     })
       .finally(() => { if (this.active.get(id)?.operation === operation) this.active.delete(id); });
-    this.active.set(id, { actor, tokenMode, controller, started, operation });
+    void operation.catch(error => {
+      operationalLog("error", "hunting_worker_failed", { jobId: id,
+        errorCode: error instanceof AppError ? error.code : "hunting_worker_failed" });
+    });
+    this.active.set(id, { actor, tokenMode, qualificationOnly, controller, started, operation });
     return started;
   }
 
@@ -178,7 +186,7 @@ export class DefenderHuntingService {
     const job = await this.repository.getJob(readScope, id);
     if (!job) throw new AppError(404, "not_found", "Hunting job was not found.");
     if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
-    this.active.get(id)?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting was cancelled locally."));
+    this.active.get(job.id.toLowerCase())?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting was cancelled locally."));
     return this.repository.cancel(readScope, id);
   }
 
@@ -188,16 +196,19 @@ export class DefenderHuntingService {
     const job = await this.repository.getJob(readScope, id);
     if (!job) throw new AppError(404, "not_found", "Hunting job was not found.");
     if (readScope.entraAgentIds) assertAgentHuntingScope(job.filters, { recordId: agentRecordId!, entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
-    this.active.get(id)?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting local cache was deleted."));
+    this.active.get(job.id.toLowerCase())?.controller.abort(new AppError(409, "hunting_cancelled", "Hunting local cache was deleted."));
     await this.repository.delete(readScope, id);
   }
 
   recover() { return this.repository.recoverInterrupted(); }
 
   async drain() {
+    this.draining = true;
     const active = [...this.active.values()];
     for (const hunt of active) hunt.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit hunting resume."));
-    await Promise.allSettled(active.map(hunt => hunt.operation));
+    const results = await Promise.allSettled(active.map(hunt => hunt.operation));
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   async waitForPrincipalAuthorization(scope: { tenantId: string; principalId: string }) {
@@ -209,76 +220,100 @@ export class DefenderHuntingService {
   }
 
   private async prepareStart(user: AuthenticatedUser, actor: { tenantId: string; principalId: string }, id: string,
-    tokenMode: DefenderHuntingTokenMode, signal: AbortSignal, cancellationSignal: AbortSignal, agentRecordId?: string) {
-    const current = await abortable(this.repository.getJob(await abortable(this.readScope(user, agentRecordId), signal), id), signal);
-    if (!current || current.authorizationPrincipalId !== user.homeAccountId || current.tokenMode !== tokenMode) throw new AppError(404, "not_found", "Hunting job was not found.");
+    tokenMode: DefenderHuntingTokenMode | undefined, signal: AbortSignal, cancellationSignal: AbortSignal,
+    validation: SessionValidation, agentRecordId?: string, qualificationOnly = false) {
+    const current = await abortable(this.currentJobForStart(user, id, tokenMode, agentRecordId, qualificationOnly, signal), signal);
+    assertCurrent(validation, signal);
     if (current.status !== "waiting_authorization") return { job: current };
-    const scope = scopeFromResult(user, tokenMode, current.resultScope);
+    const scope = scopeFromResult(user, current.tokenMode, current.resultScope);
     // Activation commits durable ownership; settle it before handling cancellation.
-    const execution = await this.repository.begin(scope, id);
-    if (signal.aborted) {
+    const execution = await commitAccountSessionValidation(validation, async () => {
+      assertCurrent(validation, signal);
+      return this.repository.begin(scope, id);
+    });
+    try { assertCurrent(validation, signal); }
+    catch (error) {
       try { await this.repository.markWaitingAuthorization(scope, id, execution); } catch (error) {
         if (!(error instanceof AppError && error.code === "hunting_execution_lost")) throw error;
       }
-      signal.throwIfAborted();
+      throw error;
     }
-    return { job: execution.job, run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal, agentRecordId) };
+    return { job: execution.job, run: () => this.run(actor, scope, execution.job, execution, signal, cancellationSignal, validation, agentRecordId) };
   }
 
-  private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode, agentRecordId?: string) {
-    const current = await this.repository.getJob(await this.readScope(user, agentRecordId), id);
-    if (!current || current.authorizationPrincipalId !== user.homeAccountId || current.tokenMode !== tokenMode) throw new AppError(404, "not_found", "Hunting job was not found.");
+  private async currentJobForStart(user: AuthenticatedUser, id: string, tokenMode: DefenderHuntingTokenMode | undefined,
+    agentRecordId?: string, qualificationOnly = false, signal?: AbortSignal) {
+    const readScope = await abortable(this.readScope(user, agentRecordId), signal);
+    signal?.throwIfAborted();
+    const current = await abortable(this.repository.getJob(readScope, id), signal);
+    if (!current || current.authorizationPrincipalId !== user.homeAccountId || tokenMode !== undefined && current.tokenMode !== tokenMode
+      || qualificationOnly && !current.qualification) throw new AppError(404, "not_found", "Hunting job was not found.");
+    if (readScope.entraAgentIds) assertAgentHuntingScope(current.filters, { recordId: agentRecordId!,
+      entraAgentIds: readScope.entraAgentIds, entraAgentApplicationIds: readScope.entraAgentApplicationIds });
+    if (current.qualification) {
+      requireQualificationRole(user, current.tokenMode);
+      await this.validateQualification(current.qualification, user, signal);
+    }
     return current;
   }
 
   private async run(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope, current: DefenderHuntingJob,
-    execution: DefenderHuntingExecution, signal: AbortSignal, cancellationSignal: AbortSignal, agentRecordId?: string) {
+    execution: DefenderHuntingExecution, signal: AbortSignal, cancellationSignal: AbortSignal, validation: SessionValidation, agentRecordId?: string) {
     let auditEvent: Awaited<ReturnType<ReturnType<typeof getAuditLog>["startEvent"]>> | undefined;
     let providerRequestAuthorized = false;
     let providerCompleted = false;
+    let phaseSignal = signal;
+    const pendingAdmissions: Promise<void>[] = [];
     try {
-      const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal, agentRecordId);
-      const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
-        ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(capabilityId), signal), { signal, clearOnSuccess: false });
+      const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal, validation, agentRecordId);
+      const token = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => {
+        assertCurrent(validation, signal);
+        return abortable(scope.tokenMode === "delegated" ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
+          : this.dependencies.applicationToken(capabilityId), signal);
+      }, { signal, clearOnSuccess: false }), signal);
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
       if (current.qualification) await this.validateQualification(current.qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
-        signal.throwIfAborted();
+        assertCurrent(validation, signal);
         requireSamePrincipal(actor, freshUser);
         current.qualification ? requireQualificationRole(freshUser, scope.tokenMode) : requireViewer(freshUser);
       }), signal);
       const audit = this.dependencies.auditLog(actor);
-      auditEvent = await abortable(audit.startEvent({ operationId: `query-hunting:${current.id}:${current.localRequestId}`, scope: "single",
+      auditEvent = await audit.startEvent({ operationId: `query-hunting:${current.id}:${current.localRequestId}`, scope: "single",
         action: "query-hunting", agentId: current.id, actor: freshUser, requestPath: `/api/hunting/jobs/${current.id}`,
-        metadata: { source: "microsoft_defender_hunting", template: current.filters.templateId, mode: current.tokenMode, correlationId: current.localRequestId } }), signal);
-      const result = await this.dependencies.observeOperation(capabilityId, freshUser, () => this.dependencies.runQuery(token, current.filters, {
+        metadata: { source: "microsoft_defender_hunting", template: current.filters.templateId, mode: current.tokenMode, correlationId: current.localRequestId } });
+      assertCurrent(validation, signal);
+      const result = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => this.dependencies.runQuery(token, current.filters, {
         signal, correlationId: current.localRequestId, tenantId: actor.tenantId,
-        beforeRequest: async () => {
-          const requestValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-          await this.validateCurrentAuthority(actor, scope, current, signal, agentRecordId);
-          await abortable(commitAccountSessionValidation(requestValidation, async () => {
-            signal.throwIfAborted();
+        beforeRequest: async (requestSignal = signal) => {
+          await this.validateCurrentAuthority(actor, scope, current, requestSignal, validation, agentRecordId);
+          const admission = commitAccountSessionValidation(validation, async () => {
+            assertCurrent(validation, requestSignal);
             await this.repository.authorizeProviderRequest(scope, current.id, execution);
-          }), signal);
+            assertCurrent(validation, requestSignal);
+          });
+          pendingAdmissions.push(admission);
+          await abortable(admission, requestSignal);
+          assertCurrent(validation, requestSignal);
           providerRequestAuthorized = true;
         },
         onResponse: providerRequestId => this.repository.recordProviderResponse(scope, current.id, execution, providerRequestId),
-      }), { signal });
+      }), { signal }), signal);
       providerCompleted = true;
       signal.throwIfAborted();
       const publicationSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
-      const publicationValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, current, publicationSignal, agentRecordId);
-      const job = await abortable(commitAccountSessionValidation(publicationValidation, async () => {
-        publicationSignal.throwIfAborted();
+      phaseSignal = publicationSignal;
+      const { user: publicationUser } = await this.validateCurrentAuthority(actor, scope, current, publicationSignal, validation, agentRecordId);
+      // Keep durable writes joined until their commit fence and transaction cleanup settle.
+      const job = await commitAccountSessionValidation(validation, async () => {
+        assertCurrent(validation, publicationSignal);
         requireSamePrincipal(actor, publicationUser);
         current.qualification ? requireQualificationRole(publicationUser, scope.tokenMode) : requireViewer(publicationUser);
-        return this.repository.publish(scope, current.id, execution, result);
-      }), publicationSignal);
+        return this.repository.publish(scope, current.id, execution, result, () => assertCurrent(validation, publicationSignal));
+      });
       if (scope.tokenMode === "delegated" && ["succeeded", "partial"].includes(job.status)) {
         try {
+          assertCurrent(validation, publicationSignal);
           await abortable(this.dependencies.recordProviderEvidence(capabilityId, publicationUser, "available", {
             providerRequestId: job.providerRequestId,
           }), publicationSignal);
@@ -292,26 +327,34 @@ export class DefenderHuntingService {
     } catch (error) {
       if (error instanceof AppError && error.code === "hunting_execution_lost") {
         if (auditEvent) await this.dependencies.auditLog(actor).completeEvent(auditEvent.id, {
-          status: signal.aborted ? "cancelled" : "inconclusive", errorCode: error.code });
+          status: phaseSignal.aborted ? "cancelled" : "inconclusive", errorCode: error.code });
         return;
       }
-      if (signal.aborted || isLocalAuthorizationFailure(error)) {
+      if (phaseSignal.aborted || isLocalAuthorizationFailure(error)) {
         try { await this.repository.markWaitingAuthorization(scope, current.id, execution); } catch (markError) {
           if (!(markError instanceof AppError && markError.code === "hunting_execution_lost")) throw markError;
         }
         if (auditEvent) await this.dependencies.auditLog(actor).completeEvent(auditEvent.id, {
-          status: signal.aborted ? "cancelled" : "inconclusive", errorCode: error instanceof AppError ? error.code : "interaction_required" });
+          status: phaseSignal.aborted ? "cancelled" : "inconclusive", errorCode: error instanceof AppError ? error.code : "interaction_required" });
         return;
       }
       const inconclusive = error instanceof AppError && ["provider_schema", "provider_error", "provider_throttled", "invalid_provider_link", "hunting_access_denied",
         "hunting_provider_request_limit", "hunting_job_expired"].includes(error.code);
-      const failed = await this.repository.fail(scope, current.id, execution, error instanceof AppError ? error.code : "provider_error", safeFailureMessage(error), inconclusive);
+      let failed: DefenderHuntingJob | undefined;
+      try {
+        failed = await this.repository.fail(scope, current.id, execution, error instanceof AppError ? error.code : "provider_error", safeFailureMessage(error), inconclusive);
+      } catch (failure) {
+        if (!(failure instanceof AppError && failure.code === "hunting_execution_lost")) throw failure;
+        if (auditEvent) await this.dependencies.auditLog(actor).completeEvent(auditEvent.id, {
+          status: phaseSignal.aborted ? "cancelled" : "inconclusive", errorCode: failure.code });
+        return;
+      }
       if (scope.tokenMode === "delegated" && providerRequestAuthorized && !providerCompleted
         && error instanceof AppError && ["missing_permission", "unsupported", "provider_schema", "provider_error",
           "provider_throttled", "invalid_provider_link", "hunting_access_denied"].includes(error.code)) {
         try {
           const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
-          signal.throwIfAborted();
+          assertCurrent(validation, signal);
           requireSamePrincipal(actor, evidenceUser);
           requireViewer(evidenceUser);
           await abortable(this.dependencies.recordProviderEvidence(capabilityForMode(scope.tokenMode), evidenceUser, providerEvidenceStatus(error), {
@@ -325,19 +368,16 @@ export class DefenderHuntingService {
       if (auditEvent) await this.dependencies.auditLog(actor).completeEvent(auditEvent.id, { status: inconclusive ? "inconclusive" : "failed",
         errorCode: error instanceof AppError ? error.code : "provider_error", metadata: { source: "microsoft_defender_hunting",
           template: current.filters.templateId, mode: current.tokenMode, correlationId: current.localRequestId, requestCount: failed?.providerRequestCount ?? 0 } });
-    }
+    } finally { await Promise.allSettled(pendingAdmissions); }
   }
 
   private async validateCurrentAuthority(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope,
-    current: DefenderHuntingJob, signal: AbortSignal, agentRecordId?: string) {
+    current: DefenderHuntingJob, signal: AbortSignal, validation: SessionValidation, agentRecordId?: string) {
+    assertCurrent(validation, signal);
     const freshUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
-    signal.throwIfAborted();
+    assertCurrent(validation, signal);
     requireSamePrincipal(actor, freshUser);
     current.qualification ? requireQualificationRole(freshUser, scope.tokenMode) : requireViewer(freshUser);
-    if (agentRecordId !== undefined) {
-      const agent = await abortable(this.dependencies.agentScope(actorScope(freshUser), agentRecordId), signal);
-      assertAgentHuntingScope(current.filters, agent);
-    }
     const capabilityId = capabilityForMode(scope.tokenMode);
     if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
     if (current.qualification) await this.validateQualification(current.qualification, freshUser, signal);
@@ -349,7 +389,12 @@ export class DefenderHuntingService {
     } else {
       throw new AppError(403, "hunting_scope_unqualified", "Application hunting requires an exact current retained-scope qualification.");
     }
-    signal.throwIfAborted();
+    assertCurrent(validation, signal);
+    if (agentRecordId !== undefined) {
+      const agent = await abortable(this.dependencies.agentScope(actorScope(freshUser), agentRecordId), signal);
+      assertAgentHuntingScope(current.filters, agent);
+    }
+    assertCurrent(validation, signal);
     return { user: freshUser, capabilityId };
   }
 
@@ -439,8 +484,14 @@ function requireSamePrincipal(scope: { tenantId: string; principalId: string }, 
 }
 
 function isLocalAuthorizationFailure(error: unknown) {
-  return error instanceof AppError && ["interaction_required", "authorization_expired", "missing_internal_role", "capability_unavailable", "not_configured",
-    "application_scope_changed", "qualification_superseded", "hunting_scope_unqualified"].includes(error.code);
+  return error instanceof AppError && (error.status === 401 || ["interaction_required", "authorization_expired", "missing_internal_role", "capability_unavailable", "not_configured",
+    "application_scope_changed", "qualification_superseded", "hunting_scope_unqualified", "maintenance", "provider_requalification_required"].includes(error.code));
+}
+
+function assertCurrent(validation: SessionValidation, signal: AbortSignal) {
+  signal.throwIfAborted();
+  assertAccountSessionValidation(validation);
+  requireProviderAdmissions();
 }
 
 function providerEvidenceStatus(error: unknown): CapabilityStatus {

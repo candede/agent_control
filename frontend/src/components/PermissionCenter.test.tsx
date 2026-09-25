@@ -36,6 +36,22 @@ async function openRequirements() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState({}, "", "/"); });
 
 describe("Permissions setup and issues", () => {
+  it("keeps app-only authentication failures out of user sign-in recovery, including issue details", async () => {
+    const view = fixture("available", "graph.package.read.application");
+    view.operationFailure = { status: "unknown", checkedAt: new Date(now - 1000).toISOString(),
+      expiresAt: new Date(now + 60000).toISOString(), evidence: { category: "authorization_expired" },
+      remediation: ["An administrator must verify the application's credentials."] };
+    render(<Page value={context([view])} />);
+    const issues = within(screen.getByRole("region", { name: "Issues" }));
+    expect(issues.getByRole("link", { name: "Admin setup" })).toHaveAttribute("href", "https://entra.microsoft.com/");
+    expect(issues.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+    await userEvent.click(issues.getByRole("button", { name: "Details: App-only agent inventory" }));
+    const dialog = within(screen.getByRole("dialog", { name: "App-only agent inventory" }));
+    expect(dialog.getByText(/User sign-in does not repair app-only authorization/)).toBeVisible();
+    expect(dialog.queryByText(/Then sign in again/)).not.toBeInTheDocument();
+    expect(dialog.queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+  });
+
   it("shows working feedback only during a check and retains confirmed issues until results arrive", () => {
     const value = { ...context([fixture("missing_permission")]), pending: true, activeCheck: { id: 1, retryFailed: true } };
     const { rerender } = render(<Page value={value} />);

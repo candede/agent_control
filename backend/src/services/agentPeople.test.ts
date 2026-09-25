@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type pg from "pg";
-import { describe, expect, it, vi } from "vitest";
-import { revokeAccountSessionMutations } from "../db/sessions.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { SavedCopilotUsageSource } from "../db/dataSync.js";
@@ -12,6 +12,8 @@ const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const observedAt = "2026-09-20T12:00:00.000Z";
 const options = { generation: "initial" };
+
+afterEach(() => vi.restoreAllMocks());
 
 function harness() {
   const user: AuthenticatedUser = { tenantId: randomUUID(), homeAccountId: randomUUID(), username: "reader@example.invalid",
@@ -29,15 +31,16 @@ function harness() {
   }))) };
   const revalidateUser = vi.fn(async () => user);
   const delegatedToken = vi.fn(async () => "fixture-token");
-  const requireAvailable = vi.fn();
+  const requireAvailable = vi.fn(async () => {});
   const admissions = vi.fn();
   const reportedFailures = vi.fn();
+  const observeOperation = vi.fn(async (_id, _user, operation) => operation(reportedFailures));
   const service = new AgentPeopleService({} as pg.Pool, {
-    observeOperation: async (_id, _user, operation) => operation(reportedFailures),
+    observeOperation,
     repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
     now: () => new Date(observedAt),
   });
-  return { service, user, repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions, reportedFailures };
+  return { service, user, repository, saved, directory, revalidateUser, delegatedToken, requireAvailable, admissions, reportedFailures, observeOperation };
 }
 
 describe("persistent agent people resolution", () => {
@@ -206,4 +209,168 @@ describe("persistent agent people resolution", () => {
     await expect(changed.service.resolve(changed.user, [id], options)).rejects.toMatchObject({ code: "scope_mismatch" });
     expect(changed.repository.save).not.toHaveBeenCalled();
   });
+
+  it.each(["generation", "references", "directory", "cache"] as const)(
+    "pins the initiating session before the %s read, even if the account signs in again", async phase => {
+      const value = harness();
+      const replaceSession = async () => {
+        await revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => {});
+        await activateAccountSession(value.user.tenantId!, value.user.homeAccountId, async () => {});
+      };
+      if (phase === "generation") value.repository.generation.mockImplementationOnce(async () => {
+        await replaceSession();
+        return "initial";
+      });
+      if (phase === "references") value.repository.referencedIds.mockImplementationOnce(async () => {
+        await replaceSession();
+        return [id];
+      });
+      if (phase === "directory") value.saved.getDirectorySource.mockImplementationOnce(async () => {
+        await replaceSession();
+        return { source: "directory", value: null, observedAt: null, attemptStatus: null,
+          message: null, attemptedAt: null, lastSuccessAt: null, rowCount: null };
+      });
+      if (phase === "cache") value.repository.read.mockImplementationOnce(async () => {
+        await replaceSession();
+        return [];
+      });
+      const operation = phase === "generation" || phase === "references"
+        ? value.service.refreshReferences(value.user, new AbortController().signal,
+          { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false })
+        : value.service.resolve(value.user, [id], options);
+      await expect(operation).rejects.toMatchObject({ code: "unauthorized" });
+      expect(value.delegatedToken).not.toHaveBeenCalled();
+      expect(value.directory.resolve).not.toHaveBeenCalled();
+      expect(value.repository.save).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["revocation", "admission"] as const)(
+    "stops token acquisition when %s changes during capability validation", async change => {
+      const value = harness();
+      let revoked: Promise<void> | undefined;
+      value.requireAvailable.mockImplementationOnce(async () => {
+        if (change === "revocation") {
+          revoked = revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => {});
+        } else {
+          value.admissions.mockImplementation(() => { throw new AppError(503, "maintenance", "Provider work stopped"); });
+        }
+      });
+      try {
+        await expect(value.service.resolve(value.user, [id], options))
+          .rejects.toMatchObject({ code: change === "revocation" ? "unauthorized" : "maintenance" });
+        expect(value.delegatedToken).not.toHaveBeenCalled();
+        expect(value.directory.resolve).not.toHaveBeenCalled();
+        expect(value.repository.save).not.toHaveBeenCalled();
+      } finally { await revoked; }
+    },
+  );
+
+  it.each(["token", "publication", "evidence"] as const)(
+    "rechecks the session after awaited %s work", async phase => {
+      const value = harness();
+      let revoked: Promise<void> | undefined;
+      const revoke = () => { revoked = revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => {}); };
+      if (phase === "token") value.delegatedToken.mockImplementationOnce(async () => { revoke(); return "fixture-token"; });
+      if (phase === "publication") value.requireAvailable.mockImplementationOnce(async () => {})
+        .mockImplementationOnce(async () => { revoke(); });
+      if (phase === "evidence") value.observeOperation.mockImplementationOnce(async (_id, _user, operation) => {
+        const result = await operation(value.reportedFailures);
+        revoke();
+        return result;
+      });
+      try {
+        await expect(value.service.resolve(value.user, [id], options)).rejects.toMatchObject({ code: "unauthorized" });
+        if (phase === "token") expect(value.directory.resolve).not.toHaveBeenCalled();
+        if (phase !== "evidence") expect(value.repository.save).not.toHaveBeenCalled();
+      } finally { await revoked; }
+    },
+  );
+
+  it("fences session changes inside database publication and before the next provider batch", async () => {
+    const value = harness();
+    let revoked: Promise<void> | undefined;
+    value.repository.save.mockImplementationOnce(async (_scope, _observations, context) => {
+      context.fence();
+      revoked = revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => {});
+      context.fence();
+    });
+    try {
+      await expect(value.service.resolve(value.user, Array.from({ length: 9 }, () => randomUUID()), options))
+        .rejects.toMatchObject({ code: "unauthorized" });
+      expect(value.directory.resolve).toHaveBeenCalledTimes(8);
+    } finally { await revoked; }
+  });
+
+  it("keeps account publication serialized until timed-out transaction cleanup settles", async () => {
+    const value = harness();
+    const deadline = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let finishQuery!: () => void;
+    let finishRollback!: () => void;
+    const query = new Promise<void>(resolve => { finishQuery = resolve; });
+    const rollback = new Promise<void>(resolve => { finishRollback = resolve; });
+    const rollingBack = vi.fn();
+    const revoked = vi.fn();
+    value.repository.save.mockImplementationOnce(async (_scope, _observations, context) => {
+      await query;
+      try { context.fence(); }
+      catch (error) { rollingBack(); await rollback; throw error; }
+    });
+    const outcome = value.service.resolve(value.user, [id], options).then(result => result, error => error);
+    await vi.waitFor(() => expect(value.repository.save).toHaveBeenCalledOnce());
+    deadline.abort(new DOMException("Fixture deadline", "TimeoutError"));
+    expect(await outcome).toMatchObject({ code: "provider_timeout" });
+    const revocation = revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => { revoked(); });
+    try {
+      finishQuery();
+      await vi.waitFor(() => expect(rollingBack).toHaveBeenCalledOnce());
+      expect(revoked).not.toHaveBeenCalled();
+    } finally {
+      finishQuery();
+      finishRollback();
+      await revocation;
+    }
+    expect(revoked).toHaveBeenCalledOnce();
+  });
+
+  it.each(["directory", "cache", "authentication", "capability", "token", "provider", "publication", "evidence"] as const)(
+    "enforces a wall-clock deadline during stalled %s work and discards late completion", async phase => {
+      const value = harness();
+      const deadline = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+      let release!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const reached = vi.fn();
+      const stall = async () => { reached(); await blocked; };
+      if (phase === "directory") {
+        const source = await value.saved.getDirectorySource();
+        value.saved.getDirectorySource.mockClear().mockImplementationOnce(async () => { await stall(); return source; });
+      }
+      if (phase === "cache") value.repository.read.mockImplementationOnce(async () => { await stall(); return []; });
+      if (phase === "authentication") value.revalidateUser.mockImplementationOnce(async () => { await stall(); return value.user; });
+      if (phase === "capability") value.requireAvailable.mockImplementationOnce(stall);
+      if (phase === "token") value.delegatedToken.mockImplementationOnce(async () => { await stall(); return "fixture-token"; });
+      if (phase === "provider") value.directory.resolve.mockImplementationOnce(async () => {
+        await stall();
+        return [{ resourceId: id, resourceType: "user", principalKind: "user", displayName: "Late person" }];
+      });
+      if (phase === "publication") value.repository.save.mockImplementationOnce(stall);
+      if (phase === "evidence") value.observeOperation.mockImplementationOnce(async (_id, _user, operation) => {
+        const result = await operation(value.reportedFailures);
+        await stall();
+        return result;
+      });
+      const outcome = value.service.resolve(value.user, [id], options).then(result => result, error => error);
+      await vi.waitFor(() => expect(reached).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("Fixture deadline", "TimeoutError"));
+      const result = await Promise.race([outcome, new Promise(resolve => setTimeout(() => resolve("still pending"), 25))]);
+      release();
+      await outcome;
+      expect(result).toMatchObject({ status: 504, code: "provider_timeout" });
+      expect(AbortSignal.timeout).toHaveBeenCalledWith(120_000);
+      if (!["publication", "evidence"].includes(phase)) expect(value.repository.save).not.toHaveBeenCalled();
+      if (!["provider", "publication", "evidence"].includes(phase)) expect(value.directory.resolve).not.toHaveBeenCalled();
+    },
+  );
 });

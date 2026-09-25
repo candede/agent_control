@@ -92,10 +92,9 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
   const snapshotId = optionalUuid(first(request.query.snapshotId));
   if (!snapshotId) throw new AppError(400, "snapshot_required", "Power Platform export requires the exact saved snapshot selection.");
   const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-  const validatePublication = async () => {
-    await validateSession();
+  const validatePublication = () => validateSession(async () => {
     await inventoryRepository.assertSnapshotCurrent(scope, snapshotId);
-  };
+  });
   const audit = getAuditLog(scope);
   const event = await audit.startEvent({
     operationId: `export-power-platform-inventory:${randomUUID()}`,
@@ -114,17 +113,21 @@ policyRoute(inventoryRouter, "get", "/inventory/export.csv", { access: "authenti
       throw new AppError(413, "export_row_limit", "The filtered Power Platform selection exceeds the 5,000 row export limit.");
     }
     const columns = ["sourceSystem", "nativeId", "displayName", "type", "environmentId", "location", "authoringTool", "agentKind", "lifecycle", "createdAt", "createdBy", "ownerId", "lastModifiedBy", "lastModifiedAt", "lastPublishedAt", "snapshotId", "snapshotObservedAt", "snapshotExpiresAt", ...agentCapabilityExportColumns] as const;
-    const rows = result.value.map(resource => ({
-      ...resource,
-      ownerId: resource.details.ownerId,
-      lastModifiedBy: resource.details.lastModifiedBy,
-      lastModifiedAt: resource.details.lastModifiedAt,
-      ...agentCapabilityExport(resource),
-      snapshotId: result.snapshot!.id,
-      snapshotObservedAt: result.snapshot!.observedAt,
-      snapshotExpiresAt: result.snapshot!.expiresAt,
-    }));
-    const csv = buildBoundedCsv(columns, rows, { maximumRows: 5_000, maximumBytes: 8_000_000, deadlineAt });
+    function* rows() {
+      for (const resource of result.value) {
+        yield {
+          ...resource,
+          ownerId: resource.details.ownerId,
+          lastModifiedBy: resource.details.lastModifiedBy,
+          lastModifiedAt: resource.details.lastModifiedAt,
+          ...agentCapabilityExport(resource),
+          snapshotId: result.snapshot!.id,
+          snapshotObservedAt: result.snapshot!.observedAt,
+          snapshotExpiresAt: result.snapshot!.expiresAt,
+        };
+      }
+    }
+    const csv = buildBoundedCsv(columns, rows(), { maximumRows: 5_000, maximumBytes: 8_000_000, deadlineAt });
     await publishBoundedCsv(request, response, "power-platform-inventory.csv", csv.buffer, {
       deadlineAt, validate: validatePublication, beforeEnd: () => audit.completeEvent(event.id, { status: "succeeded", metadata: {
         source: "power_platform", snapshotId: result.snapshot!.id, resultingCount: csv.rowCount, resultingBytes: csv.byteCount,

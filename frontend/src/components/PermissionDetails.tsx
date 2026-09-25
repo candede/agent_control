@@ -33,7 +33,9 @@ export function PermissionDetails({ view, now }: { view: CapabilityView; now: nu
     </details>
     <section className="permission-detail-section" aria-label="Setup and documentation">
       <h3>Setup links</h3>
-      <p>Administrator: App registrations &gt; this app &gt; API permissions &gt; Grant admin consent. Then sign in again.</p>
+      <p>Administrator: App registrations &gt; this app &gt; API permissions &gt; Grant admin consent. {definition.mode === "application"
+        ? "Verify the application's credentials, then retry the explicit application-scope operation. User sign-in does not repair app-only authorization."
+        : "Then sign in again."}</p>
       <div className="permission-actions">
         <a href="https://entra.microsoft.com/" target="_blank" rel="noreferrer">Entra admin center <ExternalLink size={14} aria-hidden="true" /></a>
         <a href="https://admin.microsoft.com/" target="_blank" rel="noreferrer">Microsoft admin center <ExternalLink size={14} aria-hidden="true" /></a>

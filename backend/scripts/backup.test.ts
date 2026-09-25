@@ -13,6 +13,7 @@ import { PackageInventoryRepository } from "../src/db/packageInventory.js";
 import { PurviewAuditRepository, type PurviewAuditScope } from "../src/db/purviewAudit.js";
 import { allowlistedPackage } from "../src/services/packageObservation.js";
 import { parseOfficialUsageReport } from "../src/services/officialUsageParser.js";
+import { OfficialUsageOverviewService } from "../src/services/officialUsageOverview.js";
 import type { DefenderAgentInventoryRow, DefenderHuntingFilters } from "../src/types/defenderHunting.js";
 import type { PurviewAuditFilters } from "../src/types/purviewAudit.js";
 
@@ -57,16 +58,16 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     "Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nfixture-agent,Fixture agent,Your org,user@example.invalid,2,2026-06-30",
     "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nuser@example.invalid,Fixture user,1,2,2026-06-30",
   ];
-  const acceptBundle = async (correctionOfSetId?: string) => {
+  const acceptBundle = async (correctionOfSetId?: string, owner = usageScope) => {
     const bundleId=randomUUID();
     for (const [index, original] of reports.entries()) {
       const content = correctionOfSetId && index === 2
         ? original.replace("Fixture user,1,2,2026-06-30", "Fixture user,1,3,2026-06-30")
         : original;
-      const staged=await usage.stage(usageScope,{report:parseOfficialUsageReport(Buffer.from(content),metadata),fileHash:createHash("sha256").update(content).digest("hex"),bundleId,correctionOfSetId});
-      await usage.accept(usageScope,staged.id,{stagingRevision:staged.revision,fileHash:staged.fileHash,expectedActiveRevision:staged.activeRevision});
+      const staged=await usage.stage(owner,{report:parseOfficialUsageReport(Buffer.from(content),metadata),fileHash:createHash("sha256").update(content).digest("hex"),bundleId,correctionOfSetId});
+      await usage.accept(owner,staged.id,{stagingRevision:staged.revision,fileHash:staged.fileHash,expectedActiveRevision:staged.activeRevision});
     }
-    return usage.getPublished(usageScope.tenantId);
+    return usage.getPublished(owner.tenantId);
   };
   const historicalReports = await acceptBundle();
   const currentReports = await acceptBundle(historicalReports.activeSet!.id);
@@ -77,6 +78,8 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const historicalOnlyVersionIds = historicalVersionIds.filter(id => !currentVersionIds.has(id));
   expect(sharedVersionIds).toHaveLength(2);
   expect(historicalOnlyVersionIds).toHaveLength(1);
+  const laterCorrectionScope = { ...usageScope, tenantId: "fixture-later-correction" };
+  const laterCorrectedOriginal = await acceptBundle(undefined, laterCorrectionScope);
 
   const hunting = new DefenderHuntingRepository(fixture.runtime);
   const huntingScope: DefenderHuntingScope = { tenantId:"fixture-tenant",authorizationPrincipalId:"fixture-principal",
@@ -124,6 +127,8 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   const receipt=JSON.parse(readFileSync(`${filename}.json`,"utf8"));
   expect(receipt.version).toBe(3);
   expect(Date.parse(receipt.snapshotAt)).toBeLessThanOrEqual(Date.parse(receipt.createdAt));
+  const laterCorrection = await acceptBundle(laterCorrectedOriginal.activeSet!.id, laterCorrectionScope);
+  await softDeleteOfficialSet(fixture.operator, laterCorrection.activeSet!.id);
   await softDeleteOfficialSet(fixture.operator,historicalReports.activeSet!.id);
   await fixture.operator.query("UPDATE defender_hunting_retained_scopes SET revoked_at=clock_timestamp(),revoked_by='current-review' WHERE id=$1",[historicalHunt.retainedScopeId]);
   const currentAfterReviewChanges=await fingerprints(fixture.operator);
@@ -142,6 +147,11 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect((await new PackageInventoryRepository(restoredRuntime).list(packageScope)).count).toBe(1);
     expect((await new PackageInventoryRepository(restoredRuntime).list({...packageScope,principalId:"other"})).count).toBe(0);
     expect((await new OfficialUsageRepository(restoredRuntime).getPublished(usageScope.tenantId)).reports.users?.rows).toHaveLength(1);
+    expect((await new OfficialUsageOverviewService(restoredRuntime).getOverview(laterCorrectionScope.tenantId)).summary)
+      .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
+    await expect(new OfficialUsageRepository(restoredRuntime).getPublished(
+      laterCorrectionScope.tenantId, laterCorrectedOriginal.activeSet!.id,
+    )).rejects.toMatchObject({ code: "official_usage_set_not_found" });
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
       historicalOnlyVersionIds])).rows[0].count).toBe(0);
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[

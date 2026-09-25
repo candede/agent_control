@@ -126,7 +126,7 @@ describe("agent investigations", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Resolve log identity" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("AgentIdentity.Read.All requires administrator consent.");
     expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
-    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Setup & permissions" }));
     expect(capability.openPermissions).toHaveBeenCalledOnce();
     vi.mocked(getAgentInvestigationContext).mockResolvedValue(investigation);
@@ -141,6 +141,46 @@ describe("agent investigations", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Resolve log identity" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved inventory authorization expired.");
     expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+  });
+
+  it("hides an old verified scope while refreshing and reloads the saved denial after failure", async () => {
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce({
+      ...investigation, defender: { ...investigation.defender, resolution: {
+        canResolve: true, capabilityId: "graph.agentIdentity.read", cacheStatus: "resolved",
+        resolvedAt: "2026-09-23T10:00:00Z",
+      } },
+    }).mockResolvedValue({
+      ...unresolved, defender: { ...unresolved.defender, resolution: {
+        canResolve: true, capabilityId: "graph.agentIdentity.read", cacheStatus: "not_found",
+      } },
+    });
+    let fail!: (cause: Error) => void;
+    vi.mocked(resolveAgentInvestigationIdentity).mockImplementation(() => new Promise((_resolve, reject) => { fail = reject; }));
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh log identity" }));
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    await act(async () => fail(new Error("The saved candidate was not found.")));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The saved candidate was not found.");
+    expect(await screen.findByText(/Microsoft Graph found no accessible agent identity/)).toBeVisible();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+  });
+
+  it("keeps the old verified scope hidden when both the refresh and saved-context reread fail", async () => {
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce({
+      ...investigation, defender: { ...investigation.defender, resolution: {
+        canResolve: true, capabilityId: "graph.agentIdentity.read", resolvedAt: "2026-09-23T10:00:00Z",
+      } },
+    }).mockRejectedValue(new Error("Saved inventory is unavailable."));
+    vi.mocked(resolveAgentInvestigationIdentity).mockRejectedValue(new Error("Identity lookup was denied."));
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh log identity" }));
+    expect(await screen.findByText("Saved inventory is unavailable.")).toBeVisible();
+    expect(screen.getByText(/Identity lookup was denied/)).toBeVisible();
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    expect(getAgentInvestigationContext).toHaveBeenCalledTimes(2);
   });
 
   it.each(["agent", "principal", "role"] as const)("aborts a pending identity lookup on %s changes and ignores late success", async change => {

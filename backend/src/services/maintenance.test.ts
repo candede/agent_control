@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:fs", async importOriginal => {
   const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, statSync: vi.fn(fs.statSync) };
+  return { ...fs, lstatSync: vi.fn(fs.lstatSync) };
 });
 
 let maintenance: typeof import("./maintenance.js");
@@ -23,7 +23,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  vi.mocked(statSync).mockReset();
+  vi.mocked(lstatSync).mockReset();
   vi.unstubAllEnvs();
   rmSync(directory, { recursive: true, force: true });
 });
@@ -32,7 +32,7 @@ describe("maintenance admissions", () => {
   it("admits work with no configured marker or an absent marker", () => {
     expect(maintenance.maintenanceActive()).toBe(false);
     expect(() => maintenance.requireAdmissions()).not.toThrow();
-    expect(statSync).not.toHaveBeenCalled();
+    expect(lstatSync).not.toHaveBeenCalled();
     vi.stubEnv("MAINTENANCE_FILE", marker);
     expect(maintenance.maintenanceActive()).toBe(false);
     expect(() => maintenance.requireAdmissions()).not.toThrow();
@@ -44,7 +44,7 @@ describe("maintenance admissions", () => {
     vi.stubEnv("MAINTENANCE_MODE", "true");
     expect(maintenance.maintenanceActive()).toBe(true);
     expect(() => maintenance.requireAdmissions()).toThrow(expect.objectContaining({ status: 503, code: "maintenance" }));
-    expect(statSync).not.toHaveBeenCalled();
+    expect(lstatSync).not.toHaveBeenCalled();
     vi.stubEnv("MAINTENANCE_MODE", value);
     expect(maintenance.maintenanceActive()).toBe(false);
   });
@@ -62,12 +62,12 @@ describe("maintenance admissions", () => {
 
   it.each(["EACCES", "EPERM", "EIO", "ELOOP", "ENOTDIR"])("fails closed when marker inspection returns %s", code => {
     vi.stubEnv("MAINTENANCE_FILE", marker);
-    vi.mocked(statSync).mockImplementation(() => { throw Object.assign(new Error("Private filesystem detail"), { code }); });
+    vi.mocked(lstatSync).mockImplementation(() => { throw Object.assign(new Error("Private filesystem detail"), { code }); });
     expect(maintenance.maintenanceActive()).toBe(true);
     expect(() => maintenance.requireAdmissions()).toThrow(expect.objectContaining({
       status: 503, code: "maintenance", message: "Maintenance is active; new work is not accepted.",
     }));
-    vi.mocked(statSync).mockReset();
+    vi.mocked(lstatSync).mockReset();
     expect(maintenance.maintenanceActive()).toBe(false);
   });
 
@@ -88,6 +88,6 @@ describe("maintenance admissions", () => {
     vi.stubEnv("MAINTENANCE_MODE", "false");
     expect(maintenance.maintenanceActive()).toBe(true);
     expect(() => maintenance.requireAdmissions()).toThrow(expect.objectContaining({ status: 503, code: "maintenance" }));
-    expect(statSync).not.toHaveBeenCalled();
+    expect(lstatSync).not.toHaveBeenCalled();
   });
 });

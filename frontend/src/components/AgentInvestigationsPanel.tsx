@@ -40,10 +40,10 @@ function InvestigationSession({ recordId, agentName, identity }: Props & { ident
     setResolutionError(undefined);
     try {
       await resolveAgentInvestigationIdentity(recordId, { signal: controller.signal });
-      if (!controller.signal.aborted) await context.refetch();
     } catch (cause) {
       if (!controller.signal.aborted) setResolutionError(cause instanceof Error ? cause.message : "Agent identity lookup failed. Retry or check Setup & permissions.");
     } finally {
+      if (!controller.signal.aborted) await context.refetch();
       if (!controller.signal.aborted) {
         resolutionRequest.current = undefined;
         setResolving(false);
@@ -75,7 +75,7 @@ function InvestigationSession({ recordId, agentName, identity }: Props & { ident
               {context.data.defender.resolution.reason ? <p>{context.data.defender.resolution.reason}</p> : null}
             </details>
           </div> : null}
-          {context.data.defender.status === "available"
+          {context.data.defender.status === "available" && !resolving
           ? <DefenderHuntingView agentRecordId={recordId} agentName={agentName} entraAgentIds={context.data.defender.entraAgentIds}
             entraAgentApplicationIds={context.data.defender.entraAgentApplicationIds} templates={context.data.defender.templates} />
           : !context.data.defender.resolution?.canResolve ? <IdentityUnavailable source="Defender" reason={context.data.defender.reason} reasonCode={context.data.defender.reasonCode} /> : null}

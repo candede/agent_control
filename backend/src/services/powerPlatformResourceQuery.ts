@@ -308,7 +308,7 @@ export class PowerPlatformResourceQueryClient {
 
 function validateEnvironmentId(value: string | undefined) {
   if (value === undefined || value === "") return undefined;
-  if (typeof value !== "string" || value.length > 512 || /[\r\n\0]/.test(value)) throw new AppError(400, "invalid_inventory_scope", "Inventory environment scope is invalid.");
+  if (!unicodeText(value) || value.length > 512 || /[\r\n]/.test(value)) throw new AppError(400, "invalid_inventory_scope", "Inventory environment scope is invalid.");
   return value;
 }
 
@@ -420,7 +420,12 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
       });
     }
   }
-  if (value.location !== undefined && value.location !== null && typeof value.location !== "string") {
+  for (const [field, text] of [["tenantId", tenantId], ["name", value.name]] as const) {
+    if (!unicodeText(text)) throw new InventorySchemaError("Power Platform inventory returned invalid resource identity text.", {
+      reason: "invalid_identity_text", field, resourceType: type,
+    });
+  }
+  if (value.location !== undefined && value.location !== null && !unicodeText(value.location)) {
     throw new InventorySchemaError("Power Platform inventory returned an invalid resource location.", { reason: "invalid_location", field: "location", actualType: valueType(value.location), resourceType: type });
   }
   const context = projectionContext(value.properties, type);
@@ -430,7 +435,6 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
   const createdAt = optionalDate(context, "createdAt", "properties.createdAt", "ga");
   const createdBy = optionalString(context, "createdBy", "properties.createdBy", "ga", 512);
   const lastPublishedAt = optionalDate(context, "lastPublishedAt", "properties.lastPublishedAt", "ga");
-  const createdIn = optionalString(context, "createdIn", "properties.createdIn", "ga", 256);
   const propertiesName = optionalString(context, "name", "properties.name", "ga", 512);
   const botId = optionalString(context, "botId", "properties.botId", "ga", 512);
   const identifiers: InventoryIdentifier[] = [
@@ -443,6 +447,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     ...identifier(context, "entraAgentBlueprintId", "entra_blueprint_id"),
   ];
   const details = projectDetails(context);
+  const createdIn = details.createdIn ?? null;
   const authoringTool = derivePowerPlatformAuthoringTool(type, createdIn);
   const agentKind = deriveAgentKind(type, createdIn);
   const lifecycle = deriveLifecycle(type, context.properties.lastPublishedAt, Object.hasOwn(context.properties, "lastPublishedAt"), lastPublishedAt);
@@ -459,7 +464,7 @@ function parseResource(value: unknown, expectedTenantId?: string): PowerPlatform
     tenantId,
     nativeId: value.name,
     type,
-    location: typeof value.location === "string" ? value.location.slice(0, 256) : null,
+    location: typeof value.location === "string" ? value.location.slice(0, 256).replace(/[\uD800-\uDBFF]$/, "") : null,
     displayName,
     environmentId,
     createdAt,
@@ -528,8 +533,9 @@ function projectDetails(context: ProjectionContext): PowerPlatformResourceDetail
   const connectorDetailsSupplied = supportsConnectorDetails && Object.hasOwn(context.properties, connectorKey) && context.properties[connectorKey] !== null;
   const connectors = supportsConnectorDetails ? resourceConnectors(context) : undefined;
   if (connectors !== undefined) details.connectors = connectors;
-  const counts = context.schema.has("capabilitiesCounts") && isRecord(context.properties.capabilitiesCounts) ? context.properties.capabilitiesCounts : undefined;
-  if (context.properties.capabilitiesCounts !== undefined && context.properties.capabilitiesCounts !== null && !counts) omitCapability(context);
+  const supportsCapabilityCounts = context.schema.has("capabilitiesCounts");
+  const counts = supportsCapabilityCounts && isRecord(context.properties.capabilitiesCounts) ? context.properties.capabilitiesCounts : undefined;
+  if (supportsCapabilityCounts && context.properties.capabilitiesCounts !== undefined && context.properties.capabilitiesCounts !== null && !counts) omitCapability(context);
   if (counts) {
     const connectorCount = safeCount(counts.distinctPowerPlatformConnectors);
     const operationCount = safeCount(counts.distinctPowerPlatformConnectorsOperations);
@@ -618,8 +624,15 @@ function optionalString(context: ProjectionContext, property: string, path: stri
 function optionalDate(context: ProjectionContext, property: string, path: string, fieldMaturity: InventoryFieldMaturity) {
   const value = optionalString(context, property, path, fieldMaturity, 64);
   if (!value) return null;
+  const match = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(Z|[+-](\d{2}):([0-5]\d))$/.exec(value);
   const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) { context.omittedCount += 1; delete context.provenance[property]; return null; }
+  if (!match || match[1].startsWith("0000") || Number(match[3]) > 14 || Number(match[3]) === 14 && Number(match[4]) !== 0
+    || !Number.isFinite(date.getTime()) || date.getUTCFullYear() < 1 || date.getUTCFullYear() > 9999
+    || new Date(`${match[1]}T00:00:00Z`).toISOString().slice(0, 10) !== match[1]) {
+    context.omittedCount += 1;
+    delete context.provenance[property];
+    return null;
+  }
   return date.toISOString();
 }
 
@@ -637,8 +650,9 @@ function optionalStringArray(context: ProjectionContext, property: string, path:
   const value = context.properties[property];
   if (value === undefined || value === null) return undefined;
   if (!Array.isArray(value)) { context.omittedCount += 1; return undefined; }
-  const retained = value.slice(0, limit).flatMap(entry => typeof entry === "string" && entry.length <= 512 ? [entry] : []);
+  const retained = value.slice(0, limit).flatMap(entry => unicodeText(entry) && entry.length <= 512 ? [entry] : []);
   context.omittedCount += value.length - retained.length;
+  if (value.length && !retained.length) return undefined;
   context.provenance[property] = { sourceSystem: "power_platform", path, maturity: fieldMaturity };
   return retained;
 }
@@ -693,7 +707,12 @@ function safeCount(value: unknown) {
 }
 
 function validText(value: unknown, maximumLength: number): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= maximumLength;
+  return unicodeText(value) && value.length > 0 && value.length <= maximumLength;
+}
+
+function unicodeText(value: unknown): value is string {
+  // JSON escapes can contain NUL or lone surrogates even in a valid UTF-8 response; JSONB cannot store them.
+  return typeof value === "string" && !/[\0\uD800-\uDFFF]/u.test(value);
 }
 
 function invalidContinuationToken(value: unknown): never {

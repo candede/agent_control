@@ -469,8 +469,44 @@ describe("CopilotUsageGraphClient", () => {
       { ...original.assignedPlans[0], assignedDateTime: "2026-01-01T01:00:00+01:00" },
     ] };
     const [user] = await new CopilotUsageGraphClient(directoryWithCatalog(row)).listCopilotUsers("token");
-    expect(user.servicePlans).toEqual([expect.objectContaining({ state: "enabled", assignedDateTime: "2026-01-01T00:30:00Z" })]);
+    expect(user.servicePlans).toEqual([expect.objectContaining({ state: "enabled", assignedDateTime: "2026-01-01T00:30:00.000Z" })]);
   });
+
+  it.each(["timestamp representation", "observation order"] as const)(
+    "accepts duplicate users with equivalent assignment instants despite different %s", async variation => {
+      const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+      const utc = { ...original.assignedPlans[0], assignedDateTime: "2026-01-01T00:00:00Z" };
+      const offset = { ...utc, assignedDateTime: "2026-01-01T01:00:00+01:00" };
+      const fetcher = vi.fn<FetchLike>()
+        .mockResolvedValueOnce(Response.json({
+          value: [{ ...original, assignedPlans: variation === "observation order" ? [utc, offset] : [utc] }],
+          "@odata.count": 1, "@odata.nextLink": `${buildCopilotUsersUrl(knownSkuIds)}&$skiptoken=next`,
+        }))
+        .mockResolvedValueOnce(Response.json({
+          value: [{ ...original, assignedPlans: variation === "observation order" ? [offset, utc] : [offset] }],
+        }));
+      const users = await new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token");
+      expect(users).toHaveLength(1);
+      expect(users[0].servicePlans[0]).toMatchObject({
+        state: "enabled", assignedDateTime: "2026-01-01T00:00:00.000Z",
+      });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(["2026-01-01T00:00:00.001Z", "2026-01-01T00:00:00.0000001Z"])(
+    "still rejects duplicate users with genuinely different assignment instants: %s", async assignedDateTime => {
+      const original = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+      const fetcher = vi.fn<FetchLike>(async () => Response.json({
+        "@odata.count": 1,
+        value: [original, {
+          ...original, assignedPlans: [{ ...original.assignedPlans[0], assignedDateTime }],
+        }],
+      }));
+      await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
+        .rejects.toMatchObject({ code: "provider_schema", message: "Directory returned conflicting duplicate user records." });
+    },
+  );
 
   it("loads all 2,167 assignments when enterprise directory pages exceed the generic 2 MB limit", async () => {
     const bundleId = "15f2e9fc-b782-4f73-bf51-81d8b7fff6f4";
@@ -639,6 +675,19 @@ describe("CopilotUsageGraphClient", () => {
     const fetcher = vi.fn(async () => Response.json({ value: [], "@odata.count": count }));
     await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
       .rejects.toMatchObject({ code: "provider_schema" });
+  });
+
+  it.each([0, 2, "1", null, -1, 1.5])("rejects contradictory product continuation totals even when the first total matches: %s", async count => {
+    const row = graphUser("11111111-1111-4111-8111-111111111111", "one@example.com", "Active");
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(Response.json({
+        value: [row], "@odata.count": 1,
+        "@odata.nextLink": `${buildCopilotUsersUrl(knownSkuIds)}&$skiptoken=next`,
+      }))
+      .mockResolvedValueOnce(Response.json({ value: [row], "@odata.count": count }));
+    await expect(new CopilotUsageGraphClient(withCatalog(fetcher)).listCopilotUsers("token"))
+      .rejects.toMatchObject({ code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("does not silently fall back to three SKUs when catalog access fails", async () => {
@@ -1368,6 +1417,25 @@ describe("CopilotUsageGraphClient", () => {
       users: [],
       reportRefreshDate: null,
     });
+  });
+
+  it("stops CSV parsing at the row limit before reading a malformed trailing record", async () => {
+    const row = reportUser("one@example.com", "2026-09-12").join(",");
+    const csv = `${reportCsv([])}\n${`${row}\n`.repeat(100_001)}"unterminated`;
+    const fetcher = vi.fn<FetchLike>(async () => new Response(csv));
+    await expect(new CopilotUsageGraphClient(fetcher).listAppActivity("token"))
+      .rejects.toMatchObject({ code: "provider_result_limit" });
+  });
+
+  it("accepts exactly 100,000 report users while counting CSV records rather than quoted newlines", async () => {
+    const row = reportUser("one@example.com", "2026-09-12");
+    row[2] = '"One\nEmployee"';
+    const csv = `${reportCsv([])}\n${`${row.join(",")}\n`.repeat(100_000)}`;
+    const fetcher = vi.fn<FetchLike>(async () => new Response(csv));
+    const report = await new CopilotUsageGraphClient(fetcher).listAppActivity("token");
+    expect(report.users).toHaveLength(100_000);
+    expect(report.reportRefreshDate).toBe("2026-09-13");
+    expect(report.users.at(-1)?.activity.lastActivityDate).toBe("2026-09-12");
   });
 
   it("rejects impossible calendar dates instead of rolling them into another month", async () => {

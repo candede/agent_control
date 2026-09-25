@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const { query, stat } = vi.hoisted(() => ({ query: vi.fn(), stat: vi.fn() }));
 vi.mock("../db/pool.js", () => ({ pool: { query } }));
 vi.mock("../config.js", () => ({ config: { nodeEnv: "test" } }));
-vi.mock("node:fs", () => ({ statSync: stat }));
+vi.mock("node:fs", () => ({ lstatSync: stat }));
 
 const normalRow = {
   mode: "normal",
@@ -94,12 +94,12 @@ describe("operational state", () => {
     expect(() => state.requireProviderAdmissions()).not.toThrow();
   });
 
-  it.each(["present", "EACCES", "ENOTDIR"])("reports provider work disabled with a %s maintenance marker", async outcome => {
+  it.each(["present", "dangling symlink", "EACCES", "ENOTDIR"])("reports provider work disabled with a %s maintenance marker", async outcome => {
     await state.loadOperationalState();
     vi.stubEnv("MAINTENANCE_FILE", "fixture-maintenance-marker");
     stat.mockImplementation(() => {
-      if (outcome !== "present") throw Object.assign(new Error("Marker unavailable"), { code: outcome });
-      return {};
+      if (outcome !== "present" && outcome !== "dangling symlink") throw Object.assign(new Error("Marker unavailable"), { code: outcome });
+      return { isSymbolicLink: () => outcome === "dangling symlink" };
     });
     expect(() => state.requireProviderAdmissions()).toThrow(expect.objectContaining({ code: "maintenance" }));
     expect(state.providerWorkEnabled()).toBe(false);

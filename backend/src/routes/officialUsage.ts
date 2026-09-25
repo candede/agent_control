@@ -715,10 +715,7 @@ async function sendOfficialCsv(
       maximumRows: 100_000, maximumBytes: 8_000_000, deadlineAt,
     });
     await publishBoundedCsv(request, response, input.filename, csv.buffer, {
-      deadlineAt, validate: async () => {
-        await validatePublication();
-        await loaded.validateSource();
-      },
+      deadlineAt, validate: () => validatePublication(loaded.validateSource),
       beforeEnd: () => audit.completeEvent(event.id, { status: "succeeded", metadata: {
         ...loaded.metadata, resultingCount: csv.rowCount, resultingBytes: csv.byteCount,
       } }).then(() => undefined),

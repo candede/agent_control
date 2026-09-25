@@ -3,7 +3,7 @@ import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal
 import { CopilotStudioQuarantineCanaryRepository, type QuarantineCanaryApproval } from "../db/copilotStudioQuarantineCanaries.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation, type QuarantineScope } from "../db/copilotStudioQuarantine.js";
 import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import type { CopilotStudioQuarantineStatus, InventoryQuarantineTarget, QuarantineAction, QuarantineAuthority, QuarantineJob } from "../types/copilotStudioQuarantine.js";
 import type { AuthenticatedUser } from "../types/session.js";
@@ -41,18 +41,22 @@ export class CopilotStudioQuarantineCanaryService {
   async createApproval(user: AuthenticatedUser, input: {
     snapshotId: string; resourceNativeId: string; action: QuarantineAction; prestate: boolean; prestateProviderUpdatedAt: string | null; poststate: boolean;
   }) {
-    const tenantId = requireTenant(user);
-    const target = (await this.inventory.resolveQuarantineTargets({ tenantId, principalId: user.homeAccountId }, input.snapshotId, [input.resourceNativeId]))[0];
-    const authority = await this.dependencies.approvalAuthorityContext(user);
-    return this.canaries.createApproved(user, { target, action: input.action, prestate: input.prestate, prestateProviderUpdatedAt: input.prestateProviderUpdatedAt, poststate: input.poststate, authority });
+    const scope = executionScope(user);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const target = (await this.inventory.resolveQuarantineTargets(scope, input.snapshotId, [input.resourceNativeId]))[0];
+    const current = await this.revalidateAdmin(scope);
+    const authority = await this.dependencies.approvalAuthorityContext(current);
+    return commitAccountSessionValidation(validation, () => this.canaries.createApproved(current, {
+      target, action: input.action, prestate: input.prestate, prestateProviderUpdatedAt: input.prestateProviderUpdatedAt, poststate: input.poststate, authority,
+    }));
   }
 
   async execute(user: AuthenticatedUser, originalId: string, restorationId: string) {
     const scope = executionScope(user);
-    const claimValidation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const initial = await this.authorize(scope);
     let claimed!: Awaited<ReturnType<CopilotStudioQuarantineCanaryRepository["claimCycle"]>>;
-    await commitAccountSessionValidation(claimValidation, async () => {
+    await commitAccountSessionValidation(validation, async () => {
       claimed = await this.canaries.claimCycle(initial.user, originalId, restorationId, initial.authority);
     });
 
@@ -61,12 +65,13 @@ export class CopilotStudioQuarantineCanaryService {
     let executionUnverified = false;
     try {
       const originalStatus = approvalPrestate(claimed.original);
-      originalJob = await this.submitCanaryJob(initial.user, claimed.original, originalStatus, originalId, "original");
+      originalJob = await this.submitCanaryJob(scope, validation, claimed.original, originalStatus, originalId, "original");
       executionUnverified = true;
-      await runTrackedCopilotStudioQuarantineJob(originalJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.original.id, originalJob.id));
+      await runTrackedCopilotStudioQuarantineJob(originalJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.original.id, originalJob.id, validation));
       originalJob = await this.jobs.get(scope, originalJob.id);
-      executionUnverified = !originalJob;
-      const originalResult = requireVerifiedCanaryJob(originalJob, "canary_original_unverified");
+      executionUnverified = needsVerifiedResult(originalJob);
+      const originalResult = requireVerifiedCanaryJob(originalJob, claimed.original, originalStatus, "canary_original_unverified");
+      executionUnverified = false;
 
       const restorationStatus: CopilotStudioQuarantineStatus = {
         environmentId: claimed.restoration.environmentId,
@@ -76,17 +81,18 @@ export class CopilotStudioQuarantineCanaryService {
         observedAt: originalResult.observedAt!,
         correlationId: originalResult.correlationId!,
       };
-      restorationJob = await this.submitCanaryJob(initial.user, claimed.restoration, restorationStatus, originalId, "restoration");
+      restorationJob = await this.submitCanaryJob(scope, validation, claimed.restoration, restorationStatus, originalId, "restoration");
       executionUnverified = true;
-      await runTrackedCopilotStudioQuarantineJob(restorationJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.restoration.id, restorationJob.id));
+      await runTrackedCopilotStudioQuarantineJob(restorationJob.id, scope, this.jobs, this.provider, this.canaryAuthorizer(claimed.restoration.id, restorationJob.id, validation));
       restorationJob = await this.jobs.get(scope, restorationJob.id);
-      executionUnverified = !restorationJob;
-      requireVerifiedCanaryJob(restorationJob, "canary_restoration_unverified");
+      executionUnverified = needsVerifiedResult(restorationJob);
+      requireVerifiedCanaryJob(restorationJob, claimed.restoration, restorationStatus, "canary_restoration_unverified");
+      executionUnverified = false;
 
-      const publicationValidation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+      assertAccountSessionValidation(validation);
       const current = await this.authorize(scope);
       let completed!: Awaited<ReturnType<CopilotStudioQuarantineCanaryRepository["completeCycle"]>>;
-      await commitAccountSessionValidation(publicationValidation, async () => {
+      await commitAccountSessionValidation(validation, async () => {
         completed = await this.canaries.completeCycle(current.user, claimed.original.id, claimed.restoration.id, { status: "qualified" }, current.authority);
       });
       return { ...completed, jobs: { original: originalJob, restoration: restorationJob }, qualification: { qualified: true, expiresInDays: 30 } };
@@ -101,35 +107,44 @@ export class CopilotStudioQuarantineCanaryService {
     }
   }
 
-  private async submitCanaryJob(user: AuthenticatedUser, approval: QuarantineCanaryApproval, status: CopilotStudioQuarantineStatus, cycleId: string, stage: "original" | "restoration") {
-    const authority = await this.dependencies.authorityContext(user);
+  private async submitCanaryJob(scope: QuarantineScope, validation: ReturnType<typeof beginAccountSessionValidation>, approval: QuarantineCanaryApproval, status: CopilotStudioQuarantineStatus, cycleId: string, stage: "original" | "restoration") {
+    assertAccountSessionValidation(validation);
+    const { user, authority } = await this.authorize(scope);
     if (!sameAuthority(authority, approval.authority)) throw new AppError(409, "qualification_invalidated", "Quarantine authority changed after canary approval.");
     const target = targetFromApproval(approval);
     const input = { action: approval.action, targets: [{ ...target, directStatus: status }], actor: userActor(user), authority,
       requestPath: `/api/quarantine/canary-approvals/${cycleId}/execute/${stage}`, canaryApprovalId: approval.id };
     const confirmation = createQuarantineConfirmation(input);
-    return this.jobs.submit({ tenantId: user.tenantId!, principalId: user.homeAccountId }, {
+    return commitAccountSessionValidation(validation, () => this.jobs.submit(scope, {
       ...input,
       idempotencyKey: `quarantine-canary-${approval.id}-${stage}`,
       confirmationHash: confirmation.confirmationHash,
-    });
+    }));
   }
 
-  private canaryAuthorizer(approvalId: string, jobId: string) {
+  private canaryAuthorizer(approvalId: string, jobId: string, validation: ReturnType<typeof beginAccountSessionValidation>) {
     return async (scope: QuarantineScope) => {
+      assertAccountSessionValidation(validation);
       const authorization = await this.authorize(scope);
+      assertAccountSessionValidation(validation);
       await this.canaries.authorizeJob(authorization.user, approvalId, jobId, authorization.authority);
+      assertAccountSessionValidation(validation);
       return { accessToken: authorization.accessToken, authority: authorization.authority };
     };
   }
 
   private async authorize(scope: QuarantineScope) {
-    const user = await this.dependencies.revalidateUser(scope.principalId);
-    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Admin")) throw AppError.unauthorized("The quarantine canary Admin changed or lost authority.");
+    const user = await this.revalidateAdmin(scope);
     await this.dependencies.requireAvailable("powerPlatform.quarantine.manage", user);
     const authority = await this.dependencies.authorityContext(user);
     const accessToken = await this.dependencies.delegatedToken(scope.principalId, "powerPlatform.quarantine.manage");
     return { user, authority, accessToken };
+  }
+
+  private async revalidateAdmin(scope: QuarantineScope) {
+    const user = await this.dependencies.revalidateUser(scope.principalId);
+    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Admin")) throw AppError.unauthorized("The quarantine canary Admin changed or lost authority.");
+    return user;
   }
 }
 
@@ -142,10 +157,16 @@ function approvalPrestate(approval: QuarantineCanaryApproval): CopilotStudioQuar
     lastUpdateTimeUtc: approval.prestateProviderUpdatedAt, observedAt: approval.approvedAt, correlationId: randomUUID() };
 }
 
-function requireVerifiedCanaryJob(job: QuarantineJob | undefined, code: string) {
+function needsVerifiedResult(job: QuarantineJob | undefined) {
+  return !job || ["queued", "running", "waiting_authorization", "succeeded"].includes(job.status);
+}
+
+function requireVerifiedCanaryJob(job: QuarantineJob | undefined, approval: QuarantineCanaryApproval, prestate: CopilotStudioQuarantineStatus, code: string) {
   const result = job?.results[0];
-  if (!job || job.status !== "succeeded" || job.results.length !== 1 || result?.status !== "succeeded" || result.observedState === null
-    || !result.observedProviderUpdatedAt || !result.observedAt || !result.correlationId) {
+  if (!job || !job.isCanary || job.action !== approval.action || job.status !== "succeeded" || job.results.length !== 1 || result?.status !== "succeeded"
+    || result.resourceNativeId !== approval.resourceNativeId || result.environmentId !== approval.environmentId || result.botId !== approval.botId
+    || result.requestedState !== approval.poststate || result.observedState !== approval.poststate
+    || !result.observedProviderUpdatedAt || result.observedProviderUpdatedAt === prestate.lastUpdateTimeUtc || !result.observedAt || !result.correlationId) {
     throw new AppError(409, code, "The quarantine canary direction did not produce one durable verified provider readback.");
   }
   return result;
@@ -170,13 +191,8 @@ function sameAuthority(left: QuarantineAuthority, right: QuarantineAuthority) {
 }
 
 function executionScope(user: AuthenticatedUser): QuarantineScope {
-  if (!user.tenantId || !hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required for a full quarantine canary cycle.");
+  if (!user.tenantId || !hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin is required to approve or execute a quarantine canary cycle.");
   return { tenantId: user.tenantId, principalId: user.homeAccountId };
-}
-
-function requireTenant(user: AuthenticatedUser) {
-  if (!user.tenantId) throw AppError.unauthorized("Quarantine canary approval requires a tenant scope.");
-  return user.tenantId;
 }
 
 function userActor(user: AuthenticatedUser) {

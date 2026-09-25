@@ -326,8 +326,14 @@ export async function retain(database: pg.Pool, options: { batchSize?: number; d
       "deleted_at<clock_timestamp()-interval '90 days' AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership WHERE membership.version_id=official_usage_versions.id)");
     await remove("officialArtifacts", "official_usage_artifacts",
       "NOT EXISTS (SELECT 1 FROM official_usage_versions version WHERE version.artifact_id=official_usage_artifacts.id)");
+    // The overview still needs accepted correction markers after their payloads are purged.
     await remove("officialSets", "official_usage_sets",
-      "deleted_at<clock_timestamp()-interval '90 days' AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=official_usage_sets.id)");
+      `deleted_at<clock_timestamp()-interval '90 days'
+        AND NOT EXISTS (SELECT 1 FROM official_usage_set_versions membership WHERE membership.set_id=official_usage_sets.id)
+        AND NOT (complete AND accepted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM official_usage_sets original
+          WHERE original.id=official_usage_sets.supersedes_set_id
+            AND original.tenant_id=official_usage_sets.tenant_id AND original.deleted_at IS NULL))`);
     await remove("sourceIdentifiers", "source_identifiers", `
       (source='graph_packages'
         AND NOT EXISTS (SELECT 1 FROM job_items JOIN jobs ON jobs.id=job_items.job_id WHERE jobs.tenant_id=source_identifiers.tenant_id AND source_identifiers.resource_type='microsoft.graph/copilotpackages' AND job_items.target_id=source_identifiers.native_id AND job_items.target_id=source_identifiers.identifier_value)

@@ -5,6 +5,7 @@ import { requestScope } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import type { AuditScope, AuditStatus, LocalAuditAction } from "../types/audit.js";
+import { auditMaximumOffset, auditMaximumSearchLength, isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
 
 export const auditRouter = Router();
@@ -110,10 +111,9 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", {
       operationId: event.operationId,
     })), { maximumRows: 100, maximumBytes: 1_000_000, deadlineAt });
     await publishBoundedCsv(request, response, "administrative-audit.csv", csv.buffer, {
-      deadlineAt, validate: async () => {
-        await validateSession();
+      deadlineAt, validate: () => validateSession(async () => {
         if (JSON.stringify(await audit.getExportEvents(ids)) !== selected) throw new AppError(409, "dataset_invalidated", "The exact audit selection changed or was deleted.");
-      },
+      }),
       beforeEnd: () => audit.completeEvent(receipt.id, { status: "succeeded",
         metadata: { source: "local_administrative_audit", resultingCount: csv.rowCount, resultingBytes: csv.byteCount } }).then(() => undefined),
     });
@@ -161,7 +161,7 @@ function parseOffset(value: string | undefined) {
 
   const offset = Number.parseInt(value, 10);
 
-  if (!Number.isSafeInteger(offset)) {
+  if (!Number.isSafeInteger(offset) || offset > auditMaximumOffset) {
     throw new AppError(400, "invalid_audit_offset", "Audit offset is invalid.");
   }
 
@@ -211,7 +211,7 @@ function parseOperationIdPrefix(value: string | undefined) {
     return undefined;
   }
 
-  if (normalized.length > 64 || !/^[a-zA-Z0-9-]+$/.test(normalized)) {
+  if (!isAuditOperationPrefix(normalized)) {
     throw new AppError(
       400,
       "invalid_operation_id_prefix",
@@ -229,7 +229,7 @@ function parseSearch(value: string | undefined) {
     return undefined;
   }
 
-  if (normalized.length > 200) {
+  if (normalized.length > auditMaximumSearchLength) {
     throw new AppError(400, "invalid_audit_search", "Audit search is invalid.");
   }
 

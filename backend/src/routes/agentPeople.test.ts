@@ -3,6 +3,7 @@ import session from "express-session";
 import { request as httpRequest, type Server } from "node:http";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "../config.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError, errorHandler } from "../errors.js";
 import { unifiedAgentsRouter } from "./unifiedAgents.js";
 
@@ -54,7 +55,8 @@ beforeAll(async () => {
     const listening = app.listen(0, "127.0.0.1", () => resolve(listening));
   });
 });
-beforeEach(() => {
+beforeEach(async () => {
+  await activateAccountSession(config.tenantId!, "reader", async () => {});
   vi.resetAllMocks();
   mocks.generation.mockResolvedValue("initial");
   mocks.list.mockResolvedValue({ count: 1, value: [record] });
@@ -103,6 +105,29 @@ describe("persisted agent people endpoint", () => {
     expect(await request({ recordId })).toMatchObject({ status: 409, body: { code: "dataset_invalidated" } });
     expect(mocks.project).not.toHaveBeenCalled();
   });
+
+  it.each(["generation", "inventory", "projection"] as const)(
+    "rejects a superseded account session during the %s read", async phase => {
+      const replaceSession = async () => {
+        await revokeAccountSessionMutations(config.tenantId!, "reader", async () => {});
+        await activateAccountSession(config.tenantId!, "reader", async () => {});
+      };
+      if (phase === "generation") mocks.generation.mockImplementationOnce(async () => {
+        await replaceSession();
+        return "initial";
+      });
+      if (phase === "inventory") mocks.list.mockImplementationOnce(async () => {
+        await replaceSession();
+        return { count: 1, value: [record] };
+      });
+      if (phase === "projection") mocks.project.mockImplementationOnce(async () => {
+        await replaceSession();
+        return [{ ...record, people }];
+      });
+      expect(await request({ recordId })).toMatchObject({ status: 401, body: { code: "unauthorized" } });
+      if (phase !== "projection") expect(mocks.resolve).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function request(body: unknown, options: { role?: string | null; csrf?: string | null; tenant?: string } = {}):

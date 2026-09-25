@@ -31,7 +31,7 @@ type QueryOptions = {
   signal?: AbortSignal;
   correlationId?: string;
   tenantId?: string;
-  beforeRequest?: () => Promise<void>;
+  beforeRequest?: (signal: AbortSignal) => Promise<void>;
   onResponse?: (providerRequestId: string | null) => Promise<void>;
 };
 
@@ -87,7 +87,7 @@ export class GraphHuntingClient {
         let retryTransportFailure = false;
         try {
           signal.throwIfAborted();
-          await abortable(Promise.resolve(options.beforeRequest?.()), signal);
+          await abortable(Promise.resolve(options.beforeRequest?.(signal)), signal);
           signal.throwIfAborted();
           retryTransportFailure = true;
           response = await abortable<Response>(this.dependencies.fetch(endpoint, {
@@ -113,6 +113,7 @@ export class GraphHuntingClient {
           }
           if (response.status === 200) {
             const text = await abortable(boundedProviderText(response, maximumResponseBytes, signal), signal);
+            signal.throwIfAborted();
             return parseHuntingResponse(parseJson(text), filters, options.tenantId, Buffer.byteLength(text));
           }
           if (attempt < maximumAttempts && (response.status === 429 || response.status >= 500)) {
@@ -209,6 +210,7 @@ export function expectedHuntingSchema(templateId: DefenderHuntingTemplateId) {
 
 const scalarShape = (source: string) => `(isnull(${source}) or gettype(${source}) in ("string","long","int","real","decimal","datetime","guid","bool"))`;
 const dateShape = (source: string) => `(isnull(${source}) or (${scalarShape(source)} and isnotnull(todatetime(${source}))))`;
+const optionalDateShape = (source: string) => `(${dateShape(source)} or (gettype(${source})=="string" and tostring(${source})==""))`;
 const inventoryScalarFields = ["Timestamp", "AgentId", "AgentName", "Platform", "AgentDescription", "Version", "SourceAgentId", "EntraAgentId",
   "EntraBlueprintId", "ObservabilityId", "PublishedStatus", "LifecycleStatus", "Availability", "CreatedDateTime", "LastPublishedDateTime",
   "LastUpdatedDateTime", "InstanceCount", "Model"] as const;
@@ -225,9 +227,9 @@ const activityCopilotScalarFields = ["PlatformAgentType", "ConversationId", "Thr
 const activityProjectionValid = [dateShape("Timestamp"), ...activityDirectFields.filter(field => field !== "Timestamp").map(scalarShape),
   'gettype(Event)=="dictionary"', '(isnull(Event.CopilotEventData) or gettype(CopilotEventData)=="dictionary")',
   ...activityEventScalarFields.filter(field => !["CreationTime", "CompletionTime"].includes(field)).map(field => scalarShape(`Event.${field}`)),
-  dateShape("Event.CreationTime"), dateShape("Event.CompletionTime"),
+  optionalDateShape("Event.CreationTime"), optionalDateShape("Event.CompletionTime"),
   ...activityCopilotScalarFields.filter(field => field !== "CompletionTime").map(field => scalarShape(`CopilotEventData.${field}`)),
-  dateShape("CopilotEventData.CompletionTime")].join(" and ");
+  optionalDateShape("CopilotEventData.CompletionTime")].join(" and ");
 
 function inventoryQuery(filters: DefenderHuntingFilters) {
   const predicates = [
@@ -609,7 +611,7 @@ function schemaError(name: string) {
 
 function providerRequestId(response: Response) {
   const value = response.headers.get("request-id");
-  return value && value.length <= 512 && !/[\r\n\0]/.test(value) ? value : null;
+  return value && value.length <= 256 && !/[\r\n\0]/.test(value) ? value : null;
 }
 
 function providerFailure(response: Response) {

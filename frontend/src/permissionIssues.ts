@@ -63,7 +63,10 @@ export function permissionIssue(view: CapabilityView, now = Date.now(), awaiting
     || !Number.isFinite(checkedAt) || checkedAt > now || !Number.isFinite(expiresAt) || expiresAt <= now
     || decision.status === "available" || decision.status === "missing_internal_role") return undefined;
   const issue = { view, decision, name: permissionFeatureName(view) };
-  if (["interaction_required", "authorization_expired"].includes(decision.evidence?.category ?? "")) return {
+  if (["interaction_required", "authorization_expired"].includes(decision.evidence?.category ?? "")) return definition.mode === "application" ? {
+    ...issue, message: "Ask an administrator to verify the application's credentials and authorization.",
+    action: { label: "Admin setup", href: "https://entra.microsoft.com/" },
+  } : {
     ...issue, message: "Sign in again to restore Microsoft access.",
     action: { label: "Sign in again", href: "/api/auth/login?returnTo=%2Fpermissions" },
   };

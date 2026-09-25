@@ -7,7 +7,7 @@ import {
   type QuarantineLease,
   type QuarantineScope,
 } from "../db/copilotStudioQuarantine.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import { capabilities } from "./capabilities.js";
@@ -25,17 +25,18 @@ const processOwner = randomUUID();
 const executionDeadlineMs = 30_000;
 const reconciliationDeadlineMs = 15_000;
 const maximumActiveJobs = 2;
-const active = new Map<string, { scope: QuarantineScope; controller: AbortController; operation: Promise<void> }>();
+const active = new Map<Promise<void>, { jobId: string; scope: QuarantineScope; controller: AbortController }>();
 
 export function launchCopilotStudioQuarantineJob(id: string, scope: QuarantineScope, resume = false) {
   requireProviderAdmissions();
-  if (active.has(id)) return;
+  if ([...active.values()].some(value => value.jobId === id.toLowerCase()
+    && value.scope.tenantId === scope.tenantId && value.scope.principalId === scope.principalId)) return;
   if (active.size >= maximumActiveJobs) throw new AppError(429, "workers_busy", "Two quarantine jobs are already running; retry after they finish.");
   const controller = new AbortController();
   const operation = runCopilotStudioQuarantineJob(id, scope, resume, copilotStudioQuarantineJobs, new CopilotStudioQuarantineClient(), authorizeQuarantine, controller.signal)
-    .catch(() => operationalLog("error", "quarantine_job_stopped", { jobId: id, outcome: "requires_review" }))
-    .finally(() => { if (active.get(id)?.operation === operation) active.delete(id); });
-  active.set(id, { scope, controller, operation });
+    .finally(() => active.delete(operation));
+  void operation.catch(() => operationalLog("error", "quarantine_job_stopped", { jobId: id, outcome: "requires_review" }));
+  active.set(operation, { jobId: id.toLowerCase(), scope, controller });
 }
 
 export async function runTrackedCopilotStudioQuarantineJob(
@@ -45,11 +46,12 @@ export async function runTrackedCopilotStudioQuarantineJob(
   provider: QuarantineProvider = new CopilotStudioQuarantineClient(),
   authorize: QuarantineAuthorizer = authorizeQuarantine,
 ) {
+  requireProviderAdmissions();
   if (active.size >= maximumActiveJobs) throw new AppError(429, "workers_busy", "Two quarantine jobs are already running; retry after they finish.");
   const controller = new AbortController();
   const operation = runCopilotStudioQuarantineJob(id, scope, false, repository, provider, authorize, controller.signal)
-    .finally(() => { if (active.get(id)?.operation === operation) active.delete(id); });
-  active.set(id, { scope, controller, operation });
+    .finally(() => active.delete(operation));
+  active.set(operation, { jobId: id.toLowerCase(), scope, controller });
   return operation;
 }
 
@@ -63,20 +65,44 @@ export async function runCopilotStudioQuarantineJob(
   externalSignal?: AbortSignal,
 ) {
   requireProviderAdmissions();
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const authorizeJob = async (owner: QuarantineScope) => {
+    requireProviderAdmissions();
+    externalSignal?.throwIfAborted();
+    assertAccountSessionValidation(validation);
+    const result = await authorize(owner);
+    requireProviderAdmissions();
+    externalSignal?.throwIfAborted();
+    assertAccountSessionValidation(validation);
+    return result;
+  };
   if (!await repository.get(scope, id)) throw new AppError(404, "not_found", "Quarantine job was not found.");
-  requireProviderAdmissions();
   const principal = { tenantId: scope.tenantId, homeAccountId: scope.principalId };
   let authorization: QuarantineAuthorization;
-  try { authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
-    () => authorize(scope), { signal: externalSignal, clearOnSuccess: false }); }
-  catch (error) { await repository.waitForAuthorization(scope, id); throw error; }
+  try {
+    authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
+      () => authorizeJob(scope), { signal: externalSignal, clearOnSuccess: false });
+    requireProviderAdmissions();
+    externalSignal?.throwIfAborted();
+    assertAccountSessionValidation(validation);
+  }
+  catch (error) {
+    await repository.waitForAuthorization(scope, id);
+    if (externalSignal?.aborted) return;
+    throw error;
+  }
   const lease = await repository.claim(scope, id, processOwner, resume);
   if (!lease) return;
   try {
-    for (let index = 0; index < 25 && !maintenanceActive(); index += 1) {
+    for (let index = 0; index < 25 && !maintenanceActive() && !externalSignal?.aborted; index += 1) {
       requireProviderAdmissions();
-      try { authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
-        () => authorize(scope), { signal: externalSignal, clearOnSuccess: false }); }
+      try {
+        authorization = await capabilities.observeOperation("powerPlatform.quarantine.manage", principal,
+          () => authorizeJob(scope), { signal: externalSignal, clearOnSuccess: false });
+        requireProviderAdmissions();
+        externalSignal?.throwIfAborted();
+        assertAccountSessionValidation(validation);
+      }
       catch {
         await repository.waitForAuthorization(scope, id);
         return;
@@ -85,6 +111,17 @@ export async function runCopilotStudioQuarantineJob(
       if (!current) break;
       const { job, item } = current;
       const signal = externalSignal ? AbortSignal.any([externalSignal, AbortSignal.timeout(executionDeadlineMs)]) : AbortSignal.timeout(executionDeadlineMs);
+      const requireCurrentItem = () => {
+        requireProviderAdmissions();
+        signal.throwIfAborted();
+        assertAccountSessionValidation(validation);
+      };
+      const getStatus = async (...args: Parameters<QuarantineProvider["getStatus"]>) => {
+        requireCurrentItem();
+        const observed = await provider.getStatus(...args);
+        requireCurrentItem();
+        return observed;
+      };
       let sent = false;
       try {
         requireAuthority(job, authorization.authority);
@@ -92,29 +129,23 @@ export async function runCopilotStudioQuarantineJob(
           const target = { environmentId: item.environment_id, botId: item.bot_id };
           const options = { correlationId: item.correlation_id!, signal };
           await repository.assertDispatchReady(lease, item, authorization.authority);
-          requireProviderAdmissions();
-          signal.throwIfAborted();
-          const before = await provider.getStatus(authorization.accessToken, target, options);
-          requireProviderAdmissions();
+          const before = await getStatus(authorization.accessToken, target, options);
           if (before.isBotQuarantined === item.requested_state) {
-            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorize, signal);
+            await finishAuthorized(repository, lease, job, item, "skipped", { observed: before, readbackCount: 1 }, scope, authorizeJob, signal, validation);
             return;
           }
           requireFrozenPrestate(item, before);
-          const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-          const dispatchAuthorization = await authorize(scope);
+          const dispatchAuthorization = await authorizeJob(scope);
           requireAuthority(job, dispatchAuthorization.authority);
           await repository.assertDispatchReady(lease, item, dispatchAuthorization.authority);
-          requireProviderAdmissions();
-          signal.throwIfAborted();
-          const immediate = await provider.getStatus(dispatchAuthorization.accessToken, target, options);
+          const immediate = await getStatus(dispatchAuthorization.accessToken, target, options);
           if (immediate.isBotQuarantined === item.requested_state) {
             signal.throwIfAborted();
             await commitAccountSessionValidation(validation, async () => {
               requireProviderAdmissions();
               signal.throwIfAborted();
               await repository.finishItem(lease, item, "skipped", { observed: immediate, readbackCount: 1 });
-                });
+            });
             return;
           }
           requireFrozenPrestate(item, immediate);
@@ -125,19 +156,14 @@ export async function runCopilotStudioQuarantineJob(
             await repository.markSent(lease, item, dispatchAuthorization.authority);
           });
           sent = true;
-          requireProviderAdmissions();
-          signal.throwIfAborted();
+          requireCurrentItem();
           await provider.setQuarantine(dispatchAuthorization.accessToken, target, item.requested_state, options);
-          const verified = await verifyCopilotStudioQuarantineConverged({
-            getStatus: (...args) => {
-              requireProviderAdmissions();
-              return provider.getStatus(...args);
-            },
-          }, dispatchAuthorization.accessToken, target, item.requested_state, options);
-          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorize, signal);
+          const verified = await verifyCopilotStudioQuarantineConverged({ getStatus }, dispatchAuthorization.accessToken, target, item.requested_state, options);
+          await finishAuthorized(repository, lease, job, item, "succeeded", { observed: verified.status, readbackCount: verified.readbackCount }, scope, authorizeJob, signal, validation);
         }), { signal, clearOnSuccess: () => sent });
-      } catch (error) {
-        if (error instanceof AppError && error.code === "lease_lost") throw error;
+      } catch (caught) {
+        if (caught instanceof AppError && caught.code === "lease_lost") throw caught;
+        const error: unknown = signal.aborted ? signal.reason : caught;
         if (!sent && (isAuthorizationFailure(error) || isAdmissionFailure(error))) {
           await repository.pauseItemForAuthorization(lease, item);
           return;
@@ -149,11 +175,11 @@ export async function runCopilotStudioQuarantineJob(
         }
         const failure = failureEvidence(error);
         await repository.finishItem(lease, item, sent ? "inconclusive" : error instanceof AppError && ["cancelled", "shutdown", "maintenance"].includes(error.code) ? "cancelled" : "failed", {
-          errorCode: error instanceof AppError ? error.code : "provider_error",
+          errorCode: isDeadlineExceeded(error) ? "provider_timeout" : error instanceof AppError ? error.code : "provider_error",
           message: sent ? "Provider write outcome is inconclusive; use GET reconciliation and never replay this item." : "The quarantine item stopped before provider dispatch.",
           ...failure,
         });
-        if (isAdmissionFailure(error)) return;
+        if (isAdmissionFailure(error) || externalSignal?.aborted) return;
       }
     }
   } finally {
@@ -170,21 +196,27 @@ export async function reconcileCopilotStudioQuarantineJob(
   authorize: QuarantineAuthorizer = authorizeQuarantine,
 ) {
   requireProviderAdmissions();
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   const context = await repository.reconciliationItems(scope, id);
+  assertAccountSessionValidation(validation);
   if (!context) throw new AppError(404, "not_found", "Quarantine job was not found.");
   const errors: Array<{ resourceNativeId: string; message: string }> = [];
   for (const item of context.items) {
     requireProviderAdmissions();
+    assertAccountSessionValidation(validation);
     try {
-      const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
       const authorization = await authorize(scope);
+      assertAccountSessionValidation(validation);
       requireAuthority(context.job, authorization.authority);
       const signal = AbortSignal.timeout(reconciliationDeadlineMs);
       await repository.withReconciliationLock(scope, item, async () => {
         await repository.assertReconciliationTarget(scope, item, context.job.is_canary);
         requireProviderAdmissions();
+        signal.throwIfAborted();
+        assertAccountSessionValidation(validation);
         const observed = await provider.getStatus(authorization.accessToken, { environmentId: item.environment_id, botId: item.bot_id }, { correlationId: item.correlation_id ?? randomUUID(), signal });
         requireProviderAdmissions();
+        assertAccountSessionValidation(validation);
         const publishAuthorization = await authorize(scope);
         requireAuthority(context.job, publishAuthorization.authority);
         signal.throwIfAborted();
@@ -205,10 +237,15 @@ export async function reconcileCopilotStudioQuarantineJob(
     }
   }
   requireProviderAdmissions();
+  assertAccountSessionValidation(validation);
   const finalAuthorization = await authorize(scope);
+  assertAccountSessionValidation(validation);
   requireAuthority(context.job, finalAuthorization.authority);
+  const current = await repository.get(scope, id);
   requireProviderAdmissions();
-  return { ...(await repository.get(scope, id))!, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
+  assertAccountSessionValidation(validation);
+  if (!current) throw new AppError(404, "not_found", "Quarantine job was not found.");
+  return { ...current, reconciliation: { attempted: context.items.length, failed: errors.length, errors } };
 }
 
 export async function cancelCopilotStudioQuarantineJob(
@@ -217,9 +254,12 @@ export async function cancelCopilotStudioQuarantineJob(
   repository = copilotStudioQuarantineJobs,
 ) {
   const job = await repository.cancel(scope, id);
-  const running = active.get(id);
-  if (job && running?.scope.tenantId === scope.tenantId && running.scope.principalId === scope.principalId) {
-    running.controller.abort(new AppError(409, "cancelled", "The quarantine job was cancelled."));
+  if (job) {
+    for (const running of active.values()) {
+      if (running.jobId === id.toLowerCase() && running.scope.tenantId === scope.tenantId && running.scope.principalId === scope.principalId) {
+        running.controller.abort(new AppError(409, "cancelled", "The quarantine job was cancelled."));
+      }
+    }
   }
   return job;
 }
@@ -232,9 +272,9 @@ export async function pauseCopilotStudioQuarantineForPrincipal(scope: Quarantine
 }
 
 export async function drainCopilotStudioQuarantineJobs() {
-  const current = [...active.values()];
-  for (const value of current) value.controller.abort(new AppError(503, "shutdown", "Application shutdown stopped quarantine work."));
-  const results = await Promise.allSettled(current.map(value => value.operation));
+  const current = [...active.entries()];
+  for (const [, value] of current) value.controller.abort(new AppError(503, "shutdown", "Application shutdown stopped quarantine work."));
+  const results = await Promise.allSettled(current.map(([operation]) => operation));
   const failure = results.find(result => result.status === "rejected");
   if (failure?.status === "rejected") throw failure.reason;
 }
@@ -257,9 +297,9 @@ async function finishAuthorized(
   scope: QuarantineScope,
   authorize: QuarantineAuthorizer,
   signal: AbortSignal,
+  validation: ReturnType<typeof beginAccountSessionValidation>,
 ) {
   requireProviderAdmissions();
-  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   const authorization = await authorize(scope);
   requireAuthority(job, authorization.authority);
   signal.throwIfAborted();

@@ -3,11 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentUsageRepository, type AgentUsageSnapshot, type AuthorizedAgentUsageSource, type StoredAgentUsageAssociation,
 } from "../db/agentUsage.js";
+import * as inventoryRevision from "../db/unifiedInventoryRevision.js";
 import type { AgentUsageAssociationInput } from "../types/agentUsage.js";
+import type { AuditEvent } from "../types/audit.js";
 import type { ParsedOfficialUsageReport, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { AgentUsageService, buildAgentUsageContext, buildAgentUsageProjection, combineAgentInventoryRevision } from "./agentUsage.js";
 import { agentUsageAssociationInput, agentUsageAssociationRemoval, agentUsageCandidateQuery } from "./agentUsageValidation.js";
+import { AuditLog } from "./auditLog.js";
+import * as maintenance from "./maintenance.js";
 import { allowlistedPackage } from "./packageObservation.js";
 
 const scope = { tenantId: "tenant-a", principalId: "principal-a" };
@@ -289,6 +293,52 @@ describe("report-backed inventory usage", () => {
   });
 });
 
+describe("reviewed usage mutation publication", () => {
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(snapshotAt));
+    vi.spyOn(maintenance, "requireAdmissions").mockImplementation(() => undefined);
+  });
+
+  it.each(["attach", "remove"] as const)("rolls back %s when the report disappears from the expiry-aware reread", async action => {
+    const fixture = mutation(action);
+    fixture.read.mockReset().mockResolvedValueOnce(fixture.snapshot).mockResolvedValueOnce({
+      ...fixture.updated,
+      published: { ...fixture.updated.published, activeSet: null, reports: {}, activeSelectionIncomplete: true },
+      associations: [], now: new Date(fixture.snapshot.expiresAt!), expiresAt: null,
+    });
+
+    await expect(fixture.run()).rejects.toMatchObject({ code: "agent_usage_changed" });
+    expect(fixture.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(fixture.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(fixture.complete).toHaveBeenCalledExactlyOnceWith(setId, { status: "failed", errorCode: "agent_usage_changed" });
+    expect(fixture.release).toHaveBeenCalledOnce();
+  });
+
+  it.each(["attach", "remove"] as const)("rolls back %s and its success receipt if expiry passes during audit persistence", async action => {
+    const fixture = mutation(action);
+    fixture.complete.mockImplementation(async (_id, update) => {
+      if (update.status === "succeeded") vi.mocked(Date.now).mockReturnValue(fixture.snapshot.expiresAt!.getTime());
+      return { ...fixture.event, ...update };
+    });
+
+    await expect(fixture.run()).rejects.toMatchObject({ code: "agent_usage_changed" });
+    expect(fixture.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(fixture.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(fixture.complete).toHaveBeenLastCalledWith(setId, { status: "failed", errorCode: "agent_usage_changed" });
+  });
+
+  it.each(["attach", "remove"] as const)("commits %s with the same valid report and its success receipt", async action => {
+    const fixture = mutation(action);
+    await expect(fixture.run()).resolves.toMatchObject({
+      context: { reportSet: { id: setId }, revision: buildAgentUsageContext(scope, fixture.updated).revision },
+    });
+    expect(fixture.query).toHaveBeenCalledWith("COMMIT");
+    expect(fixture.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(fixture.complete).toHaveBeenCalledExactlyOnceWith(setId, expect.objectContaining({ status: "succeeded" }));
+    expect(fixture.release).toHaveBeenCalledOnce();
+  });
+});
+
 describe("strict usage association contracts", () => {
   const input = (): AgentUsageAssociationInput => ({
     reportSetId: setId, reportAgentId: "Report-A", target: { source: "graph_packages", packageId: "Package-A" },
@@ -303,6 +353,33 @@ describe("strict usage association contracts", () => {
     expect(agentUsageAssociationRemoval(removal)).toEqual(removal);
     expect(agentUsageCandidateQuery({ search: " Agent ", limit: "250", offset: "100000" })).toEqual({ search: "Agent", limit: 250, offset: 100000 });
   });
+
+  it.each(["Agent-\u{1f916}", "Agent-\ufffd", "Élan-代理"])("preserves well-formed Unicode text %j exactly", text => {
+    const graph = { ...input(), reportAgentId: text, target: { source: "graph_packages", packageId: text } };
+    const native = { ...input(), reportAgentId: text, target: { source: "power_platform", nativeId: text, environmentId: text } };
+    expect(agentUsageAssociationInput(graph)).toEqual(graph);
+    expect(agentUsageAssociationInput(native)).toEqual(native);
+    const { target: _target, ...removal } = graph;
+    expect(agentUsageAssociationRemoval(removal)).toEqual(removal);
+    expect(agentUsageCandidateQuery({ search: text })).toEqual({ search: text, offset: 0, limit: 50 });
+  });
+
+  it.each(["\ud800", "\udfff", "\udfff\ud800", "\u0080", "\u0085", "\u009f"])(
+    "rejects malformed Unicode and control characters %j in every text field",
+    character => {
+      const text = `Agent-${character}-ID`;
+      const error = expect.objectContaining({ status: 400, code: "invalid_agent_usage_input" });
+      for (const changes of [
+        { reportAgentId: text },
+        { target: { source: "graph_packages", packageId: text } },
+        { target: { source: "power_platform", nativeId: text, environmentId: null } },
+        { target: { source: "power_platform", nativeId: "Bot-A", environmentId: text } },
+      ]) expect(() => agentUsageAssociationInput({ ...input(), ...changes })).toThrowError(error);
+      const { target: _target, ...removal } = input();
+      expect(() => agentUsageAssociationRemoval({ ...removal, reportAgentId: text })).toThrowError(error);
+      expect(() => agentUsageCandidateQuery({ search: text })).toThrowError(error);
+    },
+  );
 
   it.each([
     null, [], {}, { confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { confirmed: undefined },
@@ -395,4 +472,46 @@ function automaticData() {
     for (const row of report!.rows) row.agentId = fixture.records[0].packages[row.agentId === "Report-A" ? 0 : 1].id;
   }
   return fixture;
+}
+
+function mutation(action: "attach" | "remove") {
+  const fixture = data();
+  const association = fixture.snapshot.associations[0];
+  fixture.snapshot.associations = action === "attach" ? [] : [association];
+  fixture.snapshot.expiresAt = new Date(Date.now() + 1_000);
+  const updated: AgentUsageSnapshot = {
+    ...structuredClone(fixture.snapshot), associationRevision: "2", associations: action === "attach" ? [association] : [],
+  };
+  const query = vi.fn().mockResolvedValue({ rows: [] });
+  const release = vi.fn();
+  const client = { query, release } as unknown as pg.PoolClient;
+  const database = { connect: vi.fn().mockResolvedValue(client) } as unknown as pg.Pool;
+  const service = new AgentUsageService(database);
+  vi.spyOn(AgentUsageRepository.prototype, "resolveRecord").mockResolvedValue({
+    id: fixture.records[0].id, sources: fixture.sources.slice(0, 2),
+  });
+  const read = vi.spyOn(AgentUsageRepository.prototype, "read")
+    .mockResolvedValueOnce(fixture.snapshot).mockResolvedValue(updated);
+  vi.spyOn(AgentUsageRepository.prototype, "insert").mockResolvedValue();
+  vi.spyOn(AgentUsageRepository.prototype, "remove").mockResolvedValue();
+  vi.spyOn(inventoryRevision, "readUnifiedInventoryRevision").mockResolvedValue("a".repeat(64));
+  const event: AuditEvent = {
+    id: setId, operationId: "usage-test", scope: "single",
+    action: action === "attach" ? "associate-agent-usage" : "remove-agent-usage-association",
+    agentId: fixture.records[0].id, status: "started", startedAt: snapshotAt, requestPath: "/usage-associations",
+    actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "admin@example.invalid", displayName: "Admin" },
+  };
+  vi.spyOn(AuditLog.prototype, "startEvent").mockResolvedValue(event);
+  vi.spyOn(AuditLog.prototype, "getEvent").mockResolvedValue(event);
+  const complete = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async (_id, update) => ({ ...event, ...update }));
+  const usageRevision = buildAgentUsageContext(scope, fixture.snapshot).revision;
+  const input = {
+    reportSetId: setId, reportAgentId: association.report_agent_id, confirmed: true as const,
+    expectedUsageRevision: usageRevision, expectedInventoryRevision: combineAgentInventoryRevision("a".repeat(64), usageRevision),
+  };
+  const audit = { actor: event.actor, requestPath: event.requestPath };
+  const run = () => action === "attach"
+    ? service.attach(scope, fixture.records[0].id, { ...input, target: { source: "graph_packages", packageId: "Package-A" } }, audit)
+    : service.remove(scope, fixture.records[0].id, input, audit);
+  return { ...fixture, updated, query, release, read, event, complete, run };
 }

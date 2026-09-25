@@ -86,6 +86,51 @@ describe("separate package detail projection", () => {
     expect(result.allowedUsersAndGroups).toBeUndefined();
   });
 
+  it.each([
+    { elementTypes: ["Bots"] },
+    { elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
+      SourceIds: { EnvironmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+    }) }] }] },
+    { elementDetails: [{ elementType: "DeclarativeCopilots", elements: [
+      { id: "first", definition: "{}" }, { id: "second", definition: "{}" },
+    ] }] },
+  ])("does not hide positive catalog identity changes behind unchanged revision markers: %j", evidence => {
+    const result = projectPackageDetails({ ...summary, ...evidence }, observation, false, now);
+    expect(result).toMatchObject({ detailFreshness: { state: "invalidated" }, identityRevalidationRequired: true });
+    expect(result).not.toHaveProperty("elementDetails");
+    expect(result).not.toHaveProperty("identityDetailsCollected");
+    expect(resolvePackageAgentLinks("tenant", [result], [])[0]).not.toHaveProperty("grouping");
+  });
+
+  it("retains compatible details when catalog identity fields are sparse, empty or case-equivalent", () => {
+    const saved = { ...observation, package: { ...detailed, elementTypes: ["DeclarativeCopilots"] } };
+    for (const evidence of [
+      {},
+      { elementTypes: [], elementDetails: [{ elementType: "AgentMetadatas", elements: [] }] },
+      { elementTypes: ["declarativecopilots"], elementDetails: detailed.elementDetails },
+    ]) {
+      expect(projectPackageDetails({ ...summary, ...evidence }, saved, false, now)).toMatchObject({
+        detailFreshness: { state: "fresh" }, identityDetailsCollected: true, elementDetails: detailed.elementDetails,
+      });
+    }
+  });
+
+  it.each(["allowedUsersAndGroups", "acquireUsersAndGroups"] as const)(
+    "retains explicitly newer catalog %s but still uses newer details and enriches omissions", key => {
+      const cached = [{ resourceId: "cached", resourceType: "user" }];
+      const saved = { ...observation, package: { ...detailed, [key]: cached } };
+      for (const principals of [[], [{ resourceId: "current", resourceType: "user" }]]) {
+        const current = { ...summary, [key]: principals };
+        expect(projectPackageDetails(current, saved, false, now, now - 15 * 60_000)[key]).toEqual(principals);
+        expect(projectPackageDetails(current, saved, false, now, now - 45 * 60_000)[key]).toEqual(cached);
+      }
+      expect(projectPackageDetails(summary, saved, false, now, now - 15 * 60_000)[key]).toEqual(cached);
+      expect(projectPackageDetails({ ...summary, [key]: cached }, {
+        ...observation, package: { ...summary, identityDetailsCollected: true },
+      }, false, now, now - 45 * 60_000)).not.toHaveProperty(key);
+    },
+  );
+
   it("preserves absence rather than inventing undefined access membership properties", () => {
     const result = projectPackageDetails(summary, { ...observation, package: {
       ...summary, identityDetailsCollected: true,

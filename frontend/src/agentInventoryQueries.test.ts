@@ -44,6 +44,20 @@ function pageWithPeople(people: UnifiedAgentRecord["people"]): UnifiedAgentInven
   };
 }
 
+function pageWithEnvironment(expiresAt: string): UnifiedAgentInventoryPage {
+  const result = pageWithPeople(undefined);
+  result.value[0].environmentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  result.value[0].environment = {
+    id: result.value[0].environmentId, displayName: "Saved environment", region: null,
+    environmentType: null, isManaged: null, groupName: null, groupId: null, provenance: {},
+    observation: {
+      id: "environment-snapshot", snapshotId: "environment-snapshot", current: true,
+      observedAt: "2026-09-20T11:00:00.000Z", expiresAt,
+    },
+  };
+  return result;
+}
+
 describe("AgentInventoryQueries", () => {
   let queries: AgentInventoryQueries;
   const read = vi.mocked(getUnifiedAgents);
@@ -115,6 +129,79 @@ describe("AgentInventoryQueries", () => {
     vi.advanceTimersByTime(5_000);
     await queries.read("owner", {}, signal());
     expect(read).toHaveBeenCalledTimes(6);
+  });
+
+  it.each(["source", "usage"] as const)("rejects a response whose %s evidence expires in flight instead of caching it", async source => {
+    const expiresAt = "2026-09-20T12:00:05.000Z";
+    const expiring: UnifiedAgentInventoryPage = source === "source" ? page(expiresAt) : {
+      ...page(),
+      usageContext: { revision: "usage", lineages: [], availability: "active" as const, expiresAt,
+        reportSet: {
+          id: "report", bundleId: "bundle", complete: true, kinds: ["agents", "userAgents", "users"],
+          reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" as const },
+          supersedesSetId: null, acceptedAt: null, deletedAt: null, createdAt: "2026-09-20T12:00:00.000Z", expiresAt: null,
+        },
+      },
+    };
+    read.mockImplementationOnce(async () => {
+      vi.setSystemTime(new Date(expiresAt));
+      return expiring;
+    });
+
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ revision: "a".repeat(64) });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("expires cached environment context independently of the agent source snapshots", async () => {
+    const environmentPage = pageWithEnvironment("2026-09-20T12:00:05.000Z");
+    read.mockResolvedValueOnce(environmentPage);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(environmentPage);
+    vi.advanceTimersByTime(4_999);
+    await expect(queries.read("owner", {}, signal())).resolves.toBe(environmentPage);
+    expect(read).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("expires an empty filtered page when its off-page context deadline is reached", async () => {
+    const filteredPage = { ...page(), expiresAt: "2026-09-20T12:00:05.000Z" };
+    filteredPage.facets.environments = [{ value: "environment-id", label: "Saved environment" }];
+    read.mockResolvedValueOnce(filteredPage);
+    await expect(queries.read("owner", { search: "no results" }, signal())).resolves.toBe(filteredPage);
+    vi.advanceTimersByTime(5_000);
+    await expect(queries.read("owner", { search: "no results" }, signal())).resolves.toMatchObject({
+      facets: { environments: [] },
+    });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["2026-09-20T12:00:00.000Z", "inventory_changed"],
+    ["invalid", "invalid_inventory_expiry"],
+  ])("rejects a page-level deadline of %s", async (expiresAt, code) => {
+    read.mockResolvedValueOnce({ ...page(), expiresAt });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code });
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects environment context that expires in flight instead of caching it", async () => {
+    const expiresAt = "2026-09-20T12:00:05.000Z";
+    read.mockImplementationOnce(async () => {
+      vi.setSystemTime(new Date(expiresAt));
+      return pageWithEnvironment(expiresAt);
+    });
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "inventory_changed" });
+    await expect(queries.read("owner", {}, signal())).resolves.toMatchObject({ value: [] });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects malformed environment expiry instead of extending saved context", async () => {
+    read.mockResolvedValueOnce(pageWithEnvironment("invalid"));
+    await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "invalid_inventory_expiry" });
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it.each([

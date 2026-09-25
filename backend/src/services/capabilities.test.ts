@@ -52,6 +52,75 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe.each(["automatic", "targeted"] as const)("%s check cancellation ownership", mode => {
+  it.each([0, 1])("cancels caller %i without cancelling the other shared caller", async cancelled => {
+    const held = deferred<unknown>();
+    const controllers = [new AbortController(), new AbortController()];
+    const packageProbe = vi.fn((_token: string, _signal?: AbortSignal) => held.promise);
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    const settled = [false, false];
+    const pending = controllers.map((controller, index) => (mode === "automatic"
+      ? value.check(reader, { signal: controller.signal })
+      : value.refresh("graph.package.read.delegated", reader, controller.signal))
+      .finally(() => { settled[index] = true; }));
+    const results = Promise.allSettled(pending);
+    const cancellation = new AppError(499, "request_cancelled", "This caller disconnected.");
+    try {
+      await vi.waitFor(() => expect(packageProbe).toHaveBeenCalledOnce());
+      controllers[cancelled].abort(cancellation);
+      await vi.waitFor(() => expect(settled[cancelled]).toBe(true));
+      expect(settled[1 - cancelled]).toBe(false);
+      expect(packageProbe.mock.calls[0][1]?.aborted).toBe(false);
+      if (mode === "automatic") expect(value.checkProgress(reader)).not.toBeNull();
+    } finally { held.resolve([]); }
+    const outcomes = await results;
+    expect(outcomes[cancelled]).toEqual({ status: "rejected", reason: cancellation });
+    expect(outcomes[1 - cancelled].status).toBe("fulfilled");
+    expect(packageProbe).toHaveBeenCalledOnce();
+  });
+
+  it("does not attach an immediate replacement to abandoned work", async () => {
+    const held = deferred<unknown>();
+    const controller = new AbortController();
+    const packageProbe = vi.fn((_token: string, _signal?: AbortSignal) => Promise.resolve<unknown>([]))
+      .mockImplementationOnce(() => held.promise);
+    const { value, repository } = service(new MemoryRepository(), { packageProbe });
+    const start = (signal?: AbortSignal) => mode === "automatic"
+      ? value.check(reader, { signal })
+      : value.refresh("graph.package.read.delegated", reader, signal);
+    const cancelled = start(controller.signal);
+    const rejection = expect(cancelled).rejects.toMatchObject({ code: "request_cancelled" });
+    try {
+      await vi.waitFor(() => expect(packageProbe).toHaveBeenCalledOnce());
+      controller.abort(new AppError(499, "request_cancelled", "Disconnected"));
+      await expect(start()).resolves.toBeDefined();
+      expect(packageProbe).toHaveBeenCalledTimes(2);
+      expect(packageProbe.mock.calls[0][1]?.aborted).toBe(true);
+      expect(repository.recordEvidence.mock.calls.filter(([key]) => key.capabilityId === "graph.package.read.delegated")).toHaveLength(1);
+    } finally { held.resolve([]); await rejection; }
+  });
+
+  it("does not cancel a provider probe also awaited by the other check kind", async () => {
+    const held = deferred<unknown>();
+    const controller = new AbortController();
+    const packageProbe = vi.fn((_token: string, _signal?: AbortSignal) => held.promise);
+    const { value } = service(new MemoryRepository(), { packageProbe });
+    const automatic = (signal?: AbortSignal) => value.check(reader, { signal });
+    const targeted = (signal?: AbortSignal) => value.refresh("graph.package.read.delegated", reader, signal);
+    const cancelled = (mode === "automatic" ? automatic : targeted)(controller.signal);
+    const rejection = expect(cancelled).rejects.toMatchObject({ code: "request_cancelled" });
+    const survivor = (mode === "automatic" ? targeted : automatic)();
+    const success = expect(survivor).resolves.toBeDefined();
+    try {
+      await vi.waitFor(() => expect(packageProbe).toHaveBeenCalledOnce());
+      controller.abort(new AppError(499, "request_cancelled", "Disconnected"));
+      await rejection;
+      expect(packageProbe.mock.calls[0][1]?.aborted).toBe(false);
+    } finally { held.resolve([]); await success; }
+    expect(packageProbe).toHaveBeenCalledOnce();
+  });
+});
+
 describe("live automatic check progress", () => {
   it("is read-only and empty when no check is running", () => {
     const { value, repository, probes } = service();

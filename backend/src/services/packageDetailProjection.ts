@@ -1,4 +1,5 @@
 import type { CopilotPackageDetail, PackageDetailFreshness } from "../types/copilotPackage.js";
+import { packageControlIdentityChanged } from "./packageControlProjection.js";
 
 export type SavedPackageDetail = {
   package: CopilotPackageDetail | null;
@@ -25,7 +26,7 @@ function hasCollectedDetails(value: CopilotPackageDetail) {
 }
 
 export function projectPackageDetails(current: CopilotPackageDetail, saved: SavedPackageDetail | undefined,
-  authoritativeCurrent = false, now = Date.now()): CopilotPackageDetail {
+  authoritativeCurrent = false, now = Date.now(), currentReadStartedAt?: number): CopilotPackageDetail {
   if (!saved || saved.package && !hasCollectedDetails(saved.package)) {
     const result = { ...current, detailFreshness: { state: "missing" as const, observedAt: null, expiresAt: null } };
     delete result.elementDetails;
@@ -33,7 +34,8 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     return result;
   }
   const compatible = saved.package && saved.package.id === current.id
-    && (authoritativeCurrent || packageDetailRevisionMatches(current, saved.package));
+    && (authoritativeCurrent || packageDetailRevisionMatches(current, saved.package)
+      && !packageControlIdentityChanged(saved.package, current));
   const state: PackageDetailFreshness["state"] = !compatible ? "invalidated"
     : Date.parse(saved.expiresAt) > now && Date.parse(saved.observedAt) <= now ? "fresh" : "stale";
   const result: CopilotPackageDetail = {
@@ -51,11 +53,12 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     delete result[key];
     Object.assign(result, saved.package![key] === undefined ? {} : { [key]: saved.package![key] });
   }
-  if (current.availableTo === saved.package!.availableTo) {
+  const newerCatalog = currentReadStartedAt !== undefined && currentReadStartedAt > Date.parse(saved.observedAt);
+  if (current.availableTo === saved.package!.availableTo && !(newerCatalog && current.allowedUsersAndGroups !== undefined)) {
     delete result.allowedUsersAndGroups;
     if (saved.package!.allowedUsersAndGroups !== undefined) result.allowedUsersAndGroups = saved.package!.allowedUsersAndGroups;
   }
-  if (current.deployedTo === saved.package!.deployedTo) {
+  if (current.deployedTo === saved.package!.deployedTo && !(newerCatalog && current.acquireUsersAndGroups !== undefined)) {
     delete result.acquireUsersAndGroups;
     if (saved.package!.acquireUsersAndGroups !== undefined) result.acquireUsersAndGroups = saved.package!.acquireUsersAndGroups;
   }

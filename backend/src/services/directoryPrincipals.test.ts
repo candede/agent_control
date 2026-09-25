@@ -278,6 +278,99 @@ describe("DirectoryPrincipalsClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each(["http", "schema"])("cancels the other search collection after a %s failure", async failure => {
+    const cancel = vi.fn();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) { streamController = stream; },
+      cancel,
+    });
+    const fetcher = vi.fn<FetchLike>(async input => new URL(input).pathname.endsWith("/users")
+      ? failure === "http"
+        ? Response.json({ error: { code: "Authorization_RequestDenied" } }, { status: 403 })
+        : Response.json({ value: [{ id: "not-an-object-id" }] })
+      : new Response(body));
+    const pending = new DirectoryPrincipalsClient(fetcher).search("token", "person").catch(error => error);
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toMatchObject({
+        code: failure === "http" ? "Authorization_RequestDenied" : "provider_schema",
+      });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      streamController.error(new Error("Search fixture cleanup"));
+      await pending;
+    }
+  });
+
+  it.each(["search", "resolve"] as const)("preserves cancellation immediately before %s publication", async operation => {
+    for (const depth of [4, 5, 6]) {
+      const controller = new AbortController();
+      const reason = new DOMException("Directory lookup cancelled", "AbortError");
+      const fetcher = vi.fn<FetchLike>(async input => {
+        const payload = operation === "search"
+          ? { value: new URL(input).pathname.endsWith("/users") ? [{ id: userId }] : [] }
+          : { id: userId };
+        return new Response(new ReadableStream<Uint8Array>({
+          start(stream) { stream.enqueue(new TextEncoder().encode(JSON.stringify(payload))); },
+          pull(stream) {
+            stream.close();
+            const abortLater = (remaining: number) => {
+              if (!remaining) controller.abort(reason);
+              else queueMicrotask(() => abortLater(remaining - 1));
+            };
+            abortLater(depth);
+          },
+        }, { highWaterMark: 0 }));
+      });
+      const client = new DirectoryPrincipalsClient(fetcher);
+      const pending = operation === "search"
+        ? client.search("token", "person", 25, controller.signal)
+        : client.resolve("token", [{ resourceType: "user", resourceId: userId }], controller.signal);
+      const outcome = await pending.then(value => ({ value }), error => ({ error }));
+      expect(controller.signal.aborted).toBe(true);
+      expect(outcome).toEqual({ error: reason });
+    }
+  });
+
+  it.each([200, 403, 404])("keeps the request deadline authoritative between body completion and response mapping for %s", async status => {
+    const controller = new AbortController();
+    const reason = new DOMException("Directory request timed out", "TimeoutError");
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode(JSON.stringify(status === 200
+          ? { id: userId } : { error: { code: "Request_ResourceNotFound" } })));
+      },
+      pull(stream) {
+        stream.close();
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => controller.abort(reason)))));
+      },
+    }, { highWaterMark: 0 }), { status }));
+    try {
+      await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [{ resourceType: "user", resourceId: userId }]))
+        .rejects.toBe(reason);
+    } finally { timeout.mockRestore(); }
+  });
+
+  it.each(["search", "resolve"] as const)("checks the current-request guard before %s dispatch", async operation => {
+    const fetcher = vi.fn<FetchLike>();
+    const reason = AppError.unauthorized("Session replaced.");
+    const assertCurrent = () => { throw reason; };
+    const client = new DirectoryPrincipalsClient(fetcher);
+    await expect(operation === "search"
+      ? client.search("token", "person", 25, undefined, assertCurrent)
+      : client.resolve("token", [{ resourceType: "user", resourceId: userId }], undefined, assertCurrent))
+      .rejects.toBe(reason);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cancelled empty batch without returning a successful result", async () => {
+    const reason = new DOMException("Directory lookup cancelled", "AbortError");
+    const fetcher = vi.fn<FetchLike>();
+    await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [], AbortSignal.abort(reason))).rejects.toBe(reason);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("rejects unsupported principal types before resolving the batch", async () => {
     const fetcher = vi.fn<FetchLike>();
     await expect(new DirectoryPrincipalsClient(fetcher).resolve("token", [

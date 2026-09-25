@@ -1,5 +1,8 @@
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
 import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
+import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
+
+export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
 export const workbenchViewIds = [
   "agents",
@@ -242,19 +245,19 @@ export function parseAuditRoute(search: string): AuditRouteState {
   const action = bounded(params.get("action"), 64);
   const status = bounded(params.get("status"), 64);
   return {
-    search: bounded(params.get("q"), 256) ?? "",
+    search: bounded(params.get("q"), auditMaximumSearchLength) ?? "",
     action: action && localAuditActions.has(action) ? action : "all",
     status: status && localAuditStatuses.has(status) ? status : "all",
-    page: boundedPage(params.get("page")),
+    page: Math.min(boundedPage(params.get("page")), maximumAuditPageIndex),
   };
 }
 
 export function auditRouteSearch(state: AuditRouteState) {
   const params = new URLSearchParams();
-  if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
+  if (state.search.trim()) params.set("q", state.search.trim().slice(0, auditMaximumSearchLength));
   if (state.action !== "all" && localAuditActions.has(state.action)) params.set("action", state.action);
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
-  if (state.page > 0) params.set("page", String(state.page + 1));
+  if (state.page > 0) params.set("page", String(Math.min(state.page, maximumAuditPageIndex) + 1));
   return params;
 }
 

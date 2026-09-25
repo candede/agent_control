@@ -47,6 +47,8 @@ describe("capability registry", () => {
       permissions: ["Reports.Read.All"],
       mode: "delegated",
       dataClass: "licensed_usage",
+      purpose: expect.stringContaining("during Users sync"),
+      probe: { description: expect.stringContaining("saved dashboard reads and background capability checks never scan the report") },
     });
     expect(capabilityDefinitions.find(definition => definition.id === "graph.directory.read")?.permissions).toEqual(["User.ReadBasic.All", "Group.Read.All"]);
     expect(capabilityDefinitions.find(definition => definition.id === "graph.licenses.read")?.permissions).toEqual(["User.Read.All", "LicenseAssignment.Read.All"]);

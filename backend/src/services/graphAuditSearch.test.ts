@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import { GraphAuditSearchClient, createProviderQueryBody, providerQueryMatches, validatePurviewAuditFilters } from "./graphAuditSearch.js";
@@ -243,6 +244,52 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it.each(["stalled", "rejected"].flatMap(mode => ["get", "create"].map(operation => ({ mode, operation }))))(
+    "preserves rejected $operation outcomes without waiting for $mode cleanup", async ({ mode, operation }) => {
+      for (const [status, code] of [[302, "invalid_provider_link"], [401, "authorization_expired"], [403, "provider_denied"], [429, "provider_throttled"]] as const) {
+        const cleanup = Promise.withResolvers<void>();
+        const cancel = vi.fn(() => mode === "stalled" ? cleanup.promise : Promise.reject(new Error("cleanup failed")));
+        const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), { status, headers: { "retry-after": "60" } }));
+        const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+        const pending = (operation === "create" ? client.createQuery("token", marker, filters) : client.getQuery("token", "provider-1")).catch(error => error);
+        try {
+          expect(await Promise.race([pending, setImmediate("still pending")])).toMatchObject({ code });
+          expect(fetcher).toHaveBeenCalledOnce();
+          expect(cancel).toHaveBeenCalledOnce();
+        } finally { cleanup.resolve(); await pending; }
+      }
+    },
+  );
+
+  it("does not let stalled cleanup block a permitted read retry", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => cleanup.promise);
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), { status: 503 }))
+      .mockResolvedValueOnce(response(query("succeeded")));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = client.getQuery("token", "provider-1");
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toMatchObject({ status: "succeeded" });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { cleanup.resolve(); await pending; }
+  });
+
+  it("preserves a durable response-recording rejection when cleanup stalls", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => cleanup.promise);
+    const failure = new AppError(409, "audit_execution_lost", "stale");
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = client.getQuery("token", "provider-1", { onResponse: async () => { throw failure; } }).catch(error => error);
+    try {
+      expect(await Promise.race([pending, setImmediate("still pending")])).toBe(failure);
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally { cleanup.resolve(); await pending; }
+  });
+
   it.each(["beforeRequest", "onResponse"] as const)("does not retry unexpected %s failures as network errors", async hook => {
     const cancel = vi.fn(async () => undefined);
     const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel })));
@@ -265,7 +312,7 @@ describe("Graph Audit Search selected v1.0 contract", () => {
       await expect(Promise.race([
         client.getQuery("token", "provider-1", { [hook]: () => new Promise<void>(() => undefined) }),
         new Promise(resolve => { timer = setTimeout(() => resolve("attempt deadline ignored"), 200); }),
-      ])).rejects.toMatchObject({ code: "provider_error" });
+      ])).rejects.toMatchObject({ code: "internal_error" });
       expect(fetcher).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
       expect(cancel).toHaveBeenCalledTimes(hook === "beforeRequest" ? 0 : 1);
     } finally {
@@ -469,6 +516,107 @@ describe("Graph Audit Search selected v1.0 contract", () => {
     expect(callback).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["beforeRequest", "onResponse"] as const)("does not publish partial rows after a stalled local %s callback", async hook => {
+    const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next";
+    const stalled = Promise.withResolvers<void>();
+    const callback = vi.fn().mockResolvedValueOnce(undefined).mockReturnValue(stalled.promise);
+    const fetcher = vi.fn(async () => response({ value: [record()], "@odata.nextLink": nextLink }));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 20 });
+    try {
+      await expect(client.listRecords("token", "provider-1", tenantId, { [hook]: callback })).rejects.toMatchObject({ code: "internal_error" });
+      expect(callback).toHaveBeenCalledTimes(2);
+    } finally { stalled.resolve(); }
+  });
+
+  it.each([false, true])("classifies a page body deadline as a provider failure, not an activation timeout (prior page: %s)", async priorPage => {
+    const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next";
+    const cancel = vi.fn();
+    const fetcher = vi.fn<typeof fetch>();
+    if (priorPage) fetcher.mockResolvedValueOnce(response({ value: [record()], "@odata.nextLink": nextLink }));
+    fetcher.mockResolvedValueOnce(new Response(new ReadableStream({ cancel })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 20 });
+    const result = client.listRecords("token", "provider-1", tenantId);
+    if (priorPage) {
+      await expect(result).resolves.toMatchObject({ complete: false, pageCount: 1, storedRowCount: 1, nextLink, partialReason: "provider_error" });
+    } else {
+      await expect(result).rejects.toMatchObject({ code: "provider_error" });
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["TimeoutError", "AbortError", "authorization_expired"])("preserves enclosing %s while reading a later page body", async code => {
+    const controller = new AbortController();
+    const reason = code === "authorization_expired"
+      ? new AppError(401, code, "Signed-in authorization changed.")
+      : new DOMException("Activation stopped.", code);
+    const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next";
+    const cancel = vi.fn();
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response({ value: [record()], "@odata.nextLink": nextLink }))
+      .mockResolvedValueOnce(new Response(new ReadableStream({
+        pull() { controller.abort(reason); }, cancel,
+      }, { highWaterMark: 0 })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = client.listRecords("token", "provider-1", tenantId, { signal: controller.signal });
+    if (code === "TimeoutError") {
+      await expect(pending).resolves.toMatchObject({ complete: false, pageCount: 1, storedRowCount: 1, nextLink, partialReason: "audit_activation_timeout" });
+    } else {
+      await expect(pending).rejects.toBe(reason);
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["get", "list"])("preserves caller cancellation while consuming a %s query response", async operation => {
+    const controller = new AbortController();
+    const reason = new DOMException("Cancelled.", "AbortError");
+    const cancel = vi.fn();
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({
+      pull() { controller.abort(reason); }, cancel,
+    }, { highWaterMark: 0 })));
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait: vi.fn(), random: () => 0 });
+    const pending = operation === "get"
+      ? client.getQuery("token", "provider-1", { signal: controller.signal })
+      : client.listQueries("token", { signal: controller.signal });
+    await expect(pending).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([4, 5].flatMap(depth =>
+    ["get", "list", "create"].flatMap(operation => [false, true].map(deadline => ({ depth, operation, deadline }))),
+  ))("rejects a $operation query cancelled after JSON completion ($depth microtasks, deadline: $deadline)", async ({ depth, operation, deadline }) => {
+    const controller = new AbortController();
+    const reason = new DOMException("query stopped", deadline ? "TimeoutError" : "AbortError");
+    const timeoutSpy = deadline ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal) : undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode(JSON.stringify(operation === "list" ? { value: [query()] } : query())));
+      },
+      pull(stream) {
+        stream.close();
+        const abortAfterMicrotasks = (remaining: number) => {
+          if (remaining === 0) controller.abort(reason);
+          else queueMicrotask(() => abortAfterMicrotasks(remaining - 1));
+        };
+        abortAfterMicrotasks(depth);
+      },
+    }, { highWaterMark: 0 });
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(body, { status: operation === "create" ? 201 : 200 }));
+    const wait = vi.fn();
+    const client = new GraphAuditSearchClient({ fetch: fetcher, wait, random: () => 0 });
+    try {
+      const options = deadline ? {} : { signal: controller.signal };
+      const pending = operation === "get" ? client.getQuery("token", "provider-1", options)
+        : operation === "list" ? client.listQueries("token", options) : client.createQuery("token", marker, filters, options);
+      if (operation === "create") await expect(pending).rejects.toMatchObject({ status: 409, code: "audit_create_inconclusive" });
+      else if (deadline) await expect(pending).rejects.toMatchObject({ status: 502, code: "provider_error" });
+      else await expect(pending).rejects.toBe(reason);
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(wait).not.toHaveBeenCalled();
+      expect(body.locked).toBe(false);
+    } finally { timeoutSpy?.mockRestore(); }
+  });
+
   it("preserves records as partial when a later page fails", async () => {
     const nextLink = "https://graph.microsoft.com/v1.0/security/auditLog/queries/provider-1/records?$skiptoken=next";
     const fetcher = vi.fn()
@@ -527,7 +675,7 @@ describe("Graph Audit Search selected v1.0 contract", () => {
       });
     const client = new GraphAuditSearchClient({ fetch: fetcher as typeof fetch, wait: vi.fn(), random: () => 0 });
     await expect(client.listRecords("token", "provider-1", tenantId, { signal: controller.signal })).resolves.toMatchObject({
-      complete: false, pageCount: 1, storedRowCount: 1, nextLink,
+      complete: false, pageCount: 1, storedRowCount: 1, nextLink, partialReason: "audit_activation_timeout",
     });
   });
 

@@ -37,6 +37,9 @@ const database = { query: vi.fn(), connect: vi.fn() };
 const readPublished = vi.fn<OfficialUsageRepository["getPublished"]>();
 const inventoryRead = vi.fn<PackageInventoryRepository["list"]>();
 const providerRead = vi.fn<typeof fetch>();
+const validateExportSource: ReturnType<typeof csvExport.createExportPublicationValidator> = async validateSource => {
+  await validateSource?.();
+};
 let active: PublishedOfficialUsage;
 let retained: PublishedOfficialUsage;
 let server: Server;
@@ -144,7 +147,7 @@ describe("official usage report-agent routes", () => {
     vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }), completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
     const response = await get(`${usersPath}.csv?licenseCohort=active_without_paid&limit=1&offset=1`);
     expect(response.status).toBe(200);
     const rows = parseCsv(response.text, { columns: true, bom: true }) as Array<Record<string, string>>;
@@ -180,7 +183,7 @@ describe("official usage report-agent routes", () => {
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
       completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
     const json = await get<OfficialUsageAggregateView>("/api/official-usage/aggregate?sortBy=activeUsers&sortDirection=desc");
     const csv = await get("/api/official-usage/aggregate.csv?sortBy=activeUsers&sortDirection=desc");
     expect(json.status).toBe(200);
@@ -369,7 +372,7 @@ describe("official usage report-agent routes", () => {
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
       completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
     const baseline = await get(`${usersPath}.csv`);
     const filtered = await get(`${usersPath}.csv?agentId=Report-A`);
     expect(baseline.status).toBe(200);
@@ -393,7 +396,7 @@ describe("official usage report-agent routes", () => {
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
       completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
     const response = await get(`${usersPath}.csv?${new URLSearchParams({
       setId: retainedSetId, agentId: "Report-A", creatorType: "Declarative", responsesOnly: "true",
       sortBy: "responses", sortDirection: "asc", limit: "1", offset: "1",
@@ -415,7 +418,7 @@ describe("official usage report-agent routes", () => {
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
       completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
     active.reports.users!.rows = active.reports.users!.rows.filter(row => row.username !== "caseuser");
     const response = await get(`${usersPath}.csv`);
     expect(response.status).toBe(200);
@@ -456,7 +459,7 @@ describe("official usage report-agent query validation", () => {
       startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
       completeEvent: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
 
     for (const query of ["limit=1&limit=2", "offset[]=0", "unknown=value"]) {
       expect(await get(`${path}?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });
@@ -470,7 +473,7 @@ describe("official usage report-agent query validation", () => {
         startEvent: vi.fn().mockResolvedValue({ id: "export-event" }),
         completeEvent: vi.fn().mockResolvedValue(undefined),
       } as unknown as ReturnType<typeof auditLog.getAuditLog>);
-      vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(async () => undefined);
+      vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
 
       for (const query of [`setId=${activeSetId}&setId=${retainedSetId}`, "setId[nested]=value"]) {
         expect(await get(`${path}?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });

@@ -7,7 +7,7 @@ import { verifiedAgentIdentityClientIdProvenance, type AgentInvestigationContext
 import type { AuthenticatedUser } from "../types/session.js";
 import type { CapabilityId } from "../types/capability.js";
 import { AgentIdentityResolutionService } from "./agentIdentityResolution.js";
-import type { GraphAgentIdentityClient } from "./graphAgentIdentity.js";
+import { GraphAgentIdentityClient } from "./graphAgentIdentity.js";
 import type { CapabilityService } from "./capabilities.js";
 
 const observeOperation: CapabilityService["observeOperation"] = async (_id, _user, operation) => operation(() => undefined);
@@ -19,7 +19,7 @@ const resolvedIdentity: VerifiedAgentIdentityIds = { objectId, applicationId, ru
   runtimeProvenance: verifiedAgentIdentityClientIdProvenance };
 const recordId = "agent:33333333-3333-4333-8333-333333333333";
 
-function setup() {
+function setup(operationObserver = observeOperation) {
   const user: AuthenticatedUser = { tenantId: randomUUID(), homeAccountId: randomUUID(),
     displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Viewer"] };
   const source: AgentIdentitySource = { recordId, snapshotId: randomUUID(), nativeId: "native-agent", environmentId: "environment",
@@ -59,7 +59,8 @@ function setup() {
   const requireAvailable = vi.fn(async (capabilityId: CapabilityId) => ({ capabilityId, status: "available" as const,
     authorized: true, fresh: true, verification: "on_demand" as const, previewQualification: "not_required" as const, remediation: [] }));
   const admissions = vi.fn(() => undefined);
-  const service = new AgentIdentityResolutionService({ inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions, observeOperation });
+  const service = new AgentIdentityResolutionService({ inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions,
+    observeOperation: operationObserver });
   return { user, source, state, inventory, repository, directory, revalidateUser, delegatedToken, requireAvailable, admissions, service };
 }
 
@@ -144,6 +145,69 @@ describe("explicit saved-source identity resolution", () => {
     expect(f.state.context.defender.entraAgentIds).toEqual([]);
   });
 
+  it("rejects revocation during the final saved-context read", async () => {
+    const f = setup();
+    let revoked: Promise<void> | undefined;
+    f.inventory.resolve.mockImplementation(async () => {
+      const saved = structuredClone(f.state);
+      if (f.repository.save.mock.calls.length) {
+        revoked = revokeAccountSessionMutations(f.user.tenantId!, f.user.homeAccountId, async () => {});
+      }
+      return saved;
+    });
+    try {
+      await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: 401 });
+    } finally { await revoked; }
+  });
+
+  it("rechecks revocation after operation-evidence recording finishes", async () => {
+    const f = setup(async (_id, user, operation) => {
+      const result = await operation(() => undefined);
+      await revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => {});
+      return result;
+    });
+    await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("does not acquire a token when revocation occurs during the capability check", async () => {
+    const f = setup();
+    let revoked: Promise<void> | undefined;
+    f.requireAvailable.mockImplementation(async capabilityId => {
+      revoked = revokeAccountSessionMutations(f.user.tenantId!, f.user.homeAccountId, async () => {});
+      return { capabilityId, status: "available", authorized: true, fresh: true,
+        verification: "on_demand", previewQualification: "not_required", remediation: [] };
+    });
+    try {
+      await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: 401 });
+      expect(f.delegatedToken).not.toHaveBeenCalled();
+      expect(f.directory.resolve).not.toHaveBeenCalled();
+    } finally { await revoked; }
+  });
+
+  it.each(["revocation", "admission"] as const)("stops Graph dispatch after %s changes during a source read", async change => {
+    const f = setup();
+    let revoked: Promise<void> | undefined;
+    const dispatch = vi.fn();
+    f.directory.resolve.mockImplementation(async (_token, _candidate, _signal, before) => {
+      f.inventory.resolve.mockImplementationOnce(async () => {
+        if (change === "revocation") {
+          revoked = revokeAccountSessionMutations(f.user.tenantId!, f.user.homeAccountId, async () => {});
+        } else {
+          f.admissions.mockImplementation(() => { throw new AppError(503, "admissions_closed", "Read admission closed"); });
+        }
+        return structuredClone(f.state);
+      });
+      await before();
+      dispatch();
+      return resolvedIdentity;
+    });
+    try {
+      await expect(f.service.resolve(f.user, recordId)).rejects.toMatchObject({ status: change === "revocation" ? 401 : 503 });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(f.repository.save).not.toHaveBeenCalled();
+    } finally { await revoked; }
+  });
+
   it("propagates consent and setup errors and never substitutes a broad permission", async () => {
     const f = setup();
     f.delegatedToken.mockRejectedValue(new AppError(403, "consent_required", "Consent required"));
@@ -179,6 +243,39 @@ describe("explicit saved-source identity resolution", () => {
     expect(f.state.context.defender.resolution).toMatchObject({ cacheStatus: "provider_error", lastErrorCode: "provider_throttled" });
   });
 
+  it.each([
+    [200, 504, "provider_error", "provider_timeout"],
+    [403, 403, "authorization_required", "agent_identity_permission_required"],
+    [404, 404, "not_found", "agent_identity_not_found"],
+    [429, 429, "provider_error", "provider_throttled"],
+  ] as const)("records HTTP %s evidence when the actual directory client's body stalls", async (httpStatus, status, cacheStatus, code) => {
+    const f = setup();
+    const deadline = new AbortController();
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 8_000 ? deadline.signal : originalTimeout(ms));
+    const cancel = vi.fn();
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ cancel }), {
+      status: httpStatus, headers: { "Retry-After": "30" },
+    }));
+    const directory = new GraphAgentIdentityClient(fetcher);
+    f.directory.resolve.mockImplementation(directory.resolve.bind(directory));
+    try {
+      const result = f.service.resolve(f.user, recordId);
+      const assertion = expect(result).rejects.toMatchObject({ status });
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("deadline", "TimeoutError"));
+      await assertion;
+      expect(f.repository.saveFailure).toHaveBeenCalledWith({ tenantId: f.user.tenantId, principalId: f.user.homeAccountId },
+        f.source, { status: cacheStatus, code }, expect.any(Function));
+      expect(f.state.context.defender.resolution).toMatchObject({ cacheStatus, lastErrorCode: code });
+      expect(f.state.context.defender.entraAgentIds).toEqual([]);
+      expect(f.state.context.defender.entraAgentApplicationIds).toEqual([]);
+      expect(f.repository.save).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
+
   it("does not publish a cached denial when the source changed during the failed request", async () => {
     const f = setup();
     f.directory.resolve.mockImplementation(async () => {
@@ -205,5 +302,101 @@ describe("explicit saved-source identity resolution", () => {
     release();
     await expect(running).rejects.toMatchObject({ code: "admissions_closed" });
     expect(f.repository.save).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "user", "capability", "token", "directory"] as const)(
+    "releases a cancelled lookup without waiting for a pending %s read or publishing its late result", async stage => {
+      const f = setup();
+      const controller = new AbortController();
+      let release!: () => void;
+      const paused = new Promise<void>(resolve => { release = resolve; });
+      const pending = vi.fn(async () => { await paused; });
+      if (stage === "source") f.inventory.resolve.mockImplementationOnce(async () => { await pending(); return structuredClone(f.state); });
+      if (stage === "user") f.revalidateUser.mockImplementationOnce(async () => { await pending(); return structuredClone(f.user); });
+      if (stage === "capability") f.requireAvailable.mockImplementationOnce(async capabilityId => {
+        await pending();
+        return { capabilityId, status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [] };
+      });
+      if (stage === "token") f.delegatedToken.mockImplementationOnce(async () => { await pending(); return "fixture"; });
+      if (stage === "directory") f.directory.resolve.mockImplementationOnce(async () => { await pending(); return resolvedIdentity; });
+      const completed = vi.fn();
+      const running = f.service.resolve(f.user, recordId, controller.signal).then(completed, completed);
+      try {
+        await vi.waitFor(() => expect(pending).toHaveBeenCalledOnce());
+        controller.abort();
+        await vi.waitFor(() => expect(completed).toHaveBeenCalledWith(expect.objectContaining({
+          code: "agent_identity_resolution_timeout",
+        })), { timeout: 200 });
+        expect(f.repository.save).not.toHaveBeenCalled();
+        expect(f.repository.saveFailure).not.toHaveBeenCalled();
+        await expect(f.service.resolve(f.user, recordId)).resolves.toMatchObject({ defender: { status: "available" } });
+      } finally {
+        release();
+        await running;
+      }
+      expect(f.repository.save).toHaveBeenCalledTimes(1);
+      expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    },
+  );
+
+  it("applies the 25-second deadline even while operation evidence is pending", async () => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let release!: () => void;
+    const pending = vi.fn(async () => new Promise<void>(resolve => { release = resolve; }));
+    const f = setup(async (_id, _user, operation) => {
+      const result = await operation(() => undefined);
+      await pending();
+      return result;
+    });
+    const completed = vi.fn();
+    const running = f.service.resolve(f.user, recordId).then(completed, completed);
+    try {
+      await vi.waitFor(() => expect(pending).toHaveBeenCalledOnce());
+      expect(timeout).toHaveBeenCalledExactlyOnceWith(25_000);
+      deadline.abort(new DOMException("Deadline exceeded", "TimeoutError"));
+      await vi.waitFor(() => expect(completed).toHaveBeenCalledWith(expect.objectContaining({
+        status: 504, code: "agent_identity_resolution_timeout",
+      })));
+    } finally {
+      release?.();
+      await running;
+      timeout.mockRestore();
+    }
+  });
+
+  it("retains mutation serialization until a cancelled publication has finished its fence", async () => {
+    const f = setup();
+    const controller = new AbortController();
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const publicationRejected = vi.fn();
+    f.repository.save.mockImplementationOnce(async (_scope, _source, _value, fence) => {
+      await paused;
+      try { await fence(); }
+      catch (error) { publicationRejected(); throw error; }
+    });
+    const completed = vi.fn();
+    const running = f.service.resolve(f.user, recordId, controller.signal).then(completed, completed);
+    try {
+      await vi.waitFor(() => expect(f.repository.save).toHaveBeenCalledOnce());
+      controller.abort();
+      await vi.waitFor(() => expect(completed).toHaveBeenCalledWith(expect.objectContaining({
+        code: "agent_identity_resolution_timeout",
+      })));
+      const retry = f.service.resolve(f.user, recordId);
+      await vi.waitFor(() => expect(f.revalidateUser).toHaveBeenCalledTimes(4));
+      expect(f.delegatedToken).toHaveBeenCalledOnce();
+      expect(f.state.context.defender.entraAgentIds).toEqual([]);
+      release();
+      await expect(retry).resolves.toMatchObject({ defender: { status: "available" } });
+      expect(publicationRejected).toHaveBeenCalledOnce();
+      expect(f.repository.save).toHaveBeenCalledTimes(2);
+      expect(f.repository.saveFailure).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await running;
+    }
   });
 });

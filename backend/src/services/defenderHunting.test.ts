@@ -1,10 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DefenderHuntingRepository } from "../db/defenderHunting.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingQueryResult, DefenderHuntingRetainedScope } from "../types/defenderHunting.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { DefenderHuntingService } from "./defenderHunting.js";
-import type { GraphHuntingClient } from "./graphHunting.js";
+import { GraphHuntingClient, expectedHuntingSchema } from "./graphHunting.js";
+
+vi.mock("../config.js", () => ({ config: { nodeEnv: "test" }, authConfigured: false, loginScopes: ["openid", "profile"] }));
+vi.mock("../db/pool.js", () => ({
+  pool: {},
+  transaction: vi.fn(() => { throw new Error("Database access is outside the worker unit-test boundary."); }),
+}));
 
 const user: AuthenticatedUser = { homeAccountId: "security-a", tenantId: "tenant-a", username: "security@example.invalid", displayName: "Security Reader",
   roles: ["AgentControl.Viewer"], providerRoleIds: [] };
@@ -14,6 +21,8 @@ const qualification = { capabilityId: "defender.hunting.delegated" as const, con
 const retainedScope = { id: "44444444-4444-4444-8444-444444444444", authority: {
   capabilityId: "defender.hunting.delegated" as const, contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1,
 } };
+
+beforeEach(() => activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined));
 
 function job(overrides: Partial<DefenderHuntingJob> = {}): DefenderHuntingJob {
   return { id: "11111111-1111-4111-8111-111111111111", authorizationPrincipalId: user.homeAccountId,
@@ -45,7 +54,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     requireQualifiedScope: vi.fn(async (_scope, _filters, authority) => ({ id: retainedScope.id, authority })),
     listQualificationEvidence: vi.fn(async () => []), listRetainedScopes: vi.fn<DefenderHuntingRepository["listRetainedScopes"]>(async () => []),
     authorizeProviderRequest: vi.fn(async () => undefined), recordProviderResponse: vi.fn(async () => undefined),
-    publish: vi.fn(async () => { current = { ...current, status: "succeeded", complete: true, noData: true }; return current; }),
+    publish: vi.fn<DefenderHuntingRepository["publish"]>(async () => { current = { ...current, status: "succeeded", complete: true, noData: true }; return current; }),
     markWaitingAuthorization: vi.fn(async () => { current = { ...current, status: "waiting_authorization" }; return current; }),
     fail: vi.fn(async (_scope, _id, _execution, code) => { current = { ...current, status: "inconclusive", errorCode: code }; return current; }),
     submit: vi.fn(async () => current), listJobs: vi.fn<DefenderHuntingRepository["listJobs"]>(async () => ({ value: [current], count: 1, limit: 20, offset: 0 })),
@@ -64,6 +73,269 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Defender hunting worker", () => {
+  it.each([false, true])("tracks the initial saved-identity lookup during shutdown (qualification=%s)", async qualificationOnly => {
+    const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
+    const entraAgentIds = ["22222222-2222-4222-8222-222222222222"];
+    const pending = Promise.withResolvers<void>();
+    const agentScope = vi.fn(async () => { await pending.promise; return { recordId: agentRecordId, entraAgentIds }; });
+    const fixture = setup({ agentScope });
+    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds }, qualification: qualificationOnly ? qualification : null }));
+    const starting = qualificationOnly ? fixture.service.startQualification(user, job().id, agentRecordId)
+      : fixture.service.start(user, job().id, "delegated", agentRecordId);
+    const outcome = starting.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+    await vi.waitFor(() => expect(agentScope).toHaveBeenCalled());
+    await fixture.service.drain();
+    pending.resolve();
+    try {
+      expect((await outcome).error).toMatchObject({ status: 401 });
+      expect(fixture.repository.begin).not.toHaveBeenCalled();
+      expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+    } finally { await fixture.service.drain(); }
+  });
+
+  it("refuses new activations after draining", async () => {
+    const fixture = setup();
+    await fixture.service.drain();
+    try {
+      await expect(Promise.resolve().then(() => fixture.service.start(user, job().id, "delegated")))
+        .rejects.toMatchObject({ code: "hunting_shutdown" });
+      expect(fixture.repository.begin).not.toHaveBeenCalled();
+    } finally { await fixture.service.drain(); }
+  });
+
+  it("does not adopt a replacement session after a held durable activation", async () => {
+    const fixture = setup();
+    const pending = Promise.withResolvers<void>();
+    const begin = fixture.repository.begin.getMockImplementation()!;
+    fixture.repository.begin.mockImplementationOnce(async () => { await pending.promise; return begin(); });
+    const starting = fixture.service.start(user, job().id, "delegated");
+    const outcome = starting.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+    await vi.waitFor(() => expect(fixture.repository.begin).toHaveBeenCalledOnce());
+    const revoked = revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined);
+    const activated = activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
+    pending.resolve();
+    try {
+      expect((await outcome).error).toMatchObject({ status: 401 });
+      await Promise.all([revoked, activated]);
+      expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+      expect(fixture.dependencies.delegatedToken).not.toHaveBeenCalled();
+    } finally { await Promise.all([revoked, activated]); await fixture.service.drain(); }
+  });
+
+  it("rechecks the initiating session after awaited physical-request admission", async () => {
+    const dispatched = vi.fn();
+    const fixture = setup({ runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
+      await options?.beforeRequest?.(options.signal!);
+      dispatched();
+      return emptyResult;
+    }) });
+    let revoked: Promise<void> | undefined;
+    fixture.repository.authorizeProviderRequest.mockImplementationOnce(async () => {
+      revoked = revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined);
+    });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalled());
+    await revoked;
+    expect(dispatched).not.toHaveBeenCalled();
+    expect(fixture.repository.publish).not.toHaveBeenCalled();
+    expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+    await fixture.service.drain();
+  });
+
+  it("waits for durable audit creation and closes it when cancellation wins", async () => {
+    const fixture = setup();
+    const pending = Promise.withResolvers<void>();
+    fixture.audit.startEvent.mockImplementationOnce(async () => { await pending.promise; return { id: "late-audit" }; });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.audit.startEvent).toHaveBeenCalledOnce());
+    let drained = false;
+    const draining = fixture.service.drain().then(() => { drained = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const drainedBeforeAudit = drained;
+    pending.resolve();
+    await draining;
+    expect(drainedBeforeAudit).toBe(false);
+    expect(fixture.audit.completeEvent).toHaveBeenCalledWith("late-audit", expect.objectContaining({ status: "cancelled" }));
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancel", "session"] as const)("keeps publication fenced and joined through rollback on %s", async interruption => {
+    const fixture = setup();
+    const pending = Promise.withResolvers<void>();
+    let committed = false;
+    fixture.repository.publish.mockImplementationOnce(async (_scope, _id, _execution, _result, fence) => {
+      await pending.promise;
+      fence?.();
+      committed = true;
+      return job({ status: "succeeded" });
+    });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
+    let drained = false;
+    const stopping = interruption === "cancel" ? fixture.service.drain()
+      : revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined);
+    void stopping.then(() => { drained = true; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const drainedBeforePublication = drained;
+    pending.resolve();
+    await stopping;
+    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalled());
+    expect(drainedBeforePublication).toBe(false);
+    expect(committed).toBe(false);
+    expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.recordProviderEvidence).not.toHaveBeenCalled();
+    await fixture.service.drain();
+  });
+
+  it("bounds observation waits without allowing late provider dispatch", async () => {
+    const pending = Promise.withResolvers<void>();
+    const fixture = setup();
+    fixture.dependencies.observeOperation.mockImplementationOnce(async (_id, _user, operation) => {
+      const value = await operation(() => undefined);
+      await pending.promise;
+      return value;
+    });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.dependencies.delegatedToken).toHaveBeenCalledOnce());
+    let drained = false;
+    const draining = fixture.service.drain().then(() => { drained = true; });
+    try {
+      await vi.waitFor(() => expect(drained).toBe(true));
+      expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+    } finally { pending.resolve(); await draining; }
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+  });
+
+  it("propagates the physical-request deadline into held authority reads", async () => {
+    const pending = Promise.withResolvers<void>();
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 10 });
+    const revalidateUser = vi.fn(async () => user).mockResolvedValueOnce(user)
+      .mockImplementationOnce(async () => { await pending.promise; return user; });
+    const fixture = setup({ revalidateUser, runQuery: client.runQuery.bind(client) });
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
+    expect(revalidateUser).toHaveBeenCalledTimes(2);
+    pending.resolve();
+    await fixture.service.drain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(fixture.repository.authorizeProviderRequest).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(fixture.repository.publish).not.toHaveBeenCalled();
+  });
+
+  it("does not publish a valid hunting response completed after its attempt deadline", async () => {
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds =>
+      milliseconds === 1_337 ? deadline.signal : timeout(milliseconds));
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode(JSON.stringify({ schema: expectedHuntingSchema("agents_inventory"), results: [] })));
+      },
+      pull(stream) {
+        stream.close();
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => queueMicrotask(() =>
+          deadline.abort(new DOMException("attempt expired", "TimeoutError"))))));
+      },
+    }, { highWaterMark: 0 });
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(body));
+    const client = new GraphHuntingClient({ fetch: fetcher, wait: vi.fn(), random: () => 0, requestTimeoutMs: 1_337 });
+    const fixture = setup({ runQuery: client.runQuery.bind(client) });
+    try {
+      await fixture.service.start(user, job().id, "delegated");
+      await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
+      expect(fixture.current()).toMatchObject({ status: "inconclusive", errorCode: "provider_error" });
+      expect(fixture.repository.publish).not.toHaveBeenCalled();
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(body.locked).toBe(false);
+    } finally {
+      await fixture.service.drain();
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("does not reuse an active job for a different saved agent", async () => {
+    const selected = "22222222-2222-4222-8222-222222222222";
+    const agentScope = vi.fn(async (_scope, recordId: string) => ({
+      recordId, entraAgentIds: [recordId === "agent:selected" ? selected : "33333333-3333-4333-8333-333333333333"],
+    }));
+    const fixture = setup({ agentScope, revalidateUser: vi.fn(() => new Promise<AuthenticatedUser>(() => undefined)) });
+    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds: [selected] } }));
+    await fixture.service.start(user, job().id, "delegated", "agent:selected");
+    await expect(fixture.service.start(user, job().id, "delegated", "agent:other")).rejects.toMatchObject({ code: "not_found" });
+    expect(fixture.repository.begin).toHaveBeenCalledOnce();
+    await fixture.service.drain();
+  });
+
+  it.each(["uppercase", "lowercase"] as const)("cancels mixed-case UUIDs after %s activation", async casing => {
+    const id = "abcdefab-1234-4123-8123-abcdefabcdef";
+    const startId = casing === "uppercase" ? id.toUpperCase() : id;
+    const cancelId = casing === "uppercase" ? id : id.toUpperCase();
+    const pending = Promise.withResolvers<string>();
+    const fixture = setup({ delegatedToken: vi.fn(() => pending.promise) });
+    fixture.setCurrent(job({ id }));
+    fixture.repository.markWaitingAuthorization.mockImplementationOnce(async () => {
+      throw new AppError(409, "hunting_execution_lost", "Cancelled.");
+    });
+    await fixture.service.start(user, startId, "delegated");
+    await fixture.service.start(user, cancelId, "delegated");
+    await vi.waitFor(() => expect(fixture.dependencies.delegatedToken).toHaveBeenCalledOnce());
+    await fixture.service.cancel(user, cancelId);
+    try {
+      await vi.waitFor(() => expect(fixture.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
+      expect(fixture.repository.begin).toHaveBeenCalledOnce();
+      expect(fixture.current().status).toBe("cancelled");
+      expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+    } finally { pending.resolve("late-token"); await fixture.service.drain(); }
+  });
+
+  it("checks saved identity after awaited qualification authority before dispatch", async () => {
+    const agentRecordId = "agent:selected";
+    const selected = "22222222-2222-4222-8222-222222222222";
+    let changed = false;
+    const dispatched = vi.fn();
+    const fixture = setup({
+      agentScope: vi.fn(async () => ({ recordId: agentRecordId, entraAgentIds: [
+        changed ? "33333333-3333-4333-8333-333333333333" : selected,
+      ] })),
+      runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
+        fixture.repository.requireQualifiedScope.mockImplementationOnce(async (_scope, _filters, authority) => {
+          changed = true;
+          return { id: retainedScope.id, authority };
+        });
+        await options?.beforeRequest?.(options.signal!);
+        dispatched();
+        return emptyResult;
+      }),
+    });
+    fixture.setCurrent(job({ filters: { ...filters, entraAgentIds: [selected] } }));
+    await fixture.service.start(user, job().id, "delegated", agentRecordId);
+    await vi.waitFor(() => expect(fixture.audit.completeEvent).toHaveBeenCalledOnce());
+    expect(dispatched).not.toHaveBeenCalled();
+    expect(fixture.repository.authorizeProviderRequest).not.toHaveBeenCalled();
+    await fixture.service.drain();
+  });
+
+  it("closes the audit if cancellation wins during failure persistence", async () => {
+    const pending = Promise.withResolvers<void>();
+    const fixture = setup({ runQuery: vi.fn(async () => { throw new AppError(502, "provider_error", "Synthetic failure."); }) });
+    fixture.repository.fail.mockImplementationOnce(async () => {
+      await pending.promise;
+      throw new AppError(409, "hunting_execution_lost", "Cancelled.");
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await fixture.service.start(user, job().id, "delegated");
+      await vi.waitFor(() => expect(fixture.repository.fail).toHaveBeenCalledOnce());
+      await fixture.service.cancel(user, job().id);
+      pending.resolve();
+      await fixture.service.drain();
+      expect(fixture.audit.completeEvent).toHaveBeenCalledWith("audit-event", { status: "cancelled", errorCode: "hunting_execution_lost" });
+      expect(logged).not.toHaveBeenCalled();
+    } finally { pending.resolve(); await fixture.service.drain(); logged.mockRestore(); }
+  });
+
   it("binds runtime client IDs separately and hides jobs that used the enterprise-object namespace", async () => {
     const agentRecordId = "agent:11111111-1111-4111-8111-111111111111";
     const applicationId = "22222222-2222-4222-8222-222222222222";
@@ -243,7 +515,7 @@ describe("Defender hunting worker", () => {
 
   it("classifies ambiguous Defender access denial as provider_error evidence without inventing role or license", async () => {
     const fixture = setup({ runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       throw new AppError(403, "hunting_access_denied", "ambiguous");
     }) });
     fixture.setCurrent(job({ qualification }));
@@ -368,12 +640,39 @@ describe("Defender hunting worker", () => {
     expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
   });
 
+  it("propagates a failed shutdown pause rather than treating its log as a successful drain", async () => {
+    const fixture = setup({ delegatedToken: vi.fn(() => new Promise<string>(() => undefined)) });
+    const failure = new Error("Pause persistence failed");
+    fixture.repository.markWaitingAuthorization.mockRejectedValueOnce(failure);
+    await fixture.service.start(user, job().id, "delegated");
+    await vi.waitFor(() => expect(fixture.dependencies.delegatedToken).toHaveBeenCalledOnce());
+    await expect(fixture.service.drain()).rejects.toBe(failure);
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+  });
+
+  it("reports failure to release an activation that committed during shutdown", async () => {
+    const fixture = setup();
+    const begin = fixture.repository.begin.getMockImplementation()!;
+    const reservation = Promise.withResolvers<void>();
+    const failure = new Error("Activation release failed");
+    fixture.repository.begin.mockImplementationOnce(async () => { await reservation.promise; return begin(); });
+    fixture.repository.markWaitingAuthorization.mockRejectedValueOnce(failure);
+    const starting = fixture.service.start(user, job().id, "delegated");
+    const startedResult = Promise.allSettled([starting]);
+    await vi.waitFor(() => expect(fixture.repository.begin).toHaveBeenCalledOnce());
+    const draining = expect(fixture.service.drain()).rejects.toBe(failure);
+    reservation.resolve();
+    await draining;
+    expect(await startedResult).toEqual([{ status: "rejected", reason: failure }]);
+    expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
+  });
+
   it.each(["delegated", "application"] as const)("revalidates %s retained authority before every physical provider request", async mode => {
     const fixture = setup({ applicationIdentity: () => "application-client",
       runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       fixture.repository.requireQualifiedScope.mockRejectedValueOnce(new AppError(403, "hunting_scope_unqualified", "Revoked."));
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       return emptyResult;
     }) });
     if (mode === "application") fixture.setCurrent(job({ tokenMode: mode,
@@ -393,7 +692,7 @@ describe("Defender hunting worker", () => {
         return "delegated-token";
       }),
       runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-        await options?.beforeRequest?.();
+        await options?.beforeRequest?.(options.signal!);
         return emptyResult;
       }),
     });
@@ -408,7 +707,7 @@ describe("Defender hunting worker", () => {
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const fixture = setup({ runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       if (stage === "lookup") fixture.dependencies.revalidateUser.mockImplementationOnce(async () => { await pending; return user; });
       else fixture.dependencies.recordProviderEvidence.mockImplementationOnce(async () => { await pending; return { authorized: true }; });
       throw new AppError(403, "hunting_access_denied", "Denied.");
@@ -435,7 +734,7 @@ describe("Defender hunting worker", () => {
 
   it("does not attribute failed provider evidence to a changed account", async () => {
     const fixture = setup({ runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       fixture.dependencies.revalidateUser.mockResolvedValue({ ...user, tenantId: "another-tenant" });
       throw new AppError(403, "hunting_access_denied", "Denied.");
     }) });
@@ -452,7 +751,7 @@ describe("Defender hunting worker", () => {
 
   it.each(["audit", "publication"] as const)("does not turn a local %s failure into provider evidence", async stage => {
     const fixture = setup({ runQuery: vi.fn<GraphHuntingClient["runQuery"]>(async (_token, _filters, options) => {
-      await options?.beforeRequest?.();
+      await options?.beforeRequest?.(options.signal!);
       return emptyResult;
     }) });
     if (stage === "audit") fixture.audit.startEvent.mockRejectedValueOnce(new Error("Local audit write failed."));

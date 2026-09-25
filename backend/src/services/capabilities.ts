@@ -25,6 +25,7 @@ type ProbeDependencies = {
   directoryProbe: (token: string, signal?: AbortSignal) => Promise<unknown>;
   inventoryProbe: (token: string, signal?: AbortSignal) => Promise<unknown>;
 };
+type SharedCheck<T> = { completion: Promise<T>; controller: AbortController; waiters: number };
 
 const defaultProbeDependencies: ProbeDependencies = {
   delegatedToken: acquireDelegatedToken,
@@ -36,8 +37,8 @@ const defaultProbeDependencies: ProbeDependencies = {
 
 export class CapabilityService {
   private readonly probes: ProbeDependencies;
-  private readonly inFlight = new Map<string, Promise<CapabilityDecision>>();
-  private readonly automaticInFlight = new Map<string, { completion: Promise<void>; progress: CapabilityCheckProgress }>();
+  private readonly inFlight = new Map<string, SharedCheck<CapabilityDecision>>();
+  private readonly automaticInFlight = new Map<string, SharedCheck<void> & { progress: CapabilityCheckProgress }>();
   private readonly generations = new Map<string, number>();
   private readonly pendingPrincipalInvalidations = new Map<string, number>();
   private mutationTail: Promise<void> = Promise.resolve();
@@ -73,21 +74,28 @@ export class CapabilityService {
     options.signal?.throwIfAborted();
     const key = this.automaticCheckKey(user, Boolean(options.retryFailed));
     const generation = this.generations.get(this.principalGenerationKey(user.tenantId!, user.homeAccountId)) ?? 0;
-    const current = this.automaticInFlight.get(key);
-    if (current) {
-      await current.completion;
-      return this.automaticViews(user, generation);
+    let current = this.automaticInFlight.get(key);
+    if (!current) {
+      const progress: CapabilityCheckProgress = { checks: capabilityDefinitions
+        .filter(definition => supportsAutomaticCapabilityCheck(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
+        .map(definition => ({ capabilityId: definition.id, state: "reviewing" })) };
+      const controller = new AbortController();
+      const shared = {
+        controller, progress, waiters: 0,
+        completion: this.runAutomaticCheck(user, generation, Boolean(options.retryFailed), progress, controller.signal).finally(() => {
+          if (this.automaticInFlight.get(key) === shared) this.automaticInFlight.delete(key);
+        }),
+      };
+      this.automaticInFlight.set(key, shared);
+      current = shared;
     }
-    const progress: CapabilityCheckProgress = { checks: capabilityDefinitions
-      .filter(definition => supportsAutomaticCapabilityCheck(definition.id) && hasAnyRole(user.roles, definition.internalRoles))
-      .map(definition => ({ capabilityId: definition.id, state: "reviewing" })) };
-    const operation = this.runAutomaticCheck(user, generation, Boolean(options.retryFailed), progress, options.signal);
-    const shared: Promise<void> = operation.finally(() => {
-      if (this.automaticInFlight.get(key)?.completion === shared) this.automaticInFlight.delete(key);
+    await waitForSharedCheck(current, options.signal, () => {
+      if (this.automaticInFlight.get(key) === current) this.automaticInFlight.delete(key);
     });
-    this.automaticInFlight.set(key, { completion: shared, progress });
-    await shared;
-    return this.automaticViews(user, generation);
+    options.signal?.throwIfAborted();
+    const views = await this.automaticViews(user, generation);
+    options.signal?.throwIfAborted();
+    return views;
   }
 
   checkProgress(user: AuthenticatedUser, retryFailed = false): CapabilityCheckProgress | null {
@@ -288,9 +296,12 @@ export class CapabilityService {
     const definition = requiredDefinition(capabilityId);
     const generation = this.generation(definition.id, user);
     const current = await this.decision(definition, user);
+    signal?.throwIfAborted();
     this.requireGeneration(definition.id, user, generation);
     if (current.fresh && current.evidence?.category === "provider_throttled") return current;
-    return this.refreshAtGeneration(definition, user, generation, signal);
+    const refreshed = await this.refreshAtGeneration(definition, user, generation, signal);
+    signal?.throwIfAborted();
+    return refreshed;
   }
 
   private async refreshAtGeneration(definition: CapabilityDefinition, user: AuthenticatedUser, generation: string, signal?: AbortSignal) {
@@ -309,14 +320,21 @@ export class CapabilityService {
     const cooldown = boundedRetryAfter(saved?.details.retryAfterMs);
     if (saved && cooldown !== undefined && Date.parse(saved.observedAt) + cooldown > Date.now()) return this.decision(definition, user);
     const serializedKey = `${JSON.stringify(key)}\0${generation}`;
-    const current = this.inFlight.get(serializedKey);
-    if (current) return current;
-    const operation = this.runProbe(definition, user, key, generation, signal);
-    const shared = operation.finally(() => {
-      if (this.inFlight.get(serializedKey) === shared) this.inFlight.delete(serializedKey);
+    let current = this.inFlight.get(serializedKey);
+    if (!current) {
+      const controller = new AbortController();
+      const shared: SharedCheck<CapabilityDecision> = {
+        controller, waiters: 0,
+        completion: this.runProbe(definition, user, key, generation, controller.signal).finally(() => {
+          if (this.inFlight.get(serializedKey) === shared) this.inFlight.delete(serializedKey);
+        }),
+      };
+      this.inFlight.set(serializedKey, shared);
+      current = shared;
+    }
+    return waitForSharedCheck(current, signal, () => {
+      if (this.inFlight.get(serializedKey) === current) this.inFlight.delete(serializedKey);
     });
-    this.inFlight.set(serializedKey, shared);
-    return shared;
   }
 
   private async runProbe(definition: CapabilityDefinition, user: AuthenticatedUser, key: EvidenceKey, generation: string, cancellation?: AbortSignal) {
@@ -730,6 +748,32 @@ function evidenceVerification(definition: CapabilityDefinition, status: Capabili
   if (definition.probe.kind === "live_qualification") return value === "token" || value === "provider" ? value : undefined;
   const expected = defaultVerification(definition);
   return value === expected ? expected : undefined;
+}
+
+function waitForSharedCheck<T>(work: SharedCheck<T>, signal: AbortSignal | undefined, abandoned: () => void): Promise<T> {
+  work.waiters += 1;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      work.waiters -= 1;
+      complete();
+    };
+    const abort = () => {
+      if (settled) return;
+      finish(() => reject(signal!.reason));
+      if (work.waiters === 0) {
+        // Evict synchronously so an immediate replacement cannot join cancelled work.
+        abandoned();
+        work.controller.abort(signal!.reason);
+      }
+    };
+    work.completion.then(value => finish(() => resolve(value)), error => finish(() => reject(error)));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
 }
 
 function abortable<T>(work: PromiseLike<T>, signal: AbortSignal): Promise<T> {

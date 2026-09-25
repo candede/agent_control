@@ -9,6 +9,7 @@ import { verifiedAgentIdentityClientIdProvenance } from "../types/agentInvestiga
 import { AgentIdentityResolutionService } from "./agentIdentityResolution.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { defenderHuntingTemplates } from "../types/defenderHunting.js";
+import { AppError } from "../errors.js";
 
 const entra = "11111111-1111-4111-8111-111111111111";
 const bot = "22222222-2222-4222-8222-222222222222";
@@ -17,7 +18,7 @@ const scope = { tenantId: "tenant-a", principalId: "reader-a" };
 
 function setup() {
   const page = {
-    count: 1, sources: { powerPlatform: { state: "available" } },
+    count: 1, revision: "a".repeat(64), sources: { powerPlatform: { state: "available" } },
     value: [{
       id: recordId, displayName: "Saved agent", environmentId: "environment-a", packages: [{ id: entra, appId: entra }],
       identity: { state: "matched", evidence: [], packageEvidence: [], reason: null },
@@ -27,7 +28,7 @@ function setup() {
         provenance: { entraAppId: { sourceSystem: "power_platform", path: "properties.entraAppId", maturity: "ga" } } },
     }],
   } as unknown as UnifiedAgentInventoryPage;
-  const inventory = { list: vi.fn(async () => page) };
+  const inventory = { list: vi.fn(async () => page), assertRevision: vi.fn(async (_scope: typeof scope, _revision: string) => {}) };
   const identities = { readIdentityCandidates: vi.fn(async (): Promise<InventoryIdentityRecord[]> => [{
     nativeId: entra, tenantId: "tenant-a", environmentId: "environment-a", sourceSystem: "power_platform", resourceType: "microsoft.copilotstudio/agents",
     identifiers: page.value[0]?.powerPlatformResource?.identifiers ?? [],
@@ -60,6 +61,113 @@ describe("source-verified agent investigation context", () => {
       expect(saved.context.purview.status).toBe("unavailable");
       expect(lookup).not.toHaveBeenCalled();
     } finally { lookup.mockRestore(); }
+  });
+
+  it.each(["legacy", "typed"] as const)("rejects a changed inventory revision after %s identity reads", async kind => {
+    const fixture = kind === "legacy" ? setup() : modern();
+    const changed = new AppError(409, "inventory_changed", "Saved inventory changed.");
+    fixture.inventory.assertRevision.mockImplementation(async () => {
+      expect(fixture.identities.readIdentityCandidates).toHaveBeenCalledOnce();
+      if (kind === "typed") expect(fixture.mappings.readState).toHaveBeenCalledOnce();
+      throw changed;
+    });
+    await expect(fixture.service.resolve(scope, recordId)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
+    expect(fixture.inventory.assertRevision).toHaveBeenCalledExactlyOnceWith(scope, fixture.page.revision);
+  });
+
+  it("does not mask storage failures from the inventory revision fence", async () => {
+    const fixture = modern();
+    const unavailable = new Error("Inventory revision read failed.");
+    fixture.inventory.assertRevision.mockRejectedValue(unavailable);
+    await expect(fixture.service.resolve(scope, recordId)).rejects.toBe(unavailable);
+  });
+
+  it.each(["legacy", "typed"] as const)("rejects a %s identity selection invalidated during the candidate read", async kind => {
+    const fixture = kind === "legacy" ? setup() : modern();
+    fixture.identities.readIdentityCandidates.mockRejectedValue(new AppError(409, "snapshot_invalidated", "Inventory changed."));
+    await expect(fixture.service.resolve(scope, recordId)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
+    expect(fixture.mappings.readState).not.toHaveBeenCalled();
+  });
+
+  it("does not mask storage failures while reading identity candidates", async () => {
+    const fixture = modern();
+    const unavailable = new Error("Inventory identity read failed.");
+    fixture.identities.readIdentityCandidates.mockRejectedValue(unavailable);
+    await expect(fixture.service.resolve(scope, recordId)).rejects.toBe(unavailable);
+  });
+
+  it.each(["legacy candidates", "typed candidates", "typed cache", "revision"] as const)(
+    "rejects a source expiring during the awaited %s read", async stage => {
+      const fixture = stage === "legacy candidates" ? setup() : modern();
+      const expiresAt = Date.parse(fixture.record.observations.powerPlatform!.expiresAt);
+      const clock = vi.spyOn(Date, "now");
+      try {
+        if (stage.endsWith("candidates")) {
+          const candidates = await fixture.identities.readIdentityCandidates();
+          fixture.identities.readIdentityCandidates.mockImplementation(async () => {
+            clock.mockReturnValue(expiresAt);
+            return candidates;
+          });
+        } else if (stage === "typed cache") {
+          fixture.mappings.readState.mockImplementation(async () => {
+            clock.mockReturnValue(expiresAt);
+            return { status: "missing" };
+          });
+        } else {
+          fixture.inventory.assertRevision.mockImplementation(async () => { clock.mockReturnValue(expiresAt); });
+        }
+        await expect(fixture.service.resolve(scope, recordId)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
+      } finally { clock.mockRestore(); }
+    },
+  );
+
+  it.each(["cache", "revision"] as const)("does not expose a verified mapping that expires during the awaited %s read", async stage => {
+    const fixture = modern();
+    const now = Date.now();
+    const dates = { checkedAt: new Date(now).toISOString(), expiresAt: new Date(now + 10_000).toISOString() };
+    const cached: AgentIdentityCacheState = { status: "resolved", ...dates, value: { objectId: entra, applicationId: entra,
+      runtimeStatus: "available", runtimeProvenance: verifiedAgentIdentityClientIdProvenance, ...dates } };
+    fixture.mappings.readState.mockResolvedValue(cached);
+    const clock = vi.spyOn(Date, "now");
+    try {
+      if (stage === "cache") fixture.mappings.readState.mockImplementation(async () => {
+        clock.mockReturnValue(now + 10_000);
+        return cached;
+      });
+      else fixture.inventory.assertRevision.mockImplementation(async () => { clock.mockReturnValue(now + 10_000); });
+      const { context } = await fixture.service.resolve(scope, recordId);
+      expect(context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
+        reasonCode: "identity_resolution_expired", resolution: { canResolve: true, cacheStatus: "expired",
+          lastCheckedAt: dates.checkedAt, expiresAt: dates.expiresAt },
+        templates: { agents_inventory: { status: "unavailable" }, agent_activity: { status: "unavailable" }, agent_tools: { status: "unavailable" } } });
+      expect(context.defender.resolution?.resolvedAt).toBeUndefined();
+      expect(cached.status).toBe("resolved");
+    } finally { clock.mockRestore(); }
+  });
+
+  it("reports an expired saved denial after the final inventory check", async () => {
+    const fixture = modern();
+    const expiresAt = Date.now() + 10_000;
+    fixture.mappings.readState.mockResolvedValue({ status: "authorization_required",
+      expiresAt: new Date(expiresAt).toISOString(), lastErrorCode: "missing_permission" });
+    const clock = vi.spyOn(Date, "now");
+    try {
+      fixture.inventory.assertRevision.mockImplementation(async () => { clock.mockReturnValue(expiresAt); });
+      const { context } = await fixture.service.resolve(scope, recordId);
+      expect(context.defender.resolution).toMatchObject({ cacheStatus: "expired",
+        reasonCode: "identity_resolution_expired", lastErrorCode: "missing_permission" });
+    } finally { clock.mockRestore(); }
+  });
+
+  it("requires a saved revision for legacy runtime and Purview identities as well as typed resolution", async () => {
+    const fixture = setup();
+    fixture.page.revision = undefined;
+    const { context, identitySource, purviewTarget } = await fixture.service.resolve(scope, recordId);
+    expect(context.defender).toMatchObject({ status: "unavailable", entraAgentApplicationIds: [], reasonCode: "stale_source" });
+    expect(context.purview).toMatchObject({ status: "unavailable", reasonCode: "stale_source" });
+    expect(identitySource).toBeUndefined();
+    expect(purviewTarget).toBeUndefined();
+    expect(fixture.identities.readIdentityCandidates).not.toHaveBeenCalled();
   });
 
   it("turns a minimal typed GET with no appId or bot ID into saved inventory and runtime scopes", async () => {
@@ -151,13 +259,13 @@ describe("source-verified agent investigation context", () => {
     ["not_found", "identity_not_found"], ["provider_error", "identity_provider_error"], ["setup_required", "identity_setup_required"],
   ] as const)("reports saved %s outcomes without treating their candidate IDs as verified mappings", async (status, reasonCode) => {
     const fixture = modern();
-    fixture.mappings.readState.mockResolvedValue({ status, checkedAt: "2026-09-23T18:00:00.000Z",
-      expiresAt: "2026-09-23T18:05:00.000Z", lastErrorCode: "fixture_error",
-      value: { objectId: entra, applicationId: bot, checkedAt: "2026-09-23T18:00:00.000Z", expiresAt: "2026-09-23T18:05:00.000Z" } });
+    const dates = { checkedAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    fixture.mappings.readState.mockResolvedValue({ status, ...dates, lastErrorCode: "fixture_error",
+      value: { objectId: entra, applicationId: bot, ...dates } });
     const { context } = await fixture.service.resolve(scope, recordId);
     expect(context.defender).toMatchObject({ status: "unavailable", entraAgentIds: [], entraAgentApplicationIds: [],
       reasonCode, resolution: { canResolve: true, cacheStatus: status, reasonCode, lastErrorCode: "fixture_error",
-        lastCheckedAt: "2026-09-23T18:00:00.000Z", expiresAt: "2026-09-23T18:05:00.000Z" } });
+        lastCheckedAt: dates.checkedAt, expiresAt: dates.expiresAt } });
     expect(context.defender.resolution?.resolvedAt).toBeUndefined();
   });
 

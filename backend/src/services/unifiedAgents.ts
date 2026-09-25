@@ -1,6 +1,7 @@
 import { AppError } from "../errors.js";
 import type pg from "pg";
 import { UnifiedAgentRegistry } from "../db/unifiedAgentRegistry.js";
+import { usageChanged } from "../db/agentUsage.js";
 import { readUnifiedInventoryRevision } from "../db/unifiedInventoryRevision.js";
 import {
   PackageInventoryRepository,
@@ -111,22 +112,26 @@ export class UnifiedAgentsService {
     return result;
   }
 
-  async assertRevision(scope: PackageDataScope & InventoryDataScope, revision: string) {
+  async assertRevision(scope: PackageDataScope & InventoryDataScope, revision: string, usageExpiresAt?: string | null) {
     const check = async (database?: pg.PoolClient) => {
       const baseRevision = await this.dependencies.readRevision(scope, database);
       const usageRevision = await this.dependencies.usage.revision(scope, database);
       if (combineAgentInventoryRevision(baseRevision, usageRevision) !== revision
         || await this.dependencies.readRevision(scope, database) !== baseRevision) throw inventoryChanged();
     };
-    return this.dependencies.registry
+    await (this.dependencies.registry
       ? this.dependencies.registry.withSnapshot(scope, check)
-      : check();
+      : check());
+    assertUsageNotExpired(usageExpiresAt);
   }
 
   private async readPage(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number, recordIds?: readonly string[]) {
-    return this.dependencies.registry
+    const result = await (this.dependencies.registry
       ? this.dependencies.registry.withSnapshot(scope, database => this.listSnapshot(scope, query, maximumLimit, recordIds, database))
-      : this.listSnapshot(scope, query, maximumLimit, recordIds);
+      : this.listSnapshot(scope, query, maximumLimit, recordIds));
+    assertUsageNotExpired(result.usageContext?.expiresAt);
+    if (result.expiresAt && Date.parse(result.expiresAt) <= Date.now()) throw inventoryChanged();
+    return result;
   }
 
   private async listSnapshot(scope: PackageDataScope & InventoryDataScope, query: UnifiedAgentInventoryQuery, maximumLimit: number,
@@ -239,10 +244,24 @@ export class UnifiedAgentsService {
       identityLinks: summary.ambiguous === 0 && summary.conflicting === 0,
       sourceMemberships: true,
     };
+    const expiresAt = earliestExpiry([
+      packageObservation?.expiresAt,
+      powerPlatformObservation?.expiresAt,
+      usage.context.expiresAt,
+      usage.context.reportSet?.expiresAt,
+      ...records.flatMap(record => [
+        record.environment?.observation.expiresAt,
+        ...Object.values(record.observations.packageSnapshots).flatMap(observation =>
+          [observation.expiresAt, observation.identityDetails?.expiresAt]),
+        ...record.packages.map(value => value.detailFreshness?.state === "fresh" ? value.detailFreshness.expiresAt : null),
+        ...Object.values(record.people ?? {}).map(person => person.expiresAt),
+      ]),
+    ]);
     if (await this.dependencies.readRevision(scope, database) !== baseRevision) throw inventoryChanged();
 
     return {
       revision,
+      expiresAt,
       usageContext: usage.context,
       inventoryOverview: summarizeAgentAvailability(records),
       value: sorted.slice(offset, offset + limit),
@@ -592,6 +611,21 @@ function exactSelection(records: readonly UnifiedAgentRecord[], references: read
 
 function inventoryChanged() {
   return new AppError(409, "inventory_changed", "Saved inventory changed. Refresh Agents and try the export again.");
+}
+
+function assertUsageNotExpired(expiresAt: string | null | undefined) {
+  if (expiresAt && Date.parse(expiresAt) <= Date.now()) throw usageChanged();
+}
+
+function earliestExpiry(values: readonly (string | null | undefined)[]) {
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp)) throw new AppError(500, "saved_source_invalid", "Saved agent inventory contains an invalid expiration timestamp.");
+    earliest = Math.min(earliest, timestamp);
+  }
+  return Number.isFinite(earliest) ? new Date(earliest).toISOString() : null;
 }
 
 function recordComparator(query: UnifiedAgentInventoryQuery, environmentNames: Record<string, string>) {

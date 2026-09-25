@@ -51,8 +51,8 @@ export class AgentPeopleRepository {
       CROSS JOIN LATERAL (VALUES (resource.created_by),(resource.details->>'ownerId'),
         (resource.details->>'lastModifiedBy')) person(id)
       WHERE resource.tenant_id=$1 AND resource.principal_id=$2 AND resource.resource_type='microsoft.copilotstudio/agents'
-        AND person.id IS NOT NULL
-      ORDER BY id LIMIT 10001`, [scope.tenantId, scope.principalId]);
+        AND person.id ~* $3
+      ORDER BY id LIMIT 10001`, [scope.tenantId, scope.principalId, "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"]);
     if (result.rows.length > 10_000) throw new AppError(413, "agent_people_limit", "Agent people exceed the 10,000-identity sync limit.");
     return result.rows.map(row => row.id).filter(isDirectoryObjectId);
   }
@@ -75,7 +75,7 @@ export class AgentPeopleRepository {
   }
 
   async save(scope: DataSyncScope, observations: readonly AgentPersonObservation[],
-    context: { generation: string; publication?: UserSourcePublication; signal?: AbortSignal }) {
+    context: { generation: string; publication?: UserSourcePublication; signal?: AbortSignal; fence?: () => void }) {
     validateScope(scope);
     if (!observations.length || observations.length > 500) throw new AppError(400, "invalid_agent_people", "Save between 1 and 500 exact user observations.");
     const ids = validIds(observations.map(value => value.objectId));
@@ -90,6 +90,8 @@ export class AgentPeopleRepository {
       }
     }
     return transaction(this.database, async client => {
+      context.signal?.throwIfAborted();
+      context.fence?.();
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
       if (await this.generation(scope, client) !== context.generation) {
         throw new AppError(409, "dataset_invalidated", "Saved data was cleared while resolving agent people. Reload Agents.");
@@ -100,6 +102,8 @@ export class AgentPeopleRepository {
       [scope.tenantId, scope.principalId, ids]);
       if (count.rows[0].count + ids.length > 100_000) throw new AppError(413, "agent_people_limit", "The saved people cache exceeded its identity limit.");
       for (const value of observations) {
+        context.signal?.throwIfAborted();
+        context.fence?.();
         const days = value.status === "resolved" ? 7 : value.status === "not_found" ? 1 : 1 / 96;
         // Preserve a previous 404's time through failed retries so older roster labels cannot return.
         await client.query(`INSERT INTO agent_people_cache(tenant_id,principal_id,object_id,revision,status,
@@ -118,6 +122,7 @@ export class AgentPeopleRepository {
         [scope.tenantId, scope.principalId, value.objectId.toLowerCase(), randomUUID(), value.status,
           value.displayName, value.userPrincipalName, value.checkedAt, days, value.errorCode ?? null]);
       }
+      context.fence?.();
     }, context.signal);
   }
 }

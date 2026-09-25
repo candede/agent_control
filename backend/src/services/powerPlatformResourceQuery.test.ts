@@ -1,7 +1,10 @@
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
+import { agentCapabilityExport } from "./agentContextExport.js";
 import { withTelemetryContext } from "./telemetry.js";
+
+vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
 
 const resource = {
   tenantId: "11111111-1111-1111-1111-111111111111",
@@ -163,8 +166,8 @@ describe("PowerPlatformResourceQueryClient", () => {
       },
     }] }));
     const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
-    expect(result.resources[0].details).not.toHaveProperty("connectors");
-    expect(result.resources[0].details).not.toHaveProperty("distinctPowerPlatformConnectors");
+    expect(result.resources[0].details).toEqual({});
+    expect(result.resources[0].unknownFieldCount).toBe(2);
     expect(JSON.stringify(result)).not.toContain("unsupported-connector");
   });
 
@@ -569,6 +572,91 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(result.resources[0]).toMatchObject({ tenantId, nativeId });
   });
 
+  it.each(["tenantId", "name", "location"].flatMap(field => ["private\0text", "private\uD83Dtext", "private\uDE00text"]
+    .map(value => ({ field, value }))))("rejects non-storable $field text before reporting progress ($value)", async ({ field, value }) => {
+    const progress = vi.fn();
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, [field]: value }],
+    }));
+
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { onProgress: progress }))
+      .rejects.toMatchObject({ code: "provider_schema", diagnostics: { field } });
+    expect(progress).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private");
+  });
+
+  it.each(["environmentId", "expectedTenantId"].flatMap(field => ["private\0scope", "private\uD83Dscope", "private\uDE00scope"]
+    .map(value => ({ field, value }))))("rejects non-storable $field scope before dispatch ($value)", async ({ field, value }) => {
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, resultTruncated: 0, data: [] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", undefined, { [field]: value }))
+      .rejects.toMatchObject({ code: "invalid_inventory_scope" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(["private\0text", "private\uD83Dtext", "private\uDE00text"])("omits non-storable optional text and marks capability omissions partial (%s)", async value => {
+    const properties = {
+      displayName: value, environmentId: value, createdBy: value, ownerId: value, createdIn: value,
+      name: value, botId: value, entraAppId: value, entraAgentId: value, entraAgentBlueprintId: value,
+      channels: ["Teams", value],
+      powerPlatformConnectors: [
+        { connectorId: value, operations: [] },
+        { connectorId: "valid", operations: [{ operationId: value }, { operationId: "read" }] },
+      ],
+    };
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }] }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      displayName: null, environmentId: null, createdBy: null,
+      identifiers: [{ kind: "power_platform_resource_id", value: resource.name }],
+      details: {
+        channels: ["Teams"], connectorDetailsStatus: "partial", capabilityDetailsTruncated: true,
+        connectors: [{ connectorId: "valid", operations: [{ operationId: "read" }] }],
+      },
+      unknownFieldCount: 13,
+    });
+    expect(result.resources[0].details).not.toHaveProperty("ownerId");
+    expect(result.resources[0].details).not.toHaveProperty("createdIn");
+    expect(result.resources[0].provenance).not.toHaveProperty("displayName");
+    expect(JSON.stringify(result)).not.toContain("private");
+  });
+
+  it.each([
+    { channels: [], expected: [], omissions: 0 },
+    { channels: ["Teams"], expected: ["Teams"], omissions: 0 },
+    { channels: ["private\0channel"], expected: undefined, omissions: 1 },
+    { channels: [null, 123], expected: undefined, omissions: 2 },
+    { channels: ["Teams", false], expected: ["Teams"], omissions: 1 },
+  ])("does not present an entirely malformed channel list as supplied empty: $channels", async ({ channels, expected, omissions }) => {
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties: { channels } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0].details.channels).toEqual(expected);
+    expect(result.resources[0].unknownFieldCount).toBe(omissions);
+    if (expected === undefined) expect(result.resources[0].provenance).not.toHaveProperty("channels");
+    else expect(result.resources[0].provenance.channels.path).toBe("properties.channels");
+  });
+
+  it("retains valid supplementary Unicode without splitting a bounded location", async () => {
+    const nativeId = "agent-😀";
+    const properties = {
+      displayName: "Agent 😀", environmentId: "environment-😀", channels: ["Channel 😀"],
+      powerPlatformConnectors: [{ connectorId: "connector-😀", operations: [{ operationId: "read-😀" }] }],
+    };
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, name: nativeId, location: `${"x".repeat(255)}😀tail`, properties }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      nativeId, displayName: properties.displayName, environmentId: properties.environmentId,
+      location: "x".repeat(255),
+      details: { channels: properties.channels, connectors: properties.powerPlatformConnectors, connectorDetailsStatus: "complete" },
+    });
+    expect(result.resources[0].identifiers).toContainEqual({ kind: "power_platform_resource_id", value: nativeId });
+  });
+
   it.each(["", null, undefined])("still rejects absent tenant metadata (%s) on tenant-owned resources", async tenantId => {
     for (const type of ["microsoft.copilotstudio/agents", "microsoft.powerplatform/environments"]) {
       const fetcher = vi.fn().mockResolvedValue(Response.json({
@@ -708,6 +796,36 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(result.resources[0].details.distinctPowerPlatformConnectors).toBeUndefined();
   });
 
+  it.each(["capped", "malformed"] as const)("exports %s operation lists as partial retained details, not confirmed empty configuration", async reason => {
+    const connectors = [
+      ...(reason === "capped" ? [{
+        connectorId: "first", operations: Array.from({ length: 200 }, (_, index) => ({ operationId: `read-${index}` })),
+      }] : []),
+      { connectorId: "unretained", operations: reason === "capped" ? [{ operationId: "read" }] : [{ operationId: null }] },
+    ];
+    const fetcher = vi.fn().mockResolvedValue(Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0,
+      data: [{ ...resource, properties: {
+        powerPlatformConnectors: connectors,
+        capabilitiesCounts: {
+          distinctPowerPlatformConnectors: connectors.length,
+          distinctPowerPlatformConnectorsOperations: reason === "capped" ? 201 : 1,
+        },
+      } }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token", ["microsoft.copilotstudio/agents"]);
+    const retained = result.resources[0];
+    expect(retained.details.connectors?.at(-1)).toEqual({ connectorId: "unretained", operations: [] });
+    expect(retained.details).toMatchObject({ connectorDetailsStatus: "partial", capabilityDetailsTruncated: true });
+    const exported = agentCapabilityExport(retained);
+    expect(exported).toMatchObject({
+      connectorDetailsStatus: "partial",
+      reportedOperationTotal: reason === "capped" ? 201 : 1,
+      savedOperationDetails: reason === "capped" ? 200 : 0,
+    });
+    expect(JSON.parse(exported.configuredConnectors!).at(-1)).toEqual({ connectorId: "unretained", operations: [] });
+  });
+
   it("classifies only explicit empty publication metadata as draft", async () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json({
       totalRecords: 3,
@@ -727,6 +845,41 @@ describe("PowerPlatformResourceQueryClient", () => {
       { nativeId: "absent-publication", lifecycle: "unknown" },
       { nativeId: "malformed-publication", lifecycle: "unknown" },
     ]);
+  });
+
+  it.each([
+    "2026-02-30T12:00:00Z", "2025-02-29T12:00:00Z", "2026-04-31T12:00:00Z",
+    "2026-01-01T24:00:00Z", "0000-01-01T12:00:00Z", "2026-13-01T12:00:00Z",
+    "2026-01-01T12:00:00+14:30", "2026-01-01T12:00:00", "2026-01-01", "1",
+  ])("omits invalid or timezone-ambiguous timestamps without inventing a published lifecycle (%s)", async value => {
+    const properties = { createdAt: value, lastPublishedAt: value, lastModifiedAt: value, quarantinedAt: value };
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      createdAt: null, lastPublishedAt: null, lifecycle: "unknown", unknownFieldCount: 4,
+    });
+    expect(result.resources[0].details).not.toHaveProperty("lastModifiedAt");
+    expect(result.resources[0].details).not.toHaveProperty("quarantinedAt");
+    for (const field of Object.keys(properties)) expect(result.resources[0].provenance).not.toHaveProperty(field);
+  });
+
+  it.each([
+    ["2024-02-29T12:34:56.1234567Z", "2024-02-29T12:34:56.123Z"],
+    ["2024-02-29T12:34:56+02:30", "2024-02-29T10:04:56.000Z"],
+    ["2026-01-01T01:00:00-03:00", "2026-01-01T04:00:00.000Z"],
+  ])("keeps valid timestamp normalization and publication evidence (%s)", async (value, expected) => {
+    const properties = { createdAt: value, lastPublishedAt: value, lastModifiedAt: value, quarantinedAt: value };
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: 0, data: [{ ...resource, properties }],
+    }));
+    const result = await new PowerPlatformResourceQueryClient(fetcher).query("opaque-token");
+    expect(result.resources[0]).toMatchObject({
+      createdAt: expected, lastPublishedAt: expected, lifecycle: "published", unknownFieldCount: 0,
+      details: { lastModifiedAt: expected, quarantinedAt: expected },
+    });
+    for (const field of Object.keys(properties)) expect(result.resources[0].provenance[field].path).toBe(`properties.${field}`);
   });
 
   it("classifies authoring only from exact documented values", async () => {

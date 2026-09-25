@@ -144,7 +144,7 @@ describe("adaptive package read pacing", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("renews tokens that aged in another request's hour-long cooldown and re-enters pacing", async () => {
+  it("renews tokens that aged in another request's hour-long cooldown while preserving pacing", async () => {
     const starts: number[] = [];
     const fetcher = vi.fn<FetchLike>(async (input, init) => {
       starts.push(performance.now());
@@ -161,5 +161,94 @@ describe("adaptive package read pacing", () => {
     expect(starts[1]).toBeGreaterThanOrEqual(3_600_000);
     expect(starts[2] - starts[1]).toBeGreaterThanOrEqual(250);
     expect(getAccessToken).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps concurrent inventory scans progressing when paced admission outlasts token freshness", async () => {
+    const starts: number[] = [];
+    const fetcher = vi.fn<FetchLike>(async (input, init) => {
+      const now = performance.now();
+      const tokenIssuedAt = Number(new Headers(init?.headers).get("Authorization")?.split(" ").at(-1));
+      expect(now - tokenIssuedAt).toBeLessThan(30_000);
+      starts.push(now);
+      return Response.json(value(new URL(input).pathname.split("/").at(-1)));
+    });
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 2_000, delay: wait,
+    });
+    const getAccessToken = vi.fn(async () => {
+      await wait(100);
+      return String(performance.now());
+    });
+    const controller = new AbortController();
+    const scans = Promise.all(Array.from({ length: 4 }, (_, scan) => scanPackages(
+      "expired", Array.from({ length: 12 }, (_, index) => `package-${scan}-${index}`),
+      controller.signal, async () => undefined, client, { getAccessToken },
+    )));
+    const completed = vi.fn();
+    const observed = scans.then(completed, error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(completed).toHaveBeenCalledOnce();
+      expect(completed.mock.calls[0][0].map((scan: { totalRecords: number }) => scan.totalRecords)).toEqual([12, 12, 12, 12]);
+      expect(starts).toHaveLength(48);
+      expect(starts.every((at, index) => index === 0 || at - starts[index - 1] >= 2_000)).toBe(true);
+      expect(getAccessToken.mock.calls.length).toBeGreaterThan(48);
+    } finally {
+      controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
+      await observed;
+    }
+  });
+
+  it("rechecks cooldowns extended by an in-flight response during queued token renewal", async () => {
+    const starts: { id: string; at: number }[] = [];
+    let throttleReturned = false;
+    const fetcher = vi.fn<FetchLike>(async input => {
+      const id = new URL(input).pathname.split("/").at(-1)!;
+      starts.push({ id, at: performance.now() });
+      if (id === "package-14" && !throttleReturned) {
+        throttleReturned = true;
+        await wait(3_000);
+        return throttled("30");
+      }
+      return Response.json(value(id));
+    });
+    const client = new GraphPackagesClient(fetcher, {
+      ...packageInventoryReadPolicy, minimumReadIntervalMs: 2_000, delay: wait,
+    });
+    const getAccessToken = vi.fn(async () => {
+      if (performance.now() === 30_000) await wait(5_000);
+      return "fresh";
+    });
+    const reads = Promise.all(Array.from({ length: 16 }, (_, index) =>
+      client.getPackageDetails("expired", `package-${index}`, { getAccessToken })));
+    await Promise.all([expect(reads).resolves.toHaveLength(16), vi.runAllTimersAsync()]);
+    expect(starts.filter(start => start.at >= 30_000)).toEqual([
+      { id: "package-15", at: 61_000 }, { id: "package-14", at: 63_000 },
+    ]);
+  });
+
+  it("releases the admission queue when an aged-token renewal is cancelled", async () => {
+    const fetcher = vi.fn<FetchLike>(async input => Response.json(value(new URL(input).pathname.split("/").at(-1))));
+    fetcher.mockResolvedValueOnce(throttled("31"));
+    const client = new GraphPackagesClient(fetcher, { ...packageInventoryReadPolicy, delay: wait });
+    const first = client.getPackageDetails("token", "first");
+    await vi.advanceTimersByTimeAsync(0);
+    let release!: (token: string) => void;
+    const getAccessToken = vi.fn(async () => "initial")
+      .mockResolvedValueOnce("initial")
+      .mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const controller = new AbortController();
+    const cancelled = client.getPackageDetails("expired", "cancelled", { signal: controller.signal, getAccessToken });
+    const assertion = expect(cancelled).rejects.toMatchObject({ code: "read_job_cancelled" });
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(getAccessToken).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenCalledOnce();
+    controller.abort(new AppError(409, "read_job_cancelled", "Cancelled"));
+    await assertion;
+    await expect(first).resolves.toMatchObject({ id: "first" });
+    release("late");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.every(([input]) => new URL(input).pathname.endsWith("/first"))).toBe(true);
   });
 });

@@ -28,7 +28,7 @@ const cacheReasons: Partial<Record<AgentIdentityCacheStatus, { reason: string; r
 };
 
 export class AgentInvestigationsService {
-  constructor(private readonly inventory: Pick<typeof unifiedAgents, "list"> = unifiedAgents,
+  constructor(private readonly inventory: Pick<typeof unifiedAgents, "list" | "assertRevision"> = unifiedAgents,
     private readonly identities: Pick<PowerPlatformInventoryRepository, "readIdentityCandidates"> = new PowerPlatformInventoryRepository(),
     private readonly mappings: Pick<AgentIdentityRepository, "readState"> = new AgentIdentityRepository()) {}
 
@@ -42,7 +42,7 @@ export class AgentInvestigationsService {
     const resource = record.powerPlatformResource;
     const observation = record.observations.powerPlatform;
     const uncertain = record.identity.invalidMetadata || ["ambiguous", "conflicting"].includes(record.identity.state);
-    const current = resource?.type === "microsoft.copilotstudio/agents"
+    const current = Boolean(page.revision) && resource?.type === "microsoft.copilotstudio/agents"
       && resource.tenantId.toLowerCase() === scope.tenantId.toLowerCase()
       && observation?.current === true && Date.parse(observation.expiresAt) > Date.now()
       && page.sources.powerPlatform.state !== "unavailable";
@@ -61,7 +61,10 @@ export class AgentInvestigationsService {
     const bots = exactIds("cds_bot_id");
     const agentIds = exactIds("entra_agent_id");
     const candidates = !commonReason && (applicationIds.length === 1 || bots.length === 1 || agentIds.length === 1)
-      ? await this.identities.readIdentityCandidates(scope, ["microsoft.copilotstudio/agents"]) : [];
+      ? await this.identities.readIdentityCandidates(scope, ["microsoft.copilotstudio/agents"]).catch(error => {
+        if (error instanceof AppError && error.code === "snapshot_invalidated") throw sourceChanged();
+        throw error;
+      }) : [];
     const unambiguous = (kind: "entra_app_id" | "cds_bot_id" | "entra_agent_id", ids: string[]) => {
       if (!resource || ids.length !== 1) return false;
       const match = resolveExactInventoryIdentity({ tenantId: resource.tenantId, nativeId: resource.nativeId,
@@ -78,7 +81,7 @@ export class AgentInvestigationsService {
           : agentIds.length !== 1 || agentProvenance?.sourceSystem !== "power_platform" || agentProvenance.path !== "properties.entraAgentId"
             ? "invalid_identity_candidate"
             : !unambiguous("entra_agent_id", agentIds) ? "ambiguous_identity"
-              : !page.revision || !observation?.snapshotId || !isDirectoryObjectId(observation.snapshotId)
+              : !observation?.snapshotId || !isDirectoryObjectId(observation.snapshotId)
                 || !resource.environmentId || record.environmentId?.toLowerCase() !== resource.environmentId.toLowerCase() ? "stale_source" : undefined);
     const resolutionReason = commonReason ?? (resolutionCode === "unsupported_identity_crosswalk" ? "The typed directory crosswalk requires a source-declared Copilot Studio agent. Other provider-native log identities need a separately verified crosswalk."
       : resolutionCode === "missing_identity_candidate" ? "The saved source does not supply properties.entraAgentId. Refresh the source; bot, package and blueprint IDs cannot substitute."
@@ -91,7 +94,18 @@ export class AgentInvestigationsService {
         observation.snapshotId, resource.nativeId, resource.environmentId, agentIds[0], agentProvenance,
       ])).digest("hex"),
     } : undefined;
-    const cache: AgentIdentityCacheState = identitySource ? await this.mappings.readState(scope, identitySource) : { status: "source_unavailable" };
+    const savedCache: AgentIdentityCacheState = identitySource ? await this.mappings.readState(scope, identitySource) : { status: "source_unavailable" };
+    if (current && page.revision) {
+      try { await this.inventory.assertRevision(scope, page.revision); }
+      catch (error) {
+        if (error instanceof AppError && error.code === "inventory_changed") throw sourceChanged();
+        throw error;
+      }
+      if (!observation || Date.parse(observation.expiresAt) <= Date.now()) throw sourceChanged();
+    }
+    const cacheExpiresAt = savedCache.expiresAt ?? savedCache.value?.expiresAt;
+    const cache: AgentIdentityCacheState = cacheExpiresAt && Date.parse(cacheExpiresAt) <= Date.now()
+      ? { ...savedCache, status: "expired", value: undefined } : savedCache;
     const mapping = cache.status === "resolved" ? cache.value : undefined;
     const savedReason = resolutionReason ?? cacheReasons[cache.status]?.reason;
     const savedReasonCode = resolutionCode ?? cacheReasons[cache.status]?.reasonCode;
@@ -150,6 +164,10 @@ export class AgentInvestigationsService {
 }
 
 export const agentInvestigations = new AgentInvestigationsService();
+
+function sourceChanged() {
+  return new AppError(409, "agent_identity_source_changed", "The saved agent source changed or expired during this read. Refresh Agents.");
+}
 
 export function investigationRecordId(value: unknown): string {
   if (typeof value === "string" && value.length <= 2_048) {

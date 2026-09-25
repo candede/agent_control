@@ -1,12 +1,13 @@
 import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
-import { revokeAccountSessionMutations } from "../db/sessions.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { PackageInventoryService, scanPackages, type PackageRefreshScan } from "./packageInventory.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { GraphPackagesClient, packageInventoryReadPolicy, type FetchLike, type PackageReadOptions } from "./graphPackages.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
+import * as operationalState from "./operationalState.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -87,6 +88,62 @@ describe("Package refresh service", () => {
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  it.each(["maintenance", "provider_requalification_required"])(
+    "retains the operational pause reason for automatic enrichment instead of requesting sign-in: %s", async code => {
+      const { service, repository, dependencies, job } = fixture();
+      const automaticJob = { ...job, autoDetails: true };
+      repository.getJob.mockResolvedValue(automaticJob);
+      let closed = false;
+      vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+        if (closed) throw new AppError(503, code, "Provider admissions are closed.");
+      });
+      dependencies.scan.mockImplementationOnce(async () => {
+        closed = true;
+        return { packages: [], totalRecords: 0, pages: 1 };
+      });
+      await service.start(user, job.id, "delegated");
+      await vi.waitFor(() => expect(repository.markFailed).toHaveBeenCalledWith(
+        expect.anything(), job.id, code, "Provider admissions are closed. Saved package data is unchanged.",
+      ));
+      await service.drain();
+      expect(repository.publish).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["maintenance", "provider_requalification_required"])(
+    "fences package resume and publication when admissions close: %s", async code => {
+      for (const stage of ["start", "authorization", "activation", "collection"]) {
+        const { service, repository, dependencies, job } = fixture();
+        let closed = stage === "start";
+        vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => {
+          if (closed) throw new AppError(503, code, "Provider admissions are closed.");
+        });
+        if (stage === "authorization") dependencies.revalidateUser.mockImplementationOnce(async () => { closed = true; return user; });
+        if (stage === "activation") repository.markRunning.mockImplementationOnce(async () => { closed = true; return true; });
+        if (stage === "collection") dependencies.scan.mockImplementationOnce(async () => {
+          closed = true;
+          return { packages: [], totalRecords: 0, pages: 1 };
+        });
+        try {
+          if (stage === "collection") {
+            await service.start(user, job.id, "delegated");
+            await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce());
+          } else {
+            await expect(service.start(user, job.id, "delegated")).rejects.toMatchObject({ status: 503, code });
+            expect(dependencies.scan).not.toHaveBeenCalled();
+            if (stage === "activation") expect(repository.markWaitingAuthorization).toHaveBeenCalledOnce();
+            else expect(repository.markRunning).not.toHaveBeenCalled();
+          }
+          expect(repository.publish).not.toHaveBeenCalled();
+          expect(repository.markFailed).not.toHaveBeenCalled();
+          await expect(service.get(user, job.id, "delegated")).resolves.toMatchObject({ id: job.id });
+        } finally {
+          await service.drain();
+        }
+      }
+    },
+  );
+
   it("publishes only after current delegated authorization and a complete explicit scan", async () => {
     const { service, repository, dependencies, job } = fixture();
     await service.start(user, job.id, "delegated");
@@ -109,6 +166,49 @@ describe("Package refresh service", () => {
     expect(repository.claimDueDetails).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, user.homeAccountId, undefined);
     expect(repository.latestAutomaticDetailsJob).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, user.homeAccountId);
     expect(dependencies.scan).not.toHaveBeenCalled();
+  });
+
+  it.each(["claim", "start"] as const)("joins cancellation during automatic detail %s without launching collection", async stage => {
+    const { service, repository, dependencies, job } = fixture();
+    const controller = new AbortController();
+    const claimed = deferred<typeof job>();
+    const revalidated = deferred<AuthenticatedUser>();
+    repository.claimDueDetails.mockImplementationOnce(async () => stage === "claim" ? claimed.promise : job);
+    if (stage === "start") dependencies.revalidateUser.mockReturnValueOnce(revalidated.promise);
+    const request = service.refreshDueDetails(user, undefined, controller.signal).catch(error => error);
+    await vi.waitFor(() => expect(stage === "claim" ? repository.claimDueDetails : dependencies.revalidateUser).toHaveBeenCalled());
+    const reason = new AppError(401, "interaction_required", "Coordinator shutdown.");
+    controller.abort(reason);
+    claimed.resolve(job);
+    revalidated.resolve(user);
+    expect(await request).toBe(reason);
+    expect(dependencies.scan).not.toHaveBeenCalled();
+    expect(repository.markFailed).toHaveBeenCalled();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it.each(["load", "scan"] as const)("pins package authorization through %s across a replacement sign-in", async stage => {
+    const { service, repository, dependencies, job } = fixture();
+    const owner = { ...user, homeAccountId: `replacement-package-${stage}` };
+    job.authorizationPrincipalId = owner.homeAccountId;
+    dependencies.revalidateUser.mockResolvedValue(owner);
+    const loaded = deferred<typeof job>();
+    const scanned = deferred<Awaited<ReturnType<PackageRefreshScan>>>();
+    if (stage === "load") repository.getJob.mockReturnValueOnce(loaded.promise);
+    else dependencies.scan.mockReturnValueOnce(scanned.promise);
+    const request = service.start(owner, job.id, "delegated").catch(error => error);
+    await vi.waitFor(() => expect(stage === "load" ? repository.getJob : dependencies.scan).toHaveBeenCalled());
+    await activateAccountSession(owner.tenantId!, owner.homeAccountId, async () => undefined);
+    loaded.resolve(job);
+    scanned.resolve({ packages: [], totalRecords: 0, pages: 1 });
+    if (stage === "load") {
+      expect(await request).toMatchObject({ code: "unauthorized" });
+      expect(dependencies.revalidateUser).not.toHaveBeenCalled();
+    } else {
+      await request;
+      await vi.waitFor(() => expect(repository.markWaitingAuthorization).toHaveBeenCalled());
+    }
+    expect(repository.publish).not.toHaveBeenCalled();
   });
 
   it.each(["waiting_authorization", "running", "failed", "succeeded", "cancelled"])(
@@ -185,7 +285,7 @@ describe("Package refresh service", () => {
       packages: [], totalRecords: 0, pages: 1,
       detailFailures: [{ id: "one", missing: false, errorCode: "provider_error" }],
     });
-    await service.start(user, job.id, "delegated", { autoDetails: true });
+    await service.start(user, job.id, "delegated");
     await vi.waitFor(() => expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toContain("package_detail_read_failed"));
     expect(repository.publish).toHaveBeenCalledOnce();
     expect(vi.mocked(console.log).mock.calls.flat().join("\n")).not.toContain("package_refresh_succeeded");
@@ -755,6 +855,36 @@ describe("Package refresh service", () => {
     expect(dependencies.scan).not.toHaveBeenCalled();
   });
 
+  it.each(["revalidateUser", "requireAvailable", "delegatedToken"] as const)(
+    "persists permission-denied admission at %s instead of returning a sign-in-only job", async stage => {
+      const { service, repository, dependencies, job } = fixture();
+      dependencies[stage].mockRejectedValueOnce(new AppError(403, "missing_permission", "Consent is required."));
+      await expect(service.start(user, job.id, "delegated")).rejects.toMatchObject({ code: "missing_permission" });
+      expect(repository.markFailed).toHaveBeenCalledWith(
+        { tenantId: user.tenantId, principalId: user.homeAccountId }, job.id, "missing_permission",
+        expect.stringContaining("Review Permissions; signing in again does not grant permissions"),
+      );
+      expect(repository.markRunning).not.toHaveBeenCalled();
+      expect(dependencies.scan).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["revalidateUser", "requireAvailable", "delegatedToken"] as const)(
+    "keeps interrupted admission waiting when %s later denies permission", async stage => {
+      const { service, repository, dependencies, job } = fixture();
+      const pending = deferred<never>();
+      dependencies[stage].mockReturnValueOnce(pending.promise);
+      const starting = service.start(user, job.id, "delegated");
+      const stopped = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
+      await vi.waitFor(() => expect(dependencies[stage]).toHaveBeenCalledOnce());
+      await service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
+      pending.reject(new AppError(403, "missing_permission", "Late consent failure."));
+      await stopped;
+      expect(repository.markFailed).not.toHaveBeenCalled();
+      expect(dependencies.scan).not.toHaveBeenCalled();
+    },
+  );
+
   it("forwards explicit readiness retry and internal cleanup without weakening admission", async () => {
     const { service, repository, dependencies, job } = fixture();
     dependencies.requireAvailable.mockRejectedValueOnce(new AppError(504, "provider_timeout", "Readiness timed out."));
@@ -809,6 +939,48 @@ describe("Package refresh service", () => {
     } finally {
       response.resolve(job);
       await first;
+      await service.drain();
+    }
+  });
+
+  it("uses persisted automatic-detail mode to reserve at most two resumptions before provider authorization", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.getJob.mockImplementation(async (_scope, id = job.id) => ({ ...job, id, autoDetails: true }));
+    const authorizing = deferred<AuthenticatedUser>();
+    dependencies.revalidateUser.mockReturnValue(authorizing.promise);
+    dependencies.scan.mockImplementation((_token, _ids, signal) => new Promise((_resolve, reject) =>
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true })));
+    const starts = [service.start(user, "automatic-one", "delegated"), service.start(user, "automatic-two", "delegated")];
+    try {
+      await vi.waitFor(() => expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2));
+      const third = service.start(user, "automatic-three", "delegated");
+      const rejected = expect(third).rejects.toMatchObject({ code: "package_refresh_capacity" });
+      authorizing.resolve(user);
+      await Promise.all([...starts, rejected]);
+      expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2);
+      expect(dependencies.scan).toHaveBeenCalledTimes(2);
+    } finally {
+      authorizing.resolve(user);
+      await Promise.allSettled(starts);
+      await service.drain();
+    }
+  });
+
+  it("keeps four foreground and two persisted automatic-detail jobs in independent capacity lanes", async () => {
+    const { service, repository, dependencies, job } = fixture();
+    repository.getJob.mockImplementation(async (_scope, id = job.id) => ({
+      ...job, id, autoDetails: id.startsWith("automatic"),
+    }));
+    dependencies.scan.mockImplementation((_token, _ids, signal) => new Promise((_resolve, reject) =>
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true })));
+    try {
+      for (let index = 1; index <= 4; index += 1) await service.start(user, `foreground-${index}`, "delegated");
+      for (let index = 1; index <= 2; index += 1) await service.start(user, `automatic-${index}`, "delegated");
+      expect(dependencies.scan).toHaveBeenCalledTimes(6);
+      for (const id of ["foreground-extra", "automatic-extra"]) {
+        await expect(service.start(user, id, "delegated")).rejects.toMatchObject({ code: "package_refresh_capacity" });
+      }
+    } finally {
       await service.drain();
     }
   });

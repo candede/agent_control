@@ -234,6 +234,16 @@ describe("workbench routing", () => {
     expect(parseDataSyncRoute(dataSyncRouteSearch(sync).toString())).toEqual(sync);
   });
 
+  it("bounds Audit search and page routes to the server's supported filters", () => {
+    const route = parseAuditRoute(`q=${"a".repeat(200)}&page=1001`);
+    expect(route).toMatchObject({ search: "a".repeat(200), page: 1000 });
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
+    expect(parseAuditRoute(`q=${"a".repeat(201)}&page=1002`)).toMatchObject({ search: "", page: 1000 });
+    const serialized = auditRouteSearch({ ...route, search: "a".repeat(201), page: 2000 });
+    expect(serialized.get("q")).toHaveLength(200);
+    expect(serialized.get("page")).toBe("1001");
+  });
+
   it.each([
     ["", "reports=manage"],
     ["view=overview", "reports=manage"],

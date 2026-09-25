@@ -214,6 +214,31 @@ describe("official usage views", () => {
     });
   });
 
+  it.each(["report", "directory"] as const)("excludes object-ID aliases of %s-ambiguous users from unpaid licensing", ambiguity => {
+    const source = published();
+    const licenseDirectory = savedLicenses([
+      ["case@example.com", "disabled"], ["control@example.com", "disabled"],
+      ...(ambiguity === "directory" ? [["CASE@example.com", "disabled"] as [string, CopilotServiceSummaryState]] : []),
+    ]);
+    const directory = licenseDirectory.value!;
+    source.reports.userAgents!.rows = [];
+    source.reports.users!.rows = [
+      "case@example.com",
+      ambiguity === "directory" ? directory[2].identity.objectId : "CASE@example.com",
+      directory[0].identity.objectId,
+      "control@example.com",
+    ].map(username => ({ username, displayName: username, numberOfAgentsUsed: 1, agentResponsesReceived: 3 }));
+
+    const result = buildOfficialUsageUserView(source, {
+      staleAfterDays: 35, licenseCohort: "active_without_paid", licenseDirectory,
+    });
+    expect(result.licenseCoverage).toMatchObject({
+      state: "available", activeReportUsers: 4, paidUsers: 0, unpaidUsers: 1, unknownUsers: 3,
+    });
+    expect(result.users).toMatchObject({ count: 1, value: [{ username: "control@example.com" }] });
+    expect(result.topUsersByResponses.map(user => user.username)).toEqual(["control@example.com"]);
+  });
+
   it("computes aggregate metrics without treating active-user counts as additive identities", () => {
     const result = buildOfficialUsageAggregateView(published(), [], {
       staleAfterDays: 35,

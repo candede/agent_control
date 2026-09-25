@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { inventoryProviderRoleIds, inventoryRoleScope, normalizeInventoryProviderRoleIds, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
+import { inventoryProviderRoleIds, inventoryQueryTypes, inventoryRoleScope, normalizeInventoryProviderRoleIds, resourceTypesForInventoryScope } from "./inventoryRoleScope.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 
 describe("Power Platform provider role scope", () => {
   it("maps only documented role-template IDs with full scope taking precedence", () => {
@@ -16,5 +17,22 @@ describe("Power Platform provider role scope", () => {
       "microsoft.copilotstudio/agents",
       "microsoft.powerplatform/environments",
     ]);
+  });
+
+  it.each(["full", "ai", "unknown"] as const)("keeps supported request plans identical for the %s role hint", scope => {
+    expect(resourceTypesForInventoryScope(scope)).toEqual(powerPlatformResourceTypes);
+    expect(inventoryQueryTypes(scope, powerPlatformResourceTypes)).toEqual(powerPlatformResourceTypes);
+    for (const type of powerPlatformResourceTypes) expect(inventoryQueryTypes(scope, [type])).toEqual([type]);
+  });
+
+  it("normalizes mixed-case claims deterministically without changing their source", () => {
+    const claims = [inventoryProviderRoleIds.aiReader.toUpperCase(), inventoryProviderRoleIds.globalReader,
+      inventoryProviderRoleIds.aiReader];
+    const original = [...claims];
+    expect(normalizeInventoryProviderRoleIds(claims)).toEqual([
+      inventoryProviderRoleIds.aiReader, inventoryProviderRoleIds.globalReader,
+    ].sort());
+    expect(inventoryRoleScope({ providerRoleIds: claims })).toBe("full");
+    expect(claims).toEqual(original);
   });
 });

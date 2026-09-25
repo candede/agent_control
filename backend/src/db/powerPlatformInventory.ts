@@ -64,8 +64,6 @@ type JobRow = {
   updated_at: Date;
   finished_at: Date | null;
   snapshot_id: string | null;
-  request_hash: string;
-  query_hash: string;
   deadline_at: Date;
 };
 
@@ -123,12 +121,12 @@ export class PowerPlatformInventoryRepository {
     if (!(["full", "ai", "unknown"] as const).includes(input.roleScope)) throw new AppError(400, "invalid_inventory_scope", "Inventory role scope is invalid.");
     const requestedTypes = validateTypes(input.requestedTypes);
     const environmentScope = validateEnvironment(input.environmentScope);
-    const requestHash = queryHash(input.roleScope, environmentScope, requestedTypes);
+    const requestHash = queryHash(environmentScope, requestedTypes);
     const id = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`power-platform:${scope.tenantId}:${scope.principalId}`]);
       const existing = await client.query<JobRow>("SELECT *,NULL::uuid AS snapshot_id FROM power_platform_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND idempotency_key=$3", [scope.tenantId, scope.principalId, input.idempotencyKey]);
       if (existing.rows[0]) {
-        if (existing.rows[0].request_hash !== requestHash) throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different inventory request.");
+        if (queryHash(existing.rows[0].environment_scope, existing.rows[0].requested_types) !== requestHash) throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different inventory request.");
         return existing.rows[0].id;
       }
       const outstanding = await client.query("SELECT count(*)::int AS count FROM power_platform_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp()", [scope.tenantId, scope.principalId]);
@@ -138,7 +136,9 @@ export class PowerPlatformInventoryRepository {
         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`, [jobId, scope.tenantId, scope.principalId, input.idempotencyKey, requestHash, input.roleScope, environmentScope, JSON.stringify(requestedTypes)]);
       return jobId;
     });
-    return (await this.getJob(scope, id))!;
+    const job = await this.getJob(scope, id);
+    if (!job) throw new AppError(409, "inventory_job_expired", "The inventory refresh expired. Submit a new refresh with a new idempotency key.");
+    return job;
   }
 
   async getJob(scope: InventoryDataScope, id: string) {
@@ -221,19 +221,20 @@ export class PowerPlatformInventoryRepository {
     validateScope(scope);
     const snapshotId = await transaction(this.database, async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`power-platform:${scope.tenantId}:${scope.principalId}`]);
-      const jobResult = await client.query<JobRow>(`SELECT job.*,job.request_hash AS query_hash,NULL::uuid AS snapshot_id FROM power_platform_refresh_jobs job
+      const jobResult = await client.query<JobRow>(`SELECT job.*,NULL::uuid AS snapshot_id FROM power_platform_refresh_jobs job
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running' AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp() FOR UPDATE`, [id, scope.tenantId, scope.principalId]);
       const job = jobResult.rows[0];
       if (!job) throw new AppError(409, "inventory_job_state", "Inventory refresh is not running for this principal.");
+      // Retained hashes include optional role hints; match the actual request scope instead.
       const newer = await client.query(`SELECT 1 FROM power_platform_refresh_jobs
-        WHERE tenant_id=$1 AND principal_id=$2 AND request_hash=$3 AND status IN ('running','succeeded') AND id<>$4
-          AND (created_at,id)>(SELECT created_at,id FROM power_platform_refresh_jobs WHERE id=$4) LIMIT 1`, [scope.tenantId, scope.principalId, job.request_hash, job.id]);
+        WHERE tenant_id=$1 AND principal_id=$2 AND environment_scope=$3 AND requested_types=$4::jsonb AND status IN ('running','succeeded') AND id<>$5
+          AND (created_at,id)>(SELECT created_at,id FROM power_platform_refresh_jobs WHERE id=$5) LIMIT 1`, [scope.tenantId, scope.principalId, job.environment_scope, JSON.stringify(job.requested_types), job.id]);
       if (newer.rowCount) throw new AppError(409, "inventory_job_superseded", "A newer refresh for this scope superseded this publication.");
       validatePublication(scope, job, result);
-      await client.query("UPDATE power_platform_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND query_hash=$3 AND is_current", [scope.tenantId, scope.principalId, job.query_hash]);
+      await client.query("UPDATE power_platform_inventory_snapshots SET is_current=false,expires_at=LEAST(expires_at,clock_timestamp()) WHERE tenant_id=$1 AND principal_id=$2 AND environment_scope=$3 AND requested_types=$4::jsonb AND is_current", [scope.tenantId, scope.principalId, job.environment_scope, JSON.stringify(job.requested_types)]);
       const createdSnapshotId = randomUUID();
       await client.query(`INSERT INTO power_platform_inventory_snapshots(id,job_id,tenant_id,principal_id,query_hash,role_scope,environment_scope,requested_types,queried_types,observed_count,total_records,page_count,unknown_field_count)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13)`, [createdSnapshotId, id, scope.tenantId, scope.principalId, job.query_hash, job.role_scope, job.environment_scope, JSON.stringify(job.requested_types), JSON.stringify(result.queriedTypes), result.resources.length, result.totalRecords, result.pages, result.unknownFieldCount]);
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13)`, [createdSnapshotId, id, scope.tenantId, scope.principalId, queryHash(job.environment_scope, job.requested_types), job.role_scope, job.environment_scope, JSON.stringify(job.requested_types), JSON.stringify(result.queriedTypes), result.resources.length, result.totalRecords, result.pages, result.unknownFieldCount]);
       if (result.resources.length) {
         const rows = result.resources.map(resource => ({
           native_id: resource.nativeId, resource_type: resource.type, environment_id: resource.environmentId ?? "", location: resource.location,
@@ -349,13 +350,14 @@ export class PowerPlatformInventoryRepository {
       || types.some(type => !powerPlatformResourceTypes.includes(type))) {
       throw new AppError(403, "scope_mismatch", "Inventory identity reads require exact supported resource types.");
     }
-    const selected = await database.query<SnapshotRow & { selected_type: PowerPlatformResourceType }>(`
+    const selectSnapshots = () => database.query<SnapshotRow & { selected_type: PowerPlatformResourceType }>(`
       SELECT DISTINCT ON (queried.type) snapshot.*,queried.type AS selected_type FROM power_platform_inventory_snapshots snapshot
       CROSS JOIN LATERAL jsonb_array_elements_text(snapshot.queried_types) queried(type)
       WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
         AND queried.type=ANY($3::text[])
       ORDER BY queried.type,CASE WHEN snapshot.environment_scope='' THEN 1 ELSE 0 END DESC,snapshot.observed_at DESC,snapshot.id DESC`,
     [scope.tenantId, scope.principalId, types]);
+    const selected = await selectSnapshots();
     if (!selected.rows.length) return [];
     const candidates = await database.query<Pick<ResourceRow, "native_id" | "resource_type" | "environment_id" | "identifiers">>(`
       SELECT DISTINCT native_id COLLATE "C" AS native_id,resource_type COLLATE "C" AS resource_type,
@@ -367,6 +369,13 @@ export class PowerPlatformInventoryRepository {
     [scope.tenantId, scope.principalId, JSON.stringify(selected.rows.map(snapshot => ({ snapshot_id: snapshot.id, selected_type: snapshot.selected_type })))]);
     if (candidates.rows.length > 5000) throw new AppError(409, "source_result_limit", "Saved inventory identity candidates exceed the 5,000-row read limit.");
     await this.verifySnapshots(scope, [...new Map(selected.rows.map(snapshot => [snapshot.id, snapshot])).values()], database);
+    const current = await selectSnapshots();
+    const now = Date.now();
+    if (current.rows.length !== selected.rows.length || current.rows.some((snapshot, index) =>
+      snapshot.id !== selected.rows[index].id || snapshot.selected_type !== selected.rows[index].selected_type
+      || snapshot.expires_at.getTime() <= now)) {
+      throw new AppError(409, "snapshot_invalidated", "Saved inventory identity sources changed or expired during this read. Refresh Power Platform inventory.");
+    }
     return candidates.rows.map(row => ({
       nativeId: row.native_id, tenantId: scope.tenantId, environmentId: row.environment_id || null,
       sourceSystem: "power_platform", resourceType: row.resource_type, identifiers: row.identifiers,
@@ -622,8 +631,8 @@ function validateEnvironment(value: string | undefined) {
   return value;
 }
 
-function queryHash(roleScope: InventoryRoleScope, environmentScope: string, requestedTypes: readonly PowerPlatformResourceType[]) {
-  return createHash("sha256").update(JSON.stringify({ cloud: "global", roleScope, environmentScope, requestedTypes })).digest("hex");
+function queryHash(environmentScope: string, requestedTypes: readonly PowerPlatformResourceType[]) {
+  return createHash("sha256").update(JSON.stringify({ cloud: "global", environmentScope, requestedTypes })).digest("hex");
 }
 
 function safeCode(value: string) {

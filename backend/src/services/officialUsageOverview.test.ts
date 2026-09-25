@@ -101,6 +101,17 @@ describe("official usage cumulative overview", () => {
     expect(client.query.mock.calls[2]?.[1]).toContain("%'; SELECT");
   });
 
+  it("excludes superseded sources using accepted correction markers even without retained correction payloads", async () => {
+    const { service, client } = databaseFixture();
+    await service.getOverview("tenant");
+    const sql = String(client.query.mock.calls[2]?.[0]).replace(/\s+/g, " ");
+    expect(sql).toContain(
+      "AND NOT EXISTS ( SELECT 1 FROM official_usage_sets replacement" +
+      " WHERE replacement.tenant_id=report_set.tenant_id AND replacement.supersedes_set_id=report_set.id" +
+      " AND replacement.complete AND replacement.accepted_at IS NOT NULL )",
+    );
+  });
+
   it("rolls back and releases the client when the aggregate query fails", async () => {
     const { service, client } = databaseFixture();
     client.query.mockImplementation(async (sql: string) => {

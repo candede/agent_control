@@ -23,7 +23,7 @@ vi.mock("../services/auditLog.js", () => ({ getAuditLog: () => ({
 }) }));
 vi.mock("../services/csvExport.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/csvExport.js")>(),
-  createExportPublicationValidator: () => async () => undefined,
+  createExportPublicationValidator: () => async (validateSource?: () => Promise<void>) => { await validateSource?.(); },
 }));
 vi.mock("../services/defenderHunting.js", () => ({ defenderHunting: Object.fromEntries([
   "qualificationEvidence", "retainedScopes", "approveQualification", "startQualification", "revokeRetainedScope",

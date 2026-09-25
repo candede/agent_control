@@ -21,6 +21,10 @@ export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingRe
 
 export type AuditScope = "single" | "bulk";
 
+export const auditDefaultPageSize = 100;
+export const auditMaximumOffset = 100_000;
+export const auditMaximumSearchLength = 200;
+
 export function isAuditOperationPrefix(value: unknown): value is string {
   return typeof value === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(value);
 }

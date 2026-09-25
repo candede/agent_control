@@ -13,6 +13,7 @@ import {
   type CopilotReportResult,
 } from "./copilotUsageGraph.js";
 import type { CopilotUsageSnapshotSource, DataSyncRepository, SavedCopilotUsageSource } from "../db/dataSync.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import type { FetchLike } from "./graphPackages.js";
 import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 
@@ -375,6 +376,38 @@ describe("CopilotUsageService", () => {
     expect(result.users).toHaveLength(2);
   });
 
+  it("retains the prior directory snapshot when Graph changes its count on a continuation", async () => {
+    const previous = directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com");
+    const skuId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const row = {
+      id: "22222222-2222-4222-8222-222222222222",
+      userPrincipalName: "new@example.com",
+      assignedLicenses: [{ skuId, disabledPlans: [] }],
+      assignedPlans: previous.servicePlans,
+    };
+    const usersUrl = buildCopilotUsersUrl([skuId]);
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(Response.json({
+        value: [{ skuId, appliesTo: "User", servicePlans: previous.servicePlans }],
+      }))
+      .mockResolvedValueOnce(Response.json({
+        value: [row], "@odata.count": 1, "@odata.nextLink": `${usersUrl}&$skiptoken=next`,
+      }))
+      .mockResolvedValueOnce(Response.json({ value: [row], "@odata.count": 2 }));
+    const client = new CopilotUsageGraphClient(fetcher);
+    const harness = refreshHarness([previous]);
+    harness.graph.listCopilotUsers.mockImplementation((...args) => client.listCopilotUsers(...args));
+
+    expect(await harness.value.refreshUsers(user, undefined, { publication })).toMatchObject({ status: "partial" });
+    expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+    expect(harness.usageStore.publishAppActivity).toHaveBeenCalledOnce();
+    const result = await harness.value.users(user);
+    expect(result.sources.directory).toMatchObject({ state: "partial", message: expect.stringContaining("invalid response") });
+    expect(result.users.map(value => value.directory)).toEqual([previous.identity]);
+    expect(result.counts.licensedUsers).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
   it("does not include report-only activity in paid-license counts or infer basic access from an unmatched identity", async () => {
     const result = await service({
       directory: [directoryUser("11111111-1111-4111-8111-111111111111", "paid@example.com")],
@@ -588,6 +621,104 @@ describe("CopilotUsageService", () => {
     expect(harness.usageStore.recordUserSourceFailure.mock.calls.some(call => call[1] === "directory")).toBe(false);
   });
 
+  it.each(["directory", "app_activity"] as const)("joins the other source before surfacing an unexpected %s failure", async failedSource => {
+    const harness = refreshHarness();
+    const pending = Promise.withResolvers<void>();
+    const failure = new Error("Source processing failed.");
+    const fail = vi.fn(async () => { throw failure; });
+    if (failedSource === "directory") {
+      harness.graph.listCopilotUsers.mockImplementationOnce(fail);
+      harness.graph.listAppActivity.mockImplementationOnce(async () => {
+        await pending.promise;
+        return { users: [], reportRefreshDate: null };
+      });
+    } else {
+      harness.graph.listAppActivity.mockImplementationOnce(fail);
+      harness.graph.listCopilotUsers.mockImplementationOnce(async () => {
+        await pending.promise;
+        return [];
+      });
+    }
+    let finished = false;
+    const refresh = harness.value.refreshUsers(user, undefined, { publication })
+      .catch(error => error).finally(() => { finished = true; });
+    try {
+      await vi.waitFor(() => expect(fail).toHaveBeenCalledOnce());
+      expect(finished).toBe(false);
+    } finally {
+      pending.resolve();
+      expect(await refresh).toBe(failure);
+    }
+    expect(failedSource === "directory" ? harness.usageStore.publishAppActivity : harness.usageStore.publishDirectory)
+      .toHaveBeenCalledOnce();
+  });
+
+  it.each(["revalidation", "capability", "token", "publication-revalidation", "publication-capability"] as const)(
+    "stops after cancellation during %s without acquiring another token or publishing", async boundary => {
+      const harness = refreshHarness([]);
+      const controller = new AbortController();
+      const failure = new Error("User collection cancelled.");
+      const cancel = () => controller.abort(failure);
+      if (boundary === "revalidation") harness.revalidateUser.mockImplementationOnce(async () => { cancel(); return user; });
+      if (boundary === "capability") harness.requireAvailable.mockImplementationOnce(async () => { cancel(); return { authorized: true }; });
+      if (boundary === "token") harness.delegatedToken.mockImplementationOnce(async () => { cancel(); return "late-token"; });
+      if (boundary === "publication-revalidation") harness.revalidateUser
+        .mockResolvedValueOnce(user).mockImplementationOnce(async () => { cancel(); return user; });
+      if (boundary === "publication-capability") harness.requireAvailable
+        .mockResolvedValueOnce({ authorized: true }).mockImplementationOnce(async () => { cancel(); return { authorized: true }; });
+
+      await expect(harness.value.refreshUsers(user, controller.signal, { publication, incompleteOnly: true })).rejects.toBe(failure);
+      expect(harness.delegatedToken).toHaveBeenCalledTimes(["revalidation", "capability"].includes(boundary) ? 0 : 1);
+      expect(harness.graph.listAppActivity).toHaveBeenCalledTimes(boundary.startsWith("publication-") ? 1 : 0);
+      expect(harness.requireAvailable).toHaveBeenCalledTimes(boundary === "revalidation" ? 0 : boundary === "publication-capability" ? 2 : 1);
+      expect(harness.usageStore.publishAppActivity).not.toHaveBeenCalled();
+      expect(harness.usageStore.recordUserSourceFailure).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each((["directory", "app_activity"] as const).flatMap(source =>
+    (["capability", "token", "provider", "publication-capability"] as const).map(boundary => ({ source, boundary })),
+  ))(
+    "fences a revoked session across $source $boundary even without an abort signal", async ({ source, boundary }) => {
+      const harness = refreshHarness(source === "app_activity" ? [] : undefined);
+      if (source === "directory") {
+        (await harness.usageStore.getUserSources()).appActivity = savedSource("app_activity", { users: [], reportRefreshDate: null });
+      }
+      let revocation: Promise<void> | undefined;
+      const revoke = () => { revocation = revokeAccountSessionMutations(user.tenantId!, user.homeAccountId, async () => undefined); };
+      if (boundary === "capability") harness.requireAvailable.mockImplementationOnce(async () => { revoke(); return { authorized: true }; });
+      if (boundary === "token") harness.delegatedToken.mockImplementationOnce(async () => { revoke(); return "late-token"; });
+      const changeSession = async () => {
+        revoke();
+        await revocation;
+        await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
+      };
+      if (boundary === "provider" && source === "app_activity") harness.graph.listAppActivity.mockImplementationOnce(async () => {
+        await changeSession();
+        return { users: [], reportRefreshDate: null };
+      });
+      if (boundary === "provider" && source === "directory") harness.graph.listCopilotUsers.mockImplementationOnce(async () => {
+        await changeSession();
+        return [];
+      });
+      if (boundary === "publication-capability") harness.requireAvailable
+        .mockResolvedValueOnce({ authorized: true }).mockImplementationOnce(async () => { revoke(); return { authorized: true }; });
+      try {
+        await expect(harness.value.refreshUsers(user, undefined, { publication, incompleteOnly: true }))
+          .rejects.toMatchObject({ status: 401 });
+        expect(harness.delegatedToken).toHaveBeenCalledTimes(boundary === "capability" ? 0 : 1);
+        expect(source === "directory" ? harness.graph.listCopilotUsers : harness.graph.listAppActivity)
+          .toHaveBeenCalledTimes(["capability", "token"].includes(boundary) ? 0 : 1);
+        expect(harness.usageStore.publishDirectory).not.toHaveBeenCalled();
+        expect(harness.usageStore.publishAppActivity).not.toHaveBeenCalled();
+        expect(harness.usageStore.recordUserSourceFailure).not.toHaveBeenCalled();
+      } finally {
+        await revocation;
+        await activateAccountSession(user.tenantId!, user.homeAccountId, async () => undefined);
+      }
+    },
+  );
+
   it("honors cancellation during an awaited progress callback before directory publication", async () => {
     const harness = refreshHarness();
     const controller = new AbortController();
@@ -747,6 +878,47 @@ describe("CopilotUsageService", () => {
     expect(result.unresolvedImportedIdentities).toEqual([
       expect.objectContaining({ normalizedUserPrincipalName: "duplicate@example.com", reason: "ambiguous_directory_match" }),
     ]);
+  });
+
+  it.each(["report", "directory"] as const)("does not join another alias of a %s-ambiguous identity", async ambiguity => {
+    const person = directoryUser("11111111-1111-4111-8111-111111111111", "person@example.com");
+    const duplicate = directoryUser("22222222-2222-4222-8222-222222222222", "PERSON@example.com");
+    const control = directoryUser("33333333-3333-4333-8333-333333333333", "control@example.com");
+    const directory = ambiguity === "directory" ? [person, duplicate, control] : [person, control];
+    const importedIdentities = [
+      person.identity.userPrincipalName,
+      ambiguity === "directory" ? duplicate.identity.objectId : duplicate.identity.userPrincipalName,
+      person.identity.objectId,
+      control.identity.userPrincipalName,
+    ];
+    const appIdentities = importedIdentities.map(identity => identity.toLowerCase());
+    for (const reverse of [false, true]) {
+      const result = await service({
+        directory: reverse ? [...directory].reverse() : directory,
+        report: {
+          users: (reverse ? [...appIdentities].reverse() : appIdentities).map(identity => appUser(identity, "2026-09-12")),
+          reportRefreshDate: "2026-09-13",
+        },
+        published: importedPublished(
+          (reverse ? [...importedIdentities].reverse() : importedIdentities).map(username => ({
+            username, displayName: username, numberOfAgentsUsed: 1, agentResponsesReceived: 9,
+          })),
+          [],
+        ),
+      }).users(user);
+
+      const conflicted = result.users.filter(row => row.directory.objectId !== control.identity.objectId);
+      expect(conflicted.every(row => row.importedUsage === null && row.appActivity === null)).toBe(true);
+      expect(conflicted.every(row => row.attention.includes("agent_usage_unknown") && row.attention.includes("app_activity_unknown"))).toBe(true);
+      expect(result.users.find(row => row.directory.objectId === control.identity.objectId)).toMatchObject({
+        importedUsage: { username: "control@example.com" },
+        appActivity: { lastActivityDate: "2026-09-12" },
+      });
+      expect(result.unresolvedImportedIdentities).toHaveLength(3);
+      expect(result.unresolvedImportedIdentities.every(row => row.reason === "ambiguous_directory_match")).toBe(true);
+      expect(result.counts.measuredActivityUsers).toBe(1);
+      expect(result.sources.appActivity.state).toBe("partial");
+    }
   });
 
   it("returns independent partial source states and preserves imports when directory permission is denied", async () => {
@@ -927,6 +1099,26 @@ describe("CopilotUsageService", () => {
     expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
     expect(harness.graph.listAppActivity).not.toHaveBeenCalled();
   });
+
+  it("preserves stale app-report labeling when the latest refresh failed", async () => {
+    const harness = refreshHarness([directoryUser("11111111-1111-4111-8111-111111111111", "saved@example.com")]);
+    const saved = await harness.usageStore.getUserSources();
+    const report = appUser("saved@example.com", "2026-07-01");
+    report.activity.reportRefreshDate = "2026-08-01";
+    saved.appActivity = {
+      ...savedSource("app_activity", { users: [report], reportRefreshDate: "2026-08-01" }),
+      attemptStatus: "failed",
+      message: "The latest app refresh failed.",
+    };
+    const result = await harness.value.users(user);
+    expect(result.sources.appActivity).toMatchObject({
+      state: "stale",
+      message: expect.stringContaining("The latest app refresh failed."),
+    });
+    expect(result.sources.appActivity.message).toContain("older than 3 days");
+    expect(result.users[0].attention).toContain("app_activity_unknown");
+    expect(result.counts.measuredActivityUsers).toBeNull();
+  });
 });
 
 function service(options: {
@@ -971,17 +1163,20 @@ function refreshHarness(directory?: CopilotDirectoryUser[]) {
     listCopilotUsers: vi.fn<CopilotUsageGraphClient["listCopilotUsers"]>().mockResolvedValue([]),
     listAppActivity: vi.fn<CopilotUsageGraphClient["listAppActivity"]>().mockResolvedValue({ users: [], reportRefreshDate: null }),
   };
+  const requireAvailable = vi.fn(async () => ({ authorized: true }));
+  const delegatedToken = vi.fn(async () => "directory-token");
+  const revalidateUser = vi.fn(async () => user);
   const value = new CopilotUsageService({} as pg.Pool, {
     graph: graph as unknown as CopilotUsageGraphClient,
     usageStore,
     now: () => now,
-    requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
-    delegatedToken: vi.fn(async () => "directory-token") as never,
-    revalidateUser: vi.fn(async () => user),
+    requireAvailable: requireAvailable as never,
+    delegatedToken: delegatedToken as never,
+    revalidateUser,
     requireProviderAdmissions: vi.fn(),
     loadPublished: vi.fn(async () => emptyPublished()),
   });
-  return { value, usageStore, graph };
+  return { value, usageStore, graph, requireAvailable, delegatedToken, revalidateUser };
 }
 
 function memoryUsageStore(

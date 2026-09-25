@@ -81,7 +81,7 @@ Users may narrow a preset with exact UTC start/end times, user principal names, 
 | Ambiguous-create reconciliation | 3 attempts; at most 5 query-list pages per attempt |
 | One physical provider attempt | 10 seconds; 2,000,000 response bytes |
 | One logical provider request | At most 3 attempts and 30 seconds total for throttling/server/network failures |
-| One activation | 60 seconds; 6 single-query GETs total, including the initial resume or qualification GET; subsequent polls use 1-3 second jitter |
+| One activation | 60 seconds; 6 single-query GETs total, including the initial resume or lifecycle-verification GET; subsequent polls use 1-3 second jitter |
 | Final publication authorization | Separate 10-second bound; still aborted by cancellation/logout; no further Audit Search requests |
 | Record retrieval | 20 pages; 5,000 stored rows; 8,000,000 aggregate bytes |
 | Durable execution deadline | 48 hours |
@@ -89,7 +89,9 @@ Users may narrow a preset with exact UTC start/end times, user principal names, 
 
 Reaching a page, row, byte or time boundary publishes only minimized rows already observed and marks the job `partial`, provided current publication authorization succeeds. Activation timeout uses `audit_activation_timeout`; the separate final authorization allowance does not extend provider execution. The UI reports the requested range as unobserved rather than claiming complete coverage. A provider failure, unsupported schema or deadline never fabricates an empty successful result.
 
-An exact row or byte boundary reports `audit_row_limit` or `audit_byte_limit` when a continuation remains; a fully consumed final page remains complete even at the boundary. Durable request-admission and response-recording callbacks share the attempt deadline. Unexpected local bookkeeping failures are not retried as network errors or published as partial provider results. Rejected and redirected response bodies are cancelled before returning or retrying.
+If final publication authorization times out, the job returns to `waiting_authorization` without publishing records or provider-failure evidence. Explicit resume continues from the saved provider query ID, subject to the durable execution limits. Delegated searches and approved qualifications always verify the single-query GET before publishing lifecycle evidence, even when create or reconciliation already reports success.
+
+An exact row or byte boundary reports `audit_row_limit` or `audit_byte_limit` when a continuation remains; a fully consumed final page remains complete even at the boundary. Durable request-admission and response-recording callbacks share the attempt deadline. Unexpected local bookkeeping failures, including callback timeouts, stop with `internal_error`; they are not retried as network errors or published as partial provider results. A record-body attempt timeout is `provider_error`, not `audit_activation_timeout`; only expiry of the enclosing activation uses the latter category. Query responses recheck cancellation and attempt deadlines after JSON consumption, before accepting a returned query or page. An interrupted create remains `audit_create_inconclusive` and requires reconciliation, never an automatic second POST. Rejected and redirected response bodies are cancelled before returning or retrying, without waiting for cleanup that could stall indefinitely or replace the authoritative response status.
 
 ## Stored Data And Identity
 
@@ -99,6 +101,8 @@ Agent Control discards provider response bodies after validation. It stores only
 
 Cross-source association uses only exact `BotId` plus environment against the initiating principal's current private Power Platform snapshot. An Agent ID alone, a package ID, app ID, name, owner or timestamp cannot establish that relation. Missing, unmatched and multiply matched records remain unresolved or ambiguous and stay separately usable.
 
+Identity reads reselect the authorized snapshots after loading and verifying candidates, and check expiry again before returning them. Replacement, withdrawal, newly selected resource types or expiry during the read returns `snapshot_invalidated` rather than a stale exact association; retry against refreshed inventory.
+
 Authorized record views and CSV exports append content-free local audit events with the job ID, source and resulting count. Result bodies are never copied into local administrative audit. CSV export applies the same principal-private or current configured application-shared result scope as retrieval, caps at 5,000 records and neutralizes spreadsheet formula prefixes.
 
 ## Recovery, Cancellation And Retention
@@ -106,6 +110,8 @@ Authorized record views and CSV exports append content-free local audit events w
 Submission returns promptly after persisting the code-owned `agent-control-audit:{jobId}` marker. A timeout or connection loss during create records an unknown outcome and reconciles by exact marker and filters; it never issues a second POST. Only a complete bounded listing can establish a unique reconciliation match. Create and poll responses must match the durable marker and filters, and polling must also return the stored provider ID. Provider query ID is stored before polling, and the latest allowlisted provider request ID is retained separately from the local request ID. Execution owner/version fences reject stale writes after recovery, cancellation or replacement.
 
 Shutdown and startup perform no Graph work. Interrupted `running` or `reconciling_create` jobs return to `waiting_authorization`, including reservations that finish committing after cancellation; explicit resume revalidates current identity, role, capability and token before exactly one bounded continuation. Active reservations are shared only by requests for the same job UUID, tenant, principal and token mode; rejected starts cannot displace another worker. Jobs with a provider ID poll that ID. Jobs with only an attempted marker reconcile. Terminal provider failures remain terminal even on the last allowed poll; qualification create and reconciliation failures stop before the otherwise mandatory lifecycle GET. Completed and inconclusive work does not replay.
+
+Capability-evidence publication is fenced by the validated account session, cancellation and provider admissions. Shutdown joins already-started evidence writes; it neither starts evidence writes after cancellation nor abandons in-flight persistence.
 
 Cancel stops local polling/download and records that Microsoft Graph may continue the remote query. Delete removes only a non-running local job and its cached rows. A rejected cancel or delete does not interrupt the active worker. The selected Microsoft contract exposes no remote cancel or delete operation, so the product never claims either action changes the provider query or source events. Failed and inconclusive local jobs report possible remote continuation from the attempted request and last provider status, not from the local failure category.
 

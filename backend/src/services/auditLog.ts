@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import { pool } from "../db/pool.js";
 import type { AuditEvent, CompleteAuditEvent, ListAuditEventsQuery, StartAuditEvent } from "../types/audit.js";
-import { isAuditOperationPrefix } from "../types/audit.js";
+import { auditDefaultPageSize, auditMaximumOffset, isAuditOperationPrefix } from "../types/audit.js";
 import { AppError } from "../errors.js";
 
 export type DataScope = { tenantId: string; principalId: string };
@@ -64,7 +64,7 @@ export class AuditLog {
       ...current, ...update,
       completedAt: update.completedAt ?? new Date().toISOString(),
       message: update.message?.slice(0, 4096), errorCode: update.errorCode?.slice(0, 256),
-      metadata: update.metadata ? auditMetadata(update.metadata) : current.metadata,
+      metadata: update.metadata ? { ...current.metadata, ...auditMetadata(update.metadata) } : current.metadata,
     };
     await this.append(record);
     return record;
@@ -82,7 +82,9 @@ export class AuditLog {
   }
 
   async getEvent(id: string) {
-    const result = await this.database.query("SELECT * FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND event_id=$3", [this.scope.tenantId, this.scope.principalId, id]);
+    const result = await this.database.query(`SELECT * FROM audit_projection
+      WHERE tenant_id=$1 AND principal_id=$2 AND event_id=$3
+        AND observed_at>clock_timestamp()-interval '90 days'`, [this.scope.tenantId, this.scope.principalId, id]);
     return result.rows[0] ? toEvent(result.rows[0]) : undefined;
   }
 
@@ -95,7 +97,7 @@ export class AuditLog {
   }
 
   private filter(query: ListAuditEventsQuery) {
-    const clauses = ["tenant_id=$1", "principal_id=$2"];
+    const clauses = ["tenant_id=$1", "principal_id=$2", "observed_at>clock_timestamp()-interval '90 days'"];
     const values: unknown[] = [this.scope.tenantId, this.scope.principalId];
     for (const [key, column] of Object.entries({ agentId: "agent_id", actorUsername: "actor_username", scope: "scope", action: "action", status: "status" })) {
       const value = query[key as keyof ListAuditEventsQuery];
@@ -103,7 +105,7 @@ export class AuditLog {
     }
     if (query.operationIdPrefix) {
       values.push(escapeLike(query.operationIdPrefix) + "%");
-      clauses.push(`operation_id LIKE $${values.length} ESCAPE '\\'`);
+      clauses.push(`operation_id ILIKE $${values.length} ESCAPE '\\'`);
     }
     if (query.search) {
       values.push(`%${escapeLike(query.search)}%`);
@@ -114,8 +116,11 @@ export class AuditLog {
 
   async listEvents(query: ListAuditEventsQuery = {}) {
     const filter = this.filter(query);
-    const limit = Math.min(Math.max(Math.trunc(query.limit ?? 100), 1), 5000);
-    const offset = Math.min(Math.max(Math.trunc(query.offset ?? 0), 0), 100_000);
+    const limit = Math.min(Math.max(Math.trunc(query.limit ?? auditDefaultPageSize), 1), 5000);
+    const offset = query.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > auditMaximumOffset) {
+      throw new AppError(400, "invalid_audit_offset", "Audit offset is invalid.");
+    }
     const result = await this.database.query(`SELECT * FROM audit_projection WHERE ${filter.sql}
       ORDER BY started_at DESC,event_id DESC LIMIT $${filter.values.length + 1} OFFSET $${filter.values.length + 2}`, [...filter.values, limit, offset]);
     return result.rows.map(toEvent);
@@ -135,6 +140,7 @@ export class AuditLog {
     if (!ids.length) return [];
     const result = await this.database.query<{ agent_id: string }>(`SELECT DISTINCT agent_id COLLATE "C" AS agent_id FROM audit_events
       WHERE tenant_id=$1 AND principal_id=$2 AND scope='bulk'
+        AND observed_at>clock_timestamp()-interval '90 days'
         AND operation_id ILIKE $3 ESCAPE '\\' AND agent_id=ANY($4::text[])
       ORDER BY agent_id`,
     [this.scope.tenantId, this.scope.principalId, `${escapeLike(prefix)}%`, [...ids]]);

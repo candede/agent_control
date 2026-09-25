@@ -201,7 +201,7 @@ function requireTenant(user: AuthenticatedUser) {
 
 function approvalId(value: string) {
   if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value)) throw new AppError(400, "invalid_qualification_id", "Quarantine canary approval ID is invalid.");
-  return value;
+  return value.toLowerCase();
 }
 
 function safeErrorCode(value: string | undefined) {
@@ -209,5 +209,6 @@ function safeErrorCode(value: string | undefined) {
 }
 
 function isUtcDateTime(value: string) {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$/.test(value) && !Number.isNaN(Date.parse(value));
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$/.test(value) && !Number.isNaN(Date.parse(value))
+    && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19);
 }

@@ -135,7 +135,9 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
                   ? <span title={operation.whenCanBeUsed}>{formatPackageFacetLabel(operation.whenCanBeUsed)}</span> : "Not reported" },
                 { label: "Operation configured by (ID)", value: operation.createdBy ?? "Not reported" },
               ]} />
-            </li>)}</ul> : <span>{connector.operations ? "No operations reported in the supplied list." : "Operation details not supplied."}</span>}
+            </li>)}</ul> : <span>{connector.operations
+              ? partialConnectors ? "No operation details retained in this partial observation." : "No operations reported in the supplied list."
+              : "Operation details not supplied."}</span>}
           </li>)}
         </ul>
         {connectors.length > connectorPageSize ? <div className="agent-insight-pagination" aria-label="Connector detail pages">

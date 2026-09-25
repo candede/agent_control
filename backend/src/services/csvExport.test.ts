@@ -1,9 +1,15 @@
 import { EventEmitter } from "node:events";
 import type { Request, Response } from "express";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseCsv } from "csv-parse/sync";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
-import { buildBoundedCsv, csvValue, publishBoundedCsv } from "./csvExport.js";
+import { buildBoundedCsv, createExportPublicationValidator, csvValue, publishBoundedCsv } from "./csvExport.js";
+
+const storedSession = vi.hoisted(() => ({ query: vi.fn() }));
+vi.mock("../db/pool.js", () => ({ pool: storedSession, secretValue: () => undefined }));
+
+beforeEach(() => storedSession.query.mockReset().mockResolvedValue({ rowCount: 1, rows: [{}] }));
 
 class FakeResponse extends EventEmitter {
   headers = new Map<string, string>();
@@ -67,6 +73,35 @@ describe("bounded CSV publication", () => {
     expect(() => buildBoundedCsv(["id"], [{ id: "1" }], {
       maximumRows: 1, maximumBytes: 1_000, deadlineAt: Date.now() - 1,
     })).toThrowError(expect.objectContaining({ code: "export_deadline" }));
+  });
+
+  it.each(["byte", "deadline"] as const)("stops formatting later cells after exceeding the %s budget", budget => {
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const laterCell = vi.fn(() => "must not be formatted");
+    try {
+      expect(() => buildBoundedCsv(["first", "later"], [{
+        get first() {
+          if (budget === "deadline") now = deadlineAt;
+          return "x".repeat(100);
+        },
+        get later() { return laterCell(); },
+      }], { maximumRows: 1, maximumBytes: budget === "byte" ? 100 : 1_000, deadlineAt }))
+        .toThrowError(expect.objectContaining({ code: `export_${budget === "byte" ? "byte_limit" : "deadline"}` }));
+      expect(laterCell).not.toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("counts UTF-8, escaped quotes, formula prefixes and delimiters at the exact byte boundary", () => {
+    const buffer = Buffer.from('\uFEFFfirst,later\r\n"\'=é""","😀"\r\n', "utf8");
+    const rows = [{ first: '=é"', later: "😀" }];
+    const budget = { maximumRows: 1, maximumBytes: buffer.byteLength, deadlineAt: Date.now() + 10_000 };
+    expect(buildBoundedCsv(["first", "later"], rows, budget)).toEqual({ buffer, rowCount: 1, byteCount: buffer.byteLength });
+    expect(() => buildBoundedCsv(["first", "later"], rows, { ...budget, maximumBytes: buffer.byteLength - 1 }))
+      .toThrowError(expect.objectContaining({ code: "export_byte_limit" }));
   });
 
   it.each(["row generation", "cell formatting", "iterator completion"])(
@@ -278,5 +313,102 @@ describe("bounded CSV publication", () => {
     expect(response.listenerCount("finish")).toBe(0);
     expect(response.listenerCount("close")).toBe(0);
     expect(request.listenerCount("aborted")).toBe(0);
+  });
+});
+
+describe("export session publication fence", () => {
+  let sequence = 0;
+  function authorizedTransport() {
+    const { request, response } = transport();
+    const accountId = `csv-principal-${++sequence}`;
+    Object.assign(request, {
+      sessionID: `session-${accountId}`,
+      session: { accountId, user: { tenantId: "csv-tenant", homeAccountId: accountId,
+        roles: ["AgentControl.Admin"], username: "reader@example.invalid", displayName: "Reader" } },
+    });
+    return { request, response };
+  }
+
+  it.each(["logout", "superseding login", "role removal", "session destruction", "session replacement"] as const)(
+    "rejects %s during an in-flight stored-session read",
+    async change => {
+      const { request, response } = authorizedTransport();
+      const readStarted = Promise.withResolvers<void>();
+      const readFinished = Promise.withResolvers<{ rowCount: number; rows: object[] }>();
+      storedSession.query.mockResolvedValueOnce({ rowCount: 1, rows: [{}] }).mockImplementationOnce(() => {
+        readStarted.resolve();
+        return readFinished.promise;
+      });
+      const validate = createExportPublicationValidator(request, "AgentControl.Viewer");
+      const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.from("private\r\n"), {
+        deadlineAt: Date.now() + 10_000, validate,
+      });
+      const rejected = expect(publication).rejects.toMatchObject({ code: "unauthorized" });
+      await readStarted.promise;
+      let mutation: Promise<unknown> | undefined;
+      if (change === "logout") {
+        mutation = revokeAccountSessionMutations("csv-tenant", request.session.accountId!, async () => undefined);
+      } else if (change === "superseding login") {
+        mutation = activateAccountSession("csv-tenant", request.session.accountId!, async () => undefined);
+      } else if (change === "role removal") {
+        request.session.user!.roles = [];
+      } else if (change === "session destruction") {
+        Reflect.deleteProperty(request, "session");
+      } else {
+        request.sessionID = "replacement-session";
+      }
+      readFinished.resolve({ rowCount: 1, rows: [{}] });
+      await mutation;
+      await rejected;
+      expect(response.writes).toHaveLength(0);
+      expect(response.headers.size).toBe(0);
+    },
+  );
+
+  it.each(["first chunk", "between chunks", "after audit"] as const)(
+    "rejects logout during the %s source fence without blocking logout on that read", async phase => {
+      const { request, response } = authorizedTransport();
+      const sourceStarted = Promise.withResolvers<void>();
+      const sourceFinished = Promise.withResolvers<void>();
+      const beforeEnd = phase === "after audit" ? vi.fn(async () => undefined) : undefined;
+      const pendingCheck = phase === "first chunk" ? 2 : 3;
+      let checks = 0;
+      const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+      const validate = () => validateSession(async () => {
+        if (++checks !== pendingCheck) return;
+        sourceStarted.resolve();
+        await sourceFinished.promise;
+      });
+      const publication = publishBoundedCsv(request, response as unknown as Response, "safe.csv", Buffer.alloc(phase === "between chunks" ? 2_048 : 512), {
+        deadlineAt: Date.now() + 10_000, validate, beforeEnd, chunkBytes: 1_024,
+      });
+      const rejected = expect(publication).rejects.toMatchObject({ code: "unauthorized" });
+      await Promise.race([sourceStarted.promise, publication]);
+      await revokeAccountSessionMutations("csv-tenant", request.session.accountId!, async () => undefined);
+      sourceFinished.resolve();
+      await rejected;
+      expect(checks).toBe(pendingCheck);
+      expect(response.writes).toHaveLength(phase === "between chunks" ? 1 : 0);
+      expect(response.headers.size).toBe(phase === "between chunks" ? 4 : 0);
+      expect(response.writableEnded).toBe(false);
+      if (beforeEnd) expect(beforeEnd).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("accepts inherited Viewer access but propagates absent stored sessions and invalid sources", async () => {
+    const { request } = authorizedTransport();
+    const validateSource = vi.fn(async () => undefined);
+    const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+    const validate = () => validateSession(validateSource);
+    await validate();
+    expect(storedSession.query).toHaveBeenCalledWith(expect.any(String), [
+      request.sessionID, "csv-tenant", request.session.accountId, "AgentControl.Viewer",
+    ]);
+    expect(validateSource).toHaveBeenCalledOnce();
+    validateSource.mockRejectedValueOnce(new AppError(409, "dataset_invalidated", "Source expired."));
+    await expect(validate()).rejects.toMatchObject({ code: "dataset_invalidated" });
+    storedSession.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    await expect(validate()).rejects.toMatchObject({ code: "unauthorized" });
+    expect(validateSource).toHaveBeenCalledTimes(2);
   });
 });

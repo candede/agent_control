@@ -49,10 +49,6 @@ type BundleRow = {
   created_at: Date;
   expires_at: Date | null;
   active_set_id: string | null;
-  observation_count: number;
-  row_count: string;
-  unique_payload_count: string;
-  kinds: OfficialUsageReportKind[];
 };
 
 type ObservationRow = {
@@ -87,31 +83,14 @@ export class OfficialUsageHistoryService {
     return transaction(this.database, async client => {
       await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
       const summary = (await client.query<SummaryRow>(historySummarySql, [tenantId])).rows[0];
-      const count = (await client.query<{ count: number }>(`SELECT count(*)::int AS count
-        FROM official_usage_sets report_set
-        WHERE report_set.tenant_id=$1 AND report_set.complete AND report_set.deleted_at IS NULL
-          AND ${retainedSetIntegritySql}`, [tenantId])).rows[0].count;
       const bundles = await client.query<BundleRow>(`SELECT report_set.id,report_set.bundle_id,report_set.content_hash,
           report_set.reporting_start,report_set.reporting_end,report_set.period_provenance,
           report_set.supersedes_set_id,report_set.complete,report_set.accepted_at,report_set.deleted_at,
-          report_set.created_at,report_set.expires_at,state.active_set_id,
-          count(DISTINCT membership.version_id)::int AS observation_count,
-          count(row.ordinal)::text AS row_count,
-          count(DISTINCT (row.kind,row.payload_hash))
-            FILTER (WHERE row.ordinal IS NOT NULL)::text AS unique_payload_count,
-          coalesce(array_agg(DISTINCT membership.kind ORDER BY membership.kind)
-            FILTER (WHERE membership.kind IS NOT NULL),'{}') AS kinds
+          report_set.created_at,report_set.expires_at,state.active_set_id
         FROM official_usage_sets report_set
         LEFT JOIN official_usage_state state ON state.tenant_id=report_set.tenant_id
-        LEFT JOIN official_usage_set_versions membership
-          ON membership.set_id=report_set.id AND membership.tenant_id=report_set.tenant_id
-        LEFT JOIN official_usage_versions version
-          ON version.id=membership.version_id AND version.deleted_at IS NULL
-        LEFT JOIN official_usage_version_rows row
-          ON row.version_id=version.id AND row.tenant_id=version.tenant_id AND row.kind=version.kind
         WHERE report_set.tenant_id=$1 AND report_set.complete AND report_set.deleted_at IS NULL
           AND ${retainedSetIntegritySql}
-        GROUP BY report_set.id,state.active_set_id
         ORDER BY report_set.accepted_at DESC,report_set.id DESC
         LIMIT $2 OFFSET $3`, [tenantId, limit, offset]);
       const setIds = bundles.rows.map(row => row.id);
@@ -145,7 +124,7 @@ export class OfficialUsageHistoryService {
         summary: projectSummary(summary),
         bundles: {
           value: bundles.rows.map(row => projectBundle(row, observationsBySet.get(row.id) ?? [])),
-          count,
+          count: summary.import_count,
           limit,
           offset,
         },
@@ -264,8 +243,10 @@ function projectSummary(row: SummaryRow): OfficialUsageHistoryView["summary"] {
 }
 
 function projectBundle(row: BundleRow, versions: ObservationRow[]): OfficialUsageHistoryBundleSummary {
-  const rowCount = Number(row.row_count);
-  const uniquePayloadCount = Number(row.unique_payload_count);
+  const observations = versions.map(projectObservation);
+  const rowCount = observations.reduce((count, observation) => count + observation.rowCount, 0);
+  // Payload identities are kind-scoped, and a retained set has one observation per kind.
+  const uniquePayloadCount = observations.reduce((count, observation) => count + observation.uniquePayloadCount, 0);
   return {
     id: row.id,
     bundleId: row.bundle_id,
@@ -277,20 +258,20 @@ function projectBundle(row: BundleRow, versions: ObservationRow[]): OfficialUsag
     },
     supersedesSetId: row.supersedes_set_id,
     complete: row.complete,
-    kinds: row.kinds,
+    kinds: observations.map(observation => observation.kind),
     acceptedAt: row.accepted_at?.toISOString() ?? null,
     deletedAt: row.deleted_at?.toISOString() ?? null,
     createdAt: row.created_at.toISOString(),
     expiresAt: row.expires_at?.toISOString() ?? null,
     isActive: row.active_set_id === row.id,
-    observationCount: row.observation_count,
+    observationCount: observations.length,
     rowCount,
     uniquePayloadCount,
     repeatedRowsReused: rowCount - uniquePayloadCount,
     reportingWindowKnown: row.period_provenance !== "activity_range" &&
       row.reporting_start !== null && row.reporting_end !== null,
     activityRangeIsCoverage: false,
-    observations: versions.map(projectObservation),
+    observations,
   };
 }
 

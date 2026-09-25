@@ -93,6 +93,29 @@ describe("purposeful saved agent context", () => {
     expect(screen.queryByText(/0 saved connector details/)).not.toBeInTheDocument();
   });
 
+  it.each([
+    { connectorDetailsStatus: "partial" as const },
+    { capabilityDetailsTruncated: true },
+  ])("does not present zero retained operations as a confirmed empty provider list: %j", partial => {
+    render(<AgentOverview record={{ ...record, powerPlatformResource: { ...resource, details: {
+      ...partial, connectors: [{ connectorId: "shared_test", operations: [] }],
+    } } }} peopleState={peopleState} />);
+    const connectors = screen.getByRole("list", { name: "Configured connector details" });
+    expect(within(connectors).getByText("No operation details retained in this partial observation.")).toBeVisible();
+    expect(within(connectors).queryByText("No operations reported in the supplied list.")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { connectorDetailsStatus: "complete" as const, operations: [], expected: "No operations reported in the supplied list." },
+    { connectorDetailsStatus: "partial" as const, operations: undefined, expected: "Operation details not supplied." },
+  ])("distinguishes supplied empty operation lists from missing details: $connectorDetailsStatus", ({ connectorDetailsStatus, operations, expected }) => {
+    render(<AgentOverview record={{ ...record, powerPlatformResource: { ...resource, details: {
+      connectorDetailsStatus, connectors: [{ connectorId: "shared_test", operations }],
+    } } }} peopleState={peopleState} />);
+    const connectors = screen.getByRole("list", { name: "Configured connector details" });
+    expect(within(connectors).getByText(expected)).toBeVisible();
+  });
+
   it("uses the exact environment's own observation and preserves false managed state", () => {
     render(<AgentOverview record={{ ...record, environment }} peopleState={peopleState} />);
     expect(field("Environment name")).toHaveTextContent("Finance production");

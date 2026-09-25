@@ -3,6 +3,7 @@ import { createApp } from "./app.js";
 import { PackageMutationQualificationRepository } from "./db/packageMutationQualifications.js";
 import { CopilotStudioQuarantineCanaryRepository } from "./db/copilotStudioQuarantineCanaries.js";
 import { pool } from "./db/pool.js";
+import { errorTelemetry } from "./errors.js";
 import { bulkJobs, drainBulkJobs } from "./services/bulkJobs.js";
 import { copilotStudioQuarantineJobs, drainCopilotStudioQuarantineJobs } from "./services/copilotStudioQuarantineJobs.js";
 import { enterMaintenance } from "./services/maintenance.js";
@@ -34,19 +35,35 @@ const server = app.listen(config.port, "0.0.0.0", () => {
 const poolObservation = setInterval(() => observeDatabasePool(pool.waitingCount), 30_000);
 poolObservation.unref();
 
+let shutdownStarted = false;
 async function shutdown() {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
   enterMaintenance();
   clearInterval(poolObservation);
-  server.close();
-  const deadline = setTimeout(() => process.exit(1), 125_000);
-  deadline.unref();
-  const syncDrained = await Promise.allSettled([dataSync.drain()]);
-  const drained = [...syncDrained, ...await Promise.allSettled([drainBulkJobs(), drainCopilotStudioQuarantineJobs(), packageInventory.drain(), powerPlatformInventory.drain(), purviewAudit.drain(), defenderHunting.drain()])];
-  const failure = drained.find(result => result.status === "rejected");
-  if (failure?.status === "rejected") throw failure.reason;
-  store.close();
-  await pool.end();
-  clearTimeout(deadline);
+  // Keep the deadline referenced: an unresolved cleanup promise must not exit successfully.
+  const deadline = setTimeout(() => {
+    operationalLog("error", "shutdown_timeout");
+    process.exit(1);
+  }, 125_000);
+  try {
+    const httpDrained = Promise.allSettled([new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+    })]);
+    const syncDrained = await Promise.allSettled([dataSync.drain()]);
+    const workersDrained = await Promise.allSettled([
+      drainBulkJobs(), drainCopilotStudioQuarantineJobs(), packageInventory.drain(),
+      powerPlatformInventory.drain(), purviewAudit.drain(), defenderHunting.drain(),
+    ]);
+    const failure = [...syncDrained, ...workersDrained, ...await httpDrained].find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    store.close();
+    await pool.end();
+    clearTimeout(deadline);
+  } catch (error) {
+    operationalLog("error", "shutdown_failed", errorTelemetry(error, "shutdown_failed"));
+    process.exit(1);
+  }
 }
 process.once("SIGTERM", () => void shutdown());
 process.once("SIGINT", () => void shutdown());

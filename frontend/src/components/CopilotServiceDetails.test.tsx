@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { copilotUsageFixture } from "../test/copilotUsageFixture";
 import { CopilotServiceDetails } from "./CopilotServiceDetails";
+import { resolveCopilotServicePlan } from "../../../backend/src/services/copilotServicePlans";
 
 describe("paid-feature evidence details", () => {
   it("recognizes verified disabled users with no assigned paid services", () => {
@@ -29,5 +30,16 @@ describe("paid-feature evidence details", () => {
     render(<CopilotServiceDetails servicePlans={[plan]} copilotServiceState="disabled" current />);
     expect(screen.getByRole("list", { name: "Paid feature states" })).toHaveTextContent("Not enabled");
     expect(screen.queryByText(/No paid Copilot services are assigned/)).not.toBeInTheDocument();
+  });
+
+  it("renders normalized assignment evidence without changing the effective paid-feature state", () => {
+    const servicePlanId = copilotUsageFixture.users[0].servicePlans[0].servicePlanId;
+    const plan = resolveCopilotServicePlan(servicePlanId, false, [{
+      servicePlanId, assignedDateTime: "2026-01-01T01:00:00+01:00", capabilityStatus: "Enabled",
+    }]);
+    render(<CopilotServiceDetails servicePlans={[plan]} copilotServiceState="disabled" current />);
+    expect(screen.getByRole("list", { name: "Paid feature states" })).toHaveTextContent("Not enabled");
+    expect(screen.getByText(/Raw capability status:/)).toHaveTextContent("Enabled");
+    expect(screen.getByText(/Assigned at:/)).toHaveTextContent("2026-01-01T00:00:00.000Z");
   });
 });

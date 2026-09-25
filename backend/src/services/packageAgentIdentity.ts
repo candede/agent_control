@@ -249,6 +249,7 @@ function linkCustomEngineRepresentations(
   ]));
   const groups = new Map<string, Array<{ packageId: string; elementIds: string[] }>>();
   for (const value of packages) {
+    if (value.identityRevalidationRequired || value.detailFreshness && value.detailFreshness.state !== "fresh") continue;
     const bot = readPackageCustomEngineBotIdentity(value);
     if (!bot) continue;
     const group = groups.get(bot.botApplicationId) ?? [];

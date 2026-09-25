@@ -546,7 +546,7 @@ export class PackageInventoryRepository {
       || !Number.isSafeInteger(row.page_count) || row.page_count < 1 || row.page_count > 100)) {
       throw packageVerificationFailed();
     }
-    const packages = new Map(base.rows.map(row => [row.package_data.id, projectPackageDetails(row.package_data, undefined)]));
+    const packages = new Map(base.rows.map(row => [row.package_data.id, row.package_data]));
     const readStarted = new Map<string, Date>();
     const observations = new Map<string, UnifiedPackageSourceResult["observations"][string]>(base.rows.map(row => [row.package_data.id, {
       snapshotId: snapshot.id,
@@ -563,7 +563,7 @@ export class PackageInventoryRepository {
       );
       if (overlay.package_data && overlayIsNewer) {
         readStarted.set(overlay.native_id, overlay.read_started_at);
-        packages.set(overlay.native_id, projectPackageDetails(overlay.package_data, undefined));
+        packages.set(overlay.native_id, overlay.package_data);
         observations.set(overlay.native_id, {
           snapshotId: overlay.snapshot_id,
           scopeKind: "exact",
@@ -576,16 +576,17 @@ export class PackageInventoryRepository {
         observations.delete(overlay.native_id);
       }
     }
-    for (const detail of details.rows) {
-      const current = packages.get(detail.native_id);
-      const observation = observations.get(detail.native_id);
-      if (!current || !observation) continue;
-      const value = projectPackageDetails(current, detail.observed_at && detail.expires_at ? {
+    const detailsByTarget = new Map(details.rows.map(detail => [detail.native_id, detail]));
+    for (const [id, current] of packages) {
+      const detail = detailsByTarget.get(id);
+      const observation = observations.get(id)!;
+      const value = projectPackageDetails(current, detail?.observed_at && detail.expires_at ? {
         package: detail.package_data, observedAt: detail.observed_at.toISOString(), expiresAt: detail.expires_at.toISOString(),
-      } : undefined, detail.snapshot_id === observation.snapshotId && (observation.scopeKind === "exact" || !snapshot.catalog_only));
-      packages.set(detail.native_id, value);
+      } : undefined, detail?.snapshot_id === observation.snapshotId && (observation.scopeKind === "exact" || !snapshot.catalog_only),
+      Date.now(), (readStarted.get(id) ?? snapshot.read_started_at).getTime());
+      packages.set(id, value);
       delete observation.identityDetails;
-      if (value.detailFreshness?.state === "fresh" && value.elementDetails?.length && detail.observed_at && detail.expires_at) observation.identityDetails = {
+      if (value.detailFreshness?.state === "fresh" && value.elementDetails?.length && detail?.observed_at && detail.expires_at) observation.identityDetails = {
           snapshotId: detail.snapshot_id,
           observedAt: detail.observed_at.toISOString(),
           expiresAt: detail.expires_at.toISOString(),
@@ -764,19 +765,21 @@ function savedIdentityJoin(nativeId: string, tokenMode: string, tenant: string, 
   ) identity_detail ON true`;
 }
 
-function withSavedIdentity(row: Omit<PackageProjectionRow, "read_started_at">) {
+function withSavedIdentity(row: Omit<PackageProjectionRow, "read_started_at"> & { read_started_at: Date | null }) {
   if (!row.package_data) return null;
   return projectPackageDetails(row.package_data, row.identity_observed_at && row.identity_expires_at ? {
     package: row.identity_data,
     observedAt: row.identity_observed_at.toISOString(),
     expiresAt: row.identity_expires_at.toISOString(),
-  } : undefined, !row.catalog_only && Boolean(row.id && row.id === row.identity_snapshot_id));
+  } : undefined, !row.catalog_only && Boolean(row.id && row.id === row.identity_snapshot_id),
+  Date.now(), row.read_started_at?.getTime());
 }
 
 function applyPackageControls(value: CopilotPackageDetail | null, readStartedAt: Date | undefined, controls: readonly SavedPackageControl[]) {
   const applicable = controls.filter(control => (!value || control.detail.id === value.id)
     && (!readStartedAt || Date.parse(control.observation.observedAt) >= readStartedAt.getTime()));
-  let result = value ?? applicable.at(-1)?.detail ?? null;
+  const fallback = applicable.at(-1)?.detail;
+  let result = value ?? (fallback ? projectPackageDetails(fallback, undefined) : null);
   if (!result) return null;
   for (const control of applicable) {
     result = projectPackageControl(result, control);
@@ -924,6 +927,7 @@ function listFilters(snapshotId: string, scope: PackageDataScope, query: Package
     if (!query.auditPrincipalId) throw new AppError(403, "audit_scope_required", "An authorized audit source is required for operation reference filters.");
     values.push(query.auditPrincipalId, `${escapeLike(query.operationIdPrefix)}%`);
     conditions.push(`EXISTS (SELECT 1 FROM audit_events audit WHERE audit.tenant_id=$2 AND audit.principal_id=$${values.length - 1}
+      AND audit.observed_at>clock_timestamp()-interval '90 days'
       AND audit.agent_id=scoped.native_id AND audit.scope='bulk' AND audit.operation_id ILIKE $${values.length} ESCAPE '\\')`);
   }
   if (query.ids) {

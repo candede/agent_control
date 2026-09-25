@@ -128,6 +128,8 @@ export class AgentUsageService {
           changed = true;
         }
         const updated = changed ? await this.repository.read(scope, client) : snapshot;
+        // An expiry-aware reread can drop the report and its expiry while the write is in flight.
+        if (updated.published.activeSet?.id !== input.reportSetId) throw usageChanged();
         const resultingContext = buildAgentUsageContext(scope, updated);
         // The success receipt and association commit together. A failed audit rolls the mutation back.
         await new AuditLog(scope, client).completeEvent(event.id, {

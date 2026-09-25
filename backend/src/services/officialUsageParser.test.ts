@@ -109,20 +109,25 @@ describe("parseOfficialUsageReport", () => {
     expect(report.rows[0]).toMatchObject({ agentName: 'Research, "North"\nassistant' });
   });
 
-  it.each(["\n", "\r", "\r\n"])("rejects embedded line breaks in agent IDs (%j) before staging unreachable identities", newline => {
+  it.each(["\t", "\n", "\r", "\r\n"])("rejects embedded control characters in agent IDs (%j) before staging unassociatable identities", control => {
     for (const csv of [
       [
         "Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)",
-        `"agent${newline}1",Assistant,Declarative,1,0,42,2026-07-06`,
+        `"agent${control}1",Assistant,Declarative,1,0,42,2026-07-06`,
       ].join("\n"),
-      userAgentCsv("2026-07-06").replace("agent-1", `"agent${newline}1"`),
+      userAgentCsv("2026-07-06").replace("agent-1", `"agent${control}1"`),
     ]) {
       expect(() => parseOfficialUsageReport(bytes(csv)))
         .toThrowError(expect.objectContaining({ code: "invalid_identifier" }));
     }
   });
 
-  it.each(["Report/% Agent?x=1#[]&:=+", "a".repeat(512)])("preserves supported opaque agent IDs (%s)", agentId => {
+  it("preserves embedded tabs in display names", () => {
+    const report = parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06", "Research\tassistant")));
+    expect(report.rows[0]).toMatchObject({ agentName: "Research\tassistant" });
+  });
+
+  it.each(["Report/% Agent?x=1#[]&:=+", "a".repeat(512), "Report-\u{1f916}", "Report-\ufffd"])("preserves supported opaque agent IDs (%s)", agentId => {
     const report = parseOfficialUsageReport(bytes(userAgentCsv("2026-07-06").replace("agent-1", agentId)));
     expect(report.rows[0]).toMatchObject({ agentId });
   });

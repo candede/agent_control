@@ -212,6 +212,9 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
     SELECT report_set.id,md5(jsonb_build_array(report_set.id,report_set.tenant_id,report_set.actor_principal_id,
       report_set.bundle_id,report_set.content_hash,report_set.reporting_start,report_set.reporting_end,
       report_set.period_provenance,report_set.supersedes_set_id,report_set.complete,report_set.accepted_at,
+      EXISTS (SELECT 1 FROM official_usage_sets replacement
+        WHERE replacement.tenant_id=report_set.tenant_id AND replacement.supersedes_set_id=report_set.id
+          AND replacement.complete AND replacement.accepted_at IS NOT NULL),
       (SELECT jsonb_agg(jsonb_build_array(membership.kind,membership.version_id) ORDER BY membership.kind)
        FROM official_usage_set_versions membership WHERE membership.set_id=report_set.id))::text) AS signature
     FROM official_usage_sets report_set WHERE report_set.complete AND report_set.deleted_at IS NULL`);

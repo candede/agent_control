@@ -75,6 +75,22 @@ describe("complete package observations", () => {
 });
 
 describe("persistable package text", () => {
+  it.each(["catalog", "inventory", "detail"])("rejects malformed UTF-8 identity bytes at the Graph %s boundary", async operation => {
+    const invalid = Buffer.concat([
+      Buffer.from(operation === "detail" ? '{"id":"package","manifestId":"manifest-' : '{"id":"package-'),
+      Buffer.from([0xff]),
+      Buffer.from('","displayName":"Package","isBlocked":false}'),
+    ]);
+    const body = operation === "detail" ? invalid : Buffer.concat([Buffer.from('{"value":['), invalid, Buffer.from("]}")]);
+    const fetcher = vi.fn(async () => new Response(body));
+    const client = new GraphPackagesClient(fetcher);
+    const observation = operation === "catalog" ? client.checkCatalogAccess("fixture-token")
+      : operation === "inventory" ? client.listCopilotAgents("fixture-token")
+        : client.getPackageDetails("fixture-token", base.id);
+    await expect(observation).rejects.toMatchObject({ status: 502, code: "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { field: "displayName", limit: 256 },
     { field: "shortDescription", limit: 4096 },

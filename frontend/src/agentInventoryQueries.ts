@@ -23,7 +23,9 @@ export class AgentInventoryQueries {
         queryKey,
         queryFn: async ({ signal: requestSignal }) => {
           const page = await getUnifiedAgents(query, { signal: requestSignal });
-          expiry(page);
+          if (expiry(page) <= Date.now()) {
+            throw new ApiError(409, "inventory_changed", "The saved agent inventory or usage report expired. Reload Agents.");
+          }
           return page;
         },
       });
@@ -42,14 +44,17 @@ export class AgentInventoryQueries {
 
 function expiry(page: UnifiedAgentInventoryPage) {
   const timestamps = [
+    page.expiresAt,
     page.sources.graphPackages.observation?.expiresAt,
     page.sources.powerPlatform.observation?.expiresAt,
     page.usageContext?.reportSet?.expiresAt,
     page.usageContext?.expiresAt,
     ...page.value.flatMap(record => [
+      record.environment?.observation.expiresAt,
       record.observations.graphPackages?.expiresAt,
       record.observations.powerPlatform?.expiresAt,
       ...Object.values(record.observations.packageSnapshots).flatMap(observation => [observation.expiresAt, observation.identityDetails?.expiresAt]),
+      ...record.packages.map(value => value.detailFreshness?.state === "fresh" ? value.detailFreshness.expiresAt : null),
       ...Object.values(record.people ?? {}).map(person => person?.expiresAt),
     ]),
   ].filter((value): value is string => typeof value === "string");

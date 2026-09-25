@@ -5,6 +5,8 @@ import { AppError } from "../errors.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import type { InventorySnapshot, PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
+import { projectPackageDetails } from "./packageDetailProjection.js";
+import { projectPackageControl } from "./packageControlProjection.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import type { AgentUsageContext, AgentUsageSummary } from "../types/agentUsage.js";
@@ -483,6 +485,58 @@ describe("UnifiedAgentsService", () => {
     await expect(service.assertRevision(scope, inventoryRevision)).rejects.toMatchObject({ code: "inventory_changed" });
   });
 
+  it.each([
+    ["list", "validation"], ["forExport", "validation"], ["list", "commit"], ["forExport", "commit"],
+  ] as const)("rejects %s when usage expires after projection during final %s", async (method, phase) => {
+    const now = Date.parse("2026-09-20T12:00:00.000Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const deps = dependencies({ packages: [packageValue("one", "One")] });
+    const projection = deps.usage.project;
+    deps.usage.project = vi.fn<UnifiedAgentDependencies["usage"]["project"]>(async (...args) => {
+      const result = await projection(...args);
+      return { ...result, context: { ...result.context, availability: "active", expiresAt: new Date(now + 1_000).toISOString(),
+        reportSet: {
+          id: "report-set", bundleId: "bundle", complete: true, kinds: ["agents", "userAgents", "users"],
+          contentHash: "b".repeat(64), reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range" },
+          supersedesSetId: null, acceptedAt: null, deletedAt: null, createdAt: new Date(now).toISOString(), expiresAt: null,
+        },
+      } satisfies AgentUsageContext };
+    });
+    if (phase === "validation") {
+      deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockImplementation(async () => {
+        clock.mockReturnValue(now + 1_000);
+        return "a".repeat(64);
+      });
+    } else {
+      const client = Object.assign(new pg.Client(), { release: vi.fn() });
+      deps.registry = {
+        withSnapshot: async (_scope, work) => {
+          const result = await work(client);
+          clock.mockReturnValue(now + 1_000);
+          return result;
+        },
+        reconcile: async (_client, _scope, records) => [...records],
+      };
+    }
+    const service = new UnifiedAgentsService(deps);
+    const scope = { tenantId, principalId: "viewer" };
+    await expect(method === "list" ? service.list(scope) : service.forExport(scope, inventoryRevision))
+      .rejects.toMatchObject({ code: "agent_usage_changed" });
+  });
+
+  it("rejects export publication when usage expires during the final composite revision check", async () => {
+    const now = Date.parse("2026-09-20T12:00:00.000Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const deps = dependencies();
+    deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(64)).mockImplementation(async () => {
+      clock.mockReturnValue(now + 1_000);
+      return "a".repeat(64);
+    });
+    await expect(new UnifiedAgentsService(deps).assertRevision(
+      { tenantId, principalId: "viewer" }, inventoryRevision, new Date(now + 1_000).toISOString(),
+    )).rejects.toMatchObject({ code: "agent_usage_changed" });
+  });
+
   it("propagates usage storage failures and rejects incomplete projections instead of fabricating unused agents", async () => {
     const deps = dependencies({ packages: [packageValue("one", "One")] });
     const service = new UnifiedAgentsService(deps);
@@ -927,6 +981,124 @@ describe("UnifiedAgentsService", () => {
     }
   });
 
+  it.each([
+    { reason: "expired" },
+    { reason: "readback_changed" },
+    { reason: "new_environment", elementType: "AgentMetadatas", definition: { SourceIds: { EnvironmentId: environmentB } } },
+    { reason: "new_schema", elementType: "AgentMetadatas", definition: { SourceIds: { SchemaName: "cr_other" } } },
+    { reason: "partial_bot_readback", elementType: "Bots", definition: { botId: environmentB } },
+    { reason: "partial_engine_readback", elementType: "CustomEngineCopilots", definition: { type: "bot", id: environmentB } },
+  ])(
+    "keeps custom-engine details rejected by $reason projection out of canonical memberships",
+    async ({ reason, elementType, definition }) => {
+      const botApplicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const [native, alias] = [
+        { id: "native", metadata: { SourceIds: { EnvironmentId: environmentA, CdsBotId: botA } } },
+        { id: "alias", metadata: {} },
+      ].map(({ id, metadata }) => ({
+        ...packageValue(id, "Same displayed name"),
+        identityDetailsCollected: true as const,
+        elementDetails: [
+          { elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify(metadata) }] },
+          { elementType: "Bots", elements: [{ id: "bot", definition: JSON.stringify({ botId: botApplicationId }) }] },
+          { elementType: "CustomEngineCopilots", elements: [{ id: "engine", definition: JSON.stringify({ type: "bot", id: botApplicationId }) }] },
+        ],
+      }));
+      const rejected = reason === "expired" ? projectPackageDetails(alias, {
+        package: alias, observedAt: "2026-09-16T10:00:00.000Z", expiresAt: "2026-09-16T11:00:00.000Z",
+      }, true) : projectPackageControl(alias, {
+        detail: {
+          ...alias, isBlocked: true,
+          ...(elementType ? { elementDetails: [{ elementType, elements: [{ id: "changed", definition: JSON.stringify(definition) }] }] } : {}),
+        },
+        state: { kind: "block", isBlocked: true },
+        observation: {
+          snapshotId: "readback", observedAt: "2026-09-16T11:00:00.000Z", expiresAt: "2026-09-17T11:00:00.000Z",
+        },
+        ...(reason === "readback_changed" ? { identityRevalidationRequired: true } : {}),
+      });
+      expect(rejected.elementDetails).toEqual(alias.elementDetails);
+      expect(rejected.identityRevalidationRequired).toBe(true);
+      for (const resources of [[], [resource(environmentA)]]) {
+        const service = new UnifiedAgentsService(dependencies({ packages: [native, rejected], resources }));
+        const scope = { tenantId, principalId: "viewer" };
+        const full = await service.list(scope);
+        expect(full.count).toBe(2);
+        expect(full.verification).toMatchObject({
+          representedSourceCount: resources.length + 2, uniqueSourceCount: resources.length + 2,
+          checks: { sourceMemberships: true },
+        });
+        const exact = await service.list(scope, { recordId: "graph_packages:alias" });
+        expect(exact.value).toMatchObject([{
+          presence: "graph_packages", packages: [{ id: "alias" }],
+          powerPlatformResource: null, identity: { state: "unmatched" },
+        }]);
+        expect(exact.value[0].packages).toHaveLength(1);
+      }
+    },
+  );
+
+  it.each(["new_manifest", "new_element_types", "new_declarative_details", "multiple_declarative_agents"])(
+    "withdraws old canonical memberships when a control readback supplies %s", async reason => {
+      const metadata = {
+        elementType: "AgentMetadatas", elements: [{ id: "metadata", definition: JSON.stringify({
+          SourceIds: { EnvironmentId: environmentA, EntraApplicationId: botA,
+            ManifestId: reason === "multiple_declarative_agents" ? botA : environmentB },
+        }) }],
+      };
+      const declarative = { elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] };
+      const current: CopilotPackageDetail = {
+        ...packageValue("package", "Package"), identityDetailsCollected: true,
+        manifestId: reason === "new_manifest" ? undefined : botA,
+        elementTypes: ["new_manifest", "multiple_declarative_agents"].includes(reason) ? ["DeclarativeCopilots"] : undefined,
+        elementDetails: [metadata, ...(reason === "multiple_declarative_agents" ? [declarative] : [])],
+      };
+      const saved: PowerPlatformResource = {
+        ...resource(environmentA), identifiers: [{ kind: "entra_app_id", value: botA }],
+      };
+      const detail: CopilotPackageDetail = {
+        ...current, isBlocked: true,
+        ...(reason === "new_manifest" ? { manifestId: botA } : {}),
+        ...(reason === "new_element_types" ? { elementTypes: ["DeclarativeCopilots"] } : {}),
+        ...(reason === "new_declarative_details" ? { elementDetails: [metadata, declarative] } : {}),
+        ...(reason === "multiple_declarative_agents" ? { elementDetails: [metadata, {
+          ...declarative, elements: [...declarative.elements, { id: "second-agent", definition: "{}" }],
+        }] } : {}),
+      };
+      expect(resolvePackageAgentLinks(tenantId, [current], [saved])[0].status).toBe("matched");
+      expect(resolvePackageAgentLinks(tenantId, [detail], [saved])[0].status)
+        .toBe(reason === "multiple_declarative_agents" ? "ambiguous" : "conflicting");
+      const projected = projectPackageControl(current, {
+        detail, state: { kind: "block", isBlocked: true },
+        observation: { snapshotId: "readback", observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-10-16T11:00:00Z" },
+      });
+      const result = await new UnifiedAgentsService(dependencies({ packages: [projected], resources: [saved] }))
+        .list({ tenantId, principalId: "viewer" });
+      expect(result).toMatchObject({
+        count: 2, summary: { linked: 0, graphOnly: 1, powerPlatformOnly: 1 },
+        identityCollection: { checkedPackages: 0, pendingPackages: 1 },
+      });
+      expect(result.value.find(value => value.presence === "graph_packages")).toMatchObject({
+        packages: [{ id: current.id, isBlocked: true }], identity: { state: "unmatched" },
+      });
+    },
+  );
+
+  it("retains canonical membership through an empty optional metadata control readback", async () => {
+    const current = { ...packageValue("package", "Package", true), identityDetailsCollected: true as const };
+    const projected = projectPackageControl(current, {
+      detail: { ...current, isBlocked: true, elementDetails: [{ elementType: "AgentMetadatas", elements: [] }] },
+      state: { kind: "block", isBlocked: true },
+      observation: { snapshotId: "readback", observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-10-16T11:00:00Z" },
+    });
+    const result = await new UnifiedAgentsService(dependencies({ packages: [projected], resources: [resource(environmentA)] }))
+      .list({ tenantId, principalId: "viewer" });
+    expect(result).toMatchObject({
+      count: 1, summary: { linked: 1 }, identityCollection: { checkedPackages: 1, pendingPackages: 0 },
+      value: [{ presence: "both", packages: [{ id: current.id, isBlocked: true }], identity: { state: "matched" } }],
+    });
+  });
+
   it("returns all authorized environment and authoring choices independently of filtering and pagination", async () => {
     const pkg = { ...packageValue("custom", "Custom agent"), authoringTool: "CustomSDK" };
     const service = new UnifiedAgentsService(dependencies({
@@ -949,6 +1121,81 @@ describe("UnifiedAgentsService", () => {
       resources: [resource(environmentA)], environmentNames: { [environmentA]: "Must not be exposed" }, powerPlatformSnapshot: null,
     })).list({ tenantId, principalId: "viewer" });
     expect(unavailable.facets).toEqual({ environments: [], platforms: [] });
+  });
+
+  it.each(["filtered", "paged"] as const)("retains the independent environment deadline when its agents are %s out", async mode => {
+    const service = new UnifiedAgentsService(dependencies({
+      resources: [resource(environmentA)],
+      environmentNames: { [environmentA]: "Saved environment" },
+    }));
+    const page = await service.list({ tenantId, principalId: "viewer" },
+      mode === "filtered" ? { search: "absent" } : { offset: 1 });
+    expect(page.value).toEqual([]);
+    expect(page.facets.environments).toEqual([{ value: environmentA, label: "Saved environment" }]);
+    expect(page.sources.powerPlatform.observation?.expiresAt).toBe("2026-09-22T00:00:00.000Z");
+    expect(page).toHaveProperty("expiresAt", "2026-09-21T00:00:00.000Z");
+  });
+
+  it.each(["package", "identity", "details", "people", "usage"] as const)(
+    "bounds the whole page by off-page %s evidence", async evidence => {
+      const expiresAt = "2026-09-16T12:00:05.000Z";
+      const scope = { tenantId, principalId: "viewer" };
+      const deps = dependencies({ packages: [packageValue("package", "Package")], resources: [
+        { ...resource(environmentA), details: { ownerId: botA } },
+      ] });
+      const source = await deps.packages.readUnifiedSource(scope);
+      const observation = source.observations.package;
+      if (evidence === "package") observation.expiresAt = expiresAt;
+      if (evidence === "identity") observation.identityDetails = {
+        snapshotId: observation.snapshotId, observedAt: observation.observedAt, expiresAt,
+      };
+      if (evidence === "details") source.packages[0].detailFreshness = {
+        state: "fresh", observedAt: observation.observedAt, expiresAt,
+      };
+      deps.packages.readUnifiedSource = vi.fn(async () => source);
+      if (evidence === "people") deps.people!.project = vi.fn(async (_scope, records) => records.map(record => ({
+        ...record, ...(record.powerPlatformResource ? { people: { owner: {
+          objectId: botA, displayName: "Saved person", userPrincipalName: null,
+          observedAt: observation.observedAt, expiresAt,
+        } } } : {}),
+      })));
+      if (evidence === "usage") {
+        const project = deps.usage.project;
+        deps.usage.project = vi.fn<UnifiedAgentDependencies["usage"]["project"]>(async (...args) => {
+          const projected = await project(...args);
+          return { ...projected, context: { ...projected.context, expiresAt } };
+        });
+      }
+      const page = await new UnifiedAgentsService(deps).list(scope, { search: "absent" });
+      expect(page.value).toEqual([]);
+      expect(page.expiresAt).toBe(expiresAt);
+    },
+  );
+
+  it("does not treat already stale details as current page evidence", async () => {
+    const page = await new UnifiedAgentsService(dependencies({ packages: [{
+      ...packageValue("package", "Package"),
+      detailFreshness: { state: "stale", observedAt: "2026-09-15T00:00:00Z", expiresAt: "2026-09-15T01:00:00Z" },
+    }] })).list({ tenantId, principalId: "viewer" });
+    expect(page.expiresAt).toBe("2026-09-22T00:00:00.000Z");
+    expect(page.value[0].packages[0].detailFreshness?.state).toBe("stale");
+  });
+
+  it.each(["list", "forExport"] as const)("rejects %s when environment context expires during transaction commit", async method => {
+    const scope = { tenantId, principalId: "viewer" };
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const deps = dependencies({ resources: [resource(environmentA)], environmentNames: { [environmentA]: "Saved environment" } });
+    deps.registry = {
+      withSnapshot: async (_scope, work) => {
+        const result = await work(client);
+        vi.setSystemTime(new Date("2026-09-21T00:00:00.000Z"));
+        return result;
+      },
+      reconcile: async (_client, _scope, records) => [...records],
+    };
+    const service = new UnifiedAgentsService(deps);
+    await expect(method === "list" ? service.list(scope) : service.forExport(scope, inventoryRevision))
+      .rejects.toMatchObject({ code: "inventory_changed" });
   });
 
   it.each([

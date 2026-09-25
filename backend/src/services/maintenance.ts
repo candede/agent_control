@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { AppError } from "../errors.js";
 
 let draining = false;
@@ -8,7 +8,8 @@ export function maintenanceActive() {
   const marker = process.env.MAINTENANCE_FILE;
   if (!marker) return false;
   try {
-    statSync(marker);
+    // The marker itself closes admissions, even if it is a dangling symlink.
+    lstatSync(marker);
     return true;
   } catch (error) {
     // An unreadable marker must not reopen admissions.

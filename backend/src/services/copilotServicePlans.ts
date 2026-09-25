@@ -29,8 +29,14 @@ export function resolveCopilotServicePlan(
   const statuses = new Set(matching.map(plan => plan.capabilityStatus));
   const capabilityStatus = statuses.size === 1 ? matching[0].capabilityStatus
     : statuses.has("Enabled") && [...statuses].every(status => status === "Enabled" || status === "Warning") ? "Enabled" : null;
-  const dates = matching.flatMap(plan => plan.assignedDateTime ? [plan.assignedDateTime] : [])
-    .sort((left, right) => Date.parse(left) - Date.parse(right));
+  const dates = matching.flatMap(plan => {
+    if (!plan.assignedDateTime) return [];
+    // Graph timestamps can retain precision beyond JavaScript Date's milliseconds.
+    const submillisecond = /[T ]\d{2}:\d{2}:\d{2}\.\d{3}(\d+)(?:Z|[+-]\d{2}:?\d{2})$/i
+      .exec(plan.assignedDateTime)?.[1].replace(/0+$/, "") ?? "";
+    return [{ time: Date.parse(plan.assignedDateTime), submillisecond }];
+  }).sort((left, right) => left.time - right.time || left.submillisecond.localeCompare(right.submillisecond));
+  const latestDate = dates.at(-1);
   // Historical capabilities cannot override an explicit current per-user disable.
   const state = !enabledInAssignment ? "disabled"
     : capabilityStatus === "Enabled" ? "enabled"
@@ -42,7 +48,9 @@ export function resolveCopilotServicePlan(
     servicePlanId,
     ...definition,
     state,
-    assignedDateTime: dates.at(-1) ?? null,
+    // Equivalent timestamp spellings must not cause conflicts between duplicate paged users.
+    assignedDateTime: latestDate === undefined ? null
+      : new Date(latestDate.time).toISOString().replace(/Z$/, `${latestDate.submillisecond}Z`),
     capabilityStatus,
   };
 }

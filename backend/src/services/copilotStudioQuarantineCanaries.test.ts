@@ -105,7 +105,12 @@ describe.sequential("Copilot Studio quarantine full-cycle canaries", () => {
     await seedOperatorInventory(operator);
     const fakeProvider = provider(false, true);
     await expect(service(operator, fakeProvider).execute(operator, approved.original.id, approved.restoration.id))
-      .rejects.toMatchObject({ code: "canary_cycle_unverified" });
+      .rejects.toMatchObject({ code: "canary_original_unverified" });
+    expect(fakeProvider.setQuarantine.mock.calls.map(call => call[2])).toEqual([true]);
+    expect((await canaries.list(administrator)).value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: approved.original.id, status: "inconclusive" }),
+      expect.objectContaining({ id: approved.restoration.id, status: "inconclusive" }),
+    ]));
     expect(await jobs.isQualified({ tenantId: operator.tenantId! }, authority)).toBe(false);
   });
 

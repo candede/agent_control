@@ -124,7 +124,7 @@ describe("Admin reviewed usage routes", () => {
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it.each(["limit=0", "limit=251", "limit=1&limit=2", "offset=-1", "search=a&search=b", "target=secret", "limit=1.5"])(
+  it.each(["limit=0", "limit=251", "limit=1&limit=2", "offset=-1", "search=a&search=b", "search=a%C2%85b", "target=secret", "limit=1.5"])(
     "rejects candidate query %s without reading saved reports", async query => {
       expect(await request("GET", `/usage-candidates?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_agent_usage_input" } });
       expect(candidates).not.toHaveBeenCalled();
@@ -146,9 +146,19 @@ describe("Admin reviewed usage routes", () => {
     { confirmed: false }, { confirmed: "true" }, { confirmed: 1 }, { extra: true }, { reportSetId: "invalid" },
     { expectedInventoryRevision: "" }, { reportAgentId: "\u0000" }, { target: { source: "canonical", agentId: recordId } },
     { target: { source: "power_platform", nativeId: "bot" } },
+    { target: { source: "power_platform", nativeId: "bot", environmentId: "Environment-\ud800" } },
+    { target: { source: "graph_packages", packageId: "Package-\udfff" } },
+    { reportAgentId: "Report-\u0085" },
   ])("rejects invalid attachment %j before auditing or querying", async changes => {
     expect(await request("POST", "/usage-associations", { ...input(), ...changes })).toMatchObject({ status: 400 });
     expect(attach).not.toHaveBeenCalled();
+  });
+
+  it.each(["\ud800", "\udfff", "\u0085"])("rejects invalid removal identity %j before auditing or querying", async character => {
+    const { target: _target, ...removal } = input();
+    expect(await request("DELETE", "/usage-associations", { ...removal, reportAgentId: `Report-${character}` }))
+      .toMatchObject({ status: 400, body: { code: "invalid_agent_usage_input" } });
+    expect(remove).not.toHaveBeenCalled();
   });
 
   it("rejects targets on removal and query/body field smuggling", async () => {

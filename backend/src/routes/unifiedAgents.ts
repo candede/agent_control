@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import { AppError } from "../errors.js";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { requestScope } from "../middleware/auth.js";
 import { unifiedAgents } from "../services/unifiedAgents.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
@@ -119,19 +120,29 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
 }, async (request, response) => {
   const input = agentPeopleResolveInput(request.body);
   const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
   const controller = new AbortController();
+  const assertCurrent = () => {
+    controller.signal.throwIfAborted();
+    assertAccountSessionValidation(validation);
+  };
   const disconnected = () => { if (!response.writableEnded) controller.abort(); };
   response.once("close", disconnected);
   try {
+    assertCurrent();
     const generation = await agentPeople.generation(scope);
+    assertCurrent();
     const page = await unifiedAgents.list(scope, { recordId: input.recordId, limit: 1 });
+    assertCurrent();
     if (page.count !== 1 || !page.value[0]) throw new AppError(404, "agent_not_found", "The saved agent is unavailable.");
     const record = page.value[0];
     const ids = [record.powerPlatformResource?.createdBy, record.powerPlatformResource?.details.ownerId,
       record.powerPlatformResource?.details.lastModifiedBy]
       .filter((id): id is string => typeof id === "string" && isDirectoryObjectId(id));
     const result = await agentPeople.resolve(request.session.user!, ids, { generation, force: input.force, signal: controller.signal });
+    assertCurrent();
     const [updated] = await savedAgentPeople.project(scope, [record]);
+    assertCurrent();
     response.json({ people: updated.people, changed: result.changed });
   } finally {
     response.off("close", disconnected);
@@ -164,16 +175,15 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/export.csv", {
     await validateSession();
     const inventory = await unifiedAgents.forExport(scope, input.revision, input.query, input.recordIds);
     const referenceSelection = input.query.operationIdPrefix ? JSON.stringify(inventory.value.map(record => record.id)) : undefined;
-    const validate = async () => {
-      await validateSession();
-      await unifiedAgents.assertRevision(scope, input.revision);
+    const validate = () => validateSession(async () => {
+      await unifiedAgents.assertRevision(scope, input.revision, inventory.usageContext?.expiresAt);
       if (referenceSelection !== undefined) {
         const current = await unifiedAgents.forExport(scope, input.revision, input.query, input.recordIds);
         if (JSON.stringify(current.value.map(record => record.id)) !== referenceSelection) {
           throw new AppError(409, "dataset_invalidated", "The authorized operation-reference selection changed before export publication.");
         }
       }
-    };
+    });
     const csv = buildUnifiedAgentCsv(inventory, deadlineAt);
     await publishBoundedCsv(request, response, "agents.csv", csv.buffer, {
       deadlineAt, validate,

@@ -160,7 +160,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
   const directoryKnown = data.sources.directory.state === "available";
   const directoryCurrent = current && directoryKnown;
   const agentUsageFresh = current && data.sources.importedAgentUsage.state === "available";
-  const appActivityFresh = current && data.sources.appActivity.state === "available";
+  const appActivityFresh = current && ["available", "partial"].includes(data.sources.appActivity.state);
   const licensedUsers = useMemo(() => data.users.filter(user => isCopilotServiceActive(user.copilotServiceState)), [data.users]);
   const attention = licensedUsers.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh)).length;
   const measured = licensedUsers.filter(user => responses(user) !== null).length;
@@ -325,7 +325,7 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
   const imported = user.importedUsage;
   const fresh = current && data.sources.importedAgentUsage.state === "available";
   const directoryCurrent = current && data.sources.directory.state === "available";
-  const followUp = directoryCurrent ? recommendation(user, threshold, fresh, data.sources.appActivity.state === "available") : { label: "Verify paid license inventory", tone: "unknown" };
+  const followUp = directoryCurrent ? recommendation(user, threshold, fresh, ["available", "partial"].includes(data.sources.appActivity.state)) : { label: "Verify paid license inventory", tone: "unknown" };
   useEffect(() => {
     const element = dialog.current;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;

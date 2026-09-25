@@ -15,51 +15,62 @@ export function matchImportedUsage(
   imported: readonly OfficialUsageUserSummary[],
   directoryAvailable: boolean,
 ) {
+  const matching = matchCopilotIdentities(directoryAvailable ? directoryUsers : [], imported, summary => summary.username);
+  const unresolved: CopilotUsageUnresolvedImportedIdentity[] = matching.unresolved.map(value => ({
+    normalizedUserPrincipalName: value.normalizedIdentity,
+    importedUsage: value.value,
+    reason: directoryAvailable ? value.reason : "directory_unavailable",
+  }));
+  unresolved.sort((left, right) => left.normalizedUserPrincipalName.localeCompare(right.normalizedUserPrincipalName));
+  return { byObjectId: matching.byObjectId, unresolved };
+}
+
+export function matchCopilotIdentities<T>(
+  directoryUsers: readonly CopilotDirectoryUser[],
+  records: readonly T[],
+  identity: (value: T) => string,
+) {
   const directoryKeys = identityIndex(directoryUsers);
-  const importedKeys = new Map<string, OfficialUsageUserSummary[]>();
-  for (const summary of imported) {
-    const key = normalizeCopilotIdentity(summary.username);
-    const rows = importedKeys.get(key) ?? [];
-    rows.push(summary);
-    importedKeys.set(key, rows);
+  const recordKeys = new Map<string, T[]>();
+  for (const record of records) {
+    const key = normalizeCopilotIdentity(identity(record));
+    const rows = recordKeys.get(key) ?? [];
+    rows.push(record);
+    recordKeys.set(key, rows);
   }
-  const byObjectId = new Map<string, OfficialUsageUserSummary>();
-  const unresolved: CopilotUsageUnresolvedImportedIdentity[] = [];
-  const candidates = new Map<string, Array<{ key: string; summary: OfficialUsageUserSummary }>>();
-  for (const [key, summaries] of importedKeys) {
+
+  // Count every possible row before rejecting ambiguous keys; another alias must not bypass them.
+  const candidateCounts = new Map<string, number>();
+  for (const [key, rows] of recordKeys) {
+    for (const user of directoryKeys.get(key) ?? []) {
+      const objectId = user.identity.objectId;
+      candidateCounts.set(objectId, (candidateCounts.get(objectId) ?? 0) + rows.length);
+    }
+  }
+  const byObjectId = new Map<string, T>();
+  const unresolved: Array<{
+    normalizedIdentity: string;
+    value: T;
+    reason: "no_exact_directory_match" | "ambiguous_directory_match";
+  }> = [];
+  for (const [key, rows] of recordKeys) {
     const directoryMatches = directoryKeys.get(key) ?? [];
-    if (directoryAvailable && summaries.length === 1 && directoryMatches.length === 1) {
-      const objectId = directoryMatches[0].identity.objectId;
-      const values = candidates.get(objectId) ?? [];
-      values.push({ key, summary: summaries[0] });
-      candidates.set(objectId, values);
+    const objectId = directoryMatches.length === 1 ? directoryMatches[0].identity.objectId : undefined;
+    if (objectId !== undefined && candidateCounts.get(objectId) === 1) {
+      byObjectId.set(objectId, rows[0]);
       continue;
     }
-    const reason = !directoryAvailable
-      ? "directory_unavailable" as const
-      : summaries.length > 1 || directoryMatches.length > 1
-        ? "ambiguous_directory_match" as const
-        : "no_exact_directory_match" as const;
-    for (const summary of summaries) {
-      unresolved.push({ normalizedUserPrincipalName: key, importedUsage: summary, reason });
+    const reason = rows.length > 1 || directoryMatches.length > 0
+      ? "ambiguous_directory_match" as const
+      : "no_exact_directory_match" as const;
+    for (const value of rows) {
+      unresolved.push({ normalizedIdentity: key, value, reason });
     }
   }
-  for (const [objectId, values] of candidates) {
-    if (values.length === 1) {
-      byObjectId.set(objectId, values[0].summary);
-    } else {
-      unresolved.push(...values.map(value => ({
-        normalizedUserPrincipalName: value.key,
-        importedUsage: value.summary,
-        reason: "ambiguous_directory_match" as const,
-      })));
-    }
-  }
-  unresolved.sort((left, right) => left.normalizedUserPrincipalName.localeCompare(right.normalizedUserPrincipalName));
   return { byObjectId, unresolved };
 }
 
-export function identityIndex(users: readonly CopilotDirectoryUser[]) {
+function identityIndex(users: readonly CopilotDirectoryUser[]) {
   const result = new Map<string, CopilotDirectoryUser[]>();
   for (const user of users) {
     for (const key of new Set([

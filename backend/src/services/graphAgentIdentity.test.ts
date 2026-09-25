@@ -113,4 +113,127 @@ describe("typed Graph agent identity", () => {
     });
     await expect(new GraphAgentIdentityClient(fetcher).resolve("fixture", id, pending.signal, async () => {})).rejects.toBeDefined();
   });
+
+  it.each(["headers", "body"] as const)("reports a local %s timeout as a provider timeout, not a resolution deadline", async stage => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>(async (_url, init) => stage === "body"
+      ? new Response(new ReadableStream({ cancel }))
+      : new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      }));
+    try {
+      const result = new GraphAgentIdentityClient(fetcher).resolve("fixture", id, new AbortController().signal, async () => {});
+      const assertion = expect(result).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("deadline", "TimeoutError"));
+      await assertion;
+      expect(timeout).toHaveBeenCalledWith(8_000);
+      expect(fetcher).toHaveBeenCalledOnce();
+      if (stage === "body") expect(cancel).toHaveBeenCalledOnce();
+    } finally { timeout.mockRestore(); }
+  });
+
+  it.each([401, 403, 404, 429])("retains HTTP %s evidence when the error body times out", async status => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const cancel = vi.fn();
+    const wait = vi.fn(async () => {});
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream({ cancel }), {
+      status, headers: { "Retry-After": "30", "request-id": "fixture-request" },
+    }));
+    try {
+      const result = new GraphAgentIdentityClient(fetcher, wait).resolve("fixture", id, new AbortController().signal, async () => {});
+      const assertion = expect(result).rejects.toMatchObject({ status,
+        code: status === 404 ? "agent_identity_not_found" : status === 429 ? "graph_error" : "agent_identity_permission_required",
+        ...(status === 429 ? { details: { httpStatus: status, retryAfterMs: 30_000, correlationId: "fixture-request" } }
+          : status !== 404 ? { details: { capabilityId: "graph.agentIdentity.read",
+            provider: { httpStatus: status, correlationId: "fixture-request" } } } : {}),
+      });
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("deadline", "TimeoutError"));
+      await assertion;
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(wait).not.toHaveBeenCalled();
+    } finally { timeout.mockRestore(); }
+  });
+
+  it("still performs one admitted retry after a transient error-body timeout", async () => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout")
+      .mockReturnValueOnce(deadline.signal).mockReturnValue(new AbortController().signal);
+    const cancel = vi.fn();
+    const wait = vi.fn(async () => {});
+    const before = vi.fn(async () => {});
+    const fetcher = vi.fn<FetchLike>()
+      .mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), { status: 503, headers: { "Retry-After": "1" } }))
+      .mockResolvedValueOnce(Response.json(valid));
+    try {
+      const result = new GraphAgentIdentityClient(fetcher, wait).resolve("fixture", id, new AbortController().signal, before);
+      const assertion = expect(result).resolves.toEqual(resolved);
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      deadline.abort(new DOMException("deadline", "TimeoutError"));
+      await assertion;
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(wait).toHaveBeenCalledExactlyOnceWith(1_000, expect.any(AbortSignal));
+      expect(before).toHaveBeenCalledTimes(2);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { timeout.mockRestore(); }
+  });
+
+  it.each(["headers", "body"] as const)("sanitizes transport failures at %s without leaking internal messages", async stage => {
+    const fetcher = vi.fn<FetchLike>(async () => {
+      if (stage === "headers") throw new TypeError("private transport details");
+      return new Response(new ReadableStream({ start(controller) { controller.error(new TypeError("private transport details")); } }));
+    });
+    const result = new GraphAgentIdentityClient(fetcher).resolve("fixture", id, signal(), async () => {}).catch(error => error);
+    expect(await result).toMatchObject({ status: 502, code: "provider_network_error" });
+    expect(String(await result)).not.toContain("private transport details");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([200, 401, 403, 404, 429, 503])("keeps caller cancellation authoritative during an HTTP %s body read", async status => {
+    const caller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const cancel = vi.fn();
+    const wait = vi.fn(async () => {});
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream({ cancel }), { status }));
+    const result = new GraphAgentIdentityClient(fetcher, wait).resolve("fixture", id, caller.signal, async () => {});
+    const assertion = expect(result).rejects.toBe(reason);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    caller.abort(reason);
+    await assertion;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancellation", "deadline"])("rejects %s between final body consumption and identity return", async mode => {
+    const caller = new AbortController();
+    const reason = new DOMException(mode, mode === "cancellation" ? "AbortError" : "TimeoutError");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify(valid))); },
+      pull(controller) {
+        controller.close();
+        const abortAfterMicrotasks = (remaining: number) => {
+          if (remaining === 0) caller.abort(reason);
+          else queueMicrotask(() => abortAfterMicrotasks(remaining - 1));
+        };
+        // Four microtasks reaches the client continuation; a fifth is after it returns.
+        abortAfterMicrotasks(4);
+      },
+    }, { highWaterMark: 0 });
+    const fetcher = vi.fn<FetchLike>(async () => new Response(body));
+    const timeout = mode === "deadline" ? vi.spyOn(AbortSignal, "timeout").mockReturnValue(caller.signal) : undefined;
+    try {
+      const result = new GraphAgentIdentityClient(fetcher).resolve("fixture", id,
+        mode === "cancellation" ? caller.signal : new AbortController().signal, async () => {});
+      if (mode === "cancellation") await expect(result).rejects.toBe(reason);
+      else await expect(result).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+      expect(body.locked).toBe(false);
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally { timeout?.mockRestore(); }
+  });
 });

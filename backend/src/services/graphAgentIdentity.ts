@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError, isTimeoutError } from "../errors.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
-import { graphError, type FetchLike } from "./graphPackages.js";
+import { graphError, graphResponseError, type FetchLike } from "./graphPackages.js";
 import { boundedProviderJson } from "./providerJson.js";
 import { verifiedAgentIdentityClientIdProvenance, type VerifiedAgentIdentityIds } from "../types/agentInvestigations.js";
 
@@ -19,33 +19,41 @@ export class GraphAgentIdentityClient {
       await beforeRequest();
       signal.throwIfAborted();
       const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
-      let response: Response;
+      let response: Response | undefined;
+      let body: unknown;
+      let providerError: AppError | undefined;
       try {
         response = await this.fetcher(url, { signal: requestSignal, redirect: "error",
           headers: { Authorization: `Bearer ${token}`, Accept: "application/json;odata.metadata=full" } });
+        if (!response.ok) providerError = await graphError(response, requestSignal);
+        else body = await boundedProviderJson<unknown>(response, requestSignal, 32_768);
+        requestSignal.throwIfAborted();
       } catch (error) {
         signal.throwIfAborted();
-        if (isTimeoutError(error) || requestSignal.aborted) throw new AppError(504, "provider_timeout", "The typed agent identity lookup timed out.");
-        throw new AppError(502, "provider_network_error", "The typed agent identity lookup could not reach Microsoft Graph.");
+        if (response && !response.ok && (isTimeoutError(error) || requestSignal.aborted)) {
+          // A body deadline cannot erase the status and retry headers already received.
+          providerError ??= graphResponseError(response);
+        } else if (isTimeoutError(error) || requestSignal.aborted) {
+          throw new AppError(504, "provider_timeout", "The typed agent identity lookup timed out.");
+        } else if (error instanceof AppError) throw error;
+        else throw new AppError(502, "provider_network_error", "The typed agent identity lookup could not reach Microsoft Graph.");
       }
-      if (!response.ok) {
-        const error = await graphError(response, requestSignal);
-        if (response.status === 401 || response.status === 403) {
-          throw new AppError(response.status, "agent_identity_permission_required",
+      if (providerError) {
+        if (providerError.status === 401 || providerError.status === 403) {
+          throw new AppError(providerError.status, "agent_identity_permission_required",
             "An administrator must add delegated AgentIdentity.Read.All under API permissions in the existing Entra app registration and select Grant admin consent. Microsoft Entra target authorization is also required (Agent ID Administrator for nonowners).",
-            { capabilityId: "graph.agentIdentity.read", provider: error.details });
+            { capabilityId: "graph.agentIdentity.read", provider: providerError.details });
         }
-        if (response.status === 404) throw new AppError(404, "agent_identity_not_found",
+        if (providerError.status === 404) throw new AppError(404, "agent_identity_not_found",
           "The typed lookup found no accessible agentIdentity for the saved candidate in the current tenant. Refresh Agents; no other identity namespace was tried.");
-        const retryAfter = typeof error.details === "object" && error.details !== null && "retryAfterMs" in error.details
-          && typeof error.details.retryAfterMs === "number" ? error.details.retryAfterMs : 250;
-        if (attempt === 0 && [429, 500, 502, 503, 504].includes(response.status) && retryAfter <= 2_000) {
+        const retryAfter = typeof providerError.details === "object" && providerError.details !== null && "retryAfterMs" in providerError.details
+          && typeof providerError.details.retryAfterMs === "number" ? providerError.details.retryAfterMs : 250;
+        if (attempt === 0 && [429, 500, 502, 503, 504].includes(providerError.status) && retryAfter <= 2_000) {
           await this.wait(retryAfter, signal);
           continue;
         }
-        throw error;
+        throw providerError;
       }
-      const body = await boundedProviderJson<unknown>(response, requestSignal, 32_768);
       // The typed endpoint establishes the resource type; Graph can omit @odata.type.
       if (!body || typeof body !== "object" || Array.isArray(body)
         || ("@odata.type" in body && body["@odata.type"] !== "#microsoft.graph.agentIdentity")

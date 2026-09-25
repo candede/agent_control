@@ -10,6 +10,17 @@ function view(status: CapabilityStatus): CapabilityView {
 const onDemandIds = capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id);
 
 describe("capability UX decisions", () => {
+  it.each(["interaction_required", "authorization_expired"])("keeps application %s recovery separate from user sign-in", category => {
+    const application = view("unknown");
+    application.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
+    application.decision.capabilityId = application.definition.id;
+    application.decision.evidence = { category };
+    expect(capabilityExplanation(application)).toMatch(/administrator.*credentials/i);
+    expect(capabilityExplanation(application)).not.toMatch(/Sign in again|reauthorize this delegated/);
+    expect(capabilityNextStep(application)).toMatchObject({ label: "Admin setup", href: "https://entra.microsoft.com/" });
+    expect(capabilityNextStep(application)?.text).toMatch(/application.*permissions/i);
+  });
+
   function onDemandView(id: CapabilityId): CapabilityView {
     return {
       definition: capabilityDefinitions.find(definition => definition.id === id)!,
