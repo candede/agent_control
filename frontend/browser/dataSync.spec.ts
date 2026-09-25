@@ -492,6 +492,54 @@ test("Users navigation stays read-only and Sync retains the explicit users-only 
   expect(fixture.unexpected).toEqual([]);
 });
 
+for (const status of ["partial", "cancelled"] as const) {
+  test(`${status} sync runs stay read-only while the normal Sync action starts a fresh run`, async ({ page }) => {
+    const state = completedState();
+    const previous: DataSyncRun = {
+      ...state.run!,
+      status,
+      sources: state.run!.sources.filter(source => source.source !== "usage_reports").map(source =>
+        source.source === "users" ? source : {
+          ...source,
+          status: status === "cancelled" ? "cancelled" : source.source === "graph_packages" ? "failed" : "partial",
+          canRetry: true,
+          message: "The previous collection stopped; its saved data was kept.",
+        }),
+    };
+    const fixture = await mockSync(page, { ...state, run: previous }, [previous]);
+    await page.goto("/sync");
+    const panel = page.getByRole("region", { name: "Data sync", exact: true });
+    const workspace = panel.getByRole("region", { name: "Workspace data", exact: true });
+    await expect(workspace.getByText("3 of 3 sources synced")).toBeVisible();
+    await expect(panel.getByRole("button", { name: /retry|resume/i })).toHaveCount(0);
+    await panel.getByRole("button", { name: "View run details" }).click();
+    const details = page.getByRole("dialog", { name: "Sync run details" });
+    await expect(details.getByText(previous.id, { exact: true })).toBeVisible();
+    await expect(details.getByText("The previous collection stopped; its saved data was kept.")).toHaveCount(2);
+    await expect(details.getByRole("button", { name: /retry|resume|cancel|^sync |^start /i })).toHaveCount(0);
+    await expect(details.getByText(/Start a new sync when you're ready/)).toBeVisible();
+    expect(fixture.starts).toEqual([]);
+
+    await details.getByRole("button", { name: "Back to workspace" }).click();
+    await panel.getByRole("button", { name: "Sync all sources", exact: true }).click();
+    await expect(panel.getByText("Syncing graph packages, power platform", { exact: true })).toBeVisible();
+    await expect(workspace.getByRole("article", { name: "Graph packages" }).getByText("42", { exact: true })).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Sync all sources", exact: true })).toBeDisabled();
+    await expect(panel.getByRole("button", { name: "Cancel run", exact: true })).toBeEnabled();
+    expect(fixture.starts).toEqual([{ mode: "incremental" }]);
+    await panel.getByRole("button", { name: "View run details" }).click();
+    await expect(details.getByText("11111111-1111-4111-8111-111111111111", { exact: true })).toBeVisible();
+    await expect(details.getByText(previous.id, { exact: true })).toHaveCount(0);
+
+    await page.goto(`/sync?syncRun=${previous.id}`);
+    await expect(details.getByText(previous.id, { exact: true })).toBeVisible();
+    await expect(details.getByText("The previous collection stopped; its saved data was kept.")).toHaveCount(2);
+    await expect(details.getByRole("button", { name: /retry|resume|cancel|^sync |^start /i })).toHaveCount(0);
+    expect(fixture.starts).toEqual([{ mode: "incremental" }]);
+    expect(fixture.unexpected).toEqual([]);
+  });
+}
+
 for (const entryPath of ["/sync", "/agents"]) {
   test(`retained run links from ${entryPath} resolve to the exact Sync page across reload and history`, async ({ page }) => {
     const latest = completedState();

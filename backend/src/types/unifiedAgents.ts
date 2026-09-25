@@ -10,6 +10,8 @@ import type {
 
 export type UnifiedAgentSource = "graph_packages" | "power_platform";
 export type UnifiedAgentSourceFilter = "all" | UnifiedAgentSource | "both";
+export const unifiedAgentInventoryScopes = ["catalog", "power_platform_only", "all"] as const;
+export type UnifiedAgentInventoryScope = typeof unifiedAgentInventoryScopes[number];
 export type UnifiedAgentPresence = "graph_packages" | "power_platform" | "both";
 export type UnifiedAgentLinkState = "matched" | "unmatched" | "ambiguous" | "conflicting";
 export const unifiedAgentSortKeys = [
@@ -189,7 +191,7 @@ export type UnifiedAgentInventorySummary = {
 };
 
 export type UnifiedAgentInventoryVerification = {
-  status: "verified" | "needs_attention";
+  status: "verified" | "details_pending" | "needs_attention";
   scope: "authorized_saved_sources";
   checkedAt: string;
   graphPackageCount: number;
@@ -220,10 +222,20 @@ export type UnifiedAgentInventoryPage = {
   count: number;
   offset: number;
   limit: number;
+  /** Complete authorized inventory before inventory scope, ordinary filters, or paging. */
   summary: UnifiedAgentInventorySummary;
+  /** Resolved scope for scopeSummary, inventoryOverview, and facets. */
+  inventoryScope: UnifiedAgentInventoryScope;
+  /** Selected inventory scope before ordinary filters or paging. */
+  scopeSummary: UnifiedAgentInventorySummary;
   filteredSummary: UnifiedAgentInventorySummary;
   verification: UnifiedAgentInventoryVerification;
-  identityCollection?: { checkedPackages: number; pendingPackages: number; invalidPackages?: number };
+  identityCollection?: {
+    checkedPackages: number;
+    pendingPackages: number;
+    pendingDetails?: { missing: number; stale: number; invalidated: number };
+    invalidPackages?: number;
+  };
   facets: {
     environments: Array<{ value: string; label: string }>;
     platforms: Array<{ value: string; label: string }>;
@@ -237,6 +249,8 @@ export type UnifiedAgentInventoryPage = {
 };
 
 export type UnifiedAgentInventoryQuery = {
+  /** Defaults to all for exact reads and other non-UI consumers. */
+  inventoryScope?: UnifiedAgentInventoryScope;
   view?: UnifiedAgentView;
   recordId?: string;
   operationIdPrefix?: string;

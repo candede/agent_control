@@ -130,6 +130,74 @@ describe("Durable scoped jobs", () => {
     await jobs.release(lease);
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", cancelled: 1, inconclusive: 1 });
   });
+
+  it.each([
+    { outcome: "inconclusive", pending: false, status: "partial" },
+    { outcome: "inconclusive", pending: true, status: "partial" },
+    { outcome: "succeeded", pending: false, status: "succeeded" },
+    { outcome: "succeeded", pending: true, status: "waiting_authorization" },
+  ] as const)("preserves $outcome aggregation when authorization pauses with pending=$pending", async ({ outcome, pending, status }) => {
+    const job = await jobs.submit(scope, input(pending ? ["first", "second"] : ["first"]));
+    const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
+    const work = (await jobs.beginItem(lease))!;
+    await jobs.markSent(lease, work.item.id, work.item.prestate_hash);
+    await jobs.finishItem(lease, work.item.id, outcome);
+
+    await jobs.pauseForAuthorization(lease);
+
+    expect(await jobs.get(job.id, scope)).toMatchObject({
+      status, completed: 1, canResume: pending,
+      results: [{ id: "first", status: outcome, reconciliationStatus: outcome === "inconclusive" ? "required" : "not_required" }],
+    });
+    expect((await fixture.runtime.query("SELECT lease_owner,lease_until FROM jobs WHERE id=$1", [job.id])).rows[0])
+      .toEqual({ lease_owner: null, lease_until: null });
+    await expect(jobs.release(lease)).rejects.toMatchObject({ code: "lease_lost" });
+    expect(await jobs.claim(job.id, scope, randomUUID())).toBeUndefined();
+    await jobs.cancel(job.id, scope);
+  });
+
+  it("preserves inconclusive outcomes when the next unsent item pauses for authorization", async () => {
+    const job = await jobs.submit(scope, input(["first", "second"]));
+    const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
+    const first = (await jobs.beginItem(lease))!;
+    await jobs.markSent(lease, first.item.id, first.item.prestate_hash);
+    await jobs.finishItem(lease, first.item.id, "inconclusive");
+    const second = (await jobs.beginItem(lease))!;
+
+    await jobs.pauseItemForAuthorization(lease, second.item.id);
+
+    expect(await jobs.get(job.id, scope)).toMatchObject({
+      status: "partial", completed: 1, inconclusive: 1, canResume: true,
+      results: [{ id: "first", reconciliationStatus: "required", retryEligible: false }],
+    });
+    expect((await fixture.runtime.query("SELECT status,sent_at FROM job_items WHERE id=$1", [second.item.id])).rows[0])
+      .toEqual({ status: "queued", sent_at: null });
+    expect((await fixture.runtime.query("SELECT outcome,finished_at FROM job_attempts WHERE item_id=$1", [second.item.id])).rows[0])
+      .toEqual({ outcome: "cancelled", finished_at: expect.any(Date) });
+    const resumed = (await jobs.claim(job.id, scope, randomUUID(), true))!;
+    expect((await jobs.beginItem(resumed))?.item.id).toBe(second.item.id);
+    await jobs.finishItem(resumed, second.item.id, "skipped");
+    await jobs.release(resumed);
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1, skipped: 1, canResume: false });
+  });
+
+  it("does not release an expired lease or an unfinished item for authorization", async () => {
+    const job = await jobs.submit(scope, input(["unfinished"]));
+    const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
+    const work = (await jobs.beginItem(lease))!;
+    await expect(jobs.pauseForAuthorization(lease)).rejects.toMatchObject({ code: "lease_lost" });
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "running", completed: 0 });
+    await jobs.markSent(lease, work.item.id, work.item.prestate_hash);
+    await jobs.finishItem(lease, work.item.id, "inconclusive");
+    await fixture.operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
+
+    await expect(jobs.pauseForAuthorization(lease)).rejects.toMatchObject({ code: "lease_lost" });
+
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "running", inconclusive: 1 });
+    await jobs.recover(scope.tenantId);
+    expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1, canResume: false });
+  });
+
   it("denies admission and unsent dispatch in maintenance", async () => {
     const job = await jobs.submit(scope, input(["maintenance"]));
     const lease = (await jobs.claim(job.id, scope, randomUUID()))!;

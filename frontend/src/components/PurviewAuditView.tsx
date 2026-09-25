@@ -935,7 +935,7 @@ function PurviewAuditSession({
           <section className="purview-qualification" aria-label="Audit Search authorization pending">
             <div>
               <strong>Delegated authorization is not ready</strong>
-              <p>Automatic safe permission checks run while this signed-in session is active. No audit search is submitted by those checks.</p>
+              <p>Permissions are checked once after sign-in. To check again, open Permissions and select Check status. These checks do not submit an audit search.</p>
             </div>
             <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
           </section>
@@ -956,7 +956,7 @@ function PurviewAuditSession({
           <span>
             {available
               ? applicationMode ? "Shared application qualification is current." : "Delegated authorization is ready for an explicit bounded search."
-              : applicationMode ? "Search remains disabled until shared application setup and qualification succeed." : "Search remains disabled until automatic permission checks establish delegated authorization."}
+              : applicationMode ? "Search remains disabled until shared application setup and qualification succeed." : "Search remains disabled until a permission check establishes delegated authorization."}
           </span>
         </div>
       </form>

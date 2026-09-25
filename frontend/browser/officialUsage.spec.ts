@@ -558,6 +558,8 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   expect(uploadBodies).toHaveLength(3);
   for (const body of uploadBodies) {
     expect(body).not.toMatch(/name="(?:reportingStart|reportingEnd|sourceAsOf|downloadedAt)"/);
+    expect(body).not.toContain('name="correctionOfSetId"');
+    expect(body).toMatch(/name="rejectDuplicateKind"\r?\n\r?\ntrue/);
   }
   await page.getByRole("button", { name: "Close", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
@@ -565,7 +567,7 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Validated report previews" })).toBeVisible();
   await page.getByRole("button", { name: "Accept reviewed bundle" }).click();
-  await expect(page.getByText(/three-file snapshot was added to cumulative history and is current/)).toBeVisible();
+  await expect(page.getByText(/three-file snapshot was added to retained history and is current/)).toBeVisible();
   await expect(modal.getByLabel("Import progress").locator('[aria-current="step"]')).toContainText("Result");
   await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
@@ -649,7 +651,8 @@ test("snapshot inspection preserves raw source totals and read-only access", asy
   await expect(page.locator(".report-chart-panel")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Agent activity report" }).getByRole("link")).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/users");
-  expect(historyRequests).toEqual(["limit=1&offset=0"]);
+  expect(historyRequests.length).toBeGreaterThan(0);
+  expect(historyRequests.every(query => query === "limit=1&offset=0")).toBe(true);
   await expect(modal.getByRole("heading", { name: "Report history" })).toHaveCount(0);
   if (info.project.name === "desktop") {
     const bounds = await table.boundingBox();

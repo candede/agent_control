@@ -5,6 +5,7 @@ import type { OfficialUsageOverviewView } from "../types/officialUsage.js";
 import { retainedSetIntegritySql, validateOfficialUsageHistoryOptions } from "./officialUsageHistory.js";
 
 export type OfficialUsageOverviewOptions = {
+  scope?: "history" | "selected";
   search?: string;
   startDate?: string;
   endDate?: string;
@@ -41,7 +42,7 @@ export class OfficialUsageOverviewService {
     const activeSinceDateUtc = activeSince.toISOString().slice(0, 10);
     return transaction(this.database, async client => {
       await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
-      const result = await client.query<OverviewRow>(overviewSql(filters.sortBy, filters.sortDirection), [
+      const result = await client.query<OverviewRow>(overviewSql(filters.sortBy, filters.sortDirection, filters.scope), [
         tenantId, filters.startDate, filters.endDate, filters.search, activeSinceDateUtc, today, limit, offset,
       ]);
       const row = result.rows[0]!;
@@ -67,6 +68,9 @@ export class OfficialUsageOverviewService {
 
 export function validateOfficialUsageOverviewOptions(options: OfficialUsageOverviewOptions) {
   const paging = validateOfficialUsageHistoryOptions(options);
+  if (options.scope !== undefined && options.scope !== "history" && options.scope !== "selected") {
+    throw new AppError(400, "invalid_usage_query", "The official usage overview scope must be history or selected.");
+  }
   if (options.search !== undefined && (typeof options.search !== "string" ||
       options.search.length > 256 || /[\r\n\0]/.test(options.search))) {
     throw new AppError(400, "invalid_usage_query", "The official usage search must be at most 256 characters of text.");
@@ -81,7 +85,8 @@ export function validateOfficialUsageOverviewOptions(options: OfficialUsageOverv
   if (!["agentName", "lastActivity"].includes(sortBy) || !["asc", "desc"].includes(sortDirection)) {
     throw new AppError(400, "invalid_usage_query", "The official usage overview sort is not supported.");
   }
-  return { ...paging, search: options.search?.trim() || null, startDate, endDate, sortBy, sortDirection };
+  return { ...paging, ...(options.scope ? { scope: options.scope } : {}),
+    search: options.search?.trim() || null, startDate, endDate, sortBy, sortDirection };
 }
 
 function strictDate(value: string | undefined): string | null {
@@ -94,19 +99,21 @@ function strictDate(value: string | undefined): string | null {
   return value;
 }
 
-function overviewSql(sortBy: "agentName" | "lastActivity", sortDirection: "asc" | "desc") {
+function overviewSql(sortBy: "agentName" | "lastActivity", sortDirection: "asc" | "desc", scope: "history" | "selected" = "history") {
   const order = `${sortBy === "agentName" ? "agent_name" : "last_activity"} ${sortDirection} NULLS LAST,agent_id COLLATE "C" ASC`;
   return `WITH retained_sets AS MATERIALIZED (
       SELECT report_set.id,report_set.tenant_id,report_set.accepted_at
       FROM official_usage_sets report_set
       WHERE report_set.tenant_id=$1 AND report_set.complete AND report_set.accepted_at IS NOT NULL
         AND report_set.deleted_at IS NULL AND ${retainedSetIntegritySql}
-        -- A deleted accepted correction still supersedes the incorrect original.
+        ${scope === "selected" ? `AND report_set.id=(
+          SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1
+        )` : `-- A deleted accepted correction still supersedes the incorrect original.
         AND NOT EXISTS (
           SELECT 1 FROM official_usage_sets replacement
           WHERE replacement.tenant_id=report_set.tenant_id AND replacement.supersedes_set_id=report_set.id
             AND replacement.complete AND replacement.accepted_at IS NOT NULL
-        )
+        )`}
     ), retained_versions AS MATERIALIZED (
       SELECT DISTINCT ON (version.id) version.id,version.tenant_id,version.kind,
         report_set.id AS set_id,report_set.accepted_at

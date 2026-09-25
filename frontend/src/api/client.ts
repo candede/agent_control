@@ -806,6 +806,7 @@ export function getOfficialUsageHistory(
 export function stageOfficialUsageReport(file: File, input: {
   bundleId: string;
   correctionOfSetId?: string;
+  rejectDuplicateKind?: boolean;
   reportingStart?: string;
   reportingEnd?: string;
   periodProvenance?: "source_metadata" | "operator_asserted";
@@ -816,7 +817,7 @@ export function stageOfficialUsageReport(file: File, input: {
   const form = new FormData();
   form.append("file", file);
   for (const [key, value] of Object.entries(input)) {
-    if (value !== undefined) form.append(key, value);
+    if (value !== undefined) form.append(key, String(value));
   }
   return request<OfficialUsageStagingPreview>("/api/official-usage/staging", { method: "POST", body: form });
 }
@@ -830,7 +831,7 @@ export function previewOfficialUsageBundle(bundleId: string, options: { signal?:
 }
 
 export function acceptOfficialUsageBundle(preview: OfficialUsageBundlePreview) {
-  return request<{ setId: string; versionId: string; activeRevision: number; complete: boolean }>(`/api/official-usage/bundles/${encodeURIComponent(preview.bundleId)}/accept`, {
+  return request<{ setId: string; versionId: string; activeRevision: number; complete: boolean; reusedExistingSet?: boolean }>(`/api/official-usage/bundles/${encodeURIComponent(preview.bundleId)}/accept`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }),
   });
@@ -869,6 +870,7 @@ export type OfficialUsageAgentQuery = {
 };
 
 export type OfficialUsageOverviewQuery = {
+  scope?: "history" | "selected";
   search?: string;
   startDate?: string;
   endDate?: string;
@@ -1272,8 +1274,8 @@ export async function getBulkActionJob(id: string, options: { signal?: AbortSign
   );
 }
 
-export function getBulkActionJobs(limit = 20) {
-  return request<{ value: BulkActionJob[] }>(`/api/agents/bulk-jobs?limit=${limit}`);
+export function getBulkActionJobs(limit = 20, options: { signal?: AbortSignal } = {}) {
+  return request<{ value: BulkActionJob[] }>(`/api/agents/bulk-jobs?limit=${limit}`, { signal: options.signal });
 }
 
 export function reconcileBulkActionJob(id: string) {

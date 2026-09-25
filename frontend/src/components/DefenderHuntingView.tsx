@@ -612,13 +612,13 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
             {canQualify ? <button type="button" disabled={!approvalAcknowledged || !catalog || !filters || Boolean(rangeError || operationError || qualificationTargetError || qualificationRangeError || busy)} onClick={() => void handleApprove()}><ShieldCheck aria-hidden="true" /> Approve qualification</button> : null}
             {canStartQualification ? <button type="button" disabled={Boolean(busy)} onClick={() => void handleStartQualification()}><Play aria-hidden="true" /> Run approved qualification</button> : null}
           </div></section> : !available ? <section className="hunting-qualification" aria-label="Hunting authorization pending"><div><strong>Delegated authorization is not ready</strong>
-            <p>Automatic safe permission checks run while this signed-in session is active. They never submit a hunting query.</p></div>
+            <p>Permissions are checked once after sign-in. To check again, open Permissions and select Check status. These checks do not submit a hunting query.</p></div>
             <button type="button" className="secondary" onClick={capability.openPermissions}>Open Permissions</button>
           </section> : null}
 
         <div className="hunting-search-actions"><WorkbenchActionGate actionId="defender.search"><button type="submit" disabled={!available || !catalog || !filters || Boolean(rangeError || operationError || busy)}><Search aria-hidden="true" /> Run hunt</button></WorkbenchActionGate>
           <span>{available ? applicationMode ? "Current shared qualification permits an explicit hunt." : "Delegated authorization permits an explicit bounded hunt."
-            : applicationMode ? "Provider requests remain disabled until shared application qualification succeeds." : "Provider requests remain disabled until automatic permission checks establish delegated authorization."}</span></div>
+            : applicationMode ? "Provider requests remain disabled until shared application qualification succeeds." : "Provider requests remain disabled until a permission check establishes delegated authorization."}</span></div>
       </form>
 
       <section className="hunting-history" aria-labelledby="hunting-history-title"><header><div><h3 id="hunting-history-title">Hunting history</h3><p>Delegated results remain principal-private. Application results use only the current approved shared scope.</p></div><span>{historyCount === undefined ? "Unknown" : historyCount.toLocaleString()} jobs</span></header>

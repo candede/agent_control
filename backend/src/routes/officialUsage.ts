@@ -23,7 +23,8 @@ import { operationalLog } from "../services/telemetry.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024, files: 1, fields: 8, fieldSize: 4_096, parts: 9 },
+  // Busboy emits partsLimit when the threshold is reached, not exceeded.
+  limits: { fileSize: 8 * 1024 * 1024, files: 1, fields: 9, fieldSize: 4_096, parts: 11 },
 });
 const uploadRequestState = Symbol("officialUsageUploadState");
 const uploadDeadlineMilliseconds = 15_000;
@@ -167,6 +168,7 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
         fileHash: createHash("sha256").update(file.buffer).digest("hex"),
         bundleId: input.bundleId,
         correctionOfSetId: input.correctionOfSetId,
+        rejectDuplicateKind: input.rejectDuplicateKind,
         signal: uploadState?.signal,
       });
       stagedId = preview.id;
@@ -212,11 +214,15 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
     access: "authenticated", dataClass: "official_usage_overview", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     const scope = requestScope(request);
-    validateViewQuery(request.query, ["search", "startDate", "endDate", "sortBy", "sortDirection", "limit", "offset"]);
+    validateViewQuery(request.query, ["scope", "search", "startDate", "endDate", "sortBy", "sortDirection", "limit", "offset"]);
+    if (request.query.scope === "") {
+      throw new AppError(400, "invalid_usage_query", "The official usage overview scope is invalid.");
+    }
     if (request.query.sortBy === "" || request.query.sortDirection === "") {
       throw new AppError(400, "invalid_usage_query", "The official usage overview sort is invalid.");
     }
     response.json(await overview.getOverview(scope.tenantId, {
+      scope: queryEnum(first(request.query.scope), ["history", "selected"] as const, "overview scope"),
       search: first(request.query.search),
       startDate: first(request.query.startDate),
       endDate: first(request.query.endDate),
@@ -389,11 +395,14 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
   return router;
 }
 
-function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?: string; metadata?: OfficialUsageMetadata } {
+function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?: string; rejectDuplicateKind?: boolean; metadata?: OfficialUsageMetadata } {
   if (!body || typeof body !== "object") throw new AppError(400, "invalid_metadata", "The report upload fields are invalid.");
   const fields = body as Record<string, unknown>;
-  const allowed = new Set(["bundleId", "correctionOfSetId", "reportingStart", "reportingEnd", "periodProvenance", "sourceAsOf", "sourceAsOfProvenance", "downloadedAt"]);
+  const allowed = new Set(["bundleId", "correctionOfSetId", "rejectDuplicateKind", "reportingStart", "reportingEnd", "periodProvenance", "sourceAsOf", "sourceAsOfProvenance", "downloadedAt"]);
   if (Object.keys(fields).some(key => !allowed.has(key))) throw new AppError(400, "invalid_metadata", "The report metadata contains an unsupported field.");
+  if (fields.rejectDuplicateKind !== undefined && fields.rejectDuplicateKind !== "true" && fields.rejectDuplicateKind !== "false") {
+    throw new AppError(400, "invalid_metadata", "The rejectDuplicateKind field must be true or false.");
+  }
   const suppliedPeriodFields = [fields.reportingStart, fields.reportingEnd, fields.periodProvenance]
     .filter(value => value !== undefined && value !== "").length;
   if (suppliedPeriodFields !== 0 && suppliedPeriodFields !== 3) {
@@ -418,6 +427,7 @@ function parseStageFields(body: unknown): { bundleId: string; correctionOfSetId?
   return {
     bundleId: uuid(fields.bundleId),
     correctionOfSetId: fields.correctionOfSetId ? uuid(fields.correctionOfSetId) : undefined,
+    rejectDuplicateKind: fields.rejectDuplicateKind === undefined ? undefined : fields.rejectDuplicateKind === "true",
     metadata,
   };
 }

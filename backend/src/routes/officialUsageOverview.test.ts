@@ -5,6 +5,7 @@ import type pg from "pg";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "../config.js";
 import { errorHandler } from "../errors.js";
+import { OfficialUsageOverviewService } from "../services/officialUsageOverview.js";
 import { createOfficialUsageRouter } from "./officialUsage.js";
 import { declaredRoutePolicies } from "./policy.js";
 
@@ -22,6 +23,7 @@ vi.mock("../services/telemetry.js", async original => ({
 const client = { query: vi.fn(), release: vi.fn() };
 const database = { connect: vi.fn(), query: vi.fn() };
 const providerRead = vi.fn();
+const overviewRead = vi.spyOn(OfficialUsageOverviewService.prototype, "getOverview");
 let server: Server;
 
 beforeAll(async () => {
@@ -49,6 +51,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
+  overviewRead.mockClear();
   database.query.mockReset().mockRejectedValue(new Error("No direct inventory, snapshot or provider reads"));
   database.connect.mockReset().mockResolvedValue(client);
   client.query.mockReset().mockImplementation(async (sql: string) => {
@@ -113,6 +116,12 @@ describe("official usage overview route", () => {
     });
     expect(JSON.stringify(response.body)).not.toMatch(/totalResponses|responsesSentToUsers|username/);
     expect(client.query.mock.calls[2]?.[1]?.[0]).toBe(config.tenantId);
+    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, expect.objectContaining({ scope: undefined }));
+  });
+
+  it.each(["history", "selected"])("passes the explicit %s scope to the tenant-scoped overview", async scope => {
+    expect(await get(`?scope=${scope}`)).toMatchObject({ status: 200 });
+    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, expect.objectContaining({ scope }));
   });
 
   it("passes supported literal filters and bounded paging to the tenant-scoped read", async () => {
@@ -123,13 +132,15 @@ describe("official usage overview route", () => {
           filters: { search: "Name%", startDate: "2024-02-29", endDate: "2024-03-01", sortBy: "agentName", sortDirection: "asc" },
         },
       });
-    expect(client.query.mock.calls[2]?.[1]).toEqual([
-      config.tenantId, "2024-02-29", "2024-03-01", "Name%", expect.any(String), expect.any(String), 100, 100_000,
-    ]);
+    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, {
+      scope: undefined, search: "Name%", startDate: "2024-02-29", endDate: "2024-03-01",
+      sortBy: "agentName", sortDirection: "asc", limit: 100, offset: 100_000,
+    });
   });
 
   it.each([
     "?setId=11111111-1111-4111-8111-111111111111", "?tenantId=other", "?creatorType=Custom",
+    "?scope=", "?scope=all", "?scope=Selected", "?scope=history&scope=selected", "?scope[value]=selected",
     "?search=one&search=two", "?limit=25&limit=50", "?search[name]=test",
     `?search=${"x".repeat(257)}`, "?search=%00",
     "?startDate=", "?endDate=", "?startDate=2026-02-29", "?endDate=2026-04-31",

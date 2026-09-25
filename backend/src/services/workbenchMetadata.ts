@@ -10,7 +10,6 @@ export const workbenchViews: WorkbenchViewDefinition[] = [
   { id: "sync", label: "Sync", path: "/sync", roles: ["AgentControl.Viewer"], source: "Saved data collection, source coverage, durable sync history, and Microsoft 365 report import, management, and snapshot inspection" },
   { id: "audit", label: "Audit", path: "/audit", roles: ["AgentControl.Viewer"], source: "Local administrative actions taken from this app" },
   { id: "permissions", label: "Permissions", path: "/permissions", roles: ["AgentControl.Viewer"], source: "Agent Control capability registry" },
-  { id: "jobs", label: "Jobs", path: "/jobs", roles: ["AgentControl.Viewer"], source: "Authorized user-requested work" },
 ];
 
 export const workbenchActions: WorkbenchActionDefinition[] = [

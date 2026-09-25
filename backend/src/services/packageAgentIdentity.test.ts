@@ -307,6 +307,29 @@ describe("explicit package-to-agent identity", () => {
     }, now)[0]).toBe(saved);
   });
 
+  it.each(["missing", "stale"] as const)("matches catalog manifest proof independently of %s details", state => {
+    const value = { ...declarativePackage(), detailFreshness: { state, observedAt: null, expiresAt: null } };
+    const result = resolvePackageAgentLinks("tenant-a", [value], [declarativeResource()])[0];
+    expect(result).toMatchObject({
+      status: "matched", evidence: [{ kind: "manifest_schema_native_id", elementIds: [] }],
+    });
+    expect(result).not.toHaveProperty("controlBotId");
+    expect(resolvePackageAgentLinks("tenant-a", [value], [])[0]).toHaveProperty("grouping");
+    for (const changed of [
+      { identityRevalidationRequired: true as const },
+      { detailFreshness: { state: "invalidated" as const, observedAt: null, expiresAt: null } },
+      { elementTypes: [] },
+      { elementDetails: [...value.elementDetails!, ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: otherId } }).elementDetails!] },
+      { elementDetails: [{ elementType: "DeclarativeCopilots", elements: [
+        { id: "first", definition: "{}" }, { id: "second", definition: "{}" },
+      ] }] },
+    ]) {
+      const rejected = resolvePackageAgentLinks("tenant-a", [{ ...value, ...changed }], [declarativeResource()])[0];
+      expect(rejected.status).not.toBe("matched");
+      expect(rejected).not.toHaveProperty("grouping");
+    }
+  });
+
   it("requires declarative kind, manifest identity, and matching native and schema IDs together", () => {
     const value = declarativePackage();
     const saved = declarativeResource();

@@ -154,11 +154,15 @@ describe("OfficialUsageImportPanel", () => {
     });
     api.acknowledge.mockResolvedValue(undefined);
     api.discard.mockResolvedValue(undefined);
-    api.stage.mockImplementation((file: File) => {
+    api.stage.mockImplementation((file: File, input: { bundleId: string; correctionOfSetId?: string }) => {
       const kind = file.name.startsWith("agents")
         ? "agents"
         : file.name.startsWith("user-agents") ? "userAgents" : "users";
-      const value = preview(kind, kind === "userAgents" ? "Pseudonymous usernames remain dataset-scoped." : undefined);
+      const value = {
+        ...preview(kind, kind === "userAgents" ? "Pseudonymous usernames remain dataset-scoped." : undefined),
+        bundleId: input.bundleId,
+        correctionOfSetId: input.correctionOfSetId ?? null,
+      };
       staged = [...staged.filter(existing => existing.kind !== kind), value];
       return Promise.resolve(value);
     });
@@ -239,10 +243,10 @@ describe("OfficialUsageImportPanel", () => {
       await expect(cancelledRead).rejects.toMatchObject({ kind: "aborted" });
       expect(api.getAdminState.mock.calls[1][0].signal.aborted).toBe(false);
       const assertCurrentMetadata = () => {
-        if (operation === "accept") expect(screen.getByText(/added to cumulative history and is current/)).toBeVisible();
+        if (operation === "accept") expect(screen.getByText(/added to retained history and is current/)).toBeVisible();
         else if (operation === "select") expect(screen.getByText("Current", { exact: true })).toBeVisible();
         else if (operation === "stage") expect(screen.getByText(/saved report selection changed during validation/)).toBeVisible();
-        else if (operation === "discard") expect(screen.getByText("All staged rows were discarded.")).toBeVisible();
+        else if (operation === "discard") expect(screen.getByText(/All staged rows were discarded/)).toBeVisible();
         else expect(screen.getByText("No accepted official usage snapshots are retained.")).toBeVisible();
       };
       try {
@@ -308,7 +312,7 @@ describe("OfficialUsageImportPanel", () => {
     expect(await continueToReview()).toBeVisible();
     expect(api.stage).toHaveBeenCalledTimes(3);
     for (const [, input] of api.stage.mock.calls) {
-      expect(input).toEqual({ bundleId: expect.any(String), correctionOfSetId: undefined });
+      expect(input).toEqual({ bundleId: expect.any(String), rejectDuplicateKind: true });
     }
     expect(screen.getByRole("rowheader", { name: "Users & agents" })).toBeVisible();
     expect(screen.getByText("Pseudonymous usernames remain dataset-scoped.")).toBeVisible();
@@ -319,7 +323,7 @@ describe("OfficialUsageImportPanel", () => {
 
     await user.click(screen.getByRole("button", { name: "Accept reviewed bundle" }));
     await waitFor(() => expect(api.acceptBundle).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText(/added to cumulative history/i)).toBeVisible();
+    expect(await screen.findByText(/added to retained history/i)).toBeVisible();
     expect(screen.getByText(/and is current/i)).toBeVisible();
     expect(screen.getByLabelText("Import progress").querySelector('[aria-current="step"]')).toHaveTextContent("Result");
     expect(screen.queryByRole("region", { name: "Validated report previews" })).not.toBeInTheDocument();
@@ -363,7 +367,7 @@ describe("OfficialUsageImportPanel", () => {
     expect(screen.getByText(/No new history entry was created/i)).toBeVisible();
     expect(screen.getByText(/Original acceptance remains/)).toHaveTextContent("Aug 1, 2026");
     expect(screen.getByText(/Current selection remains 55555555 and its revision is unchanged/i)).toBeVisible();
-    expect(screen.queryByText(/added to cumulative history/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/added to retained history/i)).not.toBeInTheDocument();
   });
 
   it("reports a current semantic duplicate without refreshing its acceptance or revision", async () => {
@@ -397,10 +401,43 @@ describe("OfficialUsageImportPanel", () => {
     expect(await screen.findByText(/exactly matched the current retained snapshot/i)).toBeVisible();
     expect(screen.getByText(/Original acceptance remains/)).toHaveTextContent("Aug 5, 2026");
     expect(screen.getByText(/Current selection and revision are unchanged/i)).toBeVisible();
-    expect(screen.queryByText(/added to cumulative history/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/added to retained history/i)).not.toBeInTheDocument();
   });
 
-  it("appends a second accepted-period bundle without requiring correction acknowledgement", async () => {
+  it("reports an explicitly reused older snapshot outside the bounded admin list and lets it be inspected", async () => {
+    const duplicateSetId = "33333333-3333-4333-8333-333333333333";
+    const currentSetId = "55555555-5555-4555-8555-555555555555";
+    const state = {
+      ...emptyAdminState, activeSetId: currentSetId,
+      sets: Array.from({ length: 100 }, (_, index) => retainedSet(index ? `recent-set-${index}` : currentSetId)),
+    };
+    api.getAdminState.mockResolvedValue(state);
+    api.acceptBundle.mockResolvedValue({
+      setId: duplicateSetId, versionId: "older-version", activeRevision: 1, complete: true, reusedExistingSet: true,
+    });
+    const onViewSnapshot = vi.fn();
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} onViewSnapshot={onViewSnapshot} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["agents"], "agents.csv", { type: "text/csv" }),
+      new File(["user agents"], "user-agents.csv", { type: "text/csv" }),
+      new File(["users"], "users.csv", { type: "text/csv" }),
+    ]);
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await continueToReview();
+    await userEvent.click(screen.getByRole("button", { name: "Accept reviewed bundle" }));
+    const result = await screen.findByRole("region", { name: "Import result" });
+    await waitFor(() => expect(result).toHaveTextContent("The upload exactly matched retained snapshot 33333333"));
+    expect(result).toHaveTextContent("No new history entry was created");
+    expect(result).toHaveTextContent("Current selection remains 55555555 and its revision is unchanged");
+    expect(result).not.toHaveTextContent("added to");
+    expect(result).not.toHaveTextContent("could not confirm");
+    expect(result).not.toHaveTextContent("Original acceptance remains");
+    await userEvent.click(screen.getByRole("button", { name: "View snapshot" }));
+    expect(onViewSnapshot).toHaveBeenCalledWith(duplicateSetId);
+  });
+
+  it("stages changed reports in the same known window independently without correction acknowledgement", async () => {
     const activeSetId = "33333333-3333-4333-8333-333333333333";
     api.getAdminState.mockResolvedValue({
       ...emptyAdminState,
@@ -408,7 +445,7 @@ describe("OfficialUsageImportPanel", () => {
       sets: [{
         id: activeSetId,
         bundleId: "44444444-4444-4444-8444-444444444444",
-        reportingPeriod: { startDate: "2026-08-14", endDate: "2026-09-12", provenance: "activity_range" },
+        reportingPeriod: preview("agents").reportingPeriod,
         supersedesSetId: null,
         complete: true,
         kinds: ["agents", "userAgents", "users"],
@@ -421,9 +458,9 @@ describe("OfficialUsageImportPanel", () => {
     const user = userEvent.setup();
     render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
     await waitFor(() => expect(api.getAdminState).toHaveBeenCalled());
-    expect(screen.getByText(/ordinary uploads do not require a replacement acknowledgement/i)).toBeVisible();
-    expect(screen.getByText(/known reporting window, changed aggregate metrics require intentional correction/i)).toBeVisible();
-    expect(screen.getByText(/Activity-range-only imports have an unknown reporting window/i)).toBeVisible();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/Exact duplicate uploads are automatically reused/)).toBeVisible();
+    expect(screen.getByText(/Changed reports are saved as independent report sets, even for the same known reporting window/)).toBeVisible();
 
     await user.upload(screen.getByLabelText("Official usage CSV files"), [
       new File(["agents"], "agents.csv", { type: "text/csv" }),
@@ -435,42 +472,49 @@ describe("OfficialUsageImportPanel", () => {
     expect(await continueToReview()).toBeVisible();
     expect(screen.queryByText(/explicit correction.*before staging/i)).not.toBeInTheDocument();
     for (const [, input] of api.stage.mock.calls) {
-      expect(input.correctionOfSetId).toBeUndefined();
+      expect(input).not.toHaveProperty("correctionOfSetId");
+      expect(input.rejectDuplicateKind).toBe(true);
     }
     expect(screen.getByText(/duplicate observations reuse their original retained identity and acceptance time/i)).toBeVisible();
     expect(screen.getByText(/Aggregate snapshots are non-additive/i)).toBeVisible();
   });
 
-  it("keeps intentional correction metadata behind a separate explicit option", async () => {
+  it("keeps a restored legacy correction read-only and restarts independently after discarding staging", async () => {
     const activeSetId = "33333333-3333-4333-8333-333333333333";
+    const correctionOfSetId = "55555555-5555-4555-8555-555555555555";
+    staged = [{ ...preview("agents"), correctionOfSetId }];
     api.getAdminState.mockResolvedValue({
       ...emptyAdminState,
       activeSetId,
-      sets: [{
-        id: activeSetId,
-        bundleId: "44444444-4444-4444-8444-444444444444",
-        reportingPeriod: { startDate: "2026-08-14", endDate: "2026-09-12", provenance: "activity_range" },
-        supersedesSetId: null,
-        complete: true,
-        kinds: ["agents", "userAgents", "users"],
-        acceptedAt: "2026-09-13T12:00:00.000Z",
-        deletedAt: null,
-        createdAt: "2026-09-13T12:00:00.000Z",
-        expiresAt: "2027-03-12T12:00:00.000Z",
-      }],
+      staging: staged,
+      sets: [retainedSet(activeSetId), retainedSet(correctionOfSetId)],
     });
     const user = userEvent.setup();
     render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
-    await user.click(await screen.findByRole("checkbox", { name: /intentionally corrects/ }));
-    await user.upload(screen.getByLabelText("Official usage CSV files"), [
-      new File(["agents"], "agents.csv", { type: "text/csv" }),
-    ]);
+    await validationReady();
+    const notice = screen.getByRole("note", { name: "Legacy correction draft" });
+    expect(notice).toHaveTextContent(correctionOfSetId);
+    expect(notice).toHaveTextContent("read-only");
+    expect(notice).toHaveTextContent("discard staging");
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Back to files" }));
+    expect(notice).toBeVisible();
+    const discardedBundleId = staged[0].bundleId;
+    const discardedStageId = staged[0].id;
+    api.discard.mockImplementation(async () => {
+      staged = [];
+      api.getAdminState.mockResolvedValue({ ...emptyAdminState, activeSetId, sets: [retainedSet(activeSetId)] });
+    });
+    await user.click(screen.getByRole("button", { name: "Discard staging" }));
+    expect(await screen.findByText(/All staged rows were discarded/)).toBeVisible();
+    expect(api.discard).toHaveBeenCalledWith(discardedStageId);
+    expect(screen.queryByRole("note", { name: "Legacy correction draft" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
+    await user.upload(screen.getByLabelText("Official usage CSV files"), new File(["agents"], "agents.csv", { type: "text/csv" }));
     await user.click(screen.getByRole("button", { name: "Validate and stage" }));
-
-    expect(api.stage).toHaveBeenCalledWith(
-      expect.any(File),
-      expect.objectContaining({ correctionOfSetId: activeSetId }),
-    );
+    await validationReady();
+    expect(api.stage).toHaveBeenCalledWith(expect.any(File), { bundleId: expect.any(String), rejectDuplicateKind: true });
+    expect(api.stage.mock.calls[0][1].bundleId).not.toBe(discardedBundleId);
   });
 
   it("keeps every file validation error visible without looking up a bundle that was never created", async () => {
@@ -508,7 +552,7 @@ describe("OfficialUsageImportPanel", () => {
     await user.click(screen.getByRole("button", { name: "Validate and stage" }));
 
     expect(await screen.findByText(/exact report observation was deleted and cannot be reused/)).toBeVisible();
-    expect(screen.queryByText(/added to cumulative history/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/added to retained history/i)).not.toBeInTheDocument();
     expect(api.previewBundle).not.toHaveBeenCalled();
   });
 
@@ -538,6 +582,171 @@ describe("OfficialUsageImportPanel", () => {
     expect(screen.getByRole("button", { name: "Continue to review" })).toBeEnabled();
     await continueToReview();
     expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+  });
+
+  it.each([false, true])("requires explicit resolution of a duplicate-type draft without replacing earlier previews (restored=%s)", async restored => {
+    staged = restored ? [preview("agents"), preview("userAgents"), preview("users")].map(value => ({ ...value, rowCount: 17 })) : [];
+    api.getAdminState.mockImplementation(async () => ({ ...emptyAdminState, staging: staged }));
+    api.stage.mockImplementation((file: File, input: { bundleId: string; rejectDuplicateKind?: boolean }) => {
+      expect(input.rejectDuplicateKind).toBe(true);
+      const kind = file.name.startsWith("agents") ? "agents" : file.name.startsWith("user-agents") ? "userAgents" : "users";
+      if (staged.some(value => value.bundleId === input.bundleId && value.kind === kind)) {
+        return Promise.reject(new ApiError(409, "duplicate_report_kind", "This draft already contains an Agents report."));
+      }
+      const value = { ...preview(kind), bundleId: input.bundleId, rowCount: 17 };
+      staged = [...staged, value];
+      return Promise.resolve(value);
+    });
+    const props = { onChanged: vi.fn() };
+    const view = render(<OfficialUsageImportPanel {...props} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh import state" })).toBeEnabled());
+    if (restored) {
+      await validationReady();
+      await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    }
+    const originalFiles = [
+      new File(["original"], "agents-original.csv", { type: "text/csv" }),
+      new File(["user agents"], "user-agents.csv", { type: "text/csv" }),
+      new File(["users"], "users.csv", { type: "text/csv" }),
+    ];
+    const duplicate = new File(["replacement"], "agents-replacement.csv", { type: "text/csv" });
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), restored ? [duplicate] : [...originalFiles, duplicate]);
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await validationReady();
+    const draftBundleId = staged[0].bundleId;
+    const firstPreview = staged[0];
+    expect(screen.getByText(/agents-replacement.csv: This draft already contains an Agents report/)).toBeVisible();
+    expect(screen.getByText("Agents: 17 rows staged")).toBeVisible();
+    expect(screen.getByText("All three report kinds are present")).toBeVisible();
+    expect(screen.getByText(/Earlier staged reports were kept/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Retry rejected files" })).toBeDisabled();
+
+    view.rerender(<OfficialUsageImportPanel {...props} active={false} />);
+    view.rerender(<OfficialUsageImportPanel {...props} active />);
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    fireEvent.change(screen.getByLabelText("Official usage CSV files"), { target: { files: [] } });
+    await userEvent.click(screen.getByRole("button", { name: "Show validation" }));
+    await userEvent.click(screen.getByRole("button", { name: "Refresh import state" }));
+    await validationReady();
+    expect(staged[0]).toBe(firstPreview);
+    expect(screen.getByText("Agents: 17 rows staged")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    expect(api.acceptBundle).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), originalFiles);
+    expect(screen.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
+
+    const failedStageId = staged[0].id;
+    let failDiscard = true;
+    api.discard.mockImplementation(async (id: string) => {
+      if (failDiscard && id === failedStageId) throw new Error("Discard temporarily unavailable.");
+      staged = staged.filter(value => value.id !== id);
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Discard staging" }));
+    expect(await screen.findByText(/1 staged report\(s\) could not be discarded/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    failDiscard = false;
+    api.discard.mockClear();
+    await userEvent.click(screen.getByRole("button", { name: "Discard staging" }));
+    expect(await screen.findByText(/All staged rows were discarded/)).toBeVisible();
+    expect(api.discard).toHaveBeenCalledExactlyOnceWith(failedStageId);
+    expect(screen.queryByText(/This draft cannot be accepted/)).not.toBeInTheDocument();
+    expect(screen.getByText("No files selected")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), originalFiles);
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await continueToReview();
+    expect(staged).toHaveLength(3);
+    expect(staged[0].bundleId).not.toBe(draftBundleId);
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+    for (const [, input] of api.stage.mock.calls) expect(input).not.toHaveProperty("correctionOfSetId");
+  });
+
+  it.each([false, true])("can explicitly remove pending files and keep verified staged reports (complete=%s)", async complete => {
+    staged = complete ? [preview("agents"), preview("userAgents"), preview("users")] : [preview("agents")];
+    const originalPreviews = [...staged];
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    api.stage.mockRejectedValueOnce(new ApiError(409, "duplicate_report_kind", "This draft already contains an Agents report."))
+      .mockRejectedValueOnce(new Error("Unsupported CSV headers"));
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), [
+      new File(["replacement"], "agents-replacement.csv", { type: "text/csv" }),
+      new File(["unsupported"], "unsupported.csv", { type: "text/csv" }),
+    ]);
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await validationReady();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    expect(screen.getByText(/agents-replacement.csv: This draft already contains an Agents report/)).toBeVisible();
+    expect(screen.getByText(/unsupported.csv: Unsupported CSV headers/)).toBeVisible();
+    expect(screen.getByText(/This removes rejected files and any unvalidated selections, not staged reports/)).toBeVisible();
+    expect(api.acceptBundle).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Keep staged reports and remove pending files" }));
+    expect(screen.getByText(/Rejected and unvalidated file selections were removed from this import/)).toBeVisible();
+    expect(screen.getByText(/Earlier staged reports remain unchanged; no files were replaced/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry rejected files" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Keep staged reports and remove pending files" })).not.toBeInTheDocument();
+    expect(staged).toEqual(originalPreviews);
+    expect(api.discard).not.toHaveBeenCalled();
+    expect(api.stage).toHaveBeenCalledTimes(2);
+    expect(api.acceptBundle).not.toHaveBeenCalled();
+    if (complete) {
+      await continueToReview();
+      expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+    } else {
+      expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+      expect(screen.getByText("Missing Users & agents, Users")).toBeVisible();
+      await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+      expect(screen.getByText("No files selected")).toBeVisible();
+    }
+  });
+
+  it("requires verified previews before explicitly dropping a changed pending file selection", async () => {
+    staged = [preview("agents"), preview("userAgents"), preview("users")];
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    api.stage.mockRejectedValueOnce(new ApiError(409, "duplicate_report_kind", "This draft already contains an Agents report."));
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["replacement"], "agents.csv", { type: "text/csv" }));
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["not staged"], "users-new.csv", { type: "text/csv" }));
+    expect(screen.getByRole("button", { name: "Keep staged reports and remove pending files" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh import state" }));
+    await validationReady();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Keep staged reports and remove pending files" }));
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeEnabled();
+    expect(api.stage).toHaveBeenCalledOnce();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    expect(screen.getByText("No files selected")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
+  });
+
+  it("can discard preserved staging after duplicate rejection even if the bundle preview is unavailable", async () => {
+    staged = [preview("agents")];
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    api.previewBundle.mockRejectedValue(new Error("Preview unavailable."));
+    api.stage.mockRejectedValue(new ApiError(409, "duplicate_report_kind", "This draft already contains an Agents report."));
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await validationReady();
+    await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["replacement"], "agents.csv", { type: "text/csv" }));
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await validationReady();
+    expect(screen.getByRole("button", { name: "Continue to review" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Keep staged reports and remove pending files" })).toBeDisabled();
+    expect(screen.getByText(/Earlier staged reports were kept/)).toBeVisible();
+    api.getAdminState.mockResolvedValue(emptyAdminState);
+    await userEvent.click(screen.getByRole("button", { name: "Discard staging" }));
+    expect(await screen.findByText(/All staged rows were discarded/)).toBeVisible();
+    expect(api.discard).toHaveBeenCalledExactlyOnceWith(staged[0].id);
+    expect(screen.getByText("No files selected")).toBeVisible();
   });
 
   it("does not count preview failures as file rejections or lose the staged bundle intent", async () => {
@@ -716,7 +925,7 @@ describe("OfficialUsageImportPanel", () => {
     }
     expect(api.discard).toHaveBeenCalledTimes(2);
     expect(api.getAdminState).toHaveBeenCalledTimes(2);
-    expect(screen.queryByText("All staged rows were discarded.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/All staged rows were discarded/)).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Server validation" })).not.toBeInTheDocument();
   });
 
@@ -772,7 +981,7 @@ describe("OfficialUsageImportPanel", () => {
       sets: [retainedSet("33333333-3333-4333-8333-333333333333")],
     });
     await userEvent.click(screen.getByRole("button", { name: "Refresh result" }));
-    expect(await screen.findByText(/added to cumulative history and is current/)).toBeVisible();
+    expect(await screen.findByText(/added to retained history and is current/)).toBeVisible();
     expect(api.acceptBundle).toHaveBeenCalledOnce();
     expect(onChanged).toHaveBeenCalledOnce();
   });
@@ -990,9 +1199,10 @@ describe("OfficialUsageImportPanel", () => {
     expect(screen.getByRole("dialog", { name: "Import CSV reports" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "Retained report sets" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Back to files" }));
-    const correction = screen.getByRole("checkbox", { name: /intentionally corrects/ });
-    expect(correction).toBeChecked();
-    expect(correction).toBeDisabled();
+    const correction = screen.getByRole("note", { name: "Legacy correction draft" });
+    expect(correction).toHaveTextContent(correctionId);
+    expect(correction).toHaveTextContent("read-only");
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     await userEvent.upload(screen.getByLabelText("Official usage CSV files"), [
       new File(["user agents"], "user-agents.csv", { type: "text/csv" }),
       new File(["users"], "users.csv", { type: "text/csv" }),
@@ -1002,11 +1212,59 @@ describe("OfficialUsageImportPanel", () => {
     expect(api.stage).toHaveBeenCalledTimes(2);
     for (const [, input] of api.stage.mock.calls) {
       expect(input).toEqual({
-        bundleId, correctionOfSetId: correctionId, reportingStart: period.startDate,
+        bundleId, correctionOfSetId: correctionId, rejectDuplicateKind: true, reportingStart: period.startDate,
         reportingEnd: period.endDate, periodProvenance: "operator_asserted",
         sourceAsOf, sourceAsOfProvenance: "operator_asserted",
       });
     }
+  });
+
+  it("can leave an accepted-only legacy correction draft without deleting retained companions", async () => {
+    const correctionId = "original-corrected-snapshot";
+    const bundleId = "accepted-only-legacy-bundle";
+    const incomplete = {
+      ...retainedSet("incomplete-correction", { bundleId }),
+      complete: false, acceptedAt: null, kinds: ["agents"] as OfficialUsageReportKind[], supersedesSetId: correctionId,
+    };
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, sets: [retainedSet(correctionId), incomplete] });
+    api.previewBundle.mockResolvedValueOnce({
+      bundleId, bundleHash: "a".repeat(64), expectedActiveRevision: 1, staging: [],
+      acceptedVersions: [{
+        kind: "agents", versionId: "retained-companion", fileHash: "a".repeat(64),
+        reportingPeriod: incomplete.reportingPeriod, sourceAsOf: null, sourceAsOfProvenance: "absent",
+      }],
+      missingKinds: ["userAgents", "users"], reconciliation: {},
+    });
+    render(<OfficialUsageImportModal onChanged={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Import reports" }));
+    await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    await validationReady();
+    expect(screen.getByRole("note", { name: "Legacy correction draft" })).toHaveTextContent(correctionId);
+    await userEvent.click(screen.getByRole("button", { name: "Start independent report set" }));
+    expect(await screen.findByText(/Previously accepted companions remain retained/)).toBeVisible();
+    expect(api.discard).not.toHaveBeenCalled();
+    expect(api.confirm).not.toHaveBeenCalled();
+    expect(screen.queryByRole("note", { name: "Legacy correction draft" })).not.toBeInTheDocument();
+    await userEvent.upload(screen.getByLabelText("Official usage CSV files"), new File(["agents"], "agents.csv", { type: "text/csv" }));
+    await userEvent.click(screen.getByRole("button", { name: "Validate and stage" }));
+    await validationReady();
+    expect(api.stage).toHaveBeenCalledWith(expect.any(File), { bundleId: expect.any(String), rejectDuplicateKind: true });
+    expect(api.stage.mock.calls[0][1].bundleId).not.toBe(bundleId);
+  });
+
+  it("shows legacy correction intent explicitly during review without offering an editable mode", async () => {
+    staged = [preview("agents"), preview("userAgents"), preview("users")]
+      .map(value => ({ ...value, correctionOfSetId: "original-legacy-target" }));
+    api.getAdminState.mockResolvedValue({ ...emptyAdminState, staging: staged });
+    render(<OfficialUsageImportPanel onChanged={vi.fn()} />);
+    await continueToReview();
+    const notice = screen.getByRole("note", { name: "Legacy correction draft" });
+    expect(notice).toHaveTextContent("original-legacy-target");
+    expect(notice).toHaveTextContent("read-only and will be preserved if accepted");
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Discard staging" })).toBeEnabled();
   });
 
   it("keeps inherited staging metadata when the initial bundle preview is temporarily unavailable", async () => {

@@ -15,6 +15,7 @@ export type StageOfficialUsageInput = {
   fileHash: string;
   bundleId: string;
   correctionOfSetId?: string;
+  rejectDuplicateKind?: boolean;
   warnings?: string[];
   signal?: AbortSignal;
 };
@@ -124,8 +125,6 @@ export class OfficialUsageRepository {
     await transaction(this.database, async client => {
       await lockTenant(client, scope.tenantId);
       throwIfCancelled(input.signal);
-      await purgeExpiredPreviews(client, scope.tenantId, 10);
-      const state = await ensureState(client, scope.tenantId);
       const conflictingOwner = await client.query(`SELECT 1 FROM official_usage_sets
         WHERE tenant_id=$1 AND bundle_id=$2 AND actor_principal_id<>$3
         UNION ALL SELECT 1 FROM official_usage_staging
@@ -134,6 +133,17 @@ export class OfficialUsageRepository {
       if (conflictingOwner.rowCount) {
         throw new AppError(409, "bundle_owner_mismatch", "This unpublished report bundle belongs to another administrator.");
       }
+      if (input.rejectDuplicateKind) {
+        const duplicateKind = await client.query(`SELECT 1 FROM official_usage_staging
+          WHERE tenant_id=$1 AND actor_principal_id=$2 AND bundle_id=$3 AND kind=$4
+            AND status='active' AND expires_at>clock_timestamp() LIMIT 1`,
+        [scope.tenantId, scope.principalId, input.bundleId, input.report.kind]);
+        if (duplicateKind.rowCount) {
+          throw new AppError(409, "duplicate_report_kind", `This draft already contains a ${input.report.kind} report. Discard the draft before uploading a replacement for that report kind.`);
+        }
+      }
+      await purgeExpiredPreviews(client, scope.tenantId, 10);
+      const state = await ensureState(client, scope.tenantId);
       if (input.correctionOfSetId) {
         const correction = await client.query(`SELECT 1 FROM official_usage_sets
           WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL`, [input.correctionOfSetId, scope.tenantId]);
@@ -259,6 +269,10 @@ export class OfficialUsageRepository {
       if (Number(state.revision) !== input.expectedActiveRevision) {
         throw new AppError(409, "active_revision_mismatch", "The active official usage selection changed; create a new preview.");
       }
+      if (stage.correction_of_set_id) {
+        await validateCorrectionTarget(client, scope, stage.correction_of_set_id, stage.period_provenance,
+          dateValue(stage.reporting_start), dateValue(stage.reporting_end));
+      }
 
       const duplicateTargetSetId = stage.correction_of_set_id ?? state.active_set_id;
       if (duplicateTargetSetId) {
@@ -272,15 +286,16 @@ export class OfficialUsageRepository {
             AND version.tenant_id=membership.tenant_id AND version.kind=membership.kind AND version.deleted_at IS NULL
           WHERE staging.tenant_id=$1 AND staging.actor_principal_id=$2 AND staging.bundle_id=$3
             AND staging.status='active' AND staging.expires_at>clock_timestamp()
+            AND staging.correction_of_set_id IS NOT DISTINCT FROM $5::uuid
             AND version.content_hash=staging.content_hash`,
-        [scope.tenantId, scope.principalId, stage.bundle_id, duplicateTargetSetId]);
+        [scope.tenantId, scope.principalId, stage.bundle_id, duplicateTargetSetId, stage.correction_of_set_id]);
         if (duplicates.rows.length === 3 && new Set(duplicates.rows.map(row => row.kind)).size === 3) {
           for (const duplicate of duplicates.rows) {
             await markAccepted(client, scope, duplicate, duplicate.version_id, duplicateTargetSetId, Number(state.revision));
             await insertAudit(client, scope, "accepted", duplicate.kind, duplicate.version_id, duplicate.row_count);
           }
           const versionId = duplicates.rows.find(row => row.id === stage.id)!.version_id;
-          return { setId: duplicateTargetSetId, versionId, activeRevision: Number(state.revision), complete: state.active_set_id === duplicateTargetSetId };
+          return { setId: duplicateTargetSetId, versionId, activeRevision: Number(state.revision), complete: true };
         }
       }
 
@@ -453,7 +468,7 @@ export class OfficialUsageRepository {
         if (receipt.expires_at.getTime() <= Date.now()) {
           throw new AppError(409, "bundle_unavailable", "The reviewed report bundle receipt expired and cannot be republished.");
         }
-        const retained = await client.query<{ deleted_at: Date | null }>(`SELECT deleted_at FROM official_usage_sets
+        const retained = await client.query<{ deleted_at: Date | null; bundle_id: string }>(`SELECT deleted_at,bundle_id FROM official_usage_sets
           WHERE id=$1 AND tenant_id=$2`, [receipt.result_set_id, scope.tenantId]);
         if (retained.rows[0]?.deleted_at) {
           throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
@@ -466,6 +481,7 @@ export class OfficialUsageRepository {
           versionId: receipt.result_version_id,
           activeRevision: Number(receipt.result_active_revision),
           complete: receipt.result_complete,
+          reusedExistingSet: retained.rows[0].bundle_id !== bundleId,
         };
       }
       const preview = await bundlePreview(client, scope, bundleId, Number(state.revision));
@@ -475,17 +491,21 @@ export class OfficialUsageRepository {
       if (preview.missingKinds.length) {
         throw new AppError(409, "incomplete_bundle", "All three compatible report kinds must be reviewed before atomic publication.");
       }
+      await validateBundleHistoryIntent(client, scope, preview);
       let result: { setId: string; versionId: string; activeRevision: number; complete: boolean } | undefined;
       if (preview.contentHash && preview.staging.length === requiredKinds.length && preview.acceptedVersions.length === 0) {
+        const correctionOfSetId = preview.staging[0].correctionOfSetId;
         const duplicate = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds
           FROM official_usage_sets report_set
           WHERE report_set.tenant_id=$1 AND report_set.content_hash=$2 AND report_set.complete
-          ORDER BY report_set.deleted_at NULLS FIRST,report_set.accepted_at,report_set.id
-          LIMIT 1 FOR UPDATE`, [scope.tenantId, preview.contentHash])).rows[0];
+          ORDER BY report_set.deleted_at NULLS FIRST,
+            CASE WHEN report_set.id=$3::uuid THEN 0 WHEN report_set.supersedes_set_id=$3::uuid THEN 1 ELSE 2 END,
+            report_set.accepted_at,report_set.id
+          LIMIT 1 FOR UPDATE`, [scope.tenantId, preview.contentHash, correctionOfSetId])).rows[0];
         if (duplicate?.deleted_at) {
           throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
         }
-        if (duplicate) {
+        if (duplicate && (!correctionOfSetId || duplicate.id === correctionOfSetId || duplicate.supersedes_set_id === correctionOfSetId)) {
           const versions = await client.query<{ kind: ParsedOfficialUsageReport["kind"]; version_id: string }>(
             `SELECT kind,version_id FROM official_usage_set_versions
              WHERE set_id=$1 AND tenant_id=$2 ORDER BY kind`, [duplicate.id, scope.tenantId]);
@@ -510,7 +530,6 @@ export class OfficialUsageRepository {
           };
         }
       }
-      if (!result) await validateBundleHistoryIntent(client, scope, preview);
       if (!result) {
         for (const stage of preview.staging) {
           result = await this.acceptLocked(client, scope, stage.id, {
@@ -533,7 +552,9 @@ export class OfficialUsageRepository {
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [scope.tenantId, scope.principalId, bundleId, input.bundleHash, input.expectedActiveRevision,
         result.setId, result.versionId, result.activeRevision, result.complete]);
-      return result;
+      const retained = await client.query<{ bundle_id: string }>(`SELECT bundle_id FROM official_usage_sets
+        WHERE id=$1 AND tenant_id=$2`, [result.setId, scope.tenantId]);
+      return { ...result, reusedExistingSet: retained.rows[0].bundle_id !== bundleId };
     });
   }
 
@@ -964,38 +985,30 @@ async function validateBundleHistoryIntent(
   preview: Awaited<ReturnType<typeof bundlePreview>>,
 ) {
   if (!preview.contentHash || !preview.staging.length) return;
-  const reports = [...preview.staging, ...preview.acceptedVersions];
-  const basis = reports[0];
-  if (!basis) return;
-  const starts = reports.map(report => report.reportingPeriod.startDate).filter((value): value is string => value !== null);
-  const ends = reports.map(report => report.reportingPeriod.endDate).filter((value): value is string => value !== null);
-  const reportingStart = starts.length ? starts.sort()[0] : null;
-  const reportingEnd = ends.length ? ends.sort().at(-1)! : null;
-  const correctionOfSetId = preview.staging[0]?.correctionOfSetId ?? null;
-  if (correctionOfSetId) {
-    const correction = await client.query(`SELECT 1 FROM official_usage_sets report_set
+  const basis = preview.staging[0];
+  if (basis.correctionOfSetId) {
+    await validateCorrectionTarget(client, scope, basis.correctionOfSetId, basis.reportingPeriod.provenance,
+      basis.reportingPeriod.startDate, basis.reportingPeriod.endDate);
+  }
+}
+
+async function validateCorrectionTarget(
+  client: pg.PoolClient,
+  scope: OfficialUsageScope,
+  correctionOfSetId: string,
+  periodProvenance: StagingRow["period_provenance"],
+  reportingStart: string | null,
+  reportingEnd: string | null,
+) {
+  const correction = await client.query(`SELECT 1 FROM official_usage_sets report_set
       WHERE report_set.id=$1 AND report_set.tenant_id=$2 AND report_set.complete AND report_set.deleted_at IS NULL
         AND report_set.period_provenance=$3
         AND ($3='activity_range' OR (
           report_set.reporting_start IS NOT DISTINCT FROM $4::date
           AND report_set.reporting_end IS NOT DISTINCT FROM $5::date))`,
-    [correctionOfSetId, scope.tenantId, basis.reportingPeriod.provenance, reportingStart, reportingEnd]);
-    if (!correction.rowCount) {
-      throw new AppError(409, "invalid_correction", "A correction must target a retained observation with the same reporting-window provenance and, when known, dates.");
-    }
-    return;
-  }
-  if (basis.reportingPeriod.provenance === "activity_range") return;
-  const samePeriod = await client.query<{ id: string }>(`SELECT report_set.id
-    FROM official_usage_sets report_set
-    WHERE report_set.tenant_id=$1 AND report_set.complete AND report_set.deleted_at IS NULL
-      AND report_set.content_hash<>$2 AND report_set.period_provenance=$3
-      AND report_set.reporting_start IS NOT DISTINCT FROM $4::date
-      AND report_set.reporting_end IS NOT DISTINCT FROM $5::date
-    LIMIT 1`,
-  [scope.tenantId, preview.contentHash, basis.reportingPeriod.provenance, reportingStart, reportingEnd]);
-  if (samePeriod.rowCount) {
-    throw new AppError(409, "correction_required", "Changed content for the same known reporting window requires an explicit correction target.");
+  [correctionOfSetId, scope.tenantId, periodProvenance, reportingStart, reportingEnd]);
+  if (!correction.rowCount) {
+    throw new AppError(409, "invalid_correction", "A correction must target a retained observation with the same reporting-window provenance and, when known, dates.");
   }
 }
 

@@ -37,6 +37,7 @@ const record: UnifiedAgentRecord = {
 function inventory(records = [record]): UnifiedAgentInventoryPage {
   const summary = { total: records.length, linked: 0, graphOnly: 0, powerPlatformOnly: records.length, ambiguous: 0, conflicting: 0 };
   return { ...unifiedAgents, revision: "a".repeat(64), value: records, count: records.length, summary, filteredSummary: summary,
+    inventoryScope: "all", scopeSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: records.length, logicalAgentCount: records.length }),
     sources: { graphPackages: unifiedAgents.sources.graphPackages, powerPlatform: { state: "available", observation, error: null } },
     partial: false, errors: [], identityCollection: { checkedPackages: 0, pendingPackages: 0 } };
@@ -53,10 +54,14 @@ async function fixture(page: Page, records = [record]) {
     if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(path);
   });
   await page.route("**/api/agent-inventory*", route => {
-    const exact = new URL(route.request().url()).searchParams.get("recordId");
+    const query = new URL(route.request().url()).searchParams;
+    const exact = query.get("recordId");
     const data = inventory(records);
-    return route.fulfill({ json: { ...data, value: exact ? records.filter(record => record.id === exact) : records,
-      count: exact ? records.filter(record => record.id === exact).length : records.length } });
+    const inventoryScope = exact ? "all" : query.get("inventoryScope") === "catalog" ? "catalog" : "power_platform_only";
+    const scoped = inventoryScope === "catalog" ? inventory([]) : data;
+    const value = exact ? records.filter(record => record.id === exact) : scoped.value;
+    return route.fulfill({ json: { ...data, inventoryScope, scopeSummary: scoped.summary,
+      value, count: value.length, filteredSummary: { ...scoped.summary, total: value.length } } });
   });
   await page.route("**/api/agent-responsibility*", route => {
     const query = new URL(route.request().url()).searchParams;
@@ -80,7 +85,7 @@ test.afterEach(async ({ page }) => page.unrouteAll({ behavior: "wait" }));
 
 test("agent to exact responsible user outside paid/report cohorts and back to current canonical Overview", async ({ page }, info) => {
   const evidence = await fixture(page);
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=power_platform_only");
   await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
   const ownerField = page.getByRole("dialog").locator("dt").filter({ hasText: /^Owner$/ }).locator("..");
   await ownerField.getByRole("button", { name: "View responsibility for Same name", exact: true }).click();
@@ -134,7 +139,7 @@ test("unresolved people retain negative evidence, invalid deep links do not requ
     createdBy: { ...record.people!.createdBy!, status: "lookup_failed", errorCode: "provider_error", displayName: null, userPrincipalName: null },
   } };
   const evidence = await fixture(page, [unresolved]);
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=power_platform_only");
   await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
   await expect(page.getByRole("dialog").getByRole("button", { name: /View responsibility/ })).toHaveCount(0);
   await expect(page.getByText("User not found at the last directory lookup.")).toBeVisible();

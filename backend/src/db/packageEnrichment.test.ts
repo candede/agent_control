@@ -145,16 +145,19 @@ describe("persisted catalog and automatic detail enrichment", () => {
     expect(jobs[0]!.requestedIds).toHaveLength(20);
   });
 
-  it("enriches all saved readers without replacing summary state, catalog observations, or snapshots", async () => {
+  it.each([false, true])("enriches all saved readers without replacing catalog state (sparse details=%s)", async sparse => {
     const owner = scope();
     const catalog = await publish(owner, [{ ...summary(), isBlocked: true }]);
     const beforeRevision = await readUnifiedInventoryRevision(owner, fixture.runtime);
-    await enrich(owner, [detail()]);
+    const collected = detail();
+    if (sparse) delete collected.manifestId;
+    await enrich(owner, [collected]);
     const afterRevision = await readUnifiedInventoryRevision(owner, fixture.runtime);
     expect(afterRevision).not.toBe(beforeRevision);
     const saved = (await repository.get(owner, "one"))!;
     expect(saved.package).toMatchObject({
       displayName: "Catalog one", isBlocked: true, longDescription: "Saved detail description",
+      manifestId: summary().manifestId, identityDetailsCollected: true,
       elementDetails: detail().elementDetails, detailFreshness: { state: "fresh" },
     });
     expect((await repository.getMany(owner, ["one"]))[0].package).toEqual(saved.package);
@@ -235,7 +238,8 @@ describe("persisted catalog and automatic detail enrichment", () => {
     const before = await readUnifiedInventoryRevision(owner, fixture.runtime);
     await fixture.operator.query("UPDATE package_detail_cache SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2", [owner.tenantId, owner.principalId]);
     const saved = (await repository.get(owner, "one"))!.package!;
-    expect(saved).toMatchObject({ longDescription: "Saved detail description", detailFreshness: { state: "stale" }, identityRevalidationRequired: true });
+    expect(saved).toMatchObject({ longDescription: "Saved detail description", detailFreshness: { state: "stale" } });
+    expect(saved).not.toHaveProperty("identityDetailsCollected");
     expect((await repository.readUnifiedSource(owner)).observations.one).not.toHaveProperty("identityDetails");
     expect(await readUnifiedInventoryRevision(owner, fixture.runtime)).not.toBe(before);
   });

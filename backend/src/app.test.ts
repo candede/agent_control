@@ -24,8 +24,8 @@ import { CopilotStudioQuarantineClient } from "./services/copilotStudioQuarantin
 import { GraphPackagesClient } from "./services/graphPackages.js";
 import { allowlistedPackage } from "./services/packageObservation.js";
 import { capabilities } from "./services/capabilities.js";
-import { defenderHunting } from "./services/defenderHunting.js";
-import { purviewAudit } from "./services/purviewAudit.js";
+import { DefenderHuntingService, defenderHunting } from "./services/defenderHunting.js";
+import { PurviewAuditService, purviewAudit } from "./services/purviewAudit.js";
 import { launchBulkJob, runBulkJob } from "./services/bulkJobs.js";
 import type { AppRole } from "./types/capability.js";
 import type { PowerPlatformResource, PowerPlatformResourceType } from "./types/powerPlatformInventory.js";
@@ -75,7 +75,18 @@ vi.mock("./services/powerPlatformResourceQuery.js", async original => ({ ...awai
 } }));
 vi.mock("./services/bulkJobs.js", async original => ({ ...await original<typeof import("./services/bulkJobs.js")>(), launchBulkJob: vi.fn() }));
 vi.mock("./services/copilotStudioQuarantineJobs.js", async original => ({ ...await original<typeof import("./services/copilotStudioQuarantineJobs.js")>(), launchCopilotStudioQuarantineJob: vi.fn() }));
+// Draining is terminal, so each test needs fresh real workers rather than reopened singletons.
+vi.mock("./services/defenderHunting.js", async original => ({
+  ...await original<typeof import("./services/defenderHunting.js")>(),
+  get defenderHunting() { return huntingService; },
+}));
+vi.mock("./services/purviewAudit.js", async original => ({
+  ...await original<typeof import("./services/purviewAudit.js")>(),
+  get purviewAudit() { return auditService; },
+}));
 
+let huntingService: DefenderHuntingService;
+let auditService: PurviewAuditService;
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let application: ReturnType<typeof createApp>;
 let server: Server;
@@ -174,7 +185,11 @@ async function mutationPreview(action: "block" | "unblock", ids: string[], mutat
 }
 
 describe.sequential("packaged API/session contracts", () => {
-  beforeEach(() => clearAdmissionForTest());
+  beforeEach(() => {
+    clearAdmissionForTest();
+    huntingService = new DefenderHuntingService(new DefenderHuntingRepository(fixture.runtime));
+    auditService = new PurviewAuditService(new PurviewAuditRepository(fixture.runtime));
+  });
   afterEach(async () => {
     await Promise.all([defenderHunting.drain(), purviewAudit.drain()]);
   });
@@ -769,13 +784,21 @@ describe.sequential("packaged API/session contracts", () => {
       const response=await request(`/api/agents/${endpoint}`,{method:"POST",headers,body});
       expect(response.status).toBe(202);
       const created=await response.json();
+      expect(created.status).toBe("queued");
       const launches = vi.mocked(launchBulkJob).mock.calls.length;
       if (endpoint === "block-all") {
         await fixture.operator.query("DELETE FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal'", [config.tenantId]);
         expect((await request("/api/agents/block-all", { method: "POST", headers, body: JSON.stringify({ ids: ["different-package"], ...preview }) })).status).toBe(400);
       }
       expect((await (await request(`/api/agents/${endpoint}`,{method:"POST",headers,body})).json()).id).toBe(created.id);
-      expect(vi.mocked(launchBulkJob).mock.calls.length).toBe(launches);
+      expect(vi.mocked(launchBulkJob).mock.calls.length).toBe(launches + 1);
+      expect(launchBulkJob).toHaveBeenLastCalledWith(created.id, { tenantId: config.tenantId, principalId: "fixture-principal" });
+      const repository = new JobRepository(fixture.runtime);
+      expect(await repository.claim(created.id, { tenantId: config.tenantId!, principalId: "fixture-principal" }, randomUUID())).toBeDefined();
+      const running = await request(`/api/agents/${endpoint}`, { method: "POST", headers, body });
+      expect(running.status).toBe(202);
+      expect(await running.json()).toMatchObject({ id: created.id, status: "running" });
+      expect(vi.mocked(launchBulkJob).mock.calls.length).toBe(launches + 1);
       if (endpoint === "block-all") await publishPackageSnapshot("fixture-principal");
       await request(`/api/agents/bulk-jobs/${created.id}/cancel`,{method:"POST"});
     }
@@ -807,9 +830,11 @@ describe.sequential("packaged API/session contracts", () => {
 
   it("executes both approved canary directions as separate durable jobs", async () => {
     const originalCookie = cookie;
+    const previousUser = authFixture.revalidatedUser;
     const approvalBody = { targetId: "package-canary", action: "block", prestate: { kind: "block", isBlocked: false }, poststate: { kind: "block", isBlocked: true } };
     try {
       cookie = await roleCookie("approver", ["AgentControl.Admin"]);
+      authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: "approver" };
       expect((await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, metadata: {} }) })).status).toBe(400);
       const originalResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(approvalBody) });
       const restorationResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) });
@@ -846,19 +871,25 @@ describe.sequential("packaged API/session contracts", () => {
       expect(GraphPackagesClient.prototype.blockPackage).toHaveBeenCalledTimes(1);
       expect(GraphPackagesClient.prototype.unblockPackage).toHaveBeenCalledTimes(1);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = previousUser;
       cookie = originalCookie;
     }
   });
   it("never qualifies a forward canary whose restoration meets an external change", async () => {
     const originalCookie = cookie;
+    const previousUser = authFixture.revalidatedUser;
     const approvalBody = { targetId: "package-canary-conflict", action: "block", prestate: { kind: "block", isBlocked: false }, poststate: { kind: "block", isBlocked: true } };
     const blocksBefore = vi.mocked(GraphPackagesClient.prototype.blockPackage).mock.calls.length;
     const unblocksBefore = vi.mocked(GraphPackagesClient.prototype.unblockPackage).mock.calls.length;
     try {
       cookie = await roleCookie("conflict-approver", ["AgentControl.Admin"]);
-      const original = await (await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(approvalBody) })).json();
-      const restoration = await (await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) })).json();
+      authFixture.revalidatedUser = { ...authFixture.user, homeAccountId: "conflict-approver" };
+      const originalResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(approvalBody) });
+      const restorationResponse = await request("/api/agents/mutation-canaries", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...approvalBody, action: "unblock", prestate: approvalBody.poststate, poststate: approvalBody.prestate }) });
+      expect(originalResponse.status).toBe(201);
+      expect(restorationResponse.status).toBe(201);
+      const original = await originalResponse.json();
+      const restoration = await restorationResponse.json();
       cookie = await roleCookie("conflict-operator", ["AgentControl.Admin"]);
       authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Admin"] };
       const canaryDetails = (isBlocked: boolean) => allowlistedPackage({ id: approvalBody.targetId, displayName: "Canary", isBlocked });
@@ -879,7 +910,7 @@ describe.sequential("packaged API/session contracts", () => {
         { status: "succeeded" }, { status: "failed" },
       ]);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = previousUser;
       cookie = originalCookie;
     }
   });
@@ -1061,7 +1092,7 @@ describe.sequential("packaged API/session contracts", () => {
       partial: false,
       sources: { powerPlatform: { state: "available", observation: { roleScope: "unknown", verification: { status: "verified", storedCount: 1 } } } },
       verification: {
-        status: "needs_attention", scope: "authorized_saved_sources", graphPackageCount: 1, powerPlatformAgentCount: 1,
+        status: "details_pending", scope: "authorized_saved_sources", graphPackageCount: 1, powerPlatformAgentCount: 1,
         representedSourceCount: 2, uniqueSourceCount: 2, logicalAgentCount: 2,
         checks: { sourceScopes: true, packageMetadata: false, sourceMemberships: true },
       },
@@ -1077,7 +1108,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect(all.headers.get("cache-control")).toContain("no-store");
     const allRows = parseCsv(await all.text(), { bom: true, columns: true });
     expect(allRows).toHaveLength(2);
-    expect(allRows.every((row: Record<string, string>) => row.inventoryVerificationStatus === "needs_attention"
+    expect(allRows.every((row: Record<string, string>) => row.inventoryVerificationStatus === "details_pending"
       && row.inventorySourceCount === "2" && row.inventoryUniqueSourceCount === "2")).toBe(true);
     expect(JSON.stringify(allRows)).not.toContain("sensitive-user");
     const filtered = await exportRequest({ revision: page.revision, query: { environmentId: "11111111-1111-4111-8111-111111111111" } });

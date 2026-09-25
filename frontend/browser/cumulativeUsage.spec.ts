@@ -148,13 +148,23 @@ test("the retained-agent locator preserves search, server sort and paging", asyn
 
 test("Agents shows independent inventory and activity cards without navigation shortcuts", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
+  const scopes: Array<string | null> = [];
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/official-usage/overview") scopes.push(url.searchParams.get("scope"));
+  });
   await page.goto("/agents");
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
-  await expect(overview.getByText("Agents in repository").locator("..")).toContainText("3");
+  await expect(overview.getByText("Agents in catalog", { exact: true }).locator("..")).toContainText("3");
   await expect(overview.getByText("Reported used agents").locator("..")).toContainText("2");
   await expect(overview.getByText("Reported active · 30 days").locator("..")).toContainText("2");
   await expect(overview.getByRole("link")).toHaveCount(0);
-  await expect(overview.getByRole("button")).toHaveCount(2);
+  await expect(overview.getByRole("button", { name: /^Show / })).toHaveCount(2);
+  await expect(overview.getByRole("group", { name: "Inventory scope" }).getByRole("button")).toHaveCount(2);
+  await expect(overview.getByRole("group", { name: "Inventory scope" }).getByRole("combobox", { name: "Report set" })).toBeVisible();
+  await expect(overview.getByText("Reported used agents").locator("..")).toContainText("Selected report set");
+  expect(scopes.length).toBeGreaterThan(0);
+  expect(scopes.every(scope => scope === "selected")).toBe(true);
   await expect(overview).not.toContainText("not additive");
   await expect(overview).not.toContainText("Old imports");
   await expect(overview).toContainText("Partial data");

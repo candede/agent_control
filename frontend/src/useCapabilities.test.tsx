@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import type { CapabilityId, CapabilityView, SessionUser } from "./api/client";
-import { providerActionAllowed } from "./capabilityState";
+import { evidenceIsFresh, providerActionAllowed } from "./capabilityState";
 import { useCapabilities } from "./useCapabilities";
 import { permissionIssues } from "./permissionIssues";
 
@@ -69,21 +69,20 @@ it("gives a manual recheck a new run identity and hides completed progress", asy
   expect(result.current.activeCheck).toBeUndefined();
 });
 
-it("refreshes reported operation issues on page entry without duplicating the initial check", async () => {
+it("refreshes reported operation issues only on an explicit check", async () => {
   let operationFailure: CapabilityView["operationFailure"];
   const fetchMock = vi.fn(async () => Response.json({ value: [{ ...available(), operationFailure }] }));
   vi.stubGlobal("fetch", fetchMock);
   const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => result.current.refreshOnOpen?.());
   await waitFor(() => expect(result.current.awaitingInitialCheck).toBeUndefined());
   expect(fetchMock).toHaveBeenCalledTimes(2);
   operationFailure = { status: "missing_role", checkedAt: new Date(Date.now() - 1000).toISOString(),
     expiresAt: new Date(Date.now() + 60000).toISOString(), remediation: [] };
-  await act(async () => result.current.refreshOnOpen?.());
+  await act(async () => result.current.reload());
   expect(fetchMock).toHaveBeenCalledTimes(4);
   expect(permissionIssues(result.current.views, result.current.now)[0]?.decision.status).toBe("missing_role");
   operationFailure = undefined;
-  await act(async () => result.current.refreshOnOpen?.());
+  await act(async () => result.current.reload());
   expect(permissionIssues(result.current.views, result.current.now)).toEqual([]);
   expect(fetchMock).toHaveBeenCalledTimes(6);
 });
@@ -257,7 +256,7 @@ it.each(["fresh", "unchecked"] as const)("defers the initial provider check for 
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
-it("checks again when GET and the initial check return the same fresh expiry", async () => {
+it("keeps known delegated actions usable without rechecking when diagnostic evidence expires", async () => {
   vi.useFakeTimers();
   const sameExpiry = new Date(Date.now() + 1_000).toISOString();
   let checks = 0;
@@ -276,7 +275,9 @@ it("checks again when GET and the initial check return the same fresh expiry", a
 
   await act(() => vi.advanceTimersByTimeAsync(1_100));
   await act(async () => {});
-  expect(checks).toBe(2);
+  expect(checks).toBe(1);
+  expect(evidenceIsFresh(result.current.views[0], result.current.now)).toBe(false);
+  expect(result.current.pending).toBe(false);
   expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
 });
 
@@ -315,8 +316,8 @@ it.each([false, true])("expires application evidence without an automatic applic
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
-it.each(["initial check", "expiry check", "catalog reload", "reload check"] as const)(
-  "continues expiring evidence while a %s is pending",
+it.each(["initial check", "catalog reload", "reload check"] as const)(
+  "ages diagnostics without disabling known delegated actions while a %s is pending",
   async pendingRequest => {
     vi.useFakeTimers();
     const saved = [
@@ -344,18 +345,19 @@ it.each(["initial check", "expiry check", "catalog reload", "reload check"] as c
 
     await act(() => vi.advanceTimersByTimeAsync(1_001));
     expect(result.current.loading || result.current.pending).toBe(true);
-    expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
+    expect(evidenceIsFresh(result.current.views[0], result.current.now)).toBe(false);
+    expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
     expect(providerActionAllowed(result.current.views[1], false, result.current.now)).toBe(true);
     const requestCount = fetchMock.mock.calls.length;
 
     await act(() => vi.advanceTimersByTimeAsync(1_000));
-    expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-    expect(providerActionAllowed(result.current.views[1], false, result.current.now)).toBe(false);
+    expect(result.current.views.every(view => !evidenceIsFresh(view, result.current.now))).toBe(true);
+    expect(result.current.views.every(view => providerActionAllowed(view, false, result.current.now))).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(requestCount);
   },
 );
 
-it("preserves same-signature expiry scheduling across an explicit reload", async () => {
+it("does not start expiry checks after an explicit reload", async () => {
   vi.useFakeTimers();
   const sameExpiry = new Date(Date.now() + 1_000).toISOString();
   let checks = 0;
@@ -384,7 +386,7 @@ it("preserves same-signature expiry scheduling across an explicit reload", async
 
   await act(() => vi.advanceTimersByTimeAsync(1_100));
   await act(async () => {});
-  expect(checks).toBe(3);
+  expect(checks).toBe(2);
 });
 
 it("does not load or check protected capabilities without an assigned current role", async () => {
@@ -524,13 +526,13 @@ it("aborts an in-flight automatic check on logout", async () => {
   expect(result.current.pending).toBe(false);
 });
 
-it.each(["expiry", "reload"] as const)("aborts an in-flight %s check when the hook unmounts", async trigger => {
+it.each(["initial", "reload"] as const)("aborts an in-flight %s check when the hook unmounts", async trigger => {
   vi.useFakeTimers();
   const initial = available(new Date(Date.now() + 1_000).toISOString());
   let checks = 0;
   let checkSignal: AbortSignal | undefined;
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
-    if (url.startsWith("/api/capabilities/check") && ++checks === 2) {
+    if (url.startsWith("/api/capabilities/check") && ++checks === (trigger === "initial" ? 1 : 2)) {
       checkSignal = init?.signal ?? undefined;
       return new Promise<Response>(() => undefined);
     }
@@ -538,8 +540,7 @@ it.each(["expiry", "reload"] as const)("aborts an in-flight %s check when the ho
   }));
   const { result, unmount } = renderHook(() => useCapabilities(user));
   await act(async () => {});
-  if (trigger === "expiry") await act(() => vi.advanceTimersByTimeAsync(1_100));
-  else await act(async () => { void result.current.reload(); });
+  if (trigger === "reload") await act(async () => { void result.current.reload(); });
   expect(result.current.pending).toBe(true);
   expect(checkSignal?.aborted).toBe(false);
   unmount();
@@ -604,7 +605,7 @@ it("surfaces a failed reload that supersedes the initial catalog request and per
   expect(fetchMock).toHaveBeenCalledTimes(5);
 });
 
-it("preserves loaded decisions and retries an expiry failure once without looping", async () => {
+it("preserves loaded decisions after a failed initial check without scheduling periodic retries", async () => {
   vi.useFakeTimers();
   const fetchMock = vi.fn(async (url: string) => {
     if (url.endsWith("/check")) throw new Error("Synthetic outage");
@@ -623,244 +624,41 @@ it("preserves loaded decisions and retries an expiry failure once without loopin
   await act(() => vi.advanceTimersByTimeAsync(30_000));
   await act(() => vi.advanceTimersByTimeAsync(1000));
   await act(async () => {});
-  expect(fetchMock).toHaveBeenCalledTimes(5);
+  expect(fetchMock).toHaveBeenCalledTimes(3);
 
   await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
   act(() => window.dispatchEvent(new Event("focus")));
   await act(async () => {});
-  expect(fetchMock).toHaveBeenCalledTimes(5);
+  expect(fetchMock).toHaveBeenCalledTimes(3);
 });
 
-it("schedules later capability expiries after an earlier expiry exhausts its retry", async () => {
+it.each(["fresh", "expired", "staggered"] as const)("makes no periodic, focus or visibility permission requests after the initial check (%s diagnostics)", async scenario => {
   vi.useFakeTimers();
-  const initial = [
-    available(new Date(Date.now() + 1_000).toISOString()),
-    available(new Date(Date.now() + 90_000).toISOString(), "powerPlatform.inventory.read"),
+  const views = [
+    available(new Date(Date.now() + (scenario === "expired" ? -1 : 1_000)).toISOString()),
+    available(new Date(Date.now() + (scenario === "staggered" ? 90_000 : 1_000)).toISOString(), "powerPlatform.inventory.read"),
   ];
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (!url.endsWith("/check")) return Response.json({ value: initial });
-    checks += 1;
-    if (checks === 2 || checks === 3) throw new Error("Synthetic outage");
-    return Response.json({ value: checks === 1 ? initial : [
-      available(),
-      available(undefined, "powerPlatform.inventory.read"),
-    ] });
-  }));
-
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  expect(checks).toBe(1);
-  await act(() => vi.advanceTimersByTimeAsync(31_100));
-  expect(checks).toBe(3);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-  expect(providerActionAllowed(result.current.views[1], false, result.current.now)).toBe(true);
-
-  await act(() => vi.advanceTimersByTimeAsync(59_000));
-  expect(checks).toBe(4);
-  expect(result.current.error).toBeUndefined();
-  expect(result.current.views.every(view => providerActionAllowed(view, false, result.current.now))).toBe(true);
-});
-
-it("retries a successful check that reuses locally expired evidence without a request loop", async () => {
-  vi.useFakeTimers();
-  const expiry = new Date(Date.now() + 1_000).toISOString();
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) checks += 1;
-    return Response.json({ value: [available(checks < 3 ? expiry : undefined)] });
-  }));
-
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  expect(checks).toBe(1);
-  await act(() => vi.advanceTimersByTimeAsync(1_100));
-  expect(checks).toBe(2);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(checks).toBe(3);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
-});
-
-it("preserves a queued retry when a later check renews only another capability", async () => {
-  vi.useFakeTimers();
-  const initial = [
-    available(new Date(Date.now() + 1_000).toISOString()),
-    available(new Date(Date.now() + 10_000).toISOString(), "powerPlatform.inventory.read"),
-  ];
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) checks += 1;
-    const value = checks < 3 ? initial : [
-      checks === 3 ? initial[0] : available(),
-      available(new Date(Date.now() + 120_000).toISOString(), "powerPlatform.inventory.read"),
-    ];
-    return Response.json({ value });
-  }));
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  await act(() => vi.advanceTimersByTimeAsync(10_100));
-  expect(checks).toBe(3);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-
-  await act(() => vi.advanceTimersByTimeAsync(21_000));
-  expect(checks).toBe(4);
-  expect(result.current.views.every(view => providerActionAllowed(view, false, result.current.now))).toBe(true);
-});
-
-it.each([true, false])("settles an overdue retry after an intervening check finishes (evidence still expired: %s)", async stillExpired => {
-  vi.useFakeTimers();
-  const initial = [
-    available(new Date(Date.now() + 1_000).toISOString()),
-    available(new Date(Date.now() + 10_000).toISOString(), "powerPlatform.inventory.read"),
-  ];
-  let checks = 0;
-  let resolveInterveningCheck!: (value: Response) => void;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) checks += 1;
-    if (checks === 3) return new Promise<Response>(resolve => { resolveInterveningCheck = resolve; });
-    return Response.json({ value: checks < 4 ? initial : [
-      available(),
-      available(undefined, "powerPlatform.inventory.read"),
-    ] });
-  }));
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  await act(() => vi.advanceTimersByTimeAsync(1_001));
-  expect(checks).toBe(2);
-  await act(() => vi.advanceTimersByTimeAsync(9_000));
-  expect(checks).toBe(3);
-  expect(result.current.pending).toBe(true);
-
-  await act(() => vi.advanceTimersByTimeAsync(21_000));
-  expect(checks).toBe(3);
-  await act(async () => resolveInterveningCheck(Response.json({ value: [
-    stillExpired ? initial[0] : available(),
-    available(undefined, "powerPlatform.inventory.read"),
-  ] })));
-  expect(checks).toBe(stillExpired ? 4 : 3);
-  expect(result.current.views.every(view => providerActionAllowed(view, false, result.current.now))).toBe(true);
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(checks).toBe(stillExpired ? 4 : 3);
-});
-
-it("does not spend the retry budget when an intervening expiry replaces a queued timer", async () => {
-  vi.useFakeTimers();
-  const initial = [
-    available(new Date(Date.now() + 1_000).toISOString()),
-    available(new Date(Date.now() + 10_000).toISOString(), "powerPlatform.inventory.read"),
-    available(new Date(Date.now() + 20_000).toISOString(), "graph.directory.read"),
-  ];
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) checks += 1;
-    return Response.json({ value: checks < 4 ? initial : [
-      checks === 4 ? initial[0] : available(),
-      available(undefined, "powerPlatform.inventory.read"),
-      available(undefined, "graph.directory.read"),
-    ] });
-  }));
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  await act(() => vi.advanceTimersByTimeAsync(1_100));
-  expect(checks).toBe(2);
-  await act(() => vi.advanceTimersByTimeAsync(9_000));
-  expect(checks).toBe(3);
-  await act(() => vi.advanceTimersByTimeAsync(10_000));
-  expect(checks).toBe(4);
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(checks).toBe(5);
-  expect(result.current.views.every(view => providerActionAllowed(view, false, result.current.now))).toBe(true);
-});
-
-it("recovers from an early cached check with staggered expiries before the reported stale screenshot", async () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(new Date("2026-09-16T15:05:56.150Z"));
-  const firstExpiry = Date.parse("2026-09-16T15:10:47.952Z");
-  const laterExpiry = Date.parse("2026-09-16T15:10:56.150Z");
-  let views = [
-    available(new Date(firstExpiry).toISOString(), "powerPlatform.inventory.read"),
-    available(new Date(laterExpiry).toISOString()),
-  ];
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) {
-      checks += 1;
-      // The browser can reach expiry while the server still reuses fresh evidence.
-      const serverNow = Date.now() - 52;
-      views = views.map(view => Date.parse(view.decision.expiresAt!) > serverNow ? view : {
-        ...view,
-        decision: {
-          ...view.decision,
-          checkedAt: new Date(serverNow).toISOString(),
-          expiresAt: new Date(serverNow + 5 * 60_000).toISOString(),
-        },
-      });
-    }
-    return Response.json({ value: views });
-  }));
-
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  await act(() => vi.advanceTimersByTimeAsync(firstExpiry - Date.now() + 1));
-  expect(checks).toBe(2);
-  expect(Date.now() - 52).toBe(Date.parse("2026-09-16T15:10:47.901Z"));
-  expect(Date.parse(result.current.views[0].decision.expiresAt!)).toBe(firstExpiry);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-
-  await act(() => vi.advanceTimersByTimeAsync(laterExpiry - Date.now() + 1));
-  expect(checks).toBe(3);
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(checks).toBe(4);
-  await act(() => vi.advanceTimersByTimeAsync(Date.parse("2026-09-16T15:15:39Z") - Date.now()));
-  expect(checks).toBe(4);
-  expect(result.current.views.every(view => providerActionAllowed(view, false, Date.now()))).toBe(true);
-});
-
-it("bounds retries when successful checks never renew expired evidence", async () => {
-  vi.useFakeTimers();
-  const stale = available(new Date(Date.now() - 1).toISOString());
-  const fetchMock = vi.fn(async () => Response.json({ value: [stale] }));
+  const fetchMock = vi.fn(async () => Response.json({ value: views }));
   vi.stubGlobal("fetch", fetchMock);
-
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
   const { result } = renderHook(() => useCapabilities(user));
   await act(async () => {});
   expect(fetchMock).toHaveBeenCalledTimes(2);
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(fetchMock).toHaveBeenCalledTimes(3);
-  await act(() => vi.advanceTimersByTimeAsync(5 * 60_000));
-  act(() => window.dispatchEvent(new Event("focus")));
-  await act(async () => {});
-  expect(fetchMock).toHaveBeenCalledTimes(3);
-  expect(result.current.pending).toBe(false);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
-});
-
-it("defers an expiry retry while hidden and resumes when the page becomes visible", async () => {
-  vi.useFakeTimers();
-  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
-  const stale = available(new Date(Date.now() - 1).toISOString());
-  let checks = 0;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
-    if (url.endsWith("/check")) checks += 1;
-    return Response.json({ value: [checks < 2 ? stale : available()] });
-  }));
-
-  const { result } = renderHook(() => useCapabilities(user));
-  await act(async () => {});
-  expect(checks).toBe(1);
   visibility.mockReturnValue("hidden");
-  await act(() => vi.advanceTimersByTimeAsync(30_000));
-  expect(checks).toBe(1);
-
+  await act(() => vi.advanceTimersByTimeAsync(10 * 60_000));
   visibility.mockReturnValue("visible");
-  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
-  expect(checks).toBe(2);
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+  });
+  await act(() => vi.advanceTimersByTimeAsync(60 * 60_000));
+  expect(fetchMock.mock.calls).toHaveLength(2);
+  expect(result.current.pending).toBe(false);
+  expect(result.current.views.every(view => !evidenceIsFresh(view, result.current.now))).toBe(true);
+  expect(result.current.views.every(view => providerActionAllowed(view, false, Date.now()))).toBe(true);
 });
 
-it.each([true, false])("cancels a scheduled expiry retry on logout after a successful check: %s", async succeeds => {
+it.each([true, false])("does not run permission requests after logout (initial check succeeded: %s)", async succeeds => {
   vi.useFakeTimers();
   const stale = available(new Date(Date.now() - 1).toISOString());
   const fetchMock = vi.fn(async (url: string) => {

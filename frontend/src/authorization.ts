@@ -14,6 +14,5 @@ export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
     "sync",
     "audit",
     "permissions",
-    "jobs",
   ];
 }

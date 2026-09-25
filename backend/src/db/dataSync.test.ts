@@ -210,21 +210,118 @@ describe.sequential("Data sync repository", () => {
       user.servicePlans = servicePlans;
       return user;
     });
-    const bytes = Buffer.byteLength(JSON.stringify({ serviceEvidenceVersion: 1, users }));
+    const original = JSON.stringify({ serviceEvidenceVersion: 1, users });
+    const bytes = Buffer.byteLength(original);
     expect(bytes).toBeGreaterThan(30 * 1024 * 1024);
     expect(bytes).toBeLessThan(32 * 1024 * 1024);
+    const unencoded = await fixture.runtime.query<{ bytes: number }>(
+      "SELECT octet_length($1::jsonb::text) AS bytes", [original],
+    );
+    expect(unencoded.rows[0].bytes).toBeGreaterThan(32 * 1024 * 1024);
     await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved all matching paid-license users.");
 
     const saved = await new DataSyncRepository(fixture.runtime).getDirectorySource(owner);
     expect(saved).toMatchObject({ attemptStatus: "available", rowCount: 30_001 });
     expect(saved.value).toHaveLength(30_001);
+    expect(saved.value).toEqual(users);
     expect(saved.value?.at(-1)).toEqual(users.at(-1));
     expect(saved.value?.every(user => user.servicePlans.length === 3)).toBe(true);
     const storage = await fixture.runtime.query<{ bytes: number }>(`SELECT octet_length(snapshot_data::text) AS bytes
       FROM copilot_usage_snapshots WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory' AND is_current`,
     [owner.tenantId, owner.principalId]);
     expect(storage.rows[0].bytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+  }, 30_000);
+
+  it("losslessly reloads distinct service-plan sets without sharing mutable feature evidence between users", async () => {
+    const owner = { ...scope, principalId: "mixed-paid-license-roster" };
+    const enabled = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
+      servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
+    ));
+    const changed = enabled.toReversed().map((plan, index) => ({
+      ...plan,
+      state: index === 0 ? "disabled" as const : "unknown" as const,
+      assignedDateTime: index === 0 ? "2026-02-02T12:34:56Z" : null,
+      capabilityStatus: index === 0 ? "Deleted" as const : null,
+    }));
+    const sets = [enabled, changed, [], enabled, changed, enabled.slice(1)];
+    const users = sets.map((servicePlans, index) => ({
+      ...directoryUser(`person${index}@example.com`), servicePlans,
+    }));
+    await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved complete mixed service evidence.");
+    const storage = await fixture.runtime.query<{ encoding: string }>(`
+      SELECT snapshot_data->>'storageEncoding' AS encoding FROM copilot_usage_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory' AND is_current`,
+    [owner.tenantId, owner.principalId]);
+    expect(storage.rows[0].encoding).toBe("service-plan-sets-v1");
+    const saved = await new DataSyncRepository(fixture.runtime).getUserSources(owner);
+    expect(saved.directory.value).toEqual(users);
+    expect(saved.directory.value![0].servicePlans).not.toBe(saved.directory.value![3].servicePlans);
+    expect(saved.directory.value![0].servicePlans[0]).not.toBe(saved.directory.value![3].servicePlans[0]);
   });
+
+  it("reads an existing unencoded service-evidence-v1 snapshot without migration or refresh", async () => {
+    const owner = { ...scope, principalId: "legacy-service-evidence-reader" };
+    const user = directoryUser("legacy@example.invalid");
+    user.servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
+      servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
+    ));
+    const observedAt = new Date().toISOString();
+    await fixture.runtime.query(`WITH saved AS (
+      INSERT INTO copilot_usage_snapshots(id,tenant_id,principal_id,source_id,snapshot_data,row_count,observed_at)
+      VALUES($1,$2,$3,'directory',$4::jsonb,1,$5)
+      RETURNING id,tenant_id,principal_id,source_id,observed_at,row_count)
+      INSERT INTO copilot_usage_source_state(
+        tenant_id,principal_id,source_id,attempt_status,message,attempted_at,last_success_at,row_count,current_snapshot_id)
+      SELECT tenant_id,principal_id,source_id,'available','Previously saved service evidence.',
+        observed_at,observed_at,row_count,id FROM saved`,
+    [randomUUID(), owner.tenantId, owner.principalId, JSON.stringify({ serviceEvidenceVersion: 1, users: [user] }), observedAt]);
+    const reader = new DataSyncRepository(fixture.runtime);
+    expect(await reader.getDirectorySource(owner)).toMatchObject({
+      attemptStatus: "available", rowCount: 1, observedAt, value: [user],
+    });
+    expect((await reader.getUserSources(owner)).directory.value).toEqual([user]);
+  });
+
+  it.each(["directory", "app_activity"] as const)(
+    "enforces the actual JSONB UTF-8 byte boundary for %s and rolls back an oversized replacement",
+    async source => {
+      const owner = { ...scope, principalId: `snapshot-byte-bound-${source}` };
+      const user = directoryUser("byte-bound@example.invalid");
+      const report: CopilotReportResult = { users: [], reportRefreshDate: "" };
+      user.identity.department = "";
+      const payload = () => source === "directory" ? { serviceEvidenceVersion: 1, users: [user] } : report;
+      const fixed = await fixture.runtime.query<{ bytes: number }>(
+        "SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify(payload())],
+      );
+      const remaining = 32 * 1024 * 1024 - fixed.rows[0].bytes;
+      const text = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+      if (source === "directory") user.identity.department = text;
+      else report.reportRefreshDate = text;
+      const observedAt = new Date().toISOString();
+      const publish = () => source === "directory"
+        ? repository.publishDirectory(owner, [user], observedAt, "Saved at the byte bound.")
+        : repository.publishAppActivity(owner, report, observedAt, "Saved at the byte bound.");
+      const id = await publish();
+      const stored = await fixture.runtime.query<{ bytes: number }>(
+        "SELECT octet_length(snapshot_data::text) AS bytes FROM copilot_usage_snapshots WHERE id=$1", [id],
+      );
+      expect(stored.rows[0].bytes).toBe(32 * 1024 * 1024);
+
+      if (source === "directory") user.identity.department += "x";
+      else report.reportRefreshDate += "x";
+      expect(Buffer.byteLength(JSON.stringify(payload()))).toBeLessThanOrEqual(32 * 1024 * 1024);
+      await expect(publish()).rejects.toMatchObject({ status: 413, code: "copilot_usage_snapshot_limit" });
+      const retained = await fixture.runtime.query(`
+        SELECT snapshot.id,state.current_snapshot_id,state.row_count,state.attempt_status
+        FROM copilot_usage_snapshots snapshot JOIN copilot_usage_source_state state
+          ON state.current_snapshot_id=snapshot.id
+        WHERE snapshot.tenant_id=$1 AND snapshot.principal_id=$2 AND snapshot.source_id=$3 AND snapshot.is_current`,
+      [owner.tenantId, owner.principalId, source]);
+      expect(retained.rows).toEqual([{
+        id, current_snapshot_id: id, row_count: source === "directory" ? 1 : 0, attempt_status: "available",
+      }]);
+    }, 30_000,
+  );
 
   it("retries only incomplete top-level sources and retains every child association", async () => {
     const run = (await repository.getLatestRun(scope))!;

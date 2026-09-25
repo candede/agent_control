@@ -44,6 +44,7 @@ async function mockPeopleInventory(page: Page, record: UnifiedAgentRecord) {
   const summary = { total: 1, linked: 0, graphOnly: 0, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 };
   await page.route("**/api/agent-inventory?*", route => route.fulfill({ json: {
     ...unifiedAgents, value: [record], count: 1, summary, filteredSummary: summary,
+    inventoryScope: "power_platform_only", scopeSummary: summary,
     inventoryOverview: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 },
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 1, logicalAgentCount: 1 }, { sourceScopes: false }),
     sources: {
@@ -75,7 +76,7 @@ test("legacy Agent Builder details use saved people without directory permission
     const path = new URL(request.url()).pathname;
     if (path.includes("/directory/") || path.endsWith("/people/resolve")) lookups.push(request.url());
   });
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=power_platform_only");
   await expect(page.getByRole("region", { name: "Unified agents" })).toContainText("Microsoft 365 Copilot Agent Builder");
   await page.getByRole("button", { name: nativeId, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: nativeId, exact: true });
@@ -132,7 +133,7 @@ test("missing creator lookup is bounded, shows errors, and retries without hidin
   page.on("request", request => {
     if (new URL(request.url()).pathname === "/api/agent-inventory") inventoryReads.push(request.url());
   });
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=power_platform_only");
   const table = page.getByRole("region", { name: "Unified agents" });
   await table.getByRole("button", { name: "Columns", exact: true }).click();
   await page.getByRole("dialog", { name: "Choose agent columns" }).getByRole("checkbox", { name: "Created by", exact: true }).check();
@@ -187,7 +188,7 @@ test("fresh negative and failure evidence is not automatically retried and prese
     requests.push(route.request().postDataJSON());
     return route.fulfill({ json: { people: record.people, changed: false } });
   });
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=power_platform_only");
   await page.getByRole("button", { name: nativeId, exact: true }).click();
   const information = page.getByRole("region", { name: "Agent information" });
   await expect(information.getByText("Owner", { exact: true }).locator("..")).toContainText("Directory lookup failed. Last known identity shown.");

@@ -25,18 +25,29 @@ const environment: NonNullable<UnifiedAgentRecord["environment"]> = {
 };
 
 describe("purposeful saved agent context", () => {
-  it("shows separately retained detail freshness from a package summary before a full detail read", () => {
+  it.each(["fresh", "stale", "missing", "invalidated"] as const)("omits the package-detail freshness notice for %s summaries and full details", state => {
     const selectedPackage: CopilotPackage = {
       id: "package", displayName: "Agent", isBlocked: false,
       sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown",
       agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
-      detailFreshness: { state: "invalidated", observedAt: "2026-09-01T12:00:00Z", expiresAt: "2026-09-01T13:00:00Z" },
+      publisher: "Example publisher",
+      detailFreshness: {
+        state,
+        observedAt: state === "missing" ? null : "2026-09-01T12:00:00Z",
+        expiresAt: state === "missing" ? null : state === "fresh" ? "2099-09-01T13:00:00Z" : "2026-09-01T13:00:00Z",
+      },
     };
-    render(<AgentOverview record={{ ...record, packages: [selectedPackage] }} selectedPackage={selectedPackage} peopleState={peopleState} />);
-    const freshness = screen.getByRole("complementary", { name: "Package detail freshness" });
-    expect(freshness).toHaveTextContent("Refresh required after inventory change");
-    expect(freshness.querySelector('time[datetime="2026-09-01T12:00:00Z"]')).toBeVisible();
+    const props = { record: { ...record, packages: [selectedPackage] }, selectedPackage, peopleState };
+    const { rerender } = render(<AgentOverview {...props} />);
+    expect(screen.queryByRole("complementary", { name: "Package detail freshness" })).not.toBeInTheDocument();
+    expect(field("Publisher")).toHaveTextContent("Example publisher");
     expect(screen.queryByText("Inventory observed", { selector: "dt" })).not.toBeInTheDocument();
+
+    rerender(<AgentOverview {...props} packageDetail={{ ...selectedPackage, longDescription: "Saved package description." }} />);
+    expect(screen.queryByRole("complementary", { name: "Package detail freshness" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Details collected:|Details expire:|Package details refresh hourly/)).not.toBeInTheDocument();
+    expect(screen.getByText("Saved package description.")).toBeVisible();
+    expect(field("Publisher")).toHaveTextContent("Example publisher");
   });
 
   it("opens only exact resolved responsibility identities, never unresolved or invalid people", () => {
@@ -46,6 +57,10 @@ describe("purposeful saved agent context", () => {
       createdBy: { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "not_found" },
       lastModifiedBy: { id: "bad-id", status: "unverified", invalidId: true },
     } }} />);
+    expect(field("Owner")).toHaveTextContent("Exact owner");
+    expect(field("Created by")).toBeVisible();
+    expect(field("Last modified by")).toBeVisible();
+    expect(screen.queryByText(/Ownership, creation and last modification are distinct source relationships/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "View responsibility for Exact owner" }));
     expect(open).toHaveBeenCalledWith("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     expect(screen.getAllByText("User navigation unavailable until this exact identity is resolved.")).toHaveLength(2);
@@ -67,6 +82,8 @@ describe("purposeful saved agent context", () => {
     expect(field("Operation configured by (ID)")).toHaveTextContent("52bff06b-5db5-42cd-9919-28f95e3c07af");
     expect(field("Owner")).toHaveTextContent("Not reported");
     expect(field("Created by")).toHaveTextContent("Not reported");
+    expect(screen.queryByText(/Source-declared configuration, not observed executions/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Operation creators configured individual operations/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Capability details are partial/)).not.toBeInTheDocument();
   });
 

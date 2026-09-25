@@ -7,7 +7,7 @@ import type { InventorySnapshot, PowerPlatformResource } from "../types/powerPla
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 import { projectPackageDetails } from "./packageDetailProjection.js";
 import { projectPackageControl } from "./packageControlProjection.js";
-import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { unifiedAgentRecordId, unifiedAgentInventoryScopes } from "../types/unifiedAgents.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import type { AgentUsageContext, AgentUsageSummary } from "../types/agentUsage.js";
 import { agentColumnValue, agentStatusLabels } from "../types/agentPresentation.js";
@@ -167,7 +167,130 @@ function dependencies(options: {
   };
 }
 
+function inventoryScopeDependencies() {
+  return dependencies({
+    packages: [
+      { ...packageValue("linked-a", "Catalog linked", true), availableTo: "all", supportedHosts: ["Teams"] },
+      packageValue("linked-b-blocked", "Catalog linked", true),
+      { ...packageValue("available", "Catalog available"), availableTo: "some", authoringTool: "Microsoft 365 Copilot Agent Builder" },
+      { ...packageValue("unavailable", "Catalog unavailable"), availableTo: "none", authoringTool: "Microsoft 365 Copilot Agent Builder" },
+    ].map(value => ({ ...value, identityDetailsCollected: true })),
+    resources: [
+      { ...resource(environmentA), displayName: "Catalog linked" },
+      { ...resource(environmentB), displayName: "Native only", authoringTool: "Zebra SDK" },
+    ],
+    environmentNames: { [environmentA]: "Catalog environment", [environmentB]: "Native environment" },
+  });
+}
+
 describe("UnifiedAgentsService", () => {
+  it.each([
+    { inventoryScope: "catalog", total: 3, linked: 1, graphOnly: 2, powerPlatformOnly: 0,
+      overview: { availableToUsers: 2, organizationCreated: 1, teamsAvailable: 1, createdOrAvailable: 1 },
+      environments: [environmentA], platforms: ["Copilot Studio", "Microsoft 365 Copilot Agent Builder"] },
+    { inventoryScope: "power_platform_only", total: 1, linked: 0, graphOnly: 0, powerPlatformOnly: 1,
+      overview: { availableToUsers: 0, organizationCreated: 1, teamsAvailable: 0, createdOrAvailable: 1 },
+      environments: [environmentB], platforms: ["Zebra SDK"] },
+    { inventoryScope: "all", total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1,
+      overview: { availableToUsers: 2, organizationCreated: 2, teamsAvailable: 1, createdOrAvailable: 2 },
+      environments: [environmentA, environmentB], platforms: ["Copilot Studio", "Microsoft 365 Copilot Agent Builder", "Zebra SDK"] },
+  ] as const)("applies $inventoryScope after complete reconciliation and enrichment, before summaries and paging", async expected => {
+    const scope = { tenantId, principalId: "viewer" };
+    const deps = inventoryScopeDependencies();
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    deps.resolveLinks = vi.fn(resolvePackageAgentLinks);
+    deps.registry = {
+      withSnapshot: (_scope, work) => work(client),
+      reconcile: vi.fn(async (_client, _scope, records) => records.map((record, index) => ({
+        ...record, id: `agent:aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+      }))),
+    };
+    const people = vi.spyOn(deps.people!, "project");
+    const service = new UnifiedAgentsService(deps);
+    const page = await service.list(scope, { inventoryScope: expected.inventoryScope, limit: 1 });
+    const summary = { total: expected.total, linked: expected.linked, graphOnly: expected.graphOnly,
+      powerPlatformOnly: expected.powerPlatformOnly, ambiguous: 0, conflicting: 0 };
+    expect(page).toMatchObject({
+      count: expected.total, summary: { total: 4, linked: 1, graphOnly: 2, powerPlatformOnly: 1 },
+      inventoryScope: expected.inventoryScope, scopeSummary: summary, filteredSummary: summary, inventoryOverview: expected.overview,
+      identityCollection: { checkedPackages: 4, pendingPackages: 0 }, partial: false,
+      verification: { status: "verified", logicalAgentCount: 4, graphPackageCount: 4, powerPlatformAgentCount: 2,
+        representedSourceCount: 6, uniqueSourceCount: 6, checks: { sourceMemberships: true } },
+      sources: { graphPackages: { state: "available" }, powerPlatform: { state: "available" } },
+    });
+    expect(page.value).toHaveLength(1);
+    expect(page.value[0].id).toMatch(/^agent:/);
+    expect(page.facets.environments.map(value => value.value)).toEqual(expected.environments);
+    expect(page.facets.platforms.map(value => value.value)).toEqual(expected.platforms);
+    expect(vi.mocked(deps.resolveLinks).mock.calls[0][1]).toHaveLength(4);
+    expect(vi.mocked(deps.resolveLinks).mock.calls[0][2]).toHaveLength(2);
+    expect(vi.mocked(deps.registry.reconcile).mock.calls[0][2]).toHaveLength(4);
+    expect(vi.mocked(deps.usage.project).mock.calls[0][1]).toHaveLength(4);
+    expect(people.mock.calls[0][1]).toHaveLength(4);
+    expect(deps.powerPlatform.readAgentEnvironments).toHaveBeenCalledWith(scope, [environmentA, environmentB], client);
+
+    const filtered = await service.list(scope, { inventoryScope: expected.inventoryScope, search: "does not exist", offset: 1, limit: 1 });
+    expect(filtered).toMatchObject({ inventoryScope: expected.inventoryScope, count: 0, value: [], scopeSummary: summary, filteredSummary: { total: 0 } });
+    expect(filtered.inventoryOverview).toEqual(page.inventoryOverview);
+    expect(filtered.facets).toEqual(page.facets);
+    expect(filtered.summary).toEqual(page.summary);
+    expect(filtered.sources).toEqual(page.sources);
+  });
+
+  it.each(unifiedAgentInventoryScopes)("composes source filters and filtered exports with %s inventory scope", async inventoryScope => {
+    const scope = { tenantId, principalId: "viewer" };
+    const service = new UnifiedAgentsService(inventoryScopeDependencies());
+    const expected = inventoryScope === "catalog" ? [3, 3, 1, 1]
+      : inventoryScope === "power_platform_only" ? [1, 0, 1, 0] : [4, 3, 2, 1];
+    for (const [index, source] of (["all", "graph_packages", "power_platform", "both"] as const).entries()) {
+      const query = { inventoryScope, source, sortBy: "displayName" as const, sortDirection: "desc" as const };
+      const page = await service.list(scope, { ...query, limit: 1 });
+      expect(page.inventoryScope).toBe(inventoryScope);
+      expect(page.count, source).toBe(expected[index]);
+      expect(page.filteredSummary.total, source).toBe(expected[index]);
+      expect(page.scopeSummary.total).toBe(expected[0]);
+      expect(page.summary.total).toBe(4);
+      const exported = await service.forExport(scope, page.revision!, query);
+      expect(exported.inventoryScope).toBe(inventoryScope);
+      expect(exported.count, source).toBe(expected[index]);
+      expect(exported.value).toHaveLength(expected[index]);
+      expect(exported.value.slice(0, 1)).toEqual(page.value);
+      expect(exported.scopeSummary).toEqual(page.scopeSummary);
+      const csv = parseCsv(buildUnifiedAgentCsv(exported, Date.now() + 15_000).buffer, { bom: true, columns: true });
+      expect(csv).toHaveLength(expected[index]);
+    }
+  });
+
+  it("keeps catalog counts logical rather than package counts and filters before paging", async () => {
+    const service = new UnifiedAgentsService(inventoryScopeDependencies());
+    const scope = { tenantId, principalId: "viewer" };
+    const page = await service.list(scope, { inventoryScope: "catalog", view: "available", offset: 1, limit: 1 });
+    expect(page).toMatchObject({ count: 2, summary: { total: 4 }, scopeSummary: { total: 3 },
+      filteredSummary: { total: 2 }, inventoryOverview: { availableToUsers: 2 } });
+    expect(page.value).toHaveLength(1);
+    expect(page.value[0].packages.map(value => value.id)).toEqual(["linked-a", "linked-b-blocked"]);
+    expect(page.value[0].powerPlatformResource?.nativeId).toBe("shared-native");
+    expect(page.value[0].environment?.displayName).toBe("Catalog environment");
+  });
+
+  it("defaults omitted scope to all for exact reads and keeps exact exports independent of inventory scope", async () => {
+    const service = new UnifiedAgentsService(inventoryScopeDependencies());
+    const scope = { tenantId, principalId: "viewer" };
+    const complete = await service.list(scope);
+    expect(complete.inventoryScope).toBe("all");
+    expect(complete.scopeSummary).toEqual(complete.summary);
+    expect((await service.list(scope, { inventoryScope: "all" })).value).toEqual(complete.value);
+    const native = complete.value.find(record => !record.packages.length)!;
+    expect((await service.list(scope, { recordId: native.id })).value).toEqual([native]);
+    expect((await service.list(scope, { inventoryScope: "catalog", recordId: native.id })).value).toEqual([]);
+    for (const inventoryScope of unifiedAgentInventoryScopes) {
+      const exported = await service.forExport(scope, complete.revision!, { inventoryScope }, [native.id]);
+      expect(exported.inventoryScope).toBe("all");
+      expect(exported.value).toEqual([native]);
+      expect(exported.scopeSummary).toEqual(complete.summary);
+    }
+  });
+
   it("projects all responsible people before paging, including agents beyond the normal 250-row clamp", async () => {
     const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -1018,7 +1141,8 @@ describe("UnifiedAgentsService", () => {
         ...(reason === "readback_changed" ? { identityRevalidationRequired: true } : {}),
       });
       expect(rejected.elementDetails).toEqual(alias.elementDetails);
-      expect(rejected.identityRevalidationRequired).toBe(true);
+      if (reason === "expired") expect(rejected.detailFreshness?.state).toBe("stale");
+      else expect(rejected.identityRevalidationRequired).toBe(true);
       for (const resources of [[], [resource(environmentA)]]) {
         const service = new UnifiedAgentsService(dependencies({ packages: [native, rejected], resources }));
         const scope = { tenantId, principalId: "viewer" };
@@ -1311,7 +1435,9 @@ describe("UnifiedAgentsService", () => {
     deps.packages.readUnifiedSource = vi.fn(async () => source);
 
     const result = await new UnifiedAgentsService(deps).list(scope);
-    expect(result.identityCollection).toEqual({ checkedPackages: 1, pendingPackages: 0 });
+    expect(result.identityCollection).toEqual({
+      checkedPackages: 1, pendingPackages: 0, pendingDetails: { missing: 0, stale: 0, invalidated: 0 },
+    });
     expect(result.value[0].identity.reason).toContain("Package details were collected");
     expect(result.value[0].identity.reason).not.toContain("Refresh package details");
     expect(pkg.identityDetailsCollected).toBeUndefined();
@@ -1521,16 +1647,43 @@ describe("UnifiedAgentsService", () => {
     expect(result).toMatchObject({
       count: 1, partial: false,
       verification: {
-        status: "needs_attention", graphPackageCount: 3, powerPlatformAgentCount: 2,
+        status: "details_pending", graphPackageCount: 3, powerPlatformAgentCount: 2,
         representedSourceCount: 5, uniqueSourceCount: 5, logicalAgentCount: 3,
         checks: { sourceScopes: true, sourceMemberships: true, packageMetadata: false, identityLinks: true },
       },
     });
     const csv = parseCsv(buildUnifiedAgentCsv(result, Date.now() + 15_000).buffer, { bom: true, columns: true });
     expect(csv[0]).toMatchObject({
-      inventoryVerificationStatus: "needs_attention", inventorySourceCount: "5",
+      inventoryVerificationStatus: "details_pending", inventorySourceCount: "5",
       inventoryUniqueSourceCount: "5", inventoryLogicalAgentCount: "3",
     });
+  });
+
+  it("separates missing, expired and invalidated details from actionable inventory failures", async () => {
+    const packages: CopilotPackageDetail[] = [
+      { ...packageValue("checked", "No native metadata"), identityDetailsCollected: true },
+      packageValue("missing", "Not collected"),
+      { ...packageValue("stale", "Already collected"), detailFreshness: {
+        state: "stale", observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-14T01:00:00.000Z",
+      } },
+      { ...packageValue("changed", "Needs compatibility recheck"), identityRevalidationRequired: true,
+        detailFreshness: { state: "invalidated", observedAt: "2026-09-14T00:00:00.000Z", expiresAt: "2026-09-14T01:00:00.000Z" } },
+    ];
+    const result = await new UnifiedAgentsService(dependencies({ packages }))
+      .list({ tenantId, principalId: "viewer" }, { limit: 1 });
+    expect(result).toMatchObject({
+      count: 4, partial: false,
+      identityCollection: {
+        checkedPackages: 1, pendingPackages: 3, pendingDetails: { missing: 1, stale: 1, invalidated: 1 },
+      },
+      verification: { status: "details_pending", checks: {
+        sourceScopes: true, sourceMemberships: true, packageMetadata: false, identityLinks: true,
+      } },
+    });
+    const checked = await new UnifiedAgentsService(dependencies({ packages: [packages[0]] }))
+      .list({ tenantId, principalId: "viewer" });
+    expect(checked.verification.status).toBe("verified");
+    expect(checked.summary.graphOnly).toBe(1);
   });
 
   it("rejects repeated source identities instead of reporting a successful reconciliation", async () => {

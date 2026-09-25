@@ -113,15 +113,16 @@ describe("capability UX decisions", () => {
     expect(providerActionAllowed(view(status))).toBe(status === "available");
     expect(capabilityExplanation(view(status))).not.toBe("");
   });
-  it.each([undefined, false, true])("uses the third argument as the evidence clock with write=%s", write => {
+  it.each([undefined, false, true])("does not treat delegated diagnostic expiry as revoked access with write=%s", write => {
     const available = view("available");
     available.decision.checkedAt = "2026-09-12T09:00:00.000Z";
     available.decision.expiresAt = "2026-09-12T09:01:00.000Z";
     const expiresAt = Date.parse(available.decision.expiresAt);
 
     expect(providerActionAllowed(available, write, expiresAt - 1)).toBe(true);
-    expect(providerActionAllowed(available, write, expiresAt)).toBe(false);
-    expect(providerActionAllowed(available, write, expiresAt + 1)).toBe(false);
+    expect(providerActionAllowed(available, write, expiresAt)).toBe(true);
+    expect(providerActionAllowed(available, write, expiresAt + 1)).toBe(true);
+    expect(evidenceIsFresh(available, expiresAt)).toBe(false);
   });
   it.each([undefined, "invalid", "2026-09-12T09:00:01.000Z"])(
     "rejects evidence without a valid check at or before the current clock: %s", checkedAt => {
@@ -142,7 +143,7 @@ describe("capability UX decisions", () => {
       }
     },
   );
-  it("accepts a check at the current clock until, but not at, its expiry", () => {
+  it("expires verification claims without disabling an attempt using known delegated access", () => {
     const now = Date.parse("2026-09-12T09:00:00.000Z");
     const candidate = view("available");
     candidate.decision.checkedAt = new Date(now).toISOString();
@@ -152,7 +153,26 @@ describe("capability UX decisions", () => {
     expect(providerActionAllowed(candidate, false, now)).toBe(true);
     expect(evidenceIsFresh(candidate, now + 1)).toBe(false);
     expect(currentVerification(candidate, now + 1)).toBeUndefined();
-    expect(providerActionAllowed(candidate, false, now + 1)).toBe(false);
+    expect(providerActionAllowed(candidate, false, now + 1)).toBe(true);
+  });
+  it("retains application-scope expiry requirements and rejects malformed or denied delegated decisions", () => {
+    const candidate = view("available");
+    const now = Date.now();
+    candidate.decision.expiresAt = new Date(now - 1).toISOString();
+    expect(providerActionAllowed(candidate, false, now)).toBe(true);
+    candidate.definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
+    candidate.decision.capabilityId = candidate.definition.id;
+    expect(providerActionAllowed(candidate, false, now)).toBe(false);
+    candidate.definition = capabilityDefinitions[0];
+    candidate.decision.capabilityId = candidate.definition.id;
+    candidate.decision.expiresAt = candidate.decision.checkedAt;
+    expect(providerActionAllowed(candidate, false, now)).toBe(false);
+    candidate.decision.expiresAt = new Date(now - 1).toISOString();
+    candidate.decision.authorized = false;
+    expect(providerActionAllowed(candidate, false, now)).toBe(false);
+    candidate.decision.authorized = true;
+    candidate.decision.status = "missing_permission";
+    expect(providerActionAllowed(candidate, false, now)).toBe(false);
   });
   it.each([
     { id: "graph.package.read.delegated", verification: "provider" },
@@ -197,7 +217,7 @@ describe("capability UX decisions", () => {
       expect(capabilityExplanation(stale)).toContain("Check status");
       expect(capabilityExplanation(stale)).toContain("authorized saved data remains readable");
       expect(capabilityExplanation(stale)).not.toContain("pending");
-      expect(providerActionAllowed(stale)).toBe(false);
+      expect(providerActionAllowed(stale)).toBe(status === "available");
     }
   });
   it.each(["token_acquisition", "provider_read"] as const)("identifies a %s timeout instead of implying a permission failure", phase => {

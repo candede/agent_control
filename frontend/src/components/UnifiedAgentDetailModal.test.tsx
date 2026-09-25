@@ -668,6 +668,7 @@ describe("UnifiedAgentDetailModal", () => {
       version: "3.2.1",
       publisher: "Example vendor",
       longDescription: "<p>A <strong>full vendor description</strong> with useful details.</p>",
+      detailFreshness: { state: "stale", observedAt: "2026-09-01T12:00:00Z", expiresAt: "2026-09-01T13:00:00Z" },
       allowedUsersAndGroups: [{ resourceType: "group", resourceId: "group-1" }],
       elementDetails: [{
         elementType: "AgentMetadatas",
@@ -682,6 +683,8 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("heading", { name: "Responsibility" })).toBeVisible();
     expect(screen.getByText("full vendor description").tagName).toBe("STRONG");
     expect(screen.getByText("full vendor description")).toBeVisible();
+    expect(screen.queryByRole("complementary", { name: "Package detail freshness" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Details collected:|Details expire:|Package details refresh hourly/)).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Configured connectors and operations" })).toBeVisible();
     expect(screen.queryByText("Finance connector")).not.toBeInTheDocument();
     for (const value of ["Example vendor", "Team owner", "Tenant maker", "Tenant model", "Organization sign-in", "Configured connector"]) {

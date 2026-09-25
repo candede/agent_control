@@ -26,6 +26,7 @@ type Props = {
   quarantineSelectionAllowed: boolean;
   quarantineSelectionRestoring?: boolean;
   selectionDisabled: boolean;
+  packageActionsDisabled?: boolean;
   environmentNames?: Record<string, string>;
   columnPreferenceOwner?: string;
   sortBy?: UnifiedAgentSort;
@@ -47,7 +48,7 @@ type AgentRow = {
   quarantineReason: string | undefined;
 };
 
-type AgentTableActions = Pick<Props, "busyPackageId" | "packageOperationsAllowed" | "quarantineSelectionAllowed" | "quarantineSelectionRestoring" | "selectionDisabled" | "onToggleSelection" | "onViewDetails" | "onManageAccess" | "onSetBlocked">;
+type AgentTableActions = Pick<Props, "busyPackageId" | "packageOperationsAllowed" | "quarantineSelectionAllowed" | "quarantineSelectionRestoring" | "selectionDisabled" | "packageActionsDisabled" | "onToggleSelection" | "onViewDetails" | "onManageAccess" | "onSetBlocked">;
 const AgentTableActionsContext = createContext<AgentTableActions | undefined>(undefined);
 
 // Stable cell components preserve focus and in-flight clicks when action state changes.
@@ -86,6 +87,7 @@ export function UnifiedAgentTable({
   quarantineSelectionAllowed,
   quarantineSelectionRestoring = false,
   selectionDisabled,
+  packageActionsDisabled = selectionDisabled,
   environmentNames = emptyEnvironmentNames,
   columnPreferenceOwner,
   sortBy = "displayName",
@@ -146,7 +148,7 @@ export function UnifiedAgentTable({
   const showUsageContext = agentColumns.some(column => column.group === "Usage" && requiredColumn(column.id).getIsVisible());
 
   return (
-    <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
+    <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, packageActionsDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
     <div className="agent-grid" role="region" aria-label="Unified agents">
       <div className="agent-grid-toolbar">
         <span className="muted-cell" title={showUsageContext
@@ -226,13 +228,13 @@ function AgentNameCell({ row }: CellContext<typeof features, AgentRow>) {
 }
 
 function AgentActionsCell({ row }: CellContext<typeof features, AgentRow>) {
-  const { busyPackageId, packageOperationsAllowed, selectionDisabled, onViewDetails, onManageAccess, onSetBlocked } = useAgentTableActions();
+  const { busyPackageId, packageOperationsAllowed, packageActionsDisabled, onViewDetails, onManageAccess, onSetBlocked } = useAgentTableActions();
   const record = row.original.record;
   const packageBusy = record.packages.some(item => item.id === busyPackageId);
   return <div className="row-actions">
     <button className="icon-button" type="button" aria-label={`View details for ${record.displayName}`} title="View agent details" onClick={() => onViewDetails(record)}><Info aria-hidden="true" /></button>
-    {packageOperationsAllowed && record.packages.length === 1 ? <WorkbenchActionGate actionId="packages.access" compact><button className="icon-button" type="button" aria-label={`Manage access for ${record.displayName}`} title="Manage access" disabled={selectionDisabled} onClick={() => onManageAccess(record)}><ShieldCheck aria-hidden="true" /></button></WorkbenchActionGate> : null}
-    {packageOperationsAllowed && record.packages.length === 1 && typeof record.packages[0].isBlocked === "boolean" ? <WorkbenchActionGate actionId={record.packages[0].isBlocked ? "packages.unblock" : "packages.block"} compact><button className={`icon-button${record.packages[0].isBlocked ? "" : " danger"}`} type="button" aria-label={`${record.packages[0].isBlocked ? "Unblock" : "Block"} ${record.displayName}`} title={`${record.packages[0].isBlocked ? "Unblock" : "Block"} agent`} disabled={selectionDisabled || packageBusy} onClick={() => onSetBlocked(record, !record.packages[0].isBlocked)}>{record.packages[0].isBlocked ? <LockOpen aria-hidden="true" /> : <Lock aria-hidden="true" />}</button></WorkbenchActionGate> : null}
+    {packageOperationsAllowed && record.packages.length === 1 ? <WorkbenchActionGate actionId="packages.access" compact><button className="icon-button" type="button" aria-label={`Manage access for ${record.displayName}`} title="Manage access" disabled={packageActionsDisabled} onClick={() => onManageAccess(record)}><ShieldCheck aria-hidden="true" /></button></WorkbenchActionGate> : null}
+    {packageOperationsAllowed && record.packages.length === 1 && typeof record.packages[0].isBlocked === "boolean" ? <WorkbenchActionGate actionId={record.packages[0].isBlocked ? "packages.unblock" : "packages.block"} compact><button className={`icon-button${record.packages[0].isBlocked ? "" : " danger"}`} type="button" aria-label={`${record.packages[0].isBlocked ? "Unblock" : "Block"} ${record.displayName}`} title={`${record.packages[0].isBlocked ? "Unblock" : "Block"} agent`} disabled={packageActionsDisabled || packageBusy} onClick={() => onSetBlocked(record, !record.packages[0].isBlocked)}>{record.packages[0].isBlocked ? <LockOpen aria-hidden="true" /> : <Lock aria-hidden="true" />}</button></WorkbenchActionGate> : null}
   </div>;
 }
 

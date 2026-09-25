@@ -51,8 +51,10 @@ async function open(page: Page, value: UnifiedAgentRecord) {
     if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)) writes.push(new URL(request.url()).pathname);
   });
   const summary = { total: 1, linked: 0, graphOnly: value.packages.length ? 1 : 0, powerPlatformOnly: value.packages.length ? 0 : 1, ambiguous: 0, conflicting: 0 };
+  const inventoryScope = value.packages.length ? "catalog" : "power_platform_only";
   await page.route("**/api/agent-inventory*", route => route.fulfill({ json: {
     ...unifiedAgents, value: [value], count: 1, summary, filteredSummary: summary,
+    inventoryScope, scopeSummary: summary,
     facets: { environments: value.environment ? [{ value: environmentId, label: value.environment.displayName }] : [], platforms: [] },
   } }));
   if (value.powerPlatformResource) await page.route(`**/api/inventory/resources/${value.powerPlatformResource.nativeId}/related*`, route => {
@@ -66,7 +68,7 @@ async function open(page: Page, value: UnifiedAgentRecord) {
       audit: { status: "unmatched" }, security: { status: "unmatched" },
     } });
   });
-  await page.goto("/agents");
+  await page.goto(inventoryScope === "catalog" ? "/agents" : "/agents?inventory=power_platform_only");
   await expect.poll(() => writes).toEqual(["/api/capabilities/check"]);
   writes.length = 0;
   await page.getByRole("button", { name: `View details for ${value.displayName}`, exact: true }).click();

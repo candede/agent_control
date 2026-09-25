@@ -57,6 +57,16 @@ describe("official usage cumulative overview", () => {
       .toThrowError(expect.objectContaining({ code: "invalid_usage_query" }));
   });
 
+  it("restricts the selected overview to the active set without changing history defaults", async () => {
+    const { service, client } = databaseFixture();
+    const view = await service.getOverview("tenant", { scope: "selected" });
+    expect(view.filters.scope).toBe("selected");
+    expect(client.query.mock.calls[2]?.[0]).toContain("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1");
+    expect(client.query.mock.calls[2]?.[0]).not.toContain("replacement.supersedes_set_id");
+    await expect(service.getOverview("tenant", { scope: "all" as never }))
+      .rejects.toMatchObject({ code: "invalid_usage_query" });
+  });
+
   it("returns report-wide summary and a bounded page within one read-only repeatable-read transaction", async () => {
     const { service, database, client, row } = databaseFixture();
     const view = await service.getOverview("tenant-A", {

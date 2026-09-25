@@ -67,13 +67,14 @@ describe("Permissions setup and issues", () => {
     expect(screen.getByText("No issues reported.")).toBeVisible();
   });
 
-  it("refreshes reported issues when the page opens, not on every render", () => {
-    const refreshOnOpen = vi.fn(async () => {});
-    const value = { ...context([]), refreshOnOpen };
+  it("only checks permissions when Check status is requested, not when opening or rendering the page", () => {
+    const value = context([]);
     const { rerender } = render(<Page value={value} />);
-    expect(refreshOnOpen).toHaveBeenCalledTimes(1);
+    expect(value.reload).not.toHaveBeenCalled();
     rerender(<Page value={{ ...value, now: now + 1 }} />);
-    expect(refreshOnOpen).toHaveBeenCalledTimes(1);
+    expect(value.reload).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Check status" }));
+    expect(value.reload).toHaveBeenCalledTimes(1);
   });
 
   it("shows actual license-sync failure details and closes them after the next successful operation", async () => {

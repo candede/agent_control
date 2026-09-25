@@ -363,11 +363,13 @@ export class JobRepository {
   }
 
   async pauseForAuthorization(lease: Lease) {
-    const result = await this.database.query(`UPDATE jobs SET status='waiting_authorization',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND lease_owner=$4 AND lease_version=$5
-      AND NOT EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='running')`,
-      [lease.jobId, lease.scope.tenantId, lease.scope.principalId, lease.owner, lease.version]);
-    if (result.rowCount !== 1) throw new AppError(409, "lease_lost", "Job lease expired or was replaced; authorization state was not changed.");
+    await transaction(this.database, async client => {
+      await this.fence(client, lease);
+      const running = await client.query("SELECT 1 FROM job_items WHERE job_id=$1 AND status='running'", [lease.jobId]);
+      if (running.rowCount) throw new AppError(409, "lease_lost", "An unfinished item prevents releasing the job for authorization.");
+      await this.aggregate(client, lease.jobId);
+      await client.query("UPDATE jobs SET lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
+    });
   }
 
   async pauseItemForAuthorization(lease: Lease, itemId: string) {
@@ -377,7 +379,8 @@ export class JobRepository {
       if (item.rowCount !== 1) throw new AppError(409, "already_dispatched", "Sent work cannot return to authorization wait.");
       await client.query("UPDATE job_attempts SET finished_at=clock_timestamp(),outcome='cancelled' WHERE item_id=$1 AND lease_version=$2 AND sent_at IS NULL AND finished_at IS NULL", [itemId, lease.version]);
       await new AuditLog(lease.scope, client).completeEvent(`${itemId}:${lease.version}`, { status: "cancelled", message: "Attempt ended before dispatch because current authorization is required." });
-      await client.query("UPDATE jobs SET status='waiting_authorization',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
+      await this.aggregate(client, lease.jobId);
+      await client.query("UPDATE jobs SET lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
     });
   }
 

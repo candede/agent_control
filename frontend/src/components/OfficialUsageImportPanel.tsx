@@ -58,7 +58,7 @@ export function OfficialUsageImportPanel({
   const [files, setFiles] = useState<File[]>([]);
   const [validation, setValidation] = useState<FileValidation[]>([]);
   const [step, setStep] = useState<ImportStep>("files");
-  const [correctionMode, setCorrectionMode] = useState(false);
+  const [conflictedBundles, setConflictedBundles] = useState<string[]>([]);
   const [bundlePreview, setBundlePreview] = useState<OfficialUsageBundlePreview>();
   const [draft, setDraft] = useState<{ bundleId: string; correctionOfSetId?: string }>();
   const [previewVerified, setPreviewVerified] = useState(false);
@@ -85,6 +85,13 @@ export function OfficialUsageImportPanel({
   const previouslyActive = useRef(active);
   const priorScreen = useRef(view === "manage" ? "manage" : `import:${step}`);
   const previews = bundlePreview?.staging ?? [];
+  const hasDuplicateKindConflict = Boolean(draft && conflictedBundles.includes(draft.bundleId));
+  const discardablePreviews = [...new Map([
+    ...(adminState?.staging ?? []),
+    ...validation.flatMap(entry => entry.preview ? [entry.preview] : []),
+    ...previews,
+  ].filter(preview => preview.status === "active" && preview.bundleId === draft?.bundleId)
+    .map(preview => [preview.id, preview])).values()];
   const readAdminState = useCallback((signal: AbortSignal) =>
     readSaved(["official-usage-admin"], readSignal => getOfficialUsageAdminState({ signal: readSignal }), signal),
   [readSaved]);
@@ -141,14 +148,14 @@ export function OfficialUsageImportPanel({
   }
 
   function applyBundlePreview(preview: OfficialUsageBundlePreview, state?: OfficialUsageAdminState) {
-    pendingBundleId.current = preview.bundleId;
-    pendingCorrection.current = preview.staging[0]?.correctionOfSetId
+    const correctionOfSetId = preview.staging[0]?.correctionOfSetId
       ?? state?.sets.find(reportSet => reportSet.bundleId === preview.bundleId)?.supersedesSetId
-      ?? undefined;
+      ?? (pendingBundleId.current === preview.bundleId ? pendingCorrection.current : undefined);
+    pendingBundleId.current = preview.bundleId;
+    pendingCorrection.current = correctionOfSetId;
     setDraft({ bundleId: preview.bundleId, correctionOfSetId: pendingCorrection.current });
     setBundlePreview(preview);
     setPreviewVerified(!state || preview.expectedActiveRevision === state.activeRevision);
-    setCorrectionMode(Boolean(pendingCorrection.current));
   }
 
   const clearUnauthorized = useCallback((error: unknown) => {
@@ -167,7 +174,7 @@ export function OfficialUsageImportPanel({
     setFiles([]);
     setValidation([]);
     if (fileInput.current) fileInput.current.value = "";
-    setCorrectionMode(false);
+    setConflictedBundles([]);
     setResult(undefined);
     setStep("files");
     setBusy(false);
@@ -212,7 +219,6 @@ export function OfficialUsageImportPanel({
         setFiles([]);
         setValidation([]);
         setResult(undefined);
-        setCorrectionMode(false);
         setStep("files");
         setMessage(undefined);
       }
@@ -246,7 +252,6 @@ export function OfficialUsageImportPanel({
           ?? state.staging.find(stage => stage.bundleId === bundleId)?.correctionOfSetId
           ?? state.sets.find(reportSet => reportSet.bundleId === bundleId)?.supersedesSetId ?? undefined;
         setDraft({ bundleId, correctionOfSetId: pendingCorrection.current });
-        setCorrectionMode(Boolean(pendingCorrection.current));
         if (reset) setStep("validation");
         const preview = await previewOfficialUsageBundle(bundleId, { signal: controller.signal });
         if (!controller.signal.aborted && generation === loadGeneration.current) applyBundlePreview(preview, state);
@@ -301,7 +306,6 @@ export function OfficialUsageImportPanel({
         pendingCorrection.current = undefined;
         setDraft(undefined);
         setBundlePreview(undefined);
-        setCorrectionMode(false);
         setMessage({ tone: "error", text: "The staged bundle is no longer available. It may have expired or been discarded. Choose the CSV files to import again." });
         setStep("files");
       }
@@ -324,15 +328,27 @@ export function OfficialUsageImportPanel({
     setMessage(undefined);
   }
 
+  function keepStagedReports() {
+    if (!active || busy || !draft || !hasDuplicateKindConflict || !bundlePreview || !previewVerified || !adminVerified) return;
+    setConflictedBundles(previous => previous.filter(bundleId => bundleId !== draft.bundleId));
+    setFiles([]);
+    setValidation(previous => previous.filter(entry => entry.status === "validated"));
+    if (fileInput.current) fileInput.current.value = "";
+    setStep("validation");
+    setMessage({
+      tone: "success",
+      text: "Rejected and unvalidated file selections were removed from this import. Earlier staged reports remain unchanged; no files were replaced. Review the staged reports before accepting.",
+    });
+  }
+
   async function stageFiles() {
-    if (!active || busy || !files.length || !adminState || !adminVerified) return;
+    if (!active || busy || hasDuplicateKindConflict || !files.length || !adminState || !adminVerified) return;
     const signal = lifetime.current?.signal;
     const generation = ++loadGeneration.current;
     const reportSet = adminState.sets.find(value => value.bundleId === pendingBundleId.current);
     const priorBundleId = pendingBundleId.current;
     const bundleId = priorBundleId ?? crypto.randomUUID();
-    const correctionOfSetId = pendingBundleId.current ? pendingCorrection.current
-      : correctionMode ? adminState.activeSetId ?? undefined : undefined;
+    const correctionOfSetId = priorBundleId ? pendingCorrection.current : undefined;
     const metadata = companionMetadata(bundlePreview, reportSet, adminState.staging.find(stage => stage.bundleId === bundleId && stage.status === "active"));
     const entries: FileValidation[] = files.map(file => ({ file: { name: file.name, size: file.size }, status: "waiting" }));
     const stagedKinds = new Set<string>();
@@ -355,7 +371,9 @@ export function OfficialUsageImportPanel({
       entries[index] = { file: label, status: "validating" };
       setValidation([...entries]);
       try {
-        const preview = await stageOfficialUsageReport(file, { bundleId, correctionOfSetId, ...metadata });
+        const preview = await stageOfficialUsageReport(file, {
+          bundleId, ...(correctionOfSetId ? { correctionOfSetId } : {}), ...metadata, rejectDuplicateKind: true,
+        });
         if (!isLive(generation)) return;
         pendingBundleId.current = bundleId;
         pendingCorrection.current = correctionOfSetId;
@@ -366,6 +384,9 @@ export function OfficialUsageImportPanel({
         if (!isLive(generation) || clearUnauthorized(error)) return;
         rejectedFiles.push(file);
         entries[index] = { file: label, status: "rejected", error: errorMessage(error) };
+        if (error instanceof ApiError && error.code === "duplicate_report_kind") {
+          setConflictedBundles(previous => previous.includes(bundleId) ? previous : [...previous, bundleId]);
+        }
       }
       setValidation([...entries]);
     }
@@ -415,7 +436,7 @@ export function OfficialUsageImportPanel({
 
   async function acceptPreviews(retry = false) {
     const reviewed = retry ? acceptanceRetry : bundlePreview;
-    if (busy || !reviewed || reviewed.missingKinds.length || (!retry && (!previewVerified || files.length || step !== "review"))) return;
+    if (busy || hasDuplicateKindConflict || !reviewed || reviewed.missingKinds.length || (!retry && (!previewVerified || files.length || step !== "review"))) return;
     const signal = lifetime.current?.signal;
     const generation = ++loadGeneration.current;
     const priorState = adminState;
@@ -434,7 +455,6 @@ export function OfficialUsageImportPanel({
       setBundlePreview(undefined);
       setPreviewVerified(false);
       setAcceptanceRetry(undefined);
-      setCorrectionMode(false);
       setFiles([]);
       setValidation([]);
       setAdminVerified(false);
@@ -464,11 +484,12 @@ export function OfficialUsageImportPanel({
   }
 
   async function discardPreviews() {
-    if (!active || busy || !adminVerified || !previews.length) return;
+    if (!active || busy || !adminVerified || !draft || (!discardablePreviews.length && !bundlePreview)) return;
+    const discardedBundleId = draft.bundleId;
     const generation = ++loadGeneration.current;
     setBusy(true);
     setPreviewVerified(false);
-    const outcomes = await Promise.allSettled(previews.map(async preview => {
+    const outcomes = await Promise.allSettled(discardablePreviews.map(async preview => {
       try {
         await discardOfficialUsageStaging(preview.id);
       } catch (error) {
@@ -479,8 +500,13 @@ export function OfficialUsageImportPanel({
     if (!isLive(generation)) return;
     const failed = outcomes.filter(outcome => outcome.status === "rejected");
     if (failed.some(outcome => clearUnauthorized(outcome.reason))) return;
+    const discardedIds = new Set(outcomes.flatMap((outcome, index) =>
+      outcome.status === "fulfilled" ? [discardablePreviews[index].id] : []));
+    setValidation(previous => previous.filter(entry => !entry.preview || !discardedIds.has(entry.preview.id)));
+    setBundlePreview(previous => previous ? { ...previous, staging: previous.staging.filter(stage => !discardedIds.has(stage.id)) } : undefined);
+    setAdminState(previous => previous ? { ...previous, staging: previous.staging.filter(stage => !discardedIds.has(stage.id)) } : undefined);
     if (failed.length) {
-      const state = await refresh(bundlePreview?.bundleId);
+      const state = await refresh(discardedBundleId);
       if (!state || lifetime.current?.signal.aborted) return;
       setMessage({ tone: "error", text: `${failed.length} staged report(s) could not be discarded and remain available for retry. ${errorMessage(failed[0].reason)}` });
     } else {
@@ -489,12 +515,16 @@ export function OfficialUsageImportPanel({
       setDraft(undefined);
       setBundlePreview(undefined);
       setAcceptanceRetry(undefined);
-      setCorrectionMode(false);
+      setConflictedBundles(previous => previous.filter(bundleId => bundleId !== discardedBundleId));
+      setFiles([]);
       setValidation([]);
+      if (fileInput.current) fileInput.current.value = "";
       setStep("files");
       const state = await refresh(null);
       if (!state || lifetime.current?.signal.aborted) return;
-      setMessage({ tone: "success", text: "All staged rows were discarded." });
+      setMessage({ tone: "success", text: discardablePreviews.length
+        ? "All staged rows were discarded. Choose all three exports to start an independent report set."
+        : "Ready for an independent report set. Previously accepted companions remain retained." });
     }
   }
 
@@ -593,9 +623,10 @@ export function OfficialUsageImportPanel({
     setStep("files");
   }
 
-  const canReview = Boolean(bundlePreview && !bundlePreview.missingKinds.length && previewVerified && adminVerified && !files.length && !busy);
-  const acceptedSet = result?.verifiedState?.sets.find(value => value.id === result.accepted.setId && value.complete && !value.deletedAt);
-  const activeSet = adminVerified ? adminState?.sets.find(value => value.id === adminState.activeSetId && !value.deletedAt) : undefined;
+  const canReview = Boolean(bundlePreview && !bundlePreview.missingKinds.length && previewVerified && adminVerified && !files.length && !busy && !hasDuplicateKindConflict);
+  const acceptedSet = result?.verifiedState?.sets.find(value => value.id === result.accepted.setId);
+  const canViewAcceptedSet = result?.accepted.complete && result.verifiedState
+    && (acceptedSet ? acceptedSet.complete && !acceptedSet.deletedAt : result.accepted.reusedExistingSet);
   const selectedStep = importSteps.find(value => value.id === step)!;
 
   return (
@@ -620,6 +651,21 @@ export function OfficialUsageImportPanel({
             onResume: bundleId => void resumeSet(bundleId), onOperation: (setId, operation) => void beginSetOperation(setId, operation) } : undefined}
           onRefresh={() => void refresh(null)} onViewSnapshot={onViewSnapshot} /> : (
           <>
+            {draft?.correctionOfSetId ? <div className="usage-context-warning" role="note" aria-label="Legacy correction draft">
+              <p>This restored legacy draft intentionally corrects snapshot <strong>{draft.correctionOfSetId}</strong>.
+                {" "}Its original correction intent is read-only and will be preserved if accepted.</p>
+              <p>To import an independent report set instead, {discardablePreviews.length
+                ? "discard staging and choose all three exports again."
+                : "start an independent report set. Previously accepted companions will remain retained."}</p>
+            </div> : null}
+            {hasDuplicateKindConflict ? <div className="usage-context-warning" role="alert">
+              <p>A file duplicated a report type already in this draft. Earlier staged reports were kept.
+                {" "}This draft cannot be accepted until you explicitly keep the staged reports and remove all pending files,
+                {" "}or discard staging and choose one file per report type to restart.</p>
+              <button type="button" className="secondary" disabled={busy || !adminVerified || !previewVerified || !bundlePreview}
+                onClick={keepStagedReports}>Keep staged reports and remove pending files</button>
+              <p>This removes rejected files and any unvalidated selections, not staged reports. Refresh import state first if the staged reports are not verified.</p>
+            </div> : null}
             {step === "files" ? (
               <section className="usage-files-step" aria-label="Choose report files">
                 <p>Choose the original <strong>Agents</strong>, <strong>Users &amp; agents</strong>, and <strong>Users</strong> CSV exports from the same Microsoft reporting selection.</p>
@@ -636,15 +682,9 @@ export function OfficialUsageImportPanel({
                 </ol>
                 <a href={reportGuideUrl} target="_blank" rel="noreferrer">Microsoft report export guidance</a>
                 <p>All rows are imported; no dates need to be entered. The server identifies report types. File names and activity dates do not prove a shared reporting window.</p>
+                <p>Each draft accepts one file per report type. Adding another file of the same type is rejected without replacing earlier files. To replace a file, discard staging and choose all three exports again.</p>
                 {draft ? <p className="usage-context-warning">Companions already staged in draft {draft.bundleId.slice(0, 8)} remain available. New files must be validated before review.</p> : null}
-                {adminState?.activeSetId || correctionMode ? (
-                  <div className="official-usage-correction">
-                    <label><input type="checkbox" disabled={busy || Boolean(draft)} checked={correctionMode} onChange={event => setCorrectionMode(event.target.checked)} />{draft?.correctionOfSetId ? "This draft intentionally corrects its original snapshot." : "This upload intentionally corrects the current snapshot."}</label>
-                    <p>{draft ? `This draft's correction intent is fixed${draft.correctionOfSetId ? ` to snapshot ${draft.correctionOfSetId.slice(0, 8)}` : " as an independent import"}. Discard staging to change it.` : "Leave this off for ordinary uploads. Use it only to intentionally supersede the selected snapshot; prior observations stay in history."}</p>
-                    {activeSet ? <p>Current snapshot: {formatCoverage(activeSet.reportingPeriod)}</p> : null}
-                  </div>
-                ) : null}
-                <p>Ordinary uploads do not require a replacement acknowledgement. For a known reporting window, changed aggregate metrics require intentional correction. Activity-range-only imports have an unknown reporting window and remain independent observations.</p>
+                <p>Exact duplicate uploads are automatically reused. Changed reports are saved as independent report sets, even for the same known reporting window. Snapshots are not added together into cumulative response totals.</p>
               </section>
             ) : null}
             {step === "validation" ? (
@@ -662,8 +702,8 @@ export function OfficialUsageImportPanel({
                     {bundlePreview.acceptedVersions.map(version => <li key={version.versionId}>{kindLabel(version.kind)}: accepted companion retained</li>)}</ul>
                   {!previewVerified ? <p className="usage-context-warning">The displayed preview is not verified for approval. Refresh import state or validate changed files before continuing.</p> : null}
                 </div> : null}
-                {files.length ? <p>{files.length} file(s) selected for retry. Successfully staged companions are kept in the same bundle.</p> : null}
-                {!busy && (!bundlePreview || bundlePreview.missingKinds.length > 0) ? <p>Return to Files to add or replace the missing exports. A filename is not evidence of its report type.</p> : null}
+                {files.length ? <p>{files.length} file(s) {hasDuplicateKindConflict ? "pending removal or restart; resolve the duplicate-type conflict before continuing" : "selected for retry"}. Successfully staged companions are kept in the same bundle.</p> : null}
+                {!busy && (!bundlePreview || bundlePreview.missingKinds.length > 0) ? <p>Return to Files to add missing report types. Each draft accepts one file per type; discard staging to replace a file. A filename is not evidence of its report type.</p> : null}
               </section>
             ) : null}
             {step === "review" && bundlePreview ? <>
@@ -681,8 +721,8 @@ export function OfficialUsageImportPanel({
             ) : null}
           </>
         )}
-        {view === "import" && previews.length && step !== "result" ? <div className="usage-staging-actions">
-          <button type="button" className="secondary" disabled={busy || !adminVerified || Boolean(acceptanceRetry)} onClick={() => void discardPreviews()}><Trash2 size={16} aria-hidden="true" />Discard staging</button>
+        {view === "import" && draft && (discardablePreviews.length > 0 || bundlePreview) && step !== "result" ? <div className="usage-staging-actions">
+          <button type="button" className="secondary" disabled={busy || !adminVerified || Boolean(acceptanceRetry)} onClick={() => void discardPreviews()}><Trash2 size={16} aria-hidden="true" />{discardablePreviews.length ? "Discard staging" : "Start independent report set"}</button>
           <span>Only unaccepted staging will be discarded.</span>
         </div> : null}
         {legacyPresent && (view === "manage" || step === "files" || step === "result") ? (
@@ -703,13 +743,13 @@ export function OfficialUsageImportPanel({
           {step === "result" ? <button type="button" className="secondary" disabled={busy} onClick={startAnotherImport}>Import another bundle</button> : null}
         </div>
         <div className="usage-wizard-primary">
-          {step === "files" ? <button type="button" disabled={busy || !files.length || !adminVerified} onClick={() => void stageFiles()}><Upload size={16} aria-hidden="true" />Validate and stage</button> : null}
-          {step === "validation" && files.length ? <button type="button" className="secondary" disabled={busy || !adminVerified} onClick={() => void stageFiles()}>Retry rejected files</button> : null}
+          {step === "files" ? <button type="button" disabled={busy || hasDuplicateKindConflict || !files.length || !adminVerified} onClick={() => void stageFiles()}><Upload size={16} aria-hidden="true" />Validate and stage</button> : null}
+          {step === "validation" && files.length ? <button type="button" className="secondary" disabled={busy || hasDuplicateKindConflict || !adminVerified} onClick={() => void stageFiles()}>Retry rejected files</button> : null}
           {step === "validation" ? <button type="button" disabled={!canReview} onClick={() => { setMessage(undefined); setStep("review"); }}>Continue to review</button> : null}
           {step === "review" ? <button type="button" disabled={!canReview || Boolean(acceptanceRetry)} onClick={() => void acceptPreviews()}><Check size={16} aria-hidden="true" />{busy ? "Accepting…" : "Accept reviewed bundle"}</button> : null}
           {step === "review" && acceptanceRetry ? <button type="button" disabled={busy} onClick={() => void acceptPreviews(true)}>Retry same acceptance</button> : null}
           {step === "result" && !result?.verifiedState ? <button type="button" disabled={busy} onClick={() => void refresh(null)}>Refresh result</button> : null}
-          {step === "result" && acceptedSet && onViewSnapshot ? <button type="button" disabled={busy} onClick={() => onViewSnapshot(acceptedSet.id)}>View snapshot</button> : null}
+          {step === "result" && canViewAcceptedSet && onViewSnapshot ? <button type="button" disabled={busy} onClick={() => onViewSnapshot(result!.accepted.setId)}>View snapshot</button> : null}
         </div>
       </footer> : null}
       {confirmation ? <SetConfirmationDialog confirmation={confirmation} reportSet={adminState?.sets.find(reportSet => reportSet.id === confirmation.setId)}

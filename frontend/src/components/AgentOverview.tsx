@@ -8,7 +8,6 @@ import { usageDate } from "../usageInsights";
 import { AgentAuthoringTools, AgentAvailability, AgentStatus } from "./UnifiedAgentTable";
 import type { useAgentPeople, AgentPerson } from "../useAgentPeople";
 import { CapabilityContext } from "../capabilityContext";
-import { PackageDetailFreshnessStatus } from "./PackageDetailFreshnessStatus";
 
 const connectorPageSize = 10;
 
@@ -77,7 +76,6 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
     {record.packages.length > 1 ? <p className="agent-insight-note">Status, end-user access and installation cover all {record.packages.length} published versions. Package description and version are for the selected package; native configuration has its own Power Platform observation.</p> : null}
     {descriptionHtml ? <div className="agent-overview-description rich-description" aria-label="Agent description" dangerouslySetInnerHTML={{ __html: descriptionHtml }} />
       : <p className="agent-overview-description">{description}</p>}
-    <PackageDetailFreshnessStatus freshness={packageDetail?.detailFreshness ?? selectedPackage?.detailFreshness} now={now} />
     {missingName ? <p className="agent-insight-note">The saved inventory did not supply an agent name, so its resource ID is shown. This does not establish whether the agent was deleted.</p> : null}
     <section className="agent-overview-section" aria-label="Agent information">
       <h3>Responsibility</h3>
@@ -86,7 +84,6 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
         { label: "Created by", value: people.createdBy ? <Person value={people.createdBy} onOpen={onOpenPerson} /> : "Not reported" },
         { label: "Last modified by", value: people.lastModifiedBy ? <Person value={people.lastModifiedBy} onOpen={onOpenPerson} /> : "Not reported" },
       ]} />
-      <p className="agent-insight-note">Ownership, creation and last modification are distinct source relationships, not access assignments or reported usage. A last modifier is not necessarily the current maintainer.</p>
       {loadingPeople ? <p role="status">Resolving agent people...</p> : null}
       {peopleUnavailable ? <p className="agent-insight-note">{peopleUnavailable}</p> : null}
       {peopleError ? <p className="error-banner" role="alert">{peopleError}</p> : null}
@@ -111,7 +108,6 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
     </section>
     <section className="agent-overview-section" aria-label="Configured connectors and operations">
       <h3>Configured connectors and operations</h3>
-      <p className="agent-insight-note">Source-declared configuration, not observed executions or live connections. Connector details are preview data and reflect the published agent structure, not unpublished changes or the selected Graph package version.</p>
       <Properties values={[
         { label: "Reported connector total", value: connectorCount ?? "Unknown" },
         { label: "Reported operation total", value: operationCount ?? "Unknown" },
@@ -149,7 +145,6 @@ export function AgentOverview({ record, selectedPackage, packageDetail, peopleSt
           ? "No configured connectors were reported."
           : "Configured connector details are not available in the saved observation. Missing details do not mean no configured connectors."}</p>}
       {partialConnectors ? <p className="agent-insight-note">Capability details are partial: fields may be missing, malformed, or limited by the provider or saved projection. Reported totals are retained independently.</p> : null}
-      <p className="agent-insight-note">Operation creators configured individual operations; they are not necessarily the agent owner or creator. Names, URLs and plugin metadata do not establish native connector or flow relationships.</p>
       <h4>Invoked flows</h4>
       <p>{invokedFlowLimitation}</p>
       {resource ? <p><a href={agentContextConsoles.copilotStudio} target="_blank" rel="noreferrer">Copilot Studio (console landing page)</a> — for agents authored there, choose the agent and review its tools and flows. Console access uses your Microsoft permissions, not this saved view.</p>

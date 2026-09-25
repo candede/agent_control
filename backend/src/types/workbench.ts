@@ -7,7 +7,6 @@ export const workbenchViewIds = [
   "sync",
   "audit",
   "permissions",
-  "jobs",
 ] as const;
 
 export type WorkbenchViewId = (typeof workbenchViewIds)[number];

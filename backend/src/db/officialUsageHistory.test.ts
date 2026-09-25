@@ -188,7 +188,7 @@ describe.sequential("official usage cumulative history", () => {
       reformatted: true,
     });
     const result = await duplicate.accept();
-    expect(result).toMatchObject({ setId: dayTwoSetId, activeRevision: before.activeRevision, complete: true });
+    expect(result).toMatchObject({ setId: dayTwoSetId, activeRevision: before.activeRevision, complete: true, reusedExistingSet: true });
     expect((await fixture.runtime.query<{ sets: number; versions: number; facts: number }>(`SELECT
       (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
       (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions,
@@ -231,7 +231,7 @@ describe.sequential("official usage cumulative history", () => {
     expect((await repository.getPublished(owner.tenantId)).activeSet?.id).toBe(second.setId);
   });
 
-  it("requires correction for a known-window revision even when source-as-of advances", async () => {
+  it("preserves explicit correction lineage when source-as-of advances", async () => {
     const changedKinds = {
       agents: { changedOrdinal: 99, changedResponses: 6 },
       userAgents: { changedOrdinal: 99 },
@@ -239,9 +239,6 @@ describe.sequential("official usage cumulative history", () => {
     };
     const prior = await repository.getPublished(scope.tenantId, dayTwoSetId);
     const advancedSource = metadata("2026-06-03", "2026-07-02", "2026-07-04T08:00:00Z");
-    const unlabelled = await importBundle({ reportMetadata: advancedSource, changedKinds });
-    await expect(unlabelled.accept()).rejects.toMatchObject({ code: "correction_required" });
-
     const correction = await importBundle({
       reportMetadata: advancedSource,
       changedKinds,

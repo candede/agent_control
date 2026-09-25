@@ -77,6 +77,38 @@ function window(startDate: string, endDate: string): OfficialUsageMetadata {
 }
 
 describe.sequential("cumulative official agent/activity overview SQL", () => {
+  it("switches selected-set metrics without merging history or falling back after deletion", async () => {
+    const owner = scope();
+    const first = await importBundle(owner, { agents: [
+      { id: "older-only", date: "2026-06-01" }, { id: "shared", date: "2026-07-15" },
+    ] });
+    const second = await importBundle(owner, { agents: [{ id: "newer-only", date: "2026-07-15" }] });
+    expect((await overview.getOverview(owner.tenantId)).summary.reportedAgents).toBe(3);
+    expect(await overview.getOverview(owner.tenantId, { scope: "selected" })).toMatchObject({
+      summary: { retainedSets: 1, reportedAgents: 1, usedAgents: 1, activeAgents30Days: 1 },
+      agents: { value: [{ agentId: "newer-only", latestSetId: second.setId }] },
+    });
+    const preview = await repository.previewSetOperation(owner, "select", first.setId);
+    await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "select", setId: first.setId });
+    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).summary)
+      .toMatchObject({ retainedSets: 1, reportedAgents: 2, usedAgents: 2, activeAgents30Days: 1 });
+    await deleteSet(owner, first.setId);
+    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).summary)
+      .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
+    expect((await overview.getOverview(owner.tenantId)).summary.reportedAgents).toBe(1);
+  });
+
+  it("honors explicit selection of a legacy superseded set without reviving it in history evidence", async () => {
+    const owner = scope();
+    const first = await importBundle(owner, { agents: [{ id: "original", date: "2026-07-01" }] });
+    await importBundle(owner, { agents: [{ id: "corrected", date: "2026-07-15" }], correctionOfSetId: first.setId });
+    const preview = await repository.previewSetOperation(owner, "select", first.setId);
+    await repository.confirmSetOperation(owner, preview.id, { ...preview, operation: "select", setId: first.setId });
+    expect((await overview.getOverview(owner.tenantId, { scope: "selected" })).agents.value)
+      .toMatchObject([{ agentId: "original" }]);
+    expect((await overview.getOverview(owner.tenantId)).agents.value).toMatchObject([{ agentId: "corrected" }]);
+  });
+
   it("preserves the June 1–July 15 union from overlapping snapshots without adding response totals", async () => {
     const owner = scope();
     const dates = Array.from({ length: 45 }, (_, index) =>

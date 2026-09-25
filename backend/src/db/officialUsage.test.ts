@@ -154,16 +154,8 @@ describe.sequential("Official usage repository", () => {
     await expect(accept(incompatible)).rejects.toMatchObject({ code: "incompatible_bundle" });
   });
 
-  it("requires explicit immutable correction and makes retries idempotent", async () => {
+  it("preserves explicit immutable corrections and makes retries idempotent", async () => {
     const activeBefore = (await repository.getAdminState(administrator)).activeSetId!;
-    const unlabelledBundle = randomUUID();
-    await Promise.all(["agents", "userAgents", "users"].map(kind =>
-      stage(kind as "agents" | "userAgents" | "users", unlabelledBundle, { marker: "2" })));
-    const unlabelled = await repository.previewBundle(administrator, unlabelledBundle);
-    await expect(repository.acceptBundle(administrator, unlabelledBundle, unlabelled))
-      .rejects.toMatchObject({ code: "correction_required" });
-    expect((await repository.getAdminState(administrator)).activeSetId).toBe(activeBefore);
-
     const corrected = await completeSet("2", activeBefore);
     expect(corrected.third.complete).toBe(true);
     expect(corrected.third.setId).not.toBe(activeBefore);
@@ -244,7 +236,7 @@ describe.sequential("Official usage repository", () => {
     ]);
     const accepted = concurrent[0];
     expect(concurrent[1]).toEqual(accepted);
-    expect(accepted.complete).toBe(true);
+    expect(accepted).toMatchObject({ complete: true, reusedExistingSet: false });
     await expect(repository.acceptBundle(scope, bundleId, { ...reviewed, bundleHash: "f".repeat(64) }))
       .rejects.toMatchObject({ code: "bundle_fence_mismatch" });
     await expect(repository.acceptBundle(scope, bundleId, { ...reviewed, expectedActiveRevision: reviewed.expectedActiveRevision + 1 }))

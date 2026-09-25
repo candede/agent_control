@@ -14,7 +14,7 @@ describe("agent column preferences", () => {
     expect(used.description).toContain("existing administrator-reviewed association");
     expect(used.description).toContain("not a live or all-channel activity measure");
     expect(agentViewOptions.find(option => option.value === "organization")!.description).toContain("does not establish end-user access");
-    expect(agentViewOptions.find(option => option.value === "all")!.label).toBe("All agents in repository");
+    expect(agentViewOptions.find(option => option.value === "all")!.label).toBe("All agents in this view");
     expect(agentViewOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
   });
 

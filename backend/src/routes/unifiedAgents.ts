@@ -5,7 +5,7 @@ import { assertAccountSessionValidation, beginAccountSessionValidation } from ".
 import { requestScope } from "../middleware/auth.js";
 import { unifiedAgents } from "../services/unifiedAgents.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews } from "../types/unifiedAgents.js";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys, unifiedAgentViews } from "../types/unifiedAgents.js";
 import { isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
 import { getAuditLog } from "../services/auditLog.js";
@@ -215,7 +215,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
   if (!isRecord(query)) throw new AppError(400, "invalid_export_selection", "Export filters must be an object.");
   const allowed = new Set([
     "recordId", "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher",
-    "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view",
+    "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view", "inventoryScope",
   ]);
   const normalized: Record<string, unknown> = {};
   for (const [key, field] of Object.entries(query)) {
@@ -246,6 +246,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
 export function unifiedAgentInventoryQuery(query: Record<string, unknown>): UnifiedAgentInventoryQuery {
   const blocked = first(query.blocked);
   return {
+    inventoryScope: oneOf(first(query.inventoryScope), "inventoryScope", unifiedAgentInventoryScopes) ?? "all",
     view: oneOf(first(query.view), "view", unifiedAgentViews),
     recordId: exactRecordId(first(query.recordId)),
     operationIdPrefix: operationReference(first(query.operationIdPrefix)),

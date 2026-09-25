@@ -69,14 +69,24 @@ export function resolvePackageAgentLinks(
   }
   const identities = new Map<string, PackageAgentMetadata>();
   const resolutions: PackageAgentLinkResolution[] = packages.map(value => {
-    if (value.detailFreshness && value.detailFreshness.state !== "fresh") return {
-      packageId: value.id, status: "unmatched",
-      reason: "Package identity details are missing, expired, or changed. Refresh this package's identity before linking it to a Power Platform agent.",
-    };
     if (value.identityRevalidationRequired) return {
       packageId: value.id, status: "unmatched",
-      reason: "A control readback reported changed identity evidence. Refresh this package's identity before linking it to a Power Platform agent.",
+      reason: "Saved observations reported changed identity evidence. Refresh this package's identity before linking it to a Power Platform agent.",
     };
+    if (value.detailFreshness && value.detailFreshness.state !== "fresh") {
+      const catalogManifest = value.detailFreshness.state !== "invalidated" && normalizedGuid(value.manifestId)
+        && value.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots"))
+        && !value.elementDetails?.some(group => isPackageElementType(group.elementType, "AgentMetadatas"))
+        && (value.elementDetails?.filter(group => isPackageElementType(group.elementType, "DeclarativeCopilots"))
+          .flatMap(group => group.elements).length ?? 0) <= 1;
+      if (!catalogManifest) return {
+        packageId: value.id, status: "unmatched",
+        reason: "Package identity details are missing, expired, or changed. Refresh this package's identity before linking it to a Power Platform agent.",
+      };
+      // Current catalog manifest/type evidence is independent of hourly detail freshness.
+      // Never reuse expired detail IDs, environment constraints, or control proof.
+      value = { ...value, elementDetails: undefined, identityDetailsCollected: undefined };
+    }
     const observation = readPackageAgentMetadata(value);
     if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
       return { packageId: value.id, ...observation };

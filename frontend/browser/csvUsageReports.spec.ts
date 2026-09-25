@@ -3,12 +3,13 @@ import { expect, test, type Page } from "@playwright/test";
 import { fixtureLoginUrl, isExternalFixtureRequest } from "./permissionFixtures";
 import { mockAutomaticRefresh } from "./automaticRefreshFixtures";
 
-async function uploadBundle(page: Page, dates: [string, string, string], identity: string) {
+async function uploadBundle(page: Page, dates: [string, string, string], identity: string, expectedDuplicate = false) {
   const section = page.getByRole("region", { name: "CSV usage reports", exact: true });
   await section.getByRole("button", { name: "Add CSV reports" }).click();
   const modal = page.getByRole("dialog", { name: "Import CSV reports" });
   const another = modal.getByRole("button", { name: "Import another bundle" });
   if (await another.isVisible()) await another.click();
+  await expect(modal.getByRole("checkbox", { name: /intentionally corrects/ })).toHaveCount(0);
   const csvs = [
     `Agent ID,Agent name,Creator type,Active users (licensed),Active users (unlicensed),Responses sent to users,Last activity date (UTC)\nrange-${identity},Range agent,Your org,1,0,7,${dates[0]}`,
     `Agent ID,Agent name,Creator type,Username,Responses sent to users,Last activity date (UTC)\nrange-${identity},Range agent,Your org,range-${identity}@example.invalid,7,${dates[1]}`,
@@ -24,8 +25,10 @@ async function uploadBundle(page: Page, dates: [string, string, string], identit
   await modal.getByRole("button", { name: "Accept reviewed bundle" }).click();
   const response = await accepted;
   expect(response.ok()).toBe(true);
-  const result: { setId: string } = await response.json();
+  const result: { setId: string; reusedExistingSet: boolean } = await response.json();
+  expect(result.reusedExistingSet).toBe(expectedDuplicate);
   await expect(modal.getByRole("heading", { name: "Accepted bundle", exact: true })).toBeVisible();
+  if (expectedDuplicate) await expect(modal).toContainText("No new history entry was created");
   await modal.getByRole("button", { name: "Close", exact: true }).click();
   return result.setId;
 }
@@ -42,7 +45,7 @@ async function deleteBundle(page: Page, setId: string) {
   await modal.getByRole("button", { name: "Close reports" }).click();
 }
 
-test("CSV section reflects cumulative persisted dates after uploads, reload and deletions", async ({ page, context }, info) => {
+test("CSV section reflects retained observed activity dates across history after uploads, reload and deletions", async ({ page, context }, info) => {
   test.setTimeout(45_000);
   await context.route(isExternalFixtureRequest, route => route.abort());
   await mockAutomaticRefresh(page);
@@ -58,15 +61,35 @@ test("CSV section reflects cumulative persisted dates after uploads, reload and 
   await expect(reports).toContainText("2 retained report sets");
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();
-  await expect(reports.getByText("Reporting dates (UTC)")).toBeVisible();
+  await expect(reports.getByRole("heading", { name: "Retained activity date range" })).toBeVisible();
+  await expect(reports.getByText("Observed activity dates (UTC)")).toBeVisible();
+  await expect(reports.getByText("Reporting dates (UTC)")).toHaveCount(0);
   await expect(reports.getByText("Reporting dates not supplied")).toHaveCount(0);
+  await expect(reports).toContainText("not reporting-window bounds or proof of continuous reporting coverage");
+  await expect(reports).toContainText("across all retained, complete CSV report sets in history");
   await expect(reports).toContainText("No manual dates are needed");
   await page.reload();
   await expect(reports.locator("time[datetime='2026-01-02']")).toBeVisible();
   await expect(reports.locator("time[datetime='2026-08-29']")).toBeVisible();
+  const repeated = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name, true);
+  expect(repeated).toBe(first);
+  await expect(reports).toContainText("2 retained report sets");
+  const navigation = page.getByRole("navigation", { name: "Primary views" });
+  await navigation.getByRole("button", { name: "Agents", exact: true }).click();
+  const selector = page.getByRole("region", { name: "Report set selection" });
+  await expect(selector.getByRole("combobox")).toHaveValue(second);
+  await selector.getByRole("combobox").selectOption(first);
+  await expect(selector.getByRole("combobox")).toBeEnabled();
+  await expect(selector.getByRole("combobox")).toHaveValue(first);
+  await expect(selector.getByRole("button")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/agents$/);
+  await navigation.getByRole("button", { name: "Users", exact: true }).click();
+  await expect(selector.getByRole("combobox")).toHaveValue(first);
+  await navigation.getByRole("button", { name: /^Sync/ }).click();
+  await expect(reports).toContainText("2 retained report sets");
   expect(await new AxeBuilder({ page }).include(".data-sync-reports").analyze()).toMatchObject({ violations: [] });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  await page.screenshot({ path: info.outputPath("csv-cumulative-range.png"), fullPage: true });
+  await page.screenshot({ path: info.outputPath("csv-retained-activity-range.png"), fullPage: true });
   await deleteBundle(page, first);
   await expect(reports.locator("time[datetime='2026-01-02']")).toHaveCount(0);
   await expect(reports.locator("time[datetime='2026-08-01']")).toBeVisible();

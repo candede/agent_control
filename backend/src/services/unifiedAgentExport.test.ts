@@ -32,7 +32,7 @@ function inventory(value = [record("first"), record("second")]): UnifiedAgentInv
   };
   return {
     revision: "a".repeat(64), value, count: value.length, limit: 5_000, offset: 0,
-    summary, filteredSummary: summary,
+    summary, inventoryScope: "all", scopeSummary: summary, filteredSummary: summary,
     verification: {
       status: "needs_attention", scope: "authorized_saved_sources", checkedAt: "2026-09-15T00:00:00.000Z",
       graphPackageCount: value.length, powerPlatformAgentCount: 0, representedSourceCount: value.length,

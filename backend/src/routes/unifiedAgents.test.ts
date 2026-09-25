@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes } from "../types/unifiedAgents.js";
 
 describe("unified agent inventory query", () => {
   it("validates bounded exact responsibility input without accepting scope overrides or name joins", () => {
@@ -26,6 +26,24 @@ describe("unified agent inventory query", () => {
     expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view } }).query.view).toBe(view);
   });
 
+  it.each(unifiedAgentInventoryScopes)("accepts the %s inventory scope for lists and filtered exports", inventoryScope => {
+    expect(unifiedAgentInventoryQuery({ inventoryScope, source: "power_platform" }))
+      .toMatchObject({ inventoryScope, source: "power_platform" });
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { inventoryScope, source: "both" } }).query)
+      .toMatchObject({ inventoryScope, source: "both" });
+    expect(() => unifiedAgentExportInput({
+      revision: "a".repeat(64), recordIds: ["graph_packages:package"], query: { inventoryScope },
+    })).toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
+  });
+
+  it.each(["graph_packages", "power_platform", "Catalog", "catalog ", "none", 1, true, {}])(
+    "rejects invalid inventory scope %j", inventoryScope => {
+      expect(() => unifiedAgentInventoryQuery({ inventoryScope }))
+        .toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { inventoryScope } })).toThrow();
+    },
+  );
+
   it("accepts organizational and usage views and new column sorting for list and export", () => {
     expect(unifiedAgentInventoryQuery({ view: "organization", sortBy: "deployment" })).toMatchObject({ view: "organization", sortBy: "deployment" });
     expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { view: "used", sortBy: "responses", sortDirection: "desc" } }).query)
@@ -39,6 +57,7 @@ describe("unified agent inventory query", () => {
       search: " agent ",
       recordId: "graph_packages:package-a",
       operationIdPrefix: "a5331a93",
+      inventoryScope: "catalog",
       source: "both",
       linkState: "matched",
       environmentId: " environment-a ",
@@ -56,6 +75,7 @@ describe("unified agent inventory query", () => {
       search: "agent",
       recordId: "graph_packages:package-a",
       operationIdPrefix: "a5331a93",
+      inventoryScope: "catalog",
       source: "both",
       linkState: "matched",
       environmentId: "environment-a",
@@ -95,12 +115,15 @@ describe("unified agent inventory query", () => {
 
   it("defaults to a bounded delegated saved read contract and rejects invalid filters", () => {
     expect(unifiedAgentInventoryQuery({})).toMatchObject({
+      inventoryScope: "all",
       source: "all",
       sortBy: "displayName",
       sortDirection: "asc",
       limit: 50,
       offset: 0,
     });
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64) }).query.inventoryScope).toBe("all");
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64), recordIds: ["graph_packages:package"] }).query.inventoryScope).toBe("all");
     expect(() => unifiedAgentInventoryQuery({ source: "application" })).toThrowError(expect.objectContaining({
       code: "invalid_agent_inventory_query",
     }));

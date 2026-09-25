@@ -14,7 +14,6 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage,
   }
   const pending = inventory.identityCollection?.pendingPackages ?? 0;
   const invalid = inventory.identityCollection?.invalidPackages ?? 0;
-  if (pending) reasons.add(`${pending.toLocaleString()} package${pending === 1 ? "" : "s"} awaiting identity metadata. These details are enriched separately in the background after catalog sync.`);
   if (invalid) reasons.add(`${invalid.toLocaleString()} package${invalid === 1 ? "" : "s"} with invalid matching metadata. Use diagnostics to refresh matching details for the affected packages.`);
   if (!inventory.verification.checks.packageMetadata && !pending && !invalid) {
     reasons.add("Package identity metadata has not been verified. Open diagnostics to inspect or refresh matching details.");
@@ -22,10 +21,14 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryPage,
   if (!inventory.verification.checks.identityLinks || inventory.summary.conflicting || inventory.summary.ambiguous) {
     reasons.add(`${inventory.summary.conflicting.toLocaleString()} conflicting and ${inventory.summary.ambiguous.toLocaleString()} ambiguous identity links. Review the affected agents' matching details; names alone cannot resolve them.`);
   }
-  if (!reasons.size && (inventory.partial || inventory.verification.status === "needs_attention")) {
+  if (!reasons.size && (inventory.partial || inventory.verification.status === "needs_attention" && !pending)) {
     reasons.add("Saved inventory checks are incomplete. Open diagnostics to recheck source coverage and identity accounting.");
   }
   return [...reasons];
+}
+
+export function inventoryDetailsPending(inventory?: UnifiedAgentInventoryPage) {
+  return Boolean(inventory?.identityCollection?.pendingPackages) || inventory?.verification.status === "details_pending";
 }
 
 export function inventoryRoleHint(scope?: InventorySnapshot["roleScope"] | null) {

@@ -75,6 +75,7 @@ const graphObservation = {
 };
 const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
 export const unifiedAgents: UnifiedAgentInventoryPage = {
+  inventoryScope: "catalog", scopeSummary: agentSummary,
   revision: "a".repeat(64),
   verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 0, logicalAgentCount: 3 }, { sourceScopes: false }, layoutTime),
   value: packages.value.map(item => ({
@@ -338,6 +339,7 @@ export async function mockLayoutApi(page: Page) {
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
     "/api/capabilities/check-progress": { progress: null },
     "/api/agents": packages,
+    "/api/agents/bulk-jobs": { value: [] },
     ...Object.fromEntries(packages.value.map(item => [`/api/agents/${encodeURIComponent(item.id)}`, item])),
     "/api/agent-inventory": { ...unifiedAgents, inventoryOverview: summarizeAgentAvailability(unifiedAgents.value) },
     "/api/agent-inventory/investigations/context": {

@@ -1,7 +1,27 @@
-import { unifiedAgentSortKeys, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+import { unifiedAgentSortKeys, type UnifiedAgentInventoryScope, type UnifiedAgentInventorySummary, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+
+export const agentInventoryScopeOptions = [
+  {
+    value: "catalog", label: "Microsoft 365 catalog", metric: "Agents in catalog",
+    description: "Agents in the Microsoft 365 package catalog, enriched with confirmed Power Platform matches.",
+  },
+  {
+    value: "power_platform_only", label: "Additional Power Platform agents", metric: "Additional Power Platform agents",
+    description: "Power Platform agents with no confirmed match in the saved package catalog. Missing or stale matching information can leave an agent unmatched; this does not establish publication or end-user access.",
+  },
+  {
+    value: "all", label: "Combined inventory", metric: "Agents in combined inventory",
+    description: "All saved catalog and Power Platform agents, with confirmed matches shown once.",
+  },
+] as const satisfies readonly { value: UnifiedAgentInventoryScope; label: string; metric: string; description: string }[];
+
+export function inventoryScopeAgentCount(summary: UnifiedAgentInventorySummary, scope: UnifiedAgentInventoryScope) {
+  return scope === "catalog" ? summary.linked + summary.graphOnly
+    : scope === "power_platform_only" ? summary.powerPlatformOnly : summary.total;
+}
 
 export const agentViewOptions = [
-  { value: "all", label: "All agents in repository", description: "All agents in saved repository and Power Platform data, whether or not users can access them." },
+  { value: "all", label: "All agents in this view", description: "All agents in the selected inventory view, whether or not users can access them." },
   { value: "available", label: "Available to end users", description: "Unblocked agents available to all or selected users, excluding known quarantined agents. Access is based on saved settings, not proof of use or an individual user's permissions." },
   { value: "unavailable", label: "Not available to end users", description: "Agents known to be blocked, quarantined, or available to no users." },
   { value: "availability_unknown", label: "End-user access unknown", description: "Agents without enough saved access information. Creation, publication, installation or past usage alone does not establish access." },

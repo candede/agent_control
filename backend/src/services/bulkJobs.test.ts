@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { createJobConfirmation, JobRepository, type JobInput, type JobIntentInput } from "../db/jobs.js";
-import { revokeAccountSessionMutations } from "../db/sessions.js";
+import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { reconcileBulkJob, runBulkJob } from "./bulkJobs.js";
 import { capabilities } from "./capabilities.js";
@@ -489,20 +489,30 @@ describe("Durable bulk execution", () => {
     await raceJobs.cancel(job.id, raceScope);
   });
 
-  it("does not publish success when account revocation occurs during provider readback", async () => {
+  it.each([1, 2])("does not publish success when account revocation occurs during provider readback (%i targets)", async targetCount => {
     const raceScope = { tenantId: "fixture-tenant", principalId: `readback-race-${randomUUID()}` };
-    const candidate = confirmedInput({ ...input(), actor: { ...input().actor, homeAccountId: raceScope.principalId }, requestPath: "/api/agents/package-1/block" });
+    const candidate = confirmedInput({
+      ...input(), actor: { ...input().actor, homeAccountId: raceScope.principalId },
+      targets: Array.from({ length: targetCount }, (_, index) => ({
+        id: `package-${index + 1}`, displayName: "Fixture", prestate: { kind: "block", isBlocked: false },
+      })),
+      scope: targetCount === 1 ? "single" : "bulk",
+      requestPath: "/api/agents/block",
+    });
     const raceJobs = new JobRepository(fixture.runtime);
     const job = await raceJobs.submit(raceScope, candidate);
+    const revision = await readUnifiedInventoryRevision(raceScope, fixture.runtime);
     let releaseReadback!: (value: Response) => void;
     const readback = new Promise<Response>(resolve => { releaseReadback = resolve; });
-    let blocked = false;
+    const blocked = new Set<string>();
     let reads = 0;
-    const fetcher = vi.fn<FetchLike>(async (_url, request) => {
-      if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
+    const fetcher = vi.fn<FetchLike>(async (url, request) => {
+      const parts = new URL(url).pathname.split("/");
+      const id = decodeURIComponent(request?.method === "POST" ? parts.at(-2)! : parts.at(-1)!);
+      if (request?.method === "POST") { blocked.add(id); return new Response(null, { status: 204 }); }
       reads += 1;
       if (reads === 3) return readback;
-      return Response.json({ id: "package-1", displayName: "Fixture", isBlocked: blocked });
+      return Response.json({ id, displayName: "Fixture", isBlocked: blocked.has(id) });
     });
     const execution = runBulkJob(job.id, raceScope, false, raceJobs, new GraphPackagesClient(fetcher), async () => "ephemeral-token");
     await vi.waitFor(() => expect(reads).toBe(3));
@@ -510,7 +520,54 @@ describe("Durable bulk execution", () => {
     releaseReadback(Response.json({ id: "package-1", displayName: "Fixture", isBlocked: true }));
     await execution;
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
-    expect(await raceJobs.get(job.id, raceScope)).toMatchObject({ status: "partial", succeeded: 0, inconclusive: 1 });
+    expect(await raceJobs.get(job.id, raceScope)).toMatchObject({
+      status: "partial", completed: 1, succeeded: 0, inconclusive: 1, canResume: targetCount > 1,
+      results: [{ id: "package-1", status: "inconclusive", errorCode: "unauthorized", reconciliationStatus: "required", retryEligible: false }],
+      result: { inconclusive: 1 },
+    });
+    expect(await readUnifiedInventoryRevision(raceScope, fixture.runtime)).toBe(revision);
+    expect(await new PackageInventoryRepository(fixture.runtime).get(raceScope, "package-1")).toBeUndefined();
+    const audit = await fixture.runtime.query("SELECT status FROM audit_events WHERE operation_id=$1", [job.id]);
+    expect(audit.rows.map(row => row.status)).toContain("inconclusive");
+    expect(audit.rows.map(row => row.status)).not.toContain("succeeded");
+    expect((await fixture.runtime.query("SELECT lease_owner,lease_until FROM jobs WHERE id=$1", [job.id])).rows[0])
+      .toEqual({ lease_owner: null, lease_until: null });
+    expect((await fixture.runtime.query("SELECT target_id,status,sent_at FROM job_items WHERE job_id=$1 ORDER BY ordinal", [job.id])).rows)
+      .toEqual(Array.from({ length: targetCount }, (_, index) => ({
+        target_id: `package-${index + 1}`, status: index === 0 ? "inconclusive" : "queued", sent_at: index === 0 ? expect.any(Date) : null,
+      })));
+    const attempts = () => fixture.runtime.query(`SELECT item.target_id,attempt.outcome,attempt.sent_at,attempt.finished_at
+      FROM job_attempts attempt JOIN job_items item ON item.id=attempt.item_id
+      WHERE attempt.job_id=$1 ORDER BY item.ordinal,attempt.lease_version`, [job.id]);
+    const inconclusiveAttempt = {
+      target_id: "package-1", outcome: "inconclusive", sent_at: expect.any(Date), finished_at: expect.any(Date),
+    };
+    expect((await attempts()).rows).toEqual([inconclusiveAttempt]);
+
+    const revokedAuthorization = vi.fn(async () => "ephemeral-token");
+    await expect(runBulkJob(job.id, raceScope, true, raceJobs, new GraphPackagesClient(fetcher), revokedAuthorization))
+      .rejects.toMatchObject({ code: "unauthorized" });
+    expect(revokedAuthorization).not.toHaveBeenCalled();
+    expect((await attempts()).rows).toEqual([inconclusiveAttempt]);
+
+    await activateAccountSession(raceScope.tenantId, raceScope.principalId, async () => undefined);
+    await runBulkJob(job.id, raceScope, true, raceJobs, new GraphPackagesClient(fetcher), async () => "ephemeral-token");
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(targetCount);
+    expect(await raceJobs.get(job.id, raceScope)).toMatchObject({
+      status: "partial", succeeded: targetCount - 1, inconclusive: 1, canResume: false,
+    });
+    const resumedAttempts = (await attempts()).rows;
+    expect(resumedAttempts).toEqual(Array.from({ length: targetCount }, (_, index) => ({
+      target_id: `package-${index + 1}`, outcome: index === 0 ? "inconclusive" : "succeeded",
+      sent_at: expect.any(Date), finished_at: expect.any(Date),
+    })));
+    const readAuthorization = vi.fn<NonNullable<Parameters<typeof reconcileBulkJob>[4]>>(async () => "ephemeral-token");
+    expect(await reconcileBulkJob(job.id, raceScope, raceJobs, new GraphPackagesClient(fetcher), readAuthorization))
+      .toMatchObject({ status: "succeeded", succeeded: targetCount, inconclusive: 0, reconciliation: { attempted: 1, failed: 0 } });
+    expect(readAuthorization.mock.calls.map(([, capability]) => capability))
+      .toEqual(Array(3).fill("graph.package.read.delegated"));
+    expect((await attempts()).rows).toEqual(resumedAttempts);
+    expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(targetCount);
   });
 
   it("preserves queued unsent work when authorization is revoked during a held pre-read", async () => {

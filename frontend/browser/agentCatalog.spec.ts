@@ -45,7 +45,7 @@ test("repository cards filter actual end-user access and keep report dates in th
   await page.goto("/agents");
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
   const table = page.getByRole("region", { name: "Unified agents" });
-  await expect(overview.getByText("Agents in repository").locator("..")).toContainText("3");
+  await expect(overview.getByText("Agents in catalog").locator("..")).toContainText("3");
   await expect(overview.getByText("Available to end users").locator("..")).toContainText("1");
   await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill(records[1].displayName);
@@ -65,7 +65,7 @@ test("repository cards filter actual end-user access and keep report dates in th
   await expect(table.getByRole("cell", { name: "Not available", exact: true })).toBeVisible();
   await page.getByRole("combobox", { name: "Show agents" }).selectOption("availability_unknown");
   await expect(table.getByRole("button", { name: records[2].displayName, exact: true })).toBeVisible();
-  await overview.getByRole("button", { name: "Show agents in repository", exact: true }).click();
+  await overview.getByRole("button", { name: "Show agents in catalog", exact: true }).click();
   await expect(table.getByRole("row")).toHaveCount(4);
   await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
   await table.getByRole("button", { name: "Columns", exact: true }).click();
@@ -171,7 +171,7 @@ test("organization filters, server sorting and remembered columns stay usable an
   expect(unexpected).toEqual([]);
 });
 
-test("server sorting preserves keyboard focus and blocks stale selection until the response arrives", async ({ page }) => {
+test("server sorting uses a fixed refresh indicator without shifting the page or losing keyboard focus", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));
   let finishSort: (() => Promise<void>) | undefined;
@@ -185,14 +185,35 @@ test("server sorting preserves keyboard focus and blocks stale selection until t
   });
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
+  const overview = page.getByRole("region", { name: "Agent inventory overview" });
+  await expect(overview.getByText("Reported used agents").locator("..")).toContainText("2");
   const heading = table.getByRole("button", { name: "Sort by Agent", exact: true });
+  await heading.scrollIntoViewIfNeeded();
+  const exportButton = page.getByRole("button", { name: "Export agent inventory CSV" });
+  const attention = page.getByRole("button", { name: /Inventory needs attention.*Open Sync/ });
+  await expect(attention).toBeVisible();
+  const bounds = async () => Promise.all([table.boundingBox(), overview.boundingBox(), exportButton.boundingBox()]);
+  const initialBounds = await bounds();
   await heading.click();
   await expect.poll(() => Boolean(finishSort)).toBe(true);
   await expect(heading).toBeFocused();
   await expect(table.getByRole("checkbox").first()).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Export agent inventory CSV" })).toBeDisabled();
+  await expect(exportButton).toBeDisabled();
+  const refresh = page.getByRole("status", { name: "Updating agent results", exact: true });
+  await expect(refresh).toBeVisible();
+  await expect(exportButton.locator("..").getByRole("status")).toHaveAccessibleName("Updating agent results");
+  await expect(table.locator(".notice")).toHaveCount(0);
+  await expect(attention).toBeVisible();
+  expect(await bounds()).toEqual(initialBounds);
+  expect(await refresh.locator("svg").evaluate(element => getComputedStyle(element).animationName)).toBe("agent-refresh-spin");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  expect(await refresh.locator("svg").evaluate(element => getComputedStyle(element).animationName)).toBe("none");
+  expect((await new AxeBuilder({ page }).include(".agent-catalog-heading").analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("agent-results-refresh.png"), fullPage: true });
   await finishSort!();
   await expect(table.getByRole("checkbox").first()).toBeEnabled();
+  await expect(refresh).toHaveCount(0);
+  expect(await bounds()).toEqual(initialBounds);
   await expect(heading).toBeFocused();
   await page.keyboard.press("Enter");
   await expect(table.getByRole("columnheader", { name: "Agent", exact: true })).toHaveAttribute("aria-sort", "ascending");

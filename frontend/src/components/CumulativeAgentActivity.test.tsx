@@ -250,7 +250,7 @@ describe("cumulative retained agent activity", () => {
 });
 
 describe("inventory dashboard source boundaries", () => {
-  it("keeps absent inventory unknown while independently loading retained report evidence", async () => {
+  it("keeps absent inventory unknown while loading only the selected report evidence", async () => {
     vi.mocked(api.getOfficialUsageOverview).mockRejectedValueOnce(new Error("History unavailable."));
     render(<AgentInventoryOverview revision={0} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("History unavailable.");
@@ -259,7 +259,9 @@ describe("inventory dashboard source boundaries", () => {
     expect(within(overview).queryByRole("link")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Retry activity evidence" }));
     await waitFor(() => expect(within(overview).getByText("Reported used agents").parentElement).toHaveTextContent("2"));
-    expect(within(overview).getByText("Agents in repository").parentElement).toHaveTextContent("Unknown");
+    expect(api.getOfficialUsageOverview).toHaveBeenLastCalledWith(expect.objectContaining({ scope: "selected" }), expect.anything());
+    expect(overview).toHaveTextContent("Selected report set");
+    expect(within(overview).getByText("Agents in catalog").parentElement).toHaveTextContent("Unknown");
     expect(overview).not.toHaveTextContent("not additive");
     expect(overview).not.toHaveTextContent("Old imports");
   });

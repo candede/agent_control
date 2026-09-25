@@ -35,6 +35,7 @@ function props(overrides: Partial<ComponentProps<typeof AgentSyncTools>> = {}): 
 function inventory(agentCount: number | null = 1247): UnifiedAgentInventoryPage {
   const summary = { total: 1561, linked: 690, graphOnly: 314, powerPlatformOnly: 557, conflicting: 0, ambiguous: 0 };
   return {
+    inventoryScope: "all", scopeSummary: summary,
     value: [], count: 1561, offset: 0, limit: 50, summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 1010, powerPlatformAgentCount: 1247, logicalAgentCount: 1561 }),
     identityCollection: { checkedPackages: 1010, pendingPackages: 0 },
@@ -112,14 +113,24 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByRole("button", { name: "Verify saved inventory" })).not.toBeInTheDocument();
   });
 
-  it("explains pending detail enrichment even when catalog collection and source counts are verified", () => {
+  it.each(["details_pending", "needs_attention"] as const)("keeps routine expiry in diagnostics without an admin warning (%s receipt)", async status => {
     const saved = inventory();
-    saved.identityCollection = { checkedPackages: 1000, pendingPackages: 10 };
+    saved.identityCollection = { checkedPackages: 461, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } };
+    saved.verification = { ...createUnifiedVerification(saved.verification, { packageMetadata: false }), status };
     render(<AgentSyncTools {...props({ inventory: saved })} />);
-    expect(screen.getByText("Needs attention")).toBeVisible();
-    expect(screen.getByText(/10 packages awaiting identity metadata/)).toBeVisible();
-    expect(screen.getByText(/enriched separately in the background after catalog sync/)).toBeVisible();
+    expect(screen.getByText("Sources checked")).toBeVisible();
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText("What needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText(/awaiting identity metadata/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/549/)).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("View diagnostics"));
+    expect(screen.getByText("Saved source accounting verified")).toBeVisible();
+    expect(screen.getByText("461 package detail checks current; 549 not current.")).toBeVisible();
+    const freshness = within(screen.getByLabelText("Package detail freshness"));
+    expect(freshness.getByText("Not yet collected").nextElementSibling).toHaveTextContent(/^0$/);
+    expect(freshness.getByText("Previously collected, expired").nextElementSibling).toHaveTextContent(/^549$/);
+    expect(screen.getByText(/Repeating a successful read does not guarantee a match/)).toBeVisible();
   });
 
   it("lists actual source limitations and recovery guidance before diagnostics are opened", () => {
@@ -172,7 +183,7 @@ describe("AgentSyncTools", () => {
     expect(screen.getByText("Targets represented / unique source targets").nextElementSibling).toHaveTextContent("2,257 / 2,257");
     expect(screen.getByText("Logical agents").nextElementSibling).toHaveTextContent("1,561");
     expect(screen.getByText(/Each available source target is represented exactly once/)).toBeVisible();
-    expect(screen.getByText("1,010 package identities checked; 0 still need collection.")).toBeVisible();
+    expect(screen.getByText("1,010 package detail checks current; 0 not current.")).toBeVisible();
     expect(screen.getByText(/not a count of valid metadata or matched agents/)).toBeVisible();
     expect(screen.getByText(/does not prove every source-only row is a different physical agent/)).toBeVisible();
     expect(screen.getByText(/classic\/V1 bots.*20 minutes/)).toBeVisible();
@@ -193,14 +204,14 @@ describe("AgentSyncTools", () => {
     render(<AgentSyncTools {...props({ inventory: saved })} />);
     expect(screen.getByText(error.message)).toBeVisible();
     expect(screen.getByText(/14 conflicting and 2 ambiguous identity links/)).toBeVisible();
-    expect(screen.getByText(/2 packages awaiting identity metadata/)).toBeVisible();
+    expect(screen.queryByText(/packages awaiting identity metadata/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(screen.getByText("Saved inventory needs attention")).toBeVisible();
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(within(screen.getByRole("dialog")).getByText(/The saved request is restricted to environment finance-only/)).toBeVisible();
     expect(screen.getByText("Environment request scope").nextElementSibling).toHaveTextContent("Environment requested: finance-only");
     expect(screen.getByText(/14 conflicting and 2 ambiguous agent records require review/)).toBeVisible();
-    expect(screen.getByText("1,008 package identities checked; 2 still need collection.")).toBeVisible();
+    expect(screen.getByText("1,008 package detail checks current; 2 not current.")).toBeVisible();
     expect(screen.getByText(/1 package has invalid saved matching metadata/)).toBeVisible();
   });
 
@@ -227,13 +238,13 @@ describe("AgentSyncTools", () => {
     view.rerender(<AgentSyncTools {...actions} verifyingInventory />);
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
-    expect(screen.queryByText(/package identities checked;/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/package detail checks current;/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     view.rerender(<AgentSyncTools {...actions} inventoryError="Saved total and normalized identities disagree." />);
     expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
     expect(screen.queryByText("Authorized Power Platform query verified")).not.toBeInTheDocument();
     expect(screen.queryByText("Source-metadata links")).not.toBeInTheDocument();
-    expect(screen.queryByText(/package identities checked;/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/package detail checks current;/)).not.toBeInTheDocument();
     expect(within(screen.getByRole("region", { name: "Saved agent inventory verification" })).getByRole("alert")).toHaveTextContent("Saved total and normalized identities disagree.");
     expect(screen.getByRole("button", { name: "Verify saved inventory" })).toBeEnabled();
   });
@@ -245,7 +256,7 @@ describe("AgentSyncTools", () => {
     const actions = props({ inventory: saved, selectedPackageCount: 2 });
     render(<AgentSyncTools {...actions} />);
     await userEvent.click(screen.getByText("View diagnostics"));
-    expect(screen.getByText("1,010 package identities checked; 0 still need collection.")).toBeVisible();
+    expect(screen.getByText("1,010 package detail checks current; 0 not current.")).toBeVisible();
     expect(screen.getByText("Source-metadata links").nextElementSibling).toHaveTextContent(/^690$/);
     const diagnostic = screen.getByText(/1 package has invalid saved matching metadata/);
     expect(diagnostic).toBeVisible();

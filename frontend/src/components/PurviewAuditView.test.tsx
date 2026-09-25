@@ -254,7 +254,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText(/automatic permission checks establish delegated authorization/)).toBeVisible();
+    expect(await screen.findByText(/a permission check establishes delegated authorization/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
     expect(getPurviewAuditCatalog).toHaveBeenCalledOnce();
@@ -363,7 +363,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    await screen.findByText(/automatic permission checks establish delegated authorization/);
+    await screen.findByText(/a permission check establishes delegated authorization/);
     await user.selectOptions(screen.getByLabelText("Authorization"), "application");
     await screen.findByText("Live lifecycle not qualified");
     const approve = screen.getByRole("button", {
@@ -412,7 +412,7 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    await screen.findByText(/automatic permission checks establish delegated authorization/);
+    await screen.findByText(/a permission check establishes delegated authorization/);
     await user.selectOptions(screen.getByLabelText("Authorization"), "application");
     expect(screen.queryByRole("button", { name: "Approve qualification" })).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox", {
@@ -669,7 +669,7 @@ describe("PurviewAuditView", () => {
     expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
   });
 
-  it("keeps saved results readable after live capability evidence expires", async () => {
+  it("keeps saved results and delegated search usable after available capability evidence expires", async () => {
     vi.mocked(getPurviewAuditJobs).mockResolvedValue({
       value: [partialJob],
       count: 1,
@@ -685,8 +685,8 @@ describe("PurviewAuditView", () => {
       </CapabilityContext>,
     );
 
-    expect(await screen.findByText(/automatic permission checks establish delegated authorization/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run Audit Search" })).toBeEnabled());
+    expect(screen.queryByRole("region", { name: "Audit Search authorization pending" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /View results 11111111/ }));
     expect(getPurviewAuditRecords).toHaveBeenCalledExactlyOnceWith(
       partialJob.id,

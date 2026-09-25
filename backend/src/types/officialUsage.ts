@@ -475,6 +475,7 @@ export type OfficialUsageOverviewView = {
     offset: number;
   };
   filters: {
+    scope?: "history" | "selected";
     search: string | null;
     startDate: string | null;
     endDate: string | null;

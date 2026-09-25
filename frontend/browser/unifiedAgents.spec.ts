@@ -1,8 +1,9 @@
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import type { InventorySourceAwareDetail, PowerPlatformResource, UnifiedAgentInventoryPage, UnifiedAgentRecord } from "../src/api/client";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { createInventoryVerification, createUnifiedVerification } from "../src/test/inventoryVerification";
+import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
 
 const environmentId = "22222222-2222-4222-8222-222222222222";
 const botId = "33333333-3333-4333-8333-333333333333";
@@ -64,6 +65,7 @@ const draft: UnifiedAgentRecord = {
 const summary = { total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 };
 const catalog: UnifiedAgentInventoryPage = {
   ...unifiedAgents, value: [merged, unifiedAgents.value[2], draft], count: 3,
+  inventoryScope: "all", scopeSummary: summary,
   summary, filteredSummary: summary, identityCollection: { checkedPackages: 3, pendingPackages: 0 },
   verification: createUnifiedVerification({ graphPackageCount: 3, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, {}, layoutTime),
   facets: { ...unifiedAgents.facets, environments: [{ value: environmentId, label: "Finance production" }] },
@@ -71,14 +73,104 @@ const catalog: UnifiedAgentInventoryPage = {
   partial: false, errors: [],
 };
 
+async function mockScopedCatalog(page: Page, inventory: UnifiedAgentInventoryPage = catalog) {
+  await page.route("**/api/agent-inventory*", route => {
+    const params = new URL(route.request().url()).searchParams;
+    const inventoryScope = params.get("inventoryScope") === "power_platform_only" ? "power_platform_only"
+      : params.get("inventoryScope") === "all" ? "all" : "catalog";
+    const value = inventory.value.filter(record => inventoryScope === "all"
+      || (inventoryScope === "catalog" ? record.packages.length > 0 : record.packages.length === 0));
+    const scopeSummary = {
+      ...summary, total: value.length,
+      linked: inventoryScope === "power_platform_only" ? 0 : 1,
+      graphOnly: inventoryScope === "power_platform_only" ? 0 : 1,
+      powerPlatformOnly: inventoryScope === "catalog" ? 0 : 1,
+    };
+    return route.fulfill({ json: {
+      ...inventory, inventoryScope, scopeSummary, value, count: value.length, filteredSummary: scopeSummary,
+      inventoryOverview: summarizeAgentAvailability(value),
+    } });
+  });
+}
+
 test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
+});
+
+test("expired package details stay in diagnostics without an admin attention warning", async ({ page }) => {
+  await mockLayoutApi(page);
+  await page.clock.setFixedTime(new Date(layoutTime));
+  await mockScopedCatalog(page, {
+    ...catalog,
+    identityCollection: { checkedPackages: 668, pendingPackages: 429, pendingDetails: { missing: 0, stale: 417, invalidated: 12 } },
+    verification: {
+      ...createUnifiedVerification({ graphPackageCount: 1097, powerPlatformAgentCount: 2, logicalAgentCount: 3 }, { packageMetadata: false }, layoutTime),
+      status: "details_pending",
+    },
+  });
+  await page.goto("/agents");
+  await expect(page.getByRole("region", { name: "Unified agents" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Inventory needs attention/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Sync", exact: true }).click();
+  await expect(page.getByText("Sources checked", { exact: true })).toBeVisible();
+  await expect(page.getByText("What needs attention", { exact: true })).toHaveCount(0);
+  await expect(page.getByText(/awaiting identity metadata/)).toHaveCount(0);
+  await page.getByRole("button", { name: "View diagnostics", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Inventory diagnostics" });
+  await expect(dialog.getByText("Saved source accounting verified", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("668 package detail checks current; 429 not current.", { exact: true })).toBeVisible();
+  const freshness = dialog.getByRole("definition").filter({ hasText: /^417$/ });
+  await expect(freshness).toBeVisible();
+  await expect(dialog.getByText(/Repeating a successful read does not guarantee a match/)).toBeVisible();
+  const violations = (await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations;
+  expect(violations).toEqual([]);
+});
+
+test("catalog-first scopes stay compact and retain matched enrichment across navigation", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.setFixedTime(new Date(layoutTime));
+  await mockScopedCatalog(page);
+  await page.goto("/agents");
+  const table = page.getByRole("region", { name: "Unified agents" });
+  const scopes = page.getByRole("group", { name: "Inventory scope" });
+  await expect(table.locator("tbody tr")).toHaveCount(2);
+  await expect(scopes.getByRole("button", { name: "Microsoft 365 catalog", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(scopes.getByRole("button", { name: "Microsoft 365 catalog", exact: true })).toContainText("2");
+  await expect(page.getByText(/Agents in the Microsoft 365 package catalog|package records represent|Counts can differ from the admin portal/)).toHaveCount(0);
+  await expect(page.locator(".agent-inventory-scopes + .agent-overview-metrics")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("2");
+  await expect(table.getByText("Finance production", { exact: true })).toHaveCount(1);
+  await expect(table.getByText(draft.displayName, { exact: true })).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include(".agent-inventory-overview").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath("catalog-first.png"), fullPage: true });
+
+  await scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true }).click();
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.getByText(draft.displayName, { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/inventory=power_platform_only/);
+  await expect(scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true }))
+    .toHaveAccessibleDescription(/no confirmed match in the saved package catalog/);
+  await expect(page.getByText(/no confirmed match in the saved package catalog/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("0");
+  await page.reload();
+  await expect(scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+
+  await page.goto("/agents?inventory=all");
+  await expect(table.locator("tbody tr")).toHaveCount(3);
+  await expect(table.getByText(merged.displayName, { exact: true })).toHaveCount(1);
+  await page.screenshot({ path: info.outputPath("combined-inventory.png"), fullPage: true });
+  await page.goBack();
+  await expect(scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  expect(unexpected).toEqual([]);
 });
 
 test("one agent row selects all published versions and configuration controls without source columns", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.clock.setFixedTime(new Date(layoutTime));
-  await page.route("**/api/agent-inventory*", route => route.fulfill({ json: catalog }));
+  await mockScopedCatalog(page);
   const related: InventorySourceAwareDetail = {
     source: "power_platform", nativeId: botId, resourceType: resource.type, environmentId, snapshotId: observation.snapshotId,
     observedAt: observation.observedAt, expiresAt: observation.expiresAt, identifiers: resource.identifiers,
@@ -113,7 +205,7 @@ test("one agent row selects all published versions and configuration controls wi
       }],
     } });
   });
-  await page.goto("/agents");
+  await page.goto("/agents?inventory=all");
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.locator("tbody tr")).toHaveCount(3);
   await expect(table.getByRole("checkbox")).toHaveCount(3);

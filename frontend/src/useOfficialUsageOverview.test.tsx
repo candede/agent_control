@@ -7,6 +7,18 @@ import { useOfficialUsageOverview } from "./useOfficialUsageOverview";
 afterEach(() => vi.restoreAllMocks());
 
 describe("saved overview query freshness", () => {
+  it("keeps selected-set and history queries in distinct cache keys", async () => {
+    const read = vi.spyOn(api, "getOfficialUsageOverview").mockResolvedValue(usageOverviewFixture());
+    const { result, rerender } = renderHook(({ scope }: { scope: "selected" | "history" }) => useOfficialUsageOverview({ scope }, 0), {
+      initialProps: { scope: "selected" as "selected" | "history" },
+    });
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(read).toHaveBeenLastCalledWith(expect.objectContaining({ scope: "selected" }), expect.anything());
+    rerender({ scope: "history" });
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    expect(read).toHaveBeenLastCalledWith(expect.objectContaining({ scope: "history" }), expect.anything());
+  });
+
   it("does not submit invalid date ranges when Retry is requested", async () => {
     const read = vi.spyOn(api, "getOfficialUsageOverview").mockResolvedValue(usageOverviewFixture());
     const { result, rerender } = renderHook(({ startDate, endDate }) => useOfficialUsageOverview({ startDate, endDate }, 0), {

@@ -24,7 +24,6 @@ import {
   cancelDataSyncRun,
   getDataSyncRun,
   getDataSyncState,
-  retryDataSyncRun,
   startDataSync,
   type DataSyncMode,
   type DataSyncRun,
@@ -47,16 +46,6 @@ import {
 import "./dataSync.css";
 
 const pollIntervalMs = 1_000;
-
-const incompleteStates = new Set<DataSyncSourceState>([
-  "not_started",
-  "waiting_authorization",
-  "permission_required",
-  "awaiting_upload",
-  "partial",
-  "failed",
-  "cancelled",
-]);
 
 export type DataSyncPanelHandle = {
   refresh: () => Promise<void>;
@@ -95,7 +84,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   const [cleanAcknowledged, setCleanAcknowledged] = useState(false);
   const [checkedAt, setCheckedAt] = useState<string>();
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState<"start" | "retry" | "cancel">();
+  const [busy, setBusy] = useState<"start" | "cancel">();
   const [error, setError] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
   const readOwner = useId();
@@ -325,7 +314,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   }, [clearDeniedState, observeSources, principalKey, readOwner, readSaved, requestedRunId, requestedRunReload, stopRequestedRunPolling]);
 
   const perform = useCallback(async (
-    key: "start" | "retry" | "cancel",
+    key: "start" | "cancel",
     operation: (signal: AbortSignal) => Promise<DataSyncRun>,
   ) => {
     if (actionController.current || accessDenied.current) return;
@@ -343,7 +332,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       const run = await operation(controller.signal);
       if (controller.signal.aborted || owner !== generation.current) return;
       const current = stateRef.current;
-      const updatesCurrentRun = key === "start" || key === "retry" || current?.run?.id === run.id;
+      const updatesCurrentRun = key === "start" || current?.run?.id === run.id;
       if (requestedRunIdRef.current === run.id) {
         requestedRunGeneration.current += 1;
         stopRequestedRunPolling();
@@ -379,7 +368,8 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   }, [applyRun, clearDeniedState, observeSources, startPolling, stopPolling, stopRequestedRunPolling]);
 
   const start = useCallback(async (mode: DataSyncMode, sources?: DataSyncSourceId[], clearSavedData = false) => {
-    if (actionController.current || accessDenied.current) return;
+    if (actionController.current || accessDenied.current || !stateRef.current
+      || isProgressing(stateRef.current.run) || isProgressing(requestedRun)) return;
     setConfirmClean(false);
     setCleanAcknowledged(false);
     if (requestedRunId) {
@@ -407,7 +397,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
       }
       return run;
     });
-  }, [onRequestedRunChange, perform, requestedRunId]);
+  }, [onRequestedRunChange, perform, requestedRun, requestedRunId]);
 
   const refresh = useCallback(async (explicit = true) => {
     if (actionController.current) return;
@@ -437,38 +427,21 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
   }, [active, refresh]);
 
   function runActions(run: DataSyncRun) {
-    const retrySources = run.sources
-      .filter(source => source.canRetry && incompleteStates.has(source.status))
-      .map(source => source.source);
-    const retryBlocked = run.status === "running"
-      || (isProgressing(currentRun) && currentRun?.id !== run.id);
+    if (!isProgressing(run)) return null;
     return (
       <div className="data-sync-run-actions">
-        {retrySources.length ? (
-          <WorkbenchActionGate actionId="data-sync.retry">
-            <button type="button" className="secondary" disabled={Boolean(busy) || retryBlocked}
-              onClick={() => void perform("retry", signal => retryDataSyncRun(run.id, retrySources, { signal }))}>
-              Retry incomplete ({retrySources.length})
-            </button>
-          </WorkbenchActionGate>
-        ) : null}
-        {retrySources.length > 0 && retryBlocked ? (
-          <p className="data-sync-run-meta">Finish or cancel the active sync run before retrying these sources.</p>
-        ) : null}
-        {isProgressing(run) ? (
-          <WorkbenchActionGate actionId="data-sync.cancel">
-            <button type="button" className="secondary data-sync-cancel" disabled={Boolean(busy)} aria-busy={busy === "cancel"}
-              onClick={() => {
-                onCancelRequested?.();
-                void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }));
-              }}>
-              {busy === "cancel"
-                ? <LoaderCircle size={16} className="data-sync-spinning" aria-hidden="true" />
-                : <CircleStop size={16} aria-hidden="true" />}
-              {busy === "cancel" ? "Cancelling..." : "Cancel run"}
-            </button>
-          </WorkbenchActionGate>
-        ) : null}
+        <WorkbenchActionGate actionId="data-sync.cancel">
+          <button type="button" className="secondary data-sync-cancel" disabled={Boolean(busy)} aria-busy={busy === "cancel"}
+            onClick={() => {
+              onCancelRequested?.();
+              void perform("cancel", signal => cancelDataSyncRun(run.id, { signal }));
+            }}>
+            {busy === "cancel"
+              ? <LoaderCircle size={16} className="data-sync-spinning" aria-hidden="true" />
+              : <CircleStop size={16} aria-hidden="true" />}
+            {busy === "cancel" ? "Cancelling..." : "Cancel run"}
+          </button>
+        </WorkbenchActionGate>
       </div>
     );
   }
@@ -509,7 +482,7 @@ export const DataSyncPanel = forwardRef<DataSyncPanelHandle, {
                   <SyncProgress run={currentRun} />
                   <div className="data-sync-activity-footer" role="group" aria-label="Current sync actions">
                     <p className="data-sync-run-meta">
-                      Sync continues when you switch tabs.
+                      {isProgressing(currentRun) ? "Sync continues when you switch tabs." : "Run results stay available when you start a new sync."}
                       {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
                     </p>
                     {runActions(currentRun)}
@@ -667,7 +640,8 @@ function SyncProgress({ run, showJobIds = false }: { run: DataSyncRun; showJobId
       <p className="data-sync-progress-note">{collecting
         ? "Counts update as the provider responds and may restart for a new stage. The bar measures completed sources, not time or total objects."
         : complete ? "These are this run's results. Other successful source collections remain in Workspace data."
-          : "Previous successful data stays available. Only incomplete sources need recovery."}</p>
+          : isProgressing(run) ? "Previous successful data stays available. Resolve the waiting step or cancel this run before starting a new sync."
+            : "Previous successful data stays available. Start a new sync when you're ready."}</p>
       <p className="data-sync-run-meta">Started {formatInstant(run.startedAt)} · Last update {formatInstant(run.updatedAt)}</p>
     </section>
   );

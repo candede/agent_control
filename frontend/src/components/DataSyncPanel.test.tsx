@@ -133,6 +133,7 @@ describe("DataSyncPanel", () => {
   });
 
   afterEach(() => {
+    expect(api.retry).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -273,7 +274,7 @@ describe("DataSyncPanel", () => {
     expect(api.start).toHaveBeenCalledTimes(2);
   });
 
-  it("retries only incomplete retryable sources and cancels a server-owned run", async () => {
+  it("requires cancelling a waiting run before starting a fresh automatic sync", async () => {
     const sources = [
       source("users", "succeeded", { count: 10, canRetry: true }),
       source("graph_packages", "failed", { canRetry: true, message: "Temporary failure." }),
@@ -281,29 +282,33 @@ describe("DataSyncPanel", () => {
       source("usage_reports", "awaiting_upload", { canRetry: true }),
     ];
     const waiting = run("waiting", sources);
+    const cancelled = run("cancelled", sources);
+    const fresh = run("running", sources.filter(item => item.source !== "usage_reports"), { id: "fresh-run" });
     api.getState.mockResolvedValue(syncState({ run: waiting, sources }));
-    api.retry.mockResolvedValue(run("running", sources));
-    api.cancel.mockResolvedValue(run("cancelled", sources));
+    api.start.mockResolvedValue(fresh);
+    api.cancel.mockResolvedValue(cancelled);
     renderPanel();
 
-    expect(await screen.findByRole("button", { name: "Retry incomplete (2)" })).toBeVisible();
+    await screen.findByRole("heading", { name: "Workspace data" });
+    expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Sync all sources" })).not.toBeInTheDocument();
     expect(screen.getByText("Temporary failure.")).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Retry incomplete (2)" }));
-    expect(api.retry).toHaveBeenCalledWith(
-      waiting.id,
-      ["graph_packages", "usage_reports"],
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
+    expect(screen.getByText(/cancel this run before starting a new sync/)).toBeVisible();
+    api.getState.mockResolvedValue(syncState({ run: cancelled, sources }));
     await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
     expect(api.cancel).toHaveBeenCalledWith(waiting.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(screen.getByRole("button", { name: "Start initial sync" })).toBeEnabled();
+    api.getState.mockResolvedValue(syncState({ run: fresh, sources }));
+    await userEvent.click(screen.getByRole("button", { name: "Start initial sync" }));
+    expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "initial" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
-  it.each(["failed", "permission_required"] as const)("distinguishes Graph readiness %s from missing permissions", async status => {
+  it.each(["failed", "permission_required", "waiting_authorization"] as const)("explains Graph readiness %s without offering to retry the run", async status => {
     const message = status === "failed"
-      ? "The Microsoft readiness check timed out. This does not establish missing permissions. Retry the readiness check."
-      : "Required delegated Microsoft read permission or provider role is unavailable.";
+      ? "The Microsoft readiness check timed out. This does not establish missing permissions."
+      : status === "permission_required" ? "Required delegated Microsoft read permission or provider role is unavailable."
+        : "Sign in again to authorize the Microsoft read.";
     const sources = [
       source("users", "succeeded", { count: 10 }),
       source("graph_packages", status, { count: 0, canRetry: true, message }),
@@ -316,15 +321,22 @@ describe("DataSyncPanel", () => {
     }));
     renderPanel();
     expect(await screen.findByText(message)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Retry incomplete (1)" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
     const progress = within(screen.getByRole("region", { name: "Sync status" }));
     if (status === "failed") {
+      expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
       expect(progress.getByText("Failed", { exact: true })).toBeVisible();
       expect(screen.queryByText("Permission required", { exact: true })).not.toBeInTheDocument();
       expect(screen.queryByRole("link", { name: "Review permissions" })).not.toBeInTheDocument();
     } else {
-      expect(progress.getByText("Permission required", { exact: true })).toBeVisible();
-      expect(screen.getByRole("link", { name: "Review permissions" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Sync all sources" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Cancel run" })).toBeEnabled();
+      if (status === "permission_required") {
+        expect(progress.getByText("Permission required", { exact: true })).toBeVisible();
+        expect(screen.getByRole("link", { name: "Review permissions" })).toHaveAttribute("href", "/permissions");
+      } else {
+        expect(screen.getByRole("link", { name: "Sign in again" })).toHaveAttribute("href", "/api/auth/login");
+      }
     }
   });
 
@@ -363,10 +375,12 @@ describe("DataSyncPanel", () => {
   });
 
   it.each([
-    { label: "the displayed run is executing", currentStatus: "running", requestedRunId: undefined },
-    { label: "a different run is executing", currentStatus: "running", requestedRunId: "historical-run" },
-    { label: "a different run is waiting", currentStatus: "waiting", requestedRunId: "historical-run" },
-  ] as const)("prevents retrying incomplete sources while $label", async ({ currentStatus, requestedRunId }) => {
+    { label: "the displayed run is executing", currentStatus: "running", requestedStatus: "partial", requestedRunId: undefined },
+    { label: "a different run is executing", currentStatus: "running", requestedStatus: "partial", requestedRunId: "historical-run" },
+    { label: "a different run is waiting", currentStatus: "waiting", requestedStatus: "partial", requestedRunId: "historical-run" },
+    { label: "the requested run is executing", currentStatus: "partial", requestedStatus: "running", requestedRunId: "historical-run" },
+    { label: "the requested run is waiting", currentStatus: "partial", requestedStatus: "waiting", requestedRunId: "historical-run" },
+  ] as const)("prevents fresh starts while $label without offering retry actions", async ({ currentStatus, requestedStatus, requestedRunId }) => {
     const failed = source("users", "failed", { canRetry: true });
     const sources = [
       failed,
@@ -375,38 +389,49 @@ describe("DataSyncPanel", () => {
       }),
     ];
     api.getState.mockResolvedValue(syncState({ run: run(currentStatus, sources), sources }));
-    api.getRun.mockResolvedValue(run("partial", [failed], { id: "historical-run" }));
+    api.getRun.mockResolvedValue(run(requestedStatus, [failed], { id: "historical-run" }));
     const panelRef = createRef<DataSyncPanelHandle>();
-    renderPanel({ ref: panelRef, requestedRunId });
+    const view = renderPanel({ ref: panelRef, requestedRunId });
 
-    const target = requestedRunId ? within(await screen.findByRole("dialog", { name: "Sync run details" })) : screen;
-    const retry = await target.findByRole("button", { name: "Retry incomplete (1)" });
-    expect(retry).toBeDisabled();
-    expect(target.getByText("Finish or cancel the active sync run before retrying these sources.")).toBeVisible();
-    await userEvent.click(retry);
-    expect(api.retry).not.toHaveBeenCalled();
+    await screen.findByRole("heading", { name: "Workspace data" });
+    if (requestedRunId) await screen.findByText(requestedRunId, { selector: "code" });
+    expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start initial sync" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sync users" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reset saved data..." })).toBeDisabled();
+    await act(async () => { await panelRef.current?.start("incremental", ["users"]); });
+    expect(api.start).not.toHaveBeenCalled();
 
     const settledSources = [failed, source("graph_packages", "succeeded", { count: 0 })];
     api.getState.mockResolvedValue(syncState({ run: run("partial", settledSources), sources: settledSources }));
+    api.getRun.mockResolvedValue(run("partial", [failed], { id: "historical-run" }));
     await act(async () => { await panelRef.current?.refresh(); });
-    expect(target.getByRole("button", { name: "Retry incomplete (1)" })).toBeEnabled();
-    expect(target.queryByText("Finish or cancel the active sync run before retrying these sources.")).not.toBeInTheDocument();
+    await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+    expect(screen.getByRole("button", { name: "Start initial sync" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Sync users" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reset saved data..." })).toBeEnabled();
+    const fresh = run("running", [source("users", "queued")], { id: "fresh-run" });
+    api.start.mockResolvedValue(fresh);
+    api.getState.mockResolvedValue(syncState({ run: fresh, sources: settledSources }));
+    await userEvent.click(screen.getByRole("button", { name: "Start initial sync" }));
+    expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "initial" }, expect.anything());
   });
 
-  it("does not invalidate retained snapshots when a failed source is queued for retry", async () => {
+  it("starts a new source-only sync without invalidating retained snapshots", async () => {
     const failed = source("users", "failed", {
       count: 0, lastSuccessAt: "2026-09-15T10:00:00.000Z", canRetry: true,
     });
     const queued = { ...failed, status: "queued" as const, canRetry: false };
+    const fresh = run("running", [queued], { id: "fresh-run", mode: "incremental" });
     api.getState
       .mockResolvedValueOnce(syncState({ run: run("partial", [failed]), sources: [failed] }))
-      .mockResolvedValue(syncState({ run: run("running", [queued]), sources: [queued] }));
-    api.retry.mockResolvedValue(run("running", [queued]));
+      .mockResolvedValue(syncState({ run: fresh, sources: [queued] }));
+    api.start.mockResolvedValue(fresh);
     const onChanged = vi.fn();
     renderPanel({ onSourcesChanged: onChanged });
 
-    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
-    expect(api.retry).toHaveBeenCalledExactlyOnceWith("sync-run-1", ["users"], expect.anything());
+    await userEvent.click(await screen.findByRole("button", { name: "Sync users" }));
+    expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "incremental", sources: ["users"] }, expect.anything());
     expect(onChanged).not.toHaveBeenCalled();
   });
 
@@ -538,18 +563,18 @@ describe("DataSyncPanel", () => {
   });
 
   it("revalidates the newly selected exact run after a different run's pending mutation settles", async () => {
-    const failed = run("partial", [source("users", "failed", { canRetry: true })]);
+    const running = run("running", [source("users", "running")]);
     const newer = run("completed", [source("users", "succeeded", { count: 2 })], { id: "newer-run" });
     api.getState.mockResolvedValue(syncState());
-    api.getRun.mockResolvedValueOnce(failed).mockResolvedValue(newer);
-    let resolveRetry!: (value: DataSyncRun) => void;
-    api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
-    const view = renderPanel({ requestedRunId: failed.id });
-    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+    api.getRun.mockResolvedValueOnce(running).mockResolvedValue(newer);
+    let resolveCancel!: (value: DataSyncRun) => void;
+    api.cancel.mockReturnValueOnce(new Promise(resolve => { resolveCancel = resolve; }));
+    const view = renderPanel({ requestedRunId: running.id });
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
     view.rerenderPanel({ requestedRunId: newer.id });
     await screen.findByText(newer.id, { selector: "code" });
     expect(api.getRun).toHaveBeenCalledTimes(2);
-    await act(async () => { resolveRetry(run("running", [source("users", "running")])); });
+    await act(async () => { resolveCancel(run("cancelled", [source("users", "cancelled")])); });
     await waitFor(() => expect(api.getRun).toHaveBeenCalledTimes(3));
     expect(api.getRun).toHaveBeenLastCalledWith(newer.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(screen.getByText(newer.id, { selector: "code" })).toBeVisible();
@@ -575,41 +600,46 @@ describe("DataSyncPanel", () => {
     expect(api.cancel).toHaveBeenCalledExactlyOnceWith(running.id, expect.anything());
   });
 
-  it.each(["same", "closed", "different"] as const)(
-    "retains a fast historical retry completion with %s details when status revalidation fails",
+  it.each(["historical", "closed", "different"] as const)(
+    "retains a fast fresh-start completion with %s details when status revalidation fails",
     async selection => {
       const failed = run("partial", [source("users", "failed", { canRetry: true })], { id: "older-run" });
       const saved = source("users", "succeeded", { count: 5, lastSuccessAt: "2026-09-15T10:00:00.000Z" });
       const newer = run("completed", [saved], { id: "newer-run" });
       const completed = run("completed", [source("users", "succeeded", {
         count: 6, lastSuccessAt: "2026-09-15T11:00:00.000Z",
-      })], { id: failed.id });
+      })], { id: "fresh-run", mode: "incremental" });
       api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false, run: newer, sources: [saved] }))
-        .mockRejectedValue(new Error("Status read failed after retry."));
-      api.getRun.mockResolvedValueOnce(failed).mockResolvedValue(selection === "same" ? completed : newer);
-      let resolveRetry!: (value: DataSyncRun) => void;
-      api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
+        .mockRejectedValue(new Error("Status read failed after starting sync."));
+      api.getRun.mockResolvedValueOnce(failed).mockResolvedValue(selection === "historical" ? failed : newer);
+      let resolveStart!: (value: DataSyncRun) => void;
+      api.start.mockReturnValueOnce(new Promise(resolve => { resolveStart = resolve; }));
       const onChanged = vi.fn();
       const onRequestedRunChange = vi.fn();
       const view = renderPanel({
         requestedRunId: failed.id, onSourcesChanged: onChanged, onRequestedRunChange,
       });
-      await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
-      if (selection !== "same") {
+      onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => view.rerenderPanel({ requestedRunId }));
+      await screen.findByText(failed.id, { selector: "code" });
+      expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Back to workspace" }));
+      await userEvent.click(screen.getByRole("button", { name: "Sync all sources" }));
+      if (selection !== "closed") {
         await act(async () => {
-          view.rerenderPanel({ requestedRunId: selection === "closed" ? undefined : newer.id });
+          view.rerenderPanel({ requestedRunId: selection === "historical" ? failed.id : newer.id });
         });
       }
-      await act(async () => { resolveRetry(completed); });
+      await act(async () => { resolveStart(completed); });
 
-      expect(screen.getByRole("alert")).toHaveTextContent("Status read failed after retry.");
+      expect(screen.getByRole("alert")).toHaveTextContent("Status read failed after starting sync.");
       expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
       if (selection === "different") expect(screen.getByText(newer.id, { selector: "code" })).toBeVisible();
+      if (selection === "historical") expect(screen.getByText(failed.id, { selector: "code" })).toBeVisible();
       await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
       await userEvent.click(screen.getByRole("button", { name: "View run details" }));
-      expect(onRequestedRunChange).toHaveBeenLastCalledWith(failed.id);
+      expect(onRequestedRunChange).toHaveBeenLastCalledWith(completed.id);
       expect(within(screen.getByRole("article", { name: "Users" })).getByText("5")).toBeVisible();
-      expect(api.retry).toHaveBeenCalledExactlyOnceWith(failed.id, ["users"], expect.anything());
+      expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "incremental" }, expect.anything());
     },
   );
 
@@ -712,19 +742,19 @@ describe("DataSyncPanel", () => {
   });
 
   it("aborts an outstanding mutation after a concurrent exact-run denial and ignores its late success", async () => {
-    const failed = run("partial", [source("users", "failed", { canRetry: true })]);
+    const running = run("running", [source("users", "running")]);
     const onSourcesChanged = vi.fn();
-    let resolveRetry!: (value: DataSyncRun) => void;
+    let resolveCancel!: (value: DataSyncRun) => void;
     api.getState.mockResolvedValue(syncState({ sources: [source("users", "succeeded", { count: 42 })] }));
-    api.getRun.mockResolvedValueOnce(failed).mockRejectedValue(new ApiError(403, "forbidden", "Run access was denied."));
-    api.retry.mockReturnValueOnce(new Promise(resolve => { resolveRetry = resolve; }));
-    const view = renderPanel({ requestedRunId: failed.id, onSourcesChanged });
-    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
-    const signal = api.retry.mock.calls[0][2].signal as AbortSignal;
+    api.getRun.mockResolvedValueOnce(running).mockRejectedValue(new ApiError(403, "forbidden", "Run access was denied."));
+    api.cancel.mockReturnValueOnce(new Promise(resolve => { resolveCancel = resolve; }));
+    const view = renderPanel({ requestedRunId: running.id, onSourcesChanged });
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel run" }));
+    const signal = api.cancel.mock.calls[0][1].signal as AbortSignal;
     view.rerenderPanel({ requestedRunId: "no-longer-authorized" });
     expect(await screen.findByRole("alert")).toHaveTextContent("Run access was denied.");
     expect(signal.aborted).toBe(true);
-    await act(async () => { resolveRetry(run("completed", [source("users", "succeeded", { count: 99 })])); });
+    await act(async () => { resolveCancel(run("cancelled", [source("users", "succeeded", { count: 99 })])); });
     expect(screen.queryByRole("article", { name: "Users" })).not.toBeInTheDocument();
     expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
     expect(api.getState).toHaveBeenCalledOnce();
@@ -770,6 +800,34 @@ describe("DataSyncPanel", () => {
     expect(screen.getByText("historical-run", { selector: "code" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeInTheDocument();
+  });
+
+  it.each([true, false])("preserves the manual CSV step in older waiting runs with upload permission %s", async canUploadUsage => {
+    const sources = sourceIds.map(id => source(id, id === "usage_reports" ? "awaiting_upload" : "succeeded"));
+    const waiting = run("waiting", sources, { id: "legacy-csv-run" });
+    api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources }));
+    api.getRun.mockResolvedValue(waiting);
+    const onOpenUsageImport = vi.fn();
+    const onRequestedRunChange = vi.fn();
+    const view = renderPanel({ requestedRunId: waiting.id, canUploadUsage, onOpenUsageImport, onRequestedRunChange });
+    onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => view.rerenderPanel({ requestedRunId }));
+
+    const details = within(await screen.findByRole("dialog", { name: "Sync run details" }));
+    expect(await details.findByText(/This older run includes a manual CSV step/)).toBeVisible();
+    expect(details.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+    expect(details.getByRole("button", { name: "Cancel run" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Sync all sources" })).toBeDisabled();
+    if (canUploadUsage) {
+      await userEvent.click(details.getByRole("button", { name: "Add CSV reports" }));
+      expect(onOpenUsageImport).toHaveBeenCalledOnce();
+      expect(onRequestedRunChange).toHaveBeenCalledExactlyOnceWith(undefined);
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    } else {
+      expect(details.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
+      expect(onOpenUsageImport).not.toHaveBeenCalled();
+    }
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
   });
 
   it("does not label a failed attempt's reported records as saved data", async () => {
@@ -1461,7 +1519,7 @@ describe("DataSyncPanel", () => {
     expect(api.cancel).not.toHaveBeenCalled();
   });
 
-  it("retries and cancels the exact requested run rather than the latest run", async () => {
+  it("cancels the exact requested waiting run without offering to retry it or changing the latest run", async () => {
     const waitingSources = [
       source("users", "succeeded", { count: 2 }),
       source("graph_packages", "failed", { canRetry: true }),
@@ -1473,18 +1531,20 @@ describe("DataSyncPanel", () => {
       run: run("completed", [source("users", "succeeded")], { id: "latest-run" }),
     }));
     api.getRun.mockResolvedValue(exactRun);
-    api.retry.mockResolvedValue(exactRun);
-    api.cancel.mockResolvedValue(run("cancelled", waitingSources, { id: "exact-run" }));
-    renderPanel({ requestedRunId: "exact-run" });
+    const cancelled = run("cancelled", waitingSources, { id: exactRun.id });
+    api.cancel.mockResolvedValue(cancelled);
+    const view = renderPanel({ requestedRunId: exactRun.id });
 
-    await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
-    expect(api.retry).toHaveBeenCalledWith(
-      "exact-run",
-      ["graph_packages"],
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
+    await screen.findByText(exactRun.id, { selector: "code" });
+    expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sync all sources" })).toBeDisabled();
+    api.getRun.mockResolvedValue(cancelled);
     await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
-    expect(api.cancel).toHaveBeenCalledWith("exact-run", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(api.cancel).toHaveBeenCalledExactlyOnceWith(exactRun.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+    expect(screen.getByText("Sync complete", { exact: true })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
+    expect(api.start).not.toHaveBeenCalled();
   });
 
   it("drops an exact-run response owned by an old route and principal", async () => {
@@ -1738,33 +1798,39 @@ describe("DataSyncPanel", () => {
   });
 
   it.each(["accepted", "lost"] as const)(
-    "notifies a fast exact-run retry completion after an %s response without replaying the retry",
+    "notifies a fast fresh-start completion after an %s response without replaying the old run",
     async response => {
       const failed = run("partial", [source("users", "failed", { canRetry: true })], { id: "exact-run" });
       const completed = run("completed", [source("users", "succeeded", {
-        count: 0, jobId: "retry-users", lastSuccessAt: "2026-09-15T11:00:00.000Z",
-      })], { id: "exact-run" });
-      api.getState.mockResolvedValue(syncState());
-      api.getRun.mockResolvedValueOnce(failed);
+        count: 0, jobId: "fresh-users", lastSuccessAt: "2026-09-15T11:00:00.000Z",
+      })], { id: "fresh-run" });
+      api.getState.mockResolvedValueOnce(syncState({ run: failed, sources: failed.sources }));
+      api.getRun.mockResolvedValue(failed);
       if (response === "accepted") {
-        api.retry.mockResolvedValue(completed);
-        api.getRun.mockRejectedValue(new Error("Status read failed after retry."));
+        api.start.mockResolvedValue(completed);
+        api.getState.mockRejectedValue(new Error("Status read failed after starting sync."));
       } else {
-        api.retry.mockRejectedValue(new Error("Retry response lost."));
-        api.getRun.mockResolvedValue(completed);
+        api.start.mockRejectedValue(new Error("Start response lost."));
+        api.getState.mockResolvedValue(syncState({ run: completed, sources: completed.sources }));
       }
       const onChanged = vi.fn();
-      renderPanel({ requestedRunId: "exact-run", onSourcesChanged: onChanged });
-      await userEvent.click(await screen.findByRole("button", { name: "Retry incomplete (1)" }));
+      const onRequestedRunChange = vi.fn();
+      const view = renderPanel({ requestedRunId: failed.id, onSourcesChanged: onChanged, onRequestedRunChange });
+      onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => view.rerenderPanel({ requestedRunId }));
+      await screen.findByText(failed.id, { selector: "code" });
+      expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Back to workspace" }));
+      await userEvent.click(screen.getByRole("button", { name: "Start initial sync" }));
 
       await waitFor(() => {
         expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
         expect(screen.getByRole("alert")).toHaveTextContent(
-          response === "accepted" ? "Status read failed after retry." : "Retry response lost.",
+          response === "accepted" ? "Status read failed after starting sync." : "Start response lost.",
         );
       });
-      expect(api.retry).toHaveBeenCalledExactlyOnceWith("exact-run", ["users"], expect.anything());
-      expect(api.start).not.toHaveBeenCalled();
+      expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "initial" }, expect.anything());
+      await userEvent.click(screen.getByRole("button", { name: "View run details" }));
+      expect(onRequestedRunChange).toHaveBeenLastCalledWith(completed.id);
     },
   );
 
@@ -1864,7 +1930,7 @@ describe("DataSyncPanel", () => {
   });
 
   it.each(["accepted", "lost"] as const)(
-    "tracks a historical retry as latest activity after selection changes with an %s response",
+    "tracks a fresh sync as latest activity after selection changes with an %s response",
     async response => {
       vi.useFakeTimers();
       const priorSource = source("users", "failed", {
@@ -1875,34 +1941,38 @@ describe("DataSyncPanel", () => {
         count: 5, jobId: "newer-users", lastSuccessAt: "2026-09-15T11:00:00.000Z",
       })];
       const newer = run("completed", newerSources, { id: "newer-run", mode: "incremental" });
-      const retrySources = [{ ...priorSource, status: "running" as const, jobId: "retry-users", canRetry: false }];
-      const retried = run("running", retrySources, { id: older.id, mode: "incremental" });
+      const freshSources = [{ ...priorSource, status: "running" as const, jobId: "fresh-users", canRetry: false }];
+      const fresh = run("running", freshSources, { id: "fresh-run", mode: "incremental" });
       const completedSources = [source("users", "succeeded", {
-        count: 6, jobId: "retry-users", lastSuccessAt: "2026-09-15T12:00:00.000Z",
+        count: 6, jobId: "fresh-users", lastSuccessAt: "2026-09-15T12:00:00.000Z",
       })];
       api.getState
-        .mockResolvedValueOnce(syncState({ run: newer, sources: newerSources }))
-        .mockResolvedValueOnce(syncState({ run: retried, sources: retrySources }))
+        .mockResolvedValueOnce(syncState({ run: newer, sources: newerSources, onboardingRequired: false }))
+        .mockResolvedValueOnce(syncState({ run: fresh, sources: newerSources, onboardingRequired: false }))
         .mockResolvedValue(syncState({
-          run: run("completed", completedSources, { id: older.id, mode: "incremental" }),
+          run: run("completed", completedSources, { id: fresh.id, mode: "incremental" }),
           sources: completedSources,
         }));
       api.getRun.mockResolvedValueOnce(older).mockResolvedValue(newer);
-      let resolveRetry!: (value: DataSyncRun) => void;
-      let rejectRetry!: (reason: Error) => void;
-      api.retry.mockReturnValue(new Promise((resolve, reject) => {
-        resolveRetry = resolve;
-        rejectRetry = reject;
+      let resolveStart!: (value: DataSyncRun) => void;
+      let rejectStart!: (reason: Error) => void;
+      api.start.mockReturnValue(new Promise((resolve, reject) => {
+        resolveStart = resolve;
+        rejectStart = reject;
       }));
       const onChanged = vi.fn();
       const onRequestedRunChange = vi.fn();
       const view = renderPanel({ requestedRunId: older.id, onSourcesChanged: onChanged, onRequestedRunChange });
+      onRequestedRunChange.mockImplementation((requestedRunId: string | undefined) => view.rerenderPanel({ requestedRunId }));
       await act(async () => { await Promise.resolve(); });
-      await act(async () => { screen.getByRole("button", { name: "Retry incomplete (1)" }).click(); });
+      expect(screen.getByText(older.id, { selector: "code" })).toBeVisible();
+      expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
+      await act(async () => { screen.getByRole("button", { name: "Back to workspace" }).click(); });
+      await act(async () => { screen.getByRole("button", { name: "Sync all sources" }).click(); });
       await act(async () => { view.rerenderPanel({ requestedRunId: newer.id }); });
       await act(async () => {
-        if (response === "accepted") resolveRetry(retried);
-        else rejectRetry(new Error("The retry response was lost."));
+        if (response === "accepted") resolveStart(fresh);
+        else rejectStart(new Error("The start response was lost."));
       });
 
       expect(api.getState).toHaveBeenCalledTimes(2);
@@ -1911,12 +1981,14 @@ describe("DataSyncPanel", () => {
       expect(onChanged).not.toHaveBeenCalled();
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
       expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
-      expect(api.retry).toHaveBeenCalledExactlyOnceWith(older.id, ["users"], expect.anything());
-      if (response === "lost") expect(screen.getByRole("alert")).toHaveTextContent("The retry response was lost.");
+      expect(api.start).toHaveBeenCalledExactlyOnceWith({ mode: "incremental" }, expect.anything());
+      if (response === "lost") expect(screen.getByRole("alert")).toHaveTextContent("The start response was lost.");
 
       await act(async () => { view.rerenderPanel({ requestedRunId: undefined }); });
+      api.getRun.mockResolvedValue(run("completed", completedSources, { id: fresh.id, mode: "incremental" }));
       await act(async () => { screen.getByRole("button", { name: "View run details" }).click(); });
-      expect(onRequestedRunChange).toHaveBeenLastCalledWith(older.id);
+      expect(onRequestedRunChange).toHaveBeenLastCalledWith(fresh.id);
+      expect(screen.getByText(fresh.id, { selector: "code" })).toBeVisible();
       expect(screen.queryByText(newer.id, { selector: "code" })).not.toBeInTheDocument();
     },
   );

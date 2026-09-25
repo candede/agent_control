@@ -6,11 +6,13 @@ import {
   useState,
 } from "react";
 import {
+  ArrowRight,
+  Ban,
   Bot,
+  CircleCheck,
   ExternalLink,
   Globe2,
-  Play,
-  Square,
+  RefreshCw,
 } from "lucide-react";
 import {
   ApiError,
@@ -26,6 +28,7 @@ import {
   getInventoryRefreshJob,
   getInventoryRefreshJobs,
   getBulkActionJob,
+  getBulkActionJobs,
   getCurrentUser,
   getWorkbenchMetadata,
   cancelBulkActionJob,
@@ -71,8 +74,8 @@ import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
-import { agentSortOptions, agentViewOptions } from "./agentColumns";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+import { agentSortOptions, agentViewOptions, inventoryScopeAgentCount } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 import { inventoryAttentionReasons } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
@@ -85,17 +88,18 @@ import { AccessAssignmentModal } from "./components/AccessAssignmentModal";
 import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
 import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
 import { AuditLogView } from "./components/AuditLogView";
-import { BulkActions, type BulkProgress } from "./components/BulkActions";
+import { BulkActions, type BulkProgress, type BulkJobCommand } from "./components/BulkActions";
 import { AgentInventoryOverview } from "./components/AgentInventoryOverview";
 import { CopilotUsersView } from "./components/CopilotUsersView";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
+import { OfficialUsageReportSelector } from "./components/OfficialUsageReportSelector";
 import { CsvUsageReportsSection } from "./components/CsvUsageReportsSection";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
 import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { EnvironmentFilter } from "./components/EnvironmentFilter";
-import { JobsView } from "./components/JobsView";
+import { SyncHistoryView } from "./components/SyncHistoryView";
 import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
   agentRouteSearch,
@@ -103,6 +107,7 @@ import {
   parseDataSyncRoute,
   migrateOfficialUsageRoute,
   migrateSecurityRoute,
+  migrateJobsRoute,
   parseAgentRoute,
   parseUsersRoute,
   usersRouteSearch,
@@ -173,6 +178,8 @@ function readViewSearch(...views: WorkbenchViewId[]) {
 }
 
 function readInitialAgentRoute() {
+  const jobsRedirect = migrateJobsRoute(window.location.pathname);
+  if (jobsRedirect) window.history.replaceState({ view: "sync" }, "", jobsRedirect);
   const securityRedirect = migrateSecurityRoute(window.location.pathname);
   if (securityRedirect) window.history.replaceState({ view: "agents" }, "", securityRedirect);
   const reports = migrateOfficialUsageRoute(window.location.pathname, window.location.search);
@@ -214,6 +221,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [legacyUsagePresent, setLegacyUsagePresent] = useState(hasLegacyUsageStorage);
   const capabilityState = useCapabilities(user, sessionEpoch);
   const [trackedJob, setTrackedJob] = useState<BulkActionJob>();
+  const [bulkJobCommand, setBulkJobCommand] = useState<BulkJobCommand>();
+  const [bulkJobError, setBulkJobError] = useState<string>();
   const [bulkJobStorageError, setBulkJobStorageError] = useState<string>();
   const [linkedPackageRefreshJob, setLinkedPackageRefreshJob] = useState<PackageRefreshJob>();
   const [linkedJobError, setLinkedJobError] = useState<string>();
@@ -239,6 +248,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [loadingAgents, setLoadingAgents] = useState(false);
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState(initialAgentRoute.search);
+  const [agentInventoryScope, setAgentInventoryScope] = useState(initialAgentRoute.inventoryScope);
   const [agentView, setAgentView] = useState(initialAgentRoute.agentView);
   const [statusFilter, setStatusFilter] = useState<
     "all" | "allowed" | "blocked"
@@ -307,6 +317,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const forceCurrentAgentReload = useRef(false);
   const verificationOnlyAgentReload = useRef(false);
   const bulkJobPollRequestId = useRef(0);
+  const bulkJobCommandRequestId = useRef<number | undefined>(undefined);
   const packageRefreshRequestId = useRef(0);
   const inventoryRefreshRequestId = useRef(0);
   const linkedPackageRefreshRequestId = useRef(0);
@@ -399,7 +410,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setSelectedPowerPlatformTargets(new Map());
       setSelectedPowerPlatformSnapshot(null);
       setAgentDetail(undefined);
-      setTrackedJob(undefined);
+      clearTrackedJob();
       setLinkedPackageRefreshJob(undefined);
       setLinkedJobError(undefined);
       setBulkProgress(undefined);
@@ -445,6 +456,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const route = parseAgentRoute(window.location.search);
         if (countAdvancedAgentFilters(route) > 0) setShowAdvancedFilters(true);
         setQuery(route.search);
+        setAgentInventoryScope(route.inventoryScope);
         setAgentView(route.agentView);
         setStatusFilter(route.status);
         setPublisherFilter(route.publisher);
@@ -514,6 +526,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   useEffect(() => {
     if (activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
     const search = agentRouteSearch({
+      inventoryScope: agentInventoryScope,
       agentView,
       search: query,
       status: statusFilter,
@@ -553,7 +566,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentPageIndex, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentPageIndex, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
 
   useEffect(() => {
     if (activeView !== "sync") return;
@@ -695,7 +708,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     let active = true;
     void Promise.resolve().then(() => {
       if (!active) return;
-      setTrackedJob(undefined);
+      clearTrackedJob();
       setBulkResult(undefined);
       setLinkedJobError(undefined);
       return loadLinkedControlJob(requestedPackageControlJobId);
@@ -707,7 +720,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [activeView, principalKey, requestedPackageControlJobId, user]);
 
   useEffect(() => {
-    if (!user || !hasRole(user, "AgentControl.Admin")) {
+    if (!user || !hasRole(user, "AgentControl.Admin") || activeView !== "agents") {
       return;
     }
     if (requestedPackageControlJobId || requestedPackageRefreshJobId) return;
@@ -718,13 +731,30 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
     const jobId = stored.jobId;
 
-    if (!jobId || resumedBulkJobIds.current.has(jobId)) {
+    if (jobId) {
+      if (!resumedBulkJobIds.current.has(jobId)) {
+        resumedBulkJobIds.current.add(jobId);
+        resumeBulkJob(jobId);
+      }
       return;
     }
 
-    resumedBulkJobIds.current.add(jobId);
-    resumeBulkJob(jobId);
-  }, [principalKey, requestedPackageControlJobId, requestedPackageRefreshJobId, user]);
+    // Sign-in and session revalidation can clear the browser's active-job pointer.
+    const controller = new AbortController();
+    const owner = bulkJobPollRequestId.current;
+    getBulkActionJobs(50, { signal: controller.signal }).then(({ value }) => {
+      if (controller.signal.aborted || bulkJobPollRequestId.current !== owner) return;
+      const retained = value.find(job => isJobPolling(job.status) || job.canResume || job.status === "waiting_authorization"
+        || job.results.some(result => result.status === "inconclusive" && result.reconciliationStatus === "required"));
+      if (!retained || resumedBulkJobIds.current.has(retained.id)) return;
+      resumedBulkJobIds.current.add(retained.id);
+      resumeBulkJob(retained.id);
+    }).catch(requestError => {
+      if (controller.signal.aborted || bulkJobPollRequestId.current !== owner) return;
+      setBulkJobStorageError(`Unable to check for unfinished package tasks. Reload Agents to try again. ${errorMessage(requestError)}`);
+    });
+    return () => controller.abort();
+  }, [activeView, principalKey, requestedPackageControlJobId, requestedPackageRefreshJobId, user]);
 
   useEffect(() => {
     if (
@@ -758,7 +788,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         } else if (job.status === "running" && Date.now() < deadline) {
           timer = window.setTimeout(() => void poll(), inventoryRefreshPollIntervalMs);
         } else if (job.status === "running") {
-          setError("Power Platform agent refresh polling reached its five-minute bound. The durable job remains available in Jobs.");
+          setError("Power Platform agent refresh polling reached its five-minute bound. Open Inspect source job in Sync to check its status.");
         } else if (job.status !== "waiting_authorization") {
           setError(job.message ?? "Power Platform agent refresh did not complete.");
         }
@@ -824,7 +854,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setRequestedPackageRefreshJobId(undefined);
         setRequestedPackageControlJobId(undefined);
         setRequestedDataSyncRunId(undefined);
-        setTrackedJob(undefined);
+        clearTrackedJob();
         setLinkedPackageRefreshJob(undefined);
         setLinkedJobError(undefined);
       });
@@ -834,7 +864,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [agentEnvironmentFilter, agentPageIndex, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
+  }, [agentEnvironmentFilter, agentInventoryScope, agentPageIndex, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
 
 
   useEffect(() => {
@@ -916,6 +946,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         agentListRequestId.current += 1;
         agentListAbortController.current?.abort();
         bulkJobPollRequestId.current += 1;
+        bulkJobCommandRequestId.current = undefined;
         packageRefreshRequestId.current += 1;
         inventoryRefreshRequestId.current += 1;
         for (const timerId of timerIds) {
@@ -1039,6 +1070,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     void dataSyncPanelRef.current?.refresh();
   }
 
+  function handleReportSetSelected(selectionChanged: boolean) {
+    if (selectionChanged) {
+      const next = { ...usersRoute, reportSetId: undefined, agentId: undefined, search: "", page: 0 };
+      if (activeView === "users") handleUsersRouteChange(next, true);
+      else {
+        savedViewSearches.current.set("users", usersRouteSearch(next).toString());
+        setUsersRoute(next);
+      }
+    }
+    handleOfficialUsageChanged();
+  }
+
   function openUsageImport(view: "import" | "manage" = "import") {
     if (activeView !== "sync") navigateToView("sync");
     handleSyncReportRouteChange({ view, activityWindowDays: 30 });
@@ -1076,7 +1119,20 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
   }
 
-  const displayedUnifiedAgents = unifiedAgentPage?.value ?? [];
+  const visibleUnifiedAgentPage = unifiedAgentPage?.inventoryScope === agentInventoryScope
+    ? unifiedAgentPage : undefined;
+  const displayedUnifiedAgents = visibleUnifiedAgentPage?.value ?? [];
+  const inventoryScopeCount = visibleUnifiedAgentPage
+    ? inventoryScopeAgentCount(visibleUnifiedAgentPage.summary, agentInventoryScope) : undefined;
+  const nativeObservation = visibleUnifiedAgentPage?.sources.powerPlatform.observation;
+  const inventoryCollectionText = [
+    ...(agentInventoryScope !== "power_platform_only" ? [lastAgentListRefreshAt
+      ? `Catalog collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
+      : "No saved package catalog observation. Open Sync to collect it."] : []),
+    ...(agentInventoryScope !== "catalog" ? [nativeObservation
+      ? `Power Platform collected ${formatRefreshTime(new Date(nativeObservation.observedAt))}`
+      : "No saved Power Platform observation. Open Sync to collect it."] : []),
+  ].join(" · ");
   const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const advancedFilterCount = countAdvancedAgentFilters({
     environmentId: agentEnvironmentFilter,
@@ -1092,10 +1148,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     hostFilter !== "all" ||
     effectivePlatformFilter !== "all" ||
     parseOptionalPositiveInteger(createdWithinDays) !== undefined;
-  const exportableAgentCount = unifiedAgentPage?.count ?? 0;
+  const exportableAgentCount = visibleUnifiedAgentPage?.count ?? 0;
   const selectedExportTargetCount = selectedAgentIds.size + selectedPowerPlatformTargets.size;
   const exportSelectionRestoring = pendingPowerPlatformIds.size > 0 || pendingStoredAgentSelectionCount !== undefined;
-  const agentExportRevision = isSavedAgentRevision(unifiedAgentPage?.revision) ? unifiedAgentPage.revision : undefined;
+  const agentExportRevision = isSavedAgentRevision(visibleUnifiedAgentPage?.revision) ? visibleUnifiedAgentPage.revision : undefined;
   const agentExportNeedsReload = Boolean(unifiedAgentReadError || agentExportError?.reloadRequired || (unifiedAgentPage && !agentExportRevision));
   const selectedQuarantineObservation = selectedPowerPlatformSnapshot ?? unifiedAgentPage?.value.find(
     record => record.observations.powerPlatform,
@@ -1189,7 +1245,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setUnifiedAgentReadError(undefined);
     setBulkProgress(undefined);
     setBulkResult(undefined);
-    setTrackedJob(undefined);
+    clearTrackedJob();
     setLinkedPackageRefreshJob(undefined);
     setLinkedJobError(undefined);
   }
@@ -1234,6 +1290,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ...(hostFilter === "all" ? {} : { host: hostFilter }),
       ...(effectivePlatformFilter === "all" ? {} : { platform: effectivePlatformFilter }),
       ...(parseOptionalPositiveInteger(createdWithinDays) ? { createdWithinDays: parseOptionalPositiveInteger(createdWithinDays) } : {}),
+      inventoryScope: agentInventoryScope,
       sortBy: agentSortBy,
       sortDirection: agentSortDirection,
     };
@@ -1553,6 +1610,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     targetBlockedState: boolean,
   ) {
     if (!isCurrentAgentScope()) return;
+    const returnFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     const requestId = ++agentDetailRequestId.current;
     agentDetailAbortController.current?.abort();
     const owner = principalKey;
@@ -1567,7 +1625,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       const action = targetBlockedState ? "block" : "unblock";
       const preview = await previewPackageMutation({ action, ids: [agent.id], mutationScope: "single" });
       if (!ownsAgentFlowRequest(requestId, owner)) return;
-      setBulkConfirmation({ action, ids: [agent.id], mutationScope: "single", preview });
+      setBulkConfirmation({ action, ids: [agent.id], mutationScope: "single", preview, returnFocusTo });
       return true;
     } catch (requestError) {
       if (ownsAgentFlowRequest(requestId, owner)) {
@@ -1803,6 +1861,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
     setBulkConfirmation(undefined);
 
+    clearTrackedJob();
     setBusyBulkAction(label);
     setBulkProgress(accessUpdate ? {
       action: label as "update-availability" | "update-installation",
@@ -1812,7 +1871,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       succeeded: 0,
       failed: 0,
       skipped: 0,
-      currentAgentName: "starting server-side bulk job",
     } : {
       action: label as "block" | "unblock",
       targetBlockedState: label === "block",
@@ -1821,7 +1879,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       succeeded: 0,
       failed: 0,
       skipped: 0,
-      currentAgentName: "starting server-side bulk job",
     });
     setError(undefined);
     setBulkResult(undefined);
@@ -1850,7 +1907,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     } catch (requestError) {
       if (ownsBulkJobRequest(requestId, owner)) {
         const message = errorMessage(requestError);
-        setError(message);
+        setBulkJobError(message);
         if (mutationScope === "single" && ids.length === 1) setPackageControlError({ packageId: ids[0], message });
         setBusyBulkAction(undefined);
         setBulkProgress(undefined);
@@ -1934,8 +1991,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       if (isJobPolling(job.status)) {
         keepStored = persist;
-        const message = "Package job polling reached its five-minute bound. The durable job remains available for explicit refresh in Jobs.";
-        setError(message);
+        const message = "Automatic status updates paused after five minutes. Use Refresh status in this panel to continue checking; the task may still be running.";
+        setBulkJobError(message);
         if (packageId) setPackageControlError({ packageId, message });
         return;
       }
@@ -1946,13 +2003,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         else setBulkResult(job.result);
       }
       const message = jobStatusMessage(job.status);
-      setError(message);
       if (packageId && message) setPackageControlError({ packageId, message });
     } catch (requestError) {
       if (ownsBulkJobRequest(requestId, owner)) {
         if (persist) {
           const message = errorMessage(requestError);
-          setError(message);
+          setBulkJobError(message);
           if (packageId) setPackageControlError({ packageId, message });
         }
         else setLinkedJobError(`The exact package control job is expired, deleted, or unavailable to this account. ${errorMessage(requestError)}`);
@@ -2035,65 +2091,67 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (result.results.some(item => item.status === "succeeded" || item.status === "skipped")) requestCurrentAgentReload();
   }
 
-  async function handleResumeJob() {
+  async function handleBulkJobCommand(operation: BulkJobCommand) {
     if (!isCurrentAgentScope()) return;
-    if (!trackedJob || !window.confirm("Resume only unsent items with your current authorization? Inconclusive writes will not be replayed.")) return;
+    if (!trackedJob || bulkJobCommandRequestId.current !== undefined) return;
+    if (operation === "resume" && !window.confirm("Resume only unprocessed tasks with your current authorization? Changes with uncertain outcomes will not be repeated.")) return;
     const requestId = ++bulkJobPollRequestId.current;
     const owner = principalKey;
+    bulkJobCommandRequestId.current = requestId;
+    setBulkJobCommand(operation);
+    setBulkJobError(undefined);
     try {
-      const job = await resumeBulkActionJob(trackedJob.id);
-      if (ownsBulkJobRequest(requestId, owner)) await followBulkJob(job.id, job);
-    } catch (requestError) {
-      if (ownsBulkJobRequest(requestId, owner)) {
-        setError(errorMessage(requestError));
-        setBusyBulkAction(undefined);
-        setBulkProgress(undefined);
-      }
-    }
-  }
-
-  async function handleCancelJob() {
-    if (!isCurrentAgentScope()) return;
-    if (!trackedJob) return;
-    const requestId = ++bulkJobPollRequestId.current;
-    const owner = principalKey;
-    try {
-      const job = await cancelBulkActionJob(trackedJob.id);
-      if (ownsBulkJobRequest(requestId, owner)) {
+      if (operation === "refresh") {
+        const job = await getBulkActionJob(trackedJob.id);
+        if (!ownsBulkJobRequest(requestId, owner)) return;
+        finishBulkJobCommand(requestId);
+        await followBulkJob(job.id, job, !requestedPackageControlJobId);
+      } else if (operation === "reconcile") {
+        const reconciled = await reconcileBulkActionJob(trackedJob.id);
+        if (!ownsBulkJobRequest(requestId, owner)) return;
+        setTrackedJob(reconciled);
+        if (reconciled.result) setBulkResult(reconciled.result);
+        if (reconciled.reconciliation.attempted > reconciled.reconciliation.failed) requestCurrentAgentReload();
+        if (reconciled.reconciliation.failed) {
+          setBulkJobError(`${reconciled.reconciliation.failed} provider read${reconciled.reconciliation.failed === 1 ? "" : "s"} could not be reconciled.`);
+        }
+      } else {
+        const job = operation === "resume"
+          ? await resumeBulkActionJob(trackedJob.id) : await cancelBulkActionJob(trackedJob.id);
+        if (!ownsBulkJobRequest(requestId, owner)) return;
+        if (operation === "resume") finishBulkJobCommand(requestId);
         await followBulkJob(job.id, job, !requestedPackageControlJobId);
       }
     } catch (requestError) {
       if (ownsBulkJobRequest(requestId, owner)) {
-        setError(errorMessage(requestError));
+        setBulkJobError(errorMessage(requestError));
+        setBusyBulkAction(undefined);
+        setBulkProgress(undefined);
+        if (operation === "cancel" && isJobPolling(trackedJob.status)) {
+          finishBulkJobCommand(requestId);
+          await followBulkJob(trackedJob.id, trackedJob, !requestedPackageControlJobId);
+        }
+      }
+    } finally {
+      finishBulkJobCommand(requestId);
+      if (ownsBulkJobRequest(requestId, owner)) {
         setBusyBulkAction(undefined);
         setBulkProgress(undefined);
       }
     }
   }
 
-  async function handleReconcileJob() {
-    if (!isCurrentAgentScope()) return;
-    if (!trackedJob) return;
-    const requestId = ++bulkJobPollRequestId.current;
-    const owner = principalKey;
-    setError(undefined);
-    try {
-      const reconciled = await reconcileBulkActionJob(trackedJob.id);
-      if (!ownsBulkJobRequest(requestId, owner)) return;
-      setTrackedJob(reconciled);
-      if (reconciled.result) setBulkResult(reconciled.result);
-      if (reconciled.reconciliation.attempted > reconciled.reconciliation.failed) requestCurrentAgentReload();
-      if (reconciled.reconciliation.failed) {
-        setError(`${reconciled.reconciliation.failed} provider read${reconciled.reconciliation.failed === 1 ? "" : "s"} could not be reconciled.`);
-      }
-    } catch (requestError) {
-      if (ownsBulkJobRequest(requestId, owner)) setError(errorMessage(requestError));
-    } finally {
-      if (ownsBulkJobRequest(requestId, owner)) {
-        setBusyBulkAction(undefined);
-        setBulkProgress(undefined);
-      }
-    }
+  function finishBulkJobCommand(requestId: number) {
+    if (bulkJobCommandRequestId.current !== requestId) return;
+    bulkJobCommandRequestId.current = undefined;
+    setBulkJobCommand(undefined);
+  }
+
+  function clearTrackedJob() {
+    setTrackedJob(undefined);
+    setBulkJobError(undefined);
+    setBulkJobCommand(undefined);
+    bulkJobCommandRequestId.current = undefined;
   }
 
   function clearActiveBulkJobId() {
@@ -2113,6 +2171,30 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setPlatformFilter("all");
     setCreatedWithinDays("");
     setAgentPageIndex(0);
+  }
+
+  function handleInventoryScopeChange(scope: UnifiedAgentInventoryScope) {
+    if (scope === agentInventoryScope) return;
+    agentDetailRequestId.current += 1;
+    agentDetailAbortController.current?.abort();
+    handleClearAgentFilters();
+    setAgentInventoryScope(scope);
+    setSelectedAgentIds(new Set());
+    setPendingStoredAgentSelectionCount(undefined);
+    setSelectionRouteNotice(undefined);
+    setExportChoiceOpen(false);
+    setUnifiedAgentPage(undefined);
+    setAgentDetail(undefined);
+    setAgentDetailError(undefined);
+    setLoadingAgentDetailId(undefined);
+    setBusyAgentId(undefined);
+    setSelectedUnifiedAgent(undefined);
+    setUnifiedAgentDetailPage(undefined);
+    setAgentPackageSelection(undefined);
+    setRequestedAgentDetailId(undefined);
+    setSingleAccessAgentDetail(undefined);
+    setBulkAccessAgentIds(undefined);
+    setBulkConfirmation(undefined);
   }
 
   function resetPowerPlatformSelection() {
@@ -2433,7 +2515,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               ) : null}
               {visibleViews.includes("sync") ? <button type="button" className={visibleActiveView === "sync" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "sync" ? "page" : undefined} onClick={() => navigateToView("sync")}>Sync{syncSetupRequired ? <small className="sync-setup-hint">Setup needed</small> : null}</button> : null}
               <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
-              {visibleViews.includes("jobs") ? <button type="button" className={visibleActiveView === "jobs" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "jobs" ? "page" : undefined} onClick={() => navigateToView("jobs")}>Jobs</button> : null}
         </nav>
       </header>
 
@@ -2496,7 +2577,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             onCancelRequested={() => automaticRefresh.setPaused(true)}
             onChanged={() => handleDataSyncSourcesChanged(["power_platform"])} /> : null}
           <LinkedAgentJobStatus refreshJob={linkedPackageRefreshJob} error={linkedJobError} />
-          <JobsView key={principalKey} user={user} scope="sync" onOpenSyncRun={handleRequestedSyncRunChange} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} onCollectionCancel={() => automaticRefresh.setPaused(true)} />
+          <SyncHistoryView key={principalKey} user={user} onOpenSyncRun={handleRequestedSyncRunChange} revision={syncHistoryRevision} />
         </>
       ) : null}
       {hasRole(user, "AgentControl.Viewer") ? (
@@ -2534,34 +2615,44 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           </>
         ) : (
         <>
-          <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} />
+          {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
           <div className="agent-catalog-heading">
             <div className="agent-catalog-title">
-              <h2>Agents <span>{(unifiedAgentPage?.count ?? 0).toLocaleString()}{hasActiveAgentFilters ? ` of ${(unifiedAgentPage?.summary.total ?? 0).toLocaleString()}` : ""}</span></h2>
+              <h2>Agents <span>{visibleUnifiedAgentPage?.count.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
               <span className="last-refresh" aria-live="polite">
                 {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
-                  : lastAgentListRefreshAt
-                  ? `Graph collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && packageSnapshotExpiresAt.getTime() <= Date.now() ? " / expired" : ""}`
-                    : "No saved package observation. Open Data sync on the Sync tab to collect workspace data."}
+                  : inventoryCollectionText}
               </span>
             </div>
             <div className="agent-catalog-actions">
-              {!loadingAgents && agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
-              <button
-                type="button"
-                className="secondary icon-button control-icon-button"
-                aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
-                title={!agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
-                disabled={!canReadSensitiveUsage || loadingAgents || deferredQuery !== query || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
-                onClick={requestExportCsv}
-              >
-                <ExportIcon />
-              </button>
+              {agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
+              <div className="agent-catalog-export">
+                <span className="agent-refresh-indicator">
+                  {loadingAgents ? <span role="status" aria-label="Updating agent results"
+                    title="Updating agent results. Previous results remain visible until the current filters and sorting finish loading.">
+                    <RefreshCw className="agent-refresh-spinner" size={18} aria-hidden="true" />
+                    <span className="sr-only">Updating agent results...</span>
+                  </span> : null}
+                </span>
+                <button
+                  type="button"
+                  className="secondary icon-button control-icon-button"
+                  aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
+                  title={!agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
+                  disabled={!canReadSensitiveUsage || loadingAgents || deferredQuery !== query || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
+                  onClick={requestExportCsv}
+                >
+                  <ExportIcon />
+                </button>
+              </div>
             </div>
           </div>
 
           {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
-            inventory={unifiedAgentReadError ? undefined : unifiedAgentPage} revision={officialUsageDashboardRevision}
+            inventory={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage} revision={officialUsageDashboardRevision}
+            inventoryScope={agentInventoryScope} onInventoryScopeChange={handleInventoryScopeChange}
+            reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
+              principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
             view={agentView} onViewChange={view => { handleClearAgentFilters(); setAgentView(view); }} /> : null}
 
           {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
@@ -2571,31 +2662,26 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             {agentExportNeedsReload ? <button type="button" className="secondary" disabled={loadingAgents} onClick={requestCurrentAgentReload}>Reload saved agent inventory</button> : null}
           </div> : null}
           {exportingCsv ? <div className="report-status" role="status">Preparing agent inventory CSV. The server exports each resolved agent once.</div> : null}
-          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult) ? <BulkActions
+          {canOperate && (selectedAgentIds.size > 0 || busyBulkAction || bulkProgress || bulkResult || trackedJob || bulkJobError || (requestedPackageControlJobId && linkedJobError)) ? <BulkActions
             disabled={
-              loadingAgents || Boolean(busyAgentId) || Boolean(busyBulkAction)
+              Boolean(busyAgentId) || Boolean(busyBulkAction) || Boolean(bulkJobCommand)
             }
             busyAction={busyBulkAction}
             progress={bulkProgress}
             result={bulkResult}
+            job={trackedJob}
+            jobCommand={bulkJobCommand}
+            jobError={bulkJobError ?? (requestedPackageControlJobId ? linkedJobError : undefined)}
             selectedCount={selectedAgentIds.size}
             onBlockAll={() => void requestBulkAction(true)}
             onManageAccess={requestBulkAccessUpdate}
             onUnblockAll={() => void requestBulkAction(false)}
+            onJobCommand={operation => void handleBulkJobCommand(operation)}
           /> : null}
           {selectionRouteNotice ? (
             <div className={selectionRouteNotice.tone === "error" ? "error-banner" : "report-status"} role="status">
               {selectionRouteNotice.text}
             </div>
-          ) : null}
-          {canOperate && trackedJob && (isJobPolling(trackedJob.status) || trackedJob.canResume || trackedJob.status === "partial" || trackedJob.status === "waiting_authorization") ? (
-            <section className="job-status-panel" aria-label="Job controls">
-              <span role="status">{jobStatusMessage(trackedJob.status) ?? "Job running"}</span>
-              {trackedJob.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
-              {trackedJob.canResume ? <WorkbenchActionGate actionId="packages.resume"><button type="button" onClick={() => void handleResumeJob()}><Play size={16} aria-hidden="true" /> Resume unsent items</button></WorkbenchActionGate> : null}
-              {trackedJob.results.some(result => result.status === "inconclusive" && result.reconciliationStatus === "required") ? <WorkbenchActionGate actionId="packages.reconcile"><button type="button" className="secondary" onClick={() => void handleReconcileJob()}>Reconcile inconclusive</button></WorkbenchActionGate> : null}
-              {isJobPolling(trackedJob.status) || trackedJob.canResume ? <WorkbenchActionGate actionId="packages.cancel"><button type="button" onClick={() => void handleCancelJob()}><Square size={16} aria-hidden="true" /> Cancel unsent items</button></WorkbenchActionGate> : null}
-            </section>
           ) : null}
 
           <section className="controls catalog-controls" aria-label="Filters">
@@ -2754,7 +2840,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             <div className="screen-state">Loading Copilot agents...</div>
           ) : (
             <div className="agent-table-stack" aria-busy={loadingAgents}>
-              {loadingAgents ? <p className="notice" role="status">Updating agent results. Previous results remain visible until the current filters and sorting finish loading.</p> : null}
               <UnifiedAgentTable
                 records={displayedUnifiedAgents}
                 columnPreferenceOwner={user ? JSON.stringify([user.tenantId ?? "", user.homeAccountId]) : undefined}
@@ -2774,6 +2859,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 quarantineSelectionAllowed={canOperate}
                 quarantineSelectionRestoring={pendingPowerPlatformIds.size > 0}
                 selectionDisabled={loadingAgents || Boolean(busyBulkAction) || refreshingAgents}
+                packageActionsDisabled={Boolean(busyBulkAction) || refreshingAgents}
                 environmentNames={agentEnvironmentNames}
                 onToggleSelection={toggleUnifiedAgentSelection}
                 onViewDetails={record => {
@@ -2792,7 +2878,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               <AgentPageControls
                 pageIndex={agentPageIndex}
                 pageSize={agentDisplayPageSize}
-                totalCount={unifiedAgentPage?.count ?? 0}
+                totalCount={visibleUnifiedAgentPage?.count ?? 0}
                 loading={loadingAgents}
                 onPageChange={setAgentPageIndex}
               />
@@ -2807,6 +2893,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           agentInventoryRevision={agentReloadRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
+          reportSelector={canImportReports ? <OfficialUsageReportSelector key={`user-reports:${principalKey}`}
+            principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
           onOpenAgent={id => {
             if (!ownsAgentScope(principalKey)) return;
             navigateToView("agents");
@@ -2819,8 +2907,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         />
       ) : visibleActiveView === "audit" ? (
         <AuditLogView key={principalKey} agents={agents} />
-      ) : visibleActiveView === "jobs" ? (
-        <JobsView key={principalKey} user={user} onChanged={() => void dataSyncPanelRef.current?.refresh()} revision={syncHistoryRevision} onCollectionCancel={() => automaticRefresh.setPaused(true)} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 
       {loadingAgentDetailId ? (
@@ -2969,6 +3055,7 @@ export type BulkConfirmation = {
   mutationScope: "single" | "bulk";
   preview: PackageMutationPreview;
   accessUpdate?: PackageAccessUpdate;
+  returnFocusTo?: HTMLElement;
 };
 
 function toBulkProgress(job: BulkActionJob): BulkProgress {
@@ -3002,7 +3089,7 @@ function loadStoredActiveBulkJobId(): { jobId?: string; error?: string } {
   try {
     return { jobId: window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined };
   } catch {
-    return { error: "Unable to read the saved package job from browser storage. Open Jobs to recover retained work." };
+    return { error: "Unable to read the saved package job from browser storage. Open its saved /agents?controlJob=<job-id> link to recover it." };
   }
 }
 
@@ -3011,7 +3098,7 @@ function saveStoredActiveBulkJobId(jobId: string) {
     try {
       window.localStorage.setItem(activeBulkJobStorageKey, jobId);
     } catch {
-      return "Unable to save the active package job in browser storage. Tracking continues in this tab; use Jobs after reload.";
+      return `Unable to save the active package job in browser storage. Tracking continues in this tab; bookmark /agents?controlJob=${encodeURIComponent(jobId)} to reopen it.`;
     }
   }
 }
@@ -3191,16 +3278,21 @@ export function BulkConfirmModal({
   inline?: boolean;
 }) {
   const { summary } = confirmation.preview;
-  const actionLabel = formatDetailLabel(summary.operation) ?? summary.operation;
+  const isBlockAction = summary.operation === "block" || summary.operation === "unblock";
+  const isBlocking = summary.operation === "block";
+  const actionLabel = isBlockAction
+    ? isBlocking ? "Block" : "Unblock"
+    : formatDetailLabel(summary.operation) ?? summary.operation;
+  const targetLabel = summary.targetCount === 1 ? "package" : `${summary.targetCount.toLocaleString()} packages`;
   const panel = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    const previouslyFocused = document.activeElement;
+    const previouslyFocused = confirmation.returnFocusTo ?? document.activeElement;
     panel.current?.focus();
     return () => {
       if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) previouslyFocused.focus();
     };
-  }, [inline]);
+  }, [inline, confirmation.returnFocusTo]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -3220,16 +3312,84 @@ export function BulkConfirmModal({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [inline, onCancel]);
 
+  const technicalDetails = <>
+    <dl className="permission-metadata confirm-metadata">
+      <div><dt>Provider</dt><dd>{summary.provider}</dd></div>
+      <div><dt>Endpoint</dt><dd><code>{summary.endpoint}</code> / {summary.apiMaturity}</dd></div>
+      <div><dt>Permission</dt><dd>{summary.permission}</dd></div>
+      <div><dt>Actor</dt><dd>{summary.actor.displayName} ({summary.actor.username})</dd></div>
+      <div><dt>Rollback</dt><dd>{summary.rollback}</dd></div>
+      <div><dt>Target selection hash</dt><dd><code>{summary.targetSelectionHash}</code></dd></div>
+    </dl>
+    <ul className="confirm-agent-list" aria-label="Exact package mutation preview">
+      {summary.targets.map((target) => (
+        <li key={target.id}>
+          <span>{target.displayName}</span>
+          <small><code>{target.id}</code></small>
+          <small>Current: <code>{JSON.stringify(target.currentState)}</code></small>
+          <small>Requested: <code>{JSON.stringify(target.requestedState)}</code></small>
+        </li>
+      ))}
+    </ul>
+  </>;
+
   const content = (
       <section
         ref={panel}
-        className={inline ? "confirm-modal inline-package-confirmation" : "confirm-modal"}
+        className={`confirm-modal${inline ? " inline-package-confirmation" : ""}${isBlockAction ? " block-confirmation" : ""}`}
         role={inline ? "region" : "dialog"}
         aria-modal={inline ? undefined : true}
         aria-labelledby="bulk-confirm-title"
+        aria-describedby={isBlockAction ? "block-confirm-impact" : undefined}
         tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
       >
+        {isBlockAction ? <>
+          <div className="block-confirm-heading">
+            <span className={`block-confirm-icon${isBlocking ? " is-blocking" : ""}`}>
+              {isBlocking ? <Ban size={22} aria-hidden="true" /> : <CircleCheck size={22} aria-hidden="true" />}
+            </span>
+            <h2 id="bulk-confirm-title">{actionLabel} {targetLabel}?</h2>
+          </div>
+          <p id="block-confirm-impact" className="block-confirm-impact">
+            {isBlocking
+              ? `Users won't be able to use ${summary.targetCount === 1 ? "this package" : "these packages"}.`
+              : `Users with access will be able to use ${summary.targetCount === 1 ? "this package" : "these packages"} again.`}
+          </p>
+          <ul className={`block-confirm-targets${summary.targets.length > 1 ? " is-multiple" : ""}`} aria-label="Package changes" tabIndex={summary.targets.length > 1 ? 0 : undefined}>
+            {summary.targets.map(target => (
+              <li key={target.id}>
+                <div className="block-confirm-name">
+                  <strong>{target.displayName}</strong>
+                  {summary.targets.some(other => other.id !== target.id && other.displayName === target.displayName)
+                    ? <small>{target.id}</small> : null}
+                </div>
+                <div className="block-confirm-state">
+                  <span><span className="sr-only">Current: </span>{formatPackageBlockState(target.currentState.isBlocked)}</span>
+                  <ArrowRight size={14} aria-hidden="true" />
+                  <strong className={target.requestedState.isBlocked === true ? "is-blocked" : target.requestedState.isBlocked === false ? "is-unblocked" : undefined}>
+                    <span className="sr-only">Requested: </span>{formatPackageBlockState(target.requestedState.isBlocked)}
+                  </strong>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {summary.additionalTargetCount > 0 ? <p className="block-confirm-hint">
+            Showing {summary.targets.length.toLocaleString()} of {summary.targetCount.toLocaleString()} packages.
+            {" "}All {summary.targetCount.toLocaleString()} will be {isBlocking ? "blocked" : "unblocked"}.
+          </p> : null}
+          <p className="block-confirm-hint">
+            Availability and installation settings won't change. You can {isBlocking ? "unblock" : "block"} {summary.targetCount === 1 ? "it" : "them"} later.
+          </p>
+          <p className="block-confirm-preview">Uses a Microsoft Graph preview API.</p>
+          <details className="block-confirm-details">
+            <summary>Technical details</summary>
+            <div>
+              <p>Each package is checked again before applying the change. If its block state has changed, that package won't be updated.</p>
+              {technicalDetails}
+            </div>
+          </details>
+        </> : <>
         <div>
           <p className="eyebrow">Confirm preview package mutation</p>
           <h2 id="bulk-confirm-title">{actionLabel} {summary.targetCount === 1 ? "package" : "packages"}?</h2>
@@ -3252,29 +3412,13 @@ export function BulkConfirmModal({
             <strong>{summary.scope}</strong> scope
           </span>
         </div>
-        <dl className="permission-metadata confirm-metadata">
-          <div><dt>Provider</dt><dd>{summary.provider}</dd></div>
-          <div><dt>Endpoint</dt><dd><code>{summary.endpoint}</code> / {summary.apiMaturity}</dd></div>
-          <div><dt>Permission</dt><dd>{summary.permission}</dd></div>
-          <div><dt>Actor</dt><dd>{summary.actor.displayName} ({summary.actor.username})</dd></div>
-          <div><dt>Rollback</dt><dd>{summary.rollback}</dd></div>
-          <div><dt>Target selection hash</dt><dd><code>{summary.targetSelectionHash}</code></dd></div>
-        </dl>
-        <ul className="confirm-agent-list" aria-label="Exact package mutation preview">
-          {summary.targets.map((target) => (
-            <li key={target.id}>
-              <span>{target.displayName}</span>
-              <small><code>{target.id}</code></small>
-              <small>Current: <code>{JSON.stringify(target.currentState)}</code></small>
-              <small>Requested: <code>{JSON.stringify(target.requestedState)}</code></small>
-            </li>
-          ))}
-        </ul>
+        {technicalDetails}
         {summary.additionalTargetCount > 0 ? (
           <p className="confirm-muted">
             {summary.additionalTargetCount} more exact package targets are included in the hashed selection.
           </p>
         ) : null}
+        </>}
         <div className="confirm-actions">
           <button type="button" className="secondary" onClick={onCancel}>
             Cancel
@@ -3285,13 +3429,17 @@ export function BulkConfirmModal({
             className={summary.operation === "block" || confirmation.accessUpdate?.scope === "none" ? "danger" : undefined}
             onClick={onConfirm}
           >
-            Confirm {actionLabel.toLowerCase()}
+            {isBlockAction ? `${actionLabel} ${targetLabel}` : `Confirm ${actionLabel.toLowerCase()}`}
           </button>
           </WorkbenchActionGate>
         </div>
       </section>
   );
   return inline ? content : <div className="modal-backdrop" role="presentation" onClick={onCancel}>{content}</div>;
+}
+
+function formatPackageBlockState(isBlocked: unknown) {
+  return isBlocked === true ? "Blocked" : isBlocked === false ? "Not blocked" : "Unknown";
 }
 
 function ExportChoiceModal({

@@ -211,8 +211,14 @@ export class UnifiedAgentsService {
     const revision = combineAgentInventoryRevision(baseRevision, usage.context.revision);
     const selected = recordIds ? exactSelection(records, recordIds) : undefined;
     const summary = summarize(records);
+    // Reconcile and enrich every source membership before narrowing the visible inventory.
+    const inventoryScope = recordIds ? "all" : query.inventoryScope ?? "all";
+    const scopedRecords = records.filter(record => inventoryScope === "all"
+      || (inventoryScope === "catalog" ? record.packages.length > 0
+        : record.packages.length === 0 && record.powerPlatformResource !== null));
+    const scopeSummary = summarize(scopedRecords);
     const environments = new Map<string, { value: string; label: string }>();
-    for (const record of records) {
+    for (const record of scopedRecords) {
       if (!record.environmentId) continue;
       const key = record.environmentId.toLocaleLowerCase("en-US");
       if (!environments.has(key)) environments.set(key, {
@@ -220,8 +226,11 @@ export class UnifiedAgentsService {
         label: environmentNames[key] ?? record.environmentId,
       });
     }
-    const platforms = new Map(packageFacets(usablePackages).platforms.map(option => [normalizePackageAuthoringTool(option.value), option]));
-    for (const resource of usablePowerPlatform) {
+    const platforms = new Map(packageFacets(scopedRecords.flatMap(record => record.packages)).platforms
+      .map(option => [normalizePackageAuthoringTool(option.value), option]));
+    for (const record of scopedRecords) {
+      const resource = record.powerPlatformResource;
+      if (!resource) continue;
       const label = powerPlatformAuthoringTool(resource);
       if (label && !platforms.has(normalizePackageAuthoringTool(label))) platforms.set(normalizePackageAuthoringTool(label), { value: label, label });
     }
@@ -230,13 +239,21 @@ export class UnifiedAgentsService {
     const referenceIds = query.operationIdPrefix
       ? new Set(await this.dependencies.operationPackageIds(scope, usablePackages.map(value => value.id), query.operationIdPrefix, database))
       : undefined;
-    const filtered = records.filter(record => (!selected || selected.has(record)) && matches(record, query)
+    const filtered = scopedRecords.filter(record => (!selected || selected.has(record)) && matches(record, query)
       && (!referenceIds || record.packages.some(value => referenceIds.has(value.id))));
     const filteredSummary = summarize(filtered);
     const sorted = [...filtered].sort(recordComparator(query, environmentNames));
     const limit = Math.min(Math.max(query.limit ?? 50, 1), maximumLimit);
     const offset = Math.min(Math.max(query.offset ?? 0, 0), 100_000);
     const checkedPackages = usablePackages.filter(value => value.identityDetailsCollected).length;
+    const pendingDetails = { missing: 0, stale: 0, invalidated: 0 };
+    for (const value of usablePackages) {
+      if (value.identityDetailsCollected) continue;
+      const state = value.detailFreshness?.state;
+      if (value.identityRevalidationRequired || state === "invalidated") pendingDetails.invalidated += 1;
+      else if (state === "stale") pendingDetails.stale += 1;
+      else pendingDetails.missing += 1;
+    }
     const invalidPackages = links.filter(link => link.status !== "matched" && link.invalidMetadata).length;
     const checks: UnifiedAgentInventoryVerification["checks"] = {
       sourceScopes: sourceErrors.length === 0,
@@ -263,15 +280,18 @@ export class UnifiedAgentsService {
       revision,
       expiresAt,
       usageContext: usage.context,
-      inventoryOverview: summarizeAgentAvailability(records),
+      inventoryOverview: summarizeAgentAvailability(scopedRecords),
       value: sorted.slice(offset, offset + limit),
       count: filtered.length,
       offset,
       limit,
       summary,
+      inventoryScope,
+      scopeSummary,
       filteredSummary,
       verification: {
-        status: Object.values(checks).every(Boolean) ? "verified" : "needs_attention",
+        status: !checks.sourceScopes || !checks.identityLinks || invalidPackages > 0 ? "needs_attention"
+          : checks.packageMetadata ? "verified" : "details_pending",
         scope: "authorized_saved_sources",
         checkedAt: new Date().toISOString(),
         graphPackageCount: usablePackages.length,
@@ -282,6 +302,7 @@ export class UnifiedAgentsService {
       },
       identityCollection: {
         checkedPackages, pendingPackages: usablePackages.length - checkedPackages,
+        pendingDetails,
         ...(invalidPackages ? { invalidPackages } : {}),
       },
       facets: {

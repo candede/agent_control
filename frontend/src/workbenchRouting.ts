@@ -1,4 +1,4 @@
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
+import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, unifiedAgentInventoryScopes, type UnifiedAgentInventoryScope, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
 import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
 import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
 
@@ -10,12 +10,12 @@ export const workbenchViewIds = [
   "sync",
   "audit",
   "permissions",
-  "jobs",
 ] as const;
 
 export type WorkbenchViewId = (typeof workbenchViewIds)[number];
 
 export type AgentRouteState = {
+  inventoryScope: UnifiedAgentInventoryScope;
   agentView: UnifiedAgentView;
   search: string;
   status: "all" | "allowed" | "blocked";
@@ -84,7 +84,6 @@ const viewPaths: Record<WorkbenchViewId, string> = {
   sync: "/sync",
   audit: "/audit",
   permissions: "/permissions",
-  jobs: "/jobs",
 };
 
 const viewsByPath = new Map(
@@ -92,13 +91,17 @@ const viewsByPath = new Map(
 );
 
 export function parseWorkbenchView(pathname: string): WorkbenchViewId {
-  if (normalizePath(pathname) === "/official-usage") return "sync";
+  if (["/official-usage", "/jobs"].includes(normalizePath(pathname))) return "sync";
   return viewsByPath.get(normalizePath(pathname)) ?? "agents";
 }
 
 export function isWorkbenchPath(pathname: string) {
   const path = normalizePath(pathname);
-  return path === "/" || path === "/official-usage" || path === "/security" || viewsByPath.has(path);
+  return path === "/" || path === "/official-usage" || path === "/security" || path === "/jobs" || viewsByPath.has(path);
+}
+
+export function migrateJobsRoute(pathname: string): string | undefined {
+  return normalizePath(pathname) === "/jobs" ? "/sync" : undefined;
 }
 
 export function migrateSecurityRoute(pathname: string): string | undefined {
@@ -162,6 +165,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     ? unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: rawDetailId })
     : rawDetailId;
   return {
+    inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
     agentView: unifiedAgentViews.find(value => value === params.get("show")) ?? "all",
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
@@ -192,6 +196,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
 
 export function agentRouteSearch(state: AgentRouteState) {
   const params = new URLSearchParams();
+  if (state.inventoryScope !== "catalog") params.set("inventory", state.inventoryScope);
   if (state.agentView !== "all") params.set("show", state.agentView);
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.status !== "all") params.set("status", state.status);

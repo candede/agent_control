@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectPackageDetails } from "./packageDetailProjection.js";
+import { packageDetailRevision, projectPackageDetails } from "./packageDetailProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 
@@ -33,10 +33,61 @@ describe("separate package detail projection", () => {
     });
   });
 
+  it("accepts sparse automatic details bound to the unchanged catalog revision", () => {
+    const { manifestId: _manifest, ...sparse } = detailed;
+    const saved = { ...observation, package: sparse, catalogRevision: packageDetailRevision(summary) };
+    expect(projectPackageDetails(summary, saved, false, now)).toMatchObject({
+      manifestId: summary.manifestId, elementDetails: detailed.elementDetails,
+      identityDetailsCollected: true, detailFreshness: { state: "fresh" },
+    });
+    expect(projectPackageDetails(summary, { ...saved, catalogRevision: undefined }, false, now).detailFreshness?.state).toBe("invalidated");
+    for (const current of [{ ...summary, version: "2" }, { ...summary, manifestId: undefined }]) {
+      expect(projectPackageDetails(current, saved, false, now).detailFreshness?.state).toBe("invalidated");
+    }
+    for (const changed of [
+      { manifestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      { version: "2" },
+    ]) {
+      expect(projectPackageDetails(summary, { ...saved, package: { ...sparse, ...changed } }, false, now)
+        .detailFreshness?.state).toBe("invalidated");
+    }
+  });
+
+  it("accepts endpoint-specific modification timestamps only with an unchanged reserved catalog revision", () => {
+    const { manifestId: _manifest, ...sparse } = detailed;
+    const saved = {
+      ...observation,
+      package: { ...sparse, lastModifiedDateTime: "2026-09-24T08:00:00.8088068Z" },
+      catalogRevision: packageDetailRevision(summary),
+    };
+    const result = projectPackageDetails(summary, saved, false, now);
+    expect(result).toMatchObject({
+      lastModifiedDateTime: summary.lastModifiedDateTime, manifestId: summary.manifestId,
+      identityDetailsCollected: true, elementDetails: detailed.elementDetails, detailFreshness: { state: "fresh" },
+    });
+    expect(projectPackageDetails(summary, { ...saved, catalogRevision: undefined }, false, now)
+      .detailFreshness?.state).toBe("invalidated");
+    expect(projectPackageDetails({ ...summary, lastModifiedDateTime: "2026-09-24T08:01:00Z" }, saved, false, now)
+      .detailFreshness?.state).toBe("invalidated");
+    expect(projectPackageDetails(summary, { ...saved, expiresAt: "2026-09-24T09:59:59Z" }, false, now))
+      .toMatchObject({ detailFreshness: { state: "stale" } });
+    for (const changed of [
+      { id: "other-package" }, { version: "2" }, { manifestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      { elementTypes: ["Bots"] },
+    ]) {
+      expect(projectPackageDetails({ ...summary, elementTypes: ["DeclarativeCopilots"] },
+        { ...saved, package: { ...saved.package, ...changed } }, false, now)
+        .detailFreshness?.state).toBe("invalidated");
+    }
+  });
+
   it("retains stale descriptive details without renewing identity evidence from catalog freshness", () => {
     const result = projectPackageDetails(summary, { ...observation, expiresAt: "2026-09-24T09:59:59Z" }, false, now);
-    expect(result).toMatchObject({ longDescription: detailed.longDescription, detailFreshness: { state: "stale" }, identityRevalidationRequired: true });
+    expect(result).toMatchObject({ longDescription: detailed.longDescription, detailFreshness: { state: "stale" } });
     expect(result).not.toHaveProperty("identityDetailsCollected");
+    expect(result).not.toHaveProperty("identityRevalidationRequired");
+    expect(projectPackageDetails({ ...summary, identityRevalidationRequired: true },
+      { ...observation, expiresAt: "2026-09-24T09:59:59Z" }, false, now).identityRevalidationRequired).toBe(true);
     expect(resolvePackageAgentLinks("tenant", [result], [])[0].status).toBe("unmatched");
   });
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { X } from "lucide-react";
 import type { SortingState } from "@tanstack/react-table";
 import {
@@ -58,12 +58,14 @@ export function CopilotUsersView({
   route,
   onRouteChange,
   onOpenAgent,
+  reportSelector,
 }: {
   dataRevision?: number;
   agentInventoryRevision?: number;
   route?: UsersRouteState;
   onRouteChange?: (route: UsersRouteState, replace?: boolean) => void;
   onOpenAgent?: (id: string) => void;
+  reportSelector?: ReactNode;
 }) {
   const [data, setData] = useState<CopilotUsageUsersResponse>();
   const [read, setRead] = useState<ReadState>();
@@ -136,6 +138,7 @@ export function CopilotUsersView({
           </label>
         </div>
       </header>
+      {currentRoute.view !== "responsibility" ? reportSelector : null}
       {error && currentRoute.view !== "responsibility" ? <div className="error-banner" role="alert">{error} Use Permissions in the top navigation for connection recovery.
         {" "}<button type="button" className="secondary" onClick={() => setReload(value => value + 1)}>Retry saved users</button></div> : null}
       {loading && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}

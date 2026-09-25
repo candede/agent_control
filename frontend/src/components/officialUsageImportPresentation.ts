@@ -72,11 +72,14 @@ export function acceptedBundleMessage({ accepted, priorState, verifiedState }: I
     return "Accepted reports remain an incomplete retained snapshot and did not replace the current official usage view.";
   }
   if (!verifiedState) {
+    if (accepted.reusedExistingSet) {
+      return "The server confirmed an exact duplicate of a retained snapshot. No new history entry was created. Current selection has not yet been verified. Do not upload the files again; refresh the result.";
+    }
     return "The server accepted the reviewed bundle. Its retained snapshot and current selection have not yet been verified. Do not upload the files again; refresh the result.";
   }
   const priorSet = priorState?.sets.find(reportSet => reportSet.id === accepted.setId);
   const refreshedSet = verifiedState.sets.find(reportSet => reportSet.id === accepted.setId);
-  if (!refreshedSet || refreshedSet.deletedAt) {
+  if (refreshedSet?.deletedAt || (refreshedSet && !refreshedSet.complete) || (!refreshedSet && !accepted.reusedExistingSet)) {
     return "The reports were accepted, but refreshed history could not confirm an available retained snapshot. Refresh import state before relying on its status.";
   }
   const isCurrent = verifiedState.activeSetId === accepted.setId;
@@ -84,8 +87,10 @@ export function acceptedBundleMessage({ accepted, priorState, verifiedState }: I
     && priorState.activeSetId === verifiedState.activeSetId
     && priorState.activeRevision === verifiedState.activeRevision
     && accepted.activeRevision === verifiedState.activeRevision);
-  const acceptance = priorSet?.acceptedAt ? ` Original acceptance remains ${formatInstant(priorSet.acceptedAt)}.` : "";
-  if (priorSet?.complete && priorSet.acceptedAt && !priorSet.deletedAt) {
+  const reused = accepted.reusedExistingSet ?? Boolean(priorSet?.complete && priorSet.acceptedAt && !priorSet.deletedAt);
+  const acceptedAt = priorSet?.acceptedAt ?? refreshedSet?.acceptedAt;
+  const acceptance = acceptedAt ? ` Original acceptance remains ${formatInstant(acceptedAt)}.` : "";
+  if (reused) {
     if (isCurrent) {
       return `The upload exactly matched the current retained snapshot. No new history entry was created.${acceptance}${selectionUnchanged ? " Current selection and revision are unchanged." : " Current selection is on the matched snapshot."} Original upload bytes were discarded.`;
     }
@@ -93,10 +98,10 @@ export function acceptedBundleMessage({ accepted, priorState, verifiedState }: I
     return `The upload exactly matched retained snapshot ${accepted.setId.slice(0, 8)}. No new history entry was created.${acceptance} Current selection ${selectionUnchanged ? "remains" : "is"} ${current}${selectionUnchanged ? " and its revision is unchanged" : ""}. Original upload bytes were discarded.`;
   }
   if (isCurrent) {
-    return "The compatible three-file snapshot was added to cumulative history and is current. Prior snapshots remain retained, and original upload bytes were discarded.";
+    return "The compatible three-file snapshot was added to retained history and is current. Prior snapshots remain retained separately, and original upload bytes were discarded.";
   }
   const current = verifiedState.activeSetId ? verifiedState.activeSetId.slice(0, 8) : "none";
-  return `The compatible three-file snapshot was added to retained cumulative history. Current selection is ${current}; the new snapshot is not current. Original upload bytes were discarded.`;
+  return `The compatible three-file snapshot was added to retained history. Current selection is ${current}; the new snapshot is not current. Snapshots remain separate, and original upload bytes were discarded.`;
 }
 
 export function errorMessage(error: unknown) {

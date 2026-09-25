@@ -13,8 +13,15 @@ export function evidenceIsFresh(view: CapabilityView, now = Date.now()) {
 }
 
 export function providerActionAllowed(view: CapabilityView | undefined, _write?: boolean, now = Date.now()) {
-  return Boolean(view && hasCurrentAuthorization(view)
-    && (view.decision.verification === "on_demand" ? isOnDemandDecision(view) : evidenceIsFresh(view, now)));
+  if (!view || !hasCurrentAuthorization(view)) return false;
+  if (view.decision.verification === "on_demand") return isOnDemandDecision(view);
+  if (evidenceIsFresh(view, now)) return true;
+  const { definition, decision } = view;
+  const checkedAt = Date.parse(decision.checkedAt ?? "");
+  const expiresAt = Date.parse(decision.expiresAt ?? "");
+  // Expired diagnostics are not a revoked grant. Submitted operations enforce current authorization.
+  return definition.mode === "delegated" && (decision.verification === "provider" || decision.verification === "token")
+    && Number.isFinite(checkedAt) && checkedAt <= now && expiresAt > checkedAt && expiresAt <= now;
 }
 
 function hasCurrentAuthorization(view: CapabilityView) {
@@ -125,7 +132,7 @@ export function capabilityExplanation(view: CapabilityView, now = Date.now()) {
         ? "Provider operation access is not currently verified. An Admin must explicitly approve a bounded application-scope operation; automatic refresh does not run it."
       : decision.checkedAt ? "The check did not establish availability. Review the evidence and remediation; authorized saved data remains readable."
         : supportsAutomaticCapabilityCheck(definition.id)
-          ? "Not checked yet. Automatic safe checks run while this signed-in UI is active."
+          ? "Not checked yet. Use Check status to check access."
           : `Not checked yet. ${capabilityCheckGuidance(view)}`;
     case "available":
       if (!decision.authorized) return "Current authorization is not established. Previous successful checks do not grant access.";

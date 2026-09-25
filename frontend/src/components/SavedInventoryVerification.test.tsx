@@ -7,6 +7,7 @@ import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 function emptyInventory(): UnifiedAgentInventoryPage {
   const summary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, conflicting: 0, ambiguous: 0 };
   return {
+    inventoryScope: "all", scopeSummary: summary,
     value: [], count: 0, offset: 0, limit: 50, summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
     identityCollection: { checkedPackages: 0, pendingPackages: 0 },
@@ -40,6 +41,22 @@ function withoutSource(inventory: UnifiedAgentInventoryPage, source: keyof Unifi
 }
 
 describe("SavedAgentInventoryVerification source availability", () => {
+  it("does not describe stale package details as missing metadata or certify their freshness", () => {
+    const inventory = emptyInventory();
+    inventory.identityCollection = { checkedPackages: 0, pendingPackages: 549, pendingDetails: { missing: 0, stale: 549, invalidated: 0 } };
+    inventory.verification = {
+      ...createUnifiedVerification({ graphPackageCount: 549, powerPlatformAgentCount: 0, logicalAgentCount: 549 }, { packageMetadata: false }),
+      status: "details_pending",
+    };
+    render(<SavedAgentInventoryVerification inventory={inventory} />);
+    expect(screen.getByText("Saved source accounting verified")).toBeVisible();
+    expect(screen.queryByText("Saved inventory needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByText("Package identity metadata checked and valid.")).not.toBeInTheDocument();
+    expect(screen.getByText("Package detail checks are not all current. This is not a missing-agent count.")).toBeVisible();
+    expect(screen.getByText("Saved data checked at")).toBeVisible();
+  });
+
   it.each([true, false])("does not attest missing Graph metadata when Power Platform is available: %s", powerPlatformAvailable => {
     const inventory = emptyInventory();
     withoutSource(inventory, "graphPackages");

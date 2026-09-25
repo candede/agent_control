@@ -131,6 +131,23 @@ function renderTable(overrides: Partial<ComponentProps<typeof UnifiedAgentTable>
 }
 
 describe("UnifiedAgentTable", () => {
+  it("keeps exact package actions available while changing selection is disabled for a saved-data refresh", () => {
+    const singlePackage = { ...record, packages: [record.packages[0]] };
+    const { props, update } = renderTable({ records: [singlePackage], selectionDisabled: true, packageActionsDisabled: false });
+    expect(screen.getByRole("checkbox", { name: `Select ${record.displayName}` })).toBeDisabled();
+    const block = screen.getByRole("button", { name: `Block ${record.displayName}` });
+    const access = screen.getByRole("button", { name: `Manage access for ${record.displayName}` });
+    expect(block).toBeEnabled();
+    expect(access).toBeEnabled();
+    fireEvent.click(block);
+    fireEvent.click(access);
+    expect(props.onSetBlocked).toHaveBeenCalledWith(singlePackage, true);
+    expect(props.onManageAccess).toHaveBeenCalledWith(singlePackage);
+    update({ packageActionsDisabled: true });
+    expect(block).toBeDisabled();
+    expect(access).toBeDisabled();
+  });
+
   it("shows and hides columns, preserves mandatory identity, and resets defaults", () => {
     renderTable({ records: [{ ...record, packages: record.packages.map(item => ({ ...item, supportedHosts: ["Teams", "Copilot"] })) }] });
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));

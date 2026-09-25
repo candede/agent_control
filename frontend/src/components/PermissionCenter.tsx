@@ -84,7 +84,7 @@ export function PermissionCenter() {
 }
 
 function PermissionCenterContent() {
-  const { views, user, loading, error, pending, now, reload, awaitingInitialCheck, refreshOnOpen, activeCheck } = useCapabilityContext();
+  const { views, user, loading, error, pending, now, reload, awaitingInitialCheck, activeCheck } = useCapabilityContext();
   const canCheckPermissions = hasRole(user, "AgentControl.Viewer");
   const heading = useRef<HTMLHeadingElement>(null);
   const [selectedId, setSelectedId] = useState<CapabilityId>();
@@ -97,9 +97,6 @@ function PermissionCenterContent() {
   useEffect(() => {
     heading.current?.focus();
   }, []);
-  useEffect(() => {
-    void refreshOnOpen?.();
-  }, [refreshOnOpen]);
   const issues = permissionIssues(views, now, awaitingInitialCheck);
   const selected = issues.find(issue => issue.view.definition.id === selectedId);
   if (selectedId && !selected) setSelectedId(undefined);

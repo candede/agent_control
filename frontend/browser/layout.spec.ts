@@ -18,7 +18,7 @@ const cases = [
     fields: [".hunting-primary-fields"] },
   { name: "permissions", path: "/permissions", ready: ".permission-issue-list > li",
     fields: [] },
-  { name: "jobs", path: "/jobs", ready: ".job-history-table tbody tr",
+  { name: "sync-history", path: "/sync", ready: ".sync-history-table tbody tr",
     fields: [] },
 ];
 
@@ -83,12 +83,10 @@ for (const scenario of cases) {
     if (scenario.name === "agents") {
       await expect(page.locator(".agent-table-stack .capability-gate > button:disabled").first()).toBeVisible();
     }
-    if (scenario.name === "jobs") {
-      await expect(page.getByText(/authorized source is temporarily unavailable/)).toBeVisible();
-      await page.getByRole("button", { name: /View details for Power Platform inventory refresh/ }).click();
-      const jobDetails = page.getByRole("dialog", { name: "Job details", exact: true });
-      await expect(jobDetails.getByRole("button", { name: "Resume refresh", exact: true })).toBeDisabled();
-      await jobDetails.getByRole("button", { name: "Close job details", exact: true }).click();
+    if (scenario.name === "sync-history") {
+      await expect(page.getByRole("table", { name: "Sync history" })).toContainText("Power Platform inventory refresh");
+      await expect(page.getByRole("table", { name: "Sync history" })).not.toContainText("Package access recovery");
+      await expect(page.getByRole("button", { name: "Jobs", exact: true })).toHaveCount(0);
     }
     // Unknown provider fields are intentional fixture data, not browser failures.
     // They must not be hidden by broad console filters or by empty-state assertions.
@@ -137,7 +135,7 @@ for (const scenario of cases) {
             expect(bounds!.y, `Source rows begin in the first viewport at ${width}px`).toBeLessThan(760);
           }
         }
-        if (["jobs", "report-snapshot"].includes(scenario.name) && [360, 1920].includes(width)) {
+        if (["sync-history", "report-snapshot"].includes(scenario.name) && [360, 1920].includes(width)) {
           await test.step("Reduced-motion layout parity", async () => {
             await assertReducedMotionParity(page, `${scenario.name} at ${width}px`);
             await page.screenshot({ path: info.outputPath(`${scenario.name}-${width}-reduced-motion.png`), fullPage: true, animations: "disabled" });
@@ -154,7 +152,7 @@ for (const scenario of cases) {
 
 async function assertReducedMotionParity(page: Page, description: string) {
   const surfaces = [
-    ".jobs-view", ".jobs-current", ".jobs-history", ".job-history-table", ".job-history-table tbody tr", ".inline-actions",
+    ".sync-history", ".sync-history-table", ".sync-history-table tbody tr", ".inline-actions",
     ".official-usage-modal", ".official-usage-import", ".official-usage-fields", ".official-usage-fields > label",
     ".reporting-view", ".usage-comparison-header", ".usage-agent-table", ".usage-agent-filters",
   ].join(", ");

@@ -315,7 +315,7 @@ test("first Agents visit is saved-only and explicit collection enables exact sav
   await expect(page.getByRole("button", { name: "Details: Agent inventory", exact: true })).toHaveCount(0);
   expect(refreshes).toEqual([]);
   await page.getByRole("button", { name: "Agents", exact: true }).click();
-  await expect(page.getByText(/No saved package observation/)).toBeVisible();
+  await expect(page.getByText(/No saved package catalog observation/)).toBeVisible();
   expect(refreshes).toEqual([]);
   await collectSavedPackages(page);
   await expect(page.getByRole("button", { name: "View details for Synthetic package" })).toBeVisible();
@@ -572,15 +572,14 @@ test("job deep links keep exact source identity and browser history without prov
   });
 
   await login(page, "role-Viewer");
-  await page.getByRole("button", { name: "Jobs", exact: true }).click();
-  await page.getByRole("button", { name: /View details for Older refresh/ }).click();
-  await page.getByRole("dialog", { name: "Job details", exact: true }).getByRole("link", { name: "Open package refresh", exact: true }).click();
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("link", { name: /View details for Older refresh/ }).click();
   await expect(page).toHaveURL(new RegExp(`refreshJob=${olderId}`));
   await expect(page.getByRole("region", { name: "Selected package refresh job" })).toContainText("3 of 3 packages observed");
   expect(providerSends).toEqual([]);
 
   await page.goBack();
-  await expect(page.getByRole("heading", { name: "Jobs", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sync history", exact: true })).toBeVisible();
   await page.goForward();
   await expect(page.getByRole("region", { name: "Selected package refresh job" })).toContainText("3 of 3 packages observed");
 
@@ -631,13 +630,19 @@ test("package preview is responsive and cancellation dispatches no write", async
   await agentDialog.getByRole("button", { name: "Block Synthetic package (synthetic-package)", exact: true }).click();
   const dialog = agentDialog.getByRole("region", { name: /block package/i });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByText("Preview write risk", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Uses a Microsoft Graph preview API.", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Users won't be able to use this package.", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Delegated CopilotPackages.ReadWrite.All", { exact: true })).not.toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Block package", exact: true })).toBeVisible();
+  await dialog.getByText("Technical details", { exact: true }).click();
   await expect(dialog.getByText("Delegated CopilotPackages.ReadWrite.All", { exact: true })).toBeVisible();
-  await expect(dialog.getByText(/Current:/)).toContainText('"isBlocked":false');
-  await expect(dialog.getByText(/Requested:/)).toContainText('"isBlocked":true');
+  const rawPreview = dialog.getByRole("list", { name: "Exact package mutation preview" });
+  await expect(rawPreview.getByText(/Current:/)).toContainText('"isBlocked":false');
+  await expect(rawPreview.getByText(/Requested:/)).toContainText('"isBlocked":true');
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
+  await dialog.getByText("Technical details", { exact: true }).click();
   await page.screenshot({ path: test.info().outputPath("package-confirmation.png"), fullPage: true });
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(dialog).not.toBeVisible();
@@ -696,6 +701,7 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   const firstName = targets.value.find(target => target.powerPlatformResource?.identifiers.some(identifier => identifier.kind === "cds_bot_id" && identifier.value === firstBotId))!.displayName;
   const secondName = targets.value.find(target => target.powerPlatformResource?.identifiers.some(identifier => identifier.kind === "cds_bot_id" && identifier.value === secondBotId))!.displayName;
   await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Additional Power Platform agents", exact: true }).click();
   await expect(page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true })).toBeVisible();
   await expect(page.getByRole("checkbox", { name: `Select ${secondName}`, exact: true })).toBeVisible();
   expect(quarantineRequests.filter(value => value.includes("/status"))).toEqual([]);
@@ -722,6 +728,7 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   expect(quarantineRequests.filter(value => value === "POST /api/quarantine/jobs")).toHaveLength(0);
   await login(page, "role-Admin");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByRole("button", { name: "Additional Power Platform agents", exact: true }).click();
   await page.getByRole("checkbox", { name: `Select ${firstName}`, exact: true }).check();
 
   await page.getByRole("button", { name: "Quarantine selected" }).click();
@@ -785,7 +792,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
     if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/refresh-jobs")) providerRefreshes += 1;
   });
   await login(page, "role-Admin");
-  for (const view of ["Agents", "Users", "Audit", "Jobs"]) {
+  for (const view of ["Agents", "Users", "Audit"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
@@ -794,7 +801,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await expect(page.getByRole("button", { name: "Choose CSVs", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Close", exact: true }).click();
   await login(page, "role-Viewer");
-  for (const view of ["Agents", "Users", "Audit", "Jobs"]) {
+  for (const view of ["Agents", "Users", "Audit"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
@@ -850,7 +857,6 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
     ["/sync", "Sync"],
     ["/audit", "Audit"],
     ["/permissions", "Permissions"],
-    ["/jobs", "Jobs"],
   ] as const;
   for (const [path, label] of routes) {
     const response = await page.goto(path);
@@ -861,8 +867,8 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await page.goto("/agents?q=synthetic&status=allowed&selected=synthetic-package");
   await expect(page.getByPlaceholder("Name, publisher, ID, ref")).toHaveValue("synthetic");
   await expect(page.getByRole("checkbox", { name: /Select Synthetic package/ })).toBeChecked();
-  await page.getByRole("button", { name: "Jobs", exact: true }).click();
-  await expect(page).toHaveURL(/\/jobs$/);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
+  await expect(page).toHaveURL(/\/sync/);
   await page.goBack();
   await expect(page).toHaveURL(/\/agents\?q=synthetic&status=allowed&selected=synthetic-package$/);
   await expect(page.getByPlaceholder("Name, publisher, ID, ref")).toHaveValue("synthetic");
@@ -870,7 +876,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await page.goto("/audit?q=saved-actor&action=block&status=failed");
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("saved-actor");
   await expect(page.getByRole("combobox", { name: "Action", exact: true })).toHaveValue("block");
-  await page.getByRole("button", { name: "Jobs", exact: true }).click();
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Audit", exact: true }).click();
   await expect(page).toHaveURL(/\/audit\?.*q=saved-actor/);
   await expect(page.getByLabel("Result")).toHaveValue("failed");
@@ -887,7 +893,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await expect(page.getByLabel("Active in last")).toHaveCount(0);
   await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
-  await page.getByRole("button", { name: "Jobs", exact: true }).click();
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
   await page.goBack();
   await expect(page).toHaveURL(/\/sync$/);
   const restoredReportRead = scopedReportRequest();

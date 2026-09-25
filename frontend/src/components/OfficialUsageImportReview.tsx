@@ -56,7 +56,7 @@ export function OfficialUsageImportReview({ preview }: { preview: OfficialUsageB
         <h4>Server reconciliation</h4>
         <pre>{JSON.stringify(preview.reconciliation, null, 2)}</pre>
       </details>
-      <p>Ordinary snapshots add to retained history. Exact duplicate observations reuse their original retained identity and acceptance time. The server rechecks the reviewed hash and selection revision atomically.</p>
+      <p>Changed reports are retained as independent report sets, even for the same known reporting window. Exact duplicate observations reuse their original retained identity and acceptance time. No cumulative response total is inferred. The server rechecks the reviewed hash and selection revision atomically.</p>
     </section>
   );
 }

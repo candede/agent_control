@@ -222,7 +222,7 @@ describe("saved directory repository query", () => {
     const database = new pg.Pool();
     const client = Object.assign(new pg.Client(), { release: vi.fn() });
     vi.spyOn(database, "connect").mockResolvedValue(client);
-    const query = vi.spyOn(client, "query").mockResolvedValue({ rows: [], rowCount: 0, command: "INSERT", oid: 0, fields: [] });
+    const query = vi.spyOn(client, "query").mockResolvedValue({ rows: [], rowCount: 1, command: "INSERT", oid: 0, fields: [] });
     const users = [directoryUser()];
     await new DataSyncRepository(database).publishDirectory(scope, users, observedAt, "Saved Copilot services.");
     const insert = query.mock.calls.find(call => String(call[0]).includes("INSERT INTO copilot_usage_snapshots"));

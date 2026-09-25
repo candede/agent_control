@@ -82,6 +82,74 @@ async function publishResources(repository: PowerPlatformInventoryRepository, ke
 }
 
 describe("persisted unified agent inventory", () => {
+  it("keeps catalog-backed agents deduplicated through sparse detail enrichment, expiry and catalog refresh", async () => {
+    const fixture = await testDatabase();
+    try {
+      const packages = new PackageInventoryRepository(fixture.runtime);
+      const powerPlatform = new PowerPlatformInventoryRepository(fixture.runtime);
+      const service = new UnifiedAgentsService({
+        packages, powerPlatform, usage: new AgentUsageService(fixture.runtime), registry: new UnifiedAgentRegistry(fixture.runtime),
+        resolveLinks: resolvePackageAgentLinks, operationPackageIds: async () => [],
+        readRevision: (owner, database = fixture.runtime) => readUnifiedInventoryRevision(owner, database),
+      });
+      const { elementDetails, identityDetailsCollected: _collected, ...summary } = builderPackage("builder");
+      const catalog = { ...summary, lastModifiedDateTime: "2026-09-24T08:00:00Z", version: "1" };
+      const publishCatalog = async (key: string) => {
+        const job = await packages.submit(scope, {
+          authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: key, catalogOnly: true,
+        });
+        await packages.markRunning(scope, job.id);
+        await packages.publish(scope, job.id, { packages: [catalog], totalRecords: 1, pages: 1 });
+      };
+      await publishResources(powerPlatform, "catalog-native", [
+        nativeResource(manifestId, manifestId), nativeResource(unrelatedId, unrelatedId),
+      ]);
+      await publishCatalog("catalog-first");
+      const initial = await service.list(scope);
+      expect(initial.summary).toMatchObject({ total: 2, linked: 1, graphOnly: 0, powerPlatformOnly: 1 });
+      const canonicalId = initial.value.find(value => value.presence === "both")!.id;
+      expect(initial.verification).toMatchObject({ logicalAgentCount: 2, representedSourceCount: 3, uniqueSourceCount: 3 });
+      const job = (await packages.claimDueDetails(scope, scope.principalId))!;
+      await packages.markRunning(scope, job.id, true);
+      const { manifestId: _manifest, ...sparse } = catalog;
+      await packages.publish(scope, job.id, {
+        packages: [{ ...sparse, elementDetails, identityDetailsCollected: true }], totalRecords: 1, pages: 1, detailFailures: [],
+      });
+      const fresh = await service.list(scope, { recordId: canonicalId });
+      expect(fresh.value[0].packages[0].detailFreshness?.state).toBe("fresh");
+      for (const stage of ["fresh", "expired", "refreshed"]) {
+        if (stage === "expired") await fixture.operator.query(
+          "UPDATE package_detail_cache SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2",
+          [scope.tenantId, scope.principalId],
+        );
+        if (stage === "refreshed") await publishCatalog("catalog-again");
+        const page = await service.list(scope, { limit: 1 });
+        expect(page.count).toBe(2);
+        expect(page.summary).toEqual(initial.summary);
+        const selected = await service.list(scope, { recordId: canonicalId });
+        expect(selected.count).toBe(1);
+        expect(selected.value[0]).toMatchObject({
+          id: canonicalId, presence: "both", packages: [{ id: "builder" }],
+          powerPlatformResource: { nativeId: manifestId },
+        });
+        expect(selected.value[0].powerPlatformResource!.identifiers.some(value => value.kind === "cds_bot_id")).toBe(false);
+        if (stage !== "fresh") {
+          expect(selected.value[0].packages[0].detailFreshness?.state).toBe("stale");
+          expect(selected.value[0].observations.packageSnapshots.builder.identityDetails).toBeNull();
+        }
+        const exported = await service.forExport(scope, page.revision!, {}, [
+          "graph_packages:builder", unifiedAgentRecordId({ source: "power_platform", environmentId, nativeId: manifestId }),
+        ]);
+        expect(buildUnifiedAgentCsv(exported, Date.now() + 15_000).rowCount).toBe(1);
+        const stored = await fixture.runtime.query<{ count: number }>(
+          "SELECT count(*)::int AS count FROM unified_agents WHERE tenant_id=$1 AND principal_id=$2",
+          [scope.tenantId, scope.principalId],
+        );
+        expect(stored.rows[0].count).toBe(2);
+      }
+    } finally { await fixture.close(); }
+  });
+
   it("projects scoped cached responsibility outside directory/report cohorts with current canonical navigation after refresh", async () => {
     const fixture = await testDatabase();
     try {
@@ -355,7 +423,7 @@ describe("persisted unified agent inventory", () => {
     }
   }, 60_000);
 
-  it("reconciles both real source schemas before paging, preserves every control, and retains canonical IDs after refresh", async () => {
+  it("reconciles both real source schemas before paging and preserves memberships, controls and IDs across scope switches and refresh", async () => {
     const fixture = await testDatabase();
     try {
       const packages = new PackageInventoryRepository(fixture.runtime);
@@ -375,10 +443,11 @@ describe("persisted unified agent inventory", () => {
       }, nativeResource(unrelatedId, "cr_other")];
       await publishPackages(packages, "packages-one", values);
       await publishResources(powerPlatform, "resources-one", native);
-      const first = await service.list(scope, { limit: 1 });
+      const first = await service.list(scope, { inventoryScope: "catalog", limit: 1 });
       expect(first).toMatchObject({
-        count: 4, partial: false,
+        inventoryScope: "catalog", count: 3, partial: false,
         summary: { total: 4, linked: 2, graphOnly: 1, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 },
+        scopeSummary: { total: 3, linked: 2, graphOnly: 1, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
         identityCollection: { checkedPackages: 4, pendingPackages: 0 },
         verification: {
           status: "verified", scope: "authorized_saved_sources", graphPackageCount: 4, powerPlatformAgentCount: 3,
@@ -407,6 +476,33 @@ describe("persisted unified agent inventory", () => {
         unifiedAgentRecordId({ source: "power_platform", environmentId: environmentId.toUpperCase(), nativeId: manifestId.toUpperCase() }),
       ]) expect((await service.list(scope, { recordId })).value[0].id).toBe(builder.id);
       const beforeIds = complete.value.map(record => record.id).sort();
+      const memberships = async () => (await fixture.operator.query(
+        `SELECT agent_id,source,normalized_environment_id,normalized_native_id FROM unified_agent_sources
+         WHERE tenant_id=$1 AND principal_id=$2 ORDER BY source,normalized_environment_id,normalized_native_id`,
+        [scope.tenantId, scope.principalId],
+      )).rows;
+      const beforeMemberships = await memberships();
+      expect(beforeMemberships).toHaveLength(7);
+      const nativeOnly = complete.value.find(record => !record.packages.length)!;
+      for (const inventoryScope of ["power_platform_only", "catalog", "all", "catalog", "power_platform_only"] as const) {
+        const scoped = await service.list(scope, { inventoryScope });
+        expect(scoped.inventoryScope).toBe(inventoryScope);
+        const expected = complete.value.filter(record => inventoryScope === "all"
+          || (inventoryScope === "catalog" ? record.packages.length > 0 : record.packages.length === 0));
+        expect(scoped.value.map(record => record.id).sort()).toEqual(expected.map(record => record.id).sort());
+        expect(scoped.count).toBe(expected.length);
+        expect(scoped.scopeSummary.total).toBe(expected.length);
+        expect(scoped.summary).toEqual(complete.summary);
+        expect(scoped.verification).toMatchObject({ representedSourceCount: 7, uniqueSourceCount: 7, logicalAgentCount: 4 });
+        expect(scoped.revision).toBe(complete.revision);
+        expect(await memberships()).toEqual(beforeMemberships);
+        const filteredExport = await service.forExport(scope, complete.revision!, { inventoryScope });
+        expect(filteredExport.inventoryScope).toBe(inventoryScope);
+        expect(filteredExport.value.map(record => record.id).sort()).toEqual(expected.map(record => record.id).sort());
+        expect(await memberships()).toEqual(beforeMemberships);
+      }
+      expect((await service.list(scope, { recordId: nativeOnly.id })).value[0].id).toBe(nativeOnly.id);
+      expect((await service.forExport(scope, complete.revision!, {}, [nativeOnly.id])).value[0].id).toBe(nativeOnly.id);
       expect(complete.revision).toMatch(/^[a-f0-9]{64}$/);
       const exported = await service.forExport(scope, complete.revision!, {}, [
         builder.id, unifiedAgentRecordId({ source: "graph_packages", packageId: "builder-b-blocked" }),

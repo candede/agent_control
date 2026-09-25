@@ -31,6 +31,13 @@ type CopilotDirectorySnapshot = {
   users: readonly CopilotDirectoryUser[];
 };
 
+type UserSourceSnapshot =
+  | { sourceId: "directory"; value: CopilotDirectorySnapshot }
+  | { sourceId: "app_activity"; value: CopilotReportResult };
+
+const maximumSnapshotBytes = 32 * 1024 * 1024;
+const maximumSnapshotRows = 100_000;
+
 type RunRow = {
   id: string;
   mode: DataSyncMode;
@@ -448,11 +455,11 @@ export class DataSyncRepository {
   }
 
   async publishDirectory(scope: DataSyncScope, value: readonly CopilotDirectoryUser[], observedAt: string, message: string, publication?: UserSourcePublication) {
-    return this.publishUserSource(scope, "directory", { serviceEvidenceVersion: 1, users: value }, value.length, observedAt, message, publication);
+    return this.publishUserSource(scope, { sourceId: "directory", value: { serviceEvidenceVersion: 1, users: value } }, value.length, observedAt, message, publication);
   }
 
   async publishAppActivity(scope: DataSyncScope, value: CopilotReportResult, observedAt: string, message: string, publication?: UserSourcePublication) {
-    return this.publishUserSource(scope, "app_activity", value, value.users.length, observedAt, message, publication);
+    return this.publishUserSource(scope, { sourceId: "app_activity", value }, value.users.length, observedAt, message, publication);
   }
 
   async recordUserSourceFailure(
@@ -509,17 +516,22 @@ export class DataSyncRepository {
 
   private async publishUserSource(
     scope: DataSyncScope,
-    sourceId: CopilotUsageSnapshotSource,
-    value: CopilotDirectorySnapshot | CopilotReportResult,
+    snapshot: UserSourceSnapshot,
     rowCount: number,
     observedAt: string,
     message: string,
     publication?: UserSourcePublication,
   ) {
     validateScope(scope);
-    if (!Number.isSafeInteger(rowCount) || rowCount < 0 || rowCount > 100_000) throw new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot row limit.");
-    const payload = JSON.stringify(value);
-    if (Buffer.byteLength(payload, "utf8") > 32 * 1024 * 1024) throw new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot storage limit.");
+    const { sourceId, value } = snapshot;
+    if (!Number.isSafeInteger(rowCount) || rowCount < 0 || rowCount > maximumSnapshotRows) throw new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot row limit.");
+    let payload = JSON.stringify(value);
+    const bytes = Buffer.byteLength(payload, "utf8");
+    if (bytes > maximumSnapshotBytes) throw snapshotStorageLimit();
+    if (sourceId === "directory") {
+      const encoded = JSON.stringify(encodeDirectorySnapshot(value));
+      if (Buffer.byteLength(encoded, "utf8") < bytes) payload = encoded;
+    }
     const snapshotId = randomUUID();
     await transaction(this.database, async client => {
       await lockScope(client, scope);
@@ -528,10 +540,12 @@ export class DataSyncRepository {
       await client.query(`UPDATE copilot_usage_snapshots SET is_current=false
         WHERE tenant_id=$1 AND principal_id=$2 AND source_id=$3 AND is_current`,
       [scope.tenantId, scope.principalId, sourceId]);
-      await client.query(`INSERT INTO copilot_usage_snapshots(
+      const inserted = await client.query(`INSERT INTO copilot_usage_snapshots(
           id,tenant_id,principal_id,source_id,snapshot_data,row_count,observed_at)
-        VALUES($1,$2,$3,$4,$5::jsonb,$6,$7)`,
-      [snapshotId, scope.tenantId, scope.principalId, sourceId, payload, rowCount, observedAt]);
+        SELECT $1,$2,$3,$4,$5::jsonb,$6,$7
+        WHERE octet_length($5::jsonb::text)<=$8`,
+      [snapshotId, scope.tenantId, scope.principalId, sourceId, payload, rowCount, observedAt, maximumSnapshotBytes]);
+      if (inserted.rowCount !== 1) throw snapshotStorageLimit();
       await client.query(`INSERT INTO copilot_usage_source_state(
           tenant_id,principal_id,source_id,attempt_status,message,attempted_at,
           last_success_at,row_count,current_snapshot_id)
@@ -591,19 +605,8 @@ function projectSource(row: SourceRow): DataSyncSourceStatus {
 }
 
 function projectSavedSource<T>(source: CopilotUsageSnapshotSource, row: SavedSourceRow | undefined): SavedCopilotUsageSource<T> {
-  let value: unknown = row?.snapshot_data ?? null;
-  if (source === "directory" && value !== null) {
-    if (typeof value === "object" && "serviceEvidenceVersion" in value && value.serviceEvidenceVersion === 1
-      && "users" in value && Array.isArray(value.users)
-      && value.users.every((user: unknown) => user !== null && typeof user === "object" && !Array.isArray(user)
-        && "serviceEvidenceVersion" in user && user.serviceEvidenceVersion === 1
-        && "copilotServiceState" in user && isCopilotServiceSummaryState(user.copilotServiceState)
-        && "servicePlans" in user && Array.isArray(user.servicePlans))) {
-      value = value.users;
-    } else {
-      throw new AppError(409, "copilot_usage_snapshot_invalid", "Saved Copilot service data has an unsupported format. Refresh Users before retrying.");
-    }
-  }
+  const snapshot = row?.snapshot_data ?? null;
+  const value = source === "directory" && snapshot !== null ? decodeDirectorySnapshot(snapshot) : snapshot;
   return {
     source,
     attemptStatus: row?.attempt_status ?? null,
@@ -614,6 +617,65 @@ function projectSavedSource<T>(source: CopilotUsageSnapshotSource, row: SavedSou
     observedAt: row?.observed_at?.toISOString() ?? null,
     value: value as T | null,
   };
+}
+
+function encodeDirectorySnapshot(snapshot: CopilotDirectorySnapshot) {
+  const servicePlanSets: CopilotDirectoryUser["servicePlans"][] = [];
+  const indexes = new Map<string, number>();
+  const users = snapshot.users.map(({ servicePlans, ...user }) => {
+    const key = JSON.stringify(servicePlans);
+    let servicePlanSet = indexes.get(key);
+    if (servicePlanSet === undefined) {
+      servicePlanSet = servicePlanSets.length;
+      servicePlanSets.push(servicePlans);
+      indexes.set(key, servicePlanSet);
+    }
+    return { ...user, servicePlanSet };
+  });
+  return { serviceEvidenceVersion: 1, storageEncoding: "service-plan-sets-v1", servicePlanSets, users };
+}
+
+function decodeDirectorySnapshot(snapshot: unknown): unknown[] {
+  if (!isSnapshotObject(snapshot) || snapshot.serviceEvidenceVersion !== 1 || !Array.isArray(snapshot.users)) {
+    throw invalidDirectorySnapshot();
+  }
+  if (snapshot.users.length > maximumSnapshotRows) throw snapshotStorageLimit();
+  let users: unknown[] = snapshot.users;
+  if ("storageEncoding" in snapshot) {
+    const sets = snapshot.servicePlanSets;
+    if (snapshot.storageEncoding !== "service-plan-sets-v1" || !isSnapshotPlanSets(sets)) throw invalidDirectorySnapshot();
+    let bytes = Buffer.byteLength('{"serviceEvidenceVersion":1,"users":[]}');
+    users = users.map((user, index) => {
+      if (!isSnapshotObject(user) || "servicePlans" in user || typeof user.servicePlanSet !== "number"
+        || !Number.isSafeInteger(user.servicePlanSet) || user.servicePlanSet < 0 || user.servicePlanSet >= sets.length) throw invalidDirectorySnapshot();
+      const { servicePlanSet, ...fields } = user;
+      const servicePlans = sets[servicePlanSet];
+      const restored = { ...fields, servicePlans };
+      // Bound expansion before copying shared evidence, including on malformed saved data.
+      bytes += Buffer.byteLength(JSON.stringify(restored), "utf8") + (index === 0 ? 0 : 1);
+      if (bytes > maximumSnapshotBytes) throw snapshotStorageLimit();
+      return { ...restored, servicePlans: servicePlans.map(plan => ({ ...plan })) };
+    });
+  }
+  if (!users.every(user => isSnapshotObject(user) && user.serviceEvidenceVersion === 1
+    && isCopilotServiceSummaryState(user.copilotServiceState) && Array.isArray(user.servicePlans))) throw invalidDirectorySnapshot();
+  return users;
+}
+
+function isSnapshotObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSnapshotPlanSets(value: unknown): value is Record<string, unknown>[][] {
+  return Array.isArray(value) && value.every(set => Array.isArray(set) && set.every(isSnapshotObject));
+}
+
+function invalidDirectorySnapshot() {
+  return new AppError(409, "copilot_usage_snapshot_invalid", "Saved Copilot service data has an unsupported format. Refresh Users before retrying.");
+}
+
+function snapshotStorageLimit() {
+  return new AppError(413, "copilot_usage_snapshot_limit", "Copilot usage source exceeded the snapshot storage limit.");
 }
 
 async function finalizeRun(client: pg.PoolClient, scope: DataSyncScope, runId: string) {

@@ -5,6 +5,7 @@ export type SavedPackageDetail = {
   package: CopilotPackageDetail | null;
   observedAt: string;
   expiresAt: string;
+  catalogRevision?: ReturnType<typeof packageDetailRevision> | null;
 };
 
 export function packageDetailRevision(value: CopilotPackageDetail) {
@@ -33,9 +34,17 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     delete result.identityDetailsCollected;
     return result;
   }
-  const compatible = saved.package && saved.package.id === current.id
-    && (authoritativeCurrent || packageDetailRevisionMatches(current, saved.package)
-      && !packageControlIdentityChanged(saved.package, current));
+  // List and detail endpoints can report different modification timestamps.
+  // A reserved, unchanged catalog revision binds automatic details to that catalog;
+  // positive identity/version disagreements still invalidate the association.
+  const catalogMatches = !saved.catalogRevision
+    || JSON.stringify(saved.catalogRevision) === JSON.stringify(packageDetailRevision(current));
+  const detailed = saved.package && saved.catalogRevision && catalogMatches
+    ? { ...current, ...saved.package } : saved.package;
+  const compatible = catalogMatches && detailed && detailed.id === current.id
+    && (authoritativeCurrent || packageDetailRevisionMatches(current, saved.catalogRevision
+      ? { ...detailed, lastModifiedDateTime: current.lastModifiedDateTime } : detailed)
+      && !packageControlIdentityChanged(detailed, current));
   const state: PackageDetailFreshness["state"] = !compatible ? "invalidated"
     : Date.parse(saved.expiresAt) > now && Date.parse(saved.observedAt) <= now ? "fresh" : "stale";
   const result: CopilotPackageDetail = {
@@ -63,9 +72,6 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     if (saved.package!.acquireUsersAndGroups !== undefined) result.acquireUsersAndGroups = saved.package!.acquireUsersAndGroups;
   }
   if (state === "fresh" && !current.identityRevalidationRequired) result.identityDetailsCollected = true;
-  else {
-    delete result.identityDetailsCollected;
-    result.identityRevalidationRequired = true;
-  }
+  else delete result.identityDetailsCollected;
   return result;
 }

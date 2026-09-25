@@ -497,10 +497,12 @@ export class PackageInventoryRepository {
       observed_at: Date | null;
       expires_at: Date | null;
       from_cache?: boolean;
+      catalog_revision?: ReturnType<typeof packageDetailRevision> | null;
     }>(`WITH detailed AS (
         SELECT snapshot.id,snapshot.read_started_at AS observed_at,
           LEAST(snapshot.expires_at,snapshot.read_started_at+interval '1 hour') AS expires_at,
-          resource.native_id,resource.package_data || '{"identityDetailsCollected":true}'::jsonb AS package_data,false AS from_cache
+          resource.native_id,resource.package_data || '{"identityDetailsCollected":true}'::jsonb AS package_data,false AS from_cache,
+          NULL::jsonb AS catalog_revision
         FROM package_inventory_snapshots snapshot
         JOIN package_inventory_resources resource ON resource.snapshot_id=snapshot.id
           AND resource.tenant_id=$1 AND resource.principal_id=$2
@@ -511,14 +513,15 @@ export class PackageInventoryRepository {
           AND NOT EXISTS (SELECT 1 FROM package_detail_cache cache WHERE cache.tenant_id=$1 AND cache.principal_id=$2
             AND cache.token_mode='delegated' AND cache.native_id=resource.native_id)
         UNION ALL
-        SELECT cache.detail_snapshot_id,cache.observed_at,cache.expires_at,cache.native_id,cache.package_data,true AS from_cache
+        SELECT cache.detail_snapshot_id,cache.observed_at,cache.expires_at,cache.native_id,cache.package_data,true AS from_cache,
+          cache.catalog_revision
         FROM package_detail_cache cache WHERE cache.tenant_id=$1 AND cache.principal_id=$2
           AND cache.token_mode='delegated'
       ), latest AS (
         SELECT DISTINCT ON (native_id) * FROM detailed
         ORDER BY native_id,date_trunc('milliseconds',observed_at) DESC,id DESC
       )
-      SELECT native_id,package_data,id AS snapshot_id,observed_at,expires_at,from_cache FROM latest
+      SELECT native_id,package_data,id AS snapshot_id,observed_at,expires_at,from_cache,catalog_revision FROM latest
       ORDER BY native_id COLLATE "C" LIMIT 5001`, [scope.tenantId, scope.principalId]);
     if (details.rows.length > 5000) {
       throw new AppError(409, "source_result_limit", "Saved detailed Graph package observations exceed the 5,000-row unified inventory limit.");
@@ -582,6 +585,7 @@ export class PackageInventoryRepository {
       const observation = observations.get(id)!;
       const value = projectPackageDetails(current, detail?.observed_at && detail.expires_at ? {
         package: detail.package_data, observedAt: detail.observed_at.toISOString(), expiresAt: detail.expires_at.toISOString(),
+        catalogRevision: detail.catalog_revision,
       } : undefined, detail?.snapshot_id === observation.snapshotId && (observation.scopeKind === "exact" || !snapshot.catalog_only),
       Date.now(), (readStarted.get(id) ?? snapshot.read_started_at).getTime());
       packages.set(id, value);
@@ -733,18 +737,20 @@ type PackageProjectionRow = {
   identity_snapshot_id?: string;
   identity_observed_at?: Date;
   identity_expires_at?: Date;
+  identity_catalog_revision?: ReturnType<typeof packageDetailRevision> | null;
 };
 
 const savedDetailColumns = `identity_detail.package_data AS identity_data,
   identity_detail.snapshot_id AS identity_snapshot_id,identity_detail.observed_at AS identity_observed_at,
-  identity_detail.expires_at AS identity_expires_at`;
+  identity_detail.expires_at AS identity_expires_at,identity_detail.catalog_revision AS identity_catalog_revision`;
 
 function savedIdentityJoin(nativeId: string, tokenMode: string, tenant: string, principal: string) {
   return `LEFT JOIN LATERAL (
     SELECT saved.* FROM (
       SELECT detail.package_data || '{"identityDetailsCollected":true}'::jsonb AS package_data,
         identity_snapshot.id AS snapshot_id,identity_snapshot.read_started_at AS observed_at,
-        LEAST(identity_snapshot.expires_at,identity_snapshot.read_started_at+interval '1 hour') AS expires_at
+        LEAST(identity_snapshot.expires_at,identity_snapshot.read_started_at+interval '1 hour') AS expires_at,
+        NULL::jsonb AS catalog_revision
       FROM package_inventory_snapshots identity_snapshot
       LEFT JOIN package_inventory_resources detail ON detail.snapshot_id=identity_snapshot.id
         AND detail.tenant_id=${tenant} AND detail.principal_id=${principal} AND detail.native_id=${nativeId}
@@ -757,7 +763,7 @@ function savedIdentityJoin(nativeId: string, tokenMode: string, tenant: string, 
         AND NOT EXISTS (SELECT 1 FROM package_detail_cache cache WHERE cache.tenant_id=${tenant}
           AND cache.principal_id=${principal} AND cache.token_mode=${tokenMode} AND cache.native_id=${nativeId})
       UNION ALL
-      SELECT cache.package_data,cache.detail_snapshot_id,cache.observed_at,cache.expires_at
+      SELECT cache.package_data,cache.detail_snapshot_id,cache.observed_at,cache.expires_at,cache.catalog_revision
       FROM package_detail_cache cache WHERE cache.tenant_id=${tenant} AND cache.principal_id=${principal}
         AND cache.token_mode=${tokenMode} AND cache.native_id=${nativeId}
     ) saved
@@ -771,6 +777,7 @@ function withSavedIdentity(row: Omit<PackageProjectionRow, "read_started_at"> & 
     package: row.identity_data,
     observedAt: row.identity_observed_at.toISOString(),
     expiresAt: row.identity_expires_at.toISOString(),
+    catalogRevision: row.identity_catalog_revision,
   } : undefined, !row.catalog_only && Boolean(row.id && row.id === row.identity_snapshot_id),
   Date.now(), row.read_started_at?.getTime());
 }
@@ -779,7 +786,9 @@ function applyPackageControls(value: CopilotPackageDetail | null, readStartedAt:
   const applicable = controls.filter(control => (!value || control.detail.id === value.id)
     && (!readStartedAt || Date.parse(control.observation.observedAt) >= readStartedAt.getTime()));
   const fallback = applicable.at(-1)?.detail;
-  let result = value ?? (fallback ? projectPackageDetails(fallback, undefined) : null);
+  let result = value ?? (fallback ? {
+    ...projectPackageDetails(fallback, undefined), identityRevalidationRequired: true as const,
+  } : null);
   if (!result) return null;
   for (const control of applicable) {
     result = projectPackageControl(result, control);

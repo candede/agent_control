@@ -9,6 +9,8 @@ import {
   parseSyncReportRoute,
   migrateOfficialUsageRoute,
   migrateSecurityRoute,
+  migrateJobsRoute,
+  isWorkbenchPath,
   parseUsersRoute,
   parseWorkbenchView,
   usersRouteSearch,
@@ -32,6 +34,16 @@ describe("workbench routing", () => {
     expect(parseAgentRoute(query.toString()).agentView).toBe(agentView);
   });
 
+  it.each(["catalog", "power_platform_only", "all"] as const)("round trips the %s inventory independently of access filters", inventoryScope => {
+    const state = { ...parseAgentRoute(""), inventoryScope, agentView: "available" as const };
+    const query = agentRouteSearch(state);
+    expect(query.get("inventory")).toBe(inventoryScope === "catalog" ? null : inventoryScope);
+    expect(query.get("show")).toBe("available");
+    expect(parseAgentRoute(query.toString())).toMatchObject({ inventoryScope, agentView: "available" });
+    expect(parseAgentRoute("inventory=invalid").inventoryScope).toBe("catalog");
+    expect(parseAgentRoute("").inventoryScope).toBe("catalog");
+  });
+
   it("maps every canonical deep link without a query-string view alias", () => {
     expect(parseWorkbenchView("/agents")).toBe("agents");
     expect(parseWorkbenchView("/power-platform/")).toBe("agents");
@@ -39,9 +51,15 @@ describe("workbench routing", () => {
     expect(parseWorkbenchView("/security")).toBe("agents");
     expect(migrateSecurityRoute("/security/")).toBe("/agents");
     expect(migrateSecurityRoute("/agents")).toBeUndefined();
-    expect(parseWorkbenchView("/jobs")).toBe("jobs");
+    expect(parseWorkbenchView("/jobs")).toBe("sync");
     expect(parseWorkbenchView("/sync")).toBe("sync");
     expect(parseWorkbenchView("/unknown")).toBe("agents");
+  });
+
+  it("redirects retired Jobs bookmarks without keeping a separate view", () => {
+    expect(isWorkbenchPath("/jobs/")).toBe(true);
+    expect(migrateJobsRoute("/jobs/")).toBe("/sync");
+    expect(migrateJobsRoute("/agents")).toBeUndefined();
   });
 
   it("round trips exact sync and package refresh jobs on the dedicated sync route", () => {
@@ -69,6 +87,7 @@ describe("workbench routing", () => {
   });
   it("round trips bounded agent search, status and selection", () => {
     const query = agentRouteSearch({
+      inventoryScope: "catalog",
       agentView: "all",
       search: "  owned bot  ",
       status: "blocked",
@@ -91,6 +110,7 @@ describe("workbench routing", () => {
       "/agents?q=owned+bot&status=blocked&selected=native-1&selected=native-2",
     );
     expect(parseAgentRoute(query.toString())).toEqual({
+      inventoryScope: "catalog",
       agentView: "all",
       search: "owned bot",
       status: "blocked",
@@ -131,6 +151,7 @@ describe("workbench routing", () => {
   it("moves an oversized 5000-package selection out of the request URL without truncating its count", () => {
     const selectedIds = Array.from({ length: 5_000 }, (_, index) => `package-${index}-${"x".repeat(32)}`);
     const query = agentRouteSearch({
+      inventoryScope: "catalog",
       agentView: "all",
       search: "",
       status: "all",

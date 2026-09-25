@@ -2,7 +2,7 @@ import { useState } from "react";
 import { CircleAlert, Download, RefreshCw, ShieldCheck } from "lucide-react";
 import type { InventoryRefreshJob, UnifiedAgentInventoryPage } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { inventoryAttentionReasons } from "../inventoryVerification";
+import { inventoryAttentionReasons, inventoryDetailsPending } from "../inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 import { SyncDialog } from "./SyncDialog";
 
@@ -50,8 +50,9 @@ export function AgentSyncTools({
   const invalidPackages = currentInventory?.identityCollection?.invalidPackages ?? 0;
   const attentionReasons = verifyingInventory ? [] : inventoryAttentionReasons(currentInventory, inventoryError);
   const needsAttention = attentionReasons.length > 0;
+  const detailsPending = inventoryDetailsPending(currentInventory);
   const health = verifyingInventory ? "Checking"
-    : needsAttention ? "Needs attention" : currentInventory ? "Verified" : "Not checked";
+    : needsAttention ? "Needs attention" : currentInventory ? detailsPending ? "Sources checked" : "Verified" : "Not checked";
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">
       <div className="sync-inventory-summary">
@@ -61,7 +62,8 @@ export function AgentSyncTools({
           <p role={needsAttention ? undefined : "status"}>{verifyingInventory
             ? "Checking saved inventory. Previous results are not the result of this check."
             : needsAttention ? "Catalog sync and inventory health are separate. The issues below explain what still needs attention."
-              : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
+              : detailsPending ? "Saved source counts are checked. Package detail freshness is shown in diagnostics; no administrator action is needed for scheduled refreshes."
+                : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
         </div>
         <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setDiagnosticsOpen(true)}>View diagnostics</button>
       </div>
@@ -86,8 +88,16 @@ export function AgentSyncTools({
           <section className="sync-source-tools" aria-label="Source matching details">
             <h3>Agent identity matching</h3>
             <p>Refresh agents collects the full list and exact identity details automatically. Records are combined only when the backend verifies exact, typed source identity evidence, never by display name alone.</p>
-            {currentInventory?.identityCollection ? <p>{currentInventory.identityCollection.checkedPackages.toLocaleString()} package identities checked; {currentInventory.identityCollection.pendingPackages.toLocaleString()} still need collection.</p> : null}
-            <p>Checked is a package-detail collection count, not a count of valid metadata or matched agents. Source-only records do not by themselves prove missing agents.</p>
+            {currentInventory?.identityCollection ? <>
+              <p>{currentInventory.identityCollection.checkedPackages.toLocaleString()} package detail check{currentInventory.identityCollection.checkedPackages === 1 ? "" : "s"} current; {currentInventory.identityCollection.pendingPackages.toLocaleString()} not current.</p>
+              {currentInventory.identityCollection.pendingDetails ? <dl className="sync-inventory-counts" aria-label="Package detail freshness">
+                <div><dt>Not yet collected</dt><dd>{currentInventory.identityCollection.pendingDetails.missing.toLocaleString()}</dd></div>
+                <div><dt>Previously collected, expired</dt><dd>{currentInventory.identityCollection.pendingDetails.stale.toLocaleString()}</dd></div>
+                <div><dt>Compatibility recheck needed</dt><dd>{currentInventory.identityCollection.pendingDetails.invalidated.toLocaleString()}</dd></div>
+              </dl> : null}
+            </> : null}
+            <p>These are detail-freshness counts, not a count of valid metadata or matched agents. Expired details were already collected; they are not missing agents. Scheduled detail refreshes require no administrator action.</p>
+            <p>Some packages do not supply native-agent linking metadata. Repeating a successful read does not guarantee a match. Source-only records do not by themselves prove missing agents.</p>
             {invalidPackages > 0 ? <div className="notice" role="status">
               <strong>{invalidPackages.toLocaleString()} package{invalidPackages === 1 ? " has" : "s have"} invalid saved matching metadata.</strong>{" "}
               Select affected agents on Agents and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. Refreshing metadata does not guarantee a cross-source match.
