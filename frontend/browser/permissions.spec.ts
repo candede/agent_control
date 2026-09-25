@@ -220,7 +220,8 @@ test("administrator prerequisites replace in-app consent before and after a miss
   await page.goto("/permissions");
   const check = page.getByRole("button", { name: "Check status", exact: true });
   await expect(check).toBeEnabled();
-  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions and setup");
+  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+  await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
   await expect(page.getByRole("region", { name: "Issues", exact: true }).getByRole("status")).toHaveText("No issues reported.");
   await expect(page.getByText("App administrator", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
@@ -266,7 +267,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
   expect(unexpectedRequests).toEqual([]);
 });
 
-test("primary navigation uses the full header width at every screen size", async ({ page }, info) => {
+test("compact primary navigation has one Permissions entry and a visible icon-only sign out at every screen size", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.route("**/api/**", route => {
     const path = new URL(route.request().url()).pathname;
@@ -280,21 +281,38 @@ test("primary navigation uses the full header width at every screen size", async
   });
   await page.goto("/permissions");
   const navigation = page.getByRole("navigation", { name: "Primary views" });
-  await expect(navigation.getByRole("button")).toHaveCount(6);
+  await expect(navigation.getByRole("button")).toHaveCount(5);
   await expect(navigation.getByRole("button", { name: "Security", exact: true })).toHaveCount(0);
   await expect(navigation.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
+  const permissions = page.getByRole("button", { name: "Permissions", exact: true });
+  const signOut = page.getByRole("button", { name: "Sign out", exact: true });
+  await expect(permissions).toHaveCount(1);
+  await expect(navigation.getByRole("button", { name: "Permissions", exact: true })).toHaveCount(1);
+  await expect(permissions).toHaveAccessibleDescription(/^Permissions: \d+ issues?$/);
+  await expect(signOut).toHaveText("");
+  await expect(signOut).toHaveAttribute("aria-label", "Sign out");
   const originalViewport = page.viewportSize()!;
-  for (const width of [originalViewport.width, 768, 1024, 1920]) {
+  for (const width of [originalViewport.width, 360, 768, 1024, 1920]) {
     await page.setViewportSize({ ...originalViewport, width });
     const header = await page.locator(".top-bar").boundingBox();
     const bounds = await navigation.boundingBox();
-    expect(bounds!.x).toBeCloseTo(header!.x, 1);
-    expect(bounds!.width).toBeCloseTo(header!.width, 1);
-    for (const button of await navigation.getByRole("button").all()) {
+    expect(header!.x).toBeCloseTo(0, 1);
+    expect(header!.width).toBeCloseTo(width, 1);
+    expect(bounds!.x).toBeGreaterThanOrEqual(header!.x);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(header!.x + header!.width);
+    if (width >= 1024) expect(header!.height).toBeLessThanOrEqual(72);
+    const buttons = await navigation.getByRole("button").all();
+    for (const [index, button] of buttons.entries()) {
       const buttonBounds = await button.boundingBox();
       expect(buttonBounds!.x).toBeGreaterThanOrEqual(bounds!.x);
       expect(buttonBounds!.x + buttonBounds!.width).toBeLessThanOrEqual(bounds!.x + bounds!.width);
+      if (index) {
+        const previous = await buttons[index - 1].boundingBox();
+        expect(buttonBounds!.x).toBeGreaterThanOrEqual(previous!.x + previous!.width);
+      }
     }
+    await expect(signOut).toBeInViewport({ ratio: 1 });
+    await expect(permissions).toBeInViewport({ ratio: 1 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   }
   await page.setViewportSize(originalViewport);
@@ -439,7 +457,8 @@ for (const [status, message] of [
     } else {
       await expect(issues.getByText("No issues reported.", { exact: true })).toBeVisible();
       await expect(issues.getByRole("button", { name: /^Details:/ })).toHaveCount(0);
-      await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions and setup");
+      await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+      await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
     expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
@@ -831,7 +850,8 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
     await otherPage.goto(fixtureLoginUrl("unprobed-principal"));
     await expect(otherPage.getByRole("region", { name: "Issues", exact: true }).getByRole("alert")).toContainText("Permission checks failed after retrying.");
     await expect(otherPage.getByRole("button", { name: /^Details:/ })).toHaveCount(0);
-    await expect(otherPage.locator(".capability-health")).toHaveAccessibleName("Permissions: check failed");
+    await expect(otherPage.locator(".capability-health")).toHaveAccessibleName("Permissions");
+    await expect(otherPage.locator(".capability-health")).toHaveAccessibleDescription("Permissions: check failed");
     await expect(otherPage.locator(".permission-center")).not.toContainText("No issues reported.");
   } finally {
     await other.close();

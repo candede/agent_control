@@ -132,12 +132,13 @@ test("catalog-first scopes stay compact and retain matched enrichment across nav
   await mockScopedCatalog(page);
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
-  const scopes = page.getByRole("group", { name: "Inventory scope" });
+  const scopes = page.locator(".agent-catalog-heading").getByRole("group", { name: "Inventory scope" });
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(scopes.getByRole("button", { name: "Microsoft 365 catalog", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(scopes.getByRole("button", { name: "Microsoft 365 catalog", exact: true })).toContainText("2");
   await expect(page.getByText(/Agents in the Microsoft 365 package catalog|package records represent|Counts can differ from the admin portal/)).toHaveCount(0);
-  await expect(page.locator(".agent-inventory-scopes + .agent-overview-metrics")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Agent inventory overview" }).getByRole("group", { name: "Inventory scope" })).toHaveCount(0);
+  await expect(page.locator(".agent-inventory-overview > .agent-overview-metrics")).toBeVisible();
   await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("2");
   await expect(table.getByText("Finance production", { exact: true })).toHaveCount(1);
   await expect(table.getByText(draft.displayName, { exact: true })).toHaveCount(0);

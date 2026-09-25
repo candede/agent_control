@@ -1,26 +1,23 @@
 :root {
-  --text: #3d4745;
-  --text-h: #10211f;
-  --muted: #5f6a65;
-  --bg: #f8f5ec;
-  --surface: #fffdf7;
-  --border: #ded7c8;
-  --ink: #284a45;
-  --danger: #a84633;
+  --text: #344054;
+  --text-h: #182338;
+  --muted: #626e82;
+  --bg: #f5f7fb;
+  --surface: #ffffff;
+  --border: #dfe4ed;
+  --ink: #5146c7;
+  --ink-hover: #4035a5;
+  --danger: #b42318;
 
-  --sans: Aptos, "Avenir Next", "Trebuchet MS", sans-serif;
-  --heading: Georgia, "Times New Roman", serif;
+  --sans: "Segoe UI", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+  --heading: var(--sans);
   --mono: ui-monospace, Consolas, monospace;
 
-  font: 16px/145% var(--sans);
+  font: 16px/1.45 var(--sans);
   letter-spacing: 0;
   color-scheme: light;
   color: var(--text);
-  background:
-    linear-gradient(rgba(16, 33, 31, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(16, 33, 31, 0.035) 1px, transparent 1px),
-    var(--bg);
-  background-size: 28px 28px;
+  background: var(--bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;

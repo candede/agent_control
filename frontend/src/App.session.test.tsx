@@ -1381,6 +1381,7 @@ describe("App session revalidation", () => {
     await userEvent.click(await screen.findByRole("checkbox", { name: "Select Reconciled agent" }));
     expect(screen.getByText("1 of 25 exact Copilot Studio agents selected")).toBeInTheDocument();
     reconciled = true;
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     await userEvent.selectOptions(screen.getByDisplayValue("Name (A-Z)"), "displayName:desc");
     await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Reconciled agent" })).toBePartiallyChecked());
     await userEvent.click(screen.getByRole("checkbox", { name: "Select Reconciled agent" }));
@@ -1412,6 +1413,7 @@ describe("App session revalidation", () => {
 
     await userEvent.click(await screen.findByRole("checkbox", { name: "Select Snapshot-bound merged agent" }));
     reconciled = true;
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
     await waitFor(() => expect(screen.getByRole("checkbox", { name: "Select Snapshot-bound merged agent" })).toBePartiallyChecked());
     await userEvent.click(screen.getByRole("checkbox", { name: "Select Snapshot-bound merged agent" }));
@@ -1586,54 +1588,55 @@ describe("App session revalidation", () => {
     expect(transport.fetchMock.mock.calls.filter(([path, init]) => path.startsWith("/api/quarantine/") && init?.method === "POST")).toHaveLength(0);
   });
 
-  it("keeps basic filters compact and hides advanced controls without removing them", async () => {
+  it("keeps search and view in the table toolbar and opens detailed filters on demand", async () => {
     vi.stubGlobal("fetch", appTransport({ revalidatedRoles: viewer.roles }).fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
     const filters = within(screen.getByRole("region", { name: "Filters" }));
-    expect(filters.getAllByRole("combobox")).toHaveLength(6);
-    expect(filters.getByRole("checkbox", { name: "Advanced filters" })).not.toBeChecked();
-    expect(filters.getByLabelText("Environment")).not.toBeVisible();
+    expect(filters.getAllByRole("combobox")).toHaveLength(1);
+    expect(filters.getByRole("button", { name: "Filters" })).toHaveAttribute("aria-expanded", "false");
+    expect(filters.queryByLabelText("Environment")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Source")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Source link")).not.toBeInTheDocument();
-    for (const name of ["Show agents", "Built with", "Assigned access", "Host", "Package status"]) {
-      expect(filters.getByRole("combobox", { name })).toBeVisible();
-    }
-    expect(filters.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
-    expect(screen.getByLabelText("Publisher")).not.toBeVisible();
+    expect(filters.getByRole("combobox", { name: "Show agents" })).toBeVisible();
+    expect(filters.queryByLabelText("Publisher")).not.toBeInTheDocument();
     expect(filters.queryByRole("button", { name: "Export agent inventory CSV" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeInTheDocument();
-    await userEvent.click(filters.getByRole("checkbox", { name: "Advanced filters" }));
-    expect(filters.getByRole("region", { name: "Advanced agent filters" })).toBeVisible();
-    for (const label of ["Environment", "Search environments", "Publisher"]) {
+    await userEvent.click(filters.getByRole("button", { name: "Filters" }));
+    expect(filters.getByRole("dialog", { name: "Filter agents" })).toBeVisible();
+    for (const label of ["Built with", "Assigned access", "Host", "Package status", "Environment", "Search environments", "Publisher", "Sort"]) {
       expect(filters.getByLabelText(label)).toBeVisible();
     }
+    expect(filters.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
+    expect(filters.getByRole("combobox", { name: "Built with" })).toHaveFocus();
   });
 
-  it("preserves hidden advanced filters across tabs and expands a restored advanced route", async () => {
+  it("preserves hidden filters across tabs and exposes restored routes through removable chips", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
-    await userEvent.click(screen.getByRole("checkbox", { name: "Advanced filters" }));
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     await userEvent.type(screen.getByRole("searchbox", { name: "Search environments" }), "fin");
     expect(window.location.search).not.toContain("environment=");
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Environment" }), "env-a");
-    const toggle = screen.getByRole("checkbox", { name: "Advanced filters 1 active" });
-    await userEvent.click(toggle);
-    expect(toggle).not.toBeChecked();
-    expect(screen.getByLabelText("Environment")).not.toBeVisible();
+    const toggle = screen.getByRole("button", { name: "Filters, 1 active" });
+    await userEvent.keyboard("{Escape}");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveFocus();
+    expect(screen.queryByLabelText("Environment")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("Finance");
     expect(window.location.search).toContain("environment=env-a");
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
-    expect(screen.getByRole("checkbox", { name: "Advanced filters 1 active" })).not.toBeChecked();
-    expect(screen.getByLabelText("Environment")).toHaveValue("env-a");
+    expect(screen.getByRole("button", { name: "Filters, 1 active" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("Finance");
     await act(async () => {
       window.history.pushState({}, "", "/agents?linkState=conflicting&environment=env-b");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    expect(screen.getByRole("checkbox", { name: "Advanced filters 1 active" })).toBeChecked();
-    expect(screen.getByLabelText("Environment")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Filters, 1 active" })).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(screen.getByRole("button", { name: "Filters, 1 active" }));
     expect(screen.getByLabelText("Environment")).toHaveValue("env-b");
     expect(window.location.search).not.toContain("linkState");
   });
@@ -1646,6 +1649,7 @@ describe("App session revalidation", () => {
     render(<App />);
     await screen.findByText(agent.displayName);
     expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("organization");
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("responses:desc");
     const unifiedRequests = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?"));
     expect(new URL(unifiedRequests().at(-1)![0], "http://localhost").searchParams.get("view")).toBe("organization");
@@ -1655,7 +1659,7 @@ describe("App session revalidation", () => {
     await userEvent.click(screen.getByRole("checkbox", { name: "Hosts" }));
     await userEvent.keyboard("{Escape}");
     await userEvent.click(screen.getByRole("button", { name: "Sort by Hosts" }));
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("hosts:asc"));
+    await waitFor(() => expect(screen.getByRole("columnheader", { name: "Hosts" })).toHaveAttribute("aria-sort", "ascending"));
     expect(new URLSearchParams(window.location.search).get("sort")).toBe("hosts");
     const exportButton = screen.getByRole("button", { name: "Export agent inventory CSV" });
     await waitFor(() => expect(exportButton).toBeEnabled());
@@ -1668,6 +1672,7 @@ describe("App session revalidation", () => {
     });
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all"));
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("hosts:asc");
     expect(new URLSearchParams(window.location.search).has("show")).toBe(false);
     await waitFor(() => expect(new URL(unifiedRequests().at(-1)![0], "http://localhost").searchParams.has("view")).toBe(false));
@@ -1715,7 +1720,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(screen.getByRole("columnheader", { name: "Hosts" })).toHaveAttribute("aria-sort", "descending"));
   });
 
-  it("opens bookmarked publisher/environment filters and clears every filter without changing sorting", async () => {
+  it("shows bookmarked restrictions as chips and clears every filter without changing sorting", async () => {
     window.history.replaceState({}, "", "/agents?q=agent&source=graph_packages&status=allowed&linkState=unmatched&environment=env-a&publisher=Microsoft&availability=some&host=Teams&platform=studio&createdWithinDays=30&sort=lastModifiedAt&direction=desc");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
@@ -1733,15 +1738,19 @@ describe("App session revalidation", () => {
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("checkbox", { name: "Advanced filters 2 active" })).toBeChecked();
+    const toggle = await screen.findByRole("button", { name: "Filters, 7 active" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).toBeVisible();
+    await userEvent.click(toggle);
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("lastModifiedAt:desc");
     expect(window.location.search).not.toMatch(/source=|linkState=/);
-    await userEvent.click(screen.getByRole("checkbox", { name: "Advanced filters 2 active" }));
+    await userEvent.keyboard("{Escape}");
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
-    expect(screen.getByRole("checkbox", { name: "Advanced filters" })).not.toBeChecked();
-    expect(screen.getByRole("combobox", { name: "Package status" })).toHaveValue("all");
+    expect(screen.getByRole("button", { name: "Filters" })).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByRole("searchbox", { name: "Search" })).toHaveValue("");
     expect(window.location.search).toBe("?sort=lastModifiedAt&direction=desc");
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByRole("combobox", { name: "Package status" })).toHaveValue("all");
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("lastModifiedAt:desc");
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), "displayName:desc");
     expect(window.location.search).toBe("?direction=desc");
@@ -1751,12 +1760,14 @@ describe("App session revalidation", () => {
     })).toBe(true));
   });
 
-  it("does not open Advanced for promoted filters or apply obsolete source/link URL restrictions", async () => {
+  it("keeps bookmarked filters disclosed by chips and ignores obsolete source/link URL restrictions", async () => {
     window.history.replaceState({}, "", "/agents?source=power_platform&linkState=matched&platform=studio&createdWithinDays=30&host=Teams&availability=some");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("checkbox", { name: "Advanced filters" })).not.toBeChecked();
+    expect(await screen.findByRole("button", { name: "Filters, 4 active" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: "Remove created within filter" })).toHaveTextContent("30 days");
+    await userEvent.click(screen.getByRole("button", { name: "Filters, 4 active" }));
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Built with" })).toHaveValue("studio"));
     expect(screen.getByRole("spinbutton", { name: "Created within days" })).toHaveValue(30);
     await waitFor(() => expect(window.location.search).not.toMatch(/source=|linkState=/));
@@ -1777,6 +1788,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Sort" }), value);
     expect(window.location.search).toBe(search);
     await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => {
@@ -1898,7 +1910,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(transport.fetchMock.mock.calls
       .filter(([, init]) => init?.method && init.method !== "GET").map(([input, init]) => [input, init?.method]))
       .toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]])));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions" })).toHaveAttribute("aria-busy", "false"));
     const beforeExpansion = transport.fetchMock.mock.calls.length;
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(transport.fetchMock.mock.calls.slice(beforeExpansion)
@@ -1948,7 +1960,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await within(await screen.findByRole("region", { name: "Inventory health" })).findByText("Verified");
-    expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAttribute("aria-busy", "true");
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(nonGetRequests()).toEqual([["/api/data-sync/auto-refresh", "POST"]]);
     const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
@@ -1959,7 +1971,7 @@ describe("App session revalidation", () => {
     expect(nonGetRequests()).toEqual([["/api/data-sync/auto-refresh", "POST"]]);
     await act(async () => permissionCatalog.resolve(await base("/api/capabilities")));
     await waitFor(() => expect(nonGetRequests()).toEqual(expect.arrayContaining([["/api/capabilities/check", "POST"], ["/api/data-sync/auto-refresh", "POST"]])));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions and setup" })).toHaveAttribute("aria-busy", "false"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Permissions" })).toHaveAttribute("aria-busy", "false"));
     expect(receipt.getByRole("button", { name: "Verifying saved inventory..." })).toBeDisabled();
     await act(async () => verification.resolve(Response.json({ ...page, revision: "b".repeat(64) })));
     await receipt.findByText("Saved inventory verified");
@@ -4203,10 +4215,10 @@ describe("App session revalidation", () => {
     const scopes = within(screen.getByRole("group", { name: "Inventory scope" }));
     expect(scopes.getByRole("button", { name: "Microsoft 365 catalog" })).toHaveAttribute("aria-pressed", "true");
     expect(scopes.queryByRole("button", { name: "Combined inventory" })).not.toBeInTheDocument();
-    expect(scopes.getByRole("combobox", { name: "Report set" })).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Agent inventory overview" })).getByRole("combobox", { name: "Report set" })).toBeInTheDocument();
     expect(screen.queryByText(/Agents in the Microsoft 365 package catalog/)).not.toBeInTheDocument();
     expect(screen.queryByText(/package records represent|Counts can differ from the admin portal/)).not.toBeInTheDocument();
-    expect(screen.getByRole("group", { name: "Inventory scope" }).nextElementSibling).toHaveClass("agent-overview-metrics");
+    expect(screen.getByRole("group", { name: "Inventory scope" }).closest(".agent-catalog-heading")).not.toBeNull();
     await userEvent.click(screen.getByRole("checkbox", { name: `Select ${agent.displayName}` }));
     fireEvent.change(screen.getByRole("searchbox", { name: "Search" }), { target: { value: "Sensitive" } });
     await userEvent.click(scopes.getByRole("button", { name: "Additional Power Platform agents" }));
@@ -4249,11 +4261,11 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     const overview = within(await screen.findByRole("region", { name: "Agent inventory overview" }));
-    await waitFor(() => expect(overview.getByRole("button", { name: "Additional Power Platform agents" })).toHaveTextContent("1"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Additional Power Platform agents" })).toHaveTextContent("1"));
     expect(overview.getByText("Agents in catalog").parentElement).toHaveTextContent("Unknown");
     expect(overview.getByText("Available to end users").parentElement).toHaveTextContent("Unknown");
     expect(screen.queryByText(native.displayName)).not.toBeInTheDocument();
-    await userEvent.click(overview.getByRole("button", { name: "Additional Power Platform agents" }));
+    await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
     await screen.findByText(native.displayName);
     expect(overview.getByText(/Catalog matching is incomplete/)).toBeVisible();
   });

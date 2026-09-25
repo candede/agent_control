@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Info, Lock, LockOpen, ShieldCheck } from "lucide-react";
 import { columnVisibilityFeature, rowSortingFeature, tableFeatures, useTable, type CellContext, type ColumnDef, type ColumnVisibilityState } from "@tanstack/react-table";
 import { agentColumnValue, agentStatusLabels } from "../../../backend/src/types/agentPresentation";
@@ -18,6 +18,8 @@ const emptyEnvironmentNames: Record<string, string> = {};
 
 type Props = {
   records: UnifiedAgentRecord[];
+  controls?: ReactNode;
+  loading?: boolean;
   busyPackageId?: string;
   selectedPackageIds: Set<string>;
   selectedPowerPlatformKeys: Set<string>;
@@ -79,6 +81,8 @@ const columns: ColumnDef<typeof features, AgentRow>[] = [
 
 export function UnifiedAgentTable({
   records,
+  controls,
+  loading = false,
   busyPackageId,
   selectedPackageIds,
   selectedPowerPlatformKeys,
@@ -151,17 +155,20 @@ export function UnifiedAgentTable({
     <AgentTableActionsContext.Provider value={{ busyPackageId, packageOperationsAllowed, quarantineSelectionAllowed, quarantineSelectionRestoring, selectionDisabled, packageActionsDisabled, onToggleSelection, onViewDetails, onManageAccess, onSetBlocked }}>
     <div className="agent-grid" role="region" aria-label="Unified agents">
       <div className="agent-grid-toolbar">
-        <span className="muted-cell" title={showUsageContext
+        <div className="agent-grid-tools">
+        {controls}
+        <AgentColumnPicker columns={agentColumns.map(definition => {
+          const column = requiredColumn(definition.id);
+          return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
+        })} onToggle={id => requiredColumn(id).toggleVisibility()} onReset={() => changeVisibility({ ...defaultAgentColumnVisibility })} />
+        </div>
+        {showUsageContext || !controls ? <span className="muted-cell agent-report-note" title={showUsageContext
           ? "Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero."
           : undefined}>
           {showUsageContext && usageContext
             ? <>{usageCoverageLabel(usageContext.reportSet)}{usageContext.availability !== "active" ? ` · ${usageAvailabilityLabel(usageContext.availability)}` : ""}</>
             : "Choose columns; sort using column headings."}
-        </span>
-        <AgentColumnPicker columns={agentColumns.map(definition => {
-          const column = requiredColumn(definition.id);
-          return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
-        })} onToggle={id => requiredColumn(id).toggleVisibility()} onReset={() => changeVisibility({ ...defaultAgentColumnVisibility })} />
+        </span> : null}
       </div>
       {preferences.error ? <p className="notice" role="status">{preferences.error}</p> : null}
       {selectedAgents > 0 || packageSelectionAllowed && selectedPackageIds.size > 0 || quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <div className="selection-summary">
@@ -169,7 +176,8 @@ export function UnifiedAgentTable({
         {packageSelectionAllowed && selectedPackageIds.size > 0 ? <span>{selectedPackageIds.size} published version{selectedPackageIds.size === 1 ? "" : "s"} selected</span> : null}
         {quarantineSelectionAllowed && selectedPowerPlatformKeys.size > 0 ? <span>{selectedPowerPlatformKeys.size} exact quarantine target{selectedPowerPlatformKeys.size === 1 ? "" : "s"} selected</span> : null}
       </div> : null}
-      {records.length === 0 ? <div className="empty-state"><h2>No matching agents</h2><p>Try clearing the search or filters.</p></div> : <div className="table-shell">
+      {loading ? <div className="screen-state" role="status">Loading Copilot agents...</div>
+        : records.length === 0 ? <div className="empty-state"><h2>No matching agents</h2><p>Try clearing the search or filters.</p></div> : <div className="table-shell">
         <table className="agent-table unified-agent-table" style={{ minWidth: Math.max(520, table.getVisibleLeafColumns().length * 145) }}>
           <thead>{table.getHeaderGroups().map(group => <tr key={group.id}>{group.headers.map(header => {
             const sorted = header.column.getIsSorted();

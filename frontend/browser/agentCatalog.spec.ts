@@ -117,9 +117,12 @@ test("organization filters, server sorting and remembered columns stay usable an
     },
   }));
   const queries: URLSearchParams[] = [];
+  const cacheReads: Array<{ phase: string; parameters: Record<string, string> }> = [];
+  let phase = "initial";
   await page.route("**/api/agent-inventory?*", route => {
     const query = new URL(route.request().url()).searchParams;
     queries.push(query);
+    cacheReads.push({ phase, parameters: Object.fromEntries(query) });
     const view = unifiedAgentViews.find(value => value === query.get("view")) ?? "all";
     const value = records.filter(record => matchesAgentView(record, view));
     if (query.get("sortBy") === "responses") {
@@ -127,16 +130,26 @@ test("organization filters, server sorting and remembered columns stay usable an
     }
     return route.fulfill({ json: { ...unifiedAgents, usageContext, value, count: value.length } });
   });
-  await page.goto("/agents");
+  // Initial source revision discovery invalidates inventory caches; settle it before measuring reuse.
+  await page.goto("/sync");
+  await expect(page.getByRole("button", { name: "Permissions", exact: true })).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByRole("region", { name: "Automatic refresh", exact: true })).toContainText("Automatic refresh · On");
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Agents", exact: true }).click();
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.getByRole("row")).toHaveCount(4);
+  await expect(page.locator(".agent-table-stack")).toHaveAttribute("aria-busy", "false");
   const initialCatalogReads = queries.filter(query => !query.has("view")).length;
+  phase = "organization";
   await page.getByRole("combobox", { name: "Show agents" }).selectOption("organization");
   await expect(table.getByRole("row")).toHaveCount(3);
   await expect(table.getByRole("button", { name: records[1].displayName, exact: true })).toHaveCount(0);
   await expect(page).toHaveURL(/show=organization/);
+  phase = "return-all";
   await page.getByRole("combobox", { name: "Show agents" }).selectOption("all");
   await expect(table.getByRole("row")).toHaveCount(4);
+  await info.attach("agent-view-cache-requests", {
+    body: JSON.stringify({ initialCatalogReads, cacheReads }, null, 2), contentType: "application/json",
+  });
   expect(queries.filter(query => !query.has("view"))).toHaveLength(initialCatalogReads);
 
   await table.getByRole("button", { name: "Columns", exact: true }).click();
@@ -153,7 +166,13 @@ test("organization filters, server sorting and remembered columns stay usable an
   await expect.poll(() => queries.at(-1)?.get("sortBy")).toBe("responses");
   expect(queries.at(-1)?.get("sortDirection")).toBe("desc");
   await expect(table.getByRole("columnheader", { name: "Responses", exact: true })).toHaveAttribute("aria-sort", "descending");
-  await expect(page.getByRole("combobox", { name: "Sort", exact: true })).toHaveValue("responses:desc");
+  const filters = table.getByRole("button", { name: "Filters", exact: true });
+  await expect(filters).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByRole("combobox", { name: "Sort", exact: true })).toHaveCount(0);
+  await filters.click();
+  await expect(page.getByRole("dialog", { name: "Filter agents" }).getByRole("combobox", { name: "Sort", exact: true })).toHaveValue("responses:desc");
+  await page.keyboard.press("Escape");
+  await expect(filters).toBeFocused();
   await expect(table.getByRole("cell", { name: "Unavailable", exact: true })).toHaveCount(1);
   await expect(table.getByRole("cell", { name: "0", exact: true })).toHaveCount(1);
   await expect(table.getByRole("cell", { name: "215", exact: true })).toHaveCount(1);
@@ -192,7 +211,11 @@ test("server sorting uses a fixed refresh indicator without shifting the page or
   const exportButton = page.getByRole("button", { name: "Export agent inventory CSV" });
   const attention = page.getByRole("button", { name: /Inventory needs attention.*Open Sync/ });
   await expect(attention).toBeVisible();
-  const bounds = async () => Promise.all([table.boundingBox(), overview.boundingBox(), exportButton.boundingBox()]);
+  const surfaces = [table, overview, exportButton,
+    page.locator(".agent-catalog-heading").getByRole("group", { name: "Inventory scope" }),
+    table.locator(".agent-grid-toolbar"), heading];
+  const surfaceNames = ["table", "overview", "export", "inventory scope", "toolbar", "sort heading"];
+  const bounds = () => Promise.all(surfaces.map(surface => surface.boundingBox()));
   const initialBounds = await bounds();
   await heading.click();
   await expect.poll(() => Boolean(finishSort)).toBe(true);
@@ -204,7 +227,11 @@ test("server sorting uses a fixed refresh indicator without shifting the page or
   await expect(exportButton.locator("..").getByRole("status")).toHaveAccessibleName("Updating agent results");
   await expect(table.locator(".notice")).toHaveCount(0);
   await expect(attention).toBeVisible();
-  expect(await bounds()).toEqual(initialBounds);
+  const pendingBounds = await bounds();
+  await info.attach("agent-sort-pending-geometry", {
+    body: JSON.stringify({ surfaceNames, before: initialBounds, pending: pendingBounds }, null, 2), contentType: "application/json",
+  });
+  expect(pendingBounds).toEqual(initialBounds);
   expect(await refresh.locator("svg").evaluate(element => getComputedStyle(element).animationName)).toBe("agent-refresh-spin");
   await page.emulateMedia({ reducedMotion: "reduce" });
   expect(await refresh.locator("svg").evaluate(element => getComputedStyle(element).animationName)).toBe("none");
@@ -213,7 +240,11 @@ test("server sorting uses a fixed refresh indicator without shifting the page or
   await finishSort!();
   await expect(table.getByRole("checkbox").first()).toBeEnabled();
   await expect(refresh).toHaveCount(0);
-  expect(await bounds()).toEqual(initialBounds);
+  const settledBounds = await bounds();
+  await info.attach("agent-sort-settled-geometry", {
+    body: JSON.stringify({ surfaceNames, before: initialBounds, settled: settledBounds }, null, 2), contentType: "application/json",
+  });
+  expect(settledBounds).toEqual(initialBounds);
   await expect(heading).toBeFocused();
   await page.keyboard.press("Enter");
   await expect(table.getByRole("columnheader", { name: "Agent", exact: true })).toHaveAttribute("aria-sort", "ascending");

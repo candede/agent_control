@@ -1,55 +1,7 @@
-.agent-inventory-overview,
 .cumulative-agent-activity {
   display: grid;
   gap: 12px;
   min-width: 0;
-}
-
-.agent-inventory-overview {
-  margin-bottom: 20px;
-}
-
-.agent-inventory-scopes {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-  gap: 8px;
-}
-
-.agent-inventory-scopes:has(.usage-report-selector) {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.agent-inventory-scope {
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  min-height: 42px;
-  text-align: left;
-}
-
-.agent-inventory-scope[aria-pressed="true"] {
-  background: var(--ink);
-  border-color: var(--ink);
-  color: var(--surface);
-}
-
-.agent-inventory-scope strong {
-  font-variant-numeric: tabular-nums;
-}
-
-.agent-inventory-scope-warning {
-  margin: 0;
-  font-size: 0.85rem;
-  line-height: 1.5;
-  color: var(--muted);
-}
-
-@media (max-width: 640px) {
-  .agent-inventory-scopes,
-  .agent-inventory-scopes:has(.usage-report-selector) {
-    grid-template-columns: 1fr;
-  }
 }
 
 .usage-agent-locator {
@@ -61,43 +13,6 @@
 
 .usage-agent-locator summary { cursor: pointer; }
 .usage-agent-locator .cumulative-agent-activity { margin-top: 1rem; }
-
-.agent-overview-metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.agent-overview-metrics .metric {
-  min-width: 0;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-}
-
-.agent-overview-metrics small {
-  color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.45;
-}
-
-.agent-overview-filter {
-  align-items: stretch;
-  color: var(--ink);
-  text-align: left;
-  font: inherit;
-}
-
-.agent-overview-filter:hover,
-.agent-overview-filter[aria-pressed="true"] {
-  border-color: var(--ink);
-}
-
-.agent-overview-filter:focus-visible {
-  outline: 2px solid var(--ink);
-  outline-offset: 2px;
-}
 
 .cumulative-activity-filters {
   display: grid;
@@ -146,7 +61,6 @@
 }
 
 @media (max-width: 1000px) {
-  .agent-overview-metrics,
   .cumulative-activity-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

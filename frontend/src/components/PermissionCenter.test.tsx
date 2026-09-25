@@ -58,7 +58,8 @@ describe("Permissions setup and issues", () => {
     expect(screen.getByRole("region", { name: "Permission check progress" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Checking..." }).querySelector(".permission-spinner")).not.toBeNull();
-    expect(screen.getByRole("button", { name: "Permissions: 1 issue" }).querySelector(".permission-spinner")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Permissions" }).querySelector(".permission-spinner")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: 1 issue");
     expect(screen.getByRole("button", { name: "Details: Agent inventory" })).toBeVisible();
     expect(screen.queryByText("No issues reported.")).not.toBeInTheDocument();
     rerender(<Page value={context([fixture()])} />);
@@ -85,7 +86,7 @@ describe("Permissions setup and issues", () => {
       expiresAt: new Date(now + 60000).toISOString(), evidence: { httpStatus: 403, providerErrorCode: "Authorization_RequestDenied" },
       remediation: ["Ask an administrator to review the required grants."] };
     const { rerender } = render(<Page value={context([view])} />);
-    expect(screen.getByRole("button", { name: "Permissions: 1 issue" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: 1 issue");
     await userEvent.click(screen.getByRole("button", { name: "Details: Copilot license sync" }));
     const dialog = screen.getByRole("dialog", { name: "Copilot license sync" });
     expect(within(dialog).getByText("Microsoft denied the required API permission.")).toBeVisible();
@@ -108,7 +109,7 @@ describe("Permissions setup and issues", () => {
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByText(/Ready to try|Microsoft checks access when used|not verified|no proof|Account access|Shared application modes/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Provider verified|Local access|Needs attention/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Permissions and setup" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions and setup");
     expect(screen.getByText("Log collection setup")).toBeVisible();
     expect(screen.getByRole("region", { name: "Log setup" }).querySelector("details")).not.toHaveAttribute("open");
   });
@@ -206,7 +207,7 @@ describe("Permissions setup and issues", () => {
 
   it("shows only actual failures, with short fixes and no readiness rows", async () => {
     render(<Page value={context([fixture("missing_permission"), fixture("available", "graph.licenses.read")])} />);
-    expect(screen.getByRole("button", { name: "Permissions: 1 issue" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: 1 issue");
     const issues = within(screen.getByRole("region", { name: "Issues" }));
     expect(issues.getByText("Agent inventory")).toBeVisible();
     expect(issues.getByText("Microsoft denied the required API permission.")).toBeVisible();
@@ -258,7 +259,7 @@ describe("Permissions setup and issues", () => {
     expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
     expect(screen.getByText("AgentControl.Viewer")).toBeVisible();
     expect(screen.getByText("AgentControl.Admin")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Permissions: app role required" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: app role required");
   });
 
   it("hides cached transient errors until the initial retry confirms them", () => {
@@ -267,7 +268,7 @@ describe("Permissions setup and issues", () => {
     const value = context([failed]);
     const { rerender } = render(<Page value={{ ...value, pending: true, awaitingInitialCheck: true }} />);
     expect(screen.queryByText("Agent inventory")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Permissions:.*issue/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions and setup");
     expect(screen.getByRole("button", { name: "Checking..." })).toBeDisabled();
     rerender(<Page value={value} />);
     expect(screen.getByText("Microsoft did not respond after retrying.")).toBeVisible();

@@ -160,9 +160,10 @@ test("Agents shows independent inventory and activity cards without navigation s
   await expect(overview.getByText("Reported active · 30 days").locator("..")).toContainText("2");
   await expect(overview.getByRole("link")).toHaveCount(0);
   await expect(overview.getByRole("button", { name: /^Show / })).toHaveCount(2);
-  await expect(overview.getByRole("group", { name: "Inventory scope" }).getByRole("button")).toHaveCount(2);
-  await expect(overview.getByRole("group", { name: "Inventory scope" }).getByRole("combobox", { name: "Report set" })).toBeVisible();
-  await expect(overview.getByText("Reported used agents").locator("..")).toContainText("Selected report set");
+  await expect(page.locator(".agent-catalog-heading").getByRole("group", { name: "Inventory scope" }).getByRole("button")).toHaveCount(2);
+  await expect(overview.getByRole("group", { name: "Inventory scope" })).toHaveCount(0);
+  await expect(overview.locator(".agent-report-context").getByRole("combobox", { name: "Report set" })).toBeVisible();
+  await expect(overview.getByText("Reported used agents").locator("..")).toContainText("In selected report set");
   expect(scopes.length).toBeGreaterThan(0);
   expect(scopes.every(scope => scope === "selected")).toBe(true);
   await expect(overview).not.toContainText("not additive");

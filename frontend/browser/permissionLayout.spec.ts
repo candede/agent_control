@@ -68,14 +68,15 @@ async function expectQuietPermissions(page: Page) {
   await expect(center.getByRole("combobox", { name: "Show", includeHidden: true })).toHaveCount(0);
   await expect(center.locator(".permission-counts, .capability-status")).toHaveCount(0);
   expect(await center.textContent()).not.toMatch(/Ready to try|Microsoft checks(?: access)? when used|Microsoft validates permission|provider[- ]verified|provider authorization not verified|no current verification|not checked|last recorded success|all permissions verified/i);
-  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions and setup");
+  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+  await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
   await expect(page.locator(".capability-health")).toHaveText("Permissions");
 }
 
 async function watchPermissionWarnings(page: Page) {
   await page.addInitScript(() => {
     const observer = new MutationObserver(() => {
-      if (document.querySelector(".permission-issues [role=alert], .permission-issue-list > li, .capability-health[aria-label='Permissions: check failed']")) {
+      if (document.querySelector(".permission-issues [role=alert], .permission-issue-list > li, .capability-health[aria-description='Permissions: check failed']")) {
         document.documentElement.setAttribute("data-permission-warning-observed", "true");
         observer.disconnect();
       }
@@ -184,7 +185,8 @@ test("fresh failures have friendly details, setup links, keyboard focus and expl
   await expect(issues.getByRole("listitem")).toHaveCount(1);
   await expect(issues.getByText("Agent inventory", { exact: true })).toBeVisible();
   await expect(issues.getByText("Microsoft did not respond after retrying.", { exact: true })).toBeVisible();
-  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions: 1 issue");
+  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+  await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions: 1 issue");
   await expect(issues.getByText("Package catalog read", { exact: true })).toHaveCount(0);
   const trigger = issues.getByRole("button", { name: "Details: Agent inventory", exact: true });
   expect(await issues.locator("strong").evaluate(element => getComputedStyle(element).textTransform)).toBe("none");
@@ -271,7 +273,8 @@ test("a cached timeout stays quiet while the initial automatic retry is pending"
     await expect(page.getByRole("region", { name: "Permission check progress" })).toContainText("Checking permissions");
     await expect(issues.getByRole("listitem")).toHaveCount(0);
     await expect(issues.getByRole("alert")).toHaveCount(0);
-    await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions and setup");
+    await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+    await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
     await expect(page.locator(".capability-health")).toHaveAttribute("aria-busy", "true");
     await expect(page.locator(".capability-health")).toHaveAttribute("title", "Checking permissions");
     expect(await issues.textContent()).not.toMatch(/did not respond|timeout|failed/i);
@@ -306,7 +309,8 @@ for (const endpoint of ["/api/capabilities", "/api/capabilities/check"]) {
       await expect(page.getByRole("region", { name: "Permission check progress" })).toContainText(endpoint === "/api/capabilities"
         ? "Loading permission results" : "Checking permissions");
       await expect(page.getByRole("region", { name: "Issues", exact: true }).getByRole("alert")).toHaveCount(0);
-      await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions and setup");
+      await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+      await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
       await expect(page.locator(".capability-health")).toHaveAttribute("aria-busy", "true");
       await expect(page.locator(".capability-health")).toHaveAttribute("title", "Checking permissions");
       await expect(page.getByRole("button", { name: "Checking...", exact: true })).toBeDisabled();

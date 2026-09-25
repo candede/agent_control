@@ -64,16 +64,19 @@ export function PreviewBadge() {
   return <span className="preview-badge" tabIndex={0} aria-label={text}>Preview<span role="tooltip">{text}</span></span>;
 }
 
-export function CapabilityHealth() {
+export function CapabilityHealth({ current = false }: { current?: boolean }) {
   const { views, user, loading, pending, error, now, openPermissions, awaitingInitialCheck } = useCapabilityContext();
   const canCheckPermissions = hasRole(user, "AgentControl.Viewer");
   const count = permissionIssues(views, now, awaitingInitialCheck).length;
   const label = !canCheckPermissions ? "Permissions: app role required"
     : error ? "Permissions: check failed" : count ? `Permissions: ${count} ${count === 1 ? "issue" : "issues"}` : "Permissions and setup";
-  return <button className="capability-health secondary" type="button" onClick={openPermissions}
-    aria-label={label} aria-busy={loading || pending} title={loading || pending ? "Checking permissions" : label}>
+  return <button className={`capability-health view-button${current ? " active" : ""}`} type="button" onClick={openPermissions}
+    aria-label="Permissions" aria-description={label} aria-current={current ? "page" : undefined}
+    aria-busy={loading || pending} title={loading || pending ? "Checking permissions" : label}>
     {loading || pending ? <LoaderCircle className="permission-spinner" size={18} aria-hidden="true" /> : <ShieldCheck size={18} aria-hidden="true" />}
-    {canCheckPermissions && !error && !count ? "Permissions" : label}
+    Permissions
+    {canCheckPermissions && !error && count > 0 ? <span className="permission-issue-count" aria-hidden="true">{count}</span> : null}
+    {error || !canCheckPermissions ? <span className="permission-issue-count" aria-hidden="true">!</span> : null}
   </button>;
 }
 

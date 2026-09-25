@@ -12,6 +12,7 @@ import {
   CircleCheck,
   ExternalLink,
   Globe2,
+  LogOut,
   RefreshCw,
 } from "lucide-react";
 import {
@@ -75,7 +76,7 @@ import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
-import { agentSortOptions, agentViewOptions, inventoryScopeAgentCount } from "./agentColumns";
+import { inventoryScopeAgentCount } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 import { inventoryAttentionReasons } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
@@ -89,7 +90,8 @@ import { UnifiedAgentTable } from "./components/UnifiedAgentTable";
 import { UnifiedAgentDetailModal } from "./components/UnifiedAgentDetailModal";
 import { AuditLogView } from "./components/AuditLogView";
 import { BulkActions, type BulkProgress, type BulkJobCommand } from "./components/BulkActions";
-import { AgentInventoryOverview } from "./components/AgentInventoryOverview";
+import { AgentInventoryOverview, AgentInventoryScopes } from "./components/AgentInventoryOverview";
+import { AgentInventoryFilters, type AgentFilterValues } from "./components/AgentInventoryFilters";
 import { CopilotUsersView } from "./components/CopilotUsersView";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
@@ -98,7 +100,6 @@ import { CsvUsageReportsSection } from "./components/CsvUsageReportsSection";
 import { DataSyncPanel, type DataSyncPanelHandle } from "./components/DataSyncPanel";
 import { AgentSyncTools } from "./components/AgentSyncTools";
 import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
-import { EnvironmentFilter } from "./components/EnvironmentFilter";
 import { SyncHistoryView } from "./components/SyncHistoryView";
 import { hasLegacyUsageStorage } from "./legacyUsageStorage";
 import {
@@ -114,7 +115,6 @@ import {
   parseWorkbenchView,
   isWorkbenchPath,
   workbenchUrl,
-  type AgentRouteState,
   type UsersRouteState,
   type SyncReportRouteState,
   type WorkbenchViewId,
@@ -123,6 +123,7 @@ import { WorkbenchActionGate, WorkbenchActionProvider } from "./workbenchActionC
 import { SavedQueryProvider } from "./components/SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 import { trapDialogFocus } from "./dialogFocus";
+import "./components/agentWorkspace.css";
 
 const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
 const bulkJobPollIntervalMs = 1_000;
@@ -258,7 +259,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [hostFilter, setHostFilter] = useState(initialAgentRoute.host);
   const [platformFilter, setPlatformFilter] = useState(initialAgentRoute.platform);
   const [createdWithinDays, setCreatedWithinDays] = useState(initialAgentRoute.createdWithinDays);
-  const [showAdvancedFilters, setShowAdvancedFilters] = useState(() => countAdvancedAgentFilters(initialAgentRoute) > 0);
   const [agentSortBy, setAgentSortBy] = useState<UnifiedAgentSort>(initialAgentRoute.sortBy);
   const [agentSortDirection, setAgentSortDirection] = useState(initialAgentRoute.sortDirection);
   const [agentPageIndex, setAgentPageIndex] = useState(initialAgentRoute.page);
@@ -454,7 +454,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setActiveView(view);
       if (view === "agents") {
         const route = parseAgentRoute(window.location.search);
-        if (countAdvancedAgentFilters(route) > 0) setShowAdvancedFilters(true);
         setQuery(route.search);
         setAgentInventoryScope(route.inventoryScope);
         setAgentView(route.agentView);
@@ -1134,10 +1133,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       : "No saved Power Platform observation. Open Sync to collect it."] : []),
   ].join(" · ");
   const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
-  const advancedFilterCount = countAdvancedAgentFilters({
-    environmentId: agentEnvironmentFilter,
-    publisher: publisherFilter,
-  });
   const hasActiveAgentFilters =
     agentView !== "all" ||
     deferredQuery.trim().length > 0 ||
@@ -1201,7 +1196,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     stateChangeTimerIds.current.clear();
     clearActiveBulkJobId();
     clearPackageSelection(user);
-    setShowAdvancedFilters(false);
     setAgents([]);
     setAgentPage(undefined);
     setUnifiedAgentPage(undefined);
@@ -2159,6 +2153,24 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (storageError) setBulkJobStorageError(storageError);
   }
 
+  function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
+    if (values.search !== undefined) handleSearchQueryChange(values.search);
+    if (values.agentView !== undefined) setAgentView(values.agentView);
+    if (values.platform !== undefined) setPlatformFilter(values.platform);
+    if (values.availability !== undefined) setAvailableToFilter(values.availability);
+    if (values.host !== undefined) setHostFilter(values.host);
+    if (values.status !== undefined) setStatusFilter(values.status);
+    if (values.createdWithinDays !== undefined) setCreatedWithinDays(values.createdWithinDays);
+    if (values.publisher !== undefined) setPublisherFilter(values.publisher);
+    if (values.environmentId !== undefined) {
+      setAgentEnvironmentFilter(values.environmentId);
+      resetPowerPlatformSelection();
+    }
+    if (values.sortBy !== undefined) setAgentSortBy(values.sortBy);
+    if (values.sortDirection !== undefined) setAgentSortDirection(values.sortDirection);
+    setAgentPageIndex(0);
+  }
+
   function handleClearAgentFilters() {
     setAgentView("all");
     handleSearchQueryChange("");
@@ -2460,15 +2472,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     <main className="app-shell">
       <header className="top-bar">
         <div className="title-block">
-          <p className="eyebrow">Tenant agent management</p>
+          <span className="brand-mark"><Bot size={21} aria-hidden="true" /></span>
           <h1>Agent Control</h1>
-        </div>
-        <div className="user-menu">
-          <CapabilityHealth />
-          <span>{user.displayName || user.username}</span>
-          <button type="button" disabled={signingOut} onClick={() => void handleSignOut()}>
-            Sign out
-          </button>
         </div>
         <nav className="view-switcher" aria-label="Primary views">
               {visibleViews.includes("agents") ? (
@@ -2514,8 +2519,15 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("sync") ? <button type="button" className={visibleActiveView === "sync" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "sync" ? "page" : undefined} onClick={() => navigateToView("sync")}>Sync{syncSetupRequired ? <small className="sync-setup-hint">Setup needed</small> : null}</button> : null}
-              <button type="button" className={visibleActiveView === "permissions" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "permissions" ? "page" : undefined} onClick={() => navigateToView("permissions")}>Permissions</button>
+              <CapabilityHealth current={visibleActiveView === "permissions"} />
         </nav>
+        <div className="user-menu">
+          <span className="account-name" title={user.username}>{user.displayName || user.username}</span>
+          <button type="button" className="secondary account-signout" aria-label="Sign out" title="Sign out"
+            disabled={signingOut} onClick={() => void handleSignOut()}>
+            <LogOut size={17} aria-hidden="true" />
+          </button>
+        </div>
       </header>
 
       {hasRole(user, "AgentControl.Viewer") && visibleActiveView === "sync" ? <AutomaticRefreshStatus
@@ -2614,18 +2626,24 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             />
           </>
         ) : (
-        <>
+        <section className="agent-workspace" aria-label="Agent inventory">
           {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
           <div className="agent-catalog-heading">
             <div className="agent-catalog-title">
               <h2>Agents <span>{visibleUnifiedAgentPage?.count.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
+            </div>
+            {canReadSensitiveUsage ? <AgentInventoryScopes
+              inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}
+              value={agentInventoryScope} onChange={handleInventoryScopeChange} /> : null}
+            <div className="agent-catalog-actions">
               <span className="last-refresh" aria-live="polite">
                 {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
                   : inventoryCollectionText}
               </span>
-            </div>
-            <div className="agent-catalog-actions">
-              {agentInventoryIssueSummary ? <button type="button" className="secondary" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>Inventory needs attention · Open Sync</button> : null}
+              {agentInventoryIssueSummary ? <button type="button" className="secondary inventory-attention"
+                aria-label="Inventory needs attention · Open Sync" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>
+                Inventory needs attention <ArrowRight size={12} aria-hidden="true" />
+              </button> : null}
               <div className="agent-catalog-export">
                 <span className="agent-refresh-indicator">
                   {loadingAgents ? <span role="status" aria-label="Updating agent results"
@@ -2636,13 +2654,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 </span>
                 <button
                   type="button"
-                  className="secondary icon-button control-icon-button"
+                  className="secondary agent-export-button"
                   aria-label={exportingCsv ? "Exporting agent inventory CSV" : "Export agent inventory CSV"}
                   title={!agentExportRevision ? "Reload saved agent inventory to obtain a valid export revision" : "Export unified agents from the current saved inventory"}
                   disabled={!canReadSensitiveUsage || loadingAgents || deferredQuery !== query || exportingCsv || !agentExportRevision || agentExportNeedsReload || (exportableAgentCount === 0 && selectedExportTargetCount === 0)}
                   onClick={requestExportCsv}
                 >
-                  <ExportIcon />
+                  <ExportIcon /> <span>Export</span>
                 </button>
               </div>
             </div>
@@ -2650,7 +2668,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
           {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
             inventory={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage} revision={officialUsageDashboardRevision}
-            inventoryScope={agentInventoryScope} onInventoryScopeChange={handleInventoryScopeChange}
+            inventoryScope={agentInventoryScope}
             reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
               principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
             view={agentView} onViewChange={view => { handleClearAgentFilters(); setAgentView(view); }} /> : null}
@@ -2684,142 +2702,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             </div>
           ) : null}
 
-          <section className="controls catalog-controls" aria-label="Filters">
-            <div
-              className="filter-section filter-section-primary"
-              aria-label="Find agents"
-            >
-              <label className="filter-search">
-                <span>Search</span>
-                <input
-                  className={
-                    query.trim().length > 0 ? "active-filter-input" : undefined
-                  }
-                  type="search"
-                  value={query}
-                  onChange={(event) =>
-                    { handleSearchQueryChange(event.target.value); setAgentPageIndex(0); }
-                  }
-                  placeholder="Name, publisher, ID, ref"
-                />
-              </label>
-              <label>
-                <span>Show agents</span>
-                <select value={agentView} title={agentViewOptions.find(option => option.value === agentView)?.description}
-                  className={agentView === "all" ? undefined : "active-filter-select"} onChange={event => {
-                  const option = agentViewOptions.find(item => item.value === event.target.value);
-                  if (!option) {
-                    setError("Choose a supported agent view.");
-                    return;
-                  }
-                  setAgentView(option.value);
-                  setAgentPageIndex(0);
-                }}>
-                  {agentViewOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </label>
-              <label>
-                <span>Built with</span>
-                <select value={effectivePlatformFilter} className={effectivePlatformFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setPlatformFilter(event.target.value); setAgentPageIndex(0); }}>
-                  <option value="all">All platforms</option>
-                  {platformOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </label>
-              <label>
-                <span>Assigned access</span>
-                <select value={availableToFilter} className={availableToFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setAvailableToFilter(event.target.value); setAgentPageIndex(0); }}>
-                  <option value="all">Any assignment</option>
-                  {availableToOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </label>
-              <label>
-                <span>Host</span>
-                <select value={hostFilter} className={hostFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setHostFilter(event.target.value); setAgentPageIndex(0); }}>
-                  <option value="all">All hosts</option>
-                  {hostOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </label>
-            </div>
-
-            <div className="filter-section agent-filter-toolbar">
-              <label className="threshold-filter">
-                <span>Created within</span>
-                <div className="number-with-unit">
-                  <input type="number" min="1" max="3650" value={createdWithinDays} className={parseOptionalPositiveInteger(createdWithinDays) ? "active-filter-input" : undefined} placeholder="Any" onChange={event => { setCreatedWithinDays(event.target.value); setAgentPageIndex(0); }} />
-                  <span>days</span>
-                </div>
-              </label>
-              <label>
-                <span>Package status</span>
-                <select
-                  className={statusFilter === "all" ? undefined : "active-filter-select"}
-                  value={statusFilter}
-                  onChange={(event) => {
-                    setStatusFilter(event.target.value as "all" | "allowed" | "blocked");
-                    setAgentPageIndex(0);
-                  }}
-                >
-                  <option value="all">All states</option>
-                  <option value="allowed">Not blocked</option>
-                  <option value="blocked">Blocked</option>
-                </select>
-              </label>
-              <label className="agent-sort-control">
-                <span>Sort</span>
-                <select
-                  value={`${agentSortBy}:${agentSortDirection}`}
-                  onChange={event => {
-                    const option = agentSortOptions.find(item => item.value === event.target.value);
-                    if (!option) {
-                      setError("Choose a supported agent sort order.");
-                      return;
-                    }
-                    setAgentSortBy(option.sortBy);
-                    setAgentSortDirection(option.direction);
-                    setAgentPageIndex(0);
-                  }}
-                >
-                  {agentSortOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-              </label>
-              <div className="agent-filter-toolbar-actions">
-                <label className="advanced-filter-toggle">
-                  <input
-                    type="checkbox"
-                    checked={showAdvancedFilters}
-                    onChange={event => setShowAdvancedFilters(event.target.checked)}
-                    aria-controls="agent-advanced-filters"
-                    aria-expanded={showAdvancedFilters}
-                  />
-                  <span>Advanced filters</span>
-                  {advancedFilterCount > 0 ? <> <span className="advanced-filter-count">{advancedFilterCount} active</span></> : null}
-                </label>
-                <button type="button" className="secondary clear-filters-button" disabled={!hasActiveAgentFilters} onClick={handleClearAgentFilters}>
-                  Clear filters
-                </button>
-              </div>
-            </div>
-
-            <div id="agent-advanced-filters" className="agent-advanced-filters" role="region" aria-label="Advanced agent filters" hidden={!showAdvancedFilters}>
-              <div className="filter-section filter-section-advanced">
-                <label>
-                  <span>Publisher</span>
-                  <select value={publisherFilter} className={publisherFilter === "all" ? undefined : "active-filter-select"} onChange={event => { setPublisherFilter(event.target.value); setAgentPageIndex(0); }}>
-                    <option value="all">All publishers</option>
-                    {publisherOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-                  </select>
-                </label>
-                <EnvironmentFilter
-                  key={agentEnvironmentFilter}
-                  options={unifiedAgentPage?.facets?.environments ?? []}
-                  value={agentEnvironmentFilter}
-                  loading={loadingAgents}
-                  onChange={value => { setAgentEnvironmentFilter(value); setAgentPageIndex(0); resetPowerPlatformSelection(); }}
-                />
-              </div>
-            </div>
-          </section>
-
           {canOperate && (selectedPowerPlatformTargets.size > 0 || pendingPowerPlatformIds.size > 0 || requestedQuarantineJobId) ? <CopilotStudioQuarantineControls
             snapshot={selectedQuarantineObservation}
             targets={[...selectedPowerPlatformTargets.values()]}
@@ -2836,12 +2718,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               Resolving bulk ref {normalizedBulkRefQuery}...
             </div>
           ) : null}
-          {loadingAgents && !unifiedAgentPage ? (
-            <div className="screen-state">Loading Copilot agents...</div>
-          ) : (
             <div className="agent-table-stack" aria-busy={loadingAgents}>
               <UnifiedAgentTable
                 records={displayedUnifiedAgents}
+                loading={loadingAgents && !unifiedAgentPage}
+                controls={<AgentInventoryFilters key={principalKey}
+                  values={{ search: query, agentView, platform: effectivePlatformFilter, availability: availableToFilter,
+                    host: hostFilter, status: statusFilter, createdWithinDays, publisher: publisherFilter,
+                    environmentId: agentEnvironmentFilter, sortBy: agentSortBy, sortDirection: agentSortDirection }}
+                  options={{ platforms: platformOptions, availability: availableToOptions, hosts: hostOptions,
+                    publishers: publisherOptions, environments: unifiedAgentPage?.facets?.environments ?? [] }}
+                  loading={loadingAgents} onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={setError} />}
                 columnPreferenceOwner={user ? JSON.stringify([user.tenantId ?? "", user.homeAccountId]) : undefined}
                 sortBy={agentSortBy}
                 sortDirection={agentSortDirection}
@@ -2883,8 +2770,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 onPageChange={setAgentPageIndex}
               />
             </div>
-          )}
-        </>
+        </section>
         )
       ) : visibleActiveView === "users" ? (
         <CopilotUsersView
@@ -3247,13 +3133,6 @@ function formatDetailLabel(value?: string) {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
-}
-
-function countAdvancedAgentFilters(filters: Pick<AgentRouteState, "environmentId" | "publisher">) {
-  return [
-    filters.environmentId.trim().length > 0,
-    filters.publisher !== "all",
-  ].filter(Boolean).length;
 }
 
 function parseOptionalPositiveInteger(value: string) {

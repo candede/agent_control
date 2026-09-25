@@ -8,7 +8,7 @@ async function renderLayout(page: Page, content: string) {
       * { box-sizing: border-box; }
       body { margin: 0; font: 16px Arial; }
       .app-shell { width: 100%; padding: 16px; }
-      .top-bar { height: 24px; }
+      .top-bar { height: 24px; margin-inline: -16px; padding-inline: 16px; }
       .fields { display: grid; gap: 8px; }
       label { display: grid; min-width: 0; }
       input, select { width: 100%; min-width: 0; font: inherit; padding: 0; border: 0; }
@@ -16,6 +16,33 @@ async function renderLayout(page: Page, content: string) {
     <main class="app-shell"><header class="top-bar">Layout fixture</header>${content}</main>
   `);
 }
+
+test("full-bleed app headers do not remove the balanced content gutters", async ({ page }) => {
+  await renderLayout(page, `<section class="agent-workspace">Saved agents</section>`);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.locator(".top-bar").evaluate(element => { element.style.marginInline = "0"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual(["Header does not fill the viewport width"]);
+  await page.locator(".top-bar").evaluate(element => { element.style.marginInline = "-16px"; });
+  await page.locator(".agent-workspace").evaluate(element => { element.style.width = "calc(100% + 8px)"; });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain("section.agent-workspace does not fill the padded app content width");
+});
+
+test("the compact agent toolbar retains nonoverlapping query and column controls", async ({ page }) => {
+  await renderLayout(page, `
+    <div class="agent-grid-tools" style="display:flex;gap:8px;position:relative">
+      <section class="catalog-controls" aria-label="Filters" style="flex:1;height:32px">Query controls</section>
+      <div class="agent-column-picker" style="width:80px;height:32px">Columns</div>
+    </div>
+  `);
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
+  await page.locator(".agent-column-picker").evaluate(element => {
+    element.style.position = "absolute";
+    element.style.left = "0";
+  });
+  expect(await page.evaluate(collectLayoutFailures, { fields: [] }))
+    .toContain(".agent-grid-tools: Filters intersects div.agent-column-picker");
+});
 
 test("field checks inspect every visible match without including hidden copies", async ({ page }) => {
   await renderLayout(page, `

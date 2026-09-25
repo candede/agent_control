@@ -110,7 +110,8 @@ test("effectively licensed users lead with useful data and support ranked employ
   await expect(page.getByText("Unlinked report identities", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Concealed report user", exact: true })).toHaveCount(0);
   await expect(page.getByText("Microsoft 365 admin center Copilot Agents usage exports")).not.toBeVisible();
-  await expect(page.locator(".capability-health")).toContainText("Permissions:");
+  await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
+  await expect(page.locator(".capability-health")).toHaveAccessibleDescription(/^Permissions: \d+ issues?$/);
   await expect(page.locator(".capability-health")).not.toContainText("provider-verified");
   if (info.project.name === "desktop") {
     const bounds = await table.boundingBox();

@@ -56,23 +56,30 @@ test("report selection updates Agents and Users without navigating away or combi
   const state = await mockReportSelection(page);
   await page.goto("/agents");
   const selector = page.getByRole("region", { name: "Report set selection" });
-  const usedCount = page.getByRole("region", { name: "Agent inventory overview" }).getByText("Reported used agents", { exact: true }).locator("..");
+  const overview = page.getByRole("region", { name: "Agent inventory overview" });
+  const usedCount = overview.getByText("Reported used agents", { exact: true }).locator("..");
   await expect(selector.getByRole("combobox", { name: "Report set", exact: true })).toHaveValue(state.first.id);
   await expect(usedCount).toContainText("2");
-  const scopes = page.getByRole("group", { name: "Inventory scope" });
-  await expect(scopes.getByRole("combobox", { name: "Report set" })).toBeVisible();
+  const scopes = page.locator(".agent-catalog-heading").getByRole("group", { name: "Inventory scope" });
+  await expect(scopes.getByRole("button")).toHaveCount(2);
+  await expect(scopes.getByRole("combobox", { name: "Report set" })).toHaveCount(0);
+  await expect(overview.getByRole("group", { name: "Inventory scope" })).toHaveCount(0);
+  await expect(overview.locator(".agent-report-context").getByRole("combobox", { name: "Report set" })).toBeVisible();
   await expect(scopes.getByRole("button", { name: "Combined inventory", exact: true })).toHaveCount(0);
   await expect(selector.getByRole("button")).toHaveCount(0);
   await expect(page.getByText(/Select one saved three-file/)).toHaveCount(0);
   expect(state.mutations).toEqual([]);
   await expect(selector.getByRole("option", { name: /Observed activity.*2026-07-01/ })).toHaveCount(1);
   if (info.project.name === "desktop") {
-    const catalog = await scopes.getByRole("button", { name: "Microsoft 365 catalog", exact: true }).boundingBox();
-    const platform = await scopes.getByRole("button", { name: "Additional Power Platform agents", exact: true }).boundingBox();
+    const scopeBounds = await scopes.boundingBox();
+    const metric = await overview.getByText("Reported active · 30 days", { exact: true }).locator("..").boundingBox();
+    const context = await overview.locator(".agent-report-context").boundingBox();
     const dropdown = await selector.getByRole("combobox").boundingBox();
-    expect(Math.abs(catalog!.y - dropdown!.y)).toBeLessThan(2);
-    expect(Math.abs(platform!.y - dropdown!.y)).toBeLessThan(2);
-    expect(dropdown!.x).toBeGreaterThan(platform!.x + platform!.width);
+    expect(context!.y).toBeCloseTo(metric!.y, 1);
+    expect(context!.x).toBeGreaterThanOrEqual(metric!.x + metric!.width - 1);
+    expect(dropdown!.y).toBeGreaterThanOrEqual(scopeBounds!.y + scopeBounds!.height);
+    expect(dropdown!.x).toBeGreaterThanOrEqual(context!.x);
+    expect(dropdown!.x + dropdown!.width).toBeLessThanOrEqual(context!.x + context!.width);
   }
   await selector.getByRole("combobox").selectOption(state.second.id);
   await expect(usedCount).toContainText("7");

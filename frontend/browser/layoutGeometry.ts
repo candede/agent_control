@@ -53,12 +53,12 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
   const left = parseFloat(style.paddingLeft), right = parseFloat(style.paddingRight);
   if (left <= 0 || right <= 0 || Math.abs(left - right) > tolerance) failures.push("App must retain balanced outer padding");
   const header = shell.querySelector(".top-bar")!.getBoundingClientRect();
-  if (Math.abs(header.left - bounds.left - left) > tolerance || Math.abs(header.right - (bounds.right - right)) > tolerance) {
-    failures.push("Header does not fill the padded app content width");
+  if (Math.abs(header.left - bounds.left) > tolerance || Math.abs(header.right - bounds.right) > tolerance) {
+    failures.push("Header does not fill the viewport width");
   }
   for (const child of Array.from(shell.children).filter(visible)) contained(child, shell);
   const surfaces = [
-    ".catalog-controls", ".agent-summary-grid", ".inventory-view", ".copilot-users",
+    ".agent-workspace", ".agent-inventory-overview", ".agent-table-stack", ".agent-summary-grid", ".inventory-view", ".copilot-users",
     ".data-sync-panel", ".audit-source-view", ".defender-hunting", ".permission-center", ".jobs-view",
   ];
   for (const surface of Array.from(shell.querySelectorAll(surfaces.join(", "))).filter(visible)) {
@@ -76,7 +76,7 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
       continue;
     }
     const rect = surface.getBoundingClientRect();
-    if (Math.abs(rect.left - header.left) > tolerance || Math.abs(rect.right - header.right) > tolerance) {
+    if (Math.abs(rect.left - bounds.left - left) > tolerance || Math.abs(rect.right - (bounds.right - right)) > tolerance) {
       failures.push(`${name(surface)} does not fill the padded app content width`);
     }
   }
@@ -171,7 +171,7 @@ export function collectLayoutFailures({ fields }: { fields: string[] }) {
     }
   }
   for (const selector of [
-    ".filter-action-buttons", ".inventory-actions", ".inline-actions", ".purview-search-actions", ".hunting-search-actions",
+    ".agent-grid-tools", ".filter-action-buttons", ".inventory-actions", ".inline-actions", ".purview-search-actions", ".hunting-search-actions",
     ".report-section-header", ".report-header-actions", ".report-window-control",
     ".permission-heading", ".permission-body", ".permission-issue-list", ".permission-issue-list > li",
     ".permission-actions", ".permission-log-setup > header", ".permission-setup-heading",
