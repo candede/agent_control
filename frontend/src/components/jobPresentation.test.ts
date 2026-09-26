@@ -5,12 +5,20 @@ import { formatJobInstant, jobDuration, jobResultCount, jobStatusLabel } from ".
 const base: WorkbenchJobSummary = {
   id: "job-1", source: "data-sync", label: "Sync", target: "3 sources",
   status: "completed", total: 3, completed: 3, partial: false,
-  canResume: false, canCancel: false, canReconcile: false,
   createdAt: "2026-09-10T09:00:00.000Z", startedAt: "2026-09-10T09:01:00.000Z",
   completedAt: "2026-09-10T09:02:05.000Z", updatedAt: "2026-09-20T09:00:00.000Z", href: "/sync",
 };
 
 describe("sync job presentation", () => {
+  it.each([
+    ["running", "Syncing"],
+    ["waiting", "Action required"],
+    ["waiting_authorization", "Sign-in required"],
+    ["succeeded", "Complete"],
+  ])("keeps the current Sync label for %s", (status, expected) => {
+    expect(jobStatusLabel({ ...base, status })).toBe(expected);
+  });
+
   it.each([
     ["provider_pending", "provider pending"],
     ["constructor", "constructor"],

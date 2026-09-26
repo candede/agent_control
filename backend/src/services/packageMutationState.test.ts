@@ -6,7 +6,7 @@ import {
   type PackageAccessMutationState, type PackageMutationState,
 } from "./packageMutationState.js";
 import { allowlistedPackage } from "./packageObservation.js";
-import { GraphPackagesClient, updatePackageAccess, verifyPackageAccessApplied, verifyPackageMutationConverged, type FetchLike } from "./graphPackages.js";
+import { GraphPackagesClient, updatePackageAccess, verifyPackageMutationConverged, type FetchLike } from "./graphPackages.js";
 
 describe("package access scope consistency", () => {
   it.each(["deployedToNoOne", "deployedToNone"])("treats %s as no access during capture, update and verification", async status => {
@@ -23,7 +23,10 @@ describe("package access scope consistency", () => {
       const update: PackageAccessUpdate = { target, mode: "replace", scope: "none", principals: [] };
       const result = await updatePackageAccess(client, "token", details.id, update, details);
       expect(result).toEqual({ changed: false, previousCount: 0, resultingCount: 0, principals: [] });
-      expect(() => verifyPackageAccessApplied(details, update, [], details)).not.toThrow();
+      const action = target === "availability" ? "update-availability" : "update-installation";
+      await expect(verifyPackageMutationConverged({ getPackageDetails: async () => details }, "token", details.id,
+        action, expectedPackageMutationState(capturePackageMutationState(details, action), action, update)))
+        .resolves.toMatchObject({ readbackCount: 1 });
     }
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -69,7 +72,8 @@ describe("package access scope consistency", () => {
         acquireUsersAndGroups: target === "installation" ? [requested] : [preserved],
       });
       const applied = { ...details, [scopeProperty]: "some", [property]: [requested] };
-      expect(() => verifyPackageAccessApplied(applied, update, result.principals, details)).not.toThrow();
+      await expect(verifyPackageMutationConverged({ getPackageDetails: async () => applied }, "token", details.id, action, expected))
+        .resolves.toMatchObject({ readbackCount: 1 });
       expect(capturePackageMutationState(applied, action)).toEqual(expected);
     });
   });

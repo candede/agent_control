@@ -61,7 +61,7 @@ test("Sync status, run details and history remain live beyond thirty minutes wit
       value: [{
         id: historyRun.id, source: "data-sync", label: "Initial sync", target: "3 sources",
         status: historyRun.status, total: 3, completed: historyRun.sources.filter(source => source.status === "succeeded").length,
-        partial: false, canResume: false, canCancel: historyRun.status === "running", canReconcile: false,
+        partial: false,
         startedAt: historyRun.startedAt, completedAt: historyRun.completedAt, syncSources: historyRun.sources.map(source => source.source),
         updatedAt: historyRun.updatedAt, href: `/sync?syncRun=${historyRun.id}`,
       }],
@@ -584,17 +584,17 @@ test("one chronological sync history combines runs and refreshes, filters outcom
   await page.route("**/api/workbench/jobs", route => route.request().method() !== "GET" ? route.fallback() : route.fulfill({ json: {
     value: [{
       id: retained.id, source: "data-sync", label: "Retained initial sync", target: "4 saved sources",
-      status: "completed", total: 4, completed: 4, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      status: "completed", total: 4, completed: 4, partial: false,
       startedAt: retained.startedAt, completedAt: retained.completedAt, syncSources: retained.sources.map(source => source.source),
       updatedAt: retained.updatedAt, href: `/agents?syncRun=${retained.id}`,
     }, {
       id: "history-package", source: "package-refresh", label: "Graph package refresh", target: "Current principal Graph package catalog",
-      status: "succeeded", total: 120, completed: 120, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      status: "succeeded", total: 120, completed: 120, partial: false,
       startedAt: "2026-09-15T10:00:20.000Z", completedAt: "2026-09-15T10:01:00.000Z",
       updatedAt: retained.updatedAt, href: "/sync?refreshJob=history-package",
     }, {
       id: "history-platform", source: "power-platform", label: "Power Platform refresh", target: "Agents and environments",
-      status: "failed", total: 10, completed: 4, partial: false, canResume: false, canCancel: false, canReconcile: false,
+      status: "failed", total: 10, completed: 4, partial: false,
       startedAt: "2026-09-15T10:00:30.000Z", completedAt: "2026-09-15T10:01:00.000Z",
       updatedAt: retained.updatedAt, href: "/sync?powerPlatformJob=history-platform",
     }],

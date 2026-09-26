@@ -16,6 +16,6 @@ export function UserPurviewAudit({ userPrincipalName }: { userPrincipalName?: st
         : <button type="button" className="secondary" aria-expanded={open} onClick={() => setOpenedFor(open ? undefined : userPrincipalName)}>
           {open ? "Close Purview audit search" : "Open Purview audit search"}
         </button>}
-    {open ? <PurviewAuditView initialUserPrincipalName={userPrincipalName} /> : null}
+    {open && userPrincipalName ? <PurviewAuditView userPrincipalName={userPrincipalName} /> : null}
   </section>;
 }

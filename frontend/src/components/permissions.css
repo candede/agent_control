@@ -84,11 +84,7 @@ button.permission-text-button { padding: 4px 0; border: 0; border-radius: 0; bac
 .permission-detail-explanation { display: grid; gap: 10px; }
 .permission-detail-explanation ul { margin: 0; padding-left: 20px; }
 .permission-details .permission-metadata { grid-template-columns: repeat(2, minmax(0, 1fr)); font-size: 13px; }
-.capability-status, .preview-badge { display: inline-flex; padding: 4px 8px; font-size: 13px; font-weight: 700; border: 1px solid #786650; border-radius: 4px; background: #fff8e6; color: #594313; }
-.status-available { background: #e4f3eb; color: #20573f; border-color: #7e9c89; }
-.capability-status.status-ready { background: #e8f0fb; color: #285989; border-color: #a3bad2; }
-.capability-status.status-disabled { background: #f0f2f2; color: #4b5956; border-color: #a4aeaa; }
-.status-provider_error, .status-missing_internal_role, .status-missing_permission { color: #832d20; background: #ffede7; border-color: #c19588; }
+.preview-badge { display: inline-flex; padding: 4px 8px; font-size: 13px; font-weight: 700; border: 1px solid #786650; border-radius: 4px; background: #fff8e6; color: #594313; }
 .preview-badge { position: relative; cursor: help; }
 .preview-badge [role="tooltip"] { display: none; position: absolute; right: 0; top: 100%; width: 230px; max-width: 65vw; padding: 12px; background: #fffdf7; color: #10211f; border: 1px solid #53605a; z-index: 10; font-weight: 400; }
 .preview-badge:hover [role="tooltip"], .preview-badge:focus [role="tooltip"] { display: block; }

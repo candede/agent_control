@@ -33,7 +33,7 @@ export function kindLabel(kind: OfficialUsageReportKind) {
   return kind === "agents" ? "Agents" : kind === "userAgents" ? "Users & agents" : "Users";
 }
 
-export function formatInstant(value: string) {
+function formatInstant(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "Time unavailable"
     : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);

@@ -132,8 +132,7 @@
 }
 
 .agent-usage-metric small,
-.agent-insight-table small,
-.agent-report-candidate small {
+.agent-insight-table small {
   display: block;
   color: var(--muted);
   font-size: 0.75rem;
@@ -228,41 +227,6 @@
   min-height: 40px;
 }
 
-.agent-report-candidates {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.agent-report-candidate {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  padding: 12px;
-  text-align: left;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: #fff;
-  color: var(--text-h);
-}
-
-.agent-report-candidate > span:first-child {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.agent-report-candidate > span:last-child {
-  flex-shrink: 0;
-  text-align: right;
-}
-
-.agent-report-candidate code {
-  font-size: 0.7rem;
-  color: var(--muted);
-}
-
 .agent-insight-pagination {
   justify-content: flex-end;
   font-size: 0.8rem;
@@ -270,14 +234,6 @@
 
 .agent-insight-pagination > span {
   margin-right: auto;
-}
-
-.agent-selected-report {
-  display: grid;
-  gap: 16px;
-  min-width: 0;
-  padding-top: 18px;
-  border-top: 1px solid var(--border);
 }
 
 .agent-insight-provenance summary {
@@ -355,10 +311,6 @@
 @media (max-width: 480px) {
   .agent-usage-insights {
     padding: 14px;
-  }
-
-  .agent-report-candidates {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .agent-usage-metric {

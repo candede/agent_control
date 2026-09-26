@@ -566,10 +566,10 @@ test("job deep links keep exact source identity and browser history without prov
   await page.route(url => url.pathname === "/api/workbench/jobs", route => route.fulfill({ json: {
     value: [
       { id: latestId, source: "package-refresh", label: "Latest refresh", target: "Current principal Graph package catalog",
-        status: "succeeded", total: 9, completed: 9, partial: false, canResume: false, canCancel: false, canReconcile: false,
+        status: "succeeded", total: 9, completed: 9, partial: false,
         updatedAt: "2026-09-10T08:00:00.000Z", href: `/agents?refreshJob=${latestId}` },
       { id: olderId, source: "package-refresh", label: "Older refresh", target: "Current principal Graph package catalog",
-        status: "succeeded", total: 3, completed: 3, partial: false, canResume: false, canCancel: false, canReconcile: false,
+        status: "succeeded", total: 3, completed: 3, partial: false,
         updatedAt: "2026-09-10T07:00:00.000Z", href: `/agents?refreshJob=${olderId}` },
     ],
     unavailableSources: [], polledAt: "2026-09-10T08:00:00.000Z", requestId: "browser-job-request",

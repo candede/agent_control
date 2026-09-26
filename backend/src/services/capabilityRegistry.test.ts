@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { appRoles, capabilityIds, hasAppRole, supportsAutomaticCapabilityCheck } from "../types/capability.js";
-import { capabilityDefinitions, hasAnyRole, resolveCapabilityStatus } from "./capabilityRegistry.js";
+import { capabilityDefinitions, hasAnyRole } from "./capabilityRegistry.js";
 import { capabilityContractRevision, capabilityPermissionRevision } from "../db/capabilities.js";
 
 describe("capability registry", () => {
@@ -55,12 +55,6 @@ describe("capability registry", () => {
     for (const definition of capabilityDefinitions.filter(definition => definition.id.startsWith("graph.package.read."))) {
       expect(definition.probe.description).toMatch(/Response-size\/time-bounded.*first-page.*documented filter.*without following pagination/);
     }
-  });
-
-  it("uses conservative status precedence", () => {
-    expect(resolveCapabilityStatus(["available", "missing_license"])).toBe("missing_license");
-    expect(resolveCapabilityStatus(["provider_error", "missing_internal_role"])).toBe("missing_internal_role");
-    expect(resolveCapabilityStatus([])).toBe("unknown");
   });
 
   it("declares only the narrow delegated agent identity permission without automatic target lookups", () => {

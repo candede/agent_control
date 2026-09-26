@@ -1,5 +1,5 @@
 import type { CopilotPackage } from "../types/copilotPackage.js";
-import type { InventoryIdentifier, InventoryIdentifierKind, PowerPlatformResource } from "../types/powerPlatformInventory.js";
+import type { InventoryIdentifier, InventoryIdentifierKind } from "../types/powerPlatformInventory.js";
 
 export type InventoryIdentityRecord = {
   nativeId: string;
@@ -51,17 +51,6 @@ export function packageInventoryIdentity(tenantId: string, value: CopilotPackage
       ...(value.manifestId ? [{ kind: "manifest_id" as const, value: value.manifestId }] : []),
       ...(value.assetId ? [{ kind: "asset_id" as const, value: value.assetId }] : []),
     ]),
-  };
-}
-
-export function powerPlatformInventoryIdentity(value: PowerPlatformResource): InventoryIdentityRecord {
-  return {
-    nativeId: value.nativeId,
-    tenantId: value.tenantId,
-    environmentId: value.environmentId,
-    sourceSystem: "power_platform",
-    resourceType: value.type,
-    identifiers: sortIdentifiers(value.identifiers),
   };
 }
 

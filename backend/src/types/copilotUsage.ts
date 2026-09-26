@@ -114,8 +114,6 @@ export type CopilotUsageUnresolvedImportedIdentity = {
   reason: "no_exact_directory_match" | "ambiguous_directory_match" | "directory_unavailable";
 };
 
-export type CopilotUsageUsersRequest = Record<string, never>;
-
 export type CopilotUsageUsersResponse = {
   generatedAt: string;
   readOnly: true;

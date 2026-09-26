@@ -8,7 +8,6 @@ function job(index: number, overrides: Partial<WorkbenchJobSummary> = {}): Workb
   return {
     id: `run-${index}`, source: "data-sync", label: `Sync ${index}`, target: "1 source",
     status: "completed", total: 1, completed: 1, partial: false,
-    canResume: false, canCancel: false, canReconcile: false,
     startedAt: `2026-09-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
     completedAt: `2026-09-${String(index + 1).padStart(2, "0")}T10:01:05.000Z`,
     updatedAt: "2026-09-20T12:00:00.000Z",
@@ -21,15 +20,12 @@ function projection(value: WorkbenchJobSummary[]): WorkbenchJobsResponse {
 }
 
 describe("SyncHistoryTable", () => {
-  it("combines sync runs and refreshes without tabs, preserving units and detail links but excluding unrelated jobs", async () => {
+  it("combines sync runs and refreshes without dashboard tabs or recovery controls, preserving units and detail links", async () => {
     const onOpenSyncRun = vi.fn();
     render(<SyncHistoryTable state={projection([
-      job(1, { status: "partial", canResume: true, canCancel: true }),
+      job(1, { status: "partial" }),
       job(2, { id: "run-1", source: "package-refresh", label: "Old Graph refresh", status: "succeeded", completed: 40, href: "/sync?refreshJob=old-job" }),
-      job(3, { source: "official-usage", label: "Report draft" }),
-      job(4, { source: "purview", label: "Audit search" }),
       job(5, { source: "power-platform", label: "Power Platform refresh", status: "succeeded", completed: 0, href: "/sync?powerPlatformJob=platform-job" }),
-      job(6, { source: "defender", label: "Agent investigation" }),
     ])} error="" onRefresh={vi.fn()} onOpenSyncRun={onOpenSyncRun} />);
     const table = screen.getByRole("table", { name: "Sync history" });
     expect(screen.queryByRole("group", { name: "History type" })).not.toBeInTheDocument();
@@ -45,9 +41,6 @@ describe("SyncHistoryTable", () => {
     expect(within(table).getAllByText("1m 5s")).toHaveLength(3);
     expect(within(table).getByRole("link", { name: /View details for Old Graph refresh/ })).toHaveAttribute("href", "/sync?refreshJob=old-job");
     expect(within(table).getByRole("link", { name: /View details for Power Platform refresh/ })).toHaveAttribute("href", "/sync?powerPlatformJob=platform-job");
-    expect(screen.queryByText("Report draft")).not.toBeInTheDocument();
-    expect(screen.queryByText("Audit search")).not.toBeInTheDocument();
-    expect(screen.queryByText("Agent investigation")).not.toBeInTheDocument();
     expect(within(table).queryByRole("button", { name: /Retry|Cancel|Resume/ })).not.toBeInTheDocument();
     await userEvent.click(within(table).getByRole("link", { name: /View details for Sync 1/ }));
     expect(onOpenSyncRun).toHaveBeenCalledExactlyOnceWith("run-1");
@@ -76,14 +69,13 @@ describe("SyncHistoryTable", () => {
 
   it("does not invent durations for older metadata and surfaces partial history failures", async () => {
     const state = projection([job(1, { startedAt: undefined, completedAt: undefined, syncSources: undefined })]);
-    state.unavailableSources = [{ source: "data-sync", code: "source_unavailable" }, { source: "package-refresh", code: "source_unavailable" }, { source: "defender", code: "source_unavailable" }];
+    state.unavailableSources = [{ source: "data-sync", code: "source_unavailable" }, { source: "package-refresh", code: "source_unavailable" }];
     const onRefresh = vi.fn();
     render(<SyncHistoryTable state={state} error="History reload failed." onRefresh={onRefresh} />);
     expect(screen.getByText("Not recorded")).toBeVisible();
     expect(screen.getByText("Last update; start not recorded")).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("History reload failed.");
     expect(screen.getByRole("status")).toHaveTextContent("History is temporarily unavailable for sync runs and Graph packages.");
-    expect(screen.getByRole("status")).not.toHaveTextContent("defender");
     await userEvent.click(screen.getByRole("button", { name: "Refresh history" }));
     expect(onRefresh).toHaveBeenCalledOnce();
   });

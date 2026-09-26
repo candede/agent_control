@@ -7,7 +7,7 @@ import { defenderHuntingTemplates, type DefenderHuntingFilters, type DefenderHun
   type DefenderHuntingAuthorityBinding, type DefenderHuntingQualificationBinding, type DefenderHuntingQualificationEvidence,
   type DefenderHuntingQueryResult, type DefenderHuntingResultScope, type DefenderHuntingRetainedScope,
   type DefenderHuntingRetainedScopeBinding,
-  type DefenderAgentInventoryRow, type DefenderHuntingRow, type DefenderHuntingRowPage, type DefenderHuntingSnapshot, type DefenderHuntingTokenMode } from "../types/defenderHunting.js";
+  type DefenderHuntingRow, type DefenderHuntingRowPage, type DefenderHuntingSnapshot, type DefenderHuntingTokenMode } from "../types/defenderHunting.js";
 import { PowerPlatformInventoryRepository, type InventoryIdentityReadScope } from "./powerPlatformInventory.js";
 import { pool, transaction } from "./pool.js";
 
@@ -394,32 +394,6 @@ export class DefenderHuntingRepository {
     const associations = await this.resolveAssociations(readScope, rows.rows.map(value => value.row_data));
     return { value: rows.rows.map((value, index) => ({ ...value.row_data, association: associations[index] })), count: job.storedRowCount,
       limit: boundedLimit, offset: boundedOffset, job, snapshot: projectSnapshot(snapshotResult.rows[0]) };
-  }
-
-  async relatedInventoryRows(scope: DefenderHuntingReadScope, entraAgentId: string, limit = 20) {
-    const read = scopedWhere(scope, "job", true);
-    const boundedLimit = Math.min(Math.max(limit, 1), 50);
-    const targetOffset = read.values.length;
-    const values = [...read.values, entraAgentId, boundedLimit];
-    const base = `FROM defender_hunting_rows row JOIN defender_hunting_snapshots snapshot
-        ON snapshot.id=row.snapshot_id AND snapshot.tenant_id=row.tenant_id
-      JOIN defender_hunting_jobs job ON job.id=snapshot.job_id AND job.tenant_id=snapshot.tenant_id
-      WHERE ${read.sql} AND job.expires_at>clock_timestamp() AND job.status IN ('succeeded','partial') AND job.query_version=3
-        AND snapshot.expires_at>clock_timestamp() AND snapshot.source_table='AgentsInfo' AND snapshot.query_version=3
-        AND row.row_data->>'projectionVersion'='3' AND row.row_data->>'sourceTable'='AgentsInfo'
-        AND row.row_data->>'entraAgentObjectId'=$${targetOffset + 1}`;
-    const [rows, count] = await Promise.all([
-      this.database.query<{ snapshot_id: string; job_id: string; row_data: DefenderAgentInventoryRow }>(
-        `SELECT row.snapshot_id,snapshot.job_id,row.row_data ${base}
-          ORDER BY row.row_data->>'observationTime' DESC,row.row_ordinal LIMIT $${targetOffset + 2}`, values),
-      this.database.query<{ count: number }>(`SELECT count(*)::int AS count ${base}`, values.slice(0, -1)),
-    ]);
-    return { count: count.rows[0].count, value: rows.rows.map(row => ({
-      jobId: row.job_id, snapshotId: row.snapshot_id, nativeRecordId: row.row_data.agentId,
-      observedAt: row.row_data.observationTime, platform: row.row_data.platform,
-      lifecycleStatus: row.row_data.lifecycleStatus, publishedStatus: row.row_data.publishedStatus,
-      matchedKind: "entra_agent_id" as const,
-    })) };
   }
 
   async recoverInterrupted() {

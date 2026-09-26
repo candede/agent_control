@@ -385,9 +385,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [lastAgentListRefreshAt, setLastAgentListRefreshAt] = useState<Date>();
   const [packageSnapshotExpiresAt, setPackageSnapshotExpiresAt] = useState<Date>();
   const [refreshingAgents, setRefreshingAgents] = useState(false);
-  const [, setRecentlyChangedAgentIds] = useState<
-    Set<string>
-  >(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const agentDetailRequestId = useRef(0);
   const agentDetailAbortController = useRef<AbortController | undefined>(undefined);
@@ -411,8 +408,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const sessionRevalidationInFlight = useRef(false);
   const resumedBulkJobIds = useRef(new Set<string>());
   const agentDetailsCache = useRef(new Map<string, CopilotPackageDetail>());
-  const stateChangeVersions = useRef(new Map<string, number>());
-  const stateChangeTimerIds = useRef(new Set<number>());
   const savedViewSearches = useRef(new Map<WorkbenchViewId, string>([
     [parseWorkbenchView(window.location.pathname), window.location.search],
   ]));
@@ -1026,7 +1021,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   useEffect(
     () => {
-      const timerIds = stateChangeTimerIds.current;
       return () => {
         agentInventoryQueries.clear();
         savedQueries.clear();
@@ -1039,9 +1033,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         bulkJobCommandRequestId.current = undefined;
         packageRefreshRequestId.current += 1;
         inventoryRefreshRequestId.current += 1;
-        for (const timerId of timerIds) {
-          window.clearTimeout(timerId);
-        }
       };
     },
     [agentInventoryQueries, savedQueries],
@@ -1286,9 +1277,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     });
     resumedBulkJobIds.current.clear();
     agentDetailsCache.current.clear();
-    stateChangeVersions.current.clear();
-    for (const timerId of stateChangeTimerIds.current) window.clearTimeout(timerId);
-    stateChangeTimerIds.current.clear();
     clearActiveBulkJobId();
     clearPackageSelection(user);
     setAgents([]);
@@ -1328,7 +1316,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setPackageSnapshotExpiresAt(undefined);
     setLoadingAgents(false);
     setRefreshingAgents(false);
-    setRecentlyChangedAgentIds(new Set());
     setExportingCsv(false);
     setAgentExportError(undefined);
     setUnifiedAgentReadError(undefined);
@@ -2168,8 +2155,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       ) {
         setSingleAccessAgentDetail(undefined);
       }
-
-      markAgentStatesChanged(changedIds);
     }
 
     setBulkResult(result);
@@ -2390,54 +2375,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         ? { ...currentDetail, isBlocked: targetBlockedState }
         : currentDetail,
     );
-    markAgentStatesChanged([...changedAgentIds]);
-  }
-
-  function markAgentStatesChanged(agentIds: string[]) {
-    const changedAgentIds = [...new Set(agentIds)];
-
-    setRecentlyChangedAgentIds((current) => {
-      const next = new Set(current);
-      let addedAnyAgent = false;
-
-      for (const agentId of changedAgentIds) {
-        if (!next.has(agentId)) {
-          next.add(agentId);
-          addedAnyAgent = true;
-        }
-      }
-
-      return addedAnyAgent ? next : current;
-    });
-
-    const versions = new Map(
-      changedAgentIds.map((agentId) => {
-        const version = (stateChangeVersions.current.get(agentId) ?? 0) + 1;
-        stateChangeVersions.current.set(agentId, version);
-        return [agentId, version] as const;
-      }),
-    );
-
-    const timerId = window.setTimeout(() => {
-      stateChangeTimerIds.current.delete(timerId);
-
-      setRecentlyChangedAgentIds((current) => {
-        const next = new Set(current);
-        let removedAnyAgent = false;
-
-        for (const [agentId, version] of versions) {
-          if (stateChangeVersions.current.get(agentId) === version) {
-            stateChangeVersions.current.delete(agentId);
-            next.delete(agentId);
-            removedAnyAgent = true;
-          }
-        }
-
-        return removedAnyAgent ? next : current;
-      });
-    }, 1600);
-
-    stateChangeTimerIds.current.add(timerId);
   }
 
   function toggleUnifiedAgentSelection(record: UnifiedAgentRecord) {

@@ -85,7 +85,7 @@ export function operationAccessLabel(view: CapabilityView, now = Date.now()) {
   return "No separate operation check";
 }
 
-export function capabilityCheckGuidance(view: CapabilityView) {
+function capabilityCheckGuidance(view: CapabilityView) {
   if (view.definition.mode === "application") {
     return "Use an explicitly approved bounded application-scope operation to check access. Check status does not run application checks.";
   }

@@ -117,25 +117,6 @@ describe.sequential("Defender hunting repository", () => {
       .rejects.toMatchObject({ code: "invalid_qualification" });
   });
 
-  it("filters source-detail matches by retained authorization before rows and counts", async () => {
-    const scope: DefenderHuntingScope = { ...principalScope, authorizationPrincipalId: "detail-reader",
-      resultScope: { kind: "principal", scopeId: "detail-reader", configurationRevision: null } };
-    const { job, execution } = await submitAndBegin("detail-visibility", scope);
-    await repository.publish(scope, job.id, execution, result([inventoryRow()]));
-    const readScope = { tenantId: scope.tenantId, authorizationPrincipalId: scope.authorizationPrincipalId,
-      resultScopes: [scope.resultScope], qualifications: [{ resultScope: scope.resultScope, authority }] };
-    const nativeId = inventoryRow().entraAgentObjectId!;
-    expect((await repository.relatedInventoryRows(readScope, nativeId)).value).toEqual(expect.arrayContaining([
-      expect.objectContaining({ jobId: job.id, matchedKind: "entra_agent_id" }),
-    ]));
-    expect(await repository.relatedInventoryRows({ ...readScope, qualifications: [] }, nativeId)).toEqual({ count: 0, value: [] });
-    const retained = await repository.requireQualifiedScope(scope, filters, authority);
-    await expect(repository.revokeRetainedScope(readScope, retained.id, "application", scope.authorizationPrincipalId))
-      .rejects.toMatchObject({ code: "not_found" });
-    await repository.revokeRetainedScope(readScope, retained.id, "delegated", scope.authorizationPrincipalId);
-    expect(await repository.relatedInventoryRows(readScope, nativeId)).toEqual({ count: 0, value: [] });
-  });
-
   it("qualifies only one exact bounded template and target scope", async () => {
     const qualifiedFilters = filters;
     const qualified = await repository.submit(principalScope, { idempotencyKey: "qualified-scope", filters: qualifiedFilters,

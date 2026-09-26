@@ -6,6 +6,8 @@ Agent Control runs only explicit, curated Microsoft Graph advanced-hunting reque
 
 The entry point is **Agents > select an agent > Activity**. The standalone Security page and navigation item are removed. Old `/security` bookmarks go to `/agents` without carrying arbitrary IDs, filters, or broad investigation jobs into an agent. Permissions and Sync link to Agents.
 
+The embedded panel requires saved agent context and no longer accepts a standalone bookmark-selected job. Its provider service, authorized saved history and job lifecycle remain active dependencies of agent investigations; removing the old page does not retire those workflows.
+
 The integration follows four boundaries:
 
 1. Resolve the current authorized saved agent on the server before enabling an investigation. Do not use display names, a canonical registry ID, a package ID, or a shared blueprint as a provider identity.

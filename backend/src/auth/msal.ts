@@ -6,7 +6,7 @@ import {
   type NetworkRequestOptions,
   type NetworkResponse,
 } from "@azure/msal-node";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { authConfigured, config, getTenantConfiguration, loginScopes, normalizeSignInUsername, type TenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
 import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, assertTenantConfiguration, authenticationScopes, authFlowLifetimeMs, tenantConfigurationFingerprint } from "./flows.js";
@@ -251,12 +251,6 @@ async function getAccount(client: MsalClient, homeAccountId: string): Promise<Ac
   const cache = client.getTokenCache();
   const account = await cache.getAccountByHomeId(homeAccountId);
   return account ?? null;
-}
-
-export function matchesAuthState(expected: string, actual: string) {
-  const left = Buffer.from(expected);
-  const right = Buffer.from(actual);
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 export function safeReturnPath(value: unknown) {

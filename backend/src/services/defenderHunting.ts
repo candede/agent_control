@@ -147,11 +147,6 @@ export class DefenderHuntingService {
     return this.repository.listJobs(await this.readScope(user, agentRecordId), limit, offset);
   }
 
-  async relatedInventoryRows(user: AuthenticatedUser, entraAgentId: string, limit = 20) {
-    requireViewer(user);
-    return this.repository.relatedInventoryRows(await this.readScope(user), entraAgentId, limit);
-  }
-
   async qualificationEvidence(user: AuthenticatedUser, agentRecordId?: string) {
     requireViewer(user);
     return this.repository.listQualificationEvidence(await this.readScope(user, agentRecordId));

@@ -41,12 +41,7 @@ export type WorkbenchMetadata = {
 export type WorkbenchJobSource =
   | "data-sync"
   | "package-refresh"
-  | "package-controls"
-  | "power-platform"
-  | "official-usage"
-  | "purview"
-  | "defender"
-  | "quarantine";
+  | "power-platform";
 
 export type WorkbenchJobSummary = {
   id: string;
@@ -58,16 +53,12 @@ export type WorkbenchJobSummary = {
   total: number | null;
   completed: number | null;
   partial: boolean;
-  canResume: boolean;
-  canCancel: boolean;
-  canReconcile: boolean;
   tokenMode?: "delegated" | "application";
   createdAt?: string;
   startedAt?: string;
   completedAt?: string;
   syncSources?: DataSyncSourceId[];
   updatedAt: string;
-  expiresAt?: string;
   href: `/${string}`;
 };
 

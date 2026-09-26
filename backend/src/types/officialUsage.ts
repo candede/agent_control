@@ -155,11 +155,6 @@ export type OfficialUsageTopUser = {
   userLastActivityDateUtc?: string;
 };
 
-export type OfficialUsageDateFilter = {
-  startDate?: string;
-  endDate?: string;
-};
-
 export type OfficialUsageAgentSort =
   | "agentName"
   | "responses"

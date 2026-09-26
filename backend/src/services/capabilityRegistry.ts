@@ -5,7 +5,6 @@ import {
   type AppRole,
   type CapabilityDefinition,
   type CapabilityId,
-  type CapabilityStatus,
 } from "../types/capability.js";
 
 const graphAudience = "https://graph.microsoft.com";
@@ -167,14 +166,6 @@ export function isAppRole(value: unknown): value is AppRole {
 
 export function hasAnyRole(actual: readonly AppRole[], required: readonly AppRole[]) {
   return required.some(role => hasAppRole(actual, role));
-}
-
-export function resolveCapabilityStatus(statuses: readonly CapabilityStatus[]): CapabilityStatus {
-  const precedence: CapabilityStatus[] = [
-    "missing_internal_role", "not_configured", "preview_disabled", "missing_permission", "missing_role",
-    "missing_license", "unsupported", "provider_error", "unknown", "available",
-  ];
-  return precedence.find(status => statuses.includes(status)) ?? "unknown";
 }
 
 if (definitions.size !== capabilityIds.length) throw new Error("Capability IDs must be unique and complete.");

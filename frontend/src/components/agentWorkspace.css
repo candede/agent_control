@@ -517,8 +517,7 @@
   flex-shrink: 0;
 }
 
-.agent-workspace select.active-filter-select,
-.agent-workspace input.active-filter-input {
+.agent-workspace select.active-filter-select {
   border-color: #a9a2e8;
   background-color: #f6f5ff;
   box-shadow: none;

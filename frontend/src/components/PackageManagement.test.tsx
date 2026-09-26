@@ -7,8 +7,6 @@ import type { CapabilityId, CapabilityView, CopilotPackageDetail, SessionUser } 
 import { BulkConfirmModal, type BulkConfirmation } from "../App";
 import { CapabilityContext } from "../capabilityContext";
 import { projectVerifiedAccessScope } from "../packageMutationState";
-import { AgentDetailModal } from "./AgentDetailModal";
-import { AgentTable } from "./AgentTable";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 
 const user: SessionUser = {
@@ -44,95 +42,6 @@ const agent: CopilotPackageDetail = {
 };
 
 describe("package management UI", () => {
-  it.each(["AgentControl.Admin", "AgentControl.Viewer"] as const)("keeps package changes scoped to %s", async role => {
-    const block = vi.fn();
-    const access = vi.fn();
-    renderWithCapabilities(
-      <AgentTable
-        agents={[agent]} selectedIds={new Set()} recentlyChangedIds={new Set()} operationsAllowed
-        selectionDisabled={false} usageByAgentId={new Map()} allMatchingSelected={false} selectedCount={0}
-        onToggleAgentSelection={vi.fn()} onToggleMatchingSelection={vi.fn()} onViewDetails={vi.fn()}
-        onManageAccess={access} onBlock={block} onUnblock={vi.fn()}
-      />,
-      [onDemandCapability("graph.package.access.manage"), onDemandCapability("graph.package.block.manage")],
-      { ...user, roles: [role] },
-    );
-    const blockButton = screen.getByRole("button", { name: "Block Research assistant" });
-    const accessButton = screen.getByRole("button", { name: "Manage access for Research assistant" });
-    if (role === "AgentControl.Admin") {
-      expect(blockButton).toBeEnabled();
-      expect(accessButton).toBeEnabled();
-    } else {
-      expect(blockButton).toBeDisabled();
-      expect(accessButton).toBeDisabled();
-    }
-    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toBeDisabled();
-    expect(block).not.toHaveBeenCalled();
-    expect(access).not.toHaveBeenCalled();
-    await userEvent.click(blockButton);
-    await userEvent.click(accessButton);
-    expect(block).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 1 : 0);
-    expect(access).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 1 : 0);
-  });
-  it("keeps saved reads usable when provider permission is missing", () => {
-    renderWithCapabilities(
-      <AgentTable
-        agents={[agent]}
-        selectedIds={new Set()}
-        recentlyChangedIds={new Set()}
-        operationsAllowed
-        selectionDisabled={false}
-        usageByAgentId={new Map()}
-        allMatchingSelected={false}
-        selectedCount={0}
-        onToggleAgentSelection={vi.fn()}
-        onToggleMatchingSelection={vi.fn()}
-        onViewDetails={vi.fn()}
-        onManageAccess={vi.fn()}
-        onBlock={vi.fn()}
-        onUnblock={vi.fn()}
-      />,
-      [capability("graph.package.read.delegated", "available"), capability("graph.package.access.manage", "missing_permission"), capability("graph.package.block.manage", "missing_permission")],
-    );
-
-    expect(screen.getByRole("button", { name: "View details for Research assistant" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Manage access for Research assistant" })).toHaveAccessibleDescription(
-      "Admin prerequisite: add delegated CopilotPackages.ReadWrite.All for https://graph.microsoft.com in the app registration and grant admin consent.",
-    );
-    expect(screen.getByRole("button", { name: "Block Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Reassign owner for Research assistant" })).toHaveAccessibleDescription(/Owner reassignment is not implemented in this app/i);
-    expect(screen.getByRole("link", { name: "Reassignment documentation for Research assistant" })).toHaveAttribute("href", "https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-reassign");
-  });
-
-  it("shows package source, maturity, deployment, freshness, and distinct block semantics", () => {
-    renderWithCapabilities(
-      <AgentDetailModal agent={agent} activeTab="package" onClose={vi.fn()} onUpdateAccess={vi.fn()} />,
-      [onDemandCapability("graph.package.access.manage")],
-    );
-
-    expect(screen.getByText("Package block")).toBeInTheDocument();
-    expect(screen.getByText("Installed for", { selector: "dt" })).toBeInTheDocument();
-    expect(screen.getByText("Microsoft Graph package catalog")).toBeInTheDocument();
-    expect(screen.getByText("v1.0 read; preview controls")).toBeInTheDocument();
-    expect(screen.getByText("Not exposed by the Graph package detail contract")).toBeInTheDocument();
-    expect(screen.getByText(/not Copilot Studio quarantine/i)).toBeInTheDocument();
-  });
-
-  it("keeps package provenance independent from other source authorities", async () => {
-    const input = userEvent.setup();
-    renderWithCapabilities(
-      <AgentDetailModal agent={agent} onClose={vi.fn()} onUpdateAccess={vi.fn()} />,
-      [onDemandCapability("graph.package.access.manage")],
-    );
-
-    await input.click(screen.getByRole("tab", { name: "Identities" }));
-    expect(screen.getByRole("heading", { name: "Exact package identities and provenance" })).toBeInTheDocument();
-    expect(screen.getByText(/not substituted as another source's native target/)).toBeInTheDocument();
-    expect(screen.getByText("graph_packages · ga · displayName")).toBeInTheDocument();
-  });
-
   it.each(["block", "unblock", "update-availability"] as const)("confirms the server-issued %s summary with appropriate detail", async operation => {
     const confirmation = mutationConfirmation(operation);
     const confirm = vi.fn();

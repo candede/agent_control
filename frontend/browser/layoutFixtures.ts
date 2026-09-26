@@ -220,7 +220,7 @@ const auditEvents: AuditEvent[] = packageNames.slice(0, 2).map((agentDisplayName
   message: index ? "Provider temporarily unavailable; saved evidence remains readable." : "Package block state verified.",
 }));
 
-export const purviewJob: PurviewAuditJob = {
+const purviewJob: PurviewAuditJob = {
   id: "77777777-7777-4777-8777-777777777777", authorizationPrincipalId: actor.homeAccountId,
   resultScope: { kind: "principal", scopeId: actor.homeAccountId, configurationRevision: null },
   tokenMode: "delegated", status: "succeeded",
@@ -260,7 +260,7 @@ const purviewRecords: PurviewAuditRecordPage = {
     messages: [{ id: "layout-message-reference", isPrompt: true }], contentAvailable: false, unknownFieldCount: 0,
   }],
 };
-export const huntingJob: DefenderHuntingJob = {
+const huntingJob: DefenderHuntingJob = {
   id: "88888888-8888-4888-8888-888888888888", authorizationPrincipalId: actor.homeAccountId,
   resultScope: purviewJob.resultScope, tokenMode: "delegated", status: "succeeded",
   filters: { templateId: "agents_inventory", startDateTime: "2026-09-12T09:00:00.000Z", endDateTime: observedAt,
@@ -311,19 +311,10 @@ const huntingRows: DefenderHuntingRowPage = {
 const jobs: WorkbenchJobsResponse = {
   value: [
     { id: "layout-inventory-refresh", source: "power-platform", label: "Power Platform inventory refresh", target: "Saved delegated resource scope",
-      status: "waiting_authorization", total: 2, completed: 0, partial: false, canResume: true, canCancel: false, canReconcile: false,
+      status: "waiting_authorization", total: 2, completed: 0, partial: false,
       updatedAt: observedAt, href: "/sync?powerPlatformJob=layout-inventory-refresh" },
-    { id: "layout-package-recovery", source: "package-controls", label: "Package access recovery", target: "3 exact saved package targets",
-      status: "waiting_authorization", total: 3, completed: 1, partial: true, canResume: true, canCancel: true, canReconcile: true,
-      updatedAt: observedAt, href: "/agents" },
-    { id: purviewJob.id, source: "purview", label: "Saved Purview compliance search", target: "Copilot interactions · delegated",
-      status: "succeeded", total: 1, completed: 1, partial: false, canResume: false, canCancel: false, canReconcile: false,
-      updatedAt: observedAt, href: "/users" },
-    { id: huntingJob.id, source: "defender", label: "Saved Defender agent inventory", target: "AgentsInfo · delegated",
-      status: "succeeded", total: 1, completed: 1, partial: false, canResume: false, canCancel: false, canReconcile: false,
-      updatedAt: observedAt, href: "/agents" },
   ],
-  unavailableSources: [{ source: "quarantine", code: "temporarily_unavailable" }], polledAt: observedAt, requestId: "layout-jobs-request",
+  unavailableSources: [], polledAt: observedAt, requestId: "layout-jobs-request",
 };
 
 export async function mockLayoutApi(page: Page) {

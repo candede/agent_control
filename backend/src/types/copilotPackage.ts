@@ -11,8 +11,6 @@ export type PackageAccessTarget = "availability" | "installation";
 
 export type PackageAccessMutationMode = "add" | "replace";
 
-export type PackageAccessScope = "specific" | "none";
-
 // Provider strings, including future values, stay raw until normalized for an access decision.
 export type PackageStatus = string;
 
@@ -127,62 +125,6 @@ export function formatAgentAuthoringTool(value: string) {
   return normalized === "copilotstudio" ? "Copilot Studio"
     : normalized === "microsoft365copilotagentbuilder" ? "Microsoft 365 Copilot Agent Builder" : formatPackageFacetLabel(value);
 }
-
-export type BulkPackageResult = {
-  id: string;
-  displayName: string;
-  status: "succeeded" | "failed" | "skipped";
-  message?: string;
-  errorCode?: string;
-  errorDetails?: unknown;
-  accessResult?: PackageAccessUpdateResult;
-};
-
-export type BulkSideEffectError = {
-  phase: "start" | "result";
-  agentId: string;
-  message: string;
-};
-
-type BulkActionResultBase = {
-  total: number;
-  succeeded: number;
-  failed: number;
-  skipped: number;
-  results: BulkPackageResult[];
-  sideEffectErrors?: BulkSideEffectError[];
-};
-
-export type BulkActionResult = BulkActionResultBase &
-  (
-    | {
-        targetBlockedState: boolean;
-        accessUpdate?: never;
-      }
-    | {
-        targetBlockedState?: never;
-        accessUpdate: PackageAccessUpdate;
-      }
-  );
-
-export type BulkPackageDetailResult =
-  | {
-      id: string;
-      status: "succeeded";
-      package: CopilotPackageDetail;
-    }
-  | {
-      id: string;
-      status: "failed";
-      message: string;
-    };
-
-export type BulkPackageDetailsResult = {
-  total: number;
-  succeeded: number;
-  failed: number;
-  results: BulkPackageDetailResult[];
-};
 
 export type GraphCollectionResponse<T> = {
   value: T[];

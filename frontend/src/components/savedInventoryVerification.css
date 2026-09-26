@@ -68,7 +68,3 @@
 .saved-power-platform-verification code {
   overflow-wrap: anywhere;
 }
-
-.coverage-item.not_requested {
-  color: var(--muted);
-}

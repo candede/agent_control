@@ -5,7 +5,7 @@ import type { WorkbenchJobSummary, WorkbenchJobsResponse } from "../api/client";
 import { useListTable, type ListColumn } from "../listTable";
 import { ListTableHead } from "./ListTableHead";
 import { formatJobInstant, jobDuration, jobResultCount, jobStatusLabel } from "./jobPresentation";
-import { syncSourceDetails, syncStatusLabel } from "./syncPresentation";
+import { syncSourceDetails } from "./syncPresentation";
 import "./dataSync.css";
 
 const pageSize = 10;
@@ -37,7 +37,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
         ? job.syncSources.map(source => syncSourceDetails[source].label).join(", ")
         : job.label,
     },
-    { id: "outcome", header: "Outcome", accessorFn: statusLabel },
+    { id: "outcome", header: "Outcome", accessorFn: jobStatusLabel },
     { id: "result", header: "Result", accessorFn: jobResultCount },
     {
       id: "duration", header: "Duration",
@@ -105,7 +105,7 @@ export function SyncHistoryTable({ state, error, loading = false, onRefresh, onO
                       ? job.syncSources.map(source => syncSourceDetails[source].label).join(", ") : job.label}</strong>
                     <small>{job.source === "data-sync" && job.syncSources?.length ? job.label : job.target}</small>
                   </td>
-                  <td><span className={`status-badge status-${job.partial && ["completed", "succeeded"].includes(job.status) ? "partial" : job.status.replaceAll("_", "-")}`}>{statusLabel(job)}</span>
+                  <td><span className={`status-badge status-${job.partial && ["completed", "succeeded"].includes(job.status) ? "partial" : job.status.replaceAll("_", "-")}`}>{jobStatusLabel(job)}</span>
                     {job.partial && !["partial", "succeeded", "completed"].includes(job.status) ? <small>Partial results</small> : null}</td>
                   <td>{resultLabel(job)}</td>
                   <td>{job.startedAt && job.completedAt
@@ -155,10 +155,6 @@ function resultLabel(job: WorkbenchJobSummary) {
   }
   if (job.status === "succeeded" && !job.partial) return `${count.toLocaleString()} records saved`;
   return `${count.toLocaleString()} reported so far`;
-}
-
-function statusLabel(job: WorkbenchJobSummary) {
-  return job.partial && ["completed", "succeeded"].includes(job.status) ? jobStatusLabel(job) : syncStatusLabel(job.status);
 }
 
 function startDate(job: WorkbenchJobSummary) {

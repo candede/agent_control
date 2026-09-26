@@ -28,7 +28,7 @@ import "./officialUsage.css";
 
 const reportGuideUrl = "https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide";
 
-export type OfficialUsageImportPanelProps = {
+type OfficialUsageImportPanelProps = {
   initialStagingId?: string;
   onChanged: () => void;
   onLegacyCleared?: () => void;

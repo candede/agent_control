@@ -70,7 +70,7 @@ export function SavedAgentInventoryVerification({
   </section>;
 }
 
-export function SavedPowerPlatformVerification({
+function SavedPowerPlatformVerification({
   snapshot, loading = false, error,
 }: ReadState & { snapshot?: InventorySnapshot | UnifiedAgentPowerPlatformObservation | null }) {
   const verification = snapshot?.verification;

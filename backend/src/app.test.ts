@@ -65,7 +65,7 @@ vi.mock("./auth/msal.js", async original => {
   }),
   createAuthorizationUrl: async () => "https://login.microsoftonline.com/fixture", redeemAuthorizationCode: async () => { authFixture.redemptions += 1; return {}; },
   toAuthenticatedUser: () => ({...authFixture.user,roles:[...authFixture.user.roles]}),
-  matchesAuthState: (left:string,right:string) => left === right, evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
+  evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
 }; });
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
   checkProgress: vi.fn(() => null),

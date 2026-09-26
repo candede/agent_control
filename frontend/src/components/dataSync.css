@@ -88,7 +88,6 @@
 .data-sync-state.state-attention { color: #79551c; background: #fff3d6; }
 .data-sync-state.state-progress { color: #285989; background: #e8f0fb; }
 .data-sync-state.state-success { color: #2f645b; background: #e9f2ed; }
-.data-sync-state.state-error { color: #973a2d; background: #fbe9e7; }
 
 .data-sync-workspace > .section-heading {
   align-items: center;

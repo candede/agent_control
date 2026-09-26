@@ -10,7 +10,7 @@ type StoredSelection = {
   ids: string[];
 };
 
-export type StoredPackageSelectionResult =
+type StoredPackageSelectionResult =
   | { status: "restored"; ids: string[] }
   | { status: "unavailable" };
 

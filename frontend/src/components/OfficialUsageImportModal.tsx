@@ -8,7 +8,7 @@ import { OfficialUsageSnapshot } from "./OfficialUsageSnapshot";
 import type { ReportLocatorState } from "./CumulativeAgentActivity";
 import "./officialUsage.css";
 
-export type OfficialUsageImportModalProps = {
+type OfficialUsageImportModalProps = {
   route?: SyncReportRouteState;
   onRouteChange: (route: SyncReportRouteState | undefined) => void;
   canManage: boolean;

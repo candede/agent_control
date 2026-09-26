@@ -15,7 +15,7 @@ const empty: WorkbenchJobsResponse = {
 };
 const entry = (label: string, overrides: Partial<WorkbenchJobSummary> = {}): WorkbenchJobSummary => ({
   id: label, label, source: "data-sync", target: "3 sources", status: "completed",
-  total: 3, completed: 3, partial: false, canResume: false, canCancel: false, canReconcile: false,
+  total: 3, completed: 3, partial: false,
   updatedAt: empty.polledAt, href: `/sync?syncRun=${label}`, ...overrides,
 });
 const fetchMock = vi.fn();
@@ -27,18 +27,19 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("Sync history", () => {
-  it("keeps collection history and exact run links without mutation, import or investigation controls", async () => {
+  it("keeps collection history and ignores retired task-dashboard sources in an older server response", async () => {
     fetchMock.mockResolvedValue(Response.json({ ...empty, value: [
-      entry("Retained sync", { status: "partial", canResume: true }),
-      entry("Control work", { source: "package-controls" }),
-      entry("CSV import", { source: "official-usage" }),
-      entry("Investigation", { source: "defender" }),
-    ] }));
+      { ...entry("Retained sync", { status: "partial" }), canResume: true, canCancel: true, canReconcile: true },
+      { ...entry("Control work"), source: "package-controls" },
+      { ...entry("CSV import"), source: "official-usage" },
+      { ...entry("Investigation"), source: "defender" },
+    ], unavailableSources: [{ source: "defender", code: "source_unavailable" }] }));
     const onOpenSyncRun = vi.fn();
     render(<SyncHistoryView user={user} onOpenSyncRun={onOpenSyncRun} />);
     expect(await screen.findByText("Retained sync")).toBeVisible();
     for (const label of ["Control work", "CSV import", "Investigation"]) expect(screen.queryByText(label)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /retry|resume|cancel/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/History is temporarily unavailable/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("link", { name: /View details for Retained sync/ }));
     expect(onOpenSyncRun).toHaveBeenCalledExactlyOnceWith("Retained sync");
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/workbench/jobs",
@@ -126,7 +127,7 @@ describe("Sync history", () => {
     let completed = false;
     fetchMock.mockImplementation(async () => Response.json({ ...empty, value: [
       entry("Active sync", { status: completed ? "completed" : "running" }),
-      entry("Active control", { source: "package-controls", status: "running" }),
+      { ...entry("Active control", { status: "running" }), source: "package-controls" },
     ] }));
     render(<SyncHistoryView user={user} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });

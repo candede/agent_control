@@ -18,21 +18,6 @@ vi.mock("../api/client", async importOriginal => ({
   downloadAdministrativeAuditCsv: vi.fn(),
 }));
 
-vi.mock("./PurviewAuditView", () => ({
-  PurviewAuditView: ({
-    initialJobId,
-    onSelectedJobChange,
-  }: {
-    initialJobId?: string;
-    onSelectedJobChange?: (jobId: string) => void;
-  }) => (
-    <section aria-label="Mock Purview">
-      <span>{initialJobId ?? "No selected Purview job"}</span>
-      <button type="button" onClick={() => onSelectedJobChange?.("older-job")}>Select older job</button>
-    </section>
-  ),
-}));
-
 const associationEvent: AuditEvent = {
   id: "association-event", operationId: "associate-agent-usage:operation-1",
   action: "associate-agent-usage", scope: "single", agentId: "agent:11111111-1111-4111-8111-111111111111",
@@ -378,7 +363,7 @@ describe("AuditLogView routing", () => {
     expect(screen.getByLabelText("Action")).toHaveValue("block");
     expect(screen.getByLabelText("Result")).toHaveValue("failed");
     expect(screen.queryByRole("tablist", { name: "Audit source" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Mock Purview" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Microsoft Purview Audit Search" })).not.toBeInTheDocument();
     expect(window.location.search).toBe("?q=saved+actor&action=block&status=failed");
     await waitFor(() => expect(getAuditEvents).toHaveBeenCalledWith(
       expect.objectContaining({ search: "saved actor", action: "block", status: "failed" }), expect.anything(),
@@ -399,7 +384,7 @@ describe("AuditLogView routing", () => {
     expect(screen.getByLabelText("Search")).toHaveValue("saved actor");
     window.history.forward();
     await waitFor(() => expect(screen.getByLabelText("Action")).toHaveValue("unblock"));
-    expect(screen.queryByRole("region", { name: "Mock Purview" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Microsoft Purview Audit Search" })).not.toBeInTheDocument();
   });
 
   it("does not rewrite a destination outside Audit before the view unmounts on browser navigation", () => {

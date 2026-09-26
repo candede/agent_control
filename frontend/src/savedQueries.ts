@@ -25,7 +25,7 @@ export function createSavedQueryClient() {
   });
 }
 
-export function useSavedQueryClient() {
+function useSavedQueryClient() {
   const shared = useContext<QueryClient | undefined>(QueryClientContext);
   // Standalone panels own an isolated client; the signed-in workbench shares one.
   const [owned] = useState(() => shared ? undefined : createSavedQueryClient());

@@ -14,8 +14,8 @@ vi.mock("../api/client", async original => ({
 }));
 vi.mock("./UserAgentResponsibility", () => ({ UserAgentResponsibility: () => null }));
 vi.mock("./PurviewAuditView", () => ({
-  PurviewAuditView: ({ initialUserPrincipalName }: { initialUserPrincipalName: string }) =>
-    <div aria-label="Scoped user search">{initialUserPrincipalName}</div>,
+  PurviewAuditView: ({ userPrincipalName }: { userPrincipalName: string }) =>
+    <div aria-label="Scoped user search">{userPrincipalName}</div>,
 }));
 
 const capability: ReturnType<typeof useCapabilityContext> = {

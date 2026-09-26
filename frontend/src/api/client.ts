@@ -1,7 +1,7 @@
-import type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityView } from "../../../backend/src/types/capability";
+import type { AppRole, CapabilityCheckProgress, CapabilityView } from "../../../backend/src/types/capability";
 import { capabilityIds, supportsAutomaticCapabilityCheck } from "../../../backend/src/types/capability";
 import type { PackageDetailFreshness, PackageStatus } from "../../../backend/src/types/copilotPackage";
-export type { PackageDetailFreshness, PackageStatus } from "../../../backend/src/types/copilotPackage";
+export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
 import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
@@ -13,35 +13,30 @@ import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob } f
 import type { InventorySourceAwareDetail, WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
 import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
-export type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../../backend/src/types/agentInvestigations";
+export type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
 import type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
-export type { AgentResponsibilityPage, AgentResponsibilityQuery } from "../../../backend/src/types/agentResponsibility";
+export type { AgentResponsibilityPage } from "../../../backend/src/types/agentResponsibility";
 import type { AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext } from "../../../backend/src/types/agentUsage";
-export type { AgentUsageAssociation, AgentUsageAssociationInput, AgentUsageAssociationRemoval, AgentUsageCandidatePage, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
+export type { AgentUsageAssociation, AgentUsageContext, AgentUsageSummary, AgentUsageTarget } from "../../../backend/src/types/agentUsage";
 import type { AgentUsageAuditAction, InventoryExportAction } from "../../../backend/src/types/audit";
-export type { InventoryExportAction } from "../../../backend/src/types/audit";
-export type { InventorySourceAwareDetail, WorkbenchJobSource, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
+export type { InventorySourceAwareDetail, WorkbenchJobSummary, WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 export type { AppRole, CapabilityCheckProgress, CapabilityId, CapabilityStatus, CapabilityView } from "../../../backend/src/types/capability";
-export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, InventoryTypeCoverage, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
-export type { InventoryRefreshJobList } from "../../../backend/src/types/powerPlatformInventory";
+export type { InventoryCoverageStatus, InventoryRefreshJob, InventorySnapshot, InventorySnapshotVerification, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export type {
   UnifiedAgentInventoryPage,
   UnifiedAgentInventoryQuery,
   UnifiedAgentInventoryVerification,
-  UnifiedAgentLinkState,
-  UnifiedAgentPresence,
   UnifiedAgentRecord,
   UnifiedAgentPowerPlatformObservation,
-  UnifiedAgentSourceFilter,
 } from "../../../backend/src/types/unifiedAgents";
-export type { OfficialUsageAgent, OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistorySummary, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
-export type { CopilotAppActivity, CopilotServicePlan, CopilotServiceState, CopilotServiceSummaryState, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
+export type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+export type { CopilotAppActivity, CopilotServicePlan, CopilotServiceSummaryState, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
 export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
-export type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
-export type { DefenderAgentActivityRow, DefenderAgentInventoryRow, DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
+export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
+export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";
 export { automaticDataSyncSourceIds, dataSyncFailureStatus } from "../../../backend/src/types/dataSync";
-export type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineJobStatus } from "../../../backend/src/types/copilotStudioQuarantine";
+export type { QuarantineAction, QuarantineJob } from "../../../backend/src/types/copilotStudioQuarantine";
 
 export type QuarantineStatusView = {
   target: { resourceNativeId: string; displayName: string; environmentId: string; botId: string };
@@ -126,7 +121,6 @@ export type SessionUser = {
 
 export type CopilotPackage = {
   id: string;
-  detailFreshness?: PackageDetailFreshness;
   displayName: string;
   type?: string;
   shortDescription?: string;
@@ -151,6 +145,7 @@ export type CopilotPackage = {
   lifecycle: "unknown";
   identityConfidence: "exact_native";
   provenance: Record<string, { sourceSystem: "graph_packages"; path: string; maturity: "ga" | "preview" }>;
+  detailFreshness?: PackageDetailFreshness;
 };
 
 export type PackageAccessEntity = {
@@ -187,7 +182,7 @@ export type PackageAccessReplacement = Extract<
   { mode: "replace" }
 >;
 
-export type PackageAccessUpdateResult = {
+type PackageAccessUpdateResult = {
   changed: boolean;
   previousCount: number;
   resultingCount: number;
@@ -200,7 +195,7 @@ export type DirectoryPrincipal = PackageAccessEntity & {
   principalKind: "user" | "securityGroup" | "microsoft365Group" | "unknown";
 };
 
-export type PackageElementDetail = {
+type PackageElementDetail = {
   elementType: string;
   elements: Array<{
     id: string;
@@ -218,7 +213,7 @@ export type CopilotPackageDetail = CopilotPackage & {
   observation?: PackageObservation;
 };
 
-export type PackageObservation = {
+type PackageObservation = {
   observedAt: string;
   expiresAt: string;
   scopeKind: "broad" | "exact";
@@ -226,7 +221,7 @@ export type PackageObservation = {
   apiMaturity?: "v1.0 read; preview controls";
 };
 
-export type PackageSnapshot = PackageObservation & {
+type PackageSnapshot = PackageObservation & {
   id: string;
   tokenMode: "delegated" | "application";
   requestedIds: string[];
@@ -249,9 +244,9 @@ export type PackagePage = {
   };
 };
 
-export type PackageCountSummary = { total: number; allowed: number; blocked: number };
-export type PackageFacetOption = { value: string; label: string };
-export type PackageListQuery = {
+type PackageCountSummary = { total: number; allowed: number; blocked: number };
+type PackageFacetOption = { value: string; label: string };
+type PackageListQuery = {
   snapshotId?: string;
   search?: string;
   operationIdPrefix?: string;
@@ -286,7 +281,7 @@ export type PackageRefreshJob = {
   finishedAt: string | null;
 };
 
-export type BulkPackageResult = {
+type BulkPackageResult = {
   id: string;
   displayName: string;
   status: "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
@@ -301,7 +296,7 @@ export type BulkPackageResult = {
   retryEligible?: boolean;
 };
 
-export type BulkSideEffectError = {
+type BulkSideEffectError = {
   phase: "start" | "result";
   agentId: string;
   message: string;
@@ -356,38 +351,19 @@ export type BulkActionJob = BulkActionJobBase &
       }
   );
 
-export type BulkPackageDetailResult =
-  | {
-      id: string;
-      status: "succeeded";
-      package: CopilotPackageDetail;
-    }
-  | {
-      id: string;
-      status: "failed";
-      message: string;
-    };
-
-export type BulkPackageDetailsResult = {
-  total: number;
-  succeeded: number;
-  failed: number;
-  results: BulkPackageDetailResult[];
-};
-
 export type BlockAuditAction = "block" | "unblock";
 export type AccessAuditAction = "update-availability" | "update-installation";
-export type ReassignAuditAction = "reassign";
+type ReassignAuditAction = "reassign";
 export type AuditAction = BlockAuditAction | AccessAuditAction | ReassignAuditAction;
-export type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
-export type HuntingReadAction = "view-hunting" | "export-hunting";
-export type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
-export type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
+type ProviderAuditReadAction = "view-audit-search" | "export-audit-search";
+type HuntingReadAction = "view-hunting" | "export-hunting";
+type HuntingLifecycleAction = "approve-hunting" | "qualify-hunting" | "submit-hunting" | "query-hunting" | "cancel-hunting" | "delete-hunting" | "revoke-hunting-scope";
+type ReportExportAction = "export-official-usage-aggregate" | "export-official-usage-users";
 export type LocalAuditAction = AuditAction | ProviderAuditReadAction | HuntingReadAction | HuntingLifecycleAction | InventoryExportAction | ReportExportAction | AgentUsageAuditAction | "export-administrative-audit";
 
-export type PackageMutationState = Record<string, unknown>;
+type PackageMutationState = Record<string, unknown>;
 
-export type PackageMutationConfirmationSummary = {
+type PackageMutationConfirmationSummary = {
   risk: true;
   operation: AuditAction;
   provider: "Microsoft Graph";
@@ -414,7 +390,7 @@ export type PackageMutationPreview = {
   summary: PackageMutationConfirmationSummary;
 };
 
-export type AuditScope = "single" | "bulk";
+type AuditScope = "single" | "bulk";
 
 export type AuditStatus = "requested" | "started" | "succeeded" | "failed" | "skipped" | "inconclusive" | "cancelled";
 
@@ -452,12 +428,12 @@ export type AuditEventsQuery = {
   search?: string;
 };
 
-export type AuditEventsResponse = {
+type AuditEventsResponse = {
   value: AuditEvent[];
   count: number;
 };
 
-export type InventoryListQuery = {
+type InventoryListQuery = {
   snapshotId: string;
   environmentId?: string;
   search?: string;
@@ -465,7 +441,7 @@ export type InventoryListQuery = {
   sortDirection?: "asc" | "desc";
 };
 
-export type AuditRequestContext = {
+type AuditRequestContext = {
   actionGroupId?: string;
 };
 
@@ -579,10 +555,6 @@ export function getWorkbenchJobs(options: { signal?: AbortSignal } = {}) {
   return request<WorkbenchJobsResponse>("/api/workbench/jobs", { signal: options.signal });
 }
 
-export function configureApplicationCapability(capabilityId: CapabilityId, enabled: boolean, sharedDataScope: boolean) {
-  return request(`/api/capabilities/${encodeURIComponent(capabilityId)}/configuration`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled, sharedDataScope }) });
-}
-
 export async function getAgents(query: PackageListQuery = {}, options: { signal?: AbortSignal } = {}) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
@@ -638,7 +610,7 @@ export function removeAgentUsageAssociation(recordId: string, input: AgentUsageA
   });
 }
 
-export type UnifiedAgentExportInput = { revision: string } & (
+type UnifiedAgentExportInput = { revision: string } & (
   | { query?: UnifiedAgentExportQuery; recordIds?: never }
   | { recordIds: string[]; query?: Pick<UnifiedAgentExportQuery, "sortBy" | "sortDirection"> }
 );
@@ -706,14 +678,6 @@ export function getPackageRefreshJobs(mode: "delegated" | "application" = "deleg
   return request<{ value: PackageRefreshJob[]; lastAttemptAt: string | null; lastSuccessAt: string | null }>(
     `/api/agents/refresh-jobs?mode=${mode}&limit=${limit}`,
   );
-}
-
-export function resumePackageRefreshJob(id: string, mode: "delegated" | "application" = "delegated") {
-  return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(id)}/resume`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
-  });
 }
 
 export function cancelPackageRefreshJob(id: string, mode: "delegated" | "application" = "delegated") {
@@ -1169,14 +1133,6 @@ function inventorySearchParams(query: InventoryListQuery) {
 
 export async function getAgentDetails(id: string, options: { signal?: AbortSignal } = {}) {
   return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}`, { signal: options.signal });
-}
-
-export async function getAgentDetailsBatch(ids: string[]) {
-  return request<BulkPackageDetailsResult>("/api/agents/details", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids }),
-  });
 }
 
 export async function searchDirectoryPrincipals(search: string, limit = 25, options: { signal?: AbortSignal } = {}) {

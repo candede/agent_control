@@ -33,7 +33,6 @@ type AgentHuntingProps = {
   entraAgentIds: string[];
   entraAgentApplicationIds?: string[];
   templates?: AgentInvestigationContext["defender"]["templates"];
-  initialJobId?: string;
 };
 
 export function DefenderHuntingView(props: AgentHuntingProps) {
@@ -42,7 +41,7 @@ export function DefenderHuntingView(props: AgentHuntingProps) {
   return <DefenderHuntingSession key={JSON.stringify([accountKey, capabilityKey(capability.views), props])} {...props} accountKey={accountKey} />;
 }
 
-function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entraAgentApplicationIds = [], templates, initialJobId, accountKey }: AgentHuntingProps & { accountKey: string }) {
+function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entraAgentApplicationIds = [], templates, accountKey }: AgentHuntingProps & { accountKey: string }) {
   const capability = useCapabilityContext();
   const readSaved = useSavedRead();
   const searchAction = useWorkbenchAction("defender.search");
@@ -50,9 +49,8 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   const actionGeneration = useRef(0);
   const actionController = useRef<AbortController | undefined>(undefined);
   const savedController = useRef(new AbortController());
-  const detailController = useRef<AbortController | undefined>(undefined);
   const selectedRef = useRef<DefenderHuntingJob | undefined>(undefined);
-  const selectionOrigin = useRef<"history" | "route">("route");
+  const selectionOrigin = useRef<"history" | "action">("history");
   const approvalGeneration = useRef(0);
   const historyGeneration = useRef(0);
   const savedReadRevision = useRef<string | undefined>(undefined);
@@ -63,6 +61,8 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyOffset, setHistoryOffset] = useState(0);
   const [selected, setSelected] = useState<DefenderHuntingJob>();
+  // Keep history recovery available after a failed read clears private job data.
+  const [canReturnToHistory, setCanReturnToHistory] = useState(false);
   const [rows, setRows] = useState<DefenderHuntingRowPage>();
   const [rowOffset, setRowOffset] = useState(0);
   const [tokenMode, setTokenMode] = useState<DefenderHuntingTokenMode>("delegated");
@@ -71,8 +71,6 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   const [operations, setOperations] = useState<string[]>(() => fallbackTemplates.find(template => template.id === templateId)?.operations.slice().sort() ?? []);
   const [startDateTime, setStartDateTime] = useState(() => localDateTime(new Date(Date.now() - 60 * 60_000)));
   const [endDateTime, setEndDateTime] = useState(() => localDateTime(new Date()));
-  const [routeJobId, setRouteJobId] = useState(initialJobId);
-  const resolvedRouteJobId = useRef<string | undefined>(undefined);
   const [approvedJob, setApprovedJob] = useState<DefenderHuntingJob>();
   const [approvalAcknowledged, setApprovalAcknowledged] = useState(false);
   const [busy, setBusy] = useState<string>();
@@ -119,19 +117,17 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   function invalidateApproval(clearSelection = true) {
     actionGeneration.current += 1;
     actionController.current?.abort();
-    detailController.current?.abort();
     approvalGeneration.current += 1;
     setApprovedJob(undefined);
     setApprovalAcknowledged(false);
     setBusy(undefined);
     if (clearSelection) {
       selectedRef.current = undefined;
-      resolvedRouteJobId.current = undefined;
       selectionOrigin.current = "history";
       setSelected(undefined);
+      setCanReturnToHistory(false);
       setRows(undefined);
       setRowOffset(0);
-      setRouteJobId(undefined);
     }
   }
 
@@ -143,7 +139,6 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     generation.current += 1;
     actionGeneration.current += 1;
     savedController.current.abort();
-    detailController.current?.abort();
     actionController.current?.abort();
     selectedRef.current = undefined;
     setBusy(undefined);
@@ -196,7 +191,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
       selectedRef.current = updated;
       setSelected(updated);
       if (!readableStatuses.has(updated.status) || updated.snapshotId !== current.snapshotId || updated.updatedAt !== current.updatedAt) setRows(undefined);
-    } else if (selectionOrigin.current !== "route") {
+    } else if (selectionOrigin.current !== "action") {
       selectJob(undefined, "history");
     }
   }
@@ -237,7 +232,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
       ]);
       if (signal.aborted || generation.current !== requestGeneration) return;
       const current = selectedRef.current;
-      if (current && selectionOrigin.current === "route" && activeStatuses.has(current.status)) {
+      if (current && selectionOrigin.current === "action" && activeStatuses.has(current.status)) {
         const job = await readSavedData(["defender-hunting-job", current.id], requestSignal => getDefenderHuntingJob(current.id, { signal: requestSignal, agentRecordId }), signal);
         if (!signal.aborted && generation.current === requestGeneration && selectedRef.current?.id === job.id) {
           selectedRef.current = job;
@@ -286,38 +281,6 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   useEffect(() => () => actionController.current?.abort(), []);
 
   useEffect(() => {
-    if (!routeJobId) return;
-    if (resolvedRouteJobId.current === routeJobId) return;
-    const requestGeneration = generation.current;
-    const controller = new AbortController();
-    detailController.current = controller;
-    selectedRef.current = undefined;
-    selectionOrigin.current = "route";
-    setSelected(undefined);
-    setRows(undefined);
-    setRowOffset(0);
-    if (savedController.current.signal.aborted) return () => controller.abort();
-    void readSavedData(
-      ["defender-hunting-job", routeJobId],
-      signal => getDefenderHuntingJob(routeJobId, { signal, agentRecordId }),
-      controller.signal,
-      "The exact Defender job is expired, deleted, or unavailable to this account. ",
-    )
-      .then(job => {
-        if (!controller.signal.aborted && generation.current === requestGeneration) {
-          selectedRef.current = job;
-          setSelected(job);
-        }
-      })
-      .catch(requestError => {
-        if (!controller.signal.aborted && generation.current === requestGeneration) {
-          failSavedRead(requestError, "The exact Defender job is expired, deleted, or unavailable to this account. ");
-        }
-      });
-    return () => controller.abort();
-  }, [agentRecordId, failSavedRead, readSavedData, routeJobId]);
-
-  useEffect(() => {
     if (!hasProgressingJobs && pollCycle === 0) return;
     // Only explicit restarts clear the budget; passive visibility changes reuse it.
     const budget = pollBudget.current ?? { deadline: Date.now() + 5 * 60_000, attempts: 0 };
@@ -351,7 +314,6 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     const requestAction = ++actionGeneration.current;
     savedController.current.abort();
     savedController.current = new AbortController();
-    detailController.current?.abort();
     actionController.current?.abort();
     const controller = new AbortController();
     actionController.current = controller;
@@ -385,7 +347,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   }
 
   async function refreshSaved(requestGeneration: number, requestAction: number, signal: AbortSignal) {
-    const exactId = selectionOrigin.current === "route" ? selectedRef.current?.id ?? routeJobId : undefined;
+    const exactId = selectionOrigin.current === "action" ? selectedRef.current?.id : undefined;
     setHistoryLoading(true);
     const [nextCatalog, history, exactJob] = await Promise.all([
       readSavedData(["defender-hunting-catalog", requestAction], requestSignal => getDefenderHuntingCatalog({ signal: requestSignal, agentRecordId }), signal),
@@ -400,7 +362,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     const lastOffset = Math.max(Math.ceil(history.count / historyPageSize) - 1, 0) * historyPageSize;
     if (historyOffset > lastOffset) await loadHistory(lastOffset, requestGeneration, signal, requestAction);
     else commitHistory(history);
-    if (exactJob && currentRequest(requestGeneration, requestAction)) selectJob(exactJob, "route");
+    if (exactJob && currentRequest(requestGeneration, requestAction)) selectJob(exactJob, "action");
   }
 
   async function handleSearch(event: FormEvent) {
@@ -410,7 +372,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     await perform("search", async (requestGeneration, requestAction, signal) => {
       const job = await submitDefenderHunt(tokenMode, filters, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
-      selectJob(job, "route"); await loadHistory(0, requestGeneration, signal, requestAction);
+      selectJob(job, "action"); await loadHistory(0, requestGeneration, signal, requestAction);
     });
   }
 
@@ -452,7 +414,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
       }
       const job = await startDefenderHuntingQualification(approvedJob.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction) || approvalGeneration.current !== approvalRequest) return;
-      setApprovedJob(job); selectJob(job, "route"); await loadHistory(0, requestGeneration, signal, requestAction);
+      setApprovedJob(job); selectJob(job, "action"); await loadHistory(0, requestGeneration, signal, requestAction);
       if (!currentRequest(requestGeneration, requestAction)) return;
       if (job.status === "succeeded") await Promise.all([loadCatalog(requestGeneration, signal, requestAction), capability.reload()]);
     });
@@ -496,7 +458,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
         signal,
       );
       if (!currentRequest(requestGeneration, requestAction)) return;
-      selectJob(page.job, "route"); setRows(page);
+      selectJob(page.job, "action"); setRows(page);
     });
   }
 
@@ -504,7 +466,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     await perform(`resume:${job.id}`, async (requestGeneration, requestAction, signal) => {
       const resumed = await resumeDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
-      selectJob(resumed, "route"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
+      selectJob(resumed, "action"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
     });
   }
 
@@ -512,7 +474,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     await perform(`cancel:${job.id}`, async (requestGeneration, requestAction, signal) => {
       const cancelled = await cancelDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
-      selectJob(cancelled, "route"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
+      selectJob(cancelled, "action"); await loadHistory(historyOffset, requestGeneration, signal, requestAction);
     });
   }
 
@@ -521,7 +483,7 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
     await perform(`delete:${job.id}`, async (requestGeneration, requestAction, signal) => {
       await deleteDefenderHunt(job.id, { signal, agentRecordId });
       if (!currentRequest(requestGeneration, requestAction)) return;
-      if (selectedRef.current?.id === job.id || routeJobId === job.id) selectJob(undefined);
+      if (selectedRef.current?.id === job.id) selectJob(undefined);
       await loadHistory(historyOffset, requestGeneration, signal, requestAction);
     });
   }
@@ -540,14 +502,13 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
   const selectedTemplate = catalog?.templates.find(template => template.id === templateId);
   const readiness = available ? qualification ? "qualified_exact_scope" : "ready_to_try" : "not_ready";
 
-  function selectJob(job: DefenderHuntingJob | undefined, origin: "history" | "route" = "history") {
-    resolvedRouteJobId.current = job?.id;
+  function selectJob(job: DefenderHuntingJob | undefined, origin: "history" | "action" = "history") {
     selectedRef.current = job;
     selectionOrigin.current = origin;
     setSelected(job);
+    setCanReturnToHistory(Boolean(job));
     setRows(undefined);
     setRowOffset(0);
-    setRouteJobId(job?.id);
   }
 
   return (
@@ -561,8 +522,8 @@ function DefenderHuntingSession({ agentRecordId, agentName, entraAgentIds, entra
       </header>
 
       {error ? <div className="error-banner" role="alert">{error}
-        {routeJobId ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => {
-          selectJob(undefined, "history");
+        {canReturnToHistory ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => {
+          selectJob(undefined);
           void perform("refresh", refreshSaved);
         }}>Return to hunting history</button> : null}
       </div> : null}

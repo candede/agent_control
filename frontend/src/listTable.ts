@@ -9,7 +9,7 @@ import {
   type SortingState,
 } from "@tanstack/react-table";
 
-export const listTableFeatures = tableFeatures({
+const listTableFeatures = tableFeatures({
   rowSortingFeature,
   sortedRowModel: createSortedRowModel(),
 });

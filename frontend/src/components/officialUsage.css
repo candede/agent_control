@@ -1,4 +1,3 @@
-.usage-page-header,
 .usage-report-context,
 .usage-modal-header,
 .usage-modal-footer {
@@ -6,10 +5,6 @@
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-}
-
-.usage-page-header {
-  flex-wrap: wrap;
 }
 
 .usage-report-selector {
@@ -39,7 +34,6 @@
   font-size: 0.8125rem;
 }
 
-.usage-page-header p,
 .usage-modal-header p,
 .usage-modal-footer span,
 .usage-report-context,
@@ -48,38 +42,9 @@
   font-size: 0.875rem;
 }
 
-.usage-page-header h2 {
-  margin-bottom: 0.35rem;
-}
-
-.usage-page-views,
-.usage-page-header-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.usage-page-header-actions { gap: 1rem; }
 .official-usage-workbench .reporting-view { gap: 12px; }
-.usage-headline-grid .metric {
-  display: grid;
-  align-content: start;
-  justify-content: stretch;
-  gap: 4px;
-  padding: 12px 16px;
-}
-
-.usage-headline-grid .metric > span { line-height: 1.4; }
-.usage-headline-grid .metric > strong { font-size: 30px; line-height: 1.2; margin: 0; }
 .reporting-view > .usage-report-details:not([open]) { padding: 4px 0; border: 0; background: none; }
 
-.usage-page-views button[aria-pressed="true"] {
-  background: var(--ink);
-  color: #fff;
-}
-
-.usage-page-views button,
 .usage-agent-explorer button,
 .official-usage-history-panel button {
   min-height: 42px;
@@ -279,7 +244,6 @@
 }
 
 .usage-report-details > summary,
-.usage-import-guidance > summary,
 .usage-date-filters > summary,
 .usage-source-files summary,
 .usage-creator-breakdown > summary {
@@ -310,19 +274,8 @@
   overflow-wrap: anywhere;
 }
 
-.summary-grid.usage-headline-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin: 0;
-}
-
 .usage-scope-note {
   margin: 0;
-}
-
-.usage-headline-grid .metric small {
-  color: var(--muted);
-  font-size: 0.75rem;
-  line-height: 1.4;
 }
 
 .usage-context-warning {
@@ -760,8 +713,7 @@
 
 .usage-selected-files small,
 .usage-managed-drafts span,
-.usage-review-table small,
-.usage-managed-table small {
+.usage-review-table small {
   display: block;
   color: var(--muted);
   font-size: 0.8rem;
@@ -789,8 +741,7 @@
   vertical-align: top;
 }
 
-.usage-review-table td,
-.usage-managed-table td {
+.usage-review-table td {
   vertical-align: top;
 }
 
@@ -828,16 +779,6 @@
 }
 
 @media (max-width: 720px) {
-  .usage-page-header-actions,
-  .usage-page-views {
-    width: 100%;
-  }
-
-  .usage-page-views button {
-    width: auto;
-    flex: 1 1 0;
-  }
-
   .usage-history-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -849,30 +790,6 @@
 
   .official-usage-workbench .reporting-view {
     gap: 12px;
-  }
-
-  .summary-grid.usage-headline-grid {
-    grid-template-columns: 1fr;
-    gap: 0.5rem;
-  }
-
-  .usage-headline-grid .metric {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    min-height: 56px;
-    padding: 0.75rem;
-  }
-
-  .usage-headline-grid .metric strong {
-    margin: 0;
-    font-size: 1.75rem;
-  }
-
-  .usage-headline-grid .metric small {
-    grid-column: 1 / -1;
   }
 
   .usage-agent-filters,

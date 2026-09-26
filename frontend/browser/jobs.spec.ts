@@ -8,7 +8,7 @@ for (const path of ["/jobs", "/jobs/?source=package-controls"]) {
     const { unexpected, commands } = await mockJobs(page, () => ({
       value: [{
         id: "retained-sync", source: "data-sync", label: "Previous sync", target: "3 sources",
-        status: "partial", total: 3, completed: 2, partial: true, canResume: true, canCancel: true, canReconcile: false,
+        status: "partial", total: 3, completed: 2, partial: true,
         updatedAt: "2026-09-20T13:05:00.000Z", href: "/sync?syncRun=retained-sync",
       }],
       unavailableSources: [], polledAt: "2026-09-20T13:05:00.000Z", requestId: "synthetic-history",

@@ -9,15 +9,7 @@ import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } fr
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
-export const workbenchViewIds = [
-  "agents",
-  "users",
-  "sync",
-  "audit",
-  "permissions",
-] as const;
-
-export type WorkbenchViewId = (typeof workbenchViewIds)[number];
+export type WorkbenchViewId = "agents" | "users" | "sync" | "audit" | "permissions";
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
@@ -76,7 +68,7 @@ export type UsersRouteState = {
   page: number;
 };
 
-export type DataSyncRouteState = {
+type DataSyncRouteState = {
   powerPlatformJobId?: string;
   syncRunId?: string;
   refreshJobId?: string;

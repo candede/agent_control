@@ -133,13 +133,6 @@ button.agent-sort-heading {
   font: inherit;
 }
 
-.unified-agent-detail-modal .expanded-detail-list > li > span:first-child {
-  display: grid;
-  gap: 0.3rem;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
 .unified-agent-detail-modal {
   box-sizing: border-box;
   width: min(1080px, calc(100vw - 48px));
@@ -192,69 +185,6 @@ button.agent-sort-heading {
   color: var(--muted);
 }
 
-.unified-agent-detail-modal .expanded-detail-list {
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-}
-
-.unified-agent-detail-modal .expanded-detail-list > li {
-  grid-template-columns: minmax(0, 1fr);
-  align-items: center;
-  gap: 16px;
-  padding: 16px;
-  background: #fff;
-}
-
-.unified-agent-detail-modal .expanded-detail-list .row-actions {
-  justify-content: flex-start;
-  flex-wrap: wrap;
-  white-space: normal;
-}
-
-.unified-agent-detail-modal .expanded-detail-list .row-actions > .capability-gate {
-  width: auto;
-  flex: 0 0 auto;
-}
-
-.package-detail-state {
-  padding: 28px;
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  color: var(--muted);
-  text-align: center;
-  background: rgba(255, 255, 255, 0.56);
-}
-
-.embedded-package-detail-host,
-.embedded-package-detail {
-  min-width: 0;
-}
-
-.embedded-package-detail {
-  display: grid;
-  gap: 16px;
-  margin-top: 6px;
-  padding-top: 20px;
-  border-top: 1px solid var(--border);
-}
-
-.embedded-package-detail .detail-stat-grid,
-.embedded-package-detail .detail-layout {
-  margin-left: 0;
-  margin-right: 0;
-}
-
-.embedded-package-detail .detail-description {
-  margin: 0;
-}
-
-.embedded-package-detail .detail-stat-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.embedded-package-detail .detail-layout {
-  margin-bottom: 0;
-}
 
 .agent-management-sections {
   display: grid;
@@ -570,14 +500,6 @@ button.agent-sort-heading {
     padding: 4px;
     font-size: 0.82rem;
     overflow-wrap: anywhere;
-  }
-
-  .unified-agent-detail-modal .expanded-detail-list > li {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .unified-agent-detail-modal .expanded-detail-list .row-actions {
-    justify-content: flex-start;
   }
 
   .unified-agent-detail-modal .agent-overview-facts {

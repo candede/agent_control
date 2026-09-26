@@ -54,10 +54,10 @@ export const agentRelevanceOptions = [
   { value: "unknown", label: "No organization or usage evidence", description: "Agents without known organizational origin, installation or linked usage. This does not establish end-user access." },
 ] as const;
 
-export type AgentColumnId = UnifiedAgentSort | "actions";
+type AgentColumnId = UnifiedAgentSort | "actions";
 export type AgentColumnFormat = "text" | "date" | "number";
 export type AgentColumnGroup = "Overview" | "Usage" | "Ownership" | "Configuration" | "Diagnostics";
-export type AgentColumnDefinition = {
+type AgentColumnDefinition = {
   id: AgentColumnId;
   label: string;
   group: AgentColumnGroup;

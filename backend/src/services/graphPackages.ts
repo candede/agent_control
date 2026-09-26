@@ -3,18 +3,12 @@ import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState, packageMutationStatesEqual, type PackageMutationState } from "./packageMutationState.js";
 import { boundedProviderJson, boundedProviderText } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
-import { mapWithConcurrency } from "./mapWithConcurrency.js";
 import type { PackageReadStage, PackageScanDiagnostics } from "./packageScanDiagnostics.js";
 import { packageRefreshExecutionDeadlineMs } from "./packageRefreshPolicy.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { normalizePackageStatus } from "../types/copilotPackage.js";
 import type {
-  BulkActionResult,
-  BulkPackageDetailResult,
-  BulkPackageDetailsResult,
-  BulkPackageResult,
-  BulkSideEffectError,
   CopilotPackage,
   CopilotPackageDetail,
   GraphCollectionResponse,
@@ -32,9 +26,6 @@ export const packageInventoryReadPolicy = {
 };
 const maximumRetryAfterMs = 5 * 60_000;
 const copilotFilter = "supportedHosts/any(h:h eq 'Copilot')";
-const bulkDetailConcurrency = 6;
-const bulkWriteConcurrency = 4;
-const bulkWritePauseMs = 250;
 const defaultRetryPolicy = {
   maxAttempts: 3,
   baseDelayMs: 2_000,
@@ -71,26 +62,6 @@ type RetryPolicy = {
   maxRetryAfterMs: number;
   now: () => number;
   delay: (delayMs: number, signal?: AbortSignal) => Promise<unknown>;
-};
-
-type BulkSetBlockedStateOptions = {
-  packageIds?: string[];
-  writeConcurrency?: number;
-  writePauseMs?: number;
-  onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
-  onPackageResult?: (result: BulkPackageResult) => void | Promise<void>;
-};
-
-type BulkUpdatePackageAccessOptions = {
-  packageIds: string[];
-  writeConcurrency?: number;
-  writePauseMs?: number;
-  onPackageStart?: (agent: CopilotPackage) => void | Promise<void>;
-  onPackageResult?: (result: BulkPackageResult) => void | Promise<void>;
-};
-
-type BulkGetPackageDetailsOptions = {
-  detailConcurrency?: number;
 };
 
 export type PackageReadOptions = {
@@ -216,19 +187,6 @@ export class GraphPackagesClient {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-      },
-      options,
-    );
-  }
-
-  async reassignPackage(accessToken: string, id: string, userId: string, options: PackageMutationOptions = { correlationId: randomUUID() }) {
-    await this.requestMutationOnce<void>(
-      `${graphBeta}/copilot/admin/catalog/packages/${encodeURIComponent(id)}/reassign`,
-      accessToken,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId }),
       },
       options,
     );
@@ -595,84 +553,6 @@ export async function verifyPackageMutationConverged(
   throw new AppError(409, "verification_inconclusive", "Microsoft Graph accepted the request but the expected package state did not converge within the bounded readback window.", { expectedState, lastState, readbackCount: maxAttempts });
 }
 
-export function verifyPackageAccessApplied(
-  details: CopilotPackageDetail,
-  update: PackageAccessUpdate,
-  expectedPrincipals: PackageAccessEntity[],
-  previousDetails: CopilotPackageDetail,
-) {
-  requirePackageIdentity(details, previousDetails.id);
-  const property = accessCollectionProperty(update.target);
-  const actualPrincipals = deduplicateAccessEntities(details[property] ?? []);
-  const actualScope = inferCurrentAccessScope(
-    details,
-    update.target,
-    actualPrincipals,
-  );
-  const expectedScope = update.scope === "none" ? "none" : "specific";
-  const preservedTarget = otherAccessTarget(update.target);
-  const preservedProperty = accessCollectionProperty(preservedTarget);
-  const expectedPreservedPrincipals = deduplicateAccessEntities(
-    previousDetails[preservedProperty] ?? [],
-  );
-  const actualPreservedPrincipals = deduplicateAccessEntities(
-    details[preservedProperty] ?? [],
-  );
-  const expectedPreservedScope = inferCurrentAccessScope(
-    previousDetails,
-    preservedTarget,
-    expectedPreservedPrincipals,
-  );
-  const actualPreservedScope = inferCurrentAccessScope(
-    details,
-    preservedTarget,
-    actualPreservedPrincipals,
-  );
-  const requestedAccessKnown = details[property] !== undefined && actualScope !== "unknown";
-  const requestedAccessApplied =
-    requestedAccessKnown &&
-    actualScope === expectedScope &&
-    sameAccessEntities(actualPrincipals, expectedPrincipals);
-  const preservedAccessKnown =
-    previousDetails[preservedProperty] !== undefined &&
-    details[preservedProperty] !== undefined &&
-    expectedPreservedScope !== "unknown" &&
-    actualPreservedScope !== "unknown";
-  const otherAccessPreserved =
-    preservedAccessKnown &&
-    actualPreservedScope === expectedPreservedScope &&
-    sameAccessEntities(actualPreservedPrincipals, expectedPreservedPrincipals);
-
-  if (requestedAccessApplied && otherAccessPreserved) {
-    return;
-  }
-
-  const message = !requestedAccessKnown
-    ? `Microsoft Graph accepted the request but the requested ${formatAccessTarget(update.target)} access setting could not be verified from incomplete readback.`
-    : !requestedAccessApplied
-      ? `Microsoft Graph accepted the request but did not apply the requested ${formatAccessScope(expectedScope)} access scope. Effective access is still ${formatAccessScope(actualScope)}.`
-      : preservedAccessKnown
-        ? `Microsoft Graph accepted the request but changed the unselected ${formatAccessTarget(preservedTarget)} access setting.`
-        : `Microsoft Graph accepted the request but preservation of the unselected ${formatAccessTarget(preservedTarget)} access setting could not be verified.`;
-  throw new AppError(
-    409,
-    "access_update_not_applied",
-    message,
-    {
-      target: update.target,
-      expectedScope,
-      actualScope,
-      expectedPrincipals,
-      actualPrincipals,
-      preservedTarget,
-      expectedPreservedScope,
-      actualPreservedScope,
-      expectedPreservedPrincipals,
-      actualPreservedPrincipals,
-    },
-  );
-}
-
 function requirePackageIdentity(details: CopilotPackageDetail, id: string) {
   if (details.id !== id) throw new AppError(502, "target_mismatch", "Provider returned a different package identity.");
 }
@@ -739,26 +619,6 @@ function inferCurrentAccessScope(
   return "unknown" as const;
 }
 
-function formatAccessScope(scope: "all" | "specific" | "none" | "unknown") {
-  if (scope === "all") {
-    return "All users";
-  }
-
-  if (scope === "specific") {
-    return "Specific users or groups";
-  }
-
-  if (scope === "none") {
-    return "No users";
-  }
-
-  return "Unknown";
-}
-
-function formatAccessTarget(target: PackageAccessUpdate["target"]) {
-  return target === "availability" ? "Available to" : "Installed for";
-}
-
 function deduplicateAccessEntities(entities: PackageAccessEntity[]) {
   const unique = new Map<string, PackageAccessEntity>();
 
@@ -781,303 +641,6 @@ export function buildCopilotAgentsListUrl() {
   const url = new URL(`${graphV1}/copilot/admin/catalog/packages`);
   url.searchParams.set("$filter", copilotFilter);
   return url.toString();
-}
-
-export async function bulkSetBlockedState(
-  client: GraphPackagesClient,
-  accessToken: string,
-  targetBlockedState: boolean,
-  options: BulkSetBlockedStateOptions = {},
-): Promise<BulkActionResult> {
-  const packages = await client.listCopilotAgents(accessToken);
-  const requestedIds = options.packageIds
-    ? new Set(options.packageIds)
-    : undefined;
-  const scopedPackages = requestedIds
-    ? packages.filter((agent) => requestedIds.has(agent.id))
-    : packages;
-  const results: BulkPackageResult[] = [];
-  const sideEffectErrors: BulkSideEffectError[] = [];
-  const writeConcurrency = normalizePositiveInteger(
-    options.writeConcurrency,
-    bulkWriteConcurrency,
-  );
-  const writePauseMs = options.writePauseMs ?? bulkWritePauseMs;
-  const recordSkippedResult = async (result: BulkPackageResult) => {
-    results.push(result);
-    await emitPackageResult(options, result, sideEffectErrors);
-  };
-
-  const actionable: CopilotPackage[] = [];
-
-  if (requestedIds) {
-    const packageIds = new Set(packages.map((agent) => agent.id));
-
-    for (const id of requestedIds) {
-      if (!packageIds.has(id)) {
-        await recordSkippedResult({
-          id,
-          displayName: id,
-          status: "failed",
-          message: "Package was not found in the Copilot catalog.",
-        });
-      }
-    }
-  }
-
-  for (const agent of scopedPackages) {
-    if (agent.isBlocked === targetBlockedState) {
-      await emitPackageStart(options, agent, sideEffectErrors);
-      await recordSkippedResult({
-        id: agent.id,
-        displayName: agent.displayName,
-        status: "skipped",
-        message: targetBlockedState ? "Already blocked" : "Already unblocked",
-      });
-      continue;
-    }
-
-    actionable.push(agent);
-  }
-
-  const taskResults = await mapWithConcurrency(
-    actionable,
-    writeConcurrency,
-    async (agent) => {
-      await emitPackageStart(options, agent, sideEffectErrors);
-      let result: BulkPackageResult;
-
-      try {
-        if (writePauseMs > 0) {
-          await delay(writePauseMs);
-        }
-
-        if (targetBlockedState) {
-          await client.blockPackage(accessToken, agent.id);
-        } else {
-          await client.unblockPackage(accessToken, agent.id);
-        }
-
-        result = {
-          id: agent.id,
-          displayName: agent.displayName,
-          status: "succeeded" as const,
-        };
-      } catch (error) {
-        result = {
-          id: agent.id,
-          displayName: agent.displayName,
-          status: "failed" as const,
-          message:
-            error instanceof Error ? error.message : "Unknown Graph error",
-          errorCode: error instanceof AppError ? error.code : undefined,
-          errorDetails: error instanceof AppError ? error.details : undefined,
-        };
-      }
-
-      await emitPackageResult(options, result, sideEffectErrors);
-      return result;
-    },
-  );
-
-  results.push(...taskResults);
-
-  return {
-    targetBlockedState,
-    total: requestedIds?.size ?? packages.length,
-    succeeded: results.filter((result) => result.status === "succeeded").length,
-    failed: results.filter((result) => result.status === "failed").length,
-    skipped: results.filter((result) => result.status === "skipped").length,
-    results,
-    sideEffectErrors:
-      sideEffectErrors.length > 0 ? sideEffectErrors : undefined,
-  };
-}
-
-export async function bulkUpdatePackageAccess(
-  client: GraphPackagesClient,
-  accessToken: string,
-  update: PackageAccessUpdate,
-  options: BulkUpdatePackageAccessOptions,
-): Promise<BulkActionResult> {
-  const packages = await client.listCopilotAgents(accessToken);
-  const requestedIds = new Set(options.packageIds);
-  const packageById = new Map(packages.map((agent) => [agent.id, agent]));
-  const results: BulkPackageResult[] = [];
-  const sideEffectErrors: BulkSideEffectError[] = [];
-  const writeConcurrency = normalizePositiveInteger(
-    options.writeConcurrency,
-    bulkWriteConcurrency,
-  );
-  const writePauseMs = options.writePauseMs ?? bulkWritePauseMs;
-
-  for (const id of requestedIds) {
-    if (packageById.has(id)) {
-      continue;
-    }
-
-    const result: BulkPackageResult = {
-      id,
-      displayName: id,
-      status: "failed",
-      message: "Package was not found in the Copilot catalog.",
-    };
-    results.push(result);
-    await emitPackageResult(options, result, sideEffectErrors);
-  }
-
-  const scopedPackages = [...requestedIds].flatMap((id) => {
-    const agent = packageById.get(id);
-    return agent ? [agent] : [];
-  });
-  const taskResults = await mapWithConcurrency(
-    scopedPackages,
-    writeConcurrency,
-    async (agent): Promise<BulkPackageResult> => {
-      await emitPackageStart(options, agent, sideEffectErrors);
-      let result: BulkPackageResult;
-
-      try {
-        if (writePauseMs > 0) {
-          await delay(writePauseMs);
-        }
-
-        const currentDetails = await client.getPackageDetails(
-          accessToken,
-          agent.id,
-        );
-        const accessResult = await updatePackageAccess(
-          client,
-          accessToken,
-          agent.id,
-          update,
-          currentDetails,
-        );
-
-        if (accessResult.changed) {
-          const updatedDetails = await client.getPackageDetails(
-            accessToken,
-            agent.id,
-          );
-          verifyPackageAccessApplied(
-            updatedDetails,
-            update,
-            accessResult.principals,
-            currentDetails,
-          );
-        }
-
-        result = {
-          id: agent.id,
-          displayName: agent.displayName,
-          status: accessResult.changed ? "succeeded" : "skipped",
-          message: accessResult.changed ? undefined : "Access already assigned",
-          accessResult,
-        };
-      } catch (error) {
-        result = {
-          id: agent.id,
-          displayName: agent.displayName,
-          status: "failed",
-          message:
-            error instanceof Error ? error.message : "Unknown Graph error",
-          errorCode: error instanceof AppError ? error.code : undefined,
-          errorDetails: error instanceof AppError ? error.details : undefined,
-        };
-      }
-
-      await emitPackageResult(options, result, sideEffectErrors);
-      return result;
-    },
-  );
-
-  results.push(...taskResults);
-
-  return {
-    accessUpdate: update,
-    total: requestedIds.size,
-    succeeded: results.filter((result) => result.status === "succeeded").length,
-    failed: results.filter((result) => result.status === "failed").length,
-    skipped: results.filter((result) => result.status === "skipped").length,
-    results,
-    sideEffectErrors:
-      sideEffectErrors.length > 0 ? sideEffectErrors : undefined,
-  };
-}
-
-async function emitPackageStart(
-  options: BulkSetBlockedStateOptions | BulkUpdatePackageAccessOptions,
-  agent: CopilotPackage,
-  sideEffectErrors: BulkSideEffectError[],
-) {
-  try {
-    await options.onPackageStart?.(agent);
-  } catch (error) {
-    sideEffectErrors.push({
-      phase: "start",
-      agentId: agent.id,
-      message: errorMessage(error),
-    });
-  }
-}
-
-async function emitPackageResult(
-  options: BulkSetBlockedStateOptions | BulkUpdatePackageAccessOptions,
-  result: BulkPackageResult,
-  sideEffectErrors: BulkSideEffectError[],
-) {
-  try {
-    await options.onPackageResult?.(result);
-  } catch (error) {
-    sideEffectErrors.push({
-      phase: "result",
-      agentId: result.id,
-      message: errorMessage(error),
-    });
-  }
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Unknown side-effect error";
-}
-
-export async function bulkGetPackageDetails(
-  client: GraphPackagesClient,
-  accessToken: string,
-  ids: string[],
-  options: BulkGetPackageDetailsOptions = {},
-): Promise<BulkPackageDetailsResult> {
-  const detailConcurrency = normalizePositiveInteger(
-    options.detailConcurrency,
-    bulkDetailConcurrency,
-  );
-  const results = await mapWithConcurrency(
-    ids,
-    detailConcurrency,
-    async (id): Promise<BulkPackageDetailResult> => {
-      try {
-        return {
-          id,
-          status: "succeeded",
-          package: await client.getPackageDetails(accessToken, id),
-        };
-      } catch (error) {
-        return {
-          id,
-          status: "failed",
-          message:
-            error instanceof Error ? error.message : "Unknown Graph error",
-        };
-      }
-    },
-  );
-
-  return {
-    total: ids.length,
-    succeeded: results.filter((result) => result.status === "succeeded").length,
-    failed: results.filter((result) => result.status === "failed").length,
-    results,
-  };
 }
 
 export async function graphError(response: Response, signal?: AbortSignal) {
@@ -1245,15 +808,4 @@ async function waitForReadRetry<T>(wait: (delayMs: number, signal?: AbortSignal)
   } finally {
     removeAbort();
   }
-}
-
-function normalizePositiveInteger(value: number | undefined, fallback: number) {
-  if (value === undefined) {
-    return fallback;
-  }
-
-  const normalized = Math.trunc(value);
-  return Number.isSafeInteger(normalized) && normalized > 0
-    ? normalized
-    : fallback;
 }

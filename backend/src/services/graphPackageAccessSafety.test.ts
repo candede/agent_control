@@ -1,15 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
-import type { PackageAccessUpdate } from "../types/copilotPackage.js";
+import type { CopilotPackageDetail, PackageAccessUpdate } from "../types/copilotPackage.js";
 import {
   GraphPackagesClient,
-  bulkGetPackageDetails,
-  bulkUpdatePackageAccess,
   updatePackageAccess,
-  verifyPackageAccessApplied,
+  verifyPackageMutationConverged,
   type FetchLike,
 } from "./graphPackages.js";
 import { allowlistedPackage } from "./packageObservation.js";
+import { capturePackageMutationState, expectedPackageMutationState } from "./packageMutationState.js";
 
 const principal = { resourceType: "group", resourceId: "group-1" };
 const otherPrincipal = { resourceType: "user", resourceId: "user-1" };
@@ -22,18 +21,18 @@ const replacement: PackageAccessUpdate = {
   target: "availability", mode: "replace", scope: "specific", principals: [principal],
 };
 
+function verifyAccessReadback(details: CopilotPackageDetail, update = replacement, before = allowlistedPackage(base)) {
+  const action = update.target === "availability" ? "update-availability" : "update-installation";
+  const expected = expectedPackageMutationState(capturePackageMutationState(before, action), action, update);
+  return verifyPackageMutationConverged({ getPackageDetails: async () => details }, "token", before.id, action, expected, { maxAttempts: 1 });
+}
+
 describe("exact package access targets", () => {
   it("rejects a different detail identity without retrying", async () => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json({ ...base, id: "P_other" }));
     await expect(new GraphPackagesClient(fetcher).getPackageDetails("token", base.id))
       .rejects.toMatchObject({ status: 502, code: "target_mismatch" });
     expect(fetcher).toHaveBeenCalledOnce();
-  });
-
-  it("does not label mismatched bulk details as successful", async () => {
-    const fetcher = vi.fn<FetchLike>(async () => Response.json({ ...base, id: "P_other" }));
-    const result = await bulkGetPackageDetails(new GraphPackagesClient(fetcher), "token", [base.id]);
-    expect(result).toMatchObject({ total: 1, succeeded: 0, failed: 1, results: [{ id: base.id, status: "failed" }] });
   });
 
   it("rejects mismatched supplied details before the dispatch hook", async () => {
@@ -46,10 +45,9 @@ describe("exact package access targets", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("does not verify matching access on a different package", () => {
+  it("does not verify matching access on a different package", async () => {
     const after = allowlistedPackage({ ...base, id: "P_other", availableTo: "some", allowedUsersAndGroups: [principal] });
-    expect(() => verifyPackageAccessApplied(after, replacement, [principal], allowlistedPackage(base)))
-      .toThrow(expect.objectContaining({ code: "target_mismatch" }));
+    await expect(verifyAccessReadback(after)).rejects.toMatchObject({ code: "target_mismatch" });
   });
 });
 
@@ -76,26 +74,38 @@ describe("complete package access state", () => {
   });
 
   it.each(["allowedUsersAndGroups", "acquireUsersAndGroups"] as const)(
-    "does not verify an empty scope when readback omitted %s", property => {
+    "does not verify an empty scope when readback omitted %s", async property => {
       const update: PackageAccessUpdate = { target: "availability", mode: "replace", scope: "none", principals: [] };
       const after = allowlistedPackage({ ...base, [property]: undefined });
-      expect(() => verifyPackageAccessApplied(after, update, [], allowlistedPackage(base)))
-        .toThrow(expect.objectContaining({ code: "access_update_not_applied", message: expect.stringContaining("could not be verified") }));
+      await expect(verifyAccessReadback(after, update)).rejects.toMatchObject({ code: "incomplete_package_access_state" });
     },
   );
 
   it("cannot verify preservation when the previous collection was absent", () => {
     const after = allowlistedPackage({ ...base, availableTo: "some", allowedUsersAndGroups: [principal] });
     const before = allowlistedPackage({ ...base, acquireUsersAndGroups: undefined });
-    expect(() => verifyPackageAccessApplied(after, replacement, [principal], before))
-      .toThrow(expect.objectContaining({ code: "access_update_not_applied" }));
+    expect(() => verifyAccessReadback(after, replacement, before))
+      .toThrow(expect.objectContaining({ code: "incomplete_package_access_state" }));
   });
 
   it("cannot verify preservation when both old and new scopes are unknown", () => {
     const before = allowlistedPackage({ ...base, deployedTo: "futureScope" });
     const after = { ...before, availableTo: "some", allowedUsersAndGroups: [principal] };
-    expect(() => verifyPackageAccessApplied(after, replacement, [principal], before))
-      .toThrow(expect.objectContaining({ code: "access_update_not_applied" }));
+    expect(() => verifyAccessReadback(after, replacement, before))
+      .toThrow(expect.objectContaining({ code: "ambiguous_access_scope" }));
+  });
+
+  it.each([
+    { name: "unchanged effective scope", scope: "none", after: { availableTo: "all", deployedTo: "all" } },
+    { name: "different requested principals", scope: "specific", after: { availableTo: "some", deployedTo: "all", allowedUsersAndGroups: [otherPrincipal] } },
+    { name: "changed unselected setting", scope: "none", after: { availableTo: "none", deployedTo: "none" } },
+  ] as const)("rejects accepted access writes with $name", async ({ scope, after }) => {
+    const before = allowlistedPackage({ ...base, availableTo: "all", deployedTo: "all" });
+    const update: PackageAccessUpdate = scope === "none"
+      ? { target: "availability", mode: "replace", scope, principals: [] }
+      : replacement;
+    await expect(verifyAccessReadback(allowlistedPackage({ ...base, ...after }), update, before))
+      .rejects.toMatchObject({ code: "verification_inconclusive", details: { readbackCount: 1 } });
   });
 
   it.each(["availability", "installation"] as const)("refuses a %s write when the unselected scope is unknown", async target => {
@@ -109,24 +119,6 @@ describe("complete package access state", () => {
       .rejects.toMatchObject({ code: "ambiguous_access_scope" });
     expect(beforeWrite).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
-  });
-
-  it("reports missing readback collections as failed in best-effort bulk access updates", async () => {
-    let reads = 0;
-    const fetcher = vi.fn<FetchLike>(async (url, init) => {
-      if (init?.method === "PATCH") return new Response(null, { status: 204 });
-      if (new URL(url).pathname.endsWith("/packages")) return Response.json({ value: [base] });
-      reads += 1;
-      return Response.json(reads === 1 ? { ...base, availableTo: "all" } : { ...base, allowedUsersAndGroups: undefined });
-    });
-    const result = await bulkUpdatePackageAccess(new GraphPackagesClient(fetcher), "token",
-      { target: "availability", mode: "replace", scope: "none", principals: [] },
-      { packageIds: [base.id], writePauseMs: 0 });
-    expect(result).toMatchObject({
-      total: 1, succeeded: 0, failed: 1,
-      results: [{ id: base.id, status: "failed", errorCode: "access_update_not_applied" }],
-    });
-    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(1);
   });
 
   it.each([
@@ -165,7 +157,8 @@ describe("complete package access state", () => {
       acquireUsersAndGroups: [otherPrincipal],
     });
     const after = { ...before, availableTo: "some", allowedUsersAndGroups: [principal] };
-    expect(() => verifyPackageAccessApplied(after, update, result.principals, before)).not.toThrow();
+    await expect(verifyAccessReadback(after, { ...replacement, principals: result.principals }, before))
+      .resolves.toMatchObject({ readbackCount: 1 });
   });
 });
 

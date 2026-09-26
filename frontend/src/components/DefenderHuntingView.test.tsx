@@ -14,9 +14,8 @@ const agentRecordId = "power_platform:environment-a:agent-a";
 const entraAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const applicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const savedAccountKey = JSON.stringify(["tenant-a", "security-a", ["AgentControl.Admin"]]);
-let initialJobId: string | undefined;
 function DefenderHuntingView() {
-  return <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent" entraAgentIds={[entraAgentId]} entraAgentApplicationIds={[applicationId]} initialJobId={initialJobId} />;
+  return <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent" entraAgentIds={[entraAgentId]} entraAgentApplicationIds={[applicationId]} />;
 }
 
 function render(ui: ReactNode, reactStrictMode = false) {
@@ -93,7 +92,6 @@ function renderView(available = true, roles?: readonly ("AgentControl.Viewer" | 
 
 beforeEach(() => {
   vi.resetAllMocks();
-  initialJobId = undefined;
   window.history.replaceState({}, "", "/agents?detail=agent-a&detailTab=audit-security");
   vi.mocked(getDefenderHuntingCatalog).mockResolvedValue(catalog);
   vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
@@ -183,19 +181,6 @@ describe("DefenderHuntingView", () => {
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
-  it("loads the exact older deep-linked job without selecting the latest history item or calling a provider", async () => {
-    const latest = job({ id: "99999999-9999-4999-8999-999999999999", localRequestId: "latest-request" });
-    const older = job({ id: "88888888-8888-4888-8888-888888888888", localRequestId: "older-request" });
-    initialJobId = older.id;
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [latest], count: 21, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue(older);
-    renderView();
-
-    expect(await screen.findByText("older-request")).toBeVisible();
-    expect(getDefenderHuntingJob).toHaveBeenCalledWith(older.id, expect.objectContaining({ signal: expect.any(AbortSignal) }));
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
-
   it("aborts an old principal's history read and never renders its late rows", async () => {
     let resolveStaleHistory!: (value: Awaited<ReturnType<typeof getDefenderHuntingJobs>>) => void;
     let staleSignal!: AbortSignal;
@@ -225,17 +210,6 @@ describe("DefenderHuntingView", () => {
     expect(screen.queryByRole("button", { name: /View hunt 11111111/ })).not.toBeInTheDocument();
   });
 
-  it("does not pretend the latest row is an exact job outside the current scope", async () => {
-    const latest = job({ localRequestId: "latest-request" });
-    initialJobId = "other-principal";
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [latest], count: 1, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingJob).mockRejectedValue(new Error("Not found"));
-    renderView();
-
-    expect(await screen.findByText(/exact Defender job is expired, deleted, or unavailable/i)).toBeVisible();
-    expect(screen.queryByText("latest-request")).not.toBeInTheDocument();
-  });
-
   it("submits an explicit fixed template with typed filters and no KQL or workspace field", async () => {
     vi.mocked(submitDefenderHunt).mockResolvedValue(job());
     renderView();
@@ -243,6 +217,7 @@ describe("DefenderHuntingView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     expect(submitDefenderHunt).toHaveBeenCalledWith("delegated", expect.objectContaining({ templateId: "agents_inventory", operations: [], agentIds: [], blueprintIds: [], actorObjectIds: [] }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(await screen.findByRole("heading", { name: "Defender agent inventory result" })).toBeVisible();
     const submitted = vi.mocked(submitDefenderHunt).mock.calls[0][1] as unknown as Record<string, unknown>;
     expect(submitted).not.toHaveProperty("Query");
     expect(submitted).not.toHaveProperty("workspaceId");
@@ -473,6 +448,23 @@ describe("DefenderHuntingView", () => {
     expect(screen.getByText("Hunting history unavailable")).toBeVisible();
   });
 
+  it.each([403, 503])("keeps explicit history recovery after a selected result fails with %s", async status => {
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [job()], count: 1, limit: 20, offset: 0 });
+    vi.mocked(getDefenderHuntingRows).mockRejectedValue(new ApiError(status, "saved_read_failed", "Saved result unavailable"));
+    renderView();
+    fireEvent.click(await screen.findByRole("button", { name: /View hunt 11111111/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved result unavailable");
+    expect(screen.queryByRole("button", { name: /View hunt 11111111/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Return to hunting history" }));
+    expect(await screen.findByRole("button", { name: /View hunt 11111111/ })).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
+    expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
+    expect(getDefenderHuntingJob).not.toHaveBeenCalled();
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+  });
+
   it("does not restore history when another concurrent saved read denies access", async () => {
     const history = { value: [job()], count: 1, limit: 20, offset: 0 };
     let finish!: (value: typeof history) => void;
@@ -487,54 +479,6 @@ describe("DefenderHuntingView", () => {
     await act(async () => finish(history));
     expect(screen.queryByRole("button", { name: /View hunt 11111111/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refresh hunting history" })).toBeEnabled();
-  });
-
-  it.each([403, 503])("aborts a late exact-job sibling when bootstrap fails (%s)", async status => {
-    let finish!: (value: DefenderHuntingJob) => void;
-    let reject!: (error: Error) => void;
-    let signal!: AbortSignal;
-    initialJobId = job().id;
-    vi.mocked(getDefenderHuntingCatalog).mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail; }));
-    vi.mocked(getDefenderHuntingJob).mockImplementationOnce((_id, options) => {
-      signal = options!.signal!;
-      return new Promise(resolve => { finish = resolve; });
-    });
-    renderView();
-    await waitFor(() => expect(getDefenderHuntingJob).toHaveBeenCalledOnce());
-    await act(async () => reject(new ApiError(status, status === 403 ? "forbidden" : "unavailable", "Saved bootstrap failed")));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Saved bootstrap failed");
-    expect(signal.aborted).toBe(true);
-    await act(async () => finish(job()));
-    expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
-    expect(screen.queryByText("No hunting history")).not.toBeInTheDocument();
-    expect(screen.getByText("Unknown jobs")).toBeVisible();
-  });
-
-  it("recovers the catalog, history and exact job together after denial", async () => {
-    initialJobId = job().id;
-    vi.mocked(getDefenderHuntingJobs).mockRejectedValueOnce(new ApiError(401, "unauthorized", "Session expired"))
-      .mockResolvedValue({ value: [], count: 0, limit: 20, offset: 0 });
-    vi.mocked(getDefenderHuntingJob).mockResolvedValue(job());
-    renderView();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Session expired");
-    fireEvent.click(screen.getByRole("button", { name: "Refresh hunting history" }));
-    expect(await screen.findByRole("heading", { name: "Defender agent inventory result" })).toBeVisible();
-    expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2);
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
-  });
-
-  it("returns to authorized saved history explicitly after an exact job is deleted", async () => {
-    initialJobId = "deleted-job";
-    vi.mocked(getDefenderHuntingJob).mockRejectedValue(new ApiError(404, "not_found", "Exact job was deleted"));
-    vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [job()], count: 1, limit: 20, offset: 0 });
-    renderView();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Exact job was deleted");
-    fireEvent.click(screen.getByRole("button", { name: "Return to hunting history" }));
-    expect(await screen.findByRole("button", { name: /View hunt 11111111/ })).toBeVisible();
-    expect(new URLSearchParams(window.location.search).has("job")).toBe(false);
-    expect(getDefenderHuntingJob).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
-    expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
   it("clears selected private rows when their exact filters change or saved history removes the job", async () => {
@@ -805,51 +749,6 @@ describe("DefenderHuntingView", () => {
       expect(screen.queryByRole("button", { name: /View hunt 11111111/ })).not.toBeInTheDocument();
     } finally {
       const settled = shared?.catch(() => undefined);
-      outside.abort();
-      view.unmount();
-      client.clear();
-      await settled;
-    }
-  });
-
-  it("fences denied bootstrap siblings without cancelling another owner's shared read", async () => {
-    const client = createSavedQueryClient();
-    const outside = new AbortController();
-    const history = { value: [job()], count: 1, limit: 20, offset: 0 };
-    let finish!: (value: typeof history) => void;
-    let finishDetail!: (value: DefenderHuntingJob) => void;
-    let deny!: (error: Error) => void;
-    let sharedSignal!: AbortSignal;
-    let detailSignal!: AbortSignal;
-    initialJobId = job().id;
-    const shared = readSavedQuery(client, ["agent-investigation", savedAccountKey, agentRecordId, "defender-hunting-jobs", { limit: 20, offset: 0 }], signal => {
-      sharedSignal = signal;
-      return new Promise<typeof history>(resolve => { finish = resolve; });
-    }, outside.signal);
-    vi.mocked(getDefenderHuntingCatalog).mockReturnValueOnce(new Promise((_resolve, reject) => { deny = reject; }));
-    vi.mocked(getDefenderHuntingJob).mockImplementation((_id, options) => {
-      detailSignal = options!.signal!;
-      return new Promise(resolve => { finishDetail = resolve; });
-    });
-    const view = render(<SavedQueryProvider client={client}>
-      <CapabilityContext value={context()}><DefenderHuntingView /></CapabilityContext>
-    </SavedQueryProvider>);
-    try {
-      await waitFor(() => expect(getDefenderHuntingJob).toHaveBeenCalledOnce());
-      await act(async () => deny(new ApiError(403, "forbidden", "Catalog access denied")));
-      expect(await screen.findByRole("alert")).toHaveTextContent("Catalog access denied");
-      expect(sharedSignal.aborted).toBe(false);
-      expect(detailSignal.aborted).toBe(true);
-      await act(async () => {
-        finish(history);
-        finishDetail(job());
-        await expect(shared).resolves.toEqual(history);
-      });
-      expect(screen.getByText("Unknown jobs")).toBeVisible();
-      expect(screen.queryByRole("button", { name: /View hunt 11111111/ })).not.toBeInTheDocument();
-      expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
-    } finally {
-      const settled = shared.catch(() => undefined);
       outside.abort();
       view.unmount();
       client.clear();
