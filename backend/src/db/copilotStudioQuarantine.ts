@@ -343,7 +343,7 @@ export class CopilotStudioQuarantineRepository {
   async pauseItemForAuthorization(lease: QuarantineLease, item: QuarantineItemRow) {
     await transaction(this.database, async client => {
       await this.fence(client, lease);
-      const result = await client.query("UPDATE copilot_quarantine_job_items SET status='queued',correlation_id=NULL,updated_at=clock_timestamp() WHERE id=$1 AND sent_at IS NULL AND status='running'", [item.id]);
+      const result = await client.query("UPDATE copilot_quarantine_job_items SET status='queued',correlation_id=NULL,updated_at=clock_timestamp() WHERE id=$1 AND job_id=$2 AND sent_at IS NULL AND status='running'", [item.id, lease.jobId]);
       if (result.rowCount !== 1) throw new AppError(409, "already_dispatched", "Sent quarantine work cannot return to authorization wait.");
       await client.query("UPDATE copilot_quarantine_attempts SET finished_at=clock_timestamp(),outcome='cancelled' WHERE item_id=$1 AND lease_version=$2", [item.id, lease.version]);
       await client.query("UPDATE copilot_quarantine_jobs SET status='waiting_authorization',lease_owner=NULL,lease_until=NULL,updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
@@ -358,9 +358,16 @@ export class CopilotStudioQuarantineRepository {
   }
 
   async withReconciliationLock<T>(scope: QuarantineScope, item: QuarantineItemRow, operation: () => Promise<T>) {
+    validateScope(scope);
     const client = await this.database.connect();
     try {
       await client.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [`quarantine-target:${scope.tenantId}:${item.environment_id}:${item.bot_id}`]);
+      const current = await client.query(`SELECT 1 FROM copilot_quarantine_job_items item
+        JOIN copilot_quarantine_jobs job ON job.id=item.job_id
+        WHERE item.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.id=$4
+          AND item.status='inconclusive' AND item.reconciliation_status='required'`,
+      [item.id, scope.tenantId, scope.principalId, item.job_id]);
+      if (!current.rowCount) throw new AppError(409, "reconciliation_state", "The quarantine item no longer requires reconciliation.");
       return await operation();
     } finally {
       await client.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [`quarantine-target:${scope.tenantId}:${item.environment_id}:${item.bot_id}`]).catch(() => undefined);
@@ -376,16 +383,24 @@ export class CopilotStudioQuarantineRepository {
   }
 
   async recordReconciliation(scope: QuarantineScope, job: QuarantineJobRow, item: QuarantineItemRow, status: Exclude<QuarantineReconciliationStatus, "not_required" | "required">, observed: CopilotStudioQuarantineStatus, message: string) {
+    validateScope(scope);
     await transaction(this.database, async client => {
-      const result = await client.query(`UPDATE copilot_quarantine_job_items SET status=CASE WHEN $2='verified_applied' THEN 'succeeded' ELSE status END,
+      const current = await client.query<QuarantineJobRow>(`SELECT * FROM copilot_quarantine_jobs
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 FOR UPDATE`, [job.id, scope.tenantId, scope.principalId]);
+      if (!current.rows[0]) throw new AppError(409, "reconciliation_state", "The quarantine item no longer requires reconciliation.");
+      const result = await client.query<QuarantineItemRow>(`UPDATE copilot_quarantine_job_items SET status=CASE WHEN $2='verified_applied' THEN 'succeeded' ELSE status END,
         observed_state=$3,observed_provider_updated_at=$4,observed_at=$5,reconciliation_status=$2,reconciled_at=clock_timestamp(),message=$6,updated_at=clock_timestamp()
-        WHERE id=$1 AND status='inconclusive' AND reconciliation_status='required' RETURNING id`, [item.id, status, observed.isBotQuarantined,
-        observed.lastUpdateTimeUtc, observed.observedAt, message.slice(0, 1024)]);
+        WHERE id=$1 AND job_id=$7 AND status='inconclusive' AND reconciliation_status='required' RETURNING *`, [item.id, status, observed.isBotQuarantined,
+        observed.lastUpdateTimeUtc, observed.observedAt, message.slice(0, 1024), current.rows[0].id]);
       if (result.rowCount !== 1) throw new AppError(409, "reconciliation_state", "The quarantine item no longer requires reconciliation.");
-      await insertObservation(client, scope, targetFromItem(item), observed);
-      await insertAudit(client, { scope, actor: actorFromJob(job), jobId: job.id, itemId: item.id, correlationId: observed.correlationId, action: "reconcile",
-        phase: "reconciled", target: targetFromItem(item), requestedState: item.requested_state, observed, message });
-      await this.aggregate(client, job.id);
+      const saved = result.rows[0];
+      if (observed.environmentId !== saved.environment_id || observed.botId !== saved.bot_id) {
+        throw new AppError(502, "target_mismatch", "Provider status did not match the exact quarantine target.");
+      }
+      await insertObservation(client, scope, targetFromItem(saved), observed);
+      await insertAudit(client, { scope, actor: actorFromJob(current.rows[0]), jobId: current.rows[0].id, itemId: saved.id, correlationId: observed.correlationId, action: "reconcile",
+        phase: "reconciled", target: targetFromItem(saved), requestedState: saved.requested_state, observed, message });
+      await this.aggregate(client, current.rows[0].id);
     });
   }
 

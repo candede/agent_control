@@ -2,7 +2,7 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { hasAppRole, supportsAutomaticCapabilityCheck, type CapabilityCheckProgress, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityOperationFailure, type CapabilityStatus } from "../types/capability.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "../errors.js";
-import { config } from "../config.js";
+import { getTenantConfiguration } from "../config.js";
 import { acquireApplicationToken, acquireDelegatedToken } from "../auth/msal.js";
 import { adminManagedPermissionsMessage } from "../auth/flows.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision, type CapabilityConfiguration, type CapabilityEvidence, type EvidenceKey } from "../db/capabilities.js";
@@ -351,8 +351,8 @@ export class CapabilityService {
     this.requireGeneration(definition.id, user, generation);
     try {
       const token = await retryReadiness(() => definition.mode === "delegated"
-        ? this.probes.delegatedToken(user.homeAccountId, definition.id)
-        : this.probes.applicationToken(definition.id), timeoutMs, cancellation, beforeRequest);
+        ? this.probes.delegatedToken(user.tenantId!, user.homeAccountId, definition.id)
+        : this.probes.applicationToken(user.tenantId!, definition.id), timeoutMs, cancellation, beforeRequest);
       this.requireGeneration(definition.id, user, generation);
       phase = "provider_read";
       timeoutMs = definition.id.startsWith("graph.package.read.") ? packageReadTimeoutMs : automaticCheckDeadlineMs;
@@ -455,7 +455,7 @@ export class CapabilityService {
   private evidenceKey(definition: CapabilityDefinition, user: OperationPrincipal, configuration: CapabilityConfiguration): EvidenceKey {
     return {
       tenantId: user.tenantId!,
-      principalId: definition.mode === "application" ? config.clientId! : user.homeAccountId,
+      principalId: definition.mode === "application" ? getTenantConfiguration(user.tenantId!).clientId : user.homeAccountId,
       authorizationPrincipalId: user.homeAccountId,
       capabilityId: definition.id,
       resourceAudience: definition.audience,

@@ -27,4 +27,14 @@ describe("concurrent account role validation", () => {
     const current = beginAccountSessionValidation("tenant", "concurrent-revoke");
     await expect(commitAccountSessionValidation(current, save)).resolves.toBeUndefined();
   });
+
+  it("isolates logout and sign-in generations for the same principal in different tenants", async () => {
+    const first = beginAccountSessionValidation("tenant-a", "shared-principal");
+    const second = beginAccountSessionValidation("tenant-b", "shared-principal");
+    await revokeAccountSessionMutations("tenant-a", "shared-principal", async () => undefined);
+    await expect(commitAccountSessionValidation(first, async () => undefined)).rejects.toMatchObject({ code: "unauthorized" });
+    await expect(commitAccountSessionValidation(second, async () => "tenant-b")).resolves.toBe("tenant-b");
+    await activateAccountSession("tenant-a", "shared-principal", async () => undefined);
+    await expect(commitAccountSessionValidation(second, async () => "still-tenant-b")).resolves.toBe("still-tenant-b");
+  });
 });

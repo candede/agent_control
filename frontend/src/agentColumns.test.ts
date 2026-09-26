@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { agentColumns, agentViewOptions, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
+import { agentAccessOptions, agentColumns, agentUsageOptions, agentViewOptions, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
 import { unifiedAgentSortKeys } from "../../backend/src/types/unifiedAgents";
 
 afterEach(() => {
@@ -9,13 +9,15 @@ afterEach(() => {
 
 describe("agent column preferences", () => {
   it("describes automatic and existing reviewed evidence for selected-report usage filters", () => {
-    const used = agentViewOptions.find(option => option.value === "used")!;
+    const used = agentUsageOptions.find(option => option.value === "used")!;
     expect(used.description).toContain("matched automatically by exact saved package ID");
     expect(used.description).toContain("existing administrator-reviewed association");
     expect(used.description).toContain("not a live or all-channel activity measure");
-    expect(agentViewOptions.find(option => option.value === "organization")!.description).toContain("does not establish end-user access");
-    expect(agentViewOptions.find(option => option.value === "all")!.label).toBe("All agents in this view");
-    expect(agentViewOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
+    expect(agentViewOptions.map(option => option.label)).toEqual([
+      "All agents", "1st party agents", "3rd party agents", "User managed agents", "Copilot Studio agents", "Organization managed agents",
+    ]);
+    expect(agentViewOptions.find(option => option.value === "first_party")!.description).toContain("Using Microsoft authoring tools does not");
+    expect(agentAccessOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
   });
 
   it("offers every supported data column exactly once and keeps the original defaults", () => {

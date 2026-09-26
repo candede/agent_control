@@ -11,6 +11,8 @@ import { declaredRoutePolicies } from "./policy.js";
 vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "copilot-usage-route-test-session-secret";
 });
 
@@ -49,10 +51,11 @@ function authorizedApp() {
   app.use((request, _response, next) => {
     const supplied = request.get("x-test-role");
     request.session.accountId = "principal";
-    request.session.tenantId = config.tenantId!;
+    request.session.tenantId = config.tenants[0].tenantId!;
+    request.session.clientId = config.tenants[0].clientId;
     request.session.rolesValidatedAt = Date.now();
     request.session.user = {
-      tenantId: config.tenantId!, homeAccountId: "principal", username: "principal@example.com",
+      tenantId: config.tenants[0].tenantId!, homeAccountId: "principal", username: "principal@example.com",
       displayName: "Principal",
       roles: supplied === "viewer" ? ["AgentControl.Viewer"] : supplied === "admin" ? ["AgentControl.Admin"] : [],
     };

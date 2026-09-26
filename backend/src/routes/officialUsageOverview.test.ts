@@ -12,6 +12,8 @@ import { declaredRoutePolicies } from "./policy.js";
 vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "official-usage-overview-route-test-secret";
 });
 
@@ -32,9 +34,10 @@ beforeAll(async () => {
   app.use((request, _response, next) => {
     const role = request.get("x-test-role");
     if (role) {
-      const tenantId = request.get("x-test-tenant") ?? config.tenantId!;
+      const tenantId = request.get("x-test-tenant") ?? config.tenants[0].tenantId!;
       request.session.accountId = "overview-reader";
       request.session.tenantId = tenantId;
+      request.session.clientId = config.tenants[0].clientId;
       request.session.rolesValidatedAt = Date.now();
       request.session.user = {
         tenantId, homeAccountId: "overview-reader", username: "reader@example.invalid", displayName: "Reader",
@@ -115,13 +118,13 @@ describe("official usage overview route", () => {
       },
     });
     expect(JSON.stringify(response.body)).not.toMatch(/totalResponses|responsesSentToUsers|username/);
-    expect(client.query.mock.calls[2]?.[1]?.[0]).toBe(config.tenantId);
-    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, expect.objectContaining({ scope: undefined }));
+    expect(client.query.mock.calls[2]?.[1]?.[0]).toBe(config.tenants[0].tenantId);
+    expect(overviewRead).toHaveBeenCalledWith(config.tenants[0].tenantId, expect.objectContaining({ scope: undefined }));
   });
 
   it.each(["history", "selected"])("passes the explicit %s scope to the tenant-scoped overview", async scope => {
     expect(await get(`?scope=${scope}`)).toMatchObject({ status: 200 });
-    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, expect.objectContaining({ scope }));
+    expect(overviewRead).toHaveBeenCalledWith(config.tenants[0].tenantId, expect.objectContaining({ scope }));
   });
 
   it("passes supported literal filters and bounded paging to the tenant-scoped read", async () => {
@@ -132,7 +135,7 @@ describe("official usage overview route", () => {
           filters: { search: "Name%", startDate: "2024-02-29", endDate: "2024-03-01", sortBy: "agentName", sortDirection: "asc" },
         },
       });
-    expect(overviewRead).toHaveBeenCalledWith(config.tenantId, {
+    expect(overviewRead).toHaveBeenCalledWith(config.tenants[0].tenantId, {
       scope: undefined, search: "Name%", startDate: "2024-02-29", endDate: "2024-03-01",
       sortBy: "agentName", sortDirection: "asc", limit: 100, offset: 100_000,
     });

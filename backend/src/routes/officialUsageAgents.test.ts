@@ -20,6 +20,8 @@ import { declaredRoutePolicies } from "./policy.js";
 vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "official-usage-agent-route-test-secret";
 });
 
@@ -51,9 +53,10 @@ beforeAll(async () => {
   app.use((request, _response, next) => {
     const role = request.get("x-test-role");
     if (role) {
-      const tenantId = request.get("x-test-tenant") ?? config.tenantId!;
+      const tenantId = request.get("x-test-tenant") ?? config.tenants[0].tenantId!;
       request.session.accountId = "report-reader";
       request.session.tenantId = tenantId;
+      request.session.clientId = config.tenants[0].clientId;
       request.session.rolesValidatedAt = Date.now();
       request.session.user = {
         tenantId, homeAccountId: "report-reader", username: "reader@example.invalid", displayName: "Reader",
@@ -76,7 +79,7 @@ beforeEach(() => {
   database.query.mockReset().mockRejectedValue(new Error("Unexpected database access"));
   database.connect.mockReset().mockRejectedValue(new Error("Unexpected database connection"));
   readPublished.mockReset().mockImplementation(async (tenantId, setId) => {
-    expect(tenantId).toBe(config.tenantId);
+    expect(tenantId).toBe(config.tenants[0].tenantId);
     if (setId && setId !== activeSetId && setId !== retainedSetId) {
       throw new AppError(404, "official_usage_set_not_found", "The retained official usage report set was not found.");
     }
@@ -119,7 +122,7 @@ describe("official usage report-agent routes", () => {
         counts: { users: 2, totalResponsesReceived: 13 },
       },
     });
-    expect(readDirectory).toHaveBeenCalledExactlyOnceWith({ tenantId: config.tenantId, principalId: "report-reader" });
+    expect(readDirectory).toHaveBeenCalledExactlyOnceWith({ tenantId: config.tenants[0].tenantId, principalId: "report-reader" });
     expect(await get(`${usersPath}?licenseCohort=active_without_paid&limit=1&offset=1`)).toMatchObject({
       status: 200, body: { users: { count: 2, value: [{ username: "only-set" }] } },
     });
@@ -239,7 +242,7 @@ describe("official usage report-agent routes", () => {
     for (const user of response.body!.users.value) {
       expect(Object.keys(user).sort()).toEqual(["displayName", "responsesSentToUsers", "username"]);
     }
-    expect(readPublished).toHaveBeenCalledExactlyOnceWith(config.tenantId, undefined);
+    expect(readPublished).toHaveBeenCalledExactlyOnceWith(config.tenants[0].tenantId, undefined);
   });
 
   it("filters and sorts the complete detail breakdown before paging without changing its summary", async () => {
@@ -325,21 +328,21 @@ describe("official usage report-agent routes", () => {
     expect(await get(`${detailPath}?setId=${retainedSetId}`)).toMatchObject({
       status: 200, body: { activeSet: { id: retainedSetId }, agent: { responsesSentToUsers: 25 } },
     });
-    expect(readPublished).toHaveBeenLastCalledWith(config.tenantId, retainedSetId);
+    expect(readPublished).toHaveBeenLastCalledWith(config.tenants[0].tenantId, retainedSetId);
     expect(await get(`${usersPath}?agentId=retained-only&setId=${retainedSetId}`)).toMatchObject({
       status: 200,
       body: { activeSet: { id: retainedSetId }, users: { value: [{ username: "only-set", datasetScope: { reportSetId: retainedSetId } }], count: 1 } },
     });
-    expect(readPublished).toHaveBeenLastCalledWith(config.tenantId, retainedSetId);
+    expect(readPublished).toHaveBeenLastCalledWith(config.tenants[0].tenantId, retainedSetId);
     expect(await get("/api/official-usage/agents/retained-only")).toMatchObject({ status: 404, body: { code: "official_usage_agent_not_found" } });
     expect(await get(detailPath)).toMatchObject({ status: 200, body: { activeSet: { id: activeSetId }, agent: { responsesSentToUsers: 10 } } });
-    expect(readPublished).toHaveBeenLastCalledWith(config.tenantId, undefined);
+    expect(readPublished).toHaveBeenLastCalledWith(config.tenants[0].tenantId, undefined);
   });
 
   it.each([detailPath, `${usersPath}?agentId=Report-A`])("does not fall back to active data for an unavailable set at %s", async path => {
     const separator = path.includes("?") ? "&" : "?";
     expect(await get(`${path}${separator}setId=${missingSetId}`)).toMatchObject({ status: 404, body: { code: "official_usage_set_not_found" } });
-    expect(readPublished).toHaveBeenCalledExactlyOnceWith(config.tenantId, missingSetId);
+    expect(readPublished).toHaveBeenCalledExactlyOnceWith(config.tenants[0].tenantId, missingSetId);
   });
 
   it("does not match names, case-folded IDs, inventory IDs or an empty report", async () => {

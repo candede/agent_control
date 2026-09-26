@@ -7,9 +7,9 @@ import {
   type NetworkResponse,
 } from "@azure/msal-node";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { authConfigured, config, loginScopes } from "../config.js";
+import { authConfigured, config, getTenantConfiguration, loginScopes, normalizeSignInUsername, type TenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
-import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, authenticationScopes, authFlowLifetimeMs } from "./flows.js";
+import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, assertTenantConfiguration, authenticationScopes, authFlowLifetimeMs, tenantConfigurationFingerprint } from "./flows.js";
 import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import type { CapabilityId } from "../types/capability.js";
@@ -31,7 +31,7 @@ export type MsalClient = {
 export const msalNetworkTimeoutMs = 10_000;
 const graphAudienceIds = new Set(["https://graph.microsoft.com", "00000003-0000-0000-c000-000000000000"]);
 const powerPlatformAudienceIds = new Set(["https://api.powerplatform.com", "8578e004-a5c6-46e7-913e-12f58912df43"]);
-let client: MsalClient | undefined;
+const clients = new Map<string, { client: MsalClient; fingerprint: string }>();
 
 export const msalNetworkClient: INetworkModule = {
   sendGetRequestAsync: <T>(url: string, options?: NetworkRequestOptions, timeout?: number) =>
@@ -40,37 +40,51 @@ export const msalNetworkClient: INetworkModule = {
     sendMsalRequest<T>(url, "POST", options, msalNetworkTimeoutMs),
 };
 
-export function replaceMsalClientForTest(value: MsalClient | undefined) {
+export function replaceMsalClientForTest(tenantId: string, value: MsalClient | undefined) {
   if (process.env.NODE_ENV !== "test") throw new Error("MSAL test injection is unavailable outside tests.");
-  client = value;
+  for (const key of clients.keys()) if (key.startsWith(`${tenantId}\0`)) clients.delete(key);
+  if (value) {
+    const tenant = getTenantConfiguration(tenantId);
+    clients.set(clientKey(tenant), { client: value, fingerprint: tenantConfigurationFingerprint(tenant) });
+  }
 }
 
 export function requireAuthConfigured() {
-  if (
-    !authConfigured ||
-    !config.tenantId ||
-    !config.clientId ||
-    !config.clientSecret
-  ) {
+  if (!authConfigured || config.tenants.length === 0) {
     throw AppError.serviceUnavailable(
-      "Set TENANT_ID, CLIENT_ID, and CLIENT_SECRET before signing in.",
+      "Configure an Entra tenant, application credentials, and organizational email domains before signing in.",
     );
   }
 }
 
-export function getMsalClient() {
+export function getMsalClient(tenantId: string) {
   requireAuthConfigured();
-
-  client ??= new ConfidentialClientApplication({
+  const tenant = getTenantConfiguration(tenantId);
+  const activeConfigurations = new Map(config.tenants.map(value => [clientKey(value), tenantConfigurationFingerprint(value)]));
+  for (const [key, value] of clients) {
+    if (activeConfigurations.get(key) !== value.fingerprint) clients.delete(key);
+  }
+  const key = clientKey(tenant);
+  const existing = clients.get(key);
+  if (existing) return existing.client;
+  const client = new ConfidentialClientApplication({
     auth: {
-      authority: `https://login.microsoftonline.com/${config.tenantId}`,
-      clientId: config.clientId!,
-      clientSecret: config.clientSecret!,
+      authority: tenantAuthority(tenant.tenantId),
+      clientId: tenant.clientId,
+      clientSecret: tenant.clientSecret,
     },
     system: { networkClient: msalNetworkClient },
   }) as unknown as MsalClient;
-
+  clients.set(key, { client, fingerprint: tenantConfigurationFingerprint(tenant) });
   return client;
+}
+
+function clientKey(tenant: TenantConfiguration) {
+  return `${tenant.tenantId}\0${tenant.clientId}`;
+}
+
+function tenantAuthority(tenantId: string) {
+  return `https://login.microsoftonline.com/${tenantId}`;
 }
 
 function randomValue() {
@@ -84,10 +98,16 @@ export function capabilityScopes(capabilityId: CapabilityId) {
   return definition.permissions.map(permission => `${resource}/${permission}`);
 }
 
-export function createAuthFlow(kind: "login", options: { returnTo?: string } = {}): AuthFlow {
-  if (kind !== "login" || Object.keys(options).some(key => key !== "returnTo")) throw adminManagedPermissionsError();
+export function createAuthFlow(kind: "login", options: { tenantId: string; username: string; returnTo?: string }): AuthFlow {
+  if (kind !== "login" || Object.keys(options ?? {}).some(key => !["tenantId", "username", "returnTo"].includes(key))) throw adminManagedPermissionsError();
+  // Reauthentication can use a canonical UPN outside the tenant's initial-login routing domains.
+  const tenant = getTenantConfiguration(options?.tenantId);
   return {
     kind,
+    tenantId: tenant.tenantId,
+    clientId: tenant.clientId,
+    username: normalizedPrincipalUsername(options.username),
+    configurationFingerprint: tenantConfigurationFingerprint(tenant),
     state: randomValue(),
     nonce: randomValue(),
     codeVerifier: randomValue(),
@@ -98,81 +118,108 @@ export function createAuthFlow(kind: "login", options: { returnTo?: string } = {
 }
 
 export async function createAuthorizationUrl(flow: AuthFlow) {
-  assertLoginAuthFlow(flow);
-  const url = await getMsalClient().getAuthCodeUrl({
+  assertLiveAuthFlow(flow);
+  const url = await getMsalClient(flow.tenantId).getAuthCodeUrl({
+    authority: tenantAuthority(flow.tenantId),
+    loginHint: flow.username,
     scopes: [...authenticationScopes],
     redirectUri: config.redirectUri,
     state: flow.state,
     nonce: flow.nonce,
     codeChallenge: createHash("sha256").update(flow.codeVerifier).digest("base64url"),
     codeChallengeMethod: "S256",
-    prompt: "select_account",
+    // MSAL suppresses login_hint for select_account.
+    prompt: "login",
   });
-  return validateAuthorizationUrl(url);
+  assertLiveAuthFlow(flow);
+  return validateAuthorizationUrl(url, flow.tenantId);
 }
 
 export async function redeemAuthorizationCode(code: string, flow: AuthFlow) {
-  assertLoginAuthFlow(flow);
-  if (Date.now() - flow.createdAt > authFlowLifetimeMs) throw new AppError(400, "expired_auth_state", "The authentication request expired. Start again.");
-  const result = await getMsalClient().acquireTokenByCode({
+  assertLiveAuthFlow(flow);
+  const result = await getMsalClient(flow.tenantId).acquireTokenByCode({
+    authority: tenantAuthority(flow.tenantId),
     code,
     scopes: [...authenticationScopes],
     redirectUri: config.redirectUri,
     codeVerifier: flow.codeVerifier,
   });
 
-  validateAuthenticationPrincipal(result);
+  assertLiveAuthFlow(flow);
+  validateAuthenticationPrincipal(getTenantConfiguration(flow.tenantId), result);
   const claims = result.idTokenClaims as { nonce?: unknown; tid?: unknown } | undefined;
   if (claims?.nonce !== flow.nonce) throw AppError.unauthorized("Microsoft Entra ID returned an invalid nonce.");
 
   return result;
 }
 
-export async function acquireDelegatedToken(homeAccountId: string, capabilityId: CapabilityId) {
+function assertLiveAuthFlow(flow: AuthFlow) {
+  assertLoginAuthFlow(flow);
+  const now = Date.now();
+  if (flow.createdAt > now || now - flow.createdAt >= authFlowLifetimeMs) throw new AppError(400, "expired_auth_state", "The authentication request expired. Start again.");
+}
+
+export async function acquireDelegatedToken(tenantId: string, homeAccountId: string, capabilityId: CapabilityId) {
   const definition = getCapabilityDefinition(capabilityId);
   if (!definition || definition.mode !== "delegated") throw new AppError(400, "invalid_token_mode", "The capability does not support delegated tokens.");
-  const account = await getAccount(homeAccountId);
-
-  if (!account || account.tenantId !== config.tenantId) throw interactionRequired();
+  const tenant = getTenantConfiguration(tenantId);
+  const fingerprint = tenantConfigurationFingerprint(tenant);
+  const client = getMsalClient(tenantId);
+  const account = await getAccount(client, homeAccountId);
+  assertTenantConfiguration(tenantId, fingerprint);
+  if (!account || account.tenantId !== tenantId || account.homeAccountId !== homeAccountId) throw interactionRequired();
 
   try {
-    const result = await getMsalClient().acquireTokenSilent({ account, scopes: capabilityScopes(capabilityId) });
-    validateTokenResult(result, "delegated", definition.audience, definition.permissions, definition.acceptedPermissions, homeAccountId);
+    validateOptionalIdentityClaims(tenant, account.idTokenClaims);
+    const result = await client.acquireTokenSilent({ authority: tenantAuthority(tenantId), account, scopes: capabilityScopes(capabilityId) });
+    assertTenantConfiguration(tenantId, fingerprint);
+    validateTokenResult(tenant, result, "delegated", definition.audience, definition.permissions, definition.acceptedPermissions, homeAccountId);
     return result.accessToken;
   } catch (error) {
     throw normalizeTokenError(error);
   }
 }
 
-export async function acquireApplicationToken(capabilityId: CapabilityId) {
+export async function acquireApplicationToken(tenantId: string, capabilityId: CapabilityId) {
   const definition = getCapabilityDefinition(capabilityId);
   if (!definition || definition.mode !== "application" || definition.provider !== "Microsoft Graph") {
     throw new AppError(400, "invalid_token_mode", "The capability does not support application tokens.");
   }
+  const tenant = getTenantConfiguration(tenantId);
+  const fingerprint = tenantConfigurationFingerprint(tenant);
+  const client = getMsalClient(tenantId);
   try {
-    const result = await getMsalClient().acquireTokenByClientCredential({ scopes: ["https://graph.microsoft.com/.default"] });
-    validateTokenResult(result, "application", definition.audience, definition.permissions, definition.acceptedPermissions);
+    const result = await client.acquireTokenByClientCredential({ authority: tenantAuthority(tenantId), scopes: ["https://graph.microsoft.com/.default"] });
+    assertTenantConfiguration(tenantId, fingerprint);
+    validateTokenResult(tenant, result, "application", definition.audience, definition.permissions, definition.acceptedPermissions);
     return result!.accessToken;
   } catch (error) {
     throw normalizeTokenError(error);
   }
 }
 
-export async function revalidateAuthenticatedUser(homeAccountId: string) {
-  const account = await getAccount(homeAccountId);
-  if (!account || account.tenantId !== config.tenantId) throw interactionRequired();
+export async function revalidateAuthenticatedUser(tenantId: string, homeAccountId: string) {
+  const tenant = getTenantConfiguration(tenantId);
+  const fingerprint = tenantConfigurationFingerprint(tenant);
+  const client = getMsalClient(tenantId);
+  const account = await getAccount(client, homeAccountId);
+  assertTenantConfiguration(tenantId, fingerprint);
+  if (!account || account.tenantId !== tenantId || account.homeAccountId !== homeAccountId) throw interactionRequired();
   try {
-    const result = await getMsalClient().acquireTokenSilent({ account, scopes: loginScopes, forceRefresh: true });
-    validateAuthenticationPrincipal(result, homeAccountId);
+    validateOptionalIdentityClaims(tenant, account.idTokenClaims);
+    const result = await client.acquireTokenSilent({ authority: tenantAuthority(tenantId), account, scopes: loginScopes, forceRefresh: true });
+    assertTenantConfiguration(tenantId, fingerprint);
+    validateAuthenticationPrincipal(tenant, result, homeAccountId);
     return toAuthenticatedUser(result);
   } catch (error) {
     throw normalizeTokenError(error);
   }
 }
 
-export async function evictAccount(homeAccountId: string) {
-  const account = await getAccount(homeAccountId);
-  if (account) await getMsalClient().getTokenCache().removeAccount(account);
+export async function evictAccount(tenantId: string, homeAccountId: string) {
+  const client = getMsalClient(tenantId);
+  const account = await getAccount(client, homeAccountId);
+  if (account?.tenantId === tenantId && account.homeAccountId === homeAccountId) await client.getTokenCache().removeAccount(account);
 }
 
 export function toAuthenticatedUser(
@@ -192,7 +239,7 @@ export function toAuthenticatedUser(
 
   return {
     displayName: account.name ?? claims?.name ?? account.username,
-    username: account.username ?? claims?.preferred_username ?? "",
+    username: normalizedPrincipalUsername(claims?.preferred_username ?? account.username),
     homeAccountId: account.homeAccountId,
     tenantId: account.tenantId ?? claims?.tid,
     roles: Array.isArray(claims?.roles) ? [...new Set(claims.roles.filter(isAppRole))].sort() : [],
@@ -200,8 +247,8 @@ export function toAuthenticatedUser(
   };
 }
 
-async function getAccount(homeAccountId: string): Promise<AccountInfo | null> {
-  const cache = getMsalClient().getTokenCache();
+async function getAccount(client: MsalClient, homeAccountId: string): Promise<AccountInfo | null> {
+  const cache = client.getTokenCache();
   const account = await cache.getAccountByHomeId(homeAccountId);
   return account ?? null;
 }
@@ -212,9 +259,9 @@ export function matchesAuthState(expected: string, actual: string) {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-export function safeReturnPath(value: string | undefined) {
-  if (!value) return "/";
-  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\") || value.includes("\0")) {
+export function safeReturnPath(value: unknown) {
+  if (value === undefined || value === "") return "/";
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(value)) {
     throw new AppError(400, "invalid_return_url", "Return URL must be a local application path.");
   }
   const parsed = new URL(value, config.frontendOrigin);
@@ -222,33 +269,59 @@ export function safeReturnPath(value: string | undefined) {
   return `${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
-function validateAuthorizationUrl(value: string) {
+function validateAuthorizationUrl(value: string, tenantId: string) {
   const url = new URL(value);
-  if (url.origin !== "https://login.microsoftonline.com" || url.username || url.password || !config.tenantId || url.pathname.split("/")[1]?.toLowerCase() !== config.tenantId.toLowerCase()) {
+  if (url.origin !== "https://login.microsoftonline.com" || url.username || url.password || url.pathname.split("/")[1]?.toLowerCase() !== tenantId.toLowerCase()) {
     throw new AppError(502, "invalid_authorization_url", "Microsoft authorization returned an unexpected redirect target.");
   }
   return url.toString();
 }
 
-function validateAuthenticationPrincipal(result: AuthenticationResult | null, expectedHomeAccountId?: string): asserts result is AuthenticationResult {
+function validateAuthenticationPrincipal(tenant: TenantConfiguration, result: AuthenticationResult | null, expectedHomeAccountId?: string): asserts result is AuthenticationResult {
   if (!result?.account) throw AppError.unauthorized("Microsoft Entra ID did not return an account.");
-  const claims = result.idTokenClaims as { tid?: unknown } | undefined;
-  const tenantValues = [result.tenantId, result.account.tenantId, claims?.tid].filter(value => value !== undefined);
-  if (!config.tenantId || tenantValues.length === 0 || tenantValues.some(value => value !== config.tenantId)) {
+  const claims = result.idTokenClaims as Record<string, unknown> | undefined;
+  if ([result.tenantId, result.account.tenantId, claims?.tid].some(value => value !== tenant.tenantId)) {
     throw AppError.unauthorized("The account belongs to a different tenant.");
   }
-  if (expectedHomeAccountId && result.account.homeAccountId !== expectedHomeAccountId) {
+  if (!result.account.homeAccountId || expectedHomeAccountId && result.account.homeAccountId !== expectedHomeAccountId) {
+    throw AppError.unauthorized("Microsoft Entra ID returned a different account.");
+  }
+  if (claims?.aud !== tenant.clientId) throw AppError.unauthorized("Microsoft Entra ID returned an identity for a different application.");
+  validateClientClaims(tenant, claims);
+  validateOptionalIdentityClaims(tenant, result.account.idTokenClaims);
+  normalizedPrincipalUsername(claims?.preferred_username ?? result.account.username);
+  if (claims?.oid !== undefined && claims.oid !== result.account.localAccountId
+    || result.uniqueId && result.uniqueId !== result.account.localAccountId) {
     throw AppError.unauthorized("Microsoft Entra ID returned a different account.");
   }
 }
 
-function validateTokenResult(result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
+function normalizedPrincipalUsername(value: unknown) {
+  try { return normalizeSignInUsername(value); }
+  catch (error) {
+    if (error instanceof AppError && error.code === "invalid_username") {
+      throw AppError.unauthorized("Microsoft Entra ID did not return a valid account username.");
+    }
+    throw error;
+  }
+}
+
+function validateOptionalIdentityClaims(tenant: TenantConfiguration, claims: Record<string, unknown> | undefined) {
+  if (claims?.tid !== undefined && claims.tid !== tenant.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned an identity for a different tenant.");
+  if (claims?.aud !== undefined && claims.aud !== tenant.clientId) throw AppError.unauthorized("Microsoft Entra ID returned an identity for a different application.");
+  validateClientClaims(tenant, claims);
+}
+
+function validateTokenResult(tenant: TenantConfiguration, result: AuthenticationResult | null, mode: "delegated" | "application", audience: string, permissions: string[], accepted: string[] = [], homeAccountId?: string) {
   if (!result?.accessToken) {
     if (mode === "application") throw new AppError(502, "identity_provider_error",
       "Microsoft Entra ID did not return an application token. An administrator must verify the existing app registration and its credentials.");
     throw interactionRequired();
   }
-  if (result.tenantId !== config.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  if (result.tenantId !== tenant.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  const identityClaims = result.idTokenClaims as Record<string, unknown> | undefined;
+  validateOptionalIdentityClaims(tenant, identityClaims);
+  validateOptionalIdentityClaims(tenant, result.account?.idTokenClaims);
   if (!(result.expiresOn instanceof Date) || !Number.isFinite(result.expiresOn.getTime())) {
     throw new AppError(502, "identity_provider_error", "Microsoft Entra ID returned invalid token expiry metadata.");
   }
@@ -257,9 +330,11 @@ function validateTokenResult(result: AuthenticationResult | null, mode: "delegat
   }
 
   const claims = tryDecodeJwtPayload(result.accessToken);
-  validateOptionalProviderClaims(claims, mode, audience);
+  validateOptionalProviderClaims(tenant, claims, mode, audience);
   if (mode === "delegated") {
-    if (!result.account || result.account.tenantId !== config.tenantId || result.account.homeAccountId !== homeAccountId) {
+    if (!result.account || result.account.tenantId !== tenant.tenantId || result.account.homeAccountId !== homeAccountId
+      || claims?.oid !== undefined && claims.oid !== result.account.localAccountId
+      || identityClaims?.oid !== undefined && identityClaims.oid !== result.account.localAccountId) {
       throw AppError.unauthorized("Microsoft Entra ID returned a token for a different account.");
     }
     const granted = responsePermissions(result.scopes, audience);
@@ -275,10 +350,6 @@ function validateTokenResult(result: AuthenticationResult | null, mode: "delegat
   if (claims) {
     if (typeof claims.scp === "string" || claims.idtyp !== undefined && claims.idtyp !== "app") {
       throw new AppError(401, "invalid_token_mode", "Microsoft Entra ID returned a delegated token for an application request.");
-    }
-    const applicationId = claims.azp ?? claims.appid;
-    if (applicationId !== undefined && applicationId !== config.clientId) {
-      throw AppError.unauthorized("Microsoft Entra ID returned a token for a different application.");
     }
     const granted = new Set(Array.isArray(claims.roles) ? claims.roles.filter((role): role is string => typeof role === "string").map(role => role.toLowerCase()) : []);
     requirePermission(granted, permissions, accepted);
@@ -317,9 +388,16 @@ function requirePermission(granted: Set<string>, permissions: string[], accepted
     `The token does not contain the required permission: ${permissions.join(", ")}. ${adminManagedPermissionsMessage}`);
 }
 
-function validateOptionalProviderClaims(claims: Record<string, unknown> | undefined, mode: "delegated" | "application", audience: string) {
+function validateClientClaims(tenant: TenantConfiguration, claims: Record<string, unknown> | undefined) {
+  if ([claims?.azp, claims?.appid].some(value => value !== undefined && value !== tenant.clientId)) {
+    throw AppError.unauthorized("Microsoft Entra ID returned a token for a different application.");
+  }
+}
+
+function validateOptionalProviderClaims(tenant: TenantConfiguration, claims: Record<string, unknown> | undefined, mode: "delegated" | "application", audience: string) {
   if (!claims) return;
-  if (claims.tid !== undefined && claims.tid !== config.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  if (claims.tid !== undefined && claims.tid !== tenant.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  validateClientClaims(tenant, claims);
   const audiences = audience === "https://graph.microsoft.com" ? graphAudienceIds : powerPlatformAudienceIds;
   if (claims.aud !== undefined && (typeof claims.aud !== "string" || !audiences.has(claims.aud))) {
     throw AppError.unauthorized("Microsoft Entra ID returned a token for a different resource.");

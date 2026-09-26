@@ -827,7 +827,7 @@ describe("Package refresh service", () => {
     expect(repository.submit).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: "application-id" }, expect.objectContaining({ authorizationPrincipalId: user.homeAccountId, tokenMode: "application" }));
     await service.start(user, applicationJob.id, "application");
     await vi.waitFor(() => expect(repository.publish).toHaveBeenCalledTimes(1));
-    expect(dependencies.applicationToken).toHaveBeenCalledWith("graph.package.read.application");
+    expect(dependencies.applicationToken).toHaveBeenCalledWith(user.tenantId, "graph.package.read.application");
     expect(dependencies.delegatedToken).not.toHaveBeenCalled();
     expect(dependencies.requireApplicationDataScope).toHaveBeenCalled();
   });

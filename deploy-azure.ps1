@@ -19,6 +19,11 @@ param(
     [string]$ResourceGroupName,
     [string]$Region,
     [string]$AppRegistrationClientId,
+    [string[]]$TenantDomains,
+    [string]$TenantDisplayName,
+    [ValidateSet('agent-control-tenants-json')]
+    [string]$TenantRegistrySecretName,
+    [string]$TenantRegistryRegistrationApprovalReference,
     [string]$AppServicePlanName,
     [string]$AppServiceName,
     [string]$PostgresServerName,
@@ -69,6 +74,11 @@ function New-TargetFromParameters {
     $script:ResourceGroupName = Read-NonSecretValue 'Approved resource group' $ResourceGroupName
     $script:Region = Read-NonSecretValue 'Approved Azure region' $Region
     $script:AppRegistrationClientId = Read-NonSecretValue 'Existing Entra application/client GUID' $AppRegistrationClientId
+    if ($TenantRegistrySecretName) {
+        $script:TenantRegistryRegistrationApprovalReference = Read-NonSecretValue 'Approval reference for callback, roles, assignments and grants in EVERY registry tenant' $TenantRegistryRegistrationApprovalReference
+    } elseif (-not $TenantDomains) {
+        $script:TenantDomains = @((Read-NonSecretValue 'Accepted username domains (comma-separated exact domains; no tenant discovery)' '') -split ',' | ForEach-Object Trim)
+    }
     $script:AppServicePlanName = Read-NonSecretValue 'App Service Plan name' $AppServicePlanName
     $script:AppServiceName = Read-NonSecretValue 'App Service name' $AppServiceName
     $script:PostgresServerName = Read-NonSecretValue 'PostgreSQL Flexible Server name' $PostgresServerName
@@ -103,11 +113,13 @@ function New-TargetFromParameters {
     $script:ApprovedAt = Read-NonSecretValue 'Approval timestamp (UTC)' $ApprovedAt
     $script:ApprovalReference = Read-NonSecretValue 'Change approval reference' $ApprovalReference
     $script:BurstableRiskAcceptanceReference = Read-NonSecretValue 'Explicit Burstable POC risk acceptance reference' $BurstableRiskAcceptanceReference
+    $routing = @{ tenantRegistrySecretName = $TenantRegistrySecretName }
+    $requiredSecrets = @(Get-AzureRequiredSecretNames $routing)
     $versions = if ($SecretVersionsJson) {
         @($SecretVersionsJson | ConvertFrom-Json)
     } else {
         $values = @()
-        foreach ($name in $script:RequiredSecretNames) {
+        foreach ($name in $requiredSecrets) {
             $values += [PSCustomObject]@{ name = $name; version = Read-NonSecretValue "Selected non-secret version for $name" '' }
         }
         $values
@@ -118,8 +130,12 @@ function New-TargetFromParameters {
         @($ExistingSecretVersionsJson | ConvertFrom-Json)
     } else {
         $values = @()
-        foreach ($name in $script:RequiredSecretNames) {
-            $values += [PSCustomObject]@{ name = $name; version = Read-NonSecretValue "Currently deployed non-secret version for $name" '' }
+        foreach ($name in $requiredSecrets) {
+            if ($name -ceq $TenantRegistrySecretName) {
+                $version = [string](Read-Host "Currently deployed non-secret version for $name [Enter only for first registry migration]")
+                if ([string]::IsNullOrWhiteSpace($version)) { continue }
+            } else { $version = Read-NonSecretValue "Currently deployed non-secret version for $name" '' }
+            $values += [PSCustomObject]@{ name = $name; version = $version.Trim() }
         }
         $values
     }
@@ -141,6 +157,10 @@ function New-TargetFromParameters {
         resourceGroup = $ResourceGroupName
         region = $Region
         entraApplicationId = $AppRegistrationClientId
+        tenantDomains = @($TenantDomains | Where-Object { $null -ne $_ })
+        tenantDisplayName = $TenantDisplayName
+        tenantRegistrySecretName = $TenantRegistrySecretName
+        tenantRegistryRegistrationApprovalReference = $TenantRegistryRegistrationApprovalReference
         canonicalOrigin = $CanonicalOrigin.TrimEnd('/')
         callbackUri = "$($CanonicalOrigin.TrimEnd('/'))/api/auth/callback"
         existingVaultResourceId = $ExistingVaultResourceId
@@ -191,8 +211,8 @@ function New-TargetFromParameters {
             reference = $BurstableRiskAcceptanceReference
         }
         preparedVaultContract = [PSCustomObject]@{
-            secretNames = @($script:RequiredSecretNames)
-            runtimeConsumers = @($script:RuntimeSecretNames)
+            secretNames = $requiredSecrets
+            runtimeConsumers = @((Get-AzureRuntimeSecretReferences $routing).Values)
             administratorPasswordRuntimeAccessible = $false
             bootstrapSecretCleanupRequired = $true
             versions = @($versions)

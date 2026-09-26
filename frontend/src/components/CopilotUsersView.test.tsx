@@ -844,6 +844,67 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
+  it("keeps verified counts, recommendations and filters usable throughout a background reload", async () => {
+    let finish!: (value: typeof copilotUsageFixture) => void;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const view = render(<CopilotUsersView dataRevision={0} />);
+    await screen.findByRole("button", { name: "Ben" });
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Ben");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order by" }), "name");
+    const summary = screen.getByLabelText("M365 Copilot license summary");
+    const summaryBefore = summary.textContent;
+    const rowBefore = userRows()[0].textContent;
+    const search = screen.getByRole("searchbox", { name: "Search users or agents" });
+    search.focus();
+
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    expect(screen.getByRole("region", { name: "Users and adoption" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(summary).toHaveTextContent(summaryBefore!);
+    expect(userRows()[0]).toHaveTextContent(rowBefore!);
+    expect(screen.getByRole("button", { name: "Needs attention" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("combobox", { name: "Order by" })).toHaveValue("name");
+    expect(search).toHaveValue("Ben");
+    expect(search).toHaveFocus();
+    await userEvent.clear(search);
+    expect(userRows()).toHaveLength(2);
+    await userEvent.type(search, "Ben");
+    await userEvent.click(screen.getByRole("button", { name: "Ben" }));
+    const dialog = screen.getByRole("dialog", { name: "Ben" });
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("3");
+
+    const updated = structuredClone(copilotUsageFixture);
+    updated.users[1].importedUsage!.reportedResponsesReceived = 4;
+    await act(async () => finish(updated));
+    expect(screen.getByRole("dialog", { name: "Ben" })).toBe(dialog);
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("4");
+    expect(search).toHaveValue("Ben");
+    expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the current page and paging controls usable while saved users reload", async () => {
+    const data = structuredClone(copilotUsageFixture);
+    data.users = Array.from({ length: 103 }, (_, index) => licensedUser(index + 1, `Person${index}`, 200 - index));
+    data.counts.licensedUsers = data.users.length;
+    let finish!: (value: typeof copilotUsageFixture) => void;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(data)
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const view = render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByRole("button", { name: "Next" }));
+    const pages = screen.getByLabelText("Copilot user pages");
+    expect(pages).toHaveTextContent("51-100 of 103");
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    expect(pages).toHaveTextContent("51-100 of 103");
+    expect(screen.getByRole("button", { name: "Person50" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(pages).toHaveTextContent("101-103 of 103");
+    await act(async () => finish(structuredClone(data)));
+    expect(pages).toHaveTextContent("101-103 of 103");
+    expect(userRows()).toHaveLength(3);
+  });
+
   it("leaves collection to Sync and preserves last saved data while a reload fails", async () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
       .mockRejectedValueOnce(new Error("Authorization changed"))
@@ -898,16 +959,21 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 
-  it("clears retained user data after read authorization is revoked", async () => {
+  it.each([401, 403])("clears retained user data and details after read authorization fails with %s", async status => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
-      .mockRejectedValueOnce(new ApiError(403, "missing_internal_role", "User access was revoked."));
+      .mockRejectedValueOnce(new ApiError(status, "missing_internal_role", "User access was revoked."))
+      .mockResolvedValueOnce(structuredClone(copilotUsageFixture));
     const view = render(<CopilotUsersView dataRevision={0} />);
-    await screen.findByRole("button", { name: "Ada" });
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     view.rerender(<CopilotUsersView dataRevision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("User access was revoked.");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("M365 Copilot license summary")).not.toBeInTheDocument();
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it.each(["partial", "stale", "unavailable"] as const)("labels retained %s entitlement as last saved without current counts or recommendations", async state => {
@@ -940,14 +1006,14 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.getByRole("heading", { name: "No last-saved users in this cohort" })).toBeVisible();
   });
 
-  it("closes a selected user detail rather than silently replacing its report on revision changes", async () => {
+  it("keeps the selected user detail open when the same saved report is refreshed", async () => {
     const view = render(<CopilotUsersView dataRevision={0} />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
-    expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
+    const dialog = screen.getByRole("dialog", { name: "Ada" });
     view.rerender(<CopilotUsersView dataRevision={1} />);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(dialog).toBeVisible();
     await waitFor(() => expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
   });
 
   it("moves users between the paid and server-filtered unpaid cohorts after a new sync revision", async () => {
@@ -989,17 +1055,18 @@ describe("Paid M365 Copilot license dashboard", () => {
       expect(query).toMatchObject({ licenseCohort: "active_without_paid" });
     }
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "licenses");
-    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
-    expect(userRows()[0]).toHaveTextContent("Last saved: M365 Copilot licensed");
+    expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(userRows()[0]).toHaveTextContent("M365 Copilot licensed");
+    expect(userRows()[0]).not.toHaveTextContent("Last saved:");
     expect(within(screen.getByLabelText("M365 Copilot license summary"))
-      .getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("Unknown");
+      .getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent(String(previous.counts.licensedUsers));
     await act(async () => resolveCurrent(current));
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ben", "Drew"]);
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2);
   });
 
-  it("does not revive verified assignments or an old dialog on an A-B-A revision transition", async () => {
+  it("keeps open details and the verified snapshot while ignoring superseded revision reads", async () => {
     let resolveB!: (value: typeof copilotUsageFixture) => void;
     let resolveA!: (value: typeof copilotUsageFixture) => void;
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
@@ -1007,15 +1074,37 @@ describe("Paid M365 Copilot license dashboard", () => {
       .mockReturnValueOnce(new Promise(done => { resolveA = done; }));
     const view = render(<CopilotUsersView dataRevision={0} />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const dialog = screen.getByRole("dialog", { name: "Ada" });
     view.rerender(<CopilotUsersView dataRevision={1} />);
     view.rerender(<CopilotUsersView dataRevision={0} />);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
-    expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("Unknown");
-    await act(async () => resolveB(structuredClone(copilotUsageFixture)));
-    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
-    await act(async () => resolveA(structuredClone(copilotUsageFixture)));
+    expect(dialog).toBeVisible();
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("4");
+    const superseded = structuredClone(copilotUsageFixture);
+    superseded.users[0].directory.displayName = "Superseded Ada";
+    await act(async () => resolveB(superseded));
+    expect(screen.queryByText("Superseded Ada")).not.toBeInTheDocument();
+    expect(dialog).toBeVisible();
+    const current = structuredClone(copilotUsageFixture);
+    current.users[0].importedUsage!.reportedResponsesReceived = 201;
+    await act(async () => resolveA(current));
+    expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("201");
+  });
+
+  it("closes removed users without reopening their details on a later publication", async () => {
+    const removed = structuredClone(copilotUsageFixture);
+    removed.users = removed.users.filter(user => user.directory.displayName !== "Ada");
+    removed.counts.licensedUsers = 3;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
+      .mockResolvedValueOnce(removed).mockResolvedValueOnce(structuredClone(copilotUsageFixture));
+    const view = render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    view.rerender(<CopilotUsersView dataRevision={2} />);
+    await screen.findByRole("button", { name: "Ada" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 

@@ -84,7 +84,7 @@ export class AgentIdentityResolutionService {
       };
       const currentUser = async () => {
         assertCurrent();
-        const fresh = await wait(() => this.dependencies.revalidateUser(scope.principalId));
+        const fresh = await wait(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId));
         assertCurrent();
         const current = userScope(fresh);
         if (current.tenantId !== scope.tenantId || current.principalId !== scope.principalId) {
@@ -102,7 +102,7 @@ export class AgentIdentityResolutionService {
         await sameSource();
         await wait(() => this.dependencies.requireAvailable("graph.agentIdentity.read", fresh));
         assertCurrent();
-        return wait(() => this.dependencies.delegatedToken(scope.principalId, "graph.agentIdentity.read"));
+        return wait(() => this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "graph.agentIdentity.read"));
       });
       await commit(async () => {
         await sameSource();

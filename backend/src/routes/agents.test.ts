@@ -31,7 +31,13 @@ import {
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
-  secretValue: vi.fn((name: string) => name === "TENANT_ID" ? "11111111-1111-4111-8111-111111111111" : undefined),
+  secretValue: vi.fn((name: string) => {
+    const settings: Record<string, string> = {
+      TENANT_ID: "11111111-1111-4111-8111-111111111111", CLIENT_ID: "22222222-2222-4222-8222-222222222222",
+      CLIENT_SECRET: "synthetic-route-test-secret", TENANT_DOMAINS: "example.invalid",
+    };
+    return settings[name];
+  }),
   transaction: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
 }));
 const handlers = vi.hoisted(() => new Map<string, RequestHandler>());
@@ -74,7 +80,7 @@ describe("package refresh admission responses", () => {
       vi.spyOn(packageInventory, "get").mockResolvedValue(failed);
       const request: Partial<Request> = { body: { mode: "delegated" }, params: { id: groupId }, get: vi.fn() };
       new session.MemoryStore().createSession(request as Request, {
-        cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, user,
+        cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, clientId: userId, user,
       });
       const response = { json: vi.fn<Response["json"]>(), status: vi.fn<Response["status"]>().mockReturnThis() };
       const handler = handlers.get(`post ${path}`);
@@ -104,7 +110,7 @@ describe("directory request lifecycle", () => {
       sessionID: "directory-session",
     };
     new session.MemoryStore().createSession(request as Request, {
-      cookie: new session.Cookie(), accountId: scope.principalId, tenantId: scope.tenantId, user,
+      cookie: new session.Cookie(), accountId: scope.principalId, tenantId: scope.tenantId, clientId: userId, user,
     });
     const pending = Promise.resolve(handler(request as Request, response as Response, error => { if (error) throw error; }));
     return { pending, response, json };
@@ -285,7 +291,7 @@ describe("package mutation worker admission", () => {
       headers: { "idempotency-key": "retry" }, get: expressRequest.get,
     };
     new session.MemoryStore().createSession(request as Request, {
-      cookie: new session.Cookie(), accountId: scope.principalId, tenantId: scope.tenantId, user: actor,
+      cookie: new session.Cookie(), accountId: scope.principalId, tenantId: scope.tenantId, clientId: userId, user: actor,
     });
     await handler(request as Request, response as Response, error => { if (error) throw error; });
     return json;

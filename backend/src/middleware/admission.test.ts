@@ -15,12 +15,20 @@ describe("API admission", () => {
     expect((rejected.error as { code: string }).code).toBe("request_admission_limit");
     expect(rejected.headers["Retry-After"]).toBeDefined();
   });
+
+  it("does not share a principal budget between tenants with the same account identifier", () => {
+    const tenantA = { tenantId: "tenant-a", accountId: "shared-account" };
+    const tenantB = { tenantId: "tenant-b", accountId: "shared-account" };
+    for (let index = 0; index < 200; index += 1) expect(invoke("/jobs", "POST", tenantA).error).toBeUndefined();
+    expect(invoke("/jobs", "POST", tenantA).error).toMatchObject({ code: "request_admission_limit" });
+    expect(invoke("/jobs", "POST", tenantB).error).toBeUndefined();
+  });
 });
 
-function invoke(path: string, method: string) {
+function invoke(path: string, method: string, session: { tenantId?: string; accountId?: string } = {}) {
   let error: unknown;
   const headers: Record<string, string> = {};
-  const request = { path, method, ip: "127.0.0.1", session: {} } as Request;
+  const request = { path, method, ip: "127.0.0.1", session } as Request;
   const response = { setHeader: (name: string, value: string) => { headers[name] = value; } } as unknown as Response;
   apiAdmission(request, response, ((value?: unknown) => { error = value; }) as NextFunction);
   return { error, headers };

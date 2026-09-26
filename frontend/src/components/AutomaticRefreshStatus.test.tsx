@@ -4,7 +4,7 @@ import type { AutomaticRefreshStatus as Status } from "../useAutomaticRefresh";
 import { AutomaticRefreshStatus } from "./AutomaticRefreshStatus";
 
 const base: Status = {
-  phase: "ready", paused: false, enabled: true, online: true, visible: true,
+  phase: "ready", checking: false, paused: false, enabled: true, online: true, visible: true,
   checkedAt: undefined, message: undefined, setPaused: vi.fn(),
 };
 

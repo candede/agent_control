@@ -21,7 +21,8 @@ import { ReportedUserDetail } from "./ReportedUserDetail";
 import "./reportedUsers.css";
 
 const pageSize = 50;
-type ReadState = { key: object; value: OfficialUsageUserView } | { key: object; error: string };
+type ReadKey = { query: OfficialUsageUserQuery; dataRevision: number; retry: number };
+type ReadState = { key: ReadKey; value: OfficialUsageUserView } | { key: ReadKey; error: string };
 type ExportState = { key: object; status: "pending" | "done" } | { key: object; status: "failed"; message: string };
 type AdvancedFilters = {
   creatorType: string;
@@ -47,12 +48,13 @@ const sorts: { value: string; label: string; sortBy: OfficialUsageUserView["filt
   { value: "name-desc", label: "Name Z–A", sortBy: "displayName", sortDirection: "desc" },
 ];
 
-export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, directoryData, onAccessDenied, onOpenAgent }: {
+export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, directoryData, directoryDataRevision = dataRevision, onAccessDenied, onOpenAgent }: {
   route: UsersRouteState;
   onRouteChange: (route: UsersRouteState, replace?: boolean) => void;
   dataRevision?: number;
   agentInventoryRevision?: number;
   directoryData?: CopilotUsageUsersResponse;
+  directoryDataRevision?: number;
   onAccessDenied?: (message: string) => void;
   onOpenAgent?: (id: string) => void;
 }) {
@@ -85,25 +87,27 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
   const key = useMemo(() => ({ query, dataRevision, retry }), [query, dataRevision, retry]);
   const exportKey = useMemo(() => ({ key, draft }), [key, draft]);
   const scoped = result?.key === key ? result : undefined;
-  const data = scoped && "value" in scoped ? scoped.value : undefined;
+  const data = result?.key.query === query && "value" in result ? result.value : undefined;
   const error = scoped && "error" in scoped ? scoped.error : undefined;
+  const loading = !scoped && !data;
   const scopedExport = exportState?.key === exportKey ? exportState : undefined;
   const draftChanged = JSON.stringify(draft) !== JSON.stringify(applied);
   const invalidDates = Boolean(draft.startDate && draft.endDate && draft.startDate > draft.endDate);
   const validThreshold = /^\d+$/.test(draft.lowResponseThreshold)
     && Number(draft.lowResponseThreshold) >= 1 && Number(draft.lowResponseThreshold) <= 100_000_000;
   const hasRelationships = Boolean(data?.lineages.some(lineage => lineage.kind === "userAgents"));
+  const reportDirectory = directoryDataRevision === result?.key.dataRevision ? directoryData : undefined;
   const directoryMatches = useMemo(() => {
     const matches = new Map<string, CopilotUsageUser | null>();
-    if (directoryData?.sources.directory.state !== "available") return matches;
-    for (const user of directoryData.users) {
+    if (reportDirectory?.sources.directory.state !== "available") return matches;
+    for (const user of reportDirectory.users) {
       if (!user.importedUsage?.datasetScope.reportSetId) continue;
       const identity = reportUserKey(user.importedUsage);
       matches.set(identity, matches.has(identity) ? null : user);
     }
     return matches;
-  }, [directoryData]);
-  const selected = selectedUser?.key === key ? data?.users.value.find(user => user.username === selectedUser.username) : undefined;
+  }, [reportDirectory]);
+  const selected = selectedUser?.key === query ? data?.users.value.find(user => user.username === selectedUser.username) : undefined;
   const hasFilters = Boolean(search || agentId || JSON.stringify(applied) !== JSON.stringify(defaultFilters) || draftChanged);
   const coverageUnavailable = data?.licenseCoverage?.state === "unavailable";
   const exportDisabled = !data?.activeSet || coverageUnavailable || draftChanged || scopedExport?.status === "pending";
@@ -142,11 +146,15 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
   useEffect(() => {
     const controller = new AbortController();
     void readSaved(["official-usage-users", query, dataRevision, retry], signal => getOfficialUsageUsers(query, { signal }), controller.signal).then(value => {
-      if (!controller.signal.aborted) setResult({ key, value });
+      if (!controller.signal.aborted) {
+        setResult({ key, value });
+        setSelectedUser(selection => value.users.value.some(user => user.username === selection?.username) ? selection : undefined);
+      }
     }).catch((failure: unknown) => {
       if (controller.signal.aborted) return;
       const message = failure instanceof Error ? failure.message : "Reported user activity could not be loaded.";
       setResult({ key, error: message });
+      setSelectedUser(undefined);
       if (isAccessDenied(failure)) reportAccessDenied(message);
     });
     return () => controller.abort();
@@ -194,12 +202,13 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
       setExportState({ key: exportKey, status: "failed", message });
       if (isAccessDenied(failure)) {
         setResult({ key, error: message });
+        setSelectedUser(undefined);
         onAccessDenied?.(message);
       }
     }
   }
 
-  return <section className="reported-users" aria-label="Non-paid user activity" aria-busy={!scoped}>
+  return <section className="reported-users" aria-label="Non-paid user activity" aria-busy={loading}>
     <p className="reported-users-intro">Verified non-paid users with positive report activity. Membership uses current saved licenses, not license history.</p>
     <div className="copilot-users-toolbar reported-users-toolbar">
       <label><span>Search reported users or agents</span><input ref={searchInput} type="search" maxLength={256} placeholder="User, agent name, ID or creator" value={search}
@@ -259,7 +268,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
     {error ? <div className="error-banner" role="alert">{error} <button type="button" className="secondary" onClick={() => setRetry(value => value + 1)}>Retry reported activity</button></div> : null}
     {scopedExport?.status === "failed" && !error ? <div className="error-banner" role="alert">{scopedExport.message} <button type="button" className="secondary" disabled={exportDisabled} onClick={() => void exportUsers()}>Retry user export</button></div> : null}
     {scopedExport?.status === "done" ? <p role="status">User CSV downloaded with all agent details for matching identities in the displayed report snapshot.</p> : null}
-    {!scoped ? <p role="status">Loading reported user activity…</p> : null}
+    {loading ? <p role="status">Loading reported user activity…</p> : null}
     {data ? <>
       {coverageUnavailable ? <p className="copilot-users-notice" role="status">
         License coverage is unavailable. {data.licenseCoverage?.message} Run Users sync from Sync in the top navigation, or use Permissions to recover the connection. CSV export is unavailable until license coverage recovers.
@@ -286,7 +295,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</td>
               <td><CopilotLicenseStatus user={directoryUser} licenseAssignmentStatus={user.licenseAssignmentStatus} /></td>
               <td>{usageDate(user.userLastActivityDateUtc)}</td>
-              <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key, username: user.username })}>View details</button></td>
+              <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key: query, username: user.username })}>View details</button></td>
             </tr>;
             })}</tbody>
           </table>
@@ -308,8 +317,8 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
         <p>{data.counts.users.toLocaleString()} cohort identities; {data.counts.userRows.toLocaleString()} Users rows; {hasRelationships ? data.counts.accessRows.toLocaleString() : "Unknown"} Users &amp; agents relationships. Only verified non-paid users with positive Users-report or Users &amp; agents activity are included.</p>
         {data.lineages.map(lineage => <p key={lineage.kind}>{lineage.kind === "userAgents" ? "Users & agents" : lineage.kind === "users" ? "Users" : "Agents"} version: {lineage.versionId}. {lineage.sourceFreshness === "unknown" ? "Source refresh time not supplied; import time does not establish freshness." : ""}</p>)}
         {data.activeSet?.reportingPeriod.provenance === "activity_range" ? <p>Observed activity dates do not establish a complete reporting window.</p> : null}
-        <p>{directoryData?.sources.directory.state === "available"
-          ? `Paid-feature states observed: ${usageDate(directoryData.snapshot?.directoryObservedAt ?? directoryData.sources.directory.fetchedAt)}. Current entitlement does not prove activity or coverage during the reporting period.`
+        <p>{reportDirectory?.sources.directory.state === "available"
+          ? `Paid-feature states observed: ${usageDate(reportDirectory.snapshot?.directoryObservedAt ?? reportDirectory.sources.directory.fetchedAt)}. Current entitlement does not prove activity or coverage during the reporting period.`
           : "Detailed license evidence requires the current saved directory snapshot and a unique exact report link. Missing detail evidence does not mean basic, unlicensed or disabled."}</p>
         <p>Concealed identities and case-distinct names are report-scoped. Directory evidence requires an existing unique exact saved link with the same report set, Users version and Users &amp; agents version.</p>
         <p>{data.decisionNotice} Collection and connection recovery are available through Sync and Permissions in the top navigation.</p>

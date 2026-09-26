@@ -21,7 +21,9 @@ const mocks = vi.hoisted(() => ({
   applicationScope: vi.fn(),
 }));
 
-vi.mock("../config.js", () => ({ config: { tenantId: "tenant", clientId: "application" } }));
+vi.mock("../config.js", () => ({ getTenantConfiguration: (tenantId: string) => ({
+  tenantId, clientId: tenantId === "tenant" ? "application" : "other-application",
+}) }));
 vi.mock("../middleware/auth.js", () => ({
   requestScope: (request: Request) => ({ tenantId: request.session.user!.tenantId, principalId: request.session.accountId }),
 }));
@@ -141,6 +143,18 @@ describe("workbench jobs aggregation", () => {
       expect.objectContaining({ id: "application", source: "package-refresh", tokenMode: "application", href: "/sync?refreshJob=application&mode=application" }),
       expect.objectContaining({ id: "principal", source: "package-refresh", tokenMode: "delegated" }),
     ]));
+  });
+
+  it("loads shared application jobs using the signed-in tenant's client ID", async () => {
+    const otherUser = { ...user, tenantId: "other-tenant" };
+    await jobs(otherUser);
+    expect(mocks.packages).toHaveBeenCalledWith(
+      { tenantId: otherUser.tenantId, principalId: "other-application" }, user.homeAccountId, 20,
+    );
+    expect(mocks.packages.mock.calls.every(([scope]) => scope.tenantId === otherUser.tenantId)).toBe(true);
+    expect(mocks.packages).not.toHaveBeenCalledWith(
+      expect.objectContaining({ principalId: "application" }), expect.anything(), expect.anything(),
+    );
   });
 
   it("does not read an unapproved application scope or mark disabled collection as a failed source", async () => {

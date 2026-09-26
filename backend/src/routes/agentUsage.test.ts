@@ -13,6 +13,8 @@ import { declaredRoutePolicies } from "./policy.js";
 vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-4111-8111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "agent-usage-route-fixture-secret";
 });
 vi.mock("../services/telemetry.js", async original => ({
@@ -37,9 +39,10 @@ beforeAll(async () => {
   app.use((request, _response, next) => {
     const role = request.get("x-test-role");
     if (role) {
-      const tenantId = request.get("x-test-tenant") ?? config.tenantId!;
+      const tenantId = request.get("x-test-tenant") ?? config.tenants[0].tenantId!;
       request.session.accountId = "admin-reader";
       request.session.tenantId = tenantId;
+      request.session.clientId = config.tenants[0].clientId;
       request.session.rolesValidatedAt = Date.now();
       request.session.csrfToken = "fixture-csrf";
       request.session.user = {
@@ -118,7 +121,7 @@ describe("Admin reviewed usage routes", () => {
   it("browses candidates only through the explicit record-qualified endpoint", async () => {
     expect(await request("GET", "/usage-candidates?search=Report%20A&offset=5&limit=20")).toEqual({ status: 200, body: page });
     expect(candidates).toHaveBeenCalledExactlyOnceWith(
-      { tenantId: config.tenantId, principalId: "admin-reader" }, recordId, { search: "Report A", offset: 5, limit: 20 },
+      { tenantId: config.tenants[0].tenantId, principalId: "admin-reader" }, recordId, { search: "Report A", offset: 5, limit: 20 },
     );
     expect(attach).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
@@ -133,8 +136,8 @@ describe("Admin reviewed usage routes", () => {
   it("passes only confirmed immutable intent and scoped actor into attachment and removal", async () => {
     expect(await request("POST", "/usage-associations", input())).toEqual({ status: 200, body: { context } });
     expect(attach).toHaveBeenCalledWith(
-      { tenantId: config.tenantId, principalId: "admin-reader" }, recordId, input(),
-      expect.objectContaining({ actor: expect.objectContaining({ tenantId: config.tenantId, homeAccountId: "admin-reader" }) }),
+      { tenantId: config.tenants[0].tenantId, principalId: "admin-reader" }, recordId, input(),
+      expect.objectContaining({ actor: expect.objectContaining({ tenantId: config.tenants[0].tenantId, homeAccountId: "admin-reader" }) }),
     );
     const { target: _target, ...removal } = input();
     expect(await request("DELETE", "/usage-associations", removal)).toEqual({ status: 200, body: { context } });

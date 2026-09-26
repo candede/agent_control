@@ -124,8 +124,11 @@ export class PackageMutationQualificationRepository {
   async recordCycleJob(user: AuthenticatedUser, id: string, jobId: string) {
     requireQualificationOperator(user);
     const tenantId = requireTenant(user);
-    const result = await this.database.query<QualificationRow>(`UPDATE package_mutation_qualifications SET job_id=$4
-      WHERE id=$1 AND tenant_id=$2 AND workflow_version=3 AND status='restoring' AND actor_principal_id=$3 AND job_id IS NULL RETURNING *`,
+    const result = await this.database.query<QualificationRow>(`UPDATE package_mutation_qualifications qualification SET job_id=$4
+      WHERE id=$1 AND tenant_id=$2 AND workflow_version=3 AND status='restoring' AND actor_principal_id=$3 AND job_id IS NULL
+        AND EXISTS (SELECT 1 FROM jobs job WHERE job.id=$4 AND job.tenant_id=qualification.tenant_id
+          AND job.principal_id=qualification.actor_principal_id AND job.token_mode='delegated')
+      RETURNING qualification.*`,
     [qualificationId(id), tenantId, user.homeAccountId, qualificationId(jobId)]);
     if (!result.rows[0]) throw new AppError(409, "canary_cycle_state", "The durable canary job could not be attached to its approval.");
     return project(result.rows[0]);

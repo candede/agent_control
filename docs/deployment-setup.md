@@ -6,12 +6,12 @@ Phase 02 defines the Entra, secret, and local runtime contract. It does not depl
 
 - Docker Desktop with Compose v2.
 - PowerShell 7 (`pwsh`).
-- A Microsoft Entra single-tenant app registration, with its tenant ID, client ID and client secret for local onboarding.
-- For Azure preparation, permission to edit the app registration, assign its app roles, read the six required Key Vault secrets, and deploy the later Bicep resources.
+- An approved Microsoft Entra app registration per configured tenant, each with its tenant ID, client ID, client secret and explicit accepted username domains. Registrations may remain single-tenant.
+- For Azure preparation, permission to prepare the registrations and app-role assignments, read the six base Key Vault secrets plus the optional registry secret, and deploy the later Bicep resources.
 
 ## Entra application
 
-An authorized administrator imports only the `appRoles` entries from [the manifest](../infra/entra-app-manifest.json) into the approved single-tenant registration, preserving its existing identity, credentials, reply URLs, API permissions, consent, and other configuration. Do not replace the entire registration. The manifest contains exactly two enabled roles with fresh IDs:
+For **each configured tenant**, an authorized administrator imports only the `appRoles` entries from [the manifest](../infra/entra-app-manifest.json) into that tenant's approved registration, preserving its identity, credentials, reply URLs, API permissions, consent, and other configuration. Each registration can remain single-tenant; do not replace the entire registration. The manifest contains exactly two enabled roles with fresh IDs:
 
 | Role | Manifest role ID |
 | --- | --- |
@@ -42,6 +42,8 @@ The manifest intentionally contains no `requiredResourceAccess` entries. Configu
 ```text
 http://localhost:3001/api/auth/callback
 ```
+
+All configured registrations use the deployment's **same** callback. Repeat app-role definitions, Enterprise-application assignments, required provider permissions and tenant administrator consent in every tenant. Consent or roles in one tenant do not authorize another.
 
 ### API permissions: administrator prerequisite
 
@@ -81,6 +83,34 @@ After the administrator changes grants, sign out and back in, then use **Permiss
 
 Register the production canonical HTTPS `/api/auth/callback` Web reply URL only for the approved App Service origin. Prepare explicit `AgentControl.Viewer` or `AgentControl.Admin` assignments; missing or legacy-only assignment is diagnosed, never auto-promoted. Review the [dated provider permission inventory](provider-contract-inventory-2026-09-08.md) before separately approving delegated permissions or application permissions. This phase supplies artifacts only and does not apply registration or grant changes.
 
+## Tenant registry and domain routing
+
+Operators configure profiles; users see a work/school **username form**, not a tenant selector, and there is no in-app tenant management. A profile contains `tenantId` and `clientId` GUIDs, a nonempty single-line `clientSecret`, a nonempty `domains` string array, and optional `displayName` (1–128 printable characters). The registry is a JSON array; this is a structural example only, not working credentials:
+
+```json
+[
+  {
+    "tenantId": "11111111-1111-4111-8111-111111111111",
+    "clientId": "22222222-2222-4222-8222-222222222222",
+    "clientSecret": "<enter only in the protected registry or Key Vault>",
+    "domains": ["contoso.com", "contoso.onmicrosoft.com"],
+    "displayName": "Contoso"
+  },
+  {
+    "tenantId": "33333333-3333-4333-8333-333333333333",
+    "clientId": "44444444-4444-4444-8444-444444444444",
+    "clientSecret": "<enter only in the protected registry or Key Vault>",
+    "domains": ["fabrikam.com"]
+  }
+]
+```
+
+The runtime accepts `TENANTS_JSON_FILE` pointing to a protected file, or `TENANTS_JSON` supplied securely (Azure uses a native Key Vault reference). A supplied registry is authoritative: it does not merge with or fall back to legacy settings. Keep credential-bearing JSON out of `settings.json`, `compose.env`, target/ARM parameter files, source, shell arguments, receipts and logs. Local Compose mounts only the generated protected file for identity.
+
+Domains are exact, normalized organization domains, such as `contoso.com`, not email addresses, URLs or wildcards. Unicode-letter IDNs are supported, but separators must be ASCII dots; Unicode dot separators and invisible format controls are rejected before IDNA normalization. A configured parent domain does not implicitly admit its subdomains. Every profile requires at least one domain, even when there is only one tenant. Duplicate tenant IDs and duplicate domains, including case/IDN-equivalent domains, are rejected. The app never discovers tenants from usernames or falls back to an arbitrary/default tenant for an unknown domain.
+
+Without a registry, `TENANT_ID`, `CLIENT_ID` and `CLIENT_SECRET` (or `CLIENT_SECRET_FILE`) define one legacy profile, with required comma-separated `TENANT_DOMAINS` and optional `TENANT_DISPLAY_NAME`. Missing domains require configuration setup, not automatic discovery. `FRONTEND_ORIGIN` and `REDIRECT_URI` remain shared deployment settings, not per-tenant fields.
+
 ## Required Key Vault secrets
 
 The production workflow accepts a full Azure resource ID for an existing vault:
@@ -102,7 +132,7 @@ Use an existing RBAC-enabled vault in the approved tenant/subscription. These ar
 
 All six secrets must exist, be enabled, have non-empty values in the formats above, and be unexpired. When expiry metadata is present it must be in the future. The two database passwords must differ. The deployment operator needs narrowly scoped secret-value and metadata read access for validation. The later Azure deployment identity also needs `Microsoft.KeyVault/vaults/deploy/action` when Bicep resolves Key Vault references.
 
-Only the five rows other than `agent-control-postgres-admin-password` are available to the application runtime through native Key Vault references. No application setting, container environment, log, template output, or deployment artifact may contain the administrator password. Do not place provider bearer tokens, MSAL cache content, authorization codes, PKCE verifiers, or browser report data in Key Vault deployment parameters.
+Only the five rows other than `agent-control-postgres-admin-password` are available to the application runtime through native Key Vault references. Multi-tenant mode adds the prepared `agent-control-tenants-json` secret as a sixth runtime reference, `TENANTS_JSON`; its value is the complete registry above. The six base secrets remain required, including the approved primary tenant/application. No application setting, container environment, log, template output, or deployment artifact may contain the administrator password. Do not place provider bearer tokens, MSAL cache content, authorization codes, PKCE verifiers, or browser report data in Key Vault deployment parameters.
 
 Prepare values outside the wizard using the Azure portal's Key Vault Secrets interface or an approved secure administrative tool. Enter secret values directly there, never in chat, command-line arguments, source files, receipts, logs, or ARM outputs. Confirm enabled/not-before/expiry state and value formats without exporting values. The wizard lists missing names and permits an external repair/recheck; it never creates the vault, writes or rotates secrets, or weakens access/network policy.
 
@@ -110,7 +140,7 @@ Enable the vault's access for Azure Resource Manager template deployment. The ap
 
 Treat the administrator password as a short-lived bootstrap input even though its approved vault version remains available for future operator recovery. Mount it only into the disposable migration/operator container, remove the container and any generated secure parameter input immediately after bootstrap, and verify it is absent from App Service settings, deployment receipts, package layers and command output. The runtime must receive only the distinct `agentcontrol_app` password.
 
-App Service uses its managed identity with `Key Vault Secrets User` scoped to the five runtime secrets, never the admin-password secret. Preview and approve assignments, or verify administrator-prepared assignments. Check all three access paths independently: ARM template resolution, operator runner data-plane access, and App Service Key Vault references. For a restricted vault, the administrator must prepare the permitted network/DNS path for each caller; an entered vault ID or identity permission alone proves neither reachability nor access. Do not enable broad public access to make validation pass.
+App Service uses its managed identity with `Key Vault Secrets User` scoped to the five runtime secrets (six with the registry), never the admin-password secret. Preview and approve assignments, or verify administrator-prepared assignments. Check all three access paths independently: ARM template resolution, operator runner data-plane access, and App Service Key Vault references. For a restricted vault, the administrator must prepare the permitted network/DNS path for each caller; an entered vault ID or identity permission alone proves neither reachability nor access. Do not enable broad public access to make validation pass.
 
 Use native versioned app-setting references of this form (names and references only, never resolved values):
 
@@ -119,6 +149,10 @@ Use native versioned app-setting references of this form (names and references o
 ```
 
 Map `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `SESSION_SECRET`, and `PGPASSWORD` to their five exact table entries. Retain only non-secret version references in release receipts. Select consistent versions for provisioning/bootstrap and runtime references; existing credential changes require the Phase 11 coordinated rotation runbook, not automatic replacement. Structural driver settings use the derived `PGHOST`/`PGPORT`, fixed database `agentcontrol`, and restricted runtime login `agentcontrol_app`. The [Phase 01 database contract](../README.md) owns SQL/bootstrap/grants; `agentcontrol_admin` stays operator-only.
+
+For registry mode, set the approved target's `tenantRegistrySecretName` to `agent-control-tenants-json`, add that name to `preparedVaultContract.secretNames` and `runtimeConsumers`, and select its immutable version in `versions`. Add its current version to `existingVersions` for subsequent deployments; on the first migration from legacy, retain the six unchanged existing versions. The registry must include the approved primary tenant/application, and first migration must preserve its legacy secret. Record `tenantRegistryRegistrationApprovalReference` for administrator verification of the shared callback, roles, assignments and API grants in **every** profile's tenant. Automated directory verification covers the primary registration only; it does not claim cross-directory permission proof. The runtime-reference verifier requires the registry's exact name, vault, version and `Resolved` status.
+
+Legacy Azure targets instead require `tenantDomains` as an explicit nonempty array; `tenantDisplayName` is optional. Named parameters are `-TenantDomains` / `-TenantDisplayName`, or `-TenantRegistrySecretName agent-control-tenants-json` plus `-TenantRegistryRegistrationApprovalReference`. No parameter accepts credential-bearing JSON. See [the Azure runbook](azure-production-deployment.md#tenant-configuration).
 
 ## Local workflow
 
@@ -136,11 +170,11 @@ For `database_schema_incompatible`, the operator diagnostic names the first mism
 
 The final report shows automated check results and local readiness. Expected error-path logs are quiet unless their Vitest tests fail; failure diagnostics and nonzero exits remain intact.
 
-Runtime configuration uses `FRONTEND_ORIGIN` for same-origin browser checks and `REDIRECT_URI` for the exact `/api/auth/callback` URL on that same origin. Local Compose bounds the `json-file` logs for both persistent services to three 10 MiB files each; rotation is finite local diagnostics, not a second telemetry service. The application completion logger runs before body parsing and admission so denied requests are counted without logging URLs, headers or bodies. Local Compose receives both origin values from the saved public URL or, by default, localhost and the selected port. Azure requires production mode, HTTPS for the single origin, complete `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET` configuration, and a session secret of at least 32 bytes. App Service identity selects the trusted Azure proxy boundary; role or administrator bootstrap environment variables are not supported and cannot assign authority.
+Runtime configuration uses `FRONTEND_ORIGIN` for same-origin browser checks and `REDIRECT_URI` for the exact `/api/auth/callback` URL on that same origin. Local Compose bounds the `json-file` logs for both persistent services to three 10 MiB files each; rotation is finite local diagnostics, not a second telemetry service. The application completion logger runs before body parsing and admission so denied requests are counted without logging URLs, headers or bodies. Local Compose receives both origin values from the saved public URL or, by default, localhost and the selected port. Azure requires production mode, HTTPS for the single origin, complete tenant credentials with explicit domains through the registry or legacy profile, and a session secret of at least 32 bytes. App Service identity selects the trusted Azure proxy boundary; role or administrator bootstrap environment variables are not supported and cannot assign authority.
 
-Select the saved configuration with `-Project` (default `agent-control`). Project names are 3-40 letters, digits or hyphens, starting with a letter, and are normalized to lowercase, so `pwsh ./deploy-local.ps1 start -Project newCustomer` uses `.local/newcustomer/`. State is fixed beneath the repository root; custom locations are unsupported. First or incomplete `start` launches the wizard for missing tenant ID, client ID, client secret and port. Enter GUIDs and the secret value directly in the terminal; secret input is hidden. The port defaults to `3001` and accepts integers from `1024` through `65535`. Identity/port command-line arguments and a repository `.env` file are not supported. Configured starts reuse all saved values, including the port, without prompting. `stop` and internal maintenance helpers do not prompt for identity.
+Select the saved configuration with `-Project` (default `agent-control`). Project names are 3-40 letters, digits or hyphens, starting with a letter, and are normalized to lowercase, so `pwsh ./deploy-local.ps1 start -Project newCustomer` uses `.local/newcustomer/`. State is fixed beneath the repository root; custom locations are unsupported. First or incomplete `start` launches the wizard for missing tenant ID, client ID, hidden client secret, accepted comma-separated domains and port. The port defaults to `3001` and accepts integers from `1024` through `65535`. Identity/port command-line arguments and a repository `.env` file are not supported. Configured starts reuse all saved profiles and deployment settings without prompting. `stop` and internal maintenance helpers do not prompt for identity.
 
-The helper saves IDs and port in `.local/<lowercase-project>/settings.json` and the secret in `.local/<lowercase-project>/secrets/client-secret` with owner-only permissions (Unix mode 0600); directories are restricted. An absent, empty or whitespace-only client-secret file triggers a new secure prompt on `start`. Required identity input cannot be blank; Enter accepts the default port when none is saved. Malformed GUIDs and invalid ports are prompted again. Complete onboarding in an interactive terminal before unattended runs. Never enter secret values in chat or command arguments. The wizard validates input only: it does not verify live credentials, change app registrations or grant permissions.
+The helper saves a non-secret `tenants` collection, port and optional public URL in `.local/<lowercase-project>/settings.json`, and the credential-bearing array in `secrets/tenants.json` (Unix mode 0600, directories 0700; owner-only Windows ACLs). On first upgraded `start`, a complete legacy `tenantId`/`clientId` plus `secrets/client-secret` is preserved and only accepted domains are prompted. Port/public URL, database/session secrets, backups and retained data are unchanged. The legacy secret file remains unchanged for recovery but is no longer a runtime input. A migrated registry that is missing, invalid or inconsistent with saved metadata stops for recovery, without falling back to old credentials. Required identity input cannot be blank; malformed GUIDs, domains and ports are retried. Complete onboarding interactively before unattended runs. Never enter secret values in chat or command arguments. The wizard validates input, not live credentials, permissions or consent.
 
 To change saved configuration:
 
@@ -148,23 +182,23 @@ To change saved configuration:
 pwsh ./deploy-local.ps1 edit-config -Project agent-control-phase01
 ```
 
-The wizard prompts for tenant ID, client ID, hidden client secret, port and public URL, with Enter preserving each current value, even if an identity field is currently unset. For a port-only edit, press Enter at the three identity prompts, enter the port, then press Enter at the public URL prompt. Missing identity values remain required on the next `start`, not during `edit-config`. The wizard never displays the current secret. Unchanged settings are not rewritten and leave a running app untouched. Accepted changes to the client ID, client secret, port or public URL stop the app safely and leave it stopped; run `start` explicitly afterward. Before starting with a changed canonical origin, register its exact `/api/auth/callback` as an Entra Web reply URL.
+The wizard walks through every profile's tenant ID, client ID, hidden secret, domains and optional display name, then offers **Add another tenant? [y/N]**, followed by the shared port and public URL. Enter preserves values; `-` clears a display name. New profiles must be complete; duplicates are rejected before any save. For a port-only edit, keep all profile fields and decline additions. A previously unconfigured legacy identity may remain incomplete during a port edit, but the next `start` requires credentials and domains. The wizard never displays secrets. No-op edits neither rewrite files nor stop the app. Accepted changes safely drain and stop an existing app; run `start` explicitly afterward. Before changing the canonical origin, register its exact `/api/auth/callback` in every tenant's app.
 
-For dev tunnels, `pwsh ./deploy-local.ps1 -Action edit-config -Project agent-control-phase01` accepts a public URL such as `https://your-tunnel.devtunnels.ms`. It is saved as `publicUrl` in the project settings, separately from the local port; no `:3002` is appended to that public URL. Only a canonical HTTPS origin without a trailing slash, path, query or fragment is accepted. Enter keeps the current value; `local` clears it and restores automatic localhost behavior. Existing projects need no migration or additional prompt on `start`.
+For dev tunnels, `pwsh ./deploy-local.ps1 -Action edit-config -Project agent-control-phase01` accepts a public URL such as `https://your-tunnel.devtunnels.ms`. It is saved as `publicUrl` in the project settings, separately from the local port; no `:3002` is appended to that public URL. Only a canonical HTTPS origin without a trailing slash, path, query or fragment is accepted. Enter keeps the current value; `local` clears it and restores automatic localhost behavior. The tenant-registry migration preserves an existing public URL without another prompt.
 
 A public URL enables `TRUST_PROXY=1` for one controlled tunnel/reverse-proxy hop, which must forward `X-Forwarded-Proto: https` for secure session cookies. Clearing it disables proxy trust. The listener remains loopback-published, and readiness probes still use localhost: deployment does not verify tunnel availability. Register `https://your-tunnel.devtunnels.ms/api/auth/callback` in Entra and begin a fresh sign-in through the tunnel. Update the setting and registration if the tunnel hostname changes. See the [tunnel walkthrough](../README.md#testing-through-a-dev-tunnel).
 
 The tunnel must also preserve the browser's `Origin` header. Persist this on the existing port with `devtunnel port update YOUR_TUNNEL_ID -p YOUR_LOCAL_PORT --host-header unchanged --origin-header unchanged`, retaining its approved access controls. Then host it with `devtunnel host YOUR_TUNNEL_ID --host-header unchanged --origin-header unchanged`. Host flags alone may not change an existing port's settings. Dev Tunnel's default localhost Origin rewrite causes `403 invalid_origin` on permission checks and sign-out even when sign-in works and the saved public URL is correct. Editing app configuration does not configure the tunnel port. The port update can take effect on a running tunnel. Do not force a fixed trusted Origin or relax the backend check; reload the public URL after updating the port, then retry **Check status** or **Sign out**. An origin rejection's problem response includes `details.expectedOrigin` and `details.receivedOrigin` to distinguish an incorrect app URL from a rewritten or missing browser header.
 
-The tenant ID can change before the project has a database volume; a previously missing tenant ID can also be filled in. Changing a nonempty saved tenant ID when a volume exists is rejected before stopping the app or writing settings. Configuration edits do not migrate data between tenants; use a separate project for another tenant.
+A tenant ID can be corrected before the project has a database volume; a missing ID can also be filled in. Replacing a saved tenant ID when a volume exists is rejected before stopping the app or writing settings. Add another profile instead. The wizard neither deletes tenant profiles nor migrates data between tenants; a separate project is optional when a fully separate installation is desired.
 
-Changing the saved client/application ID on an existing volume stops the app and writes `control/reauthenticate` in the project state directory. The next `start` clears only persisted login sessions before reopening, requiring sign-in under the new app registration. It preserves the session-signing secret and all business data. Secret-only or port-only edits do not schedule this purge.
+Adding a tenant or changing a saved client/application ID or domain list on an existing volume writes `control/reauthenticate`. The next `start` clears only persisted login sessions before reopening. It preserves the session-signing secret and all business data. Secret-only, display-name-only or port-only edits do not schedule this purge.
 
-Managed Compose calls clear shell values for `LOCAL_STATE_DIR`, `LOCAL_TEST_IMAGE`, `APP_PORT`, `APP_UID`, `APP_GID`, `APP_IMAGE`, `TENANT_ID`, `CLIENT_ID`, `FRONTEND_ORIGIN`, `REDIRECT_URI`, and `TRUST_PROXY`, then restore them afterward. Those exported variables cannot override saved project configuration or the fixture-only test image.
+Managed Compose calls clear shell values for project interpolation, `TENANTS_JSON` / `TENANTS_JSON_FILE`, legacy identity/credential/domain settings, origin/callback and proxy trust, then restore them afterward. Exported values cannot override the protected registry, saved project configuration or fixture-only test image.
 
 Testing, retention, backup, isolated restore/reopen and whole-project destruction remain [operator-only helper calls](operations.md#operator-only-local-helpers), not public deployment arguments. The database-only exception is explicit `start -DbReset`.
 
-Runtime mounts only `client-secret`, `session`, and `postgres-app`. The operator alone mounts `postgres-admin`. Existing identity values are preserved; use a separate project for another tenant. Generated DB/session secrets are reused, not silently rotated; missing/corrupt DB/session secrets with an existing volume stop for recovery before onboarding. No provider token or MSAL cache file is created.
+Runtime secret mounts are only `tenants.json`, `session`, and `postgres-app`; `postgres-admin` remains provisioning/operator-only. Generated DB/session secrets are reused, not silently rotated; missing/corrupt DB/session secrets with an existing volume stop for recovery before onboarding. Keep a matching protected configuration/registry backup separately from database dumps. `start -DbReset` preserves the entire tenant collection, secret files, port/public URL and existing backups; it never recreates profiles. No provider token or MSAL cache file is created.
 
 ## Azure workflow
 
@@ -175,17 +209,17 @@ pwsh ./deploy-azure.ps1 -Action Plan -TargetFile <approved-target.json>
 pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <same-approved-target.json>
 ```
 
-The script accepts an approved target file, equivalent named non-secret parameters, or interactive non-secret prompts. It validates the full existing Key Vault resource ID, six selected versions, exact resource/database identities, dated itemized estimate, budget/change/maintenance approval and explicit Burstable POC risk acceptance. `Plan` performs a real control-plane what-if only in a future explicitly approved Azure session; local tests use `-ExecutionMode Mock` with a fail-closed fixture and are never cloud proof. `Deploy` must use the unchanged approved target after preview. The removed `deploy-production.ps1` and Static Web Apps transport have no wrapper or active release path.
+The script accepts an approved target file, equivalent named non-secret parameters, or interactive non-secret prompts. It validates the full existing Key Vault resource ID, six selected base versions plus the optional registry version, explicit legacy domains when not using a registry, exact resource/database identities, dated itemized estimate, budget/change/maintenance approval and explicit Burstable POC risk acceptance. `Plan` performs a real control-plane what-if only in a future explicitly approved Azure session; local tests use `-ExecutionMode Mock` with a fail-closed fixture and are never cloud proof. `Deploy` must use the unchanged approved target after preview. The removed `deploy-production.ps1` and Static Web Apps transport have no wrapper or active release path.
 
 The deployment operator must have:
 
 - Azure Resource Manager deployment access at the target scope;
 - `Microsoft.KeyVault/vaults/deploy/action` when secrets are consumed by template deployment;
-- data-plane permission to read and validate all six required secret values and metadata;
+- data-plane permission to read and validate all six base secrets plus the registry when configured;
 - permission to configure the Entra application manifest and its redirect URIs; and
 - authority to arrange required runtime managed-identity, Key Vault, and network access without exporting secret values.
 
-The wizard verifies registration differences and an Admin assignment but never changes directory configuration, consent, API grants, app roles or provider roles. An authorized administrator applies any approved registration change separately and reruns preflight. The local-only Phase 12 implementation did not invoke Azure, Entra or a provider.
+The wizard verifies the primary registration and an Admin assignment but never changes directory configuration, consent, API grants, app roles or provider roles. Additional tenants require separate administrator verification recorded by the registry approval reference; the receipt explicitly does not claim their automated directory verification. An authorized administrator applies registration changes separately and reruns preflight. Local mocked validation does not invoke Azure, Entra or a provider.
 
 ## Capability enablement
 

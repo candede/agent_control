@@ -42,12 +42,12 @@ vi.mock("../src/auth/msal.js", async original => {
       return { tenantId: "11111111-1111-1111-1111-111111111111", homeAccountId: `fixture-${result.scenario}`, displayName: "Synthetic account", username: "fixture@example.invalid", roles,
         providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
     },
-    acquireDelegatedToken: async (accountId: string) => {
+    acquireDelegatedToken: async (_tenantId: string, accountId: string) => {
       if (accountId === "fixture-missing_permission" || accountId === "fixture-missing_delegated_grant") throw new AppError(403, "missing_permission", "Synthetic missing permission");
       return accountId;
     },
     acquireApplicationToken: async () => "fixture-application",
-    revalidateAuthenticatedUser: async (accountId: string) => {
+    revalidateAuthenticatedUser: async (_tenantId: string, accountId: string) => {
       const scenario = accountId.replace(/^fixture-/, "");
       const roles = scenario === "missing_internal_role" ? [] : scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${scenario.slice(5)}`)) : [...appRoles];
       return { tenantId: "11111111-1111-1111-1111-111111111111", homeAccountId: accountId, displayName: "Synthetic account", username: "fixture@example.invalid", roles,
@@ -71,15 +71,15 @@ beforeAll(async () => {
   pool.options.database = fixture.name; pool.options.user = "agentcontrol_app"; pool.options.password = fixturePassword;
   const repository = new CapabilityRepository(fixture.runtime);
   const applicationDefinition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
-  await repository.setApplicationConfiguration(config.tenantId!, applicationDefinition.id, true, true, "fixture-administrator");
+  await repository.setApplicationConfiguration(config.tenants[0].tenantId!, applicationDefinition.id, true, true, "fixture-administrator");
   const invalidatePrincipal = capabilities.invalidatePrincipal.bind(capabilities);
   vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
     await invalidatePrincipal(user);
     const scenario = user.homeAccountId.replace(/^fixture-/, "");
     if (![...statuses, "stale", "role-Viewer", "role-Admin"].includes(scenario)) return;
     for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "provider_read")) {
-      const configuration = await repository.configuration(config.tenantId!, definition.id);
-      await repository.recordEvidence({ tenantId: config.tenantId!, principalId: definition.mode === "application" ? config.clientId! : user.homeAccountId,
+      const configuration = await repository.configuration(config.tenants[0].tenantId!, definition.id);
+      await repository.recordEvidence({ tenantId: config.tenants[0].tenantId!, principalId: definition.mode === "application" ? config.tenants[0].clientId! : user.homeAccountId,
         authorizationPrincipalId: user.homeAccountId, capabilityId: definition.id, resourceAudience: definition.audience, environmentId: definition.cloud,
         tokenMode: definition.mode as "delegated" | "application", permissionRevision: capabilityPermissionRevision(definition), contractRevision: capabilityContractRevision(definition), configurationRevision: configuration.revision,
       }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", {
@@ -168,7 +168,7 @@ it("qualifies packaged browser workflows through Chromium and axe", async ({ sig
 });
 
 async function seedQuarantineTargets(capabilityRepository: CapabilityRepository) {
-  const scope = { tenantId: config.tenantId!, principalId: "fixture-role-Admin" };
+  const scope = { tenantId: config.tenants[0].tenantId!, principalId: "fixture-role-Admin" };
   const inventory = new PowerPlatformInventoryRepository(fixture.runtime);
   const job = await inventory.submit(scope, { idempotencyKey: "browser-quarantine-targets", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"] });
   expect(await inventory.markRunning(scope, job.id)).toBe(true);
@@ -198,7 +198,7 @@ async function officialUsageFingerprint(
   repository: OfficialUsageRepository,
   options: { staleAfterDays: number; now: Date },
 ) {
-  const published = await repository.getPublished(config.tenantId!);
+  const published = await repository.getPublished(config.tenants[0].tenantId!);
   const aggregate = buildOfficialUsageAggregateView(published, [], options);
   const users = buildOfficialUsageUserView(published, options);
   return {

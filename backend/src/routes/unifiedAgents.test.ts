@@ -1,8 +1,56 @@
 import { describe, expect, it } from "vitest";
 import { agentPeopleResolveInput, agentResponsibilityQuery, unifiedAgentExportInput, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes } from "../types/unifiedAgents.js";
+import {
+  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentViews,
+  unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
+} from "../types/unifiedAgents.js";
+
+const filterEnums = {
+  view: unifiedAgentViews, endUserAccess: unifiedAgentAccessFilters, reportedUsage: unifiedAgentUsageFilters,
+  management: unifiedAgentManagementFilters, relevance: unifiedAgentRelevanceFilters,
+};
 
 describe("unified agent inventory query", () => {
+  it.each(Object.entries(filterEnums).flatMap(([key, values]) => values.map(value => ({ key, value }))))(
+    "accepts exact $key=$value enum selections for lists and exports", ({ key, value }) => {
+      expect(unifiedAgentInventoryQuery({ [key]: value })).toMatchObject({ [key]: value });
+      expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { [key]: value } }).query).toMatchObject({ [key]: value });
+    },
+  );
+
+  it.each(Object.keys(filterEnums))("rejects malformed %s selections instead of silently clearing filters", key => {
+    for (const value of ["future", " all", "all ", "All", "", null, true, 1, {}, ["all"], ["all", "unknown"], "__proto__"]) {
+      expect(() => unifiedAgentInventoryQuery({ [key]: value }), JSON.stringify(value))
+        .toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { [key]: value } }), JSON.stringify(value)).toThrow();
+    }
+    expect(unifiedAgentInventoryQuery({ [key]: undefined })[key as keyof typeof filterEnums]).toBeUndefined();
+  });
+
+  it("preserves all combined filters and legacy relevance in exported queries without accepting scope overrides", () => {
+    const query = {
+      inventoryScope: "catalog", view: "copilot_studio", endUserAccess: "unavailable", reportedUsage: "used",
+      management: "organization_managed", relevance: "organization", publisher: "Publisher",
+      platform: "Copilot Studio", sortBy: "responses", sortDirection: "desc",
+    };
+    expect(unifiedAgentInventoryQuery(query)).toMatchObject(query);
+    expect(unifiedAgentExportInput({ revision: "a".repeat(64), query }).query).toMatchObject(query);
+    for (const invalid of [
+      { endUserAccess: "used" }, { reportedUsage: "unknown" }, { management: "organization" }, { relevance: "user_managed" },
+    ]) {
+      expect(() => unifiedAgentInventoryQuery(invalid)).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: invalid })).toThrow();
+    }
+    for (const extra of [{ tenantId: "other" }, { principalId: "other" }, { filters: query }, { limit: 1 }, { offset: 1 }]) {
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { ...query, ...extra } }))
+        .toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
+    }
+    for (const key of Object.keys(filterEnums)) {
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), recordIds: ["graph_packages:package"], query: { [key]: "all" } }))
+        .toThrowError(expect.objectContaining({ code: "invalid_export_selection" }));
+    }
+  });
+
   it("validates bounded exact responsibility input without accepting scope overrides or name joins", () => {
     expect(agentResponsibilityQuery({ objectId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", offset: "250", limit: "100" }))
       .toEqual({ objectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", search: undefined, offset: 250, limit: 100 });

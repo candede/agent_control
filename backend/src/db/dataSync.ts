@@ -280,6 +280,7 @@ export class DataSyncRepository {
           AND status IN ('queued','running','waiting_authorization') FOR UPDATE`,
       [runId, scope.tenantId, scope.principalId, sourceId]);
       if (!source.rows[0]) throw new AppError(409, "data_sync_source_state", "The data sync source is no longer awaiting a child job.");
+      await requireSourceJobScope(client, scope, runId, sourceId, jobId);
       await client.query(`INSERT INTO data_sync_source_jobs(run_id,tenant_id,principal_id,source_id,attempt,job_id)
         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (run_id,source_id,attempt) DO NOTHING`,
       [runId, scope.tenantId, scope.principalId, sourceId, source.rows[0].attempt, jobId]);
@@ -299,6 +300,7 @@ export class DataSyncRepository {
     if (update.jobId) validateUuid(update.jobId, "source job ID");
     await transaction(this.database, async client => {
       await lockScope(client, scope);
+      if (update.jobId) await requireSourceJobScope(client, scope, runId, sourceId, update.jobId);
       const result = await client.query<SourceRow>(`UPDATE data_sync_run_sources source SET
           status=$5,
           job_id=COALESCE($6::uuid,source.job_id),
@@ -738,6 +740,20 @@ function successfulMarkerMessage(sourceId: DataSyncSourceId, count: number | nul
 
 async function lockScope(client: pg.PoolClient, scope: DataSyncScope) {
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+}
+
+async function requireSourceJobScope(client: pg.PoolClient, scope: DataSyncScope, runId: string, sourceId: DataSyncSourceId, jobId: string) {
+  // Users sync has an attempt UUID, not a persisted provider job.
+  if (sourceId !== "graph_packages" && sourceId !== "power_platform") return;
+  const table = sourceId === "graph_packages" ? "package_refresh_jobs" : "power_platform_refresh_jobs";
+  const authority = sourceId === "graph_packages" ? "AND token_mode='delegated' AND authorization_principal_id=$3" : "";
+  // A previously authorized association survives provider-job retention for failed-source reconciliation.
+  const job = await client.query(`SELECT 1 FROM ${table} WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 ${authority}
+    UNION ALL SELECT 1 FROM data_sync_source_jobs
+      WHERE job_id=$1 AND tenant_id=$2 AND principal_id=$3 AND run_id=$4 AND source_id=$5
+        AND NOT EXISTS (SELECT 1 FROM ${table} WHERE id=$1) LIMIT 1`,
+  [jobId, scope.tenantId, scope.principalId, runId, sourceId]);
+  if (!job.rowCount) throw new AppError(409, "data_sync_source_job_scope", "The provider job was not found in this data sync account scope.");
 }
 
 export async function requireUserPublication(client: pg.PoolClient, scope: DataSyncScope, publication: UserSourcePublication) {

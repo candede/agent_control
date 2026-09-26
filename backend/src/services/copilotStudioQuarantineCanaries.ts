@@ -137,12 +137,12 @@ export class CopilotStudioQuarantineCanaryService {
     const user = await this.revalidateAdmin(scope);
     await this.dependencies.requireAvailable("powerPlatform.quarantine.manage", user);
     const authority = await this.dependencies.authorityContext(user);
-    const accessToken = await this.dependencies.delegatedToken(scope.principalId, "powerPlatform.quarantine.manage");
+    const accessToken = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage");
     return { user, authority, accessToken };
   }
 
   private async revalidateAdmin(scope: QuarantineScope) {
-    const user = await this.dependencies.revalidateUser(scope.principalId);
+    const user = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
     if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Admin")) throw AppError.unauthorized("The quarantine canary Admin changed or lost authority.");
     return user;
   }

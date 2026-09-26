@@ -1144,7 +1144,7 @@ function service(options: {
     usageStore,
     now: () => now,
     requireAvailable: vi.fn(async () => ({ authorized: true })) as never,
-    delegatedToken: vi.fn(async (_principal: string, capability: string) => `${capability}-token`) as never,
+    delegatedToken: vi.fn(async (_tenantId: string, _principal: string, capability: string) => `${capability}-token`) as never,
     revalidateUser: vi.fn(async () => user),
     requireProviderAdmissions: vi.fn(),
     loadPublished: vi.fn(async () => options.published),

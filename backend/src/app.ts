@@ -73,13 +73,13 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
     catch { response.status(503).json({ ok: false }); }
   });
   policyRoute(app, "get", "/api/auth/status", { access: "public", dataClass: "identity" }, (_request, response) => response.json({ authConfigured, callback: config.redirectUri,
-    setup: authConfigured ? undefined : "Configure tenant/client IDs and the client secret, and register the displayed callback in Entra." }));
+    setup: authConfigured ? undefined : "Configure each tenant's ID, client credentials, and accepted username domains, and register the displayed callback in Entra." }));
   policyRoute(app, "get", "/security", { access: "public", dataClass: "public" }, (_request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.redirect(302, "/agents");
   });
   app.use(express.json({ limit: "512kb" }));
-  const store = createSessionStore(database, config.tenantId ?? "unconfigured");
+  const store = createSessionStore(database);
   app.use(session({ name: "agent-control.sid", store, secret: config.sessionSecret, resave: false, saveUninitialized: false,
     cookie: { httpOnly: true, sameSite: "lax", secure: config.frontendOrigin.startsWith("https://"), maxAge: 8*60*60*1000 } }));
   app.use("/api", apiAdmission);

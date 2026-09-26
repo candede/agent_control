@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { config } from "../config.js";
+import { getTenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
 import { PackageInventoryRepository } from "../db/packageInventory.js";
 import { PowerPlatformInventoryRepository } from "../db/powerPlatformInventory.js";
@@ -152,7 +152,7 @@ policyRoute(workbenchRouter, "get", "/workbench/jobs", {
   loaders.push({ source: "data-sync", load: async () => (await dataSync.listRuns(scope, 20)).map(dataSyncJobSummary) });
   if (hasAppRole(user.roles, "AgentControl.Viewer")) {
     loaders.push({ source: "package-refresh", load: async () => (await packageRepository.listJobs(scope, user.homeAccountId, 20)).value.map(packageRefreshJobSummary) });
-    const applicationPrincipalId = config.clientId;
+    const applicationPrincipalId = getTenantConfiguration(scope.tenantId).clientId;
     if (applicationPrincipalId) {
       loaders.push({ source: "package-refresh", load: async () => {
         try {

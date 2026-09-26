@@ -9,7 +9,7 @@ describe("route policy declarations", () => {
     createApp({} as never, "artifacts/not-used");
     const expected = [
       "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}", "GET /security",
-      "GET /auth/login", "POST /auth/consent", "GET /auth/callback", "POST /auth/logout", "GET /me",
+      "GET /auth/login", "POST /auth/login", "POST /auth/consent", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
       "GET /agent-inventory", "POST /agent-inventory/export.csv", "GET /agents", "GET /directory/principals", "POST /directory/principals/resolve", "POST /agents/details",
@@ -59,6 +59,7 @@ describe("route policy declarations", () => {
       access: "authenticated", dataClass: "identity", roles: ["AgentControl.Viewer"], csrf: true,
     });
     expect(declaredRoutePolicies.get("GET /auth/login")).toEqual({ access: "public", dataClass: "identity" });
+    expect(declaredRoutePolicies.get("POST /auth/login")).toEqual({ access: "public", dataClass: "identity" });
     expect(declaredRoutePolicies.get("GET /auth/callback")).toEqual({ access: "public", dataClass: "identity" });
   });
 

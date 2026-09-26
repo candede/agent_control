@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
-import { config } from "../config.js";
+import { findTenantConfiguration } from "../config.js";
 import { DefenderHuntingRepository, type DefenderHuntingExecution, type DefenderHuntingReadScope, type DefenderHuntingScope } from "../db/defenderHunting.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
@@ -23,7 +23,7 @@ type Dependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
-  applicationIdentity: () => string | undefined;
+  applicationIdentity: (tenantId: string) => string | undefined;
   qualificationContext: typeof capabilities.huntingQualificationContext;
   recordProviderEvidence: typeof capabilities.recordHuntingQualificationEvidence;
   auditLog: typeof getAuditLog;
@@ -39,7 +39,7 @@ const defaultDependencies: Dependencies = {
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
-  applicationIdentity: () => config.clientId,
+  applicationIdentity: tenantId => findTenantConfiguration(tenantId)?.clientId,
   qualificationContext: capabilities.huntingQualificationContext.bind(capabilities),
   recordProviderEvidence: capabilities.recordHuntingQualificationEvidence.bind(capabilities),
   auditLog: getAuditLog,
@@ -66,7 +66,7 @@ export class DefenderHuntingService {
     const capabilityId = capabilityForMode(input.tokenMode);
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
-    const scope = scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity());
+    const scope = scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!));
     if (input.tokenMode === "delegated") {
       await this.dependencies.requireAvailable(capabilityId, user);
       return this.repository.submit(scope, { idempotencyKey: input.idempotencyKey, filters });
@@ -84,7 +84,7 @@ export class DefenderHuntingService {
     const applicationConfiguration = input.tokenMode === "application"
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user) : undefined;
     const context = await this.dependencies.qualificationContext(capabilityId, user);
-    return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity()), {
+    return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)), {
       idempotencyKey: `qualification_${randomUUID().replaceAll("-", "")}`,
       filters,
       qualification: { ...context, approvedBy: user.homeAccountId },
@@ -268,8 +268,8 @@ export class DefenderHuntingService {
       const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, current, signal, validation, agentRecordId);
       const token = await abortable(this.dependencies.observeOperation(capabilityId, freshUser, () => {
         assertCurrent(validation, signal);
-        return abortable(scope.tokenMode === "delegated" ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
-          : this.dependencies.applicationToken(capabilityId), signal);
+        return abortable(scope.tokenMode === "delegated" ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
+          : this.dependencies.applicationToken(actor.tenantId, capabilityId), signal);
       }, { signal, clearOnSuccess: false }), signal);
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
       if (current.qualification) await this.validateQualification(current.qualification, freshUser, signal);
@@ -353,7 +353,7 @@ export class DefenderHuntingService {
         && error instanceof AppError && ["missing_permission", "unsupported", "provider_schema", "provider_error",
           "provider_throttled", "invalid_provider_link", "hunting_access_denied"].includes(error.code)) {
         try {
-          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
+          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal);
           assertCurrent(validation, signal);
           requireSamePrincipal(actor, evidenceUser);
           requireViewer(evidenceUser);
@@ -374,7 +374,7 @@ export class DefenderHuntingService {
   private async validateCurrentAuthority(actor: { tenantId: string; principalId: string }, scope: DefenderHuntingScope,
     current: DefenderHuntingJob, signal: AbortSignal, validation: SessionValidation, agentRecordId?: string) {
     assertCurrent(validation, signal);
-    const freshUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
+    const freshUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal);
     assertCurrent(validation, signal);
     requireSamePrincipal(actor, freshUser);
     current.qualification ? requireQualificationRole(freshUser, scope.tokenMode) : requireViewer(freshUser);
@@ -406,14 +406,14 @@ export class DefenderHuntingService {
 
   private async requireExactApplicationScope(scope: DefenderHuntingScope, user: AuthenticatedUser, capabilityId: CapabilityId, signal: AbortSignal) {
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityId, user), signal);
-    const current = scopeFor(user, "application", configuration.revision, this.dependencies.applicationIdentity()).resultScope;
+    const current = scopeFor(user, "application", configuration.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
     if (!resultScopeMatches(scope.resultScope, current)) throw new AppError(409, "application_scope_changed", "Application hunting configuration changed after this job was submitted.");
   }
 
   private async resultScopeForMode(user: AuthenticatedUser, tokenMode: DefenderHuntingTokenMode, signal?: AbortSignal) {
     if (tokenMode === "delegated") return scopeFor(user, tokenMode).resultScope;
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityForMode(tokenMode), user), signal);
-    return scopeFor(user, tokenMode, configuration?.revision, this.dependencies.applicationIdentity()).resultScope;
+    return scopeFor(user, tokenMode, configuration?.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
   }
 
   private async readScope(user: AuthenticatedUser, agentRecordId?: string): Promise<DefenderHuntingReadScope> {

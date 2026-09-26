@@ -37,6 +37,7 @@ import {
   reconcileBulkActionJob,
   resumeBulkActionJob,
   signOut,
+  startSignIn,
   startExactPackageRefresh,
   startPackageRefresh,
   refreshPackageIdentityDetails,
@@ -75,6 +76,7 @@ import { allowedViews, hasRole } from "./authorization";
 import { useCapabilities } from "./useCapabilities";
 import { useAutomaticRefresh } from "./useAutomaticRefresh";
 import { AutomaticRefreshStatus } from "./components/AutomaticRefreshStatus";
+import { BackgroundRefreshIndicator } from "./components/BackgroundRefreshIndicator";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInventoryScope, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 import { inventoryScopeAgentCount } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
@@ -125,7 +127,7 @@ import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 import { trapDialogFocus } from "./dialogFocus";
 import "./components/agentWorkspace.css";
 
-const activeBulkJobStorageKey = "agent-control:active-bulk-job:v1";
+const activeBulkJobStoragePrefix = "agent-control:active-bulk-job:v2:";
 const bulkJobPollIntervalMs = 1_000;
 const packageRefreshPollIntervalMs = 750;
 const inventoryRefreshPollIntervalMs = 1_000;
@@ -205,6 +207,83 @@ function App() {
   return <SavedQueryProvider client={savedQueries}><Workbench savedQueries={savedQueries} /></SavedQueryProvider>;
 }
 
+function SignInForm({ disabled }: { disabled: boolean }) {
+  const [username, setUsername] = useState("");
+  const [validationError, setValidationError] = useState<string>();
+  const [signInError, setSignInError] = useState<string>();
+  const [pending, setPending] = useState(false);
+  const usernameInput = useRef<HTMLInputElement>(null);
+  const request = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => request.current?.abort(), []);
+
+  async function handleSubmit() {
+    if (disabled || request.current) return;
+    const value = username.trim();
+    setSignInError(undefined);
+    if (!value || value.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      setValidationError("Enter your work or school username, such as name@organization.com.");
+      usernameInput.current?.focus();
+      return;
+    }
+    setValidationError(undefined);
+    const controller = new AbortController();
+    request.current = controller;
+    setPending(true);
+    const search = new URLSearchParams(window.location.search);
+    search.delete("authorization");
+    search.delete("returnTo");
+    const returnTo = isWorkbenchPath(window.location.pathname) && !window.location.pathname.startsWith("//")
+      ? `${window.location.pathname}${search.size ? `?${search}` : ""}` : "/agents";
+    try {
+      const { authorizationUrl } = await startSignIn({ username: value, returnTo }, { signal: controller.signal });
+      if (!controller.signal.aborted) window.location.assign(authorizationUrl);
+    } catch (requestError) {
+      if (controller.signal.aborted) return;
+      setSignInError(requestError instanceof Error ? requestError.message : "Unable to start sign-in. Please try again.");
+      setPending(false);
+      request.current = undefined;
+    }
+  }
+
+  return (
+    <form className="signin-form" aria-label="Sign in" aria-busy={pending} noValidate onSubmit={event => {
+      event.preventDefault();
+      void handleSubmit();
+    }}>
+      <label htmlFor="signin-username">Work or school username</label>
+      <input
+        ref={usernameInput}
+        id="signin-username"
+        name="username"
+        type="email"
+        inputMode="email"
+        autoComplete="username"
+        autoCapitalize="none"
+        spellCheck={false}
+        maxLength={320}
+        required
+        disabled={disabled || pending}
+        aria-invalid={Boolean(validationError)}
+        aria-describedby={`signin-hint${validationError || signInError ? " signin-error" : ""}`}
+        value={username}
+        onChange={event => {
+          setUsername(event.target.value);
+          setValidationError(undefined);
+          setSignInError(undefined);
+        }}
+      />
+      <p id="signin-hint" className="signin-hint">
+        Use your organization&apos;s email address. You&apos;ll continue to Microsoft to sign in.
+      </p>
+      {validationError || signInError ? <div id="signin-error" className="error-banner" role="alert">{validationError ?? signInError}</div> : null}
+      <button className="signin-button" type="submit" disabled={disabled || pending}>
+        {pending ? "Preparing sign-in..." : "Sign in with Entra ID"}
+      </button>
+      {pending ? <p role="status">Preparing Microsoft sign-in...</p> : null}
+    </form>
+  );
+}
+
 function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSavedQueryClient> }) {
   const [agentInventoryQueries] = useState(() => new AgentInventoryQueries());
   const [initialAgentRoute] = useState(readInitialAgentRoute);
@@ -251,6 +330,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [query, setQuery] = useState(initialAgentRoute.search);
   const [agentInventoryScope, setAgentInventoryScope] = useState(initialAgentRoute.inventoryScope);
   const [agentView, setAgentView] = useState(initialAgentRoute.agentView);
+  const [endUserAccess, setEndUserAccess] = useState(initialAgentRoute.endUserAccess);
+  const [reportedUsage, setReportedUsage] = useState(initialAgentRoute.reportedUsage);
+  const [agentManagement, setAgentManagement] = useState(initialAgentRoute.management);
+  const [agentRelevance, setAgentRelevance] = useState(initialAgentRoute.relevance);
   const [statusFilter, setStatusFilter] = useState<
     "all" | "allowed" | "blocked"
   >(initialAgentRoute.status);
@@ -457,6 +540,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setQuery(route.search);
         setAgentInventoryScope(route.inventoryScope);
         setAgentView(route.agentView);
+        setEndUserAccess(route.endUserAccess);
+        setReportedUsage(route.reportedUsage);
+        setAgentManagement(route.management);
+        setAgentRelevance(route.relevance);
         setStatusFilter(route.status);
         setPublisherFilter(route.publisher);
         setAvailableToFilter(route.availability);
@@ -523,10 +610,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [pendingStoredAgentSelectionCount, user]);
 
   useEffect(() => {
-    if (activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
+    if (!user || activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
     const search = agentRouteSearch({
       inventoryScope: agentInventoryScope,
       agentView,
+      endUserAccess,
+      reportedUsage,
+      management: agentManagement,
+      relevance: agentRelevance,
       search: query,
       status: statusFilter,
       publisher: publisherFilter,
@@ -565,10 +656,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentPageIndex, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
 
   useEffect(() => {
-    if (activeView !== "sync") return;
+    if (!user || activeView !== "sync") return;
     const search = dataSyncRouteSearch({
       powerPlatformJobId: requestedPowerPlatformJobId,
       syncRunId: requestedDataSyncRunId,
@@ -581,7 +672,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (`${window.location.pathname}${window.location.search}` !== next) {
       window.history.replaceState({ view: "sync" }, "", next);
     }
-  }, [activeView, requestedPowerPlatformJobId, requestedDataSyncRunId, requestedPackageRefreshJobId, requestedPackageRefreshMode, syncReportRoute]);
+  }, [activeView, requestedPowerPlatformJobId, requestedDataSyncRunId, requestedPackageRefreshJobId, requestedPackageRefreshMode, syncReportRoute, user]);
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer") || activeView !== "agents" || !requestedAgentDetailId
@@ -724,7 +815,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
     if (requestedPackageControlJobId || requestedPackageRefreshJobId) return;
 
-    const stored = loadStoredActiveBulkJobId();
+    const stored = loadStoredActiveBulkJobId(user);
     if (stored.error) {
       void Promise.resolve().then(() => setBulkJobStorageError(stored.error));
     }
@@ -863,7 +954,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [agentEnvironmentFilter, agentInventoryScope, agentPageIndex, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, hostFilter, platformFilter, publisherFilter, statusFilter, user]);
+  }, [agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
 
 
   useEffect(() => {
@@ -1135,6 +1226,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const hasActiveAgentFilters =
     agentView !== "all" ||
+    endUserAccess !== "all" ||
+    reportedUsage !== "all" ||
+    agentManagement !== "all" ||
+    agentRelevance !== "all" ||
     deferredQuery.trim().length > 0 ||
     agentEnvironmentFilter.trim().length > 0 ||
     statusFilter !== "all" ||
@@ -1276,6 +1371,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   function currentUnifiedAgentQuery(): UnifiedAgentExportQuery {
     return {
       ...(agentView !== "all" ? { view: agentView } : {}),
+      ...(endUserAccess !== "all" ? { endUserAccess } : {}),
+      ...(reportedUsage !== "all" ? { reportedUsage } : {}),
+      ...(agentManagement !== "all" ? { management: agentManagement } : {}),
+      ...(agentRelevance !== "all" ? { relevance: agentRelevance } : {}),
       ...(normalizedBulkRefQuery ? { operationIdPrefix: normalizedBulkRefQuery } : deferredQuery.trim() ? { search: deferredQuery.trim() } : {}),
       ...(agentEnvironmentFilter.trim() ? { environmentId: agentEnvironmentFilter.trim() } : {}),
       ...(statusFilter === "all" ? {} : { blocked: statusFilter === "blocked" }),
@@ -1963,7 +2062,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setBusyBulkAction(job.action);
       setBulkProgress(toBulkProgress(job));
       if (persist) {
-        const storageError = saveStoredActiveBulkJobId(job.id);
+        const storageError = user ? saveStoredActiveBulkJobId(user, job.id) : undefined;
         if (storageError) setBulkJobStorageError(storageError);
       }
 
@@ -2149,13 +2248,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function clearActiveBulkJobId() {
-    const storageError = clearStoredActiveBulkJobId();
+    const storageError = user ? clearStoredActiveBulkJobId(user) : undefined;
     if (storageError) setBulkJobStorageError(storageError);
   }
 
   function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
     if (values.search !== undefined) handleSearchQueryChange(values.search);
     if (values.agentView !== undefined) setAgentView(values.agentView);
+    if (values.endUserAccess !== undefined) setEndUserAccess(values.endUserAccess);
+    if (values.reportedUsage !== undefined) setReportedUsage(values.reportedUsage);
+    if (values.management !== undefined) setAgentManagement(values.management);
+    if (values.relevance !== undefined) setAgentRelevance(values.relevance);
     if (values.platform !== undefined) setPlatformFilter(values.platform);
     if (values.availability !== undefined) setAvailableToFilter(values.availability);
     if (values.host !== undefined) setHostFilter(values.host);
@@ -2173,6 +2276,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleClearAgentFilters() {
     setAgentView("all");
+    setEndUserAccess("all");
+    setReportedUsage("all");
+    setAgentManagement("all");
+    setAgentRelevance("all");
     handleSearchQueryChange("");
     resetPowerPlatformSelection();
     setAgentEnvironmentFilter("");
@@ -2454,12 +2561,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             take action.
           </p>
           {authorizationNotice ? <p role="status">{authorizationNotice}</p> : null}
-          {error ? <div className="error-banner">{error}</div> : null}
+          {error ? <div className="error-banner" role="alert">{error}</div> : null}
           {bulkJobStorageError ? <div className="error-banner" role="status">{bulkJobStorageError}</div> : null}
           {authSetup?.authConfigured === false ? <div className="error-banner"><strong>Sign-in is not configured.</strong><p>{authSetup.setup}</p><code>{authSetup.callback}</code></div> : null}
-          <a className="primary-link signin-button" aria-disabled={authSetup?.authConfigured === false} href={authSetup?.authConfigured === false ? undefined : "/api/auth/login"}>
-            Sign in with Entra ID
-          </a>
+          <SignInForm disabled={authSetup?.authConfigured === false} />
         </section>
         <AppFooter />
       </main>
@@ -2470,6 +2575,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     <CapabilityContext key={principalKey} value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
     <WorkbenchActionProvider value={workbenchMetadata?.actions}>
     <main className="app-shell">
+      <BackgroundRefreshIndicator active={automaticRefresh.checking || loadingAgents} />
       <header className="top-bar">
         <div className="title-block">
           <span className="brand-mark"><Bot size={21} aria-hidden="true" /></span>
@@ -2671,7 +2777,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             inventoryScope={agentInventoryScope}
             reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
               principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
-            view={agentView} onViewChange={view => { handleClearAgentFilters(); setAgentView(view); }} /> : null}
+            allSelected={!hasActiveAgentFilters} onClearFilters={handleClearAgentFilters}
+            endUserAccess={endUserAccess} reportedUsage={reportedUsage}
+            onAccessChange={endUserAccess => handleAgentFilterChange({ endUserAccess })}
+            onUsageChange={reportedUsage => handleAgentFilterChange({ reportedUsage })} /> : null}
 
           {agentExportError || agentExportNeedsReload ? <div className="error-banner" role="alert">
             <span>{agentExportError?.message ?? (unifiedAgentReadError
@@ -2723,7 +2832,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 records={displayedUnifiedAgents}
                 loading={loadingAgents && !unifiedAgentPage}
                 controls={<AgentInventoryFilters key={principalKey}
-                  values={{ search: query, agentView, platform: effectivePlatformFilter, availability: availableToFilter,
+                  values={{ search: query, agentView, endUserAccess, reportedUsage, management: agentManagement, relevance: agentRelevance,
+                    platform: effectivePlatformFilter, availability: availableToFilter,
                     host: hostFilter, status: statusFilter, createdWithinDays, publisher: publisherFilter,
                     environmentId: agentEnvironmentFilter, sortBy: agentSortBy, sortDirection: agentSortDirection }}
                   options={{ platforms: platformOptions, availability: availableToOptions, hosts: hostOptions,
@@ -2967,32 +3077,36 @@ function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-function loadStoredActiveBulkJobId(): { jobId?: string; error?: string } {
+function activeBulkJobStorageKey(user: SessionUser) {
+  return `${activeBulkJobStoragePrefix}${encodeURIComponent(user.tenantId ?? "")}:${encodeURIComponent(user.homeAccountId)}`;
+}
+
+function loadStoredActiveBulkJobId(user: SessionUser): { jobId?: string; error?: string } {
   if (typeof window === "undefined") {
     return {};
   }
 
   try {
-    return { jobId: window.localStorage.getItem(activeBulkJobStorageKey) ?? undefined };
+    return { jobId: window.localStorage.getItem(activeBulkJobStorageKey(user)) ?? undefined };
   } catch {
     return { error: "Unable to read the saved package job from browser storage. Open its saved /agents?controlJob=<job-id> link to recover it." };
   }
 }
 
-function saveStoredActiveBulkJobId(jobId: string) {
+function saveStoredActiveBulkJobId(user: SessionUser, jobId: string) {
   if (typeof window !== "undefined") {
     try {
-      window.localStorage.setItem(activeBulkJobStorageKey, jobId);
+      window.localStorage.setItem(activeBulkJobStorageKey(user), jobId);
     } catch {
       return `Unable to save the active package job in browser storage. Tracking continues in this tab; bookmark /agents?controlJob=${encodeURIComponent(jobId)} to reopen it.`;
     }
   }
 }
 
-function clearStoredActiveBulkJobId() {
+function clearStoredActiveBulkJobId(user: SessionUser) {
   if (typeof window !== "undefined") {
     try {
-      window.localStorage.removeItem(activeBulkJobStorageKey);
+      window.localStorage.removeItem(activeBulkJobStorageKey(user));
     } catch {
       return "Unable to clear the saved package job from browser storage. A later reload may retry the saved job ID with current authorization.";
     }

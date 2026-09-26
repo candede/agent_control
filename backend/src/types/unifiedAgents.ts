@@ -23,8 +23,18 @@ export const unifiedAgentSortKeys = [
 ] as const;
 export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
-export const unifiedAgentViews = ["all", "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
+export const unifiedAgentQuickViews = ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const;
+export type UnifiedAgentQuickView = typeof unifiedAgentQuickViews[number];
+export const unifiedAgentViews = [...unifiedAgentQuickViews, "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
 export type UnifiedAgentView = typeof unifiedAgentViews[number];
+export const unifiedAgentAccessFilters = ["all", "available", "unavailable", "unknown"] as const;
+export type UnifiedAgentAccessFilter = typeof unifiedAgentAccessFilters[number];
+export const unifiedAgentUsageFilters = ["all", "used"] as const;
+export type UnifiedAgentUsageFilter = typeof unifiedAgentUsageFilters[number];
+export const unifiedAgentManagementFilters = ["all", "user_managed", "organization_managed", "unknown"] as const;
+export type UnifiedAgentManagementFilter = typeof unifiedAgentManagementFilters[number];
+export const unifiedAgentRelevanceFilters = ["all", "organization", "unknown"] as const;
+export type UnifiedAgentRelevanceFilter = typeof unifiedAgentRelevanceFilters[number];
 
 export type UnifiedAgentTarget =
   | { source: "canonical"; agentId: string }
@@ -252,6 +262,10 @@ export type UnifiedAgentInventoryQuery = {
   /** Defaults to all for exact reads and other non-UI consumers. */
   inventoryScope?: UnifiedAgentInventoryScope;
   view?: UnifiedAgentView;
+  endUserAccess?: UnifiedAgentAccessFilter;
+  reportedUsage?: UnifiedAgentUsageFilter;
+  management?: UnifiedAgentManagementFilter;
+  relevance?: UnifiedAgentRelevanceFilter;
   recordId?: string;
   operationIdPrefix?: string;
   search?: string;

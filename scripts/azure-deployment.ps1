@@ -1,5 +1,7 @@
 #requires -Version 7.0
 
+. (Join-Path $PSScriptRoot 'tenant-deployment.ps1')
+
 $script:ReleaseSchemaVersion = 27
 
 $script:RequiredSecretNames = @(
@@ -22,6 +24,26 @@ $script:EstimateItemNames = @(
     'restoreDrill'
 )
 
+function Get-AzureRequiredSecretNames {
+    param($Target)
+    $names = @($script:RequiredSecretNames)
+    if ($Target.tenantRegistrySecretName) { $names += [string]$Target.tenantRegistrySecretName }
+    return $names
+}
+
+function Get-AzureRuntimeSecretReferences {
+    param($Target)
+    $references = [ordered]@{
+        TENANT_ID = 'agent-control-tenant-id'
+        CLIENT_ID = 'agent-control-client-id'
+        CLIENT_SECRET = 'agent-control-client-secret'
+        SESSION_SECRET = 'agent-control-session-secret'
+        PGPASSWORD = 'agent-control-postgres-app-password'
+    }
+    if ($Target.tenantRegistrySecretName) { $references.TENANTS_JSON = [string]$Target.tenantRegistrySecretName }
+    return $references
+}
+
 function Get-SelectedSecretVersion {
     param($Target, [string]$SecretName)
     $selected = @($Target.preparedVaultContract.versions | Where-Object { $_.name -ceq $SecretName })
@@ -35,7 +57,7 @@ function Get-ChangedSecretVersionNames {
     param($Target)
     if ($Target.installationMode -eq 'fresh') { return @() }
     $changed = @()
-    foreach ($name in $script:RequiredSecretNames) {
+    foreach ($name in (Get-AzureRequiredSecretNames $Target)) {
         $existing = @($Target.preparedVaultContract.existingVersions | Where-Object { $_.name -ceq $name })
         if ($existing.Count -eq 1 -and [string]$existing[0].version -cne (Get-SelectedSecretVersion $Target $name)) { $changed += $name }
     }
@@ -133,6 +155,23 @@ function Test-ApprovedAzureTarget {
     Assert-GuidValue $Target.tenantId 'tenantId'
     Assert-GuidValue $Target.subscriptionId 'subscriptionId'
     Assert-GuidValue $Target.entraApplicationId 'entraApplicationId'
+    if ($Target.tenantRegistrySecretName) {
+        if ($Target.tenantRegistrySecretName -cne 'agent-control-tenants-json') { throw 'tenantRegistrySecretName must name the prepared agent-control-tenants-json secret, never inline registry values.' }
+        if ([string]::IsNullOrWhiteSpace([string]$Target.tenantRegistryRegistrationApprovalReference) -or
+            [string]$Target.tenantRegistryRegistrationApprovalReference -match '[\x00-\x1f\x7f]') {
+            throw 'Registry mode requires tenantRegistryRegistrationApprovalReference confirming callback, roles, assignments and grants in every configured tenant.'
+        }
+    }
+    if (-not $Target.tenantRegistrySecretName -or $Target.tenantDomains) {
+        Assert-DeploymentTenantProfiles @(@{
+            tenantId = $Target.tenantId; clientId = $Target.entraApplicationId; clientSecret = 'validation-only'
+            domains = $Target.tenantDomains
+        })
+    }
+    if ($Target.tenantDisplayName -and ([string]$Target.tenantDisplayName -match '[\x00-\x1f\x7f]' -or
+        [string]::IsNullOrWhiteSpace([string]$Target.tenantDisplayName) -or ([string]$Target.tenantDisplayName).Length -gt 128)) {
+        throw 'tenantDisplayName must contain 1 to 128 printable characters when supplied.'
+    }
     if ($Target.resourceGroup -notmatch '^[a-zA-Z0-9._()/-]{1,90}$' -or $Target.resourceGroup -match '[/\\]') {
         throw 'resourceGroup is invalid.'
     }
@@ -197,21 +236,28 @@ function Test-ApprovedAzureTarget {
         throw 'Legacy audit inputs are accepted only for legacy_import mode.'
     }
 
-    if (@(Compare-Object @($Target.preparedVaultContract.secretNames) @($script:RequiredSecretNames) -CaseSensitive).Count -or
-        @(Compare-Object @($Target.preparedVaultContract.runtimeConsumers) @($script:RuntimeSecretNames) -CaseSensitive).Count -or
+    $requiredSecrets = @(Get-AzureRequiredSecretNames $Target)
+    $runtimeSecrets = @((Get-AzureRuntimeSecretReferences $Target).Values)
+    if (@(Compare-Object @($Target.preparedVaultContract.secretNames) $requiredSecrets -CaseSensitive).Count -or
+        @($Target.preparedVaultContract.secretNames).Count -ne $requiredSecrets.Count -or
+        @(Compare-Object @($Target.preparedVaultContract.runtimeConsumers) $runtimeSecrets -CaseSensitive).Count -or
+        @($Target.preparedVaultContract.runtimeConsumers).Count -ne $runtimeSecrets.Count -or
         $Target.preparedVaultContract.administratorPasswordRuntimeAccessible -ne $false -or
         $Target.preparedVaultContract.bootstrapSecretCleanupRequired -ne $true) {
-        throw 'Prepared-vault names and five-runtime-consumer contract do not match.'
+        throw 'Prepared-vault names and runtime-consumer contract do not match the selected tenant configuration.'
     }
-    foreach ($name in $script:RequiredSecretNames) {
+    foreach ($name in $requiredSecrets) {
         Get-SelectedSecretVersion $Target $name | Out-Null
     }
-    if (@($Target.preparedVaultContract.versions).Count -ne 6) { throw 'Prepared vault must select exactly six versions.' }
+    if (@($Target.preparedVaultContract.versions).Count -ne $requiredSecrets.Count) { throw 'Prepared vault must select exactly one version for every required secret.' }
     if ($Target.installationMode -ne 'fresh') {
-        if (@($Target.preparedVaultContract.existingVersions).Count -ne 6) {
-            throw 'Existing deployment requires its six previously selected versions for a fail-closed credential comparison.'
+        $existingNames = if ($Target.tenantRegistrySecretName -and @($Target.preparedVaultContract.existingVersions).Count -eq $script:RequiredSecretNames.Count) {
+            @($script:RequiredSecretNames)
+        } else { $requiredSecrets }
+        if (@($Target.preparedVaultContract.existingVersions).Count -ne $existingNames.Count) {
+            throw 'Existing deployment requires every previously selected version for a fail-closed credential comparison.'
         }
-        foreach ($name in $script:RequiredSecretNames) {
+        foreach ($name in $existingNames) {
             $existing = @($Target.preparedVaultContract.existingVersions | Where-Object { $_.name -ceq $name })
             if ($existing.Count -ne 1 -or [string]$existing[0].version -notmatch '^[a-zA-Z0-9]{1,64}$') {
                 throw "Existing version evidence is invalid for $name."
@@ -330,7 +376,11 @@ function Get-AzJson {
     param([string[]]$Arguments, [switch]$SensitiveOutput, [switch]$AllowFailure)
     $result = Invoke-ExternalCommand 'az' ($Arguments + @('--only-show-errors', '-o', 'json')) -SensitiveOutput:$SensitiveOutput -AllowFailure:$AllowFailure
     if ($result.code -ne 0) { return @{ commandFailed = $true; exitCode = $result.code } }
-    return $result.output | ConvertFrom-Json -Depth 30
+    try { return $result.output | ConvertFrom-Json -Depth 30 }
+    catch {
+        if ($SensitiveOutput) { throw 'Sensitive Azure response was invalid JSON; contents are not displayed.' }
+        throw
+    }
 }
 
 function New-AzureDeploymentContext {
@@ -602,7 +652,7 @@ function Invoke-RealAzureOperation {
             if ($vault.properties.tenantId -ine $target.tenantId -or $vault.properties.enableRbacAuthorization -ne $true -or
                 $vault.properties.enabledForTemplateDeployment -ne $true) { throw 'Prepared vault tenant/RBAC/template-deployment contract failed.' }
             $values = @{}
-            foreach ($secretName in $script:RequiredSecretNames) {
+            foreach ($secretName in (Get-AzureRequiredSecretNames $target)) {
                 $version = Get-SelectedSecretVersion $target $secretName
                 $secret = Get-AzJson @('keyvault', 'secret', 'show', '--vault-name', $vault.name, '--name', $secretName, '--version', $version) -SensitiveOutput
                 if ($secret.attributes.enabled -ne $true -or -not $secret.value -or
@@ -618,11 +668,24 @@ function Invoke-RealAzureOperation {
                 $values['agent-control-postgres-admin-password'].Length -lt 32 -or
                 $values['agent-control-postgres-app-password'].Length -lt 32 -or
                 $values['agent-control-postgres-admin-password'] -ceq $values['agent-control-postgres-app-password'] -or
-                @($values.Values | Where-Object { $_ -match "[`r`n`0]" }).Count) {
+                @($values.GetEnumerator() | Where-Object { $_.Key -cne $target.tenantRegistrySecretName -and $_.Value -match "[`r`n`0]" }).Count) {
                 throw 'Prepared secret value-format separation contract failed.'
             }
+            $profileCount = 1
+            if ($target.tenantRegistrySecretName) {
+                $profiles = ConvertFrom-DeploymentTenantRegistry $values[$target.tenantRegistrySecretName]
+                $primary = @($profiles | Where-Object { $_.tenantId -ieq $target.tenantId -and $_.clientId -ieq $target.entraApplicationId })
+                if ($primary.Count -ne 1) { throw 'Tenant registry must retain the approved primary tenant/application; no tenant may be silently replaced.' }
+                $migratingRegistry = $target.installationMode -ne 'fresh' -and
+                    -not @($target.preparedVaultContract.existingVersions | Where-Object name -CEQ $target.tenantRegistrySecretName).Count
+                if ($migratingRegistry -and $primary[0].clientSecret -cne $values['agent-control-client-secret']) {
+                    throw 'First registry migration must preserve the approved legacy client secret; credential rotation requires its separate approved workflow.'
+                }
+                $profileCount = $profiles.Count
+            }
+            $Context.TenantProfileCount = $profileCount
             $Context.SecretValues = $values
-            return @{ vaultResourceId = $target.existingVaultResourceId; secretVersions = @($target.preparedVaultContract.versions); valuesRedacted = $true }
+            return @{ vaultResourceId = $target.existingVaultResourceId; secretVersions = @($target.preparedVaultContract.versions); tenantProfileCount = $profileCount; valuesRedacted = $true }
         }
         'registration_verify' {
             $app = Get-AzJson @('ad', 'app', 'show', '--id', $target.entraApplicationId)
@@ -645,7 +708,13 @@ function Invoke-RealAzureOperation {
             $assignments = Get-AzJson @('rest', '--method', 'get', '--url',
                 "https://graph.microsoft.com/v1.0/servicePrincipals/$($servicePrincipals[0].id)/appRoleAssignedTo?`$filter=appRoleId%20eq%20$($administratorRole[0].id)&`$select=id,principalType")
             if (@($assignments.value).Count -lt 1) { throw 'At least one approved AgentControl.Admin assignment is required.' }
-            return @{ roleCount = $actualRoles.Count; callbackVerified = $true; directoryWrites = 0; administratorAssignmentCount = @($assignments.value).Count }
+            return @{
+                roleCount = $actualRoles.Count; callbackVerified = $true; directoryWrites = 0
+                administratorAssignmentCount = @($assignments.value).Count
+                primaryRegistrationVerified = $true
+                additionalRegistrationsVerified = $false
+                tenantRegistryRegistrationApprovalReference = $target.tenantRegistryRegistrationApprovalReference
+            }
         }
         'qualification_preflight' {
             return Test-ApprovedQualificationTargets $Context.QualificationTargets $target
@@ -791,12 +860,7 @@ function Invoke-RealAzureOperation {
         'runtime_access_verify' {
             $app = Get-AzJson @('webapp', 'show', '--ids', $target.expectedResourceIds.appService)
             if (-not $app.identity.principalId) { throw 'App managed identity is missing.' }
-            $expectedReferences = [ordered]@{}
-            $expectedReferences['TENANT_ID'] = 'agent-control-tenant-id'
-            $expectedReferences['CLIENT_ID'] = 'agent-control-client-id'
-            $expectedReferences['CLIENT_SECRET'] = 'agent-control-client-secret'
-            $expectedReferences['SESSION_SECRET'] = 'agent-control-session-secret'
-            $expectedReferences['PGPASSWORD'] = 'agent-control-postgres-app-password'
+            $expectedReferences = Get-AzureRuntimeSecretReferences $target
             $referenceUrl = "https://management.azure.com$($target.expectedResourceIds.appService)/config/configreferences/appsettings/list?api-version=2022-03-01"
             $resolved = $false
             $attempts = 0
@@ -820,7 +884,7 @@ function Invoke-RealAzureOperation {
                 if (-not $resolved -and $attempts -lt 5 -and $Context.ExecutionMode -eq 'Real') { Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempts)) }
             } while (-not $resolved -and $attempts -lt 5)
             if (-not $resolved) {
-                throw 'All five exact native Key Vault references, including CLIENT_SECRET, must report Resolved with the approved names and versions.'
+                throw 'All exact native Key Vault references, including CLIENT_SECRET and TENANTS_JSON when configured, must report Resolved with the approved names and versions.'
             }
             $adminScope = "$($target.existingVaultResourceId)/secrets/agent-control-postgres-admin-password"
             $adminAccess = Get-AzJson @('role', 'assignment', 'list', '--assignee-object-id', $app.identity.principalId,
@@ -844,7 +908,7 @@ function Invoke-RealAzureOperation {
                 }
             }
             Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'runtime') -RuntimeRole | Out-Null
-            return @{ principalIdPresent = $true; runtimeSecretCount = 5; nativeReferencesResolved = $true; propagationAttempts = $attempts; administratorSecretReadable = $false; databaseRuntimeLeastPrivilege = $true }
+            return @{ principalIdPresent = $true; runtimeSecretCount = $expectedReferences.Count; nativeReferencesResolved = $true; propagationAttempts = $attempts; administratorSecretReadable = $false; databaseRuntimeLeastPrivilege = $true }
         }
         'monitoring_verify' {
             $appDiagnostics = Get-AzJson @('monitor', 'diagnostic-settings', 'show', '--resource',
@@ -1165,6 +1229,10 @@ function New-AzureParameterFile {
         location = @{ value = $target.region }
         tenantId = @{ value = $target.tenantId }
         appRegistrationClientId = @{ value = $target.entraApplicationId }
+        tenantDomains = @{ value = @($target.tenantDomains | Where-Object { $null -ne $_ }) }
+        tenantDisplayName = @{ value = [string]$target.tenantDisplayName }
+        tenantRegistrySecretName = @{ value = [string]$target.tenantRegistrySecretName }
+        tenantRegistrySecretVersion = @{ value = $(if ($target.tenantRegistrySecretName) { Get-SelectedSecretVersion $target $target.tenantRegistrySecretName } else { '' }) }
         appServicePlanName = @{ value = $target.resources.appServicePlan.name }
         appServiceName = @{ value = $target.resources.appService.name }
         postgresServerName = @{ value = $target.resources.postgresFlexibleServer.name }

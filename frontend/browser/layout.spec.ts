@@ -235,7 +235,7 @@ test("the compact metric strip distinguishes unavailable sources and missing rep
   await expect(overview.getByText("Agents in catalog", { exact: true }).locator("..")).toContainText("Partial data");
   await expect(overview.getByText("Reported used agents", { exact: true }).locator("..")).toContainText("No selected report data");
   await expect(overview.getByText("Reported active · 30 days", { exact: true }).locator("..")).toContainText("No selected report data");
-  await expect(overview.locator(".agent-report-context")).toContainText("Reported counts are independent of inventory.");
+  await expect(overview.locator(".agent-report-context")).not.toContainText("Reported counts are independent of inventory.");
   expect((await new AxeBuilder({ page }).include(".agent-inventory-overview").analyze()).violations).toEqual([]);
   expect(unexpected).toEqual([]);
 });

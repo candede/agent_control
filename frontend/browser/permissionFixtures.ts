@@ -8,6 +8,7 @@ export function fixtureLoginUrl(scenario: string) {
     throw new Error("The browser fixture requires a plain HTTP loopback origin.");
   }
   const login = new URL("/api/auth/login", origin);
+  login.searchParams.set("username", "fixture@example.invalid");
   login.searchParams.set("returnTo", `/permissions?${new URLSearchParams({ fixture: scenario })}`);
   return login.href;
 }

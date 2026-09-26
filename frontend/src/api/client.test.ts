@@ -70,6 +70,7 @@ import {
   startPackageRefresh,
   stageOfficialUsageReport,
   signOut,
+  startSignIn,
   startDataSync,
   startPurviewAuditQualification,
   startDefenderHuntingQualification,
@@ -114,6 +115,90 @@ it("checks automatic refresh with an empty JSON body and the current session CSR
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("username sign-in API client", () => {
+  const authorizationUrl = "https://login.microsoftonline.com/example/oauth2/v2.0/authorize?state=test-state";
+
+  it("posts the username and return path to the same-origin login endpoint with session cookies", async () => {
+    const fetchMock = mockJsonResponse({ authorizationUrl });
+    const controller = new AbortController();
+    const input = { username: "user@example.com", returnTo: "/agents?q=Budget" };
+    await expect(startSignIn(input, { signal: controller.signal })).resolves.toEqual({ authorizationUrl });
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/auth/login", expect.objectContaining({
+      method: "POST",
+      credentials: "include",
+      body: JSON.stringify(input),
+      signal: controller.signal,
+      headers: expect.objectContaining({ Accept: "application/json", "Content-Type": "application/json" }),
+    }));
+  });
+
+  it("omits an unspecified return path", async () => {
+    const fetchMock = mockJsonResponse({ authorizationUrl });
+    await startSignIn({ username: "user@example.com" });
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ username: "user@example.com" });
+  });
+
+  it.each([400, 401, 403, 503])("preserves login errors without session revalidation for HTTP %s", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+      code: status === 401 ? "unauthorized" : "tenant_not_configured",
+      detail: "Your organization is not configured for sign-in.",
+      requestId: "login-request",
+    }, { status })));
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      await expect(startSignIn({ username: "user@unknown.example" })).rejects.toMatchObject({
+        status,
+        message: "Your organization is not configured for sign-in.",
+        requestId: "login-request",
+      });
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each([401, 403])("does not treat an unclassified login HTTP %s as a protected-session denial", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("Sign-in unavailable", { status })));
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      await expect(startSignIn({ username: "user@example.com" })).rejects.toMatchObject({ status, code: "request_failed" });
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each([
+    null, {}, { authorizationUrl: null }, { authorizationUrl: 42 }, { authorizationUrl: "/api/auth/login" },
+    { authorizationUrl: "/api/auth/callback?state=synthetic-state&code=synthetic-code" },
+    { authorizationUrl: "javascript:alert(1)" }, { authorizationUrl: "http://login.microsoftonline.com/authorize" },
+    { authorizationUrl: "https://username:password@login.microsoftonline.com/authorize" },
+  ])("rejects a malformed or unsafe sign-in URL: %j", response => {
+    mockJsonResponse(response);
+    return expect(startSignIn({ username: "user@example.com" })).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("normalizes network failures", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Network unavailable")));
+    await expect(startSignIn({ username: "user@example.com" })).rejects.toMatchObject({
+      code: "network_error", message: "The server could not be reached.",
+    });
+  });
+
+  it("rejects a late authorization URL after the form is abandoned", async () => {
+    const pending = deferredResponse();
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(pending.promise));
+    const controller = new AbortController();
+    const result = startSignIn({ username: "user@example.com" }, { signal: controller.signal });
+    const cancelled = expect(result).rejects.toMatchObject({ code: "request_aborted" });
+    controller.abort();
+    pending.resolve(Response.json({ authorizationUrl }));
+    await cancelled;
+  });
 });
 
 describe("access API client", () => {
@@ -571,6 +656,11 @@ describe("access API client", () => {
       verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }, { sourceScopes: false }),
     });
     await getUnifiedAgents({
+      view: "third_party",
+      endUserAccess: "available",
+      reportedUsage: "used",
+      management: "organization_managed",
+      relevance: "organization",
       search: "Builder & one",
       source: "both",
       linkState: "matched",
@@ -588,7 +678,7 @@ describe("access API client", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "/api/agent-inventory?search=Builder+%26+one&source=both&linkState=matched&environmentId=environment%2Fone&blocked=true&publisher=__unknown__&availableTo=__some_or_all__&host=__unknown_host__&platform=Copilot+Studio&createdWithinDays=30&limit=50&offset=100",
+      "/api/agent-inventory?view=third_party&endUserAccess=available&reportedUsage=used&management=organization_managed&relevance=organization&search=Builder+%26+one&source=both&linkState=matched&environmentId=environment%2Fone&blocked=true&publisher=__unknown__&availableTo=__some_or_all__&host=__unknown_host__&platform=Copilot+Studio&createdWithinDays=30&limit=50&offset=100",
       expect.objectContaining({ credentials: "include" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -639,7 +729,11 @@ describe("access API client", () => {
       .mockResolvedValueOnce(new Response(csv, { headers: { "Content-Type": "text/csv" } }));
     vi.stubGlobal("fetch", fetchMock);
     await getCurrentUser();
-    const input = { revision: "a".repeat(64), query: { environmentId: "env/one", search: "Agent & one", sortBy: "lastModifiedAt" as const, sortDirection: "desc" as const } };
+    const input = { revision: "a".repeat(64), query: {
+      view: "third_party" as const, endUserAccess: "available" as const, reportedUsage: "used" as const,
+      management: "organization_managed" as const, relevance: "organization" as const,
+      environmentId: "env/one", search: "Agent & one", sortBy: "lastModifiedAt" as const, sortDirection: "desc" as const,
+    } };
     const blob = await downloadUnifiedAgentInventoryCsv(input);
     expect(await blob.text()).toBe(csv);
     expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/export.csv", {

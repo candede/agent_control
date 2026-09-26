@@ -82,9 +82,7 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:${APP_PORT:-3001}}
       REDIRECT_URI: ${REDIRECT_URI:-http://localhost:${APP_PORT:-3001}/api/auth/callback}
       TRUST_PROXY: ${TRUST_PROXY:-0}
-      TENANT_ID: ${TENANT_ID:-}
-      CLIENT_ID: ${CLIENT_ID:-}
-      CLIENT_SECRET_FILE: /run/secrets/client-secret
+      TENANTS_JSON_FILE: /run/secrets/tenants.json
       SESSION_SECRET_FILE: /run/secrets/session
       OFFICIAL_USAGE_STALE_AFTER_DAYS: ${OFFICIAL_USAGE_STALE_AFTER_DAYS:-35}
       PGHOST: postgres
@@ -96,7 +94,8 @@ services:
     secrets:
       - postgres-app
       - session
-      - client-secret
+      - source: tenants
+        target: tenants.json
     volumes:
       - ${LOCAL_STATE_DIR}/control:/run/control:ro
     ports:
@@ -130,5 +129,5 @@ secrets:
     file: ${LOCAL_STATE_DIR}/secrets/postgres-app
   session:
     file: ${LOCAL_STATE_DIR}/secrets/session
-  client-secret:
-    file: ${LOCAL_STATE_DIR}/secrets/client-secret
+  tenants:
+    file: ${LOCAL_STATE_DIR}/secrets/tenants.json

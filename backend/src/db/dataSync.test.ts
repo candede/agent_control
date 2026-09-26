@@ -4,6 +4,7 @@ import { testDatabase } from "../../scripts/testDatabase.js";
 import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
 import { copilotServicePlanDefinitions, resolveCopilotServicePlan } from "../services/copilotServicePlans.js";
 import { DataSyncRepository } from "./dataSync.js";
+import { PackageInventoryRepository } from "./packageInventory.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: DataSyncRepository;
@@ -337,13 +338,16 @@ describe.sequential("Data sync repository", () => {
     await expect(repository.retry(scope, run.id, ["power_platform"])).rejects.toMatchObject({ code: "data_sync_source_complete" });
     await expect(repository.retry(scope, run.id, ["usage_reports"])).rejects.toMatchObject({ code: "data_sync_source_complete" });
     expect(await repository.retry(scope, run.id, ["graph_packages"])).toEqual(["graph_packages"]);
-    const firstJob = randomUUID();
+    const packages = new PackageInventoryRepository(fixture.runtime);
+    const firstJob = (await packages.submit(scope, { tokenMode: "delegated",
+      authorizationPrincipalId: scope.principalId, idempotencyKey: `${run.id}-first` })).id;
     await repository.attachJob(scope, run.id, "graph_packages", firstJob);
     await repository.updateSource(scope, run.id, "graph_packages", {
       status: "failed", jobId: firstJob, message: "Failed again.", canRetry: true,
     });
     expect(await repository.retry(scope, run.id, ["graph_packages"])).toEqual(["graph_packages"]);
-    const secondJob = randomUUID();
+    const secondJob = (await packages.submit(scope, { tokenMode: "delegated",
+      authorizationPrincipalId: scope.principalId, idempotencyKey: `${run.id}-second` })).id;
     await repository.attachJob(scope, run.id, "graph_packages", secondJob);
     const associations = await fixture.runtime.query<{ job_id: string }>(
       "SELECT job_id FROM data_sync_source_jobs WHERE run_id=$1 ORDER BY attempt",

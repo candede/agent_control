@@ -21,7 +21,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   const context = useContext(CapabilityContext);
   const canRead = !context || hasAppRole(context.user?.roles ?? [], "AgentControl.Viewer");
   const scope = JSON.stringify([context?.user?.tenantId, context?.user?.homeAccountId, context?.user?.roles]);
-  const [result, setResult] = useState<{ key: object; value?: AgentResponsibilityPage; error?: string }>();
+  const [result, setResult] = useState<{ key: { query: object }; value?: AgentResponsibilityPage; error?: string }>();
   const [retry, setRetry] = useState(0);
   const [localPage, setLocalPage] = useState(0);
   const readSaved = useSavedRead();
@@ -29,8 +29,8 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   const personId = route?.personId ?? objectId;
   const search = route?.search ?? "";
   const valid = personId === undefined ? Boolean(route) : isDirectoryObjectId(personId);
-  const key = useMemo(() => ({ scope, personId, search, page, dataRevision, agentInventoryRevision, retry, readSaved }),
-    [scope, personId, search, page, dataRevision, agentInventoryRevision, retry, readSaved]);
+  const query = useMemo(() => ({ scope, personId, search, page, readSaved }), [scope, personId, search, page, readSaved]);
+  const key = useMemo(() => ({ query, dataRevision, agentInventoryRevision, retry }), [query, dataRevision, agentInventoryRevision, retry]);
   const scoped = result?.key === key ? result : undefined;
   useEffect(() => {
     if (!valid || !canRead) return;
@@ -47,7 +47,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
       });
     return () => controller.abort();
   }, [valid, canRead, key, scope, personId, search, page, dataRevision, agentInventoryRevision, retry, readSaved]);
-  const data = canRead ? scoped?.value : undefined;
+  const data = canRead && valid && result?.key.query === query ? result.value : undefined;
   const selected = data?.selected;
   const count = selected?.count ?? data?.count ?? 0;
   const changePage = (next: number) => route ? onRouteChange?.({ ...route, page: next }) : setLocalPage(next);
@@ -60,7 +60,7 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
         {route && personId ? <button type="button" className="secondary" onClick={() => onRouteChange?.({ view: "responsibility", search: "", page: 0 })}>All responsible people</button> : null}
         {route && !personId ? <label>Search responsible people<input aria-label="Search responsible people" value={search}
           onChange={event => onRouteChange?.({ ...route, search: event.target.value, page: 0 })} /></label> : null}
-        {!scoped ? <p role="status">Loading saved responsibility...</p> : null}
+        {!scoped && !data ? <p role="status">Loading saved responsibility...</p> : null}
         {scoped?.error ? <p role="alert" className="error-banner">{scoped.error} <button type="button" className="secondary"
           onClick={() => setRetry(value => value + 1)}>Retry saved responsibility</button></p> : null}
         {data ? <>

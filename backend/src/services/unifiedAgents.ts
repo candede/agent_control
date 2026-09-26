@@ -43,7 +43,7 @@ import {
 import { powerPlatformAgentKey } from "./inventoryIdentity.js";
 import { parseUnifiedAgentRecordId, unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { AuditLog } from "./auditLog.js";
-import { agentColumnValue, matchesAgentView, packageAuthoringTool, summarizeAgentAvailability, type AgentColumnValue } from "../types/agentPresentation.js";
+import { agentColumnValue, matchesAgentFilters, packageAuthoringTool, summarizeAgentAvailability, type AgentColumnValue } from "../types/agentPresentation.js";
 import { agentUsage, combineAgentInventoryRevision } from "./agentUsage.js";
 import { savedAgentPeople } from "./savedAgentPeople.js";
 import { projectAgentResponsibility } from "./agentResponsibility.js";
@@ -560,7 +560,7 @@ function unavailableStatus(
 }
 
 function matches(record: UnifiedAgentRecord, query: UnifiedAgentInventoryQuery) {
-  if (!matchesAgentView(record, query.view)) return false;
+  if (!matchesAgentFilters(record, query)) return false;
   if (query.recordId && !matchesRecordId(record, query.recordId)) return false;
   if (query.source && query.source !== "all") {
     if (query.source === "both" && record.presence !== "both") return false;

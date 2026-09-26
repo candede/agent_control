@@ -24,7 +24,8 @@ import { UserPurviewAudit } from "./UserPurviewAudit";
 import "./copilotUsers.css";
 
 type Cohort = "licensed" | "attention" | "unknown";
-type ReadState = { key: object; status: "ready" } | { key: object; status: "failed"; error: string; accessDenied?: boolean };
+type ReadKey = { dataRevision: number; reload: number; needsDirectory: boolean };
+type ReadState = { key: ReadKey; status: "ready" } | { key: ReadKey; status: "failed"; error: string; accessDenied?: boolean };
 const pageSize = 50;
 const defaultLicenseSorting: SortingState = [{ id: "responses", desc: true }];
 const licenseSorts = [
@@ -80,10 +81,10 @@ export function CopilotUsersView({
   const readKey = useMemo(() => ({ dataRevision, reload, needsDirectory }), [dataRevision, reload, needsDirectory]);
   const scopedRead = read?.key === readKey ? read : undefined;
   const loading = !scopedRead;
-  const currentData = scopedRead?.status === "ready" ? data : undefined;
+  const currentData = read?.status === "ready" ? data : undefined;
   const error = scopedRead?.status === "failed" ? scopedRead.error : undefined;
   const accessDenied = scopedRead?.status === "failed" && scopedRead.accessDenied;
-  const selectionKey = useMemo(() => ({ readKey, view: currentRoute.view }), [readKey, currentRoute.view]);
+  const selectionKey = useMemo(() => ({ view: currentRoute.view }), [currentRoute.view]);
   const selected = selectedUser?.key === selectionKey
     ? data?.users.find(user => user.directory.objectId === selectedUser.id)
     : undefined;
@@ -101,12 +102,14 @@ export function CopilotUsersView({
       if (!controller.signal.aborted) {
         setData(result);
         setRead({ key: readKey, status: "ready" });
+        setSelectedUser(selection => result.users.some(user => user.directory.objectId === selection?.id) ? selection : undefined);
       }
     }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
         const denied = failure instanceof ApiError && (failure.status === 401 || failure.status === 403);
         if (denied) {
           setData(undefined);
+          setSelectedUser(undefined);
         }
         setRead({ key: readKey, status: "failed", error: failure instanceof Error ? failure.message : "Paid Copilot licenses and usage could not be loaded.", accessDenied: denied });
       }
@@ -115,7 +118,7 @@ export function CopilotUsersView({
   }, [needsDirectory, dataRevision, readKey, readSaved, reload]);
 
   return (
-    <section className="copilot-users" aria-label="Users and adoption" aria-busy={loading && currentRoute.view === "licenses"}>
+    <section className="copilot-users" aria-label="Users and adoption" aria-busy={loading && !data && currentRoute.view === "licenses"}>
       <header className="copilot-users-header">
         <div>
           <h2>Users & adoption</h2>
@@ -141,10 +144,10 @@ export function CopilotUsersView({
       {currentRoute.view !== "responsibility" ? reportSelector : null}
       {error && currentRoute.view !== "responsibility" ? <div className="error-banner" role="alert">{error} Use Permissions in the top navigation for connection recovery.
         {" "}<button type="button" className="secondary" onClick={() => setReload(value => value + 1)}>Retry saved users</button></div> : null}
-      {loading && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}
+      {loading && !data && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}
       {data && !currentData && currentRoute.view !== "responsibility" ? <p className="copilot-users-notice" role="status">Showing the last saved user snapshot. Current licensing and adoption recommendations are unverified until saved users reload.</p> : null}
       {currentRoute.view === "responsibility" ? <UserAgentResponsibility key={currentRoute.personId ?? "people"} route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
-        : currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} directoryData={currentData} onOpenAgent={onOpenAgent}
+        : currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} directoryData={currentData} directoryDataRevision={read?.key.dataRevision} onOpenAgent={onOpenAgent}
         onAccessDenied={message => { directoryRequest.current?.abort(); setData(undefined); setRead({ key: readKey, status: "failed", error: message, accessDenied: true }); }} /> : null
         : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, key: selectionKey })} /> : null}
       {selected && selectedUser && data ? <CopilotUserDetail user={selected} data={data} current={Boolean(currentData)} threshold={selectedUser.threshold} returnFocusTo={cohortSelect} onClose={() => setSelectedUser(undefined)} onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} /> : null}

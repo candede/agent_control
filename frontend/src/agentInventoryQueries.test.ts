@@ -99,6 +99,20 @@ describe("AgentInventoryQueries", () => {
     expect(read).toHaveBeenCalledTimes(6);
   });
 
+  it("separates quick-view and independent evidence filters in the saved query cache", async () => {
+    const base = { view: "third_party" as const };
+    await queries.read("owner", base, signal());
+    for (const filters of [
+      { endUserAccess: "available" as const }, { reportedUsage: "used" as const },
+      { management: "organization_managed" as const }, { relevance: "unknown" as const },
+      { endUserAccess: "available" as const, reportedUsage: "used" as const, management: "organization_managed" as const },
+    ]) {
+      await queries.read("owner", { ...base, ...filters }, signal());
+      await queries.read("owner", { ...base, ...filters }, signal());
+    }
+    expect(read).toHaveBeenCalledTimes(6);
+  });
+
   it("never extends a saved source or selected report expiration", async () => {
     read.mockResolvedValueOnce(page("2026-09-20T12:00:05.000Z"));
     await queries.read("owner", {}, signal());

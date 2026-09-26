@@ -232,7 +232,7 @@ export class CopilotUsageService {
   ) {
     const { scope, validation } = context;
     assertCurrentRefresh(context);
-    const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
     assertCurrentRefresh(context);
     await commitAccountSessionValidation(validation, async () => {
       assertCurrentRefresh(context);
@@ -295,7 +295,7 @@ export class CopilotUsageService {
   private async currentDelegatedToken(context: UserSourceRefreshContext, capabilityId: CapabilityId) {
     const { scope, validation } = context;
     assertCurrentRefresh(context);
-    const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+    const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
     assertCurrentRefresh(context);
     let token = "";
     await commitAccountSessionValidation(validation, async () => {
@@ -304,7 +304,7 @@ export class CopilotUsageService {
       requireViewer(freshUser);
       await this.dependencies.requireAvailable(capabilityId, freshUser);
       assertCurrentRefresh(context);
-      token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
+      token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, capabilityId);
       assertCurrentRefresh(context);
     });
     assertCurrentRefresh(context);

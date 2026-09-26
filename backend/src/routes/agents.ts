@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
-import { config } from "../config.js";
+import { getTenantConfiguration } from "../config.js";
 import { createJobConfirmation, type JobIntentInput } from "../db/jobs.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageListQuery } from "../db/packageInventory.js";
 import { packageCanaryMutation, PackageMutationQualificationRepository } from "../db/packageMutationQualifications.js";
@@ -133,7 +133,7 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (job.tokenMode !== "delegated") throw new AppError(409,"invalid_token_mode","This route can resume delegated jobs only.");
   await capabilities.requireAvailable(job.capabilityId, request.session.user!);
-  await acquireDelegatedToken(scope.principalId, job.capabilityId);
+  await acquireDelegatedToken(scope.tenantId, scope.principalId, job.capabilityId);
   await bulkJobs.recover(scope.tenantId, true);
   job = await bulkJobs.get(id, scope);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
@@ -279,7 +279,7 @@ async function submit(request: Request, action: AuditAction, ids: string[], acce
   const capabilityId = action === "block" || action === "unblock" ? "graph.package.block.manage" : "graph.package.access.manage";
   const intent = await buildMutationIntent(request, action, ids, accessUpdate, scope);
   if (createJobConfirmation(intent).confirmationHash !== confirmedHash) throw new AppError(409, "confirmation_mismatch", "The confirmed package selection or current state changed. Review and confirm the mutation again.");
-  await acquireDelegatedToken(owner.principalId, capabilityId);
+  await acquireDelegatedToken(owner.tenantId, owner.principalId, capabilityId);
   const job = await commitAccountSessionValidation(validation, () => bulkJobs.submit(owner, { ...intent, confirmationHash: confirmedHash, idempotencyKey: request.get("Idempotency-Key") ?? randomUUID() }));
   if (job.status === "queued") await commitAccountSessionValidation(validation, async () => launchBulkJob(job.id, owner));
   return job;
@@ -362,7 +362,7 @@ async function withDirectoryRequest(
       assertCurrent();
       await capabilities.requireAvailable("graph.directory.read", request.session.user!);
       assertCurrent();
-      const token = await acquireDelegatedToken(scope.principalId, "graph.directory.read");
+      const token = await acquireDelegatedToken(scope.tenantId, scope.principalId, "graph.directory.read");
       assertCurrent();
       await operation(token, signal, assertCurrent);
     };
@@ -460,8 +460,7 @@ async function savedPackageScope(request: Request, mode: "delegated" | "applicat
   const owner = requestScope(request);
   if (mode === "delegated") return owner;
   await capabilities.requireApplicationDataScope("graph.package.read.application", request.session.user!);
-  if (!config.clientId) throw new AppError(503, "not_configured", "Application package reads require configured tenant and client identity.");
-  return { tenantId: owner.tenantId, principalId: config.clientId };
+  return { tenantId: owner.tenantId, principalId: getTenantConfiguration(owner.tenantId).clientId };
 }
 
 function packageMode(value: unknown) {
@@ -630,12 +629,12 @@ function canaryJobAuthorizer(
   jobId: string,
   validation: ReturnType<typeof beginAccountSessionValidation>,
 ) {
-  return async (scope: ReturnType<typeof requestScope>, capabilityId: Parameters<typeof acquireDelegatedToken>[1]) => {
+  return async (scope: ReturnType<typeof requestScope>, capabilityId: Parameters<typeof acquireDelegatedToken>[2]) => {
     assertAccountSessionValidation(validation);
     const current = await revalidateCanaryAdmin(scope);
     const identity = await capabilities.packageQualificationIdentity(approval.action, current);
     if (identity.capabilityId !== capabilityId || current.homeAccountId !== operator.homeAccountId) throw AppError.unauthorized("The canary job no longer matches its exact approval actor or capability.");
-    const token = await acquireDelegatedToken(scope.principalId, capabilityId);
+    const token = await acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
     await commitAccountSessionValidation(validation, () => mutationQualifications.authorizeCycleJob(current, approval.id, jobId, identity));
     assertAccountSessionValidation(validation);
     return token;
@@ -643,7 +642,7 @@ function canaryJobAuthorizer(
 }
 
 async function revalidateCanaryAdmin(scope: ReturnType<typeof requestScope>) {
-  const user = await revalidateAuthenticatedUser(scope.principalId);
+  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The canary Admin no longer matches the signed-in account.");
   if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required for the full canary cycle.");
   return user;

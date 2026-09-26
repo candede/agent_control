@@ -43,7 +43,7 @@ describe("Copilot Studio quarantine control", () => {
     await expect(value.status(viewer, target.snapshotId, target.resourceNativeId, true)).resolves.toMatchObject({ direct: { source: "provider", providerUpdatedAt: direct.lastUpdateTimeUtc } });
     expect(provider.getStatus).toHaveBeenCalledTimes(1);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.read", viewer);
-    expect(dependencies.delegatedToken).toHaveBeenCalledWith(viewer.homeAccountId, "powerPlatform.quarantine.read");
+    expect(dependencies.delegatedToken).toHaveBeenCalledWith(viewer.tenantId, viewer.homeAccountId, "powerPlatform.quarantine.read");
     expect(dependencies.revalidateUser).toHaveBeenCalledTimes(2);
     expect(repository.recordObservation).toHaveBeenCalledWith({ tenantId: "tenant-a", principalId: "operator-a" }, target, direct);
   });
@@ -99,7 +99,7 @@ describe("Copilot Studio quarantine control", () => {
     await expect(value.submit(user, input)).resolves.toMatchObject({ isCanary: false });
     expect(inventory.resolveQuarantineTargets).toHaveBeenLastCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, target.snapshotId, [target.resourceNativeId]);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.manage", user);
-    expect(dependencies.delegatedToken).toHaveBeenCalledWith(user.homeAccountId, "powerPlatform.quarantine.manage");
+    expect(dependencies.delegatedToken).toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "powerPlatform.quarantine.manage");
     expect(provider.getStatus).toHaveBeenCalledWith("ephemeral-token", target, { correlationId: expect.any(String) });
     expect(repository.submit).toHaveBeenCalledWith({ tenantId: user.tenantId, principalId: user.homeAccountId }, {
       action: input.action, targets: [{ ...target, directStatus: direct }],
@@ -128,7 +128,7 @@ describe("Copilot Studio quarantine control", () => {
     dependencies.requireAvailable.mockRejectedValueOnce(new AppError(403, "capability_unavailable", "Admin authority was revoked."));
     await expect(value.submit(user, { action: "quarantine", snapshotId: target.snapshotId, resourceNativeIds: [target.resourceNativeId],
       confirmationHash: "e".repeat(64), idempotencyKey: "cached-revoked" })).rejects.toMatchObject({ code: "capability_unavailable" });
-    expect(dependencies.revalidateUser).toHaveBeenCalledWith(user.homeAccountId);
+    expect(dependencies.revalidateUser).toHaveBeenCalledWith(user.tenantId, user.homeAccountId);
     expect(dependencies.requireAvailable).toHaveBeenCalledWith("powerPlatform.quarantine.manage", user);
     expect(provider.getStatus).not.toHaveBeenCalled();
     expect(repository.submit).not.toHaveBeenCalled();

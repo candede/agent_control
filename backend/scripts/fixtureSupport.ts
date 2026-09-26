@@ -21,10 +21,13 @@ export function configureBrowserFixtureEnvironment(env: NodeJS.ProcessEnv = proc
     throw new Error("The browser fixture requires a plain HTTP loopback origin with a fixed port.");
   }
   // File-backed settings take precedence over inline values in runtime configuration.
-  for (const name of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "SESSION_SECRET"]) delete env[`${name}_FILE`];
+  for (const name of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "SESSION_SECRET", "TENANT_DOMAINS", "TENANTS_JSON"]) delete env[`${name}_FILE`];
+  delete env.TENANTS_JSON;
+  delete env.TENANT_DISPLAY_NAME;
   env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   env.CLIENT_ID = "22222222-2222-2222-2222-222222222222";
   env.CLIENT_SECRET = "synthetic-browser-client-secret";
+  env.TENANT_DOMAINS = "example.invalid";
   env.SESSION_SECRET = "synthetic-browser-session-secret-0001";
   env.FRONTEND_ORIGIN = origin.origin;
   env.REDIRECT_URI = `${origin.origin}/api/auth/callback`;

@@ -446,7 +446,7 @@ describe("Defender hunting worker", () => {
     expect(fixture.dependencies.runQuery).not.toHaveBeenCalled();
     release(user);
     await vi.waitFor(() => expect(fixture.repository.publish).toHaveBeenCalledOnce());
-    expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.homeAccountId, "defender.hunting.delegated");
+    expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "defender.hunting.delegated");
     expect(fixture.dependencies.applicationToken).not.toHaveBeenCalled();
   });
 

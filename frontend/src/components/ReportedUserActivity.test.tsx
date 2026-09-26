@@ -803,17 +803,50 @@ describe("reported user activity", () => {
     expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ setId: usageFixtureSetId }), expect.anything());
   });
 
-  it("closes details and removes stale data when report revisions change or authorization is revoked", async () => {
+  it("keeps rows, controls and open details intact until a background revision finishes", async () => {
+    const pending = deferred<api.OfficialUsageUserView>();
+    const props = { route: { ...initialRoute, search: "Ada" }, onRouteChange: vi.fn(), directoryData: directoryFixture() };
+    const view = render(<ReportedUserActivity {...props} />);
+    const { dialog } = await openUser("Ada");
+    const table = screen.getByRole("region", { name: "Active users without paid Copilot" });
+    const original = table.textContent;
+    const close = within(dialog).getByRole("button", { name: "Close reported user details" });
+    expect(close).toHaveFocus();
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
+    view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={0} />);
+    expect(table).toHaveTextContent(original!);
+    expect(dialog).toBeVisible();
+    expect(close).toHaveFocus();
+    expect(screen.getByRole("region", { name: "Non-paid user activity" })).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByText(/Loading reported user activity/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    expect(screen.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
+    expect(within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();
+    const updated = usageUsersFixture({ staleAfterDays: 35, search: "Ada" });
+    updated.users.value[0].reportedResponsesReceived = 202;
+    await act(async () => pending.resolve(updated));
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
+    expect(within(dialog).getByText("Responses (Users report)").parentElement).toHaveTextContent("202");
+    expect(within(dialog).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
+    view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={1} />);
+    expect(within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();
+  });
+
+  it("closes details and removes retained data when a background read actually loses authorization", async () => {
     const denied = vi.fn();
     const props = { route: initialRoute, onRouteChange: vi.fn(), onAccessDenied: denied };
     const view = render(<ReportedUserActivity {...props} dataRevision={0} />);
     await openUser("Ada");
     vi.mocked(api.getOfficialUsageUsers).mockRejectedValueOnce(new api.ApiError(401, "expired", "Sign in again"));
     view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
+    expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign in again");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Sign in again");
     expect(denied).toHaveBeenCalledWith("Sign in again");
+    await userEvent.click(screen.getByRole("button", { name: "Retry reported activity" }));
+    await screen.findByRole("region", { name: "Active users without paid Copilot" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("distinguishes missing reports, missing companions, empty matches and out-of-range pages", async () => {

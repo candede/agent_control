@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   purviewDrain: vi.fn<() => Promise<void>>(),
   defenderDrain: vi.fn<() => Promise<void>>(),
 }));
-vi.mock("./config.js", () => ({ config: { port: 3001, tenantId: "fixture-tenant", nodeEnv: "test" }, validateRuntimeConfig: vi.fn() }));
+vi.mock("./config.js", () => ({ config: { port: 3001, tenants: [{ tenantId: "tenant-a" }, { tenantId: "tenant-b" }], nodeEnv: "test" }, validateRuntimeConfig: vi.fn() }));
 vi.mock("./app.js", () => ({ createApp: () => ({ app: { listen: mocks.listen }, store: { close: mocks.storeClose } }) }));
 vi.mock("./db/pool.js", () => ({ pool: { end: mocks.poolEnd, waitingCount: 0 } }));
 vi.mock("./db/packageMutationQualifications.js", () => ({ PackageMutationQualificationRepository: class { recoverInterrupted = mocks.recover; } }));
@@ -73,6 +73,13 @@ async function settle() {
 }
 
 describe("maintenance shutdown lifecycle", () => {
+  it("recovers interrupted work for every configured tenant", () => {
+    for (const tenantId of ["tenant-a", "tenant-b"]) {
+      expect(mocks.recover).toHaveBeenCalledWith(tenantId, true);
+      expect(mocks.recover.mock.calls.filter(([tenant]) => tenant === tenantId)).toHaveLength(3);
+    }
+  });
+
   it("keeps database and session persistence open until admitted HTTP requests have finished", async () => {
     signals.get("SIGTERM")!();
     await settle();

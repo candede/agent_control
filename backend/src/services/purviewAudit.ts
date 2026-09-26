@@ -1,5 +1,5 @@
 import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
-import { config } from "../config.js";
+import { findTenantConfiguration } from "../config.js";
 import { PurviewAuditRepository, type PurviewAuditExecution, type PurviewAuditReadScope, type PurviewAuditScope } from "../db/purviewAudit.js";
 import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry } from "../errors.js";
@@ -22,7 +22,7 @@ type AuditDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
-  applicationIdentity: () => string | undefined;
+  applicationIdentity: (tenantId: string) => string | undefined;
   qualificationContext: typeof capabilities.auditQualificationContext;
   recordQualificationEvidence: typeof capabilities.recordAuditQualificationEvidence;
   createQuery: GraphAuditSearchClient["createQuery"];
@@ -42,7 +42,7 @@ const defaultDependencies: AuditDependencies = {
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
-  applicationIdentity: () => config.clientId,
+  applicationIdentity: tenantId => findTenantConfiguration(tenantId)?.clientId,
   qualificationContext: capabilities.auditQualificationContext.bind(capabilities),
   recordQualificationEvidence: capabilities.recordAuditQualificationEvidence.bind(capabilities),
   createQuery: graphAudit.createQuery.bind(graphAudit),
@@ -85,7 +85,7 @@ export class PurviewAuditService {
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
       : undefined;
     await this.dependencies.requireAvailable(capabilityId, user);
-    return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity()), { idempotencyKey: input.idempotencyKey, filters });
+    return this.repository.submit(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)), { idempotencyKey: input.idempotencyKey, filters });
   }
 
   async approveQualification(user: AuthenticatedUser, input: { tokenMode: PurviewAuditTokenMode; filters: unknown }) {
@@ -96,7 +96,7 @@ export class PurviewAuditService {
       ? await this.dependencies.requireApplicationDataScope(capabilityId, user)
       : undefined;
     const context = await this.dependencies.qualificationContext(capabilityId, user);
-    return this.repository.approveQualification(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity()), { filters, ...context, approvedBy: user.homeAccountId });
+    return this.repository.approveQualification(scopeFor(user, input.tokenMode, applicationConfiguration?.revision, this.dependencies.applicationIdentity(user.tenantId!)), { filters, ...context, approvedBy: user.homeAccountId });
   }
 
   async startQualification(user: AuthenticatedUser, qualificationId: string) {
@@ -282,8 +282,8 @@ export class PurviewAuditService {
       const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
       const { user: freshUser, capabilityId } = await this.validateCurrentAuthority(actor, scope, qualification, signal);
       const token = await this.dependencies.observeOperation(capabilityId, freshUser, () => abortable(scope.tokenMode === "delegated"
-        ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(capabilityId), signal), { signal, clearOnSuccess: false });
+        ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
+        : this.dependencies.applicationToken(actor.tenantId, capabilityId), signal), { signal, clearOnSuccess: false });
       if (scope.tokenMode === "application") await this.requireExactApplicationScope(scope, freshUser, capabilityId, signal);
       if (qualification) await this.validateCurrentQualification(qualification, freshUser, signal);
       await abortable(commitAccountSessionValidation(validation, async () => {
@@ -391,7 +391,7 @@ export class PurviewAuditService {
           const evidenceSignal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(10_000)]);
           evidenceSignal.throwIfAborted();
           const evidenceValidation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
-          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.principalId), evidenceSignal);
+          const evidenceUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), evidenceSignal);
           await commitAccountSessionValidation(evidenceValidation, async () => {
             evidenceSignal.throwIfAborted();
             requireProviderAdmissions();
@@ -417,7 +417,7 @@ export class PurviewAuditService {
   ) {
     signal.throwIfAborted();
     requireProviderAdmissions();
-    const freshUser = await abortable(this.dependencies.revalidateUser(actor.principalId), signal);
+    const freshUser = await abortable(this.dependencies.revalidateUser(actor.tenantId, actor.principalId), signal);
     signal.throwIfAborted();
     requireProviderAdmissions();
     requireSamePrincipal(actor, freshUser);
@@ -442,7 +442,7 @@ export class PurviewAuditService {
 
   private async requireExactApplicationScope(scope: PurviewAuditScope, user: AuthenticatedUser, capabilityId: CapabilityId, signal: AbortSignal) {
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityId, user), signal);
-    const current = scopeFor(user, "application", configuration?.revision, this.dependencies.applicationIdentity()).resultScope;
+    const current = scopeFor(user, "application", configuration?.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
     if (!resultScopeMatches(scope.resultScope, current)) {
       throw new AppError(409, "application_scope_changed", "Application Audit Search configuration changed after this job was submitted.");
     }
@@ -475,7 +475,7 @@ export class PurviewAuditService {
   private async resultScopeForMode(user: AuthenticatedUser, tokenMode: PurviewAuditTokenMode, signal?: AbortSignal) {
     if (tokenMode === "delegated") return scopeFor(user, tokenMode).resultScope;
     const configuration = await abortable(this.dependencies.requireApplicationDataScope(capabilityForMode(tokenMode), user), signal);
-    return scopeFor(user, tokenMode, configuration?.revision, this.dependencies.applicationIdentity()).resultScope;
+    return scopeFor(user, tokenMode, configuration?.revision, this.dependencies.applicationIdentity(user.tenantId!)).resultScope;
   }
 
   private async readScope(user: AuthenticatedUser): Promise<PurviewAuditReadScope> {

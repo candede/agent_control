@@ -485,7 +485,7 @@ test("automatic checks, administrator setup, panels and focus return", async ({ 
   expect(legacyProbes).toBe(0);
   expect(unexpectedProviderWorkloads).toEqual([]);
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
-  await expect(page.getByRole("link", { name: "Sign in with Entra ID" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in with Entra ID" })).toBeVisible();
   await login(page, "missing_delegated_grant");
   const missingIssue = page.locator(".permission-issue-list > li").filter({ hasText: "Agent inventory" });
   const setup = missingIssue.getByRole("button", { name: "Details: Agent inventory", exact: true });

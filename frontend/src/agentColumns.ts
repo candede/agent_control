@@ -1,4 +1,4 @@
-import { unifiedAgentSortKeys, type UnifiedAgentInventoryScope, type UnifiedAgentInventorySummary, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+import { unifiedAgentSortKeys, type UnifiedAgentInventoryScope, type UnifiedAgentInventorySummary, type UnifiedAgentQuickView, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 
 export const agentInventoryScopeOptions = [
   {
@@ -21,12 +21,36 @@ export function inventoryScopeAgentCount(summary: UnifiedAgentInventorySummary, 
 }
 
 export const agentViewOptions = [
-  { value: "all", label: "All agents in this view", description: "All agents in the selected inventory view, whether or not users can access them." },
+  { value: "all", label: "All agents", description: "All agents in the selected inventory scope, subject to the other active filters. Quick views can overlap." },
+  { value: "first_party", label: "1st party agents", description: "Agents classified by the package catalog as built by Microsoft, such as Researcher and Analyst. Using Microsoft authoring tools does not make an agent 1st party." },
+  { value: "third_party", label: "3rd party agents", description: "Agents classified by the package catalog as built by external vendors or partners." },
+  { value: "user_managed", label: "User managed agents", description: "Confirmed internal Agent Builder agents with explicitly no catalog distribution or installation. Incomplete or ambiguous management evidence remains unknown." },
+  { value: "copilot_studio", label: "Copilot Studio agents", description: "Agents with saved Copilot Studio authoring evidence, regardless of publisher or management. Excludes Copilot Studio Lite / Agent Builder." },
+  { value: "organization_managed", label: "Organization managed agents", description: "Agents with verified administrative access changes and current assigned access or installation. Generic availability or installation alone does not establish admin management." },
+] as const satisfies readonly { value: UnifiedAgentQuickView; label: string; description: string }[];
+
+export const agentAccessOptions = [
+  { value: "all", label: "Any end-user access", description: "Do not restrict end-user access." },
   { value: "available", label: "Available to end users", description: "Unblocked agents available to all or selected users, excluding known quarantined agents. Access is based on saved settings, not proof of use or an individual user's permissions." },
   { value: "unavailable", label: "Not available to end users", description: "Agents known to be blocked, quarantined, or available to no users." },
-  { value: "availability_unknown", label: "End-user access unknown", description: "Agents without enough saved access information. Creation, publication, installation or past usage alone does not establish access." },
-  { value: "organization", label: "Organization-related agents", description: "Organization-created or shared agents, Microsoft agents, and agents with installation or reported usage. This does not establish end-user access." },
+  { value: "unknown", label: "End-user access unknown", description: "Agents without enough saved access information. Creation, publication, installation or past usage alone does not establish access." },
+] as const;
+
+export const agentUsageOptions = [
+  { value: "all", label: "Any reported usage", description: "Include agents with or without selected-report evidence." },
   { value: "used", label: "Used in selected report", description: "Agents with positive responses in the selected Microsoft 365 report, matched automatically by exact saved package ID or through an existing administrator-reviewed association. This is not a live or all-channel activity measure." },
+] as const;
+
+export const agentManagementOptions = [
+  { value: "all", label: "Any management" },
+  { value: "user_managed", label: "User managed agents" },
+  { value: "organization_managed", label: "Organization managed agents" },
+  { value: "unknown", label: "Unknown management" },
+] as const;
+
+export const agentRelevanceOptions = [
+  { value: "all", label: "Any organization/usage evidence" },
+  { value: "organization", label: "Organization-related agents", description: "Organization-created or shared agents, Microsoft agents, and agents with installation or reported usage. This does not establish end-user access." },
   { value: "unknown", label: "No organization or usage evidence", description: "Agents without known organizational origin, installation or linked usage. This does not establish end-user access." },
 ] as const;
 

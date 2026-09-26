@@ -9,6 +9,19 @@ param tenantId string
 @description('Exact existing Microsoft Entra application/client ID. Registration changes are verified outside ARM.')
 param appRegistrationClientId string
 
+@description('Explicit accepted username domains for the legacy single-tenant profile. Ignored by the runtime when a registry is provided.')
+param tenantDomains array = []
+
+@description('Optional display name for the legacy single-tenant profile.')
+param tenantDisplayName string = ''
+
+@description('Optional prepared registry secret. Its JSON value never enters template parameters, settings or receipts; App Service resolves the native reference.')
+@allowed(['', 'agent-control-tenants-json'])
+param tenantRegistrySecretName string = ''
+
+@description('Immutable version of the optional tenant registry secret. Required when tenantRegistrySecretName is set.')
+param tenantRegistrySecretVersion string = ''
+
 @description('Exact resource names approved by the operator.')
 param appServicePlanName string
 param appServiceName string
@@ -23,7 +36,7 @@ param keyVaultSubscriptionId string
 param keyVaultResourceGroupName string
 param keyVaultName string
 
-@description('Selected immutable versions for all six prepared secrets. Versions are non-secret receipt evidence.')
+@description('Selected immutable versions for the six base secrets. Versions are non-secret receipt evidence.')
 param tenantIdSecretVersion string
 param clientIdSecretVersion string
 param clientSecretVersion string
@@ -58,35 +71,39 @@ var secretNames = {
   postgresAdminPassword: 'agent-control-postgres-admin-password'
   postgresAppPassword: 'agent-control-postgres-app-password'
 }
-var runtimeSecrets = [
+var runtimeSecrets = concat([
   {
     name: secretNames.tenantId
+    settingName: 'TENANT_ID'
     version: tenantIdSecretVersion
   }
   {
     name: secretNames.clientId
+    settingName: 'CLIENT_ID'
     version: clientIdSecretVersion
   }
   {
     name: secretNames.clientSecret
+    settingName: 'CLIENT_SECRET'
     version: clientSecretVersion
   }
   {
     name: secretNames.sessionSecret
+    settingName: 'SESSION_SECRET'
     version: sessionSecretVersion
   }
   {
     name: secretNames.postgresAppPassword
+    settingName: 'PGPASSWORD'
     version: postgresAppPasswordSecretVersion
   }
-]
-var runtimeSecretSettingNames = [
-  'TENANT_ID'
-  'CLIENT_ID'
-  'CLIENT_SECRET'
-  'SESSION_SECRET'
-  'PGPASSWORD'
-]
+], empty(tenantRegistrySecretName) ? [] : [
+  {
+    name: tenantRegistrySecretName
+    settingName: 'TENANTS_JSON'
+    version: tenantRegistrySecretVersion
+  }
+])
 var commonTags = union(tags, {
   app: 'agent-control'
   topology: 'single-app-managed-postgresql'
@@ -94,8 +111,8 @@ var commonTags = union(tags, {
   approvedApplication: appRegistrationClientId
 })
 var keyVaultUri = 'https://${keyVaultName}${environment().suffixes.keyvaultDns}/'
-var runtimeAppSettings = [for (secret, index) in runtimeSecrets: {
-  name: runtimeSecretSettingNames[index]
+var runtimeAppSettings = [for secret in runtimeSecrets: {
+  name: secret.settingName
   value: '@Microsoft.KeyVault(SecretUri=${keyVaultUri}secrets/${secret.name}/${secret.version})'
 }]
 
@@ -184,6 +201,10 @@ resource appService 'Microsoft.Web/sites@2024-11-01' = {
           value: redirectUri
         }
         {
+          name: 'TENANT_DOMAINS'
+          value: join(tenantDomains, ',')
+        }
+        {
           name: 'PGHOST'
           value: postgres.outputs.fullyQualifiedDomainName
         }
@@ -210,6 +231,11 @@ resource appService 'Microsoft.Web/sites@2024-11-01' = {
         {
           name: 'MAINTENANCE_MODE'
           value: 'true'
+        }
+      ], empty(tenantDisplayName) ? [] : [
+        {
+          name: 'TENANT_DISPLAY_NAME'
+          value: tenantDisplayName
         }
       ], runtimeAppSettings)
     }

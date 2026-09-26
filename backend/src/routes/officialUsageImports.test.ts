@@ -10,6 +10,8 @@ import { createOfficialUsageRouter } from "./officialUsage.js";
 const mocks = vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "official-usage-import-route-test-secret";
   return { stage: vi.fn(), acceptBundle: vi.fn(), discardStaging: vi.fn() };
 });
@@ -37,11 +39,12 @@ beforeAll(async () => {
   app.use(session({ secret: "official-usage-import-route-test-secret", resave: false, saveUninitialized: false }));
   app.use((request, _response, next) => {
     request.session.accountId = "import-administrator";
-    request.session.tenantId = config.tenantId!;
+    request.session.tenantId = config.tenants[0].tenantId!;
+    request.session.clientId = config.tenants[0].clientId;
     request.session.csrfToken = "import-csrf";
     request.session.rolesValidatedAt = Date.now();
     request.session.user = {
-      tenantId: config.tenantId!, homeAccountId: "import-administrator", username: "admin@example.invalid",
+      tenantId: config.tenants[0].tenantId!, homeAccountId: "import-administrator", username: "admin@example.invalid",
       displayName: "Administrator", roles: ["AgentControl.Admin"],
     };
     next();
@@ -80,7 +83,7 @@ describe("official usage import route contracts", () => {
     const response = await upload(value === undefined ? [] : [["rejectDuplicateKind", value]]);
     expect(response.status).toBe(201);
     expect(mocks.stage).toHaveBeenCalledWith({
-      tenantId: config.tenantId, principalId: "import-administrator",
+      tenantId: config.tenants[0].tenantId, principalId: "import-administrator",
     }, expect.objectContaining({ bundleId, rejectDuplicateKind: expected, report: expect.objectContaining({ kind: "agents" }) }));
   });
 

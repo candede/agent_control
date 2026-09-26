@@ -10,6 +10,8 @@ import { unifiedAgentsRouter } from "./unifiedAgents.js";
 const mocks = vi.hoisted(() => {
   process.env.TENANT_ID = "11111111-1111-4111-8111-111111111111";
   process.env.CLIENT_ID = "22222222-2222-4222-8222-222222222222";
+  process.env.CLIENT_SECRET = "synthetic-route-test-secret";
+  process.env.TENANT_DOMAINS = "example.invalid";
   process.env.SESSION_SECRET = "agent-people-fixture-secret";
   return { list: vi.fn(), generation: vi.fn(), resolve: vi.fn(), project: vi.fn(), requireAvailable: vi.fn() };
 });
@@ -39,9 +41,10 @@ beforeAll(async () => {
   app.use((request, _response, next) => {
     const role = request.get("x-test-role");
     if (role) {
-      const tenantId = request.get("x-test-tenant") ?? config.tenantId!;
+      const tenantId = request.get("x-test-tenant") ?? config.tenants[0].tenantId!;
       request.session.accountId = "reader";
       request.session.tenantId = tenantId;
+      request.session.clientId = config.tenants[0].clientId;
       request.session.rolesValidatedAt = Date.now();
       request.session.csrfToken = "fixture-csrf";
       request.session.user = { tenantId, homeAccountId: "reader", username: "reader@example.invalid", displayName: "Reader",
@@ -56,7 +59,7 @@ beforeAll(async () => {
   });
 });
 beforeEach(async () => {
-  await activateAccountSession(config.tenantId!, "reader", async () => {});
+  await activateAccountSession(config.tenants[0].tenantId!, "reader", async () => {});
   vi.resetAllMocks();
   mocks.generation.mockResolvedValue("initial");
   mocks.list.mockResolvedValue({ count: 1, value: [record] });
@@ -71,11 +74,11 @@ afterAll(async () => {
 describe("persisted agent people endpoint", () => {
   it.each(["viewer", "admin"])("resolves only the saved record's exact user IDs under the %s account scope", async role => {
     expect(await request({ recordId, force: true }, { role })).toEqual({ status: 200, body: { people, changed: true } });
-    const scope = { tenantId: config.tenantId, principalId: "reader" };
+    const scope = { tenantId: config.tenants[0].tenantId, principalId: "reader" };
     expect(mocks.generation).toHaveBeenCalledWith(scope);
     expect(mocks.generation.mock.invocationCallOrder[0]).toBeLessThan(mocks.list.mock.invocationCallOrder[0]);
     expect(mocks.list).toHaveBeenCalledExactlyOnceWith(scope, { recordId, limit: 1 });
-    expect(mocks.resolve).toHaveBeenCalledWith(expect.objectContaining({ tenantId: config.tenantId, homeAccountId: "reader" }),
+    expect(mocks.resolve).toHaveBeenCalledWith(expect.objectContaining({ tenantId: config.tenants[0].tenantId, homeAccountId: "reader" }),
       [creatorId, ownerId], { generation: "initial", force: true, signal: expect.any(AbortSignal) });
     expect(mocks.project).toHaveBeenCalledWith(scope, [record]);
   });
@@ -109,8 +112,8 @@ describe("persisted agent people endpoint", () => {
   it.each(["generation", "inventory", "projection"] as const)(
     "rejects a superseded account session during the %s read", async phase => {
       const replaceSession = async () => {
-        await revokeAccountSessionMutations(config.tenantId!, "reader", async () => {});
-        await activateAccountSession(config.tenantId!, "reader", async () => {});
+        await revokeAccountSessionMutations(config.tenants[0].tenantId!, "reader", async () => {});
+        await activateAccountSession(config.tenants[0].tenantId!, "reader", async () => {});
       };
       if (phase === "generation") mocks.generation.mockImplementationOnce(async () => {
         await replaceSession();

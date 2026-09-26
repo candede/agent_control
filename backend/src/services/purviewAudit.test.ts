@@ -308,7 +308,7 @@ describe("Purview audit worker", () => {
     expect(fixture.dependencies.getQuery).toHaveBeenCalledOnce();
     expect(fixture.dependencies.listRecords).toHaveBeenCalledOnce();
     expect(fixture.current().providerStatus).toBe("succeeded");
-    expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.homeAccountId, "purview.audit.search.delegated");
+    expect(fixture.dependencies.delegatedToken).toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "purview.audit.search.delegated");
     expect(fixture.dependencies.recordQualificationEvidence).toHaveBeenCalledWith(
       "purview.audit.search.delegated",
       user,

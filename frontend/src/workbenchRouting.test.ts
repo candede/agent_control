@@ -27,19 +27,19 @@ describe("workbench routing", () => {
     expect(parseUsersRoute("view=responsibility&person=Alice")).toMatchObject({ view: "responsibility", personId: "Alice" });
     expect(usersRouteSearch({ ...route, personId: "Alice" }).get("person")).toBe("invalid");
   });
-  it.each(["available", "unavailable", "availability_unknown"] as const)("round trips the %s end-user access filter", agentView => {
-    const state = { ...parseAgentRoute(""), agentView };
+  it.each(["available", "unavailable", "unknown"] as const)("round trips the %s end-user access filter", endUserAccess => {
+    const state = { ...parseAgentRoute(""), endUserAccess };
     const query = agentRouteSearch(state);
-    expect(query.get("show")).toBe(agentView);
-    expect(parseAgentRoute(query.toString()).agentView).toBe(agentView);
+    expect(query.get("access")).toBe(endUserAccess);
+    expect(parseAgentRoute(query.toString()).endUserAccess).toBe(endUserAccess);
   });
 
   it.each(["catalog", "power_platform_only", "all"] as const)("round trips the %s inventory independently of access filters", inventoryScope => {
-    const state = { ...parseAgentRoute(""), inventoryScope, agentView: "available" as const };
+    const state = { ...parseAgentRoute(""), inventoryScope, endUserAccess: "available" as const };
     const query = agentRouteSearch(state);
     expect(query.get("inventory")).toBe(inventoryScope === "catalog" ? null : inventoryScope);
-    expect(query.get("show")).toBe("available");
-    expect(parseAgentRoute(query.toString())).toMatchObject({ inventoryScope, agentView: "available" });
+    expect(query.get("access")).toBe("available");
+    expect(parseAgentRoute(query.toString())).toMatchObject({ inventoryScope, endUserAccess: "available" });
     expect(parseAgentRoute("inventory=invalid").inventoryScope).toBe("catalog");
     expect(parseAgentRoute("").inventoryScope).toBe("catalog");
   });
@@ -89,6 +89,7 @@ describe("workbench routing", () => {
     const query = agentRouteSearch({
       inventoryScope: "catalog",
       agentView: "all",
+      endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "  owned bot  ",
       status: "blocked",
       publisher: "all",
@@ -112,6 +113,7 @@ describe("workbench routing", () => {
     expect(parseAgentRoute(query.toString())).toEqual({
       inventoryScope: "catalog",
       agentView: "all",
+      endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "owned bot",
       status: "blocked",
       publisher: "all",
@@ -153,6 +155,7 @@ describe("workbench routing", () => {
     const query = agentRouteSearch({
       inventoryScope: "catalog",
       agentView: "all",
+      endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "",
       status: "all",
       publisher: "all",
@@ -291,15 +294,31 @@ describe("workbench routing", () => {
       .toEqual({ view: "manage", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
   });
 
-  it("round trips organization views and all supported table sorts without changing old links", () => {
-    for (const agentView of ["all", "organization", "used", "unknown"] as const) {
+  it("round trips quick views and combined evidence filters with all supported table sorts", () => {
+    for (const agentView of ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const) {
       for (const sortBy of ["hosts", "responses", "activeUsers", "lastActivity", "owner", "publisher"] as const) {
-        const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a"), agentView, sortBy, sortDirection: "desc" as const };
+        const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a&access=available&usage=used&management=organization_managed&relevance=organization"), agentView, sortBy, sortDirection: "desc" as const };
         expect(parseAgentRoute(agentRouteSearch(route).toString())).toEqual(route);
       }
     }
     expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ agentView: "all", sortBy: "displayName" });
     expect(agentRouteSearch(parseAgentRoute("")).has("show")).toBe(false);
+  });
+
+  it.each([
+    ["available", "access", "available"], ["unavailable", "access", "unavailable"],
+    ["availability_unknown", "access", "unknown"], ["used", "usage", "used"],
+    ["organization", "relevance", "organization"], ["unknown", "relevance", "unknown"],
+  ])("migrates legacy show=%s without broadening its result", (legacy, key, value) => {
+    const route = parseAgentRoute(`show=${legacy}&inventory=power_platform_only&q=policy&page=3`);
+    const query = agentRouteSearch(route);
+    expect(route.agentView).toBe("all");
+    expect(query.has("show")).toBe(false);
+    expect(query.get(key)).toBe(value);
+    expect(query.get("inventory")).toBe("power_platform_only");
+    expect(query.get("q")).toBe("policy");
+    expect(query.get("page")).toBe("3");
+    expect(parseAgentRoute(query.toString())).toEqual(route);
   });
 
   it("round trips the unified agent inventory export audit action", () => {

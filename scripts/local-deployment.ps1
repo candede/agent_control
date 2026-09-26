@@ -1,10 +1,12 @@
+. (Join-Path $PSScriptRoot 'tenant-deployment.ps1')
+
 function Invoke-DockerCommand {
     param([string[]]$Arguments, [switch]$Capture)
     $savedEnvironment = @{}
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
@@ -46,8 +48,27 @@ function Read-LocalSettings {
     param([string]$State)
     $file = Join-Path $State 'settings.json'
     if (-not (Test-Path -LiteralPath $file)) { return [ordered]@{} }
-    $settings = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable
-    if ($settings -isnot [Collections.IDictionary]) { throw 'Project settings must be a JSON object. Restore settings.json before continuing.' }
+    $document = $null
+    try {
+        $json = [IO.File]::ReadAllText($file)
+        $document = [Text.Json.JsonDocument]::Parse($json)
+        $settings = ConvertFrom-Json -InputObject $json -AsHashtable
+        if ($settings -isnot [Collections.IDictionary] -or $document.RootElement.ValueKind -ne [Text.Json.JsonValueKind]::Object) { throw 'Invalid settings object.' }
+        # PowerShell otherwise coerces ISO-looking display names into dates.
+        $value = [Text.Json.JsonElement]::new()
+        if ($document.RootElement.TryGetProperty('tenantDisplayName',[ref]$value) -and $value.ValueKind -eq [Text.Json.JsonValueKind]::String) {
+            $settings.tenantDisplayName = $value.GetString()
+        }
+        if ($settings.tenants -is [array] -and $document.RootElement.TryGetProperty('tenants',[ref]$value) -and $value.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+            for ($index = 0; $index -lt $settings.tenants.Count; $index++) {
+                $name = [Text.Json.JsonElement]::new()
+                $entry = $value[$index]
+                if ($entry.ValueKind -eq [Text.Json.JsonValueKind]::Object -and $entry.TryGetProperty('displayName',[ref]$name) -and
+                    $name.ValueKind -eq [Text.Json.JsonValueKind]::String) { $settings.tenants[$index].displayName = $name.GetString() }
+            }
+        }
+    } catch { throw 'Project settings must be a valid JSON object. Restore settings.json before continuing.' }
+    finally { if ($document) { $document.Dispose() } }
     if ($settings.Contains('port') -and ($settings.port -isnot [long] -and $settings.port -isnot [int] -or $settings.port -lt 1024 -or $settings.port -gt 65535)) {
         throw 'Saved project port must be an integer from 1024 to 65535. Repair settings.json before continuing.'
     }
@@ -106,7 +127,11 @@ function Show-LocalRegistrationGuidance {
 
 Registered app permissions and setup
 ===================================
-Use an approved single-tenant Entra Web application.
+Use an approved Entra Web application for each configured tenant.
+Each registration can remain single-tenant; all use this deployment's callback.
+Enter every accepted username domain explicitly. Domains are exact, not wildcard
+or suffix matches. No tenant discovery or fallback is performed.
+Users enter their username; tenant profiles are managed only by the operator.
 API permissions and tenant administrator consent are prerequisites.
 Configure them before admitting users; the app does not request or grant permissions.
 
@@ -210,12 +235,64 @@ function Read-LocalClientSecret {
         $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
         $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer).Trim()
         if ([string]::IsNullOrWhiteSpace($value) -and ($Current -or $AllowEmpty)) { return $Current }
-        if ([string]::IsNullOrWhiteSpace($value) -or $value -match '[\r\n]') { throw 'Configuration requires a non-empty, single-line client secret. Rerun start or edit-config in an interactive terminal to complete setup.' }
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -match '[\r\n\0]') { throw 'Configuration requires a non-empty, single-line client secret. Rerun start or edit-config in an interactive terminal to complete setup.' }
         return $value
     } finally {
         if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
         if ($secure) { $secure.Dispose() }
     }
+}
+
+function Read-LocalTenantDomains {
+    param([string[]]$Current,[switch]$AllowEmpty)
+    $prompt = 'Accepted username domains (comma-separated, exact domains only)'
+    if ($Current.Count) { $prompt += " [$($Current -join ','); Enter to keep]" }
+    while ($true) {
+        $value = [string](Read-Host $prompt)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            if ($Current.Count) { return ,@($Current) }
+            if ($AllowEmpty) { return ,@() }
+            throw 'Configuration requires accepted sign-in domains. Rerun start or edit-config to complete setup; tenant discovery is not supported.'
+        }
+        $domains = @($value -split ',' | ForEach-Object { ConvertTo-DeploymentDomain $_ })
+        if ($domains.Count -eq ($value -split ',').Count -and -not @($domains | Where-Object { -not $_ }).Count -and
+            @($domains | Sort-Object -Unique).Count -eq $domains.Count) { return ,$domains }
+        Write-Warning 'Enter unique exact domains, such as contoso.com,contoso.onmicrosoft.com; no usernames, URLs or wildcards.'
+    }
+}
+
+function Read-LocalTenantProfile {
+    param($Current,[switch]$Edit,[switch]$AllowIncomplete)
+    $profile = [ordered]@{
+        tenantId = [string]$Current.tenantId
+        clientId = [string]$Current.clientId
+        clientSecret = [string]$Current.clientSecret
+        domains = @($Current.domains)
+    }
+    if ($Current.displayName) { $profile.displayName = [string]$Current.displayName }
+    if ($Edit -or -not $profile.tenantId) { $profile.tenantId = Read-LocalIdentifier 'Entra tenant ID (directory GUID)' $profile.tenantId -AllowEmpty:$AllowIncomplete }
+    if ($Edit -or -not $profile.clientId) { $profile.clientId = Read-LocalIdentifier 'Entra client ID (application GUID)' $profile.clientId -AllowEmpty:$AllowIncomplete }
+    if ($Edit -or -not $profile.clientSecret) { $profile.clientSecret = Read-LocalClientSecret $profile.clientSecret -AllowEmpty:$AllowIncomplete }
+    if ($Edit -or -not $profile.domains.Count) { $profile.domains = Read-LocalTenantDomains $profile.domains -AllowEmpty:$AllowIncomplete }
+    if ($Edit) {
+        while ($true) {
+            $value = [string](Read-Host "Tenant display name [$($profile.displayName); Enter to keep; '-' to clear]")
+            if ([string]::IsNullOrWhiteSpace($value)) { break }
+            if ($value.Trim() -ceq '-') { $profile.Remove('displayName'); break }
+            if ($value.Length -le 128 -and $value -notmatch '[\x00-\x1f\x7f]') { $profile.displayName = $value.Trim(); break }
+            Write-Warning 'Use at most 128 printable characters.'
+        }
+    }
+    return $profile
+}
+
+function Get-LocalTenantMetadata {
+    param([object[]]$Profiles)
+    return ,@(foreach ($profile in $Profiles) {
+        $metadata = [ordered]@{ tenantId = $profile.tenantId; clientId = $profile.clientId; domains = @($profile.domains) }
+        if ($profile.displayName) { $metadata.displayName = $profile.displayName }
+        $metadata
+    })
 }
 
 function Read-LocalPort {
@@ -233,7 +310,14 @@ function Read-LocalPort {
 function Write-LocalText {
     param([string]$Path,[string]$Value)
     if (-not (Test-Path -LiteralPath $Path) -or [IO.File]::ReadAllText($Path) -cne $Value) {
-        [IO.File]::WriteAllText($Path,$Value)
+        $pending = "$Path.pending-$([Guid]::NewGuid().ToString('N'))"
+        try {
+            [IO.File]::WriteAllText($pending,$Value)
+            Protect-LocalPath $pending
+            [IO.File]::Move($pending,$Path,$true)
+        } finally {
+            if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force }
+        }
     }
     Protect-LocalPath $Path
 }
@@ -251,50 +335,119 @@ function Initialize-LocalState {
         }
     }
     $settings = Read-LocalSettings $state
-    $tenantId = ([string]$settings.tenantId).Trim()
-    $clientId = ([string]$settings.clientId).Trim()
-    $previousTenantId = $tenantId
-    $previousClientId = $clientId
+    $originalSettings = $settings | ConvertTo-Json -Depth 20 -Compress
     $port = if ($settings.Contains('port')) { [int]$settings.port } else { 0 }
     $publicUrl = [string]$settings.publicUrl
     $settingsFile = Join-Path $state 'settings.json'
-    foreach ($identifier in @($tenantId,$clientId)) { if ($identifier -and $identifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings; use a separate project for another tenant.' } }
+    $registryFile = Join-Path $secretDirectory 'tenants.json'
+    $hasRegistry = Test-Path -LiteralPath $registryFile -PathType Leaf
     $clientFile = Join-Path $secretDirectory 'client-secret'
-    $clientSecret = if (Test-Path -LiteralPath $clientFile) { [IO.File]::ReadAllText($clientFile).Trim() } else { '' }
-    $previousSecret = $clientSecret
-    $missingClientSecret = [string]::IsNullOrWhiteSpace($clientSecret)
-    if ($Edit -or ($Onboard -and (-not $tenantId -or -not $clientId -or $missingClientSecret -or -not $port))) {
+    if ($hasRegistry) {
+        $profiles = ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText($registryFile))
+        foreach ($name in @('tenantId','clientId')) {
+            $savedIdentifier = ([string]$settings.$name).Trim()
+            if ($savedIdentifier -and $savedIdentifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings.' }
+        }
+        if ($settings.tenantId -and -not @($profiles | Where-Object { $_.tenantId -ieq ([string]$settings.tenantId).Trim() -and $_.clientId -ieq ([string]$settings.clientId).Trim() }).Count) {
+            throw 'Protected registry does not preserve the saved legacy tenant/application. Restore matching configuration; no tenant was discarded.'
+        }
+        if ($settings.Contains('tenants') -and
+            (ConvertTo-Json -InputObject (Get-LocalTenantMetadata $profiles) -Depth 20 -Compress) -cne
+            (ConvertTo-Json -InputObject (Get-LocalTenantMetadata $settings.tenants) -Depth 20 -Compress)) {
+            throw 'Saved tenant metadata and protected registry disagree. Restore matching project configuration before continuing; no tenant was discarded.'
+        }
+    } else {
+        if ($settings.Contains('tenants')) { throw 'Protected tenant registry is missing. Restore secrets/tenants.json; saved tenants must not be discarded or regenerated.' }
+        $legacy = [ordered]@{
+            tenantId = ([string]$settings.tenantId).Trim()
+            clientId = ([string]$settings.clientId).Trim()
+            clientSecret = $(if (Test-Path -LiteralPath $clientFile) { [IO.File]::ReadAllText($clientFile).Trim() } else { '' })
+            domains = @()
+        }
+        if ($settings.Contains('tenantDomains')) {
+            if ($settings.tenantDomains -isnot [array]) { throw 'Saved tenantDomains must be an array of exact accepted domains.' }
+            $legacy.domains = @($settings.tenantDomains | ForEach-Object { ConvertTo-DeploymentDomain $_ })
+            if ($legacy.domains.Count -ne $settings.tenantDomains.Count -or @($legacy.domains | Where-Object { -not $_ }).Count -or
+                @($legacy.domains | Sort-Object -Unique).Count -ne $legacy.domains.Count) {
+                throw 'Saved tenantDomains must contain unique exact accepted domains.'
+            }
+        }
+        if ($settings.Contains('tenantDisplayName')) {
+            if ($settings.tenantDisplayName -isnot [string] -or [string]::IsNullOrWhiteSpace($settings.tenantDisplayName) -or
+                $settings.tenantDisplayName.Length -gt 128 -or $settings.tenantDisplayName -match '[\x00-\x1f\x7f]') {
+                throw 'Saved tenantDisplayName must contain 1 to 128 printable characters.'
+            }
+            $legacy.displayName = $settings.tenantDisplayName
+        }
+        foreach ($identifier in @($legacy.tenantId,$legacy.clientId)) {
+            if ($identifier -and $identifier -notmatch '^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$') { throw 'Saved tenant and client identifiers must be GUIDs. Restore the project settings.' }
+        }
+        $profiles = @($legacy)
+    }
+    $previousProfiles = ConvertTo-Json -InputObject $profiles -Depth 20 -Compress
+    $previousMetadata = Get-LocalTenantMetadata $profiles
+    if ($Edit -or ($Onboard -and (-not $hasRegistry -or -not $port))) {
         Write-Host "Configure local project '$($Context.Project)'. Press Enter to keep saved values; secret input is hidden."
         Show-LocalRegistrationGuidance
-        if ($Edit -or -not $tenantId) { $tenantId = Read-LocalIdentifier 'Entra tenant ID (directory GUID)' $tenantId -AllowEmpty:$Edit }
-        if ($Edit -or -not $clientId) { $clientId = Read-LocalIdentifier 'Entra client ID (application GUID)' $clientId -AllowEmpty:$Edit }
-        if ($Edit -or $missingClientSecret) { $clientSecret = Read-LocalClientSecret $clientSecret -AllowEmpty:$Edit }
+        $profiles = @(foreach ($profile in $profiles) {
+            Read-LocalTenantProfile $profile -Edit:$Edit -AllowIncomplete:($Edit -and -not $hasRegistry)
+        })
+        if ($Edit) {
+            while ($true) {
+                $add = [string](Read-Host 'Add another tenant? [y/N]')
+                if ([string]::IsNullOrWhiteSpace($add) -or $add.Trim() -ieq 'n') { break }
+                if ($add.Trim() -ine 'y') { Write-Warning 'Enter y to add a tenant, or Enter to continue.'; continue }
+                $profiles += Read-LocalTenantProfile @{ domains = @() } -Edit
+            }
+        }
         if ($Edit -or -not $port) { $port = Read-LocalPort $port }
         if ($Edit) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
         $origin = if ($publicUrl) { $publicUrl } else { "http://localhost:$port" }
-        Write-Host "Register $origin/api/auth/callback as the application's Web reply URL. Begin sign-in at $origin."
+        Write-Host "Register $origin/api/auth/callback as every configured application's Web reply URL. Begin sign-in at $origin."
     }
     if (-not $port) { throw 'Project port is missing. Run start or edit-config to complete the project wizard.' }
-    if ($Edit -and $ExistingVolume -and $previousTenantId -and $previousTenantId -ine $tenantId) {
-        throw 'This project has retained data for its saved tenant. Use a new project for another tenant; no configuration changes were saved.'
+    if ($Edit -and $ExistingVolume) {
+        for ($index = 0; $index -lt $previousMetadata.Count; $index++) {
+            if ($previousMetadata[$index].tenantId -and $previousMetadata[$index].tenantId -ine $profiles[$index].tenantId) {
+                throw 'This profile has retained data for its saved tenant. Add another tenant instead of replacing its ID; no configuration changes were saved.'
+            }
+        }
     }
-    $tenantChanged = $previousTenantId -cne $tenantId
-    $clientChanged = $previousClientId -cne $clientId
-    $publicUrlChanged = [string]$settings.publicUrl -cne $publicUrl
-    $settingsChanged = $tenantChanged -or $clientChanged -or $settings.port -ne $port -or $publicUrlChanged
-    $secretChanged = $previousSecret -cne $clientSecret
+    $complete = @($profiles | Where-Object { -not $_.tenantId -or -not $_.clientId -or -not $_.clientSecret -or -not $_.domains.Count }).Count -eq 0
+    if ($complete -or $Onboard -or $hasRegistry -or $profiles.Count -gt 1) { Assert-DeploymentTenantProfiles $profiles }
+    $metadata = Get-LocalTenantMetadata $profiles
+    $registryChanged = $complete -and (-not $hasRegistry -or (ConvertTo-Json -InputObject $profiles -Depth 20 -Compress) -cne $previousProfiles)
+    $identityChanged = $false
+    if ($complete) {
+        $oldIdentity = @($previousMetadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')" }) -join "`n"
+        $newIdentity = @($metadata | ForEach-Object { "$($_.tenantId)|$($_.clientId)|$($_.domains -join ',')" }) -join "`n"
+        $identityChanged = $oldIdentity -ine $newIdentity
+        $settings.tenants = $metadata
+        $settings.Remove('tenantId')
+        $settings.Remove('clientId')
+        $settings.Remove('tenantDomains')
+        $settings.Remove('tenantDisplayName')
+    } elseif ($Edit) {
+        foreach ($name in @('tenantId','clientId')) {
+            if ($profiles[0].$name -and $profiles[0].$name -cne ([string]$settings.$name).Trim()) { $settings[$name] = $profiles[0].$name }
+        }
+        if ($profiles[0].domains.Count) { $settings.tenantDomains = @($profiles[0].domains) }
+        if ($profiles[0].displayName) { $settings.tenantDisplayName = $profiles[0].displayName }
+        else { $settings.Remove('tenantDisplayName') }
+    }
+    $legacySecretChanged = -not $complete -and $profiles[0].clientSecret -and
+        (-not (Test-Path -LiteralPath $clientFile) -or [IO.File]::ReadAllText($clientFile).Trim() -cne $profiles[0].clientSecret)
     if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
-    if ($Edit -and ($settingsChanged -or $secretChanged) -and $ExistingVolume) {
+    $settings.port = $port
+    if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
+    $settingsChanged = ($settings | ConvertTo-Json -Depth 20 -Compress) -cne $originalSettings
+    if ($Edit -and ($settingsChanged -or $registryChanged -or $legacySecretChanged) -and $ExistingVolume) {
         if (-not (Test-Path -LiteralPath (Join-Path $state 'compose.env'))) { throw 'Existing project compose.env is missing. Run start to recover it before editing configuration.' }
         $controlDirectory = Join-Path $state 'control'
         [IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
         Protect-LocalPath $controlDirectory -Directory
         Write-LocalText (Join-Path $controlDirectory 'maintenance') 'maintenance'
         Invoke-DockerCommand ($Context.Compose + @('stop','--timeout','130','app'))
-        if ($previousClientId -and $previousClientId -ine $clientId) {
-            Write-LocalText (Join-Path $controlDirectory 'reauthenticate') 'application-changed'
-            Write-Host 'Application ID changed. Existing sessions will be cleared on the next start; users must sign in again.'
-        }
     }
     foreach ($directory in @($state,$secretDirectory,(Join-Path $state 'control'),(Join-Path $state 'backups'))) {
         [IO.Directory]::CreateDirectory($directory) | Out-Null
@@ -305,33 +458,33 @@ function Initialize-LocalState {
         if (-not (Test-Path -LiteralPath $file)) { [IO.File]::WriteAllText($file,[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))) }
         Protect-LocalPath $file
     }
-    if ($secretChanged -or (-not $Edit -and -not (Test-Path -LiteralPath $clientFile))) {
-        Write-LocalText $clientFile $clientSecret
-    }
+    if ($registryChanged) { Write-LocalText $registryFile (ConvertTo-Json -InputObject $profiles -Depth 20) }
+    if ($hasRegistry -or $registryChanged) { Protect-LocalPath $registryFile }
+    if ($legacySecretChanged) { Write-LocalText $clientFile $profiles[0].clientSecret }
     if (Test-Path -LiteralPath $clientFile) { Protect-LocalPath $clientFile }
+    if ($ExistingVolume -and $identityChanged) {
+        Write-LocalText (Join-Path $state 'control/reauthenticate') 'tenant-configuration-changed'
+        Write-Host 'Tenant/application/domain configuration changed. Existing sessions will be cleared on the next start; users must sign in again.'
+    }
     $userId = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
     $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
     if ($settingsChanged -or -not (Test-Path -LiteralPath $settingsFile)) {
-        $settings.port = $port
-        if ($tenantChanged) { $settings.tenantId = $tenantId }
-        if ($clientChanged) { $settings.clientId = $clientId }
-        if ($publicUrlChanged) { $settings.publicUrl = $publicUrl }
         Write-LocalText $settingsFile ($settings | ConvertTo-Json -Depth 20)
     }
     $Context.Port = $port
     $Context.Url = "http://localhost:$port"
     $Context.PublicUrl = if ($publicUrl) { $publicUrl } else { $Context.Url }
     $trustProxy = if ($publicUrl) { '1' } else { '0' }
-    $lines = @("LOCAL_STATE_DIR='$state'","APP_PORT=$port","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$($Context.Image)","TENANT_ID=$tenantId","CLIENT_ID=$clientId",
+    $lines = @("LOCAL_STATE_DIR='$state'","APP_PORT=$port","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$($Context.Image)",
         "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy")
     Write-LocalText (Join-Path $state 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
     Protect-LocalPath $settingsFile
     Protect-LocalPath (Join-Path $state 'compose.env')
     if ($Edit) {
-        if ($settingsChanged -or $secretChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
+        if ($settingsChanged -or $registryChanged -or $legacySecretChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
         else { Write-Host 'Configuration unchanged.' }
-        if (-not $tenantId -or -not $clientId -or -not $clientSecret) {
-            Write-Host 'Identity configuration is incomplete. start will ask for the missing values before launching the app.'
+        if (-not $complete) {
+            Write-Host 'Identity configuration is incomplete. start will ask for missing credentials and accepted domains before launching the app.'
         }
     }
 }
@@ -345,7 +498,10 @@ function Assert-LocalPort {
 
 function Invoke-LocalOperator {
     param($Context,[string[]]$Command,[string]$BackupDirectory)
-    $arguments = @('run','--rm','--network',$Context.Network,'--mount',"type=bind,source=$($Context.State)/secrets,target=/run/secrets,readonly",'-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e','PGDATABASE=agentcontrol','-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app')
+    $arguments = @('run','--rm','--network',$Context.Network,
+        '--mount',"type=bind,source=$($Context.State)/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly",
+        '--mount',"type=bind,source=$($Context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",
+        '-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e','PGDATABASE=agentcontrol','-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app')
     if ($BackupDirectory) { $arguments += @('--mount',"type=bind,source=$BackupDirectory,target=/backups") }
     Invoke-DockerCommand ($arguments + @($Context.Operator) + $Command)
 }

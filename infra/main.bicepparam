@@ -3,6 +3,11 @@ using './main.bicep'
 param location = 'approved-region'
 param tenantId = '00000000-0000-0000-0000-000000000000'
 param appRegistrationClientId = '00000000-0000-0000-0000-000000000000'
+param tenantDomains = ['approved-tenant.onmicrosoft.com']
+param tenantDisplayName = ''
+// For registry mode, set both to the prepared secret name and immutable version; never paste its value.
+param tenantRegistrySecretName = ''
+param tenantRegistrySecretVersion = ''
 param appServicePlanName = 'approved-agent-control-plan'
 param appServiceName = 'approved-agent-control-app'
 param postgresServerName = 'approved-agent-control-postgres'

@@ -111,7 +111,7 @@ describe("quarantine canary authorization and evidence boundaries", () => {
     const current = { ...f.user, displayName: "Current Admin" };
     f.dependencies.revalidateUser.mockResolvedValue(current);
     await f.service.createApproval(f.user, approvalInput);
-    expect(f.dependencies.revalidateUser).toHaveBeenCalledExactlyOnceWith(f.user.homeAccountId);
+    expect(f.dependencies.revalidateUser).toHaveBeenCalledExactlyOnceWith(f.user.tenantId, f.user.homeAccountId);
     expect(f.createApproved).toHaveBeenCalledWith(current, expect.objectContaining({ target, authority }));
     expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
     expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();

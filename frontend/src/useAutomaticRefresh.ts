@@ -64,6 +64,7 @@ export function useAutomaticRefresh({
     online: navigator.onLine,
   }));
   const [observation, setObservation] = useState<Observation & { owner: string; authorization: string }>();
+  const [checkingRequest, setCheckingRequest] = useState<{ owner: string; authorization: string }>();
   const session = useRef<{
     owner: string;
     authorization: string;
@@ -125,6 +126,10 @@ export function useAutomaticRefresh({
       }
       const controller = new AbortController();
       inFlight.current = controller;
+      const request = { owner: principalKey, authorization: authorizationKey };
+      setCheckingRequest(request);
+      const finishChecking = () => setCheckingRequest(current => current === request ? undefined : current);
+      controller.signal.addEventListener("abort", finishChecking, { once: true });
       let timedOut = false;
       const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, requestTimeoutMs);
       requestTimeout = timeout;
@@ -168,6 +173,8 @@ export function useAutomaticRefresh({
           });
         }
       } finally {
+        controller.signal.removeEventListener("abort", finishChecking);
+        finishChecking();
         window.clearTimeout(timeout);
         requestTimeout = undefined;
         if (inFlight.current === controller) inFlight.current = undefined;
@@ -193,6 +200,8 @@ export function useAutomaticRefresh({
     && (observation.authorization === authorizationKey || observation.phase === "sign_in_required") ? observation : undefined;
   return {
     phase: status?.phase ?? (enabled ? "checking" as const : "ready" as const),
+    checking: enabled && !paused && availability.visible && availability.online
+      && checkingRequest?.owner === principalKey && checkingRequest.authorization === authorizationKey,
     message: status?.message,
     checkedAt: status?.checkedAt,
     paused,

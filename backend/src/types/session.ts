@@ -11,6 +11,10 @@ export type AuthenticatedUser = {
 
 export type AuthFlow = {
   kind: "login";
+  tenantId: string;
+  clientId: string;
+  username: string;
+  configurationFingerprint: string;
   state: string;
   nonce: string;
   codeVerifier: string;
@@ -22,6 +26,7 @@ export type AuthFlow = {
 declare module "express-session" {
   interface SessionData {
     tenantId?: string;
+    clientId?: string;
     authFlowHandle?: string;
     accountId?: string;
     user?: AuthenticatedUser;

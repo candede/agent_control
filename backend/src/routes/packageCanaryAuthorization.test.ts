@@ -11,7 +11,13 @@ import "./agents.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
-  secretValue: vi.fn((name: string) => name === "TENANT_ID" ? "11111111-1111-4111-8111-111111111111" : undefined),
+  secretValue: vi.fn((name: string) => {
+    const settings: Record<string, string> = {
+      TENANT_ID: "11111111-1111-4111-8111-111111111111", CLIENT_ID: "22222222-2222-4222-8222-222222222222",
+      CLIENT_SECRET: "synthetic-route-test-secret", TENANT_DOMAINS: "example.invalid",
+    };
+    return settings[name];
+  }),
   transaction: vi.fn(async () => { throw new Error("Unit tests must not access a database."); }),
 }));
 const handlers = vi.hoisted(() => new Map<string, RequestHandler>());
@@ -97,7 +103,7 @@ function fixture() {
         : { confirmed: true, restorationApprovalId: restoration.id },
     };
     new session.MemoryStore().createSession(req as Request, {
-      cookie: new session.Cookie(), tenantId: scope.tenantId, accountId: scope.principalId, user,
+      cookie: new session.Cookie(), tenantId: scope.tenantId, clientId: "22222222-2222-4222-8222-222222222222", accountId: scope.principalId, user,
     });
     const json = vi.fn<Response["json"]>();
     const response: Partial<Response> = { json, status: vi.fn().mockReturnThis() };

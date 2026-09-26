@@ -21,7 +21,7 @@ import {
   type UnifiedAgentInventoryPage,
   type UnifiedAgentRecord,
 } from "./api/client";
-import { storePackageSelection } from "./packageSelectionSession";
+import { restorePackageSelection, storePackageSelection } from "./packageSelectionSession";
 import * as savedQueries from "./savedQueries";
 import { mockNativeDialogs } from "./test/dialog";
 import { copilotUsageFixture } from "./test/copilotUsageFixture";
@@ -40,6 +40,10 @@ const viewer: SessionUser = {
   tenantId: "tenant-1",
   roles: ["AgentControl.Viewer"],
 };
+
+function activeBulkJobStorageKey(user: SessionUser = viewer) {
+  return `agent-control:active-bulk-job:v2:${encodeURIComponent(user.tenantId ?? "")}:${encodeURIComponent(user.homeAccountId)}`;
+}
 
 function automaticRefreshResponse(overrides: Partial<AutomaticRefreshResult> = {}): AutomaticRefreshResult {
   return {
@@ -319,6 +323,7 @@ describe("App session revalidation", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/agents");
     window.localStorage.clear();
+    window.sessionStorage.clear();
     resetInventoryFixtures();
   });
 
@@ -369,6 +374,108 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toEqual([]);
     expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")
       .every(([input]) => ["/api/data-sync/auto-refresh", "/api/capabilities/check"].includes(input))).toBe(true);
+  });
+
+  it.each(["source", "running details", "starting details"] as const)(
+    "clears the login refresh indicator after page reads settle while %s work continues on the server", async kind => {
+      vi.useFakeTimers();
+      window.history.replaceState({}, "", "/users");
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      const pending = deferredResponse();
+      const now = new Date().toISOString();
+      const state = automaticRefreshResponse(kind === "source" ? {
+        run: {
+          id: "automatic-run", automatic: true, mode: "incremental", status: "running",
+          startedAt: now, updatedAt: now, completedAt: null,
+          sources: [{ source: "users", status: "running", jobId: null, count: null,
+            lastSuccessAt: null, updatedAt: now, message: "", canRetry: false }],
+        },
+      } : {
+        detailJob: { id: "automatic-details", status: kind === "running details" ? "running" : "waiting_authorization", updatedAt: now },
+      });
+      let firstCheck = true;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        if (input === "/api/data-sync/auto-refresh") {
+          if (!firstCheck) return Response.json(state);
+          firstCheck = false;
+          return pending.promise;
+        }
+        if (input === "/api/copilot-usage/users") return Response.json(copilotUsageFixture);
+        return base(input, init);
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      await act(() => vi.advanceTimersByTimeAsync(500));
+      expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+      expect(screen.getByRole("status", { name: "Background refresh" })).toBeVisible();
+
+      await act(async () => pending.resolve(Response.json(state)));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(2);
+      fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await act(() => vi.advanceTimersByTimeAsync(500));
+      expect(screen.getByText("Automatic refresh · Refreshing in the background")).toBeVisible();
+      expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps Users interactive through a minute-check reload and shows only a subtle pending-read indicator", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/users");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let refreshing = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, users: refreshing ? "users-2" : "users-1" },
+      }));
+      if (input === "/api/copilot-usage/users") return refreshing ? pending.promise : Response.json(copilotUsageFixture);
+      if (input.startsWith("/api/agent-responsibility")) {
+        return Response.json(responsibilityFixture(new URL(input, "http://localhost").searchParams.get("objectId") ?? undefined));
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(500));
+    const summary = screen.getByLabelText("M365 Copilot license summary");
+    const original = summary.textContent;
+    const search = screen.getByRole("searchbox", { name: "Search users or agents" });
+    fireEvent.change(search, { target: { value: "Ben" } });
+    search.focus();
+    expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+    const reads = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/copilot-usage/users").length;
+    const before = reads();
+
+    refreshing = true;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(reads()).toBe(before + 1);
+    await act(() => vi.advanceTimersByTimeAsync(500));
+    expect(screen.getByRole("status", { name: "Background refresh" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "Background refresh" }).textContent).toBe("");
+    expect(summary).toHaveTextContent(original!);
+    expect(search).toHaveValue("Ben");
+    expect(search).toHaveFocus();
+    expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Users and adoption" })).toHaveAttribute("aria-busy", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Ben" }));
+    const dialog = screen.getByRole("dialog", { name: "Ben" });
+    const updated = structuredClone(copilotUsageFixture);
+    updated.users[1].importedUsage!.reportedResponsesReceived = 4;
+    await act(async () => pending.resolve(Response.json(updated)));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByRole("dialog", { name: "Ben" })).toBe(dialog);
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("4");
+    expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(reads()).toBe(before + 1);
   });
 
   it.each(["block", "unblock"] as const)("keeps selected package actions usable during a background inventory read and reports an actual %s denial", async action => {
@@ -705,9 +812,9 @@ describe("App session revalidation", () => {
     expect(setupReads).toBe(2);
     expect(firstSignal?.aborted).toBe(true);
     await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
-    await screen.findByRole("link", { name: "Sign in with Entra ID" });
+    await screen.findByRole("button", { name: "Sign in with Entra ID" });
     await act(async () => firstSetup.resolve(Response.json({ authConfigured: true })));
-    expect(screen.getByRole("link", { name: "Sign in with Entra ID" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeInTheDocument();
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     expect(firstSignal?.aborted).toBe(true);
     expect(transport.meCalls()).toBe(1);
@@ -1648,11 +1755,12 @@ describe("App session revalidation", () => {
     const download = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("organization");
-    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+    await userEvent.click(screen.getByRole("button", { name: "Filters, 1 active" }));
+    expect(screen.getByRole("combobox", { name: "Organization/usage evidence" })).toHaveValue("organization");
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("responses:desc");
     const unifiedRequests = () => transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?"));
-    expect(new URL(unifiedRequests().at(-1)![0], "http://localhost").searchParams.get("view")).toBe("organization");
+    expect(new URL(unifiedRequests().at(-1)![0], "http://localhost").searchParams.get("relevance")).toBe("organization");
     expect(new URL(agentListRequests(transport.fetchMock).at(-1)![0], "http://localhost").searchParams.get("sortBy")).toBe("displayName");
 
     await userEvent.click(screen.getByRole("button", { name: "Columns" }));
@@ -1668,7 +1776,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(download.filenames).toHaveLength(1));
     const exported = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")!;
     expect(JSON.parse(String(exported[1]?.body))).toMatchObject({
-      revision: unifiedRevision, query: { view: "organization", sortBy: "hosts", sortDirection: "asc" },
+      revision: unifiedRevision, query: { relevance: "organization", sortBy: "hosts", sortDirection: "asc" },
     });
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all"));
@@ -1676,6 +1784,49 @@ describe("App session revalidation", () => {
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("hosts:asc");
     expect(new URLSearchParams(window.location.search).has("show")).toBe(false);
     await waitFor(() => expect(new URL(unifiedRequests().at(-1)![0], "http://localhost").searchParams.has("view")).toBe(false));
+  });
+
+  it("combines party, access, usage and management across requests, exports and browser history", async () => {
+    window.history.replaceState({}, "", "/agents?show=third_party&access=available&usage=used&management=organization_managed");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const download = mockCsvDownload();
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    expect(screen.getByRole("button", { name: "Show available to end users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Show reported used agents" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
+    const lastQuery = () => new URL(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?")).at(-1)![0], "http://localhost").searchParams;
+    expect(Object.fromEntries(lastQuery())).toMatchObject({
+      view: "third_party", endUserAccess: "available", reportedUsage: "used", management: "organization_managed",
+    });
+    const exportButton = screen.getByRole("button", { name: "Export agent inventory CSV" });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await userEvent.click(exportButton);
+    await userEvent.click(await screen.findByRole("button", { name: /Download matching agents/ }));
+    await waitFor(() => expect(download.filenames).toHaveLength(1));
+    const exported = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")!;
+    expect(JSON.parse(String(exported[1]?.body))).toMatchObject({
+      revision: unifiedRevision, query: { view: "third_party", endUserAccess: "available", reportedUsage: "used", management: "organization_managed" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Remove reported usage filter" }));
+    await waitFor(() => expect(lastQuery().has("reportedUsage")).toBe(false));
+    expect(lastQuery().get("view")).toBe("third_party");
+    expect(lastQuery().get("management")).toBe("organization_managed");
+    await act(async () => {
+      window.history.pushState({}, "", "/agents?show=first_party&usage=used");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => expect(lastQuery().get("view")).toBe("first_party"));
+    expect(lastQuery().get("reportedUsage")).toBe("used");
+    expect(lastQuery().has("endUserAccess")).toBe(false);
+    expect(lastQuery().has("management")).toBe(false);
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("first_party");
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => expect(lastQuery().has("reportedUsage")).toBe(false));
+    expect(lastQuery().has("view")).toBe(false);
+    expect(window.location.search).toBe("");
   });
 
   it("preserves the focused sort control and column choices while a server sort is pending", async () => {
@@ -2136,8 +2287,9 @@ describe("App session revalidation", () => {
     const transport = appTransport({ revalidatedRoles: [], authenticated: false });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    expect(await screen.findByRole("link", { name: "Sign in with Entra ID" })).toHaveAttribute("href", "/api/auth/login");
-    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("link")).toHaveLength(1);
+    expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByRole("textbox", { name: "Work or school username" })).toBeVisible();
     expect(screen.getByText("Understand and manage your organization's AI agents in one place.")).toBeInTheDocument();
     expect(screen.getByText(/Discover agents across Microsoft 365 and Copilot Studio, explore Copilot usage and service insights, and investigate activity/)).toBeInTheDocument();
     expect(screen.getByText(/Make informed decisions about adoption and access, with the controls to take action/)).toBeInTheDocument();
@@ -2151,8 +2303,8 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("status")).toHaveTextContent("Microsoft permission setup was cancelled or denied. Retry or contact your tenant administrator.");
-    expect(screen.getByRole("link", { name: "Sign in with Entra ID" })).toHaveAttribute("href", "/api/auth/login");
-    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("link")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
+    expect(within(screen.getByRole("region", { name: "Agent Control" })).getAllByRole("button")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/auth/consent"))).toBe(false);
   });
 
@@ -2174,6 +2326,81 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await act(async () => transport.releaseRevalidation());
     expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+  });
+
+  it("clears saved queries and cached inventory when the same home account revalidates in another tenant", async () => {
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const owners: string[] = [];
+    const unsubscribe = client.getQueryCache().subscribe(event => {
+      if (event.type === "added" && event.query.queryKey[1] === "package-summaries") {
+        owners.push(String(event.query.queryKey[2]));
+      }
+    });
+    const nextUser = { ...viewer, tenantId: "tenant-2", displayName: "Revalidated tenant user" };
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles,
+      revalidatedUser: nextUser,
+      deferRevalidation: true,
+    });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let nextTenant = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (nextTenant && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        const page = structuredClone(unifiedPage);
+        page.value[0].displayName = "Current tenant agent";
+        page.value[0].packages[0].displayName = "Current tenant agent";
+        return Response.json(page);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const privateQuery = ["saved", "private-tenant-report", viewer.tenantId, viewer.homeAccountId];
+    client.setQueryData(privateQuery, { value: ["Previous tenant report"] });
+    expect(owners.at(-1)).toContain(`${viewer.tenantId}:${viewer.homeAccountId}:`);
+    transport.failProtectedReadsWith = 401;
+    await act(async () => { await expect(getAgents()).rejects.toMatchObject({ status: 401 }); });
+    await waitFor(() => expect(transport.meCalls()).toBe(2));
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(client.getQueryData(privateQuery)).toBeUndefined();
+    nextTenant = true;
+    transport.failProtectedReadsWith = undefined;
+    await act(async () => transport.releaseRevalidation());
+    expect(await screen.findByText("Current tenant agent")).toBeVisible();
+    expect(screen.getByText(nextUser.displayName)).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(owners.at(-1)).toContain(`${nextUser.tenantId}:${viewer.homeAccountId}:`);
+    expect(client.getQueryData(privateQuery)).toBeUndefined();
+    unsubscribe();
+  });
+
+  it("clears only the signing-out tenant's stored selections and jobs along with its query cache", async () => {
+    const otherTenant = { ...viewer, tenantId: "tenant-2" };
+    const client = savedQueries.createSavedQueryClient();
+    vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === "/api/auth/logout" ? new Response(null, { status: 204 }) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    window.localStorage.setItem(activeBulkJobStorageKey(viewer), "current-tenant-job");
+    window.localStorage.setItem(activeBulkJobStorageKey(otherTenant), "other-tenant-job");
+    storePackageSelection(viewer, ["current-tenant-package"]);
+    storePackageSelection(otherTenant, ["other-tenant-package"]);
+    render(<App />);
+    await screen.findByText(agent.displayName);
+    const privateQuery = ["saved", "private-tenant-report", viewer.tenantId, viewer.homeAccountId];
+    client.setQueryData(privateQuery, { value: ["Private report"] });
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("textbox", { name: "Work or school username" })).toBeVisible();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(client.getQueryData(privateQuery)).toBeUndefined();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey(viewer))).toBeNull();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey(otherTenant))).toBe("other-tenant-job");
+    expect(restorePackageSelection(viewer, 1)).toEqual({ status: "unavailable" });
+    expect(restorePackageSelection(otherTenant, 1)).toEqual({ status: "restored", ids: ["other-tenant-package"] });
   });
 
   it.each([false, true])("keeps a restored unified agent detail open after the saved inventory resolves (Strict Mode: %s)", async reactStrictMode => {
@@ -3609,6 +3836,7 @@ describe("App session revalidation", () => {
 
   it.each([
     ["the same account", viewer],
+    ["the same account in another tenant", { ...viewer, tenantId: "tenant-2" }],
     ["a different account", { ...viewer, tenantId: "tenant-2", homeAccountId: "viewer-2" }],
   ] as const)("does not auto-start a package scan when revalidating %s", async (_label, revalidatedUser) => {
     const transport = initialCatalogTransport({
@@ -4659,7 +4887,7 @@ describe("App session revalidation", () => {
         await screen.findByText(agent.displayName);
       }
       await act(async () => pending.resolve(Response.json(waitingBulkJob())));
-      expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+      expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
       expect(screen.queryByRole("group", { name: "Package job progress" })).not.toBeInTheDocument();
     },
   );
@@ -4675,7 +4903,7 @@ describe("App session revalidation", () => {
       const pending = deferredResponse();
       const job = waitingBulkJob();
       const endpoint = `/api/agents/bulk-jobs/${job.id}/${operation}`;
-      window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+      window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
       let deny = false;
       transport.fetchMock.mockImplementation(async (input, init) => {
         if (deny && new URL(input, "http://localhost").pathname === "/api/agents") {
@@ -4706,7 +4934,7 @@ describe("App session revalidation", () => {
       await act(async () => pending.resolve(Response.json({
         ...job, reconciliation: { attempted: 1, failed: 0, errors: [] },
       })));
-      expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+      expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
       expect(screen.queryByRole("group", { name: "Package job progress" })).not.toBeInTheDocument();
     },
   );
@@ -4804,11 +5032,11 @@ describe("App session revalidation", () => {
       else app.unmount();
       await act(async () => pending.resolve(Response.json(waitingBulkJob())));
       if (scenario === "navigation") {
-        expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBe(waitingBulkJob().id);
+        expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(waitingBulkJob().id);
         await userEvent.click(screen.getByRole("button", { name: "Agents" }));
         expect(screen.getByRole("group", { name: "Package job progress" })).toBeInTheDocument();
       } else {
-        expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+        expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
       }
     },
   );
@@ -4858,7 +5086,7 @@ describe("App session revalidation", () => {
     const job = { ...waitingBulkJob(), status: "running", canResume: false } satisfies BulkActionJob;
     const jobEndpoint = `/api/agents/bulk-jobs/${job.id}`;
     let polls = 0;
-    window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === jobEndpoint) {
         polls += 1;
@@ -4878,7 +5106,7 @@ describe("App session revalidation", () => {
     await act(async () => pending.resolve(Response.json(job)));
     expect(panel.getByRole("status")).toHaveTextContent("Cancelled");
     expect(panel.queryByRole("button", { name: "Cancel unprocessed tasks" })).not.toBeInTheDocument();
-    expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
     expect(panel.getByText("Unprocessed tasks were cancelled. Changes already in progress may still finish.")).toBeInTheDocument();
   });
 
@@ -4896,16 +5124,36 @@ describe("App session revalidation", () => {
     const panel = within(await screen.findByRole("region", { name: "Exact package bulk actions" }));
     expect(await panel.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
     expect(panel.getByRole("link", { name: "Sign in again" })).toBeVisible();
-    expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBe(job.id);
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBe(job.id);
     expect(transport.fetchMock.mock.calls.filter(([path]) => String(path).includes("/bulk-jobs"))
       .every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
+  });
+
+  it.each([
+    ["another tenant's", activeBulkJobStorageKey({ ...viewer, tenantId: "tenant-2" })],
+    ["another user's", activeBulkJobStorageKey({ ...viewer, homeAccountId: "viewer-2" })],
+    ["legacy unscoped", "agent-control:active-bulk-job:v1"],
+  ])("restores only the current principal's job and never %s browser job", async (_label, otherKey) => {
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const job = { ...waitingBulkJob(), id: "current-principal-job" };
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
+    window.localStorage.setItem(otherKey, "foreign-principal-job");
+    transport.fetchMock.mockImplementation(async (input, init) =>
+      input === `/api/agents/bulk-jobs/${job.id}` ? Response.json(job) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Resume unprocessed tasks" })).toBeEnabled();
+    expect(transport.fetchMock.mock.calls.some(([path]) => path === `/api/agents/bulk-jobs/${job.id}`)).toBe(true);
+    expect(transport.fetchMock.mock.calls.some(([path]) => path.includes("foreign-principal-job"))).toBe(false);
+    expect(window.localStorage.getItem(otherKey)).toBe("foreign-principal-job");
   });
 
   it("refreshes interrupted progress in place using only the exact job GET", async () => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
     const job = waitingBulkJob();
-    window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
     let reads = 0;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === `/api/agents/bulk-jobs/${job.id}`) {
@@ -4936,7 +5184,7 @@ describe("App session revalidation", () => {
     const pending = deferredResponse();
     const job = waitingBulkJob();
     const endpoint = `/api/agents/bulk-jobs/${job.id}/${operation}`;
-    window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
     let attempts = 0;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === `/api/agents/bulk-jobs/${job.id}`) return Response.json(job);
@@ -4974,7 +5222,7 @@ describe("App session revalidation", () => {
     const transport = accessEditorTransport();
     const base = transport.fetchMock.getMockImplementation()!;
     const job: BulkActionJob = { ...waitingBulkJob(), status: "running", canResume: false, results: [] };
-    window.localStorage.setItem("agent-control:active-bulk-job:v1", job.id);
+    window.localStorage.setItem(activeBulkJobStorageKey(), job.id);
     let cancellationFailed = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === `/api/agents/bulk-jobs/${job.id}/cancel`) {
@@ -4992,7 +5240,7 @@ describe("App session revalidation", () => {
     expect(await panel.findByRole("alert")).toHaveTextContent("Cancellation unavailable.");
     await waitFor(() => expect(panel.getByRole("status")).toHaveTextContent("Completed"), { timeout: 3000 });
     expect(panel.getByText("2 of 2 processed")).toBeVisible();
-    expect(window.localStorage.getItem("agent-control:active-bulk-job:v1")).toBeNull();
+    expect(window.localStorage.getItem(activeBulkJobStorageKey())).toBeNull();
   });
 
   it("reports unavailable browser job storage without blocking saved inventory", async () => {
@@ -5000,7 +5248,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     const read = Storage.prototype.getItem;
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, key: string) {
-      if (this === window.localStorage && key === "agent-control:active-bulk-job:v1") {
+      if (this === window.localStorage && key === activeBulkJobStorageKey()) {
         throw new DOMException("Storage is blocked", "SecurityError");
       }
       return read.call(this, key);
@@ -5024,7 +5272,7 @@ describe("App session revalidation", () => {
       remove.call(this, key);
     });
     await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
-    expect(await screen.findByRole("link", { name: "Sign in with Entra ID" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeInTheDocument();
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     expect(screen.getByText(/Unable to clear the saved package job/)).toBeInTheDocument();
   });

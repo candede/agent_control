@@ -77,4 +77,37 @@ describe("PostgreSQL audit projection", () => {
     expect(await audit.matchingOperationPackageIds([], "REF_CASE")).toEqual([]);
     await expect(audit.matchingOperationPackageIds(["included"], "ref%")).rejects.toMatchObject({ code: "invalid_operation_reference" });
   });
+
+  it("isolates colliding event and operation IDs across tenants and accounts, including completion and exports", async () => {
+    const scopes = [
+      { tenantId: "audit-overlap-a", principalId: "same-account" },
+      { tenantId: "audit-overlap-b", principalId: "same-account" },
+      { tenantId: "audit-overlap-a", principalId: "private-account" },
+    ];
+    const logs = scopes.map(scope => new AuditLog(scope, fixture.runtime));
+    const input: StartAuditEvent = {
+      id: "same-provider-event", operationId: "tenant-overlap-operation", scope: "single", action: "block",
+      targetBlockedState: true, agentId: "same-provider-package", requestPath: "/api/agents/same-provider-package/block", actor,
+    };
+    for (const [index, current] of scopes.entries()) {
+      await logs[index].startEvent({ ...input, actor: { ...actor, tenantId: current.tenantId, homeAccountId: current.principalId },
+        metadata: { source: `${current.tenantId}/${current.principalId}` } });
+    }
+    await logs[0].completeEvent(input.id!, { status: "succeeded" });
+    await logs[1].completeEvent(input.id!, { status: "failed", message: "Only tenant B failed." });
+    const foreign = await logs[1].startEvent({ ...input, id: "tenant-b-private-event",
+      actor: { ...actor, tenantId: scopes[1].tenantId, homeAccountId: scopes[1].principalId } });
+    for (const [index, status] of ["succeeded", "failed", "started"].entries()) {
+      expect(await logs[index].getEvent(input.id!)).toMatchObject({ status,
+        metadata: { source: `${scopes[index].tenantId}/${scopes[index].principalId}` } });
+    }
+    expect(await logs[0].countEvents({ operationIdPrefix: input.operationId })).toBe(1);
+    expect(await logs[0].listEvents({ operationIdPrefix: input.operationId })).toMatchObject([{ status: "succeeded" }]);
+    expect(await logs[0].getExportEvents([foreign.id, input.id!])).toMatchObject([{ id: input.id, status: "succeeded" }]);
+    expect(await logs[0].getEvent(foreign.id)).toBeUndefined();
+    await expect(logs[0].completeEvent(foreign.id, { status: "succeeded" })).rejects.toThrow("scope");
+    expect(await logs[1].getEvent(foreign.id)).toMatchObject({ status: "started" });
+    await expect(logs[0].requestEvents([{ ...input, actor: { ...actor, tenantId: scopes[1].tenantId,
+      homeAccountId: scopes[1].principalId } }])).rejects.toThrow("scope");
+  });
 });

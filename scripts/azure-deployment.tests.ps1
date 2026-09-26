@@ -30,14 +30,16 @@ function Save-Json {
 }
 
 function New-Target {
-    param([ValidateSet('fresh', 'upgrade', 'legacy_import')][string]$Mode = 'upgrade')
+    param([ValidateSet('fresh', 'upgrade', 'legacy_import')][string]$Mode = 'upgrade',[switch]$Registry)
     $tenant = '11111111-1111-4111-8111-111111111111'
     $subscription = '22222222-2222-4222-8222-222222222222'
     $group = 'fixture-agent-control'
     $plan = 'fixture-agent-control-plan'
     $app = 'fixture-agent-control-app'
     $postgres = 'fixture-agent-control-postgres'
-    $versions = @($script:RequiredSecretNames | ForEach-Object { [PSCustomObject]@{ name = $_; version = 'fixtureversion1' } })
+    $secretNames = @($script:RequiredSecretNames)
+    if ($Registry) { $secretNames += 'agent-control-tenants-json' }
+    $versions = @($secretNames | ForEach-Object { [PSCustomObject]@{ name = $_; version = 'fixtureversion1' } })
     return [PSCustomObject]@{
         contractVersion = 2
         isApproval = $true
@@ -46,6 +48,10 @@ function New-Target {
         resourceGroup = $group
         region = 'fixtureregion'
         entraApplicationId = '33333333-3333-4333-8333-333333333333'
+        tenantDomains = @('contoso.com')
+        tenantDisplayName = 'Contoso'
+        tenantRegistrySecretName = $(if ($Registry) { 'agent-control-tenants-json' } else { '' })
+        tenantRegistryRegistrationApprovalReference = $(if ($Registry) { 'fixture-every-tenant-registration-approval' } else { '' })
         canonicalOrigin = "https://$app.azurewebsites.net"
         callbackUri = "https://$app.azurewebsites.net/api/auth/callback"
         existingVaultResourceId = "/subscriptions/$subscription/resourceGroups/fixture-security/providers/Microsoft.KeyVault/vaults/fixture-vault"
@@ -104,14 +110,29 @@ function New-Target {
         }
         legacyStaticWebApp = [PSCustomObject]@{ resourceId = $null; retirementApproved = $false; approvalReference = $null }
         preparedVaultContract = [PSCustomObject]@{
-            secretNames = @($script:RequiredSecretNames)
-            runtimeConsumers = @($script:RuntimeSecretNames)
+            secretNames = $secretNames
+            runtimeConsumers = @($secretNames | Where-Object { $_ -cne 'agent-control-postgres-admin-password' })
             administratorPasswordRuntimeAccessible = $false
             bootstrapSecretCleanupRequired = $true
             versions = @($versions)
             existingVersions = $(if ($Mode -eq 'fresh') { @() } else { @($versions | ForEach-Object { [PSCustomObject]@{ name = $_.name; version = $_.version } }) })
         }
     }
+}
+
+function New-RegistryProfiles {
+    param($Target)
+    return @(
+        @{
+            tenantId = $Target.tenantId; clientId = $Target.entraApplicationId
+            clientSecret = 'synthetic-fixture-agent-control-client-secret-value-that-is-long-enough-0001'
+            domains = @('contoso.com'); displayName = 'Contoso'
+        },
+        @{
+            tenantId = '88888888-8888-4888-8888-888888888888'; clientId = '99999999-9999-4999-8999-999999999999'
+            clientSecret = 'synthetic-secondary-tenant-secret-never-log'; domains = @('fabrikam.com')
+        }
+    )
 }
 
 $script:OperationNames = @(
@@ -154,12 +175,7 @@ function Add-DatabaseCommand {
 function ReferenceStatus {
     param($Target, [string]$Status = 'Resolved', [string]$MismatchSetting)
     $properties = [ordered]@{}
-    $map = [ordered]@{}
-    $map['TENANT_ID'] = 'agent-control-tenant-id'
-    $map['CLIENT_ID'] = 'agent-control-client-id'
-    $map['CLIENT_SECRET'] = 'agent-control-client-secret'
-    $map['SESSION_SECRET'] = 'agent-control-session-secret'
-    $map['PGPASSWORD'] = 'agent-control-postgres-app-password'
+    $map = Get-AzureRuntimeSecretReferences $Target
     foreach ($setting in $map.Keys) {
         $secret = if ($setting -ceq $MismatchSetting) { 'wrong-secret' } else { $map[$setting] }
         $properties[$setting] = [PSCustomObject]@{
@@ -216,10 +232,11 @@ function New-Fixture {
     Add-Az $fixture vault_preflight @('keyvault', 'show', '--id', $Target.existingVaultResourceId) -Json @{
         name = 'fixture-vault'; properties = @{ tenantId = $Target.tenantId; enableRbacAuthorization = $true; enabledForTemplateDeployment = $true }
     }
-    foreach ($name in $script:RequiredSecretNames) {
+    foreach ($name in (Get-AzureRequiredSecretNames $Target)) {
         $value = "synthetic-fixture-$name-value-that-is-long-enough-0001"
         if ($name -eq 'agent-control-tenant-id') { $value = $Target.tenantId }
         if ($name -eq 'agent-control-client-id') { $value = $Target.entraApplicationId }
+        if ($name -eq 'agent-control-tenants-json') { $value = ConvertTo-Json -InputObject @(New-RegistryProfiles $Target) -Depth 20 }
         Add-Az $fixture vault_preflight @('keyvault', 'secret', 'show', '--vault-name', 'fixture-vault', '--name', $name,
             '--version', 'fixtureversion1') -Json @{ value = $value; attributes = @{ enabled = $true; expires = [DateTimeOffset]::UtcNow.AddDays(30).ToString('o') } }
     }
@@ -455,7 +472,7 @@ function New-Context {
 
 try {
     $parseErrors = $null
-    foreach ($file in @((Join-Path $root 'deploy-azure.ps1'), (Join-Path $root 'scripts/azure-deployment.ps1'))) {
+    foreach ($file in @((Join-Path $root 'deploy-azure.ps1'), (Join-Path $root 'scripts/azure-deployment.ps1'), (Join-Path $root 'scripts/tenant-deployment.ps1'))) {
         [Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$parseErrors) | Out-Null
         Assert-True (@($parseErrors).Count -eq 0) "PowerShell syntax failed for $file"
     }
@@ -469,6 +486,10 @@ try {
         $bicep.Contains("metricName: 'HealthCheckStatus'") -and
         $bicep.Contains('parse_json(ResultDescription).event') -and -not $bicep.Contains('ResultDescription has_any')) `
         'Bicep containment, silent-availability, or structured-event monitoring contract is incomplete.'
+    Assert-True ($bicep.Contains("settingName: 'TENANTS_JSON'") -and $bicep.Contains('version: tenantRegistrySecretVersion') -and
+        $bicep.Contains("name: 'TENANT_DOMAINS'") -and $bicep.Contains("value: join(tenantDomains, ',')") -and
+        $bicep.Contains('runtimeSecretNames: [for secret in runtimeSecrets: secret.name]')) `
+        'Registry secret reference, explicit legacy domains or least-privilege runtime secret scope is missing.'
 
     $target = New-Target
     Assert-True ((Test-ApprovedAzureTarget $target Mock).expectedSchemaVersion -eq 26) 'Valid target was rejected.'
@@ -484,7 +505,10 @@ try {
         @{ mutate = { param($t) $t.expectedSchemaVersion = 25 }; error = 'approved baseline' },
         @{ mutate = { param($t) $t.estimate.monthlyTotal = 9 }; error = 'total' },
         @{ mutate = { param($t) $t.resources.postgresFlexibleServer.sku = 'Standard_D2s_v3' }; error = 'renewed estimate' },
-        @{ mutate = { param($t) $t.resources.approvedAppOutboundIpv4Addresses = @() }; error = 'outbound' }
+        @{ mutate = { param($t) $t.resources.approvedAppOutboundIpv4Addresses = @() }; error = 'outbound' },
+        @{ mutate = { param($t) $t.tenantDomains = @() }; error = 'accepted sign-in domain' },
+        @{ mutate = { param($t) $t.tenantDomains = @('*.contoso.com') }; error = 'exact organization domains' },
+        @{ mutate = { param($t) $t.tenantDomains = @('contoso.com','CONTOSO.com') }; error = 'duplicate accepted domain' }
     )) {
         $invalid = Copy-Object $target
         & $case.mutate $invalid
@@ -494,6 +518,104 @@ try {
     $changedVersion.preparedVaultContract.versions[5].version = 'fixtureversion2'
     Assert-Fails { Test-ApprovedAzureTarget $changedVersion Mock } 'Phase 11 coordinated-rotation prerequisite'
     Assert-True (-not (Get-Content -LiteralPath (Join-Path $root 'deploy-azure.ps1') -Raw).Contains('CredentialRotation')) 'Wizard still exposes credential rotation.'
+
+    $registryTarget = New-Target -Registry
+    $registryTarget.tenantDomains = @()
+    Assert-True ((Test-ApprovedAzureTarget $registryTarget Mock).tenantRegistrySecretName -ceq 'agent-control-tenants-json') 'Authoritative registry target incorrectly required legacy domains.'
+    $dateLikeProfile = @(New-RegistryProfiles $registryTarget)[0]
+    $dateLikeProfile.displayName = '2026-09-26T00:00:00Z'
+    $dateLikeProfile.clientSecret = '2026-09-26T00:00:00Z'
+    $parsedDateLike = ConvertFrom-DeploymentTenantRegistry (ConvertTo-Json -InputObject @($dateLikeProfile) -Depth 20)
+    Assert-True ($parsedDateLike[0].displayName -is [string] -and $parsedDateLike[0].clientSecret -ceq '2026-09-26T00:00:00Z') 'PowerShell JSON parsing changed a string credential or display name into a date.'
+    $unapprovedRegistry = Copy-Object $registryTarget
+    $unapprovedRegistry.tenantRegistryRegistrationApprovalReference = ''
+    Assert-Fails { Test-ApprovedAzureTarget $unapprovedRegistry Mock } 'EVERY|every configured tenant'
+    $registryContext = New-Context $registryTarget (New-Fixture $registryTarget) 'registry'
+    $registryEvidence = Invoke-DeploymentOperation $registryContext vault_preflight
+    Assert-True ($registryEvidence.tenantProfileCount -eq 2 -and $registryEvidence.valuesRedacted) 'Prepared multi-tenant registry was not validated in memory.'
+    $parameterFile = New-AzureParameterFile $registryContext
+    $parameterText = [IO.File]::ReadAllText($parameterFile)
+    $parameters = ($parameterText | ConvertFrom-Json).parameters
+    Assert-True ($parameters.tenantRegistrySecretName.value -ceq 'agent-control-tenants-json' -and $parameters.tenantRegistrySecretVersion.value -ceq 'fixtureversion1') 'Azure did not select the immutable registry reference.'
+    Assert-True (-not $parameterText.Contains('synthetic-secondary-tenant-secret') -and -not $parameterText.Contains('synthetic-fixture-agent-control-client-secret')) 'Registry credentials leaked into ARM parameters.'
+    Assert-True ((Invoke-DeploymentOperation $registryContext runtime_access_verify).runtimeSecretCount -eq 6) 'Runtime verification did not require the sixth native registry reference.'
+    $registryRegistration = Invoke-DeploymentOperation $registryContext registration_verify
+    Assert-True ($registryRegistration.primaryRegistrationVerified -and -not $registryRegistration.additionalRegistrationsVerified -and
+        $registryRegistration.tenantRegistryRegistrationApprovalReference -ceq $registryTarget.tenantRegistryRegistrationApprovalReference) 'Registry registration evidence overclaimed verification of another directory.'
+    Write-AzureDeploymentReceipt $registryContext 'test-only' '' @{ vault_preflight = $registryEvidence; registration_verify = $registryRegistration } | Out-Null
+    $registryReceipt = [IO.File]::ReadAllText($registryContext.ReceiptPath)
+    Assert-True (-not $registryReceipt.Contains('synthetic-secondary-tenant-secret') -and -not $registryReceipt.Contains('synthetic-fixture-agent-control-client-secret')) 'Registry credentials leaked into a deployment receipt.'
+    Remove-AzureSensitiveDirectories $registryContext
+
+    $legacyParameters = New-Context $target (New-Fixture $target) 'legacy-domains'
+    $legacyParameterFile = New-AzureParameterFile $legacyParameters
+    $legacyParameterValues = (Get-Content -LiteralPath $legacyParameterFile -Raw | ConvertFrom-Json).parameters
+    Assert-True (($legacyParameterValues.tenantDomains.value -join ',') -ceq 'contoso.com' -and $legacyParameterValues.tenantDisplayName.value -ceq 'Contoso') 'Legacy accepted domains/display name did not reach ARM.'
+    Assert-True ($legacyParameterValues.tenantRegistrySecretName.value -ceq '') 'Legacy deployment unexpectedly enabled registry mode.'
+    Remove-AzureSensitiveDirectories $legacyParameters
+
+    $registryMigration = Copy-Object $registryTarget
+    $registryMigration.preparedVaultContract.existingVersions = @($registryMigration.preparedVaultContract.existingVersions | Where-Object name -CNE 'agent-control-tenants-json')
+    Assert-True ((Test-ApprovedAzureTarget $registryMigration Mock).preparedVaultContract.versions.Count -eq 7) 'First registry migration rejected the six unchanged legacy versions.'
+    $migratingContext = New-Context $registryMigration (New-Fixture $registryMigration) 'registry-migration'
+    Assert-True ((Invoke-DeploymentOperation $migratingContext vault_preflight).tenantProfileCount -eq 2) 'First registry migration did not retain the approved primary identity.'
+    Remove-AzureSensitiveDirectories $migratingContext
+    $idnProfiles = @(New-RegistryProfiles $registryTarget)
+    $idnProfiles[1].domains = @("b$([char]0x00fc)cher.example")
+    $idnRegistryValue = ConvertTo-Json -InputObject $idnProfiles -Depth 20
+    $idnFixture = New-Fixture $registryTarget
+    $idnFixture.commands.vault_preflight[7].json.value = $idnRegistryValue
+    $idnContext = New-Context $registryTarget $idnFixture 'registry-unicode-letter-idn'
+    Assert-True ((Invoke-DeploymentOperation $idnContext vault_preflight).tenantProfileCount -eq 2 -and
+        $idnContext.SecretValues['agent-control-tenants-json'] -ceq $idnRegistryValue) 'Azure rejected a supported Unicode-letter domain or rewrote the protected registry during validation.'
+    Remove-AzureSensitiveDirectories $idnContext
+    foreach ($case in @(
+        @{ name='malformed'; json='[{"clientSecret":"synthetic-secondary-tenant-secret-never-log"}'; error='valid JSON array' },
+        @{ name='empty'; json='[]'; error='at least one tenant' },
+        @{ name='object'; json='{}'; error='JSON array' },
+        @{ name='wrong-property-case'; mutate={ param($p) $p[1].Remove('tenantId'); $p[1]['TenantId']='88888888-8888-4888-8888-888888888888' }; error='tenantId and clientId must be GUIDs' },
+        @{ name='missing-domain'; mutate={ param($p) $p[1].domains=@() }; error='accepted sign-in domain' },
+        @{ name='non-string-domain'; mutate={ param($p) $p[1].domains=@('fabrikam.com',42) }; error='exact organization domains' },
+        @{ name='unicode-domain-separator'; mutate={ param($p) $p[1].domains=@("example$([char]0x3002)com") }; error='exact organization domains' },
+        @{ name='domain-format-control'; mutate={ param($p) $p[1].domains=@("exam$([char]0x200b)ple.com") }; error='exact organization domains' },
+        @{ name='domain-url'; mutate={ param($p) $p[1].domains=@('https://example.com') }; error='exact organization domains' },
+        @{ name='domain-username'; mutate={ param($p) $p[1].domains=@('user@example.com') }; error='exact organization domains' },
+        @{ name='domain-wildcard'; mutate={ param($p) $p[1].domains=@('*.example.com') }; error='exact organization domains' },
+        @{ name='duplicate-domain'; mutate={ param($p) $p[1].domains=@('CONTOSO.com') }; error='duplicate accepted domain' },
+        @{ name='duplicate-tenant'; mutate={ param($p) $p[1].tenantId=$p[0].tenantId }; error='duplicate tenant' },
+        @{ name='invalid-secret'; mutate={ param($p) $p[1].clientSecret="synthetic-secret`ninvalid" }; error='single-line client secret' },
+        @{ name='replaced-primary'; mutate={ param($p) $p[0].clientId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }; error='approved primary tenant' },
+        @{ name='rotated-primary'; mutate={ param($p) $p[0].clientSecret='synthetic-unapproved-rotation' }; error='preserve the approved legacy client secret' }
+    )) {
+        $profiles = @(New-RegistryProfiles $registryMigration)
+        if ($case.mutate) { & $case.mutate $profiles }
+        $fixture = New-Fixture $registryMigration
+        $fixture.commands.vault_preflight[7].json.value = $(if ($case.ContainsKey('json')) { $case.json } else { ConvertTo-Json -InputObject $profiles -Depth 20 })
+        $invalidRegistry = New-Context $registryMigration $fixture "registry-$($case.name)"
+        try { Assert-Fails { Invoke-DeploymentOperation $invalidRegistry vault_preflight } $case.error }
+        catch { throw "Registry case $($case.name): $($_.Exception.Message)" }
+    }
+    foreach ($issue in @('missing','wrong-name','wrong-version','unresolved')) {
+        $status = ReferenceStatus $registryTarget
+        if ($issue -eq 'missing') { $status.properties.PSObject.Properties.Remove('TENANTS_JSON') }
+        if ($issue -eq 'wrong-name') { $status.properties.TENANTS_JSON.secretName = 'wrong-secret' }
+        if ($issue -eq 'wrong-version') { $status.properties.TENANTS_JSON.secretVersion = 'wrongversion' }
+        if ($issue -eq 'unresolved') { $status.properties.TENANTS_JSON.status = 'AccessToKeyVaultDenied' }
+        $fixture = New-Fixture $registryTarget
+        Add-RuntimeCommands $fixture $registryTarget @($status,$status,$status,$status,$status)
+        $badReference = New-Context $registryTarget $fixture "registry-reference-$issue"
+        Set-SyntheticBootstrapSecrets $badReference
+        Assert-Fails { Invoke-DeploymentOperation $badReference runtime_access_verify } 'native Key Vault references'
+    }
+    foreach ($mode in @('fresh','upgrade')) {
+        $fullRegistryTarget = if ($mode -eq 'fresh') { New-Target fresh -Registry } else { Copy-Object $registryMigration }
+        $fullRegistryContext = New-Context $fullRegistryTarget (New-Fixture $fullRegistryTarget) "registry-full-$mode"
+        $fullRegistryReceipt = Invoke-AzureDeployment $fullRegistryContext Deploy
+        Assert-True ($fullRegistryReceipt.status -ceq 'deployed' -and
+            $fullRegistryReceipt.evidence.vault_preflight.tenantProfileCount -eq 2 -and
+            $fullRegistryReceipt.evidence.runtime_access_verify.runtimeSecretCount -eq 6) 'Mock registry deployment did not carry validated profiles through the complete release flow.'
+        Assert-True (-not [IO.File]::ReadAllText($fullRegistryContext.ReceiptPath).Contains('synthetic-secondary-tenant-secret')) 'Complete registry deployment leaked credentials.'
+    }
 
     $registration = New-Context $target (New-Fixture $target) 'registration'
     $registrationEvidence = Invoke-DeploymentOperation $registration registration_verify
@@ -840,7 +962,7 @@ try {
     & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Plan -ExecutionMode Mock `
         -MockFixturePath $parameterFixturePath -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $namedReceipt `
         -TenantId $parameterTarget.tenantId -SubscriptionId $parameterTarget.subscriptionId -ResourceGroupName $parameterTarget.resourceGroup `
-        -Region $parameterTarget.region -AppRegistrationClientId $parameterTarget.entraApplicationId `
+        -Region $parameterTarget.region -AppRegistrationClientId $parameterTarget.entraApplicationId -TenantDomains $parameterTarget.tenantDomains -TenantDisplayName $parameterTarget.tenantDisplayName `
         -AppServicePlanName $parameterTarget.resources.appServicePlan.name -AppServiceName $parameterTarget.resources.appService.name `
         -PostgresServerName $parameterTarget.resources.postgresFlexibleServer.name -ExistingVaultResourceId $parameterTarget.existingVaultResourceId `
         -CanonicalOrigin $parameterTarget.canonicalOrigin -InstallationMode upgrade -ExpectedSchemaVersion 26 `

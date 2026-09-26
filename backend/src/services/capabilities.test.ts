@@ -9,9 +9,16 @@ import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.j
 import { capabilityDefinitions } from "./capabilityRegistry.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
 
-vi.hoisted(() => { process.env.CLIENT_ID = "22222222-2222-2222-2222-222222222222"; });
+vi.hoisted(() => {
+  process.env.TENANTS_JSON = JSON.stringify([
+    { tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-2222-2222-222222222222",
+      clientSecret: "synthetic-capability-a", domains: ["example.invalid"] },
+    { tenantId: "33333333-3333-3333-3333-333333333333", clientId: "44444444-4444-4444-4444-444444444444",
+      clientSecret: "synthetic-capability-b", domains: ["other.example.invalid"] },
+  ]);
+});
 
-const reader: AuthenticatedUser = { tenantId: "tenant", homeAccountId: "reader-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"] };
+const reader: AuthenticatedUser = { tenantId: "11111111-1111-1111-1111-111111111111", homeAccountId: "reader-a", username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer"] };
 
 class MemoryRepository {
   configurations = new Map<string, CapabilityConfiguration>();
@@ -29,15 +36,18 @@ class MemoryRepository {
     for (const [key] of this.evidenceRows) if ((JSON.parse(key) as EvidenceKey).capabilityId === id) this.evidenceRows.delete(key);
     return value;
   });
-  invalidatePrincipal = vi.fn(async (_tenantId: string, principalId: string) => {
-    for (const [key] of this.evidenceRows) if ((JSON.parse(key) as EvidenceKey).authorizationPrincipalId === principalId) this.evidenceRows.delete(key);
+  invalidatePrincipal = vi.fn(async (tenantId: string, principalId: string) => {
+    for (const [key] of this.evidenceRows) {
+      const scope = JSON.parse(key) as EvidenceKey;
+      if (scope.tenantId === tenantId && scope.authorizationPrincipalId === principalId) this.evidenceRows.delete(key);
+    }
   });
   invalidateCapability = vi.fn(async (_tenantId: string, capabilityId: string) => {
     for (const [key] of this.evidenceRows) if ((JSON.parse(key) as EvidenceKey).capabilityId === capabilityId) this.evidenceRows.delete(key);
   });
 }
 
-function service(repository = new MemoryRepository(), overrides: Partial<{ delegatedToken: (accountId: string, capabilityId: CapabilityId) => Promise<string>; applicationToken: () => Promise<string>; packageProbe: (token: string) => Promise<unknown>; directoryProbe: (token: string) => Promise<unknown>; inventoryProbe: (token: string) => Promise<unknown> }> = {}) {
+function service(repository = new MemoryRepository(), overrides: Partial<{ delegatedToken: (tenantId: string, accountId: string, capabilityId: CapabilityId) => Promise<string>; applicationToken: () => Promise<string>; packageProbe: (token: string) => Promise<unknown>; directoryProbe: (token: string) => Promise<unknown>; inventoryProbe: (token: string) => Promise<unknown> }> = {}) {
   const probes = {
     delegatedToken: vi.fn(async () => "delegated-token"), applicationToken: vi.fn(async () => "application-token"),
     packageProbe: vi.fn(async () => []), directoryProbe: vi.fn(async () => []), inventoryProbe: vi.fn(async () => []),
@@ -266,7 +276,7 @@ describe("recent actual operation failures", () => {
       const { value, repository } = service();
       await expect(value.observeOperation(id, reader, async () => { throw denied(); })).rejects.toThrow();
       const user = { ...reader };
-      if (change === "tenant") user.tenantId = "another-tenant";
+      if (change === "tenant") user.tenantId = "33333333-3333-3333-3333-333333333333";
       if (change === "principal") user.homeAccountId = "another-reader";
       if (change === "role") user.roles = [];
       if (change === "configuration") repository.configurations.set(id, { enabled: false, sharedDataScope: false, previewQualified: false, revision: 2 });
@@ -490,7 +500,7 @@ describe("capability decisions", () => {
       expect(repository.recordEvidence).not.toHaveBeenCalled();
 
       expect((await value.check(user)).map(view => view.definition.id)).toEqual(capabilityIds);
-      expect(probes.delegatedToken).not.toHaveBeenCalledWith(user.homeAccountId, "graph.agentIdentity.read");
+      expect(probes.delegatedToken).not.toHaveBeenCalledWith(user.tenantId, user.homeAccountId, "graph.agentIdentity.read");
     },
   );
 
@@ -535,16 +545,16 @@ describe("capability decisions", () => {
       expect(decision.remediation.join(" ")).not.toMatch(/Run the automatic/i);
       delegatedToken.mockClear();
       await value.check(reader, { retryFailed: true });
-      expect(delegatedToken).not.toHaveBeenCalledWith(reader.homeAccountId, id);
+      expect(delegatedToken).not.toHaveBeenCalledWith(reader.tenantId, reader.homeAccountId, id);
       expect((await value.decision(id, reader)).status).toBe("unknown");
       await expect(value.requireAvailable(id, { ...reader, roles: [] })).rejects.toMatchObject({
         code: "capability_unavailable", details: { status: "missing_internal_role" },
       });
-      expect(delegatedToken).not.toHaveBeenCalledWith(reader.homeAccountId, id);
+      expect(delegatedToken).not.toHaveBeenCalledWith(reader.tenantId, reader.homeAccountId, id);
       await expect(value.requireAvailable(id, reader)).resolves.toMatchObject({
         status: "available", authorized: true, fresh: true, verification: "token",
       });
-      expect(delegatedToken).toHaveBeenCalledWith(reader.homeAccountId, id);
+      expect(delegatedToken).toHaveBeenCalledWith(reader.tenantId, reader.homeAccountId, id);
     },
   );
 
@@ -633,7 +643,7 @@ describe("capability decisions", () => {
       await expect(value.requireAvailable(id, admin)).resolves.toMatchObject({ verification: "token" });
       expect(await value.decision(id, { ...admin, homeAccountId: "another-admin" })).toMatchObject({ verification: "on_demand" });
       expect(await value.decision(id, reader)).toMatchObject({ status: "missing_internal_role" });
-      expect(delegatedToken).toHaveBeenCalledWith(admin.homeAccountId, id);
+      expect(delegatedToken).toHaveBeenCalledWith(admin.tenantId, admin.homeAccountId, id);
       expect(probes.packageProbe).not.toHaveBeenCalled();
       expect(probes.directoryProbe).not.toHaveBeenCalled();
       expect(probes.inventoryProbe).not.toHaveBeenCalled();
@@ -644,7 +654,7 @@ describe("capability decisions", () => {
   it("automatically checks Admin write scopes, reuses successful token evidence, and retries missing consent", async () => {
     const admin: AuthenticatedUser = { ...reader, roles: ["AgentControl.Admin"] };
     let consented = false;
-    const delegatedToken = vi.fn(async (_accountId: string, id: CapabilityId) => {
+    const delegatedToken = vi.fn(async (_tenantId: string, _accountId: string, id: CapabilityId) => {
       if (!consented && id.startsWith("graph.package.") && id.endsWith(".manage")) {
         throw new AppError(403, "missing_permission", "Consent required");
       }
@@ -931,7 +941,7 @@ describe("capability decisions", () => {
   it("accepts a bounded inventory access sample when the tenant total exceeds the refresh ceiling", async () => {
     const fetcher = vi.fn(async () => Response.json({
       totalRecords: 5_001, count: 1, resultTruncated: 1, skipToken: "next",
-      data: [{ tenantId: "tenant", name: "environment-a", type: "microsoft.powerplatform/environments", properties: {} }],
+      data: [{ tenantId: reader.tenantId, name: "environment-a", type: "microsoft.powerplatform/environments", properties: {} }],
     }));
     const client = new PowerPlatformResourceQueryClient(fetcher);
     const { value } = service(new MemoryRepository(), { inventoryProbe: token => client.checkAccess(token) });
@@ -960,7 +970,7 @@ describe("capability decisions", () => {
       definition: { probe: { kind: "on_demand" } },
       decision: { status: "available", authorized: true, verification: "token", previewQualification: "not_required" },
     });
-    expect(probes.delegatedToken).toHaveBeenCalledWith(operator.homeAccountId, "powerPlatform.quarantine.manage");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(operator.tenantId, operator.homeAccountId, "powerPlatform.quarantine.manage");
     expect(probes.packageProbe).not.toHaveBeenCalled();
     expect(probes.directoryProbe).not.toHaveBeenCalled();
     expect(probes.inventoryProbe).not.toHaveBeenCalled();
@@ -1003,7 +1013,7 @@ describe("capability decisions", () => {
       authorized: true,
       verification: "token",
     });
-    expect(probes.delegatedToken).toHaveBeenCalledWith(securityReader.homeAccountId, "purview.audit.search.delegated");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(securityReader.tenantId, securityReader.homeAccountId, "purview.audit.search.delegated");
     expect(probes.packageProbe).not.toHaveBeenCalled();
     expect(probes.directoryProbe).not.toHaveBeenCalled();
     expect(probes.inventoryProbe).not.toHaveBeenCalled();
@@ -1073,9 +1083,9 @@ describe("capability decisions", () => {
       verification: "token",
     });
     expect(viewerViews.find(view => view.definition.id === "powerPlatform.quarantine.manage")?.decision.status).toBe("missing_internal_role");
-    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.homeAccountId, "powerPlatform.quarantine.manage");
-    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.homeAccountId, "graph.package.access.manage");
-    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.homeAccountId, "graph.package.block.manage");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.tenantId, administrator.homeAccountId, "powerPlatform.quarantine.manage");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.tenantId, administrator.homeAccountId, "graph.package.access.manage");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(administrator.tenantId, administrator.homeAccountId, "graph.package.block.manage");
     expect(probes.packageProbe).toHaveBeenCalledTimes(1);
     expect(probes.directoryProbe).toHaveBeenCalledTimes(1);
     expect(probes.inventoryProbe).toHaveBeenCalledTimes(1);
@@ -1432,7 +1442,7 @@ describe("capability decisions", () => {
   it("isolates principal failures and records complete application/environment scope", async () => {
     const repository = new MemoryRepository();
     repository.configurations.set("graph.package.read.application", { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
-    const { value } = service(repository, { delegatedToken: vi.fn(async accountId => {
+    const { value } = service(repository, { delegatedToken: vi.fn(async (_tenantId, accountId) => {
       if (accountId === "reader-b") throw new Error("provider unavailable");
       return "delegated-token";
     }) });
@@ -1446,6 +1456,30 @@ describe("capability decisions", () => {
       expect.objectContaining({ principalId: "22222222-2222-2222-2222-222222222222", authorizationPrincipalId: "reader-a", environmentId: "global", tokenMode: "application" }),
     ]));
     for (const key of keys) expect(key.contractRevision).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("partitions application identity, provider tokens, and invalidation by tenant even for the same account", async () => {
+    const repository = new MemoryRepository();
+    const applicationId = "graph.package.read.application";
+    repository.configurations.set(applicationId, { enabled: true, sharedDataScope: true, previewQualified: false, revision: 2 });
+    const { value, probes } = service(repository);
+    const other = { ...reader, tenantId: "33333333-3333-3333-3333-333333333333" };
+    await Promise.all([
+      value.refresh(applicationId, reader), value.refresh(applicationId, other),
+      value.refresh("graph.package.read.delegated", reader), value.refresh("graph.package.read.delegated", other),
+    ]);
+    expect(probes.applicationToken).toHaveBeenCalledWith(reader.tenantId, applicationId);
+    expect(probes.applicationToken).toHaveBeenCalledWith(other.tenantId, applicationId);
+    expect(probes.delegatedToken).toHaveBeenCalledWith(reader.tenantId, reader.homeAccountId, "graph.package.read.delegated");
+    expect(probes.delegatedToken).toHaveBeenCalledWith(other.tenantId, reader.homeAccountId, "graph.package.read.delegated");
+    expect(repository.recordEvidence.mock.calls.map(([key]) => key)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tenantId: reader.tenantId, principalId: "22222222-2222-2222-2222-222222222222", tokenMode: "application" }),
+      expect.objectContaining({ tenantId: other.tenantId, principalId: "44444444-4444-4444-4444-444444444444", tokenMode: "application" }),
+    ]));
+    await value.invalidatePrincipal(reader);
+    expect(await value.decision("graph.package.read.delegated", reader)).toMatchObject({ status: "unknown" });
+    expect(await value.decision("graph.package.read.delegated", other)).toMatchObject({ status: "available" });
+    expect(await value.decision(applicationId, other)).toMatchObject({ status: "available" });
   });
 
   it("never authorizes expired success evidence", async () => {

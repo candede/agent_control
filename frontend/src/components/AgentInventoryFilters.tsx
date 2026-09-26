@@ -1,12 +1,12 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Search, SlidersHorizontal, X } from "lucide-react";
 import type { UnifiedAgentInventoryPage } from "../api/client";
-import { agentSortOptions, agentViewOptions } from "../agentColumns";
+import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions, agentViewOptions } from "../agentColumns";
 import type { AgentRouteState } from "../workbenchRouting";
 import { EnvironmentFilter } from "./EnvironmentFilter";
 
 export type AgentFilterValues = Pick<AgentRouteState,
-  "search" | "agentView" | "platform" | "availability" | "host" | "status"
+  "search" | "agentView" | "endUserAccess" | "reportedUsage" | "management" | "relevance" | "platform" | "availability" | "host" | "status"
   | "createdWithinDays" | "publisher" | "environmentId" | "sortBy" | "sortDirection">;
 
 type Option = { value: string; label: string };
@@ -38,15 +38,31 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
   const trigger = useRef<HTMLButtonElement>(null);
   const firstField = useRef<HTMLSelectElement>(null);
   const id = useId();
+  function changeChoice<T extends string>(value: string, choices: readonly { value: T }[], change: (value: T) => void) {
+    const choice = choices.find(option => option.value === value);
+    if (!choice) {
+      onError("Choose a supported agent filter.");
+      return;
+    }
+    change(choice.value);
+  }
   const fields = [
     { key: "platform", label: "Built with", all: "All platforms", value: values.platform, options: options.platforms,
       change: (value: string) => onChange({ platform: value }) },
+    { key: "endUserAccess", label: "End-user access", all: agentAccessOptions[0].label, value: values.endUserAccess, options: agentAccessOptions.slice(1),
+      change: (value: string) => changeChoice(value, agentAccessOptions, endUserAccess => onChange({ endUserAccess })) },
+    { key: "reportedUsage", label: "Reported usage", all: agentUsageOptions[0].label, value: values.reportedUsage, options: agentUsageOptions.slice(1),
+      change: (value: string) => changeChoice(value, agentUsageOptions, reportedUsage => onChange({ reportedUsage })) },
+    { key: "management", label: "Management", all: agentManagementOptions[0].label, value: values.management, options: agentManagementOptions.slice(1),
+      change: (value: string) => changeChoice(value, agentManagementOptions, management => onChange({ management })) },
     { key: "availability", label: "Assigned access", all: "Any assignment", value: values.availability, options: options.availability,
       change: (value: string) => onChange({ availability: value }) },
     { key: "host", label: "Host", all: "All hosts", value: values.host, options: options.hosts,
       change: (value: string) => onChange({ host: value }) },
     { key: "publisher", label: "Publisher", all: "All publishers", value: values.publisher, options: options.publishers,
       change: (value: string) => onChange({ publisher: value }) },
+    { key: "relevance", label: "Organization/usage evidence", all: agentRelevanceOptions[0].label, value: values.relevance, options: agentRelevanceOptions.slice(1),
+      change: (value: string) => changeChoice(value, agentRelevanceOptions, relevance => onChange({ relevance })) },
   ];
   const chips = fields.filter(field => field.value !== "all").map(field => ({
     key: field.key, label: field.label,
@@ -208,7 +224,7 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
             </label>
           </div>
           <footer>
-            <span>You can also sort using column headings.</span>
+            <span>Filters combine with the quick view. Missing management evidence stays unknown.</span>
             <button type="button" className="secondary" disabled={!hasFilters} onClick={() => {
               onClear();
               firstField.current?.focus();
@@ -217,6 +233,8 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
         </div> : null}
       </div>
     </div>
+    {values.agentView === "user_managed" || values.agentView === "organization_managed" || values.management !== "all"
+      ? <p className="notice" role="note">Management views show confirmed evidence only. Sharing, installation or missing data alone does not establish who manages an agent.</p> : null}
     {hasFilters ? <div className="agent-filter-chips" aria-label="Active filters">
       {chips.map(chip => <button key={chip.key} type="button" className="agent-filter-chip"
         aria-label={`Remove ${chip.label.toLowerCase()} filter`} title={`${chip.label}: ${chip.value}`}

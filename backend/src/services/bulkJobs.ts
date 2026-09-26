@@ -284,18 +284,18 @@ async function releaseIfOwned(repository: BulkJobExecutionRepository, lease: Lea
 }
 
 async function authorizeDelegatedJob(scope: DataScope, capabilityId: CapabilityId) {
-  const user = await revalidateAuthenticatedUser(scope.principalId);
+  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The job initiator no longer matches the signed-in account.");
   await capabilities.requireAvailable(capabilityId, user);
-  return acquireDelegatedToken(scope.principalId, capabilityId);
+  return acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
 }
 
 async function authorizeReconciliation(scope: DataScope, capabilityId: CapabilityId) {
-  const user = await revalidateAuthenticatedUser(scope.principalId);
+  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The reconciliation actor no longer matches the signed-in account.");
   if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to reconcile package mutations.");
   await capabilities.requireAvailable(capabilityId, user);
-  return acquireDelegatedToken(scope.principalId, capabilityId);
+  return acquireDelegatedToken(scope.tenantId, scope.principalId, capabilityId);
 }
 
 async function finishAuthorized(

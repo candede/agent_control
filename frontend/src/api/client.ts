@@ -506,6 +506,27 @@ export function subscribeSessionRevalidationRequired(listener: (error: ApiError)
   };
 }
 
+export async function startSignIn(
+  input: { username: string; returnTo?: string },
+  options: { signal?: AbortSignal } = {},
+) {
+  const result = await request<{ authorizationUrl: string }>("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+    signal: options.signal,
+  }, { revalidateSession: false });
+  let target: URL;
+  try {
+    if (!result || typeof result.authorizationUrl !== "string") throw new Error();
+    target = new URL(result.authorizationUrl);
+    if (target.protocol !== "https:" || target.username || target.password) throw new Error();
+  } catch {
+    throw new ApiError(200, "invalid_response", "The server returned an invalid sign-in URL. Please try again.");
+  }
+  return { authorizationUrl: target.href };
+}
+
 export async function getCurrentUser(options: { signal?: AbortSignal } = {}) {
   assertCurrentRequest(sessionGeneration, options.signal);
   const generation = ++sessionGeneration;
@@ -1369,7 +1390,7 @@ function auditContextHeaders(context: AuditRequestContext | undefined) {
     : undefined;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, options: { revalidateSession?: boolean } = {}): Promise<T> {
   return requestBody(path, {
     ...init,
     headers: {
@@ -1390,14 +1411,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       }
       throw error;
     }
-  });
+  }, options);
 }
 
 function requestBlob(path: string, init: RequestInit) {
   return requestBody(path, init, response => response.blob());
 }
 
-async function requestBody<T>(path: string, init: RequestInit, readBody: (response: Response) => Promise<T>): Promise<T> {
+async function requestBody<T>(
+  path: string,
+  init: RequestInit,
+  readBody: (response: Response) => Promise<T>,
+  options: { revalidateSession?: boolean } = {},
+): Promise<T> {
   const generation = sessionGeneration;
   let response: Response | undefined;
   try {
@@ -1413,7 +1439,7 @@ async function requestBody<T>(path: string, init: RequestInit, readBody: (respon
       throw new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
     }
     if (error instanceof ApiError) {
-      notifySessionRevalidation(error);
+      if (options.revalidateSession !== false) notifySessionRevalidation(error);
       throw error;
     }
     if (!response || error instanceof TypeError) {

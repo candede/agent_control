@@ -8,6 +8,7 @@ afterEach(() => vi.restoreAllMocks());
 
 const defaults: AgentFilterValues = {
   search: "", agentView: "all", platform: "all", availability: "all", host: "all",
+  endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
   status: "all", createdWithinDays: "", publisher: "all", environmentId: "",
   sortBy: "displayName", sortDirection: "asc",
 };
@@ -48,7 +49,7 @@ describe("inventory filter toolbar", () => {
     const dialog = within(screen.getByRole("dialog", { name: "Filter agents" }));
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(dialog.getByRole("combobox", { name: "Built with" })).toHaveFocus();
-    for (const name of ["Built with", "Assigned access", "Host", "Publisher", "Package status", "Environment", "Sort"]) {
+    for (const name of ["Built with", "End-user access", "Reported usage", "Management", "Assigned access", "Host", "Publisher", "Package status", "Environment", "Sort"]) {
       expect(dialog.getByRole("combobox", { name })).toBeVisible();
     }
     expect(dialog.getByRole("spinbutton", { name: "Created within days" })).toBeVisible();
@@ -78,7 +79,7 @@ describe("inventory filter toolbar", () => {
   it("applies filters immediately, preserves them on outside dismissal, and resets without changing sort", async () => {
     const { user, changed } = setup();
     await user.type(screen.getByRole("searchbox", { name: "Search" }), "policy");
-    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "available");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "first_party");
     await user.click(screen.getByRole("button", { name: "Filters" }));
     await user.selectOptions(screen.getByRole("combobox", { name: "Built with" }), "studio");
     expect(changed).toHaveBeenLastCalledWith({ platform: "studio" });
@@ -108,6 +109,26 @@ describe("inventory filter toolbar", () => {
     expect(screen.getByRole("button", { name: "Filters, 1 active" })).toHaveFocus();
     await user.click(screen.getByRole("button", { name: "Remove environment filter" }));
     expect(screen.getByRole("button", { name: "Filters" })).toBeVisible();
+  });
+
+  it("combines quick views with independent evidence filters and removes each without changing the view", async () => {
+    const { user, changed } = setup();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "third_party");
+    await user.click(screen.getByRole("button", { name: "Filters" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "End-user access" }), "available");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Reported usage" }), "used");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Management" }), "organization_managed");
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Remove reported usage filter" }));
+    expect(changed).toHaveBeenLastCalledWith({ reportedUsage: "all" });
+    expect(screen.getByRole("button", { name: "Remove end-user access filter" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Remove management filter" })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    await user.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+    expect(screen.queryByRole("button", { name: /Remove .* filter/ })).not.toBeInTheDocument();
   });
 
   it("preserves keyboard focus when applying an environment or resetting the panel", async () => {

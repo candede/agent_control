@@ -7,8 +7,9 @@ import type { InventorySnapshot, PowerPlatformResource } from "../types/powerPla
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
 import { projectPackageDetails } from "./packageDetailProjection.js";
 import { projectPackageControl } from "./packageControlProjection.js";
+import { capturePackageMutationState } from "./packageMutationState.js";
 import { unifiedAgentRecordId, unifiedAgentInventoryScopes } from "../types/unifiedAgents.js";
-import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
+import type { UnifiedAgentInventoryQuery, UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import type { AgentUsageContext, AgentUsageSummary } from "../types/agentUsage.js";
 import { agentColumnValue, agentStatusLabels } from "../types/agentPresentation.js";
 import { combineAgentInventoryRevision } from "./agentUsage.js";
@@ -183,7 +184,121 @@ function inventoryScopeDependencies() {
   });
 }
 
+function quickViewDependencies() {
+  const packages: CopilotPackageDetail[] = [
+    { ...packageValue("first", "First"), type: "microsoft", authoringTool: null, availableTo: "all" },
+    { ...packageValue("vendor", "Vendor"), type: "external", authoringTool: null, availableTo: "some" },
+    { ...packageValue("personal", "Personal"), type: "custom", authoringTool: "Copilot Studio Lite", availableTo: "none", deployedTo: "none" },
+    ...["studio-low", "studio-high", "admin-blocked"].map(id => {
+      const item = {
+        ...packageValue(id, id), type: "external", availableTo: "all", deployedTo: "none",
+        publisher: "Vendor", supportedHosts: ["Teams"], allowedUsersAndGroups: [], acquireUsersAndGroups: [],
+      };
+      return projectPackageControl(item, {
+        detail: item, state: capturePackageMutationState(item, "update-availability"),
+        observation: { snapshotId: "admin-control", observedAt: "2026-09-15T10:00:00.000Z", expiresAt: "2026-09-22T00:00:00.000Z" },
+      });
+    }),
+    { ...packageValue("generic", "Generic"), type: "external", availableTo: "some", deployedTo: "all",
+      acquireUsersAndGroups: [{ resourceId: "installation-group", resourceType: "group" }] },
+    { ...packageValue("unknown", "Unknown"), authoringTool: null },
+    { ...packageValue("zero", "Zero"), type: "external", availableTo: "some" },
+  ];
+  const deps = dependencies({
+    packages: packages.reverse(),
+    resources: [{ ...resource(environmentB, "native"), authoringTool: null }],
+  });
+  const counts = new Map([["vendor", 6], ["personal", 2], ["studio-low", 2], ["studio-high", 10], ["admin-blocked", 3], ["zero", 0]]);
+  deps.usage.project = vi.fn(async (_scope, records) => ({
+    context: usageContext,
+    summaries: new Map(records.map(record => {
+      const id = record.packages[0]?.id;
+      const responses = id ? counts.get(id) : undefined;
+      return [record.id, {
+        status: responses !== undefined ? "linked" : id === "generic" ? "unlinked" : "unavailable",
+        reportSetId: "report", responses: responses ?? (id === "generic" ? 99 : null),
+        activeUsers: 100, lastActivityDateUtc: "2026-09-15", associations: [],
+      } satisfies AgentUsageSummary];
+    })),
+  }));
+  return deps;
+}
+
 describe("UnifiedAgentsService", () => {
+  it.each([
+    { query: { view: "first_party", endUserAccess: "available", management: "unknown" }, expected: ["first"] },
+    { query: { view: "third_party", reportedUsage: "used", management: "unknown" }, expected: ["vendor"] },
+    { query: { view: "user_managed", endUserAccess: "unavailable", reportedUsage: "used", relevance: "organization" }, expected: ["personal"] },
+    { query: { view: "copilot_studio", endUserAccess: "available", reportedUsage: "used", management: "organization_managed", relevance: "organization" },
+      expected: ["studio-high", "studio-low"] },
+    { query: { view: "organization_managed", endUserAccess: "unavailable", reportedUsage: "used" }, expected: ["admin-blocked"] },
+    { query: { view: "all", endUserAccess: "unknown", management: "unknown" }, expected: ["native", "unknown"] },
+    { query: { view: "all", management: "unknown", relevance: "unknown" }, expected: ["zero", "unknown"] },
+    { query: { view: "availability_unknown", management: "unknown", relevance: "organization" }, expected: ["native"] },
+    { query: { view: "unknown", reportedUsage: "used" }, expected: [] },
+    { query: { view: "used", endUserAccess: "unavailable", management: "user_managed" }, expected: ["personal"] },
+    { query: { view: "available", management: "user_managed" }, expected: [] },
+    { query: { view: "unavailable", endUserAccess: "available" }, expected: [] },
+    { query: { view: "organization", endUserAccess: "unavailable", reportedUsage: "used" }, expected: ["admin-blocked", "personal"] },
+    { query: { view: "copilot_studio", reportedUsage: "used", management: "organization_managed", publisher: "Vendor",
+      host: "Teams", platform: "Copilot Studio", blocked: false, source: "graph_packages", inventoryScope: "catalog" },
+      expected: ["studio-high", "studio-low"] },
+    { query: { view: "copilot_studio", management: "unknown", search: "Generic" }, expected: ["generic"] },
+    { query: { view: "organization_managed", search: "Generic" }, expected: [] },
+    { query: { view: "copilot_studio", source: "power_platform" }, expected: [] },
+  ] satisfies Array<{ query: UnifiedAgentInventoryQuery; expected: string[] }>)(
+    "intersects quick views and filters before counts, numeric ordering, paging and CSV: $query", async ({ query, expected }) => {
+      const deps = quickViewDependencies();
+      const service = new UnifiedAgentsService(deps);
+      const scope = { tenantId, principalId: "viewer" };
+      const selection = { ...query, sortBy: "responses" as const, sortDirection: "desc" as const, offset: expected.length > 1 ? 1 : 0, limit: 1 };
+      const identify = (record: UnifiedAgentRecord) => record.packages[0]?.id ?? record.powerPlatformResource!.nativeId;
+      const page = await service.list(scope, selection);
+      expect(page).toMatchObject({
+        count: expected.length, summary: { total: 10 }, filteredSummary: { total: expected.length },
+        scopeSummary: { total: query.inventoryScope === "catalog" ? 9 : 10 }, revision: inventoryRevision,
+      });
+      expect(page.value.map(identify)).toEqual(expected.slice(selection.offset, selection.offset + 1));
+      expect(vi.mocked(deps.usage.project).mock.calls[0][1]).toHaveLength(10);
+      expect(deps.packages.readUnifiedSource).toHaveBeenCalledWith(scope);
+      expect(deps.powerPlatform.readUnifiedSource).toHaveBeenCalledWith(scope);
+      const exported = await service.forExport(scope, page.revision!, selection);
+      expect(exported.count).toBe(expected.length);
+      expect(exported.value.map(identify)).toEqual(expected);
+      expect(exported.filteredSummary).toEqual(page.filteredSummary);
+      const csv = buildUnifiedAgentCsv(exported, Date.now() + 15_000);
+      const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
+      expect(csv.rowCount).toBe(expected.length);
+      expect(rows.map(row => row.agentId)).toEqual(exported.value.map(record => record.id));
+      expect(rows.map(row => row.responses)).toEqual(exported.value.map(record => String(record.usage?.responses ?? "")));
+    },
+  );
+
+  it("classifies linked packages together and preserves positive admin controls without using generic group acquisition", async () => {
+    const deps = dependencies({
+      packages: [
+        { ...packageValue("microsoft", "First", true), type: "microsoft", availableTo: "all",
+          acquireUsersAndGroups: [{ resourceId: "group", resourceType: "group" }] },
+        { ...packageValue("external", "Third", true), type: "external", availableTo: "some", deployedTo: "all",
+          controlObservations: { access: {
+            snapshotId: "admin-control", observedAt: "2026-09-15T00:00:00.000Z", expiresAt: "2026-09-22T00:00:00.000Z",
+          } } },
+      ],
+      resources: [{ ...resource(environmentA), details: { isQuarantined: true } }],
+    });
+    const service = new UnifiedAgentsService(deps);
+    const scope = { tenantId, principalId: "viewer" };
+    expect((await service.list(scope, { view: "first_party" })).count).toBe(0);
+    expect((await service.list(scope, { view: "third_party" })).count).toBe(0);
+    const query = { view: "copilot_studio" as const, management: "organization_managed" as const, endUserAccess: "unavailable" as const };
+    const page = await service.list(scope, query);
+    expect(page).toMatchObject({ count: 1, filteredSummary: { total: 1, linked: 1 }, summary: { total: 1 } });
+    expect(page.value[0].packages).toHaveLength(2);
+    expect(page.value[0].packages.find(item => item.id === "external")?.controlObservations?.access?.snapshotId).toBe("admin-control");
+    expect((await service.forExport(scope, page.revision!, query)).value).toEqual(page.value);
+    expect((await service.list(scope, { ...query, endUserAccess: "available" })).count).toBe(0);
+  });
+
   it.each([
     { inventoryScope: "catalog", total: 3, linked: 1, graphOnly: 2, powerPlatformOnly: 0,
       overview: { availableToUsers: 2, organizationCreated: 1, teamsAvailable: 1, createdOrAvailable: 1 },

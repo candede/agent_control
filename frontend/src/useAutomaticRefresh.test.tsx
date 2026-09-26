@@ -73,6 +73,28 @@ afterEach(() => {
 });
 
 describe("automatic saved-data refresh", () => {
+  it("separates active browser checks from ongoing server refreshes and clears activity after failures", async () => {
+    const initial = deferred<AutomaticRefreshResult>();
+    const later = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(initial.promise).mockReturnValueOnce(later.promise);
+    const props = options({ enabled: false });
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props });
+    expect(hook.result.current.checking).toBe(false);
+    hook.rerender({ ...props, enabled: true });
+    await settle();
+    expect(hook.result.current.checking).toBe(true);
+    await act(async () => initial.resolve(response({ run: sourceRun("users", "running") })));
+    expect(hook.result.current.phase).toBe("refreshing");
+    expect(hook.result.current.checking).toBe(false);
+    await advance(59_999);
+    expect(hook.result.current.checking).toBe(false);
+    await advance(1);
+    expect(hook.result.current.checking).toBe(true);
+    await act(async () => later.reject(new ApiError(503, "unavailable", "Status check unavailable")));
+    expect(hook.result.current.phase).toBe("backoff");
+    expect(hook.result.current.checking).toBe(false);
+  });
+
   it("checks after valid sign-in, invalidates the first publication, then only changed source revisions", async () => {
     const props = options({ enabled: false });
     const { rerender } = renderHook(useAutomaticRefresh, { initialProps: props });
@@ -96,11 +118,13 @@ describe("automatic saved-data refresh", () => {
     const pending = deferred<AutomaticRefreshResult>();
     check.mockReturnValueOnce(pending.promise);
     const props = options();
-    renderHook(useAutomaticRefresh, { initialProps: props, wrapper: ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode> });
+    const hook = renderHook(useAutomaticRefresh, { initialProps: props, wrapper: ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode> });
     await settle();
     expect(check).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.checking).toBe(true);
     await advance(10 * 60_000);
     expect(check).toHaveBeenCalledTimes(1);
+    expect(hook.result.current.checking).toBe(false);
     await act(async () => pending.resolve(response()));
     await advance(60_000);
     expect(check).toHaveBeenCalledTimes(2);
@@ -133,10 +157,12 @@ describe("automatic saved-data refresh", () => {
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
     const signal = check.mock.calls[0][0]!.signal!;
+    expect(hook.result.current.checking).toBe(true);
     if (reason === "hidden") await visible(false);
     else if (reason === "offline") await online(false);
     else hook.rerender({ ...props, enabled: false });
     expect(signal.aborted).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
     await act(async () => pending.resolve(response()));
     expect(props.onSourcesChanged).not.toHaveBeenCalled();
     expect(props.onRunsChanged).not.toHaveBeenCalled();
@@ -156,9 +182,11 @@ describe("automatic saved-data refresh", () => {
     const first = options();
     const hook = renderHook(useAutomaticRefresh, { initialProps: first });
     await settle();
+    expect(hook.result.current.checking).toBe(true);
     const next = options({ [field]: "new-scope" });
     hook.rerender(next);
     expect(check.mock.calls[0][0]!.signal!.aborted).toBe(true);
+    expect(hook.result.current.checking).toBe(false);
     await settle();
     expect(check).toHaveBeenCalledTimes(1);
     await act(async () => pending.resolve(response({
@@ -171,6 +199,27 @@ describe("automatic saved-data refresh", () => {
     expect(check).toHaveBeenCalledTimes(2);
     expect(hook.result.current.message).toBeUndefined();
     expect(hook.result.current.phase).toBe("ready");
+    expect(hook.result.current.checking).toBe(false);
+  });
+
+  it("does not revive an aborted request indicator when pausing and resuming before the transport settles", async () => {
+    const previous = deferred<AutomaticRefreshResult>();
+    const current = deferred<AutomaticRefreshResult>();
+    check.mockReturnValueOnce(previous.promise).mockReturnValueOnce(current.promise);
+    const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
+    await settle();
+    expect(hook.result.current.checking).toBe(true);
+    act(() => hook.result.current.setPaused(true));
+    expect(hook.result.current.checking).toBe(false);
+    act(() => hook.result.current.setPaused(false));
+    await settle();
+    expect(hook.result.current.checking).toBe(false);
+    expect(check).toHaveBeenCalledTimes(1);
+    await act(async () => previous.resolve(response()));
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(hook.result.current.checking).toBe(true);
+    await act(async () => current.resolve(response()));
+    expect(hook.result.current.checking).toBe(false);
   });
 
   it("uses bounded exponential backoff and returns to minute checks after success", async () => {
@@ -212,9 +261,11 @@ describe("automatic saved-data refresh", () => {
     }));
     const hook = renderHook(useAutomaticRefresh, { initialProps: options() });
     await settle();
+    expect(hook.result.current.checking).toBe(true);
     await advance(30_000);
     expect(check.mock.calls[0][0]!.signal!.aborted).toBe(true);
     expect(hook.result.current.phase).toBe("backoff");
+    expect(hook.result.current.checking).toBe(false);
     await advance(59_999);
     expect(check).toHaveBeenCalledTimes(1);
     await advance(1);
@@ -238,6 +289,7 @@ describe("automatic saved-data refresh", () => {
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
     expect(hook.result.current.phase).toBe("sign_in_required");
+    expect(hook.result.current.checking).toBe(false);
     const calls = check.mock.calls.length;
     await advance(3_600_000);
     await visible(false);
@@ -320,6 +372,7 @@ describe("automatic saved-data refresh", () => {
     const hook = renderHook(useAutomaticRefresh, { initialProps: props });
     await settle();
     expect(hook.result.current.phase).toBe("permission_required");
+    expect(hook.result.current.checking).toBe(false);
     await advance(3_600_000);
     expect(check).toHaveBeenCalledTimes(1);
     check.mockImplementation(async () => response());
@@ -366,8 +419,10 @@ describe("automatic saved-data refresh", () => {
     check.mockReturnValueOnce(pending.promise);
     await advance(60_000);
     expect(hook.result.current.phase).toBe(status);
+    expect(hook.result.current.checking).toBe(true);
     await act(async () => pending.resolve(response()));
     expect(hook.result.current.phase).toBe(status);
+    expect(hook.result.current.checking).toBe(false);
     check.mockResolvedValueOnce(response({ run: sourceRun("users", "succeeded") }));
     await advance(60_000);
     expect(hook.result.current.phase).toBe(status);

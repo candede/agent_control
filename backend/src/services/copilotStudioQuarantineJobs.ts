@@ -280,11 +280,11 @@ export async function drainCopilotStudioQuarantineJobs() {
 }
 
 async function authorizeQuarantine(scope: QuarantineScope): Promise<QuarantineAuthorization> {
-  const user = await revalidateAuthenticatedUser(scope.principalId);
+  const user = await revalidateAuthenticatedUser(scope.tenantId, scope.principalId);
   if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The quarantine actor no longer matches the signed-in account.");
   await capabilities.requireAvailable("powerPlatform.quarantine.manage", user);
   const authority = await capabilities.quarantineAuthorityContext(user);
-  return { accessToken: await acquireDelegatedToken(scope.principalId, "powerPlatform.quarantine.manage"), authority };
+  return { accessToken: await acquireDelegatedToken(scope.tenantId, scope.principalId, "powerPlatform.quarantine.manage"), authority };
 }
 
 async function finishAuthorized(

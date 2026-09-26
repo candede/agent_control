@@ -1,6 +1,7 @@
 import session, { type SessionData } from "express-session";
 import connectPgSimple from "connect-pg-simple";
 import type pg from "pg";
+import { findTenantConfiguration } from "../config.js";
 import { AppError } from "../errors.js";
 import { isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
@@ -9,24 +10,61 @@ import type { AppRole } from "../types/capability.js";
 
 const PgSessionStore = connectPgSimple(session);
 
-export function createSessionStore(database: pg.Pool, tenantId: string) {
+export function createSessionStore(database: pg.Pool) {
   const store = new PgSessionStore({ pool: database, tableName: "sessions", createTableIfMissing: false,
     pruneSessionInterval: false, errorLog: () => operationalLog("error", "session_store_error") });
   const get = store.get.bind(store);
   const set = store.set.bind(store);
-  store.get = (id, callback) => get(id, (error, data) => callback(error, data?.tenantId === tenantId ? data : null));
-  store.set = (id, data, callback) => {
-    if (data.user && (data.user.tenantId !== tenantId || data.accountId !== data.user.homeAccountId)) {
-      callback?.(new Error("Session tenant/principal mismatch.")); return;
+  const destroy = store.destroy.bind(store);
+  store.get = (id, callback) => get(id, (error, data) => {
+    if (error || !data) { callback(error, null); return; }
+    const sanitized = sanitizedSession(data, false);
+    if (!sanitized) {
+      destroy(id, destroyError => callback(destroyError ?? null, null));
+      return;
     }
-    const sanitized: SessionData = {
-      cookie: data.cookie, tenantId, authFlowHandle: typeof data.authFlowHandle === "string" && /^[a-zA-Z0-9_-]{43}$/.test(data.authFlowHandle) ? data.authFlowHandle : undefined, accountId: data.accountId,
-      csrfToken: data.csrfToken, rolesValidatedAt: data.rolesValidatedAt, signedInAt: data.signedInAt,
-      user: data.user ? { tenantId, homeAccountId: data.user.homeAccountId, displayName: data.user.displayName.slice(0,256), username: data.user.username.slice(0,256), roles: [...new Set(data.user.roles.filter(isAppRole))].sort(), providerRoleIds: normalizeInventoryProviderRoleIds(data.user.providerRoleIds) } : undefined,
-    };
+    callback(null, sanitized);
+  });
+  store.set = (id, data, callback) => {
+    const sanitized = sanitizedSession(data, true);
+    if (!sanitized) { callback?.(new Error("Session tenant/principal/client mismatch.")); return; }
     set(id, sanitized, callback);
   };
   return store;
+}
+
+export function getValidatedSessionIdentity(data: Partial<SessionData> | undefined) {
+  return sessionIdentity(data, false);
+}
+
+function sessionIdentity(data: Partial<SessionData> | undefined, allowMissingClientId: boolean) {
+  const tenant = findTenantConfiguration(data?.tenantId);
+  const user = data?.user;
+  if (!tenant || !user || user.tenantId !== tenant.tenantId
+    || typeof data.accountId !== "string" || !data.accountId || data.accountId !== user.homeAccountId
+    || data.clientId !== tenant.clientId && !(allowMissingClientId && data.clientId === undefined)
+    || typeof user.username !== "string" || !user.username.trim() || typeof user.displayName !== "string"
+    || !Array.isArray(user.roles) || user.roles.some(role => typeof role !== "string")) return undefined;
+  return { tenantId: tenant.tenantId, clientId: tenant.clientId, accountId: data.accountId, user };
+}
+
+function sanitizedSession(data: SessionData, allowMissingClientId: boolean): SessionData | undefined {
+  const authFlowHandle = typeof data.authFlowHandle === "string" && /^[a-zA-Z0-9_-]{43}$/.test(data.authFlowHandle) ? data.authFlowHandle : undefined;
+  if (data.user === undefined && data.tenantId === undefined && data.clientId === undefined && data.accountId === undefined) {
+    return { cookie: data.cookie, authFlowHandle };
+  }
+  const identity = sessionIdentity(data, allowMissingClientId);
+  if (!identity) return undefined;
+  return {
+    cookie: data.cookie, tenantId: identity.tenantId, clientId: identity.clientId, accountId: identity.accountId, authFlowHandle,
+    csrfToken: data.csrfToken, rolesValidatedAt: data.rolesValidatedAt, signedInAt: data.signedInAt,
+    user: {
+      tenantId: identity.tenantId, homeAccountId: identity.accountId,
+      displayName: identity.user.displayName.slice(0, 256), username: identity.user.username.slice(0, 256),
+      roles: [...new Set(identity.user.roles.filter(isAppRole))].sort(),
+      providerRoleIds: normalizeInventoryProviderRoleIds(identity.user.providerRoleIds),
+    },
+  };
 }
 
 export async function revokeAccountSessions(database: pg.Pool, tenantId: string, principalId: string) {
@@ -68,11 +106,14 @@ export async function assertCurrentStoredSession(
   principalId: string,
   requiredRole: AppRole,
 ) {
+  const tenant = findTenantConfiguration(tenantId);
+  if (!tenant) throw AppError.unauthorized("The export session or required role is no longer current.");
   const result = await database.query(`SELECT 1 FROM sessions
     WHERE sid=$1 AND tenant_id=$2 AND principal_id=$3 AND expire>clock_timestamp()
+      AND sess->>'clientId'=$5 AND sess->'user'->>'tenantId'=$2 AND sess->'user'->>'homeAccountId'=$3
       AND (jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),$4)
         OR ($4='AgentControl.Viewer' AND jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),'AgentControl.Admin')))`,
-  [sessionId, tenantId, principalId, requiredRole]);
+  [sessionId, tenantId, principalId, requiredRole, tenant.clientId]);
   if (result.rowCount !== 1) throw AppError.unauthorized("The export session or required role is no longer current.");
 }
 

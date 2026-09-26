@@ -69,7 +69,7 @@ describe("explicit saved-source identity resolution", () => {
     const f = setup();
     const result = await f.service.resolve(f.user, recordId);
     expect(result.defender).toMatchObject({ status: "available", entraAgentIds: [objectId], entraAgentApplicationIds: [applicationId] });
-    expect(f.delegatedToken).toHaveBeenCalledExactlyOnceWith(f.user.homeAccountId, "graph.agentIdentity.read");
+    expect(f.delegatedToken).toHaveBeenCalledExactlyOnceWith(f.user.tenantId, f.user.homeAccountId, "graph.agentIdentity.read");
     expect(f.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture", objectId, expect.any(AbortSignal), expect.any(Function));
     expect(f.repository.save).toHaveBeenCalledExactlyOnceWith({ tenantId: f.user.tenantId, principalId: f.user.homeAccountId },
       f.source, resolvedIdentity, expect.any(Function));

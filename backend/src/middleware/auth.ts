@@ -1,34 +1,35 @@
 import { timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { AppError } from "../errors.js";
-import { config } from "../config.js";
 import { revalidateAuthenticatedUser } from "../auth/msal.js";
-import { beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
+import { beginAccountSessionValidation, commitAccountSessionValidation, getValidatedSessionIdentity } from "../db/sessions.js";
 import { capabilities } from "../services/capabilities.js";
 import { hasAppRole, type AppRole, type CapabilityId } from "../types/capability.js";
 
 export const roleRevalidationIntervalMs = 5 * 60 * 1000;
 
 export const requireSession: RequestHandler = async (request, _response, next) => {
-  if (!request.session.accountId || !request.session.user || !Array.isArray(request.session.user.roles) || !config.tenantId || request.session.user.tenantId !== config.tenantId || request.session.user.homeAccountId !== request.session.accountId) {
+  const identity = getValidatedSessionIdentity(request.session);
+  if (!identity) {
     request.session.destroy(error => next(error ?? AppError.unauthorized()));
     return;
   }
 
   try {
-    if (!request.session.rolesValidatedAt || Date.now() - request.session.rolesValidatedAt >= roleRevalidationIntervalMs) {
-      const validation = beginAccountSessionValidation(request.session.tenantId!, request.session.accountId);
-      const previousRoles = request.session.user.roles;
-      const previousProviderRoleIds = request.session.user.providerRoleIds ?? [];
-      const user = await revalidateAuthenticatedUser(request.session.accountId);
+    const validatedAt = request.session.rolesValidatedAt;
+    if (typeof validatedAt !== "number" || !Number.isFinite(validatedAt) || validatedAt > Date.now() || Date.now() - validatedAt >= roleRevalidationIntervalMs) {
+      const validation = beginAccountSessionValidation(identity.tenantId, identity.accountId);
+      const user = await revalidateAuthenticatedUser(identity.tenantId, identity.accountId);
       await commitAccountSessionValidation(validation, async () => {
         await reloadSession(request);
-        if (user.tenantId !== request.session.tenantId || user.homeAccountId !== request.session.accountId) {
+        const current = getValidatedSessionIdentity(request.session);
+        if (!current || current.tenantId !== identity.tenantId || current.accountId !== identity.accountId || current.clientId !== identity.clientId
+          || user.tenantId !== identity.tenantId || user.homeAccountId !== identity.accountId) {
           throw AppError.unauthorized("Microsoft Entra ID returned a different signed-in account.");
         }
         request.session.user = user;
         request.session.rolesValidatedAt = Date.now();
-        if (previousRoles.join("\0") !== user.roles.join("\0") || previousProviderRoleIds.join("\0") !== (user.providerRoleIds ?? []).join("\0")) await capabilities.invalidatePrincipal(user);
+        if (current.user.roles.join("\0") !== user.roles.join("\0") || (current.user.providerRoleIds ?? []).join("\0") !== (user.providerRoleIds ?? []).join("\0")) await capabilities.invalidatePrincipal(user);
         await saveSession(request);
       });
     }
@@ -81,6 +82,7 @@ export const requireCsrf: RequestHandler = (request, _response, next) => {
 };
 
 export function requestScope(request: Request) {
-  if (!config.tenantId || request.session.user?.tenantId !== config.tenantId || !request.session.accountId) throw AppError.unauthorized();
-  return { tenantId: config.tenantId, principalId: request.session.accountId };
+  const identity = getValidatedSessionIdentity(request.session);
+  if (!identity) throw AppError.unauthorized();
+  return { tenantId: identity.tenantId, principalId: identity.accountId };
 }

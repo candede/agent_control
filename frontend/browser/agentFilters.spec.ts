@@ -200,7 +200,7 @@ test("filter dialog flips near the viewport bottom and stays contained and focus
 test("filter dismissal supports the close button, Escape, outside click and nonmodal keyboard navigation", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await page.goto("/agents");
-  const trigger = page.getByRole("button", { name: "Filters", exact: true });
+  const trigger = page.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ });
   const dialog = page.getByRole("dialog", { name: "Filter agents", exact: true });
   await trigger.focus();
   await page.keyboard.press("Enter");
@@ -221,6 +221,7 @@ test("filter dismissal supports the close button, Escape, outside click and nonm
   await trigger.click();
   await page.getByRole("region", { name: "Agent inventory overview" }).getByText("Reported used agents", { exact: true }).click();
   await expect(dialog).toHaveCount(0);
+  await expect(trigger).toHaveAccessibleName("Filters, 1 active");
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
 
   await trigger.focus();
@@ -386,7 +387,7 @@ test("each chip removes only its own restriction and Clear also resets search an
   await page.goto("/agents");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill("policy");
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("organization");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("first_party");
   const trigger = page.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "Filter agents", exact: true });
@@ -416,7 +417,7 @@ test("each chip removes only its own restriction and Clear also resets search an
     const latest = queries.at(-1)!;
     expect(Object.fromEntries(Object.keys(remaining).map(field => [field, latest.get(field)]))).toEqual(remaining);
     expect(Object.fromEntries(["search", "view", "sortBy", "sortDirection"].map(field => [field, latest.get(field)]))).toEqual({
-      search: "policy", view: "organization", sortBy: "lastModifiedAt", sortDirection: "desc",
+      search: "policy", view: "first_party", sortBy: "lastModifiedAt", sortDirection: "desc",
     });
     await expect(page.getByRole("button", { name: `Remove ${name} filter`, exact: true })).toHaveCount(0);
     await expect(trigger).toHaveAccessibleName(Object.keys(remaining).length ? `Filters, ${Object.keys(remaining).length} active` : "Filters");
@@ -430,7 +431,7 @@ test("each chip removes only its own restriction and Clear also resets search an
   await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toHaveValue("all");
   await expect(page).toHaveURL(/\/agents\?sort=lastModifiedAt&direction=desc$/);
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("organization");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("first_party");
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
   expect(unexpected).toEqual([]);
 });

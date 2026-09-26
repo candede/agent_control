@@ -27,3 +27,35 @@
 .automatic-refresh-actions button {
   font-size: inherit;
 }
+
+.background-refresh-indicator {
+  align-items: center;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #dfe5eb);
+  border-radius: 50%;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  color: var(--muted, #4b5563);
+  display: flex;
+  height: 32px;
+  justify-content: center;
+  pointer-events: none;
+  position: fixed;
+  right: max(12px, env(safe-area-inset-right));
+  width: 32px;
+  z-index: 20;
+}
+
+.background-refresh-indicator svg {
+  animation: background-refresh-spin 1.2s linear infinite;
+  transform-origin: center;
+}
+
+@keyframes background-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .background-refresh-indicator svg {
+    animation: none;
+  }
+}

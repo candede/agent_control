@@ -1,6 +1,6 @@
-import { formatAgentAuthoringTool, formatPackageFacetLabel, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
+import { formatAgentAuthoringTool, formatPackageFacetLabel, normalizePackageAuthoringTool, normalizePackageStatus, type CopilotPackage } from "./copilotPackage.js";
 import { powerPlatformAuthoringTool } from "./powerPlatformInventory.js";
-import type { SavedAgentPerson, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
+import type { SavedAgentPerson, UnifiedAgentInventoryQuery, UnifiedAgentRecord, UnifiedAgentSort, UnifiedAgentView } from "./unifiedAgents.js";
 
 export type AgentRelevanceReason = "organization_created" | "organization_shared" | "microsoft" | "deployed" | "reported_usage";
 export type AgentColumnValue = string | number | null;
@@ -30,11 +30,46 @@ export function agentRelevanceReasons(record: UnifiedAgentRecord): AgentRelevanc
 
 export function matchesAgentView(record: UnifiedAgentRecord, view: UnifiedAgentView = "all") {
   if (view === "all") return true;
+  if (view === "first_party" || view === "third_party") {
+    const origin = view === "first_party" ? "microsoft" : "external";
+    return record.packages.length > 0 && record.packages.every(item => item.type?.trim().toLowerCase() === origin);
+  }
+  if (view === "copilot_studio") return hasAuthoringTool(record, "copilotstudio");
+  if (view === "user_managed" || view === "organization_managed") return agentManagement(record) === view;
   if (view === "available" || view === "unavailable") return agentUserAvailability(record) === view;
   if (view === "availability_unknown") return agentUserAvailability(record) === "unknown";
   if (view === "used") return record.usage?.status === "linked" && (record.usage.responses ?? 0) > 0;
   const reasons = agentRelevanceReasons(record);
-  return view === "organization" ? reasons.length > 0 : reasons.length === 0;
+  return view === "organization" ? reasons.length > 0 : view === "unknown" && reasons.length === 0;
+}
+
+export function agentManagement(record: UnifiedAgentRecord): "user_managed" | "organization_managed" | "unknown" {
+  // Installation/acquisition scopes alone do not identify an admin actor; saved access controls do.
+  if (record.packages.some(item => item.controlObservations?.access
+    && [item.availableTo, item.deployedTo].some(value => {
+      const status = normalizePackageStatus(value);
+      return status === "all" || status === "some";
+    }))) return "organization_managed";
+  if (record.packages.length > 0 && hasAuthoringTool(record, "microsoft365copilotagentbuilder")
+    && record.packages.every(item => {
+      const origin = item.type?.trim().toLowerCase();
+      return (origin === "custom" || origin === "shared")
+        && normalizePackageStatus(item.availableTo) === "none" && normalizePackageStatus(item.deployedTo) === "none";
+    })) return "user_managed";
+  return "unknown";
+}
+
+export function matchesAgentFilters(record: UnifiedAgentRecord,
+  query: Pick<UnifiedAgentInventoryQuery, "view" | "endUserAccess" | "reportedUsage" | "management" | "relevance">): boolean {
+  return matchesAgentView(record, query.view)
+    && (!query.endUserAccess || query.endUserAccess === "all" || agentUserAvailability(record) === query.endUserAccess)
+    && (!query.reportedUsage || query.reportedUsage === "all" || matchesAgentView(record, "used"))
+    && (!query.management || query.management === "all" || agentManagement(record) === query.management)
+    && (!query.relevance || query.relevance === "all" || matchesAgentView(record, query.relevance));
+}
+
+function hasAuthoringTool(record: UnifiedAgentRecord, tool: string) {
+  return agentAuthoringToolLabels(record).some(label => normalizePackageAuthoringTool(label) === tool);
 }
 
 function packageAvailableToUsers(item: CopilotPackage) {

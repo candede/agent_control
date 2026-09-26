@@ -104,7 +104,7 @@ export class PowerPlatformInventoryService {
       if (current.status !== "waiting_authorization") throw new AppError(409, "inventory_job_state", "Only a waiting inventory refresh can be started.");
       ownedWaitingJob = true;
       stage = "revalidate_user";
-      const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+      const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
       assertCurrent();
       let token = "";
       await this.dependencies.observeOperation("powerPlatform.inventory.read", freshUser, async () => {
@@ -116,7 +116,7 @@ export class PowerPlatformInventoryService {
         await this.dependencies.requireAvailable("powerPlatform.inventory.read", freshUser, options);
         assertCurrent();
         stage = "delegated_token";
-        token = await this.dependencies.delegatedToken(scope.principalId, "powerPlatform.inventory.read");
+        token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "powerPlatform.inventory.read");
         assertCurrent();
         // Serialize the state change, not provider calls that would delay sign-out.
         await commitAccountSessionValidation(validation, async () => {
@@ -235,7 +235,7 @@ export class PowerPlatformInventoryService {
       }), { signal });
       stage = "publication_authorization";
       assertCurrent();
-      const freshUser = await this.dependencies.revalidateUser(scope.principalId);
+      const freshUser = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
       assertCurrent();
       requireSamePrincipal(scope, freshUser);
       requireReader(freshUser);

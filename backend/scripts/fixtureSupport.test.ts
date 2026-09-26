@@ -28,18 +28,24 @@ describe("browser fixture environment", () => {
     const env = browserEnvironment({
       TENANT_ID_FILE: "/unused/tenant", CLIENT_ID_FILE: "/unused/client",
       CLIENT_SECRET_FILE: "/unused/client-secret", SESSION_SECRET_FILE: "/unused/session",
+      TENANTS_JSON: "must-not-use-operator-tenants", TENANTS_JSON_FILE: "/unused/tenants",
+      TENANT_DOMAINS_FILE: "/unused/domains", TENANT_DISPLAY_NAME: "Operator organization",
       PGDATABASE: "agentcontrol_test_control", PGPASSWORD_FILE: "/unused/admin",
       APP_PGPASSWORD_FILE: "/unused/runtime",
     });
     configureBrowserFixtureEnvironment(env);
-    for (const name of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "SESSION_SECRET"]) {
+    for (const name of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "SESSION_SECRET", "TENANT_DOMAINS"]) {
       expect(env).not.toHaveProperty(`${name}_FILE`);
       expect(env[name]).toBeTruthy();
     }
+    expect(env).not.toHaveProperty("TENANTS_JSON");
+    expect(env).not.toHaveProperty("TENANTS_JSON_FILE");
+    expect(env).not.toHaveProperty("TENANT_DISPLAY_NAME");
     expect(env).toMatchObject({
       NODE_ENV: "test", AGENT_CONTROL_FIXTURE_MODE: "browser",
       TENANT_ID: "11111111-1111-1111-1111-111111111111",
       CLIENT_ID: "22222222-2222-2222-2222-222222222222",
+      TENANT_DOMAINS: "example.invalid",
       FRONTEND_ORIGIN: "http://localhost:3001", REDIRECT_URI: "http://localhost:3001/api/auth/callback",
       PGDATABASE: "agentcontrol_test_control", PGPASSWORD_FILE: "/unused/admin",
       APP_PGPASSWORD_FILE: "/unused/runtime",

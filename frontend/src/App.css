@@ -52,6 +52,27 @@
   width: 100%;
 }
 
+.signin-form {
+  display: grid;
+  gap: 12px;
+  width: min(440px, 100%);
+  min-width: 0;
+}
+
+.signin-form label {
+  color: var(--text-h);
+  font-weight: 700;
+}
+
+.signin-form input {
+  min-height: 44px;
+}
+
+.signin-hint {
+  color: #45504d;
+  font-size: 14px;
+}
+
 .signin-button {
   justify-self: start;
   margin-top: 2px;
@@ -59,7 +80,7 @@
   font-weight: 800;
 }
 
-.signin-button[aria-disabled="true"] {
+.signin-button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }

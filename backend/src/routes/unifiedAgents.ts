@@ -5,7 +5,10 @@ import { assertAccountSessionValidation, beginAccountSessionValidation } from ".
 import { requestScope } from "../middleware/auth.js";
 import { unifiedAgents } from "../services/unifiedAgents.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys, unifiedAgentViews } from "../types/unifiedAgents.js";
+import {
+  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys, unifiedAgentViews,
+  unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
+} from "../types/unifiedAgents.js";
 import { isAuditOperationPrefix } from "../types/audit.js";
 import { policyRoute } from "./policy.js";
 import { getAuditLog } from "../services/auditLog.js";
@@ -216,6 +219,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
   const allowed = new Set([
     "recordId", "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher",
     "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view", "inventoryScope",
+    "endUserAccess", "reportedUsage", "management", "relevance",
   ]);
   const normalized: Record<string, unknown> = {};
   for (const [key, field] of Object.entries(query)) {
@@ -247,7 +251,11 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
   const blocked = first(query.blocked);
   return {
     inventoryScope: oneOf(first(query.inventoryScope), "inventoryScope", unifiedAgentInventoryScopes) ?? "all",
-    view: oneOf(first(query.view), "view", unifiedAgentViews),
+    view: filterValue(query.view, "view", unifiedAgentViews),
+    endUserAccess: filterValue(query.endUserAccess, "endUserAccess", unifiedAgentAccessFilters),
+    reportedUsage: filterValue(query.reportedUsage, "reportedUsage", unifiedAgentUsageFilters),
+    management: filterValue(query.management, "management", unifiedAgentManagementFilters),
+    relevance: filterValue(query.relevance, "relevance", unifiedAgentRelevanceFilters),
     recordId: exactRecordId(first(query.recordId)),
     operationIdPrefix: operationReference(first(query.operationIdPrefix)),
     search: optionalText(first(query.search), "search", 256),
@@ -305,6 +313,14 @@ function oneOf<const T extends readonly string[]>(value: unknown, name: string, 
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value !== "string" || !values.includes(value)) {
     throw invalidQuery(`${name} must be one of: ${values.join(", ")}.`);
+  }
+  return value as T[number];
+}
+
+function filterValue<const T extends readonly string[]>(value: unknown, name: string, values: T): T[number] | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !values.includes(value)) {
+    return invalidQuery(`${name} must be one of: ${values.join(", ")}.`);
   }
   return value as T[number];
 }

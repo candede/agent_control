@@ -114,7 +114,7 @@ export class CopilotStudioQuarantineControlService {
     const observed = await this.dependencies.observeOperation(capabilityId, user, async () => {
       const current = await this.authorize(scope, capabilityId);
       assertAccountSessionValidation(validation);
-      const token = await this.dependencies.delegatedToken(scope.principalId, capabilityId);
+      const token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, capabilityId);
       const providerResults: Array<FrozenQuarantineTarget["directStatus"]> = [];
       for (const value of missing) {
         assertAccountSessionValidation(validation);
@@ -138,7 +138,7 @@ export class CopilotStudioQuarantineControlService {
   }
 
   private async authorize(scope: QuarantineScope, capabilityId: CapabilityId) {
-    const user = await this.dependencies.revalidateUser(scope.principalId);
+    const user = await this.dependencies.revalidateUser(scope.tenantId, scope.principalId);
     if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId) throw AppError.unauthorized("The quarantine status actor changed accounts.");
     await this.dependencies.requireAvailable(capabilityId, user);
     return user;

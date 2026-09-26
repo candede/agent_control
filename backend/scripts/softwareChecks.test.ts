@@ -70,7 +70,7 @@ describe("isolated aggregate software qualification", () => {
   });
 
   it("uses a new database with fixture-only settings and never forwards application secrets", async () => {
-    for (const key of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "CLIENT_SECRET_FILE", "SESSION_SECRET", "SESSION_SECRET_FILE", "DATABASE_URL", "NODE_OPTIONS"]) {
+    for (const key of ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "CLIENT_SECRET_FILE", "TENANTS_JSON", "TENANTS_JSON_FILE", "TENANT_DOMAINS", "TENANT_DOMAINS_FILE", "SESSION_SECRET", "SESSION_SECRET_FILE", "DATABASE_URL", "NODE_OPTIONS"]) {
       vi.stubEnv(key, "real-application-setting-must-not-reach-fixtures");
     }
     await runSoftwareChecks();

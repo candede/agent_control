@@ -1,6 +1,6 @@
 import { acquireApplicationToken, acquireDelegatedToken, revalidateAuthenticatedUser } from "../auth/msal.js";
 import { setTimeout as delay } from "node:timers/promises";
-import { config } from "../config.js";
+import { findTenantConfiguration } from "../config.js";
 import { PackageInventoryRepository, type PackageDataScope, type PackageRefreshInput, type PackageScanResult } from "../db/packageInventory.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
@@ -35,7 +35,7 @@ type PackageRefreshDependencies = {
   observeOperation: typeof capabilities.observeOperation;
   requireApplicationDataScope: typeof capabilities.requireApplicationDataScope;
   scan: PackageRefreshScan;
-  applicationPrincipalId: () => string | undefined;
+  applicationPrincipalId: (tenantId: string) => string | undefined;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
 
@@ -48,7 +48,7 @@ const defaultDependencies: PackageRefreshDependencies = {
   observeOperation: capabilities.observeOperation.bind(capabilities),
   requireApplicationDataScope: capabilities.requireApplicationDataScope.bind(capabilities),
   scan: (token, ids, signal, progress, options) => scanPackages(token, ids, signal, progress, graphPackages, options),
-  applicationPrincipalId: () => config.clientId,
+  applicationPrincipalId: tenantId => findTenantConfiguration(tenantId)?.clientId,
   wait: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
 };
 
@@ -76,13 +76,13 @@ export class PackageInventoryService {
     requireRefreshRole(user);
     requireProviderAdmissions();
     if (input.tokenMode === "application") await this.dependencies.requireApplicationDataScope("graph.package.read.application", user);
-    const scope = dataScope(user, input.tokenMode, this.dependencies.applicationPrincipalId());
+    const scope = dataScope(user, input.tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
     return this.repository.submit(scope, { ...input, authorizationPrincipalId: user.homeAccountId });
   }
 
   async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number, signal?: AbortSignal) {
     requireRefreshRole(user);
-    const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId());
+    const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId(user.tenantId!));
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
     const assertCurrent = () => {
       signal?.throwIfAborted();
@@ -123,7 +123,7 @@ export class PackageInventoryService {
 
   async start(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], options: { retryFailed?: boolean } = {}) {
     const actor = actorScope(user);
-    const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
+    const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
     id = id.toLowerCase();
     if (this.draining) throw new AppError(503, "package_refresh_shutdown", "Package refreshes are stopping for application shutdown.");
     requireProviderAdmissions();
@@ -178,7 +178,7 @@ export class PackageInventoryService {
       }
       // Persisted mode, not a caller hint, owns the lane before provider authorization begins.
       this.starting.get(id)!.autoDetails = autoDetails;
-      const freshUser = await this.dependencies.revalidateUser(actor.principalId);
+      const freshUser = await this.dependencies.revalidateUser(actor.tenantId, actor.principalId);
       assertCurrent();
       requireSamePrincipal(actor, freshUser);
       requireRefreshRole(freshUser);
@@ -188,8 +188,8 @@ export class PackageInventoryService {
       await this.dependencies.requireAvailable(capabilityId, freshUser, options);
       assertCurrent();
       token = await this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
-        ? this.dependencies.delegatedToken(actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(capabilityId), { signal, clearOnSuccess: false });
+        ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
+        : this.dependencies.applicationToken(actor.tenantId, capabilityId), { signal, clearOnSuccess: false });
       assertCurrent();
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
@@ -227,14 +227,14 @@ export class PackageInventoryService {
   }
 
   async get(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"]) {
-    const job = await this.repository.getJob(dataScope(user, tokenMode, this.dependencies.applicationPrincipalId()), id);
+    const job = await this.repository.getJob(dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!)), id);
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
     return job;
   }
 
   async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], cancellationReason: RefreshCancellationReason = "requested") {
     requireRefreshRole(user);
-    const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId());
+    const scope = dataScope(user, tokenMode, this.dependencies.applicationPrincipalId(user.tenantId!));
     id = id.toLowerCase();
     const job = await this.repository.getJob(scope, id);
     if (!job || job.authorizationPrincipalId !== user.homeAccountId) throw new AppError(404, "not_found", "Package refresh job was not found.");
@@ -292,8 +292,8 @@ export class PackageInventoryService {
             assertCurrent();
             const capabilityId = capabilityForMode(current.tokenMode);
             const currentToken = current.tokenMode === "delegated"
-              ? await this.dependencies.delegatedToken(actor.principalId, capabilityId)
-              : await this.dependencies.applicationToken(capabilityId);
+              ? await this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
+              : await this.dependencies.applicationToken(actor.tenantId, capabilityId);
             assertCurrent();
             return currentToken;
           },
@@ -303,7 +303,7 @@ export class PackageInventoryService {
         stage = "publication_authorization";
         try {
           assertCurrent();
-          const freshUser = await this.dependencies.revalidateUser(actor.principalId);
+          const freshUser = await this.dependencies.revalidateUser(actor.tenantId, actor.principalId);
           assertCurrent();
           requireSamePrincipal(actor, freshUser);
           requireRefreshRole(freshUser);

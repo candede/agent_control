@@ -250,15 +250,57 @@ describe("cumulative retained agent activity", () => {
 });
 
 describe("inventory dashboard source boundaries", () => {
+  it.each([0, 2])("selects the used view when the selected report has %i used agents", async usedAgents => {
+    const report = usageOverviewFixture();
+    report.summary.usedAgents = usedAgents;
+    vi.mocked(api.getOfficialUsageOverview).mockResolvedValue(report);
+    const onUsageChange = vi.fn();
+    const { rerender } = render(<AgentInventoryOverview revision={0} reportedUsage="all" onUsageChange={onUsageChange} />);
+    const button = screen.getByRole("button", { name: "Show reported used agents" });
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(within(button).getByText(String(usedAgents))).toBeVisible();
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(button);
+    expect(onUsageChange).toHaveBeenCalledExactlyOnceWith("used");
+    rerender(<AgentInventoryOverview revision={0} reportedUsage="used" onUsageChange={onUsageChange} />);
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(button);
+    expect(onUsageChange).toHaveBeenLastCalledWith("all");
+    rerender(<AgentInventoryOverview revision={0} endUserAccess="available" reportedUsage="all" onUsageChange={onUsageChange} />);
+    expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("disables the used view shortcut while loading and when no report is selected", async () => {
+    let resolve!: (value: api.OfficialUsageOverviewView) => void;
+    vi.mocked(api.getOfficialUsageOverview).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    const onUsageChange = vi.fn();
+    render(<AgentInventoryOverview revision={0} onUsageChange={onUsageChange} />);
+    const button = screen.getByRole("button", { name: "Show reported used agents" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveTextContent("Unknown");
+    await userEvent.click(button);
+    const report = usageOverviewFixture();
+    report.summary.retainedSets = 0;
+    report.summary.usedAgents = 0;
+    await act(async () => resolve(report));
+    expect(button).toBeDisabled();
+    expect(button).toHaveTextContent("No selected report data");
+    await userEvent.click(button);
+    expect(onUsageChange).not.toHaveBeenCalled();
+  });
+
   it("keeps absent inventory unknown while loading only the selected report evidence", async () => {
     vi.mocked(api.getOfficialUsageOverview).mockRejectedValueOnce(new Error("History unavailable."));
-    render(<AgentInventoryOverview revision={0} />);
+    render(<AgentInventoryOverview revision={0} onClearFilters={vi.fn()} onAccessChange={vi.fn()} onUsageChange={vi.fn()} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("History unavailable.");
     const overview = screen.getByRole("region", { name: "Agent inventory overview" });
+    const usedButton = within(overview).getByRole("button", { name: "Show reported used agents" });
+    expect(usedButton).toBeDisabled();
     expect(within(overview).getAllByText("Unknown")).toHaveLength(4);
     expect(within(overview).queryByRole("link")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Retry activity evidence" }));
     await waitFor(() => expect(within(overview).getByText("Reported used agents").parentElement).toHaveTextContent("2"));
+    expect(usedButton).toBeEnabled();
     expect(api.getOfficialUsageOverview).toHaveBeenLastCalledWith(expect.objectContaining({ scope: "selected" }), expect.anything());
     expect(overview).toHaveTextContent("Selected report set");
     expect(within(overview).getByText("Agents in catalog").parentElement).toHaveTextContent("Unknown");

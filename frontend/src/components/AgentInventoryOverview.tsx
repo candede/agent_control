@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { UnifiedAgentInventoryPage } from "../api/client";
-import type { UnifiedAgentInventoryScope, UnifiedAgentView } from "../../../backend/src/types/unifiedAgents";
+import type { UnifiedAgentAccessFilter, UnifiedAgentInventoryScope, UnifiedAgentUsageFilter } from "../../../backend/src/types/unifiedAgents";
 import { agentInventoryScopeOptions, inventoryScopeAgentCount } from "../agentColumns";
 import { useOfficialUsageOverview } from "../useOfficialUsageOverview";
 import { usageCount, usageDate } from "../usageInsights";
@@ -28,11 +28,16 @@ export function AgentInventoryScopes({ inventory, value, onChange }: {
   </div>;
 }
 
-export function AgentInventoryOverview({ inventory, revision, view, onViewChange, inventoryScope = "catalog", reportSelector }: {
+export function AgentInventoryOverview({ inventory, revision, allSelected, onClearFilters,
+  endUserAccess = "all", reportedUsage = "all", onAccessChange, onUsageChange, inventoryScope = "catalog", reportSelector }: {
   inventory?: UnifiedAgentInventoryPage;
   revision: number;
-  view?: UnifiedAgentView;
-  onViewChange?: (view: "all" | "available") => void;
+  allSelected?: boolean;
+  onClearFilters?: () => void;
+  endUserAccess?: UnifiedAgentAccessFilter;
+  reportedUsage?: UnifiedAgentUsageFilter;
+  onAccessChange?: (value: UnifiedAgentAccessFilter) => void;
+  onUsageChange?: (value: UnifiedAgentUsageFilter) => void;
   inventoryScope?: UnifiedAgentInventoryScope;
   reportSelector?: ReactNode;
 }) {
@@ -50,18 +55,18 @@ export function AgentInventoryOverview({ inventory, revision, view, onViewChange
     <div className="agent-overview-metrics">
       <Metric label={selectedScope.metric} value={scopeCount(inventory, inventoryScope)}
         hint={inventory?.partial ? "Includes unavailable agents · Partial data" : "Includes unavailable agents"}
-        selected={view === "all"} onClick={onViewChange ? () => onViewChange("all") : undefined} />
+        selected={allSelected} onClick={onClearFilters} />
       <Metric label="Available to end users" value={hasInventory ? scopedInventory?.inventoryOverview?.availableToUsers ?? null : null}
         hint={inventory?.partial ? "In this view · Partial data" : "All or selected users"}
-        selected={view === "available"} onClick={onViewChange ? () => onViewChange("available") : undefined} />
+        selected={endUserAccess === "available"} onClick={onAccessChange ? () => onAccessChange(endUserAccess === "available" ? "all" : "available") : undefined} />
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
-        hint={reports ? "In selected report set" : "No selected report data"} />
+        hint={reports ? "In selected report set" : "No selected report data"}
+        selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
       <Metric label="Reported active · 30 days" value={reports?.activeAgents30Days ?? null}
         hint={reports && data ? `${usageDate(data.summary.activeSinceDateUtc)} - ${usageDate(data.summary.asOf)} (UTC)` : "No selected report data"} />
       <div className="agent-report-context">
         <span className="agent-context-label">Report context</span>
         {reportSelector ?? <span>Selected report set</span>}
-        <small>Reported counts are independent of inventory.</small>
       </div>
     </div>
     {loading ? <p role="status">Loading selected report evidence...</p> : null}

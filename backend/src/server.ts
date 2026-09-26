@@ -24,9 +24,11 @@ if (operationalState.mode === "normal") {
   await purviewAudit.recover();
   await defenderHunting.recover();
   await copilotStudioQuarantineJobs.recoverInterrupted(true);
-  if (config.tenantId) await bulkJobs.recover(config.tenantId, true);
-  if (config.tenantId) await new PackageMutationQualificationRepository().recoverInterrupted(config.tenantId);
-  if (config.tenantId) await new CopilotStudioQuarantineCanaryRepository().recoverInterrupted(config.tenantId);
+  for (const tenant of config.tenants) {
+    await bulkJobs.recover(tenant.tenantId, true);
+    await new PackageMutationQualificationRepository().recoverInterrupted(tenant.tenantId);
+    await new CopilotStudioQuarantineCanaryRepository().recoverInterrupted(tenant.tenantId);
+  }
 }
 const { app, store } = createApp();
 const server = app.listen(config.port, "0.0.0.0", () => {

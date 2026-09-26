@@ -8,6 +8,9 @@ import { buildBoundedCsv, createExportPublicationValidator, csvValue, publishBou
 
 const storedSession = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("../db/pool.js", () => ({ pool: storedSession, secretValue: () => undefined }));
+vi.mock("../config.js", () => ({
+  findTenantConfiguration: (tenantId: string) => tenantId === "csv-tenant" ? { tenantId, clientId: "csv-client" } : undefined,
+}));
 
 beforeEach(() => storedSession.query.mockReset().mockResolvedValue({ rowCount: 1, rows: [{}] }));
 
@@ -323,13 +326,13 @@ describe("export session publication fence", () => {
     const accountId = `csv-principal-${++sequence}`;
     Object.assign(request, {
       sessionID: `session-${accountId}`,
-      session: { accountId, user: { tenantId: "csv-tenant", homeAccountId: accountId,
+      session: { accountId, tenantId: "csv-tenant", clientId: "csv-client", user: { tenantId: "csv-tenant", homeAccountId: accountId,
         roles: ["AgentControl.Admin"], username: "reader@example.invalid", displayName: "Reader" } },
     });
     return { request, response };
   }
 
-  it.each(["logout", "superseding login", "role removal", "session destruction", "session replacement"] as const)(
+  it.each(["logout", "superseding login", "role removal", "session destruction", "session replacement", "tenant replacement", "client replacement"] as const)(
     "rejects %s during an in-flight stored-session read",
     async change => {
       const { request, response } = authorizedTransport();
@@ -354,6 +357,10 @@ describe("export session publication fence", () => {
         request.session.user!.roles = [];
       } else if (change === "session destruction") {
         Reflect.deleteProperty(request, "session");
+      } else if (change === "tenant replacement") {
+        request.session.tenantId = "another-tenant";
+      } else if (change === "client replacement") {
+        request.session.clientId = "another-client";
       } else {
         request.sessionID = "replacement-session";
       }
@@ -402,7 +409,7 @@ describe("export session publication fence", () => {
     const validate = () => validateSession(validateSource);
     await validate();
     expect(storedSession.query).toHaveBeenCalledWith(expect.any(String), [
-      request.sessionID, "csv-tenant", request.session.accountId, "AgentControl.Viewer",
+      request.sessionID, "csv-tenant", request.session.accountId, "AgentControl.Viewer", "csv-client",
     ]);
     expect(validateSource).toHaveBeenCalledOnce();
     validateSource.mockRejectedValueOnce(new AppError(409, "dataset_invalidated", "Source expired."));

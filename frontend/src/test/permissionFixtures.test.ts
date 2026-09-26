@@ -38,6 +38,8 @@ describe("permission browser fixture boundaries", () => {
     const login = new URL(fixtureLoginUrl("scenario & role=Viewer"));
     expect(login.origin).toBe(origin);
     expect(login.pathname).toBe("/api/auth/login");
+    expect(login.searchParams.get("username")).toBe("fixture@example.invalid");
+    expect([...login.searchParams.keys()]).toEqual(["username", "returnTo"]);
     const returnTo = new URL(login.searchParams.get("returnTo")!, origin);
     expect(returnTo.pathname).toBe("/permissions");
     expect([...returnTo.searchParams]).toEqual([["fixture", "scenario & role=Viewer"]]);

@@ -1,4 +1,9 @@
-import { parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentViews, unifiedAgentInventoryScopes, type UnifiedAgentInventoryScope, type UnifiedAgentSort, type UnifiedAgentView } from "../../backend/src/types/unifiedAgents";
+import {
+  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentQuickViews,
+  unifiedAgentInventoryScopes, unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
+  type UnifiedAgentInventoryScope, type UnifiedAgentSort, type UnifiedAgentQuickView,
+  type UnifiedAgentAccessFilter, type UnifiedAgentUsageFilter, type UnifiedAgentManagementFilter, type UnifiedAgentRelevanceFilter,
+} from "../../backend/src/types/unifiedAgents";
 import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
 import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } from "../../backend/src/types/audit";
 
@@ -16,7 +21,11 @@ export type WorkbenchViewId = (typeof workbenchViewIds)[number];
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
-  agentView: UnifiedAgentView;
+  agentView: UnifiedAgentQuickView;
+  endUserAccess: UnifiedAgentAccessFilter;
+  reportedUsage: UnifiedAgentUsageFilter;
+  management: UnifiedAgentManagementFilter;
+  relevance: UnifiedAgentRelevanceFilter;
   search: string;
   status: "all" | "allowed" | "blocked";
   publisher: string;
@@ -155,6 +164,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
   const params = new URLSearchParams(search);
   const query = (params.get("q") ?? "").slice(0, 256);
   const status = params.get("status");
+  const legacyView = params.get("show");
   const sortBy = params.get("sort");
   const selectedIds = [...new Set(params.getAll("selected").filter(validSelectedId))].slice(0, maximumPackageSelection);
   const selectionCount = boundedSelectionCount(params.get("selectionCount"));
@@ -166,7 +176,13 @@ export function parseAgentRoute(search: string): AgentRouteState {
     : rawDetailId;
   return {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
-    agentView: unifiedAgentViews.find(value => value === params.get("show")) ?? "all",
+    agentView: unifiedAgentQuickViews.find(value => value === params.get("show")) ?? "all",
+    endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access"))
+      ?? (legacyView === "available" || legacyView === "unavailable" ? legacyView : legacyView === "availability_unknown" ? "unknown" : "all"),
+    reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (legacyView === "used" ? "used" : "all"),
+    management: unifiedAgentManagementFilters.find(value => value === params.get("management")) ?? "all",
+    relevance: unifiedAgentRelevanceFilters.find(value => value === params.get("relevance"))
+      ?? (legacyView === "organization" || legacyView === "unknown" ? legacyView : "all"),
     search: query,
     status: status === "allowed" || status === "blocked" ? status : "all",
     publisher: bounded(params.get("publisher"), 256) ?? "all",
@@ -198,6 +214,10 @@ export function agentRouteSearch(state: AgentRouteState) {
   const params = new URLSearchParams();
   if (state.inventoryScope !== "catalog") params.set("inventory", state.inventoryScope);
   if (state.agentView !== "all") params.set("show", state.agentView);
+  if (state.endUserAccess !== "all") params.set("access", state.endUserAccess);
+  if (state.reportedUsage !== "all") params.set("usage", state.reportedUsage);
+  if (state.management !== "all") params.set("management", state.management);
+  if (state.relevance !== "all") params.set("relevance", state.relevance);
   if (state.search.trim()) params.set("q", state.search.trim().slice(0, 256));
   if (state.status !== "all") params.set("status", state.status);
   if (state.publisher !== "all") params.set("publisher", state.publisher);

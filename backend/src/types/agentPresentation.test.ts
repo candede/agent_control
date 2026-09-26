@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { agentColumnValue, agentPersonLabel, agentRelevanceReasons, agentUserAvailability, matchesAgentView, summarizeAgentAvailability } from "./agentPresentation.js";
+import { agentColumnValue, agentManagement, agentPersonLabel, agentRelevanceReasons, agentUserAvailability, matchesAgentFilters, matchesAgentView, summarizeAgentAvailability } from "./agentPresentation.js";
 import type { CopilotPackage } from "./copilotPackage.js";
+import type { PowerPlatformResource } from "./powerPlatformInventory.js";
 import type { UnifiedAgentRecord } from "./unifiedAgents.js";
+import { unifiedAgentAccessFilters, unifiedAgentManagementFilters, unifiedAgentQuickViews, unifiedAgentRelevanceFilters, unifiedAgentUsageFilters } from "./unifiedAgents.js";
 
 function record(packages: Array<Partial<CopilotPackage>> = [{}]): UnifiedAgentRecord {
   return {
@@ -16,6 +18,202 @@ function record(packages: Array<Partial<CopilotPackage>> = [{}]): UnifiedAgentRe
     observations: { graphPackages: null, packageSnapshots: {}, powerPlatform: null },
   };
 }
+
+function nativeResource(overrides: Partial<PowerPlatformResource> = {}): PowerPlatformResource {
+  return {
+    tenantId: "tenant", nativeId: "native", type: "microsoft.copilotstudio/agents",
+    location: null, displayName: null, environmentId: "environment", createdAt: null, createdBy: null,
+    lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: null, creatorType: "unknown",
+    agentKind: "agent", lifecycle: "unknown", identityConfidence: "exact_native", identifiers: [],
+    provenance: {}, details: {}, unknownFieldCount: 0, ...overrides,
+  };
+}
+
+const accessObservation = {
+  snapshotId: "control", observedAt: "2026-09-17T10:00:00Z", expiresAt: "2026-09-24T10:00:00Z",
+};
+const personalPackage: Partial<CopilotPackage> = {
+  type: "custom", authoringTool: "Microsoft 365 Copilot Agent Builder", availableTo: "none", deployedTo: "none",
+};
+
+describe("agent quick views and independent filters", () => {
+  it.each([
+    { types: ["microsoft"], first: true, third: false },
+    { types: [" MICROSOFT ", "microsoft"], first: true, third: false },
+    { types: ["external"], first: false, third: true },
+    { types: ["EXTERNAL", " external "], first: false, third: true },
+    ...[[], ["custom"], ["shared"], ["first_party"], ["third_party"], ["Microsoft Corporation"],
+      [undefined], ["future"], ["microsoft", "external"], ["microsoft", "custom"], ["external", "shared"],
+      ["microsoft", undefined], ["external", "future"]].map(types => ({ types, first: false, third: false })),
+  ])("classifies publisher party only from consistent saved package types: $types", ({ types, first, third }) => {
+    const value = record(types.map(type => ({
+      type, publisher: "Microsoft", displayName: "Microsoft Copilot", authoringTool: "Microsoft Copilot Studio",
+    })));
+    value.usage = { status: "unlinked", responses: 100, reportSetId: "report", activeUsers: 1, lastActivityDateUtc: null,
+      associations: [{ reportAgentId: "report-agent", reportAgentName: "Microsoft Copilot",
+        basis: "exact_package_id", target: { source: "graph_packages", packageId: "package-0" } }] };
+    expect(matchesAgentView(value, "first_party")).toBe(first);
+    expect(matchesAgentView(value, "third_party")).toBe(third);
+  });
+
+  it.each([
+    { authoringTool: "Copilot Studio" }, { authoringTool: "Microsoft Copilot Studio" },
+    { platform: "CopilotStudio" }, { shortDescription: "Built using Copilot Studio." },
+  ])("uses normalized saved package authoring evidence for Studio: %j", item => {
+    const value = record([item]);
+    expect(matchesAgentView(value, "copilot_studio")).toBe(true);
+    expect(matchesAgentView(value, "first_party")).toBe(false);
+  });
+
+  it.each(["Copilot Studio Lite", "Microsoft Copilot Studio Lite", "Microsoft 365 Copilot Agent Builder", "Agent Builder"])(
+    "does not put %s in the full Studio quick view", authoringTool => {
+      expect(matchesAgentView(record([{ authoringTool }]), "copilot_studio")).toBe(false);
+    },
+  );
+
+  it.each([
+    { details: {}, studio: false }, { details: { createdIn: "Future authoring tool" }, studio: false },
+    { details: { createdIn: "Copilot Studio" }, studio: true },
+    { details: { createdIn: "Copilot Studio Lite" }, studio: false },
+    { details: { createdIn: "Microsoft 365 Copilot Agent Builder" }, studio: false },
+  ])("uses native authoring evidence rather than the resource type: $details", ({ details, studio }) => {
+    const value = record([]);
+    value.powerPlatformResource = nativeResource({ details });
+    expect(matchesAgentView(value, "copilot_studio")).toBe(studio);
+    expect(matchesAgentView(value, "first_party")).toBe(false);
+    expect(matchesAgentView(value, "third_party")).toBe(false);
+    expect(agentManagement(value)).toBe("unknown");
+  });
+
+  it.each([
+    personalPackage,
+    { ...personalPackage, type: " SHARED " },
+    { ...personalPackage, authoringTool: "Copilot Studio Lite" },
+    { ...personalPackage, authoringTool: null, platform: "Microsoft 365 Copilot Agent Builder" },
+    { ...personalPackage, authoringTool: null, shortDescription: "Built using Microsoft 365 Copilot Agent Builder." },
+    { ...personalPackage, availableTo: "allowedForNoOne", deployedTo: "notDeployed", isBlocked: true },
+  ])("confirms user management only with internal origin, Builder and explicit negative scopes: %j", item => {
+    const value = record([item]);
+    expect(agentManagement(value)).toBe("user_managed");
+    expect(matchesAgentView(value, "user_managed")).toBe(true);
+    expect(matchesAgentView(value, "organization_managed")).toBe(false);
+  });
+
+  it.each([
+    { type: undefined }, { type: "microsoft" }, { type: "external" }, { type: "future" },
+    { authoringTool: null }, { authoringTool: "Copilot Studio" }, { authoringTool: "Agent Builder" },
+    { availableTo: undefined }, { availableTo: "future" }, { availableTo: "all" },
+    { deployedTo: undefined }, { deployedTo: "future" }, { deployedTo: "some" },
+  ])("leaves incomplete or contrary user-management evidence unknown: %j", override => {
+    expect(agentManagement(record([{ ...personalPackage, ...override }]))).toBe("unknown");
+  });
+
+  it("requires every package's internal origin and explicit negative scopes without inferring from missing catalogs", () => {
+    const value = record([personalPackage, { ...personalPackage, type: "shared", authoringTool: null }]);
+    expect(agentManagement(value)).toBe("user_managed");
+    for (const other of [{}, { type: "external", availableTo: "none", deployedTo: "none" },
+      { type: "custom", availableTo: "none" }, { type: "shared", availableTo: "none", deployedTo: "some" }]) {
+      value.packages = record([personalPackage, other]).packages;
+      expect(agentManagement(value)).toBe("unknown");
+    }
+    value.packages = record([{ ...personalPackage, authoringTool: null }]).packages;
+    value.powerPlatformResource = nativeResource({ details: { createdIn: "Copilot Studio Lite" } });
+    expect(agentManagement(value)).toBe("user_managed");
+    value.packages = [];
+    expect(agentManagement(value)).toBe("unknown");
+  });
+
+  it.each([
+    { availableTo: "all" }, { availableTo: "availableToSome" },
+    { deployedTo: "Installed-For-All" }, { deployedTo: "some" },
+  ])("requires verified administrative access controls as well as positive scopes: %j", scopes => {
+    const value = record([{ type: "external", ...scopes }]);
+    expect(agentManagement(value)).toBe("unknown");
+    value.packages[0].controlObservations = { block: accessObservation };
+    expect(agentManagement(value)).toBe("unknown");
+    value.packages[0].controlObservations.access = accessObservation;
+    expect(agentManagement(value)).toBe("organization_managed");
+    expect(matchesAgentView(value, "organization_managed")).toBe(true);
+  });
+
+  it("does not combine unrelated controls and installation scopes or infer an actor from native management/publication", () => {
+    const value = record([
+      { availableTo: "none", deployedTo: "none", controlObservations: { access: accessObservation } },
+      { type: "shared", availableTo: "some", deployedTo: "all", authoringTool: "Copilot Studio" },
+    ]);
+    value.powerPlatformResource = nativeResource({ lifecycle: "published", authoringTool: "Copilot Studio", details: { isManaged: true } });
+    expect(agentManagement(value)).toBe("unknown");
+    value.packages.pop();
+    expect(agentManagement(value)).toBe("unknown");
+    value.packages[0].availableTo = undefined;
+    value.packages[0].deployedTo = "future";
+    expect(agentManagement(value)).toBe("unknown");
+    value.packages = [];
+    expect(agentManagement(value)).toBe("unknown");
+  });
+
+  it("keeps management independent of block/quarantine and lets positive admin evidence override personal packages", () => {
+    const value = record([personalPackage, {
+      type: "shared", availableTo: "some", deployedTo: "none", isBlocked: true,
+      controlObservations: { access: accessObservation },
+    }]);
+    expect(agentManagement(value)).toBe("organization_managed");
+    expect(agentUserAvailability(value)).toBe("unavailable");
+    value.packages[1].isBlocked = false;
+    value.powerPlatformResource = nativeResource({ details: { isQuarantined: true } });
+    expect(agentManagement(value)).toBe("organization_managed");
+    expect(matchesAgentFilters(value, { view: "organization_managed", endUserAccess: "unavailable" })).toBe(true);
+    expect(matchesAgentFilters(value, { view: "organization_managed", endUserAccess: "available" })).toBe(false);
+    value.packages = record([personalPackage]).packages;
+    expect(agentManagement(value)).toBe("user_managed");
+  });
+
+  it.each([
+    { status: "linked", responses: 1, used: true },
+    { status: "linked", responses: 0, used: false },
+    { status: "linked", responses: null, used: false },
+    { status: "unlinked", responses: 5, used: false },
+    { status: "unavailable", responses: 5, used: false },
+  ] as const)("filters reported usage by positive linked responses, not activity or report names: $status $responses", ({ status, responses, used }) => {
+    const value = record([{ type: "external", availableTo: "all" }]);
+    value.usage = { status, responses, reportSetId: "report", activeUsers: 99, lastActivityDateUtc: "2026-09-17", associations: [] };
+    expect(matchesAgentFilters(value, { reportedUsage: "used" })).toBe(used);
+    expect(matchesAgentView(value, "used")).toBe(used);
+    expect(matchesAgentFilters(value, { relevance: "organization" })).toBe(used);
+    expect(matchesAgentFilters(value, { relevance: "unknown" })).toBe(!used);
+  });
+
+  it("intersects all six quick views with every independent filter and preserves legacy view meanings", () => {
+    const value = record([{
+      type: "external", authoringTool: "Copilot Studio", availableTo: "all", controlObservations: { access: accessObservation },
+    }]);
+    value.usage = { status: "linked", responses: 3, reportSetId: "report", activeUsers: 1, lastActivityDateUtc: null, associations: [] };
+    for (const view of unifiedAgentQuickViews) {
+      for (const endUserAccess of unifiedAgentAccessFilters) {
+        for (const reportedUsage of unifiedAgentUsageFilters) {
+          for (const management of unifiedAgentManagementFilters) {
+            for (const relevance of unifiedAgentRelevanceFilters) {
+              const query = { view, endUserAccess, reportedUsage, management, relevance };
+              expect(matchesAgentFilters(value, query), JSON.stringify(query)).toBe(
+                ["all", "third_party", "copilot_studio", "organization_managed"].includes(view)
+                && ["all", "available"].includes(endUserAccess)
+                && ["all", "organization_managed"].includes(management)
+                && ["all", "organization"].includes(relevance),
+              );
+            }
+          }
+        }
+      }
+    }
+    expect(matchesAgentFilters(value, { view: "used", management: "organization_managed" })).toBe(true);
+    expect(matchesAgentFilters(value, { view: "organization", endUserAccess: "available" })).toBe(true);
+    expect(matchesAgentFilters(value, { view: "available", endUserAccess: "unavailable" })).toBe(false);
+    const unknown = record([{}]);
+    expect(matchesAgentFilters(unknown, { view: "unknown", management: "unknown", endUserAccess: "unknown", relevance: "unknown" })).toBe(true);
+    expect(matchesAgentFilters(unknown, { view: "availability_unknown", reportedUsage: "used" })).toBe(false);
+    expect(matchesAgentFilters(unknown, {})).toBe(true);
+  });
+});
 
 describe("agent presentation and organizational relevance", () => {
   it("only presents a saved person's label for the same exact native user ID", () => {

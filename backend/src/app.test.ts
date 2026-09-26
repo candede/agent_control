@@ -36,6 +36,13 @@ import { dataSync } from "./services/dataSync.js";
 vi.hoisted(() => {
   process.env.TENANT_ID="11111111-1111-1111-1111-111111111111";
   process.env.CLIENT_ID="99999999-9999-4999-8999-999999999999";
+  process.env.CLIENT_SECRET="synthetic-app-test-secret";
+  process.env.TENANT_DOMAINS="example.invalid";
+  process.env.TENANTS_JSON=JSON.stringify([
+    {tenantId:process.env.TENANT_ID,clientId:process.env.CLIENT_ID,clientSecret:process.env.CLIENT_SECRET,domains:["example.invalid"]},
+    {tenantId:"33333333-3333-4333-8333-333333333333",clientId:"44444444-4444-4444-8444-444444444444",
+      clientSecret:"synthetic-other-app-test-secret",domains:["other.example.invalid"]},
+  ]);
   process.env.SESSION_SECRET="fixture-session-secret-never-used-outside-tests-01";
 });
 const huntingCapabilityFixture = vi.hoisted(() => ({ applicationRevision: 1 }));
@@ -47,14 +54,19 @@ const authFixture = vi.hoisted(() => ({
   redemptions: 0,
 }));
 const inventoryProviderFixture = vi.hoisted(() => ({ queries: 0 }));
-vi.mock("./auth/msal.js", () => ({
+vi.mock("./auth/msal.js", async original => {
+  const actual = await original<typeof import("./auth/msal.js")>();
+  return {
+  ...actual,
   acquireDelegatedToken: vi.fn(async () => "fixture-token"),
   acquireApplicationToken: vi.fn(async () => "fixture-application-token"),
-  createAuthFlow: (kind:string, options:Record<string,unknown> = {}) => ({kind,state:"fixture-state",nonce:"fixture-nonce",codeVerifier:"fixture-verifier",scopes:["openid","profile","offline_access"],createdAt:Date.now(),...options,returnTo:typeof options.returnTo === "string" ? options.returnTo : "/"}),
+  createAuthFlow: (kind:"login", options:Parameters<typeof actual.createAuthFlow>[1]) => ({
+    ...actual.createAuthFlow(kind, options),state:"fixture-state______________________________",nonce:"fixture-nonce".padEnd(43, "_"),codeVerifier:"fixture-verifier".padEnd(43, "_"),
+  }),
   createAuthorizationUrl: async () => "https://login.microsoftonline.com/fixture", redeemAuthorizationCode: async () => { authFixture.redemptions += 1; return {}; },
   toAuthenticatedUser: () => ({...authFixture.user,roles:[...authFixture.user.roles]}),
   matchesAuthState: (left:string,right:string) => left === right, evictAccount: vi.fn(async () => undefined), revalidateAuthenticatedUser: vi.fn(async () => { authFixture.revalidationStarted += 1; if (authFixture.pendingRevalidation) await authFixture.pendingRevalidation; return {...authFixture.revalidatedUser,roles:[...authFixture.revalidatedUser.roles]}; }),
-}));
+}; });
 vi.mock("./services/capabilities.js", () => ({ capabilities: {
   checkProgress: vi.fn(() => null),
   observeOperation: vi.fn(async (_id, _user, operation: (reportFailure: (error: unknown) => void) => Promise<unknown>) => operation(() => undefined)),
@@ -125,14 +137,14 @@ function signedSessionCookie(sid: string) {
   const signature=createHmac("sha256",config.sessionSecret).update(sid).digest("base64").replace(/=+$/g,"");
   return `agent-control.sid=${encodeURIComponent(`s:${sid}.${signature}`)}`;
 }
-async function roleCookie(principalId: string, roles: AppRole[], rolesValidatedAt = Date.now()) {
+async function roleCookie(principalId: string, roles: AppRole[], rolesValidatedAt = Date.now(), tenant = config.tenants[0]) {
   const sid=randomUUID();
-  await new Promise<void>((resolve,reject) => application.store.set(sid,{cookie:new session.Cookie({maxAge:60000}),tenantId:config.tenantId,accountId:principalId,csrfToken,rolesValidatedAt,user:{tenantId:config.tenantId!,homeAccountId:principalId,username:`${principalId}@example.invalid`,displayName:principalId,roles}},error => error ? reject(error) : resolve()));
+  await new Promise<void>((resolve,reject) => application.store.set(sid,{cookie:new session.Cookie({maxAge:60000}),tenantId:tenant.tenantId,clientId:tenant.clientId,accountId:principalId,csrfToken,rolesValidatedAt,user:{tenantId:tenant.tenantId,homeAccountId:principalId,username:`${principalId}@${tenant.domains[0]}`,displayName:principalId,roles}},error => error ? reject(error) : resolve()));
   return signedSessionCookie(sid);
 }
-async function publishPackageSnapshot(principalId: string, requestedIds?: string[]) {
+async function publishPackageSnapshot(principalId: string, requestedIds?: string[], tenantId = config.tenants[0].tenantId, displayName = "Fixture") {
   const repository = new PackageInventoryRepository(fixture.runtime);
-  const scope = { tenantId: config.tenantId!, principalId };
+  const scope = { tenantId, principalId };
   const job = await repository.submit(scope, {
     authorizationPrincipalId: principalId,
     tokenMode: "delegated",
@@ -143,7 +155,7 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
   await repository.publish(scope, job.id, {
     packages: [{
       id: "package-1",
-      displayName: "Fixture",
+      displayName,
       isBlocked: false,
       allowedUsersAndGroups: [{ resourceType: "user", resourceId: "sensitive-user" }],
       acquireUsersAndGroups: [],
@@ -162,10 +174,10 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
 }
 async function publishQuarantineInventory(principalId: string, ownerId?: string) {
   const repository = new PowerPlatformInventoryRepository(fixture.runtime);
-  const scope = { tenantId: config.tenantId!, principalId };
+  const scope = { tenantId: config.tenants[0].tenantId!, principalId };
   const job = await repository.submit(scope, { idempotencyKey: `quarantine-inventory-${principalId}-${randomUUID()}`, roleScope: "unknown", requestedTypes: ["microsoft.copilotstudio/agents"] });
   await repository.markRunning(scope, job.id);
-  await repository.publish(scope, job.id, { resources: [{ tenantId: config.tenantId!, nativeId: "native-agent", type: "microsoft.copilotstudio/agents",
+  await repository.publish(scope, job.id, { resources: [{ tenantId: config.tenants[0].tenantId!, nativeId: "native-agent", type: "microsoft.copilotstudio/agents",
     location: null, displayName: "Exact agent", environmentId: "11111111-1111-4111-8111-111111111111", createdAt: null, createdBy: null,
     lastPublishedAt: null, sourceSystem: "power_platform", authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent",
     lifecycle: "published", identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "native-agent" },
@@ -210,7 +222,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(result.headers.get("cache-control")).toBe("no-store");
       expect(await result.json()).toEqual(responseBody);
       expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-        homeAccountId: "automatic-viewer", tenantId: config.tenantId, roles: ["AgentControl.Viewer"],
+        homeAccountId: "automatic-viewer", tenantId: config.tenants[0].tenantId, roles: ["AgentControl.Viewer"],
       }), undefined);
       for (const body of [{ tenantId: "other" }, { principalId: "other" }, { signedInAt: Date.now() }, { clearSavedData: true }, { sources: ["usage_reports"] }, { mode: "full" }]) {
         expect((await send(body)).status).toBe(400);
@@ -317,19 +329,19 @@ describe.sequential("packaged API/session contracts", () => {
     expect(await response.json()).toMatchObject({ code: "unauthorized" });
   });
   it("regenerates the session at login and removes the previous identifier", async () => {
-    const login = await request("/api/auth/login");
+    const login = await request("/api/auth/login?username=fixture%40example.invalid");
     const previousCookie=login.headers.get("set-cookie")!.split(";")[0];
     cookie=previousCookie;
     const pendingSession=await fixture.runtime.query("SELECT sess::text AS value FROM sessions");
-    for (const secret of ["fixture-state","fixture-nonce","fixture-verifier"]) expect(JSON.stringify(pendingSession.rows)).not.toContain(secret);
+    for (const secret of ["fixture-state______________________________","fixture-nonce","fixture-verifier"]) expect(JSON.stringify(pendingSession.rows)).not.toContain(secret);
     const redemptions=authFixture.redemptions;
     const signInStartedAt = Date.now();
-    const callback=await request("/api/auth/callback?code=fixture&state=fixture-state");
+    const callback=await request("/api/auth/callback?code=fixture&state=fixture-state______________________________");
     expect(callback.status).toBe(302); cookie=callback.headers.get("set-cookie")!.split(";")[0];
     expect(cookie).not.toBe(previousCookie);
     const me=await request("/api/me"); expect(me.status).toBe(200); csrfToken=(await me.json()).csrfToken;
     expect((await request("/api/me",{headers:{Cookie:previousCookie}})).status).toBe(401);
-    expect((await request("/api/auth/callback?code=fixture&state=fixture-state")).status).toBe(400);
+    expect((await request("/api/auth/callback?code=fixture&state=fixture-state______________________________")).status).toBe(400);
     expect(authFixture.redemptions).toBe(redemptions+1);
     const stored=await fixture.runtime.query("SELECT sess::text AS value FROM sessions");
     expect(JSON.stringify(stored.rows)).not.toContain("fixture-token");
@@ -350,6 +362,47 @@ describe.sequential("packaged API/session contracts", () => {
       }), signedInAt);
     } finally { refresh.mockRestore(); }
   });
+  it("routes username-first login to a configured second tenant and rejects a callback from the first tenant", async () => {
+    const previousUser = authFixture.user;
+    const tenant = config.tenants[1];
+    const start = () => request("/api/auth/login", {
+      method: "POST", headers: { Cookie: "", "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "login-domain-b@other.example.invalid", returnTo: "/agents" }),
+    });
+    try {
+      const unknown = await request("/api/auth/login", {
+        method: "POST", headers: { Cookie: "", "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "admin@unconfigured.example" }),
+      });
+      expect(unknown.status).toBe(400);
+      expect(await unknown.json()).toMatchObject({ code: "unknown_tenant" });
+      const mismatched = await start();
+      expect(mismatched.status).toBe(200);
+      const rejected = await request("/api/auth/callback?code=fixture&state=fixture-state______________________________", {
+        headers: { Cookie: mismatched.headers.get("set-cookie")!.split(";")[0] },
+      });
+      expect(rejected.status).toBe(401);
+      authFixture.user = { ...previousUser, tenantId: tenant.tenantId, homeAccountId: "login-domain-b",
+        username: "login-domain-b@other.example.invalid" };
+      const login = await start();
+      expect(await login.json()).toEqual({ authorizationUrl: "https://login.microsoftonline.com/fixture" });
+      const signedIn = await request("/api/auth/callback?code=fixture&state=fixture-state______________________________", {
+        headers: { Cookie: login.headers.get("set-cookie")!.split(";")[0] },
+      });
+      expect(signedIn.status).toBe(302);
+      expect(signedIn.headers.get("location")).toBe("/agents");
+      const tenantCookie = signedIn.headers.get("set-cookie")!.split(";")[0];
+      const me = await request("/api/me", { headers: { Cookie: tenantCookie } });
+      expect(me.status).toBe(200);
+      const identity = await me.json();
+      expect(identity.user).toMatchObject({ tenantId: tenant.tenantId, homeAccountId: "login-domain-b" });
+      expect(JSON.stringify(identity)).not.toContain(tenant.clientSecret);
+      expect((await request("/api/auth/logout", {
+        method: "POST", headers: { Cookie: tenantCookie, "x-csrf-token": identity.csrfToken },
+      })).status).toBe(204);
+      expect((await request("/api/me", { headers: { Cookie: tenantCookie } })).status).toBe(401);
+    } finally { authFixture.user = previousUser; }
+  });
   it.each(["graph.package.read.delegated", "graph.agentIdentity.read", "defender.hunting.application", "unknown"])("retires permission consent for %s without creating an authorization transaction", async capabilityId => {
     const originalCookie=cookie;
     cookie=await roleCookie("fixture-principal",["AgentControl.Viewer"]);
@@ -361,7 +414,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(body).toMatchObject({ code: "admin_managed_permissions", detail: expect.stringContaining("Grant admin consent") });
       expect(body).not.toHaveProperty("authorizationUrl");
       const redemptions = authFixture.redemptions;
-      expect((await request("/api/auth/callback?code=fixture&state=fixture-state")).status).toBe(400);
+      expect((await request("/api/auth/callback?code=fixture&state=fixture-state______________________________")).status).toBe(400);
       expect(authFixture.redemptions).toBe(redemptions);
     } finally { cookie=originalCookie; }
   });
@@ -371,7 +424,7 @@ describe.sequential("packaged API/session contracts", () => {
     try {
       expect((await request("/api/auth/login")).status).toBe(302);
       authFixture.user.roles=[];
-      const callback=await request("/api/auth/callback?code=fixture&state=fixture-state");
+      const callback=await request("/api/auth/callback?code=fixture&state=fixture-state______________________________");
       expect(callback.status).toBe(302);
       cookie=callback.headers.get("set-cookie")!.split(";")[0];
       const me=await request("/api/me");
@@ -390,11 +443,11 @@ describe.sequential("packaged API/session contracts", () => {
         const login = await request("/api/auth/login?returnTo=%2F%3Fview%3Dpermissions");
         expect(login.status).toBe(302);
         const redemptions = authFixture.redemptions;
-        const result = await request(`/api/auth/callback?state=fixture-state&error=${providerError}&error_description=private-provider-text`);
+        const result = await request(`/api/auth/callback?state=fixture-state______________________________&error=${providerError}&error_description=private-provider-text`);
         expect(result.status).toBe(302);
         expect(result.headers.get("location")).toBe(`/?view=permissions&authorization=${outcome}`);
         expect(authFixture.redemptions).toBe(redemptions);
-        expect((await request("/api/auth/callback?state=fixture-state&error=access_denied")).status).toBe(400);
+        expect((await request("/api/auth/callback?state=fixture-state______________________________&error=access_denied")).status).toBe(400);
         expect(await (await request("/api/me")).json()).toMatchObject({ user: { roles: ["AgentControl.Viewer"] } });
       }
     } finally { cookie = originalCookie; }
@@ -422,7 +475,7 @@ describe.sequential("packaged API/session contracts", () => {
     const otherCookie = await roleCookie("other-security-reader", ["AgentControl.Viewer"]);
     const readerCookie = await roleCookie("ordinary-reader", ["AgentControl.Viewer"]);
     const repository = new PurviewAuditRepository(fixture.runtime);
-    const scope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
+    const scope = { tenantId: config.tenants[0].tenantId!, authorizationPrincipalId: principalId,
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
     const filters = { presetId: "copilot_interactions" as const, operations: ["CopilotInteraction"], startDateTime: "2026-09-09T10:00:00.000Z", endDateTime: "2026-09-09T11:00:00.000Z", userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [] };
     const job = await repository.submit(scope, { idempotencyKey: "provider-audit-http", filters });
@@ -463,7 +516,7 @@ describe.sequential("packaged API/session contracts", () => {
       const exportedRecord = Object.fromEntries(exportHeader.map((column, index) => [column, exportRow[index]]));
       expect(exportedRecord).toMatchObject({
         jobId: job.id,
-        tenantId: config.tenantId,
+        tenantId: config.tenants[0].tenantId,
         wrapperId: "wrapper-http",
         requestedStartDateTime: filters.startDateTime,
         requestedEndDateTime: filters.endDateTime,
@@ -479,7 +532,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(exportText).toContain(job.localRequestId);
       expect(exportText).not.toContain("promptText");
 
-      expect((await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action IN ('view-audit-search','export-audit-search') ORDER BY action", [config.tenantId, principalId])).rows).toEqual([
+      expect((await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action IN ('view-audit-search','export-audit-search') ORDER BY action", [config.tenants[0].tenantId, principalId])).rows).toEqual([
         { action: "export-audit-search", status: "succeeded", metadata: {
           source: "microsoft_purview_audit", jobId: job.id, resultingCount: 1, resultingBytes: expect.any(Number),
         } },
@@ -504,7 +557,7 @@ describe.sequential("packaged API/session contracts", () => {
     const otherCookie = await roleCookie("other-hunting-reader", ["AgentControl.Viewer"]);
     const readerCookie = await roleCookie("ordinary-hunting-reader", ["AgentControl.Viewer"]);
     const repository = new DefenderHuntingRepository(fixture.runtime);
-    const scope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
+    const scope = { tenantId: config.tenants[0].tenantId!, authorizationPrincipalId: principalId,
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
     const filters = { templateId: "agents_inventory" as const, startDateTime: "2026-09-09T10:00:00.000Z", endDateTime: "2026-09-09T11:00:00.000Z",
       agentIds: ["@defender-agent"], blueprintIds: [], actorObjectIds: [], operations: [] };
@@ -573,7 +626,7 @@ describe.sequential("packaged API/session contracts", () => {
       const exportText = await exported.text();
       const [exportHeader, exportValue] = parseCsv(exportText, { bom: true }) as string[][];
       const exportedRow = Object.fromEntries(exportHeader.map((column, index) => [column, exportValue[index]]));
-      expect(exportedRow).toMatchObject({ jobId: job.id, tenantId: config.tenantId, sourceTable: "AgentsInfo", agentId: "'@defender-agent",
+      expect(exportedRow).toMatchObject({ jobId: job.id, tenantId: config.tenants[0].tenantId, sourceTable: "AgentsInfo", agentId: "'@defender-agent",
         requestedStartDateTime: filters.startDateTime, requestedEndDateTime: filters.endDateTime, complete: "true", noData: "false" });
       expect(exportText).toContain("'=Formula agent");
       expect(exportText).toContain("'@defender-agent");
@@ -609,10 +662,10 @@ describe.sequential("packaged API/session contracts", () => {
         VALUES($1,'defender.hunting.application',true,true,$2)
         ON CONFLICT (tenant_id,capability_id) DO UPDATE SET enabled=true,shared_data_scope=true,
           revision=capability_configuration.revision+1,updated_by=EXCLUDED.updated_by,updated_at=clock_timestamp()
-        RETURNING revision`, [config.tenantId, principalId]);
+        RETURNING revision`, [config.tenants[0].tenantId, principalId]);
       huntingCapabilityFixture.applicationRevision = Number(configuration.rows[0].revision);
-      const applicationScope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
-        resultScope: { kind: "application" as const, scopeId: config.clientId!, configurationRevision: huntingCapabilityFixture.applicationRevision },
+      const applicationScope = { tenantId: config.tenants[0].tenantId!, authorizationPrincipalId: principalId,
+        resultScope: { kind: "application" as const, scopeId: config.tenants[0].clientId!, configurationRevision: huntingCapabilityFixture.applicationRevision },
         tokenMode: "application" as const };
       const applicationAuthority = { capabilityId: "defender.hunting.application" as const, contractRevision: "a".repeat(64),
         permissionRevision: "b".repeat(64), configurationRevision: huntingCapabilityFixture.applicationRevision };
@@ -633,14 +686,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await request(`/api/hunting/jobs/${applicationJob.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(200);
 
       const changedConfiguration = await fixture.operator.query<{ revision: string }>(`UPDATE capability_configuration
-        SET revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND capability_id='defender.hunting.application' RETURNING revision`, [config.tenantId]);
+        SET revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND capability_id='defender.hunting.application' RETURNING revision`, [config.tenants[0].tenantId]);
       huntingCapabilityFixture.applicationRevision = Number(changedConfiguration.rows[0].revision);
       const changedHistory = await request("/api/hunting/jobs?limit=10&offset=0", { headers: { Cookie: otherCookie } });
       await expect(changedHistory.json()).resolves.toMatchObject({ count: 0, value: [] });
       expect((await request(`/api/hunting/jobs/${applicationJob.id}/rows`, { headers: { Cookie: otherCookie } })).status).toBe(404);
       expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
 
-      const auditRows = (await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action LIKE '%hunting%' ORDER BY action,observed_at", [config.tenantId, principalId])).rows;
+      const auditRows = (await fixture.runtime.query("SELECT action,status,metadata FROM audit_projection WHERE tenant_id=$1 AND principal_id=$2 AND action LIKE '%hunting%' ORDER BY action,observed_at", [config.tenants[0].tenantId, principalId])).rows;
       expect(auditRows).toEqual(expect.arrayContaining([
         { action: "cancel-hunting", status: "succeeded", metadata: { source: "microsoft_defender_hunting" } },
         { action: "revoke-hunting-scope", status: "succeeded", metadata: { source: "microsoft_defender_hunting" } },
@@ -694,7 +747,7 @@ describe.sequential("packaged API/session contracts", () => {
         qualification: null, retainedScopeId: null,
       });
       await vi.waitFor(() => expect(vi.mocked(revalidateAuthenticatedUser).mock.calls.slice(revalidationCalls)
-        .filter(([accountId]) => accountId === principalId)).toHaveLength(1));
+        .filter(([, accountId]) => accountId === principalId)).toHaveLength(1));
       expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
       const cancelled = await request(`/api/hunting/jobs/${job.id}/cancel`, { method: "POST", headers: { Cookie: viewerCookie } });
       expect(cancelled.status).toBe(200);
@@ -732,7 +785,7 @@ describe.sequential("packaged API/session contracts", () => {
       assert(job !== null && typeof job === "object" && "id" in job && typeof job.id === "string");
       expect(job).toMatchObject({ status: "reconciling_create", activationCount: 1, providerRequestCount: 0 });
       await vi.waitFor(() => expect(vi.mocked(revalidateAuthenticatedUser).mock.calls.slice(revalidationCalls)
-        .filter(([accountId]) => accountId === "prompt-audit-reader")).toHaveLength(1));
+        .filter(([, accountId]) => accountId === "prompt-audit-reader")).toHaveLength(1));
       expect(vi.mocked(acquireDelegatedToken).mock.calls).toHaveLength(tokenCalls);
       expect((await request(`/api/audit-search/jobs/${job.id}/cancel`, { method: "POST", headers: { Cookie: securityCookie } })).status).toBe(200);
     } finally {
@@ -750,7 +803,7 @@ describe.sequential("packaged API/session contracts", () => {
       cookie=login.headers.get("set-cookie")!.split(";")[0];
       const redemptions=authFixture.redemptions;
       expect((await request("/api/auth/callback?code=fixture&state=wrong-state")).status).toBe(400);
-      expect((await request("/api/auth/callback?code=fixture&state=fixture-state")).status).toBe(400);
+      expect((await request("/api/auth/callback?code=fixture&state=fixture-state______________________________")).status).toBe(400);
       expect(authFixture.redemptions).toBe(redemptions);
     } finally { cookie=originalCookie; }
   });
@@ -760,7 +813,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect(confirmedBlock).toMatchObject({ summary: { risk: true } });
     const single=await request("/api/agents/package-1/block",{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(confirmedBlock)});
     expect(single.status).toBe(202); const job=await single.json();
-    await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=true,package_data=jsonb_set(package_data,'{isBlocked}','true'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId]);
+    await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=true,package_data=jsonb_set(package_data,'{isBlocked}','true'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
     try {
       expect((await (await request("/api/agents/package-1/block",{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(confirmedBlock)})).json()).id).toBe(job.id);
       for (const changed of [
@@ -771,7 +824,7 @@ describe.sequential("packaged API/session contracts", () => {
         expect((await request(changed[0],{method:"POST",headers:{"Idempotency-Key":key,"Content-Type":"application/json"},body:JSON.stringify(changed[1])})).status).toBe(409);
       }
     } finally {
-      await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=false,package_data=jsonb_set(package_data,'{isBlocked}','false'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId]);
+      await fixture.operator.query("UPDATE package_inventory_resources SET is_blocked=false,package_data=jsonb_set(package_data,'{isBlocked}','false'::jsonb) WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
     }
     expect((await request(`/api/agents/bulk-jobs/${job.id}`)).status).toBe(200);
     await request(`/api/agents/bulk-jobs/${job.id}/cancel`,{method:"POST"});
@@ -787,14 +840,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect(created.status).toBe("queued");
       const launches = vi.mocked(launchBulkJob).mock.calls.length;
       if (endpoint === "block-all") {
-        await fixture.operator.query("DELETE FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal'", [config.tenantId]);
+        await fixture.operator.query("DELETE FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal'", [config.tenants[0].tenantId]);
         expect((await request("/api/agents/block-all", { method: "POST", headers, body: JSON.stringify({ ids: ["different-package"], ...preview }) })).status).toBe(400);
       }
       expect((await (await request(`/api/agents/${endpoint}`,{method:"POST",headers,body})).json()).id).toBe(created.id);
       expect(vi.mocked(launchBulkJob).mock.calls.length).toBe(launches + 1);
-      expect(launchBulkJob).toHaveBeenLastCalledWith(created.id, { tenantId: config.tenantId, principalId: "fixture-principal" });
+      expect(launchBulkJob).toHaveBeenLastCalledWith(created.id, { tenantId: config.tenants[0].tenantId, principalId: "fixture-principal" });
       const repository = new JobRepository(fixture.runtime);
-      expect(await repository.claim(created.id, { tenantId: config.tenantId!, principalId: "fixture-principal" }, randomUUID())).toBeDefined();
+      expect(await repository.claim(created.id, { tenantId: config.tenants[0].tenantId!, principalId: "fixture-principal" }, randomUUID())).toBeDefined();
       const running = await request(`/api/agents/${endpoint}`, { method: "POST", headers, body });
       expect(running.status).toBe(202);
       expect(await running.json()).toMatchObject({ id: created.id, status: "running" });
@@ -805,9 +858,9 @@ describe.sequential("packaged API/session contracts", () => {
     expect(launchBulkJob).toHaveBeenCalled();
   });
   it("admits confirmed access intent while preserving role, CSRF and exact confirmation guards", async () => {
-    const prior = await fixture.operator.query("SELECT snapshot_id,package_data FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId]);
+    const prior = await fixture.operator.query("SELECT snapshot_id,package_data FROM package_inventory_resources WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId]);
     try {
-      await fixture.operator.query("UPDATE package_inventory_resources SET package_data=package_data || $2::jsonb WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenantId, { availableTo: "some", deployedTo: "none" }]);
+      await fixture.operator.query("UPDATE package_inventory_resources SET package_data=package_data || $2::jsonb WHERE tenant_id=$1 AND principal_id='fixture-principal' AND native_id='package-1'", [config.tenants[0].tenantId, { availableTo: "some", deployedTo: "none" }]);
       const intent = { action: "update-availability", ids: ["package-1"], mutationScope: "single", target: "availability", mode: "replace", scope: "none", principals: [] };
       const preview = await request("/api/agents/mutation-preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(intent) });
       expect(preview.status).toBe(200);
@@ -846,7 +899,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(restorationApproval).toMatchObject({ status: "approved", action: "unblock", approvedBy: { principalId: "approver" } });
 
       cookie = await roleCookie("operator", ["AgentControl.Admin"]);
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "operator", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "operator", displayName: "Operator", username: "operator@example.invalid", roles: ["AgentControl.Admin"] };
       const canaryDetails = (isBlocked: boolean) => allowlistedPackage({ id: "package-canary", displayName: "Canary", isBlocked });
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
         .mockResolvedValueOnce(canaryDetails(false))
@@ -865,8 +918,8 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_items WHERE job_id=ANY($1::uuid[]) AND status='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       expect((await fixture.operator.query("SELECT count(*)::int AS count FROM job_attempts WHERE job_id=ANY($1::uuid[]) AND outcome='succeeded' AND sent_at IS NOT NULL", [[result.jobs.originalId, result.jobs.restorationId]])).rows[0].count).toBe(2);
       const saved = new PackageInventoryRepository(fixture.runtime);
-      expect((await saved.get({ tenantId: config.tenantId!, principalId: "operator" }, "package-canary"))?.package.isBlocked).toBe(false);
-      expect(await saved.get({ tenantId: config.tenantId!, principalId: "another-operator" }, "package-canary")).toBeUndefined();
+      expect((await saved.get({ tenantId: config.tenants[0].tenantId!, principalId: "operator" }, "package-canary"))?.package.isBlocked).toBe(false);
+      expect(await saved.get({ tenantId: config.tenants[0].tenantId!, principalId: "another-operator" }, "package-canary")).toBeUndefined();
       expect((await request(`/api/agents/mutation-canaries/${approval.id}/execute`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true, restorationApprovalId: restorationApproval.id }) })).status).toBe(409);
       expect(GraphPackagesClient.prototype.blockPackage).toHaveBeenCalledTimes(1);
       expect(GraphPackagesClient.prototype.unblockPackage).toHaveBeenCalledTimes(1);
@@ -891,7 +944,7 @@ describe.sequential("packaged API/session contracts", () => {
       const original = await originalResponse.json();
       const restoration = await restorationResponse.json();
       cookie = await roleCookie("conflict-operator", ["AgentControl.Admin"]);
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "conflict-operator", displayName: "Conflict Operator", username: "conflict-operator@example.invalid", roles: ["AgentControl.Admin"] };
       const canaryDetails = (isBlocked: boolean) => allowlistedPackage({ id: approvalBody.targetId, displayName: "Canary", isBlocked });
       vi.mocked(GraphPackagesClient.prototype.getPackageDetails)
         .mockResolvedValueOnce(canaryDetails(false))
@@ -916,7 +969,7 @@ describe.sequential("packaged API/session contracts", () => {
   });
   it("retains Admin authority through reconciliation publication", async () => {
     const repository = new JobRepository(fixture.runtime);
-    const owner = { tenantId: config.tenantId!, principalId: "fixture-principal" };
+    const owner = { tenantId: config.tenants[0].tenantId!, principalId: "fixture-principal" };
     const intent: JobIntentInput = { action: "block", targets: [{ id: "reconcile-role-loss", displayName: "Reconcile", prestate: { kind: "block", isBlocked: false } }], actor: authFixture.user, requestPath: "/api/agents/block", scope: "single" };
     const job = await repository.submit(owner, { ...intent, idempotencyKey: randomUUID(), confirmationHash: createJobConfirmation(intent).confirmationHash });
     const provider = {
@@ -930,7 +983,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await request(`/api/agents/bulk-jobs/${job.id}/reconcile`, { method: "POST" })).status).toBe(403);
       expect(await repository.get(job.id, owner)).toMatchObject({ results: [{ reconciliationStatus: "required" }] });
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
     }
   });
   it("requires same-origin mutations and isolates saved jobs by principal", async () => {
@@ -1018,13 +1071,59 @@ describe.sequential("packaged API/session contracts", () => {
     expect(exact.status).toBe(200);
     expect(await exact.json()).toMatchObject({id:"package-1",allowedUsersAndGroups:[{resourceId:"sensitive-user"}]});
   });
+  it("isolates inventory, audit, exports, and logout when two tenants use the same account and provider IDs", async () => {
+    const principalId = "overlapping-tenant-http-account";
+    const tenantA = config.tenants[0];
+    const tenantB = config.tenants[1];
+    const cookieA = await roleCookie(principalId, ["AgentControl.Admin"], Date.now(), tenantA);
+    const cookieB = await roleCookie(principalId, ["AgentControl.Admin"], Date.now(), tenantB);
+    const snapshotA = await publishPackageSnapshot(principalId, undefined, tenantA.tenantId, "Tenant A only");
+    const snapshotB = await publishPackageSnapshot(principalId, undefined, tenantB.tenantId, "Tenant B only");
+    const events = [];
+    for (const tenant of [tenantA, tenantB]) {
+      events.push(await new AuditLog({ tenantId: tenant.tenantId, principalId }, fixture.runtime).startEvent({
+        operationId: "same-operation-id", scope: "single", action: "block", targetBlockedState: true,
+        agentId: "package-1", actor: { tenantId: tenant.tenantId, homeAccountId: principalId,
+          displayName: tenant.tenantId === tenantA.tenantId ? "Tenant A actor" : "Tenant B actor",
+          username: `${principalId}@${tenant.domains[0]}` }, requestPath: "/fixture",
+      }));
+    }
+    for (const [tenantCookie, name, event] of [
+      [cookieA, "Tenant A only", events[0]], [cookieB, "Tenant B only", events[1]],
+    ] as const) {
+      const exact = await request("/api/agents/package-1", { headers: { Cookie: tenantCookie } });
+      expect(exact.status).toBe(200);
+      expect(await exact.json()).toMatchObject({ id: "package-1", displayName: name });
+      const listed = await request("/api/agents", { headers: { Cookie: tenantCookie } });
+      expect(await listed.json()).toMatchObject({ count: 1, value: [{ id: "package-1", displayName: name }] });
+      const audit = await request("/api/audit/events?agentId=package-1", { headers: { Cookie: tenantCookie } });
+      expect(await audit.json()).toMatchObject({ count: 1, value: [{ id: event.id }] });
+    }
+    const foreignSnapshot = await request("/api/agents/export.csv", {
+      method: "POST", headers: { Cookie: cookieA, "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ["package-1"], snapshotId: snapshotB }),
+    });
+    expect(foreignSnapshot.status).toBe(404);
+    expect(await foreignSnapshot.json()).toMatchObject({ code: "not_found" });
+    expect(snapshotA).not.toBe(snapshotB);
+    const foreignAudit = await request("/api/audit/events/export.csv", {
+      method: "POST", headers: { Cookie: cookieB, "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: [events[0].id] }),
+    });
+    expect(foreignAudit.status).toBe(404);
+    expect((await request("/api/auth/logout", { method: "POST", headers: { Cookie: cookieA } })).status).toBe(204);
+    expect((await request("/api/me", { headers: { Cookie: cookieA } })).status).toBe(401);
+    const unaffected = await request("/api/me", { headers: { Cookie: cookieB } });
+    expect(unaffected.status).toBe(200);
+    expect(await unaffected.json()).toMatchObject({ user: { tenantId: tenantB.tenantId, homeAccountId: principalId } });
+  });
   it("exports only exact authorized package rows with snapshot provenance, formula safety and row-free audit", async () => {
     const principalId="package-export-reader";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     const snapshotId=await publishPackageSnapshot(principalId);
     await fixture.operator.query(`UPDATE package_inventory_resources
       SET publisher='=formula',package_data=jsonb_set(package_data,'{publisher}',to_jsonb('=formula'::text))
-      WHERE tenant_id=$1 AND principal_id=$2 AND snapshot_id=$3`,[config.tenantId,principalId,snapshotId]);
+      WHERE tenant_id=$1 AND principal_id=$2 AND snapshot_id=$3`,[config.tenants[0].tenantId,principalId,snapshotId]);
     const response=await request("/api/agents/export.csv",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({ids:["package-1"],snapshotId})});
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/csv");
@@ -1049,7 +1148,7 @@ describe.sequential("packaged API/session contracts", () => {
   it("reads private responsibility with Viewer access, outside paid rosters, without provider reads or ownership-based authority", async () => {
     const principalId = "responsibility-reader";
     const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const scope = { tenantId: config.tenantId!, principalId };
+    const scope = { tenantId: config.tenants[0].tenantId!, principalId };
     const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
     await publishQuarantineInventory(principalId, objectId);
     const cache = new AgentPeopleRepository(fixture.runtime);
@@ -1148,10 +1247,10 @@ describe.sequential("packaged API/session contracts", () => {
       const principalId = `unified-export-race-${change}`;
       const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
       const snapshotId = await publishPackageSnapshot(principalId);
-      const scope = { tenantId: config.tenantId!, principalId };
+      const scope = { tenantId: config.tenants[0].tenantId!, principalId };
       if (change === "filter-source") await new AuditLog(scope, fixture.runtime).startEvent({
         operationId: "abcd1234-source", scope: "bulk", action: "block", targetBlockedState: true, agentId: "package-1",
-        actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
+        actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
         requestPath: "/fixture",
       });
       const saved = await request("/api/agent-inventory", { headers: { Cookie: readerCookie } });
@@ -1209,12 +1308,12 @@ describe.sequential("packaged API/session contracts", () => {
     "denies export when %s changes during final audit without releasing rows", async change => {
       const principalId = `export-race-${change}`;
       const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-      const ownerId = change === "application-scope" ? config.clientId! : principalId;
+      const ownerId = change === "application-scope" ? config.tenants[0].clientId! : principalId;
       const snapshotId = await publishPackageSnapshot(ownerId);
       if (change === "filter-source") {
-        await new AuditLog({ tenantId: config.tenantId!, principalId }, fixture.runtime).startEvent({
+        await new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime).startEvent({
           operationId: "abcd1234-race", scope: "bulk", action: "block", targetBlockedState: true, agentId: "package-1",
-          actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
+          actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
           requestPath: "/fixture",
         });
       }
@@ -1244,7 +1343,7 @@ describe.sequential("packaged API/session contracts", () => {
         expect(exported.headers.get("content-type")).toContain("application/problem+json");
         const body = await exported.text();
         expect(body).not.toContain("package-1");
-        const audit = new AuditLog({ tenantId: config.tenantId!, principalId }, fixture.runtime);
+        const audit = new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime);
         expect(await audit.listEvents({ action: "export-package-inventory" })).toEqual([
           expect.objectContaining({ status: "failed", metadata: expect.objectContaining({ source: "graph_packages", snapshotId }) }),
         ]);
@@ -1258,9 +1357,9 @@ describe.sequential("packaged API/session contracts", () => {
     const principalId = "inventory-audit-filter";
     const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
     const snapshotId = await publishPackageSnapshot(principalId);
-    const audit = new AuditLog({ tenantId: config.tenantId!, principalId }, fixture.runtime);
+    const audit = new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime);
     await audit.startEvent({ operationId: "abcd1234-own-action", scope: "bulk", action: "block", targetBlockedState: true,
-      agentId: "package-1", actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
+      agentId: "package-1", actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Fixture", username: "fixture@example.invalid" },
       requestPath: "/fixture" });
     expect((await request("/api/agents?operationIdPrefix=abcd1234", { headers: { Cookie: readerCookie } })).status).toBe(200);
     const exportRequest = { method: "POST", headers: { Cookie: readerCookie, "Content-Type": "application/json" },
@@ -1277,9 +1376,9 @@ describe.sequential("packaged API/session contracts", () => {
 
   it("exports only current scoped administrative events and rechecks deletion before publication", async () => {
     const principalId = "administrative-export";
-    const audit = new AuditLog({ tenantId: config.tenantId!, principalId }, fixture.runtime);
+    const audit = new AuditLog({ tenantId: config.tenants[0].tenantId!, principalId }, fixture.runtime);
     const event = await audit.startEvent({ operationId: "local-export-target", scope: "single", action: "block", targetBlockedState: true,
-      agentId: "package-1", actor: { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "=Formula", username: "fixture@example.invalid" },
+      agentId: "package-1", actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "=Formula", username: "fixture@example.invalid" },
       requestPath: "/fixture", message: "private selected audit message" });
     const exportRequest = (selectedCookie: string) => request("/api/audit/events/export.csv", {
       method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify({ ids: [event.id] }),
@@ -1315,7 +1414,7 @@ describe.sequential("packaged API/session contracts", () => {
     const principalId = "source-detail-reader";
     const snapshotId = await publishQuarantineInventory(principalId);
     const repository = new PurviewAuditRepository(fixture.runtime);
-    const scope = { tenantId: config.tenantId!, authorizationPrincipalId: principalId,
+    const scope = { tenantId: config.tenants[0].tenantId!, authorizationPrincipalId: principalId,
       resultScope: { kind: "principal" as const, scopeId: principalId, configurationRevision: null }, tokenMode: "delegated" as const };
     const filters = { presetId: "copilot_studio_admin" as const, operations: ["BotCreate"], startDateTime: "2026-09-09T10:00:00.000Z",
       endDateTime: "2026-09-09T11:00:00.000Z", userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [] };
@@ -1357,11 +1456,11 @@ describe.sequential("packaged API/session contracts", () => {
     const principalId="inventory-reader";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
     const repository=new PowerPlatformInventoryRepository(fixture.runtime);
-    const inventoryScope={tenantId:config.tenantId!,principalId};
+    const inventoryScope={tenantId:config.tenants[0].tenantId!,principalId};
     const job=await repository.submit(inventoryScope,{idempotencyKey:"route-inventory",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
     await repository.markRunning(inventoryScope,job.id);
     const malicious:PowerPlatformResource={
-      tenantId:config.tenantId!,nativeId:"@native",type:"microsoft.copilotstudio/agents",location:null,displayName:"=SUM(1,1)",environmentId:"environment-a",
+      tenantId:config.tenants[0].tenantId!,nativeId:"@native",type:"microsoft.copilotstudio/agents",location:null,displayName:"=SUM(1,1)",environmentId:"environment-a",
       createdAt:null,createdBy:null,lastPublishedAt:null,sourceSystem:"power_platform",authoringTool:null,creatorType:"unknown",agentKind:"agent",lifecycle:"draft",
       identityConfidence:"exact_native",identifiers:[{kind:"power_platform_resource_id",value:"@native"}],
       provenance:{connectors:{sourceSystem:"power_platform",path:"properties.powerPlatformConnectors",maturity:"preview"}},
@@ -1427,7 +1526,7 @@ describe.sequential("packaged API/session contracts", () => {
     const otherOperatorCookie = await roleCookie("quarantine-other", ["AgentControl.Admin"]);
     const administratorCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const securityReaderCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-    authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: principalId, displayName: "Quarantine operator", username: "quarantine-operator@example.invalid", roles: ["AgentControl.Admin"] };
+    authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId, displayName: "Quarantine operator", username: "quarantine-operator@example.invalid", roles: ["AgentControl.Admin"] };
     const providerReads = vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length;
     try {
       const targetList = await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: operatorCookie } });
@@ -1466,14 +1565,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect(await submit.json()).toMatchObject({ status: "queued", action: "quarantine" });
 
       const quarantineRepository = new CopilotStudioQuarantineRepository(fixture.runtime);
-      const inventoryTarget = (await new PowerPlatformInventoryRepository(fixture.runtime).resolveQuarantineTargets({ tenantId: config.tenantId!, principalId }, snapshotId, ["native-agent"]))[0];
+      const inventoryTarget = (await new PowerPlatformInventoryRepository(fixture.runtime).resolveQuarantineTargets({ tenantId: config.tenants[0].tenantId!, principalId }, snapshotId, ["native-agent"]))[0];
       const frozenTarget = { ...inventoryTarget, directStatus: { environmentId: inventoryTarget.environmentId, botId: inventoryTarget.botId, isBotQuarantined: false,
         lastUpdateTimeUtc: "2026-09-09T10:00:00.123Z", observedAt: new Date().toISOString(), correlationId: randomUUID() } };
-      const durableInput = { action: "quarantine" as const, targets: [frozenTarget], actor: { tenantId: config.tenantId!, homeAccountId: principalId,
+      const durableInput = { action: "quarantine" as const, targets: [frozenTarget], actor: { tenantId: config.tenants[0].tenantId!, homeAccountId: principalId,
         displayName: "Quarantine operator", username: "quarantine-operator@example.invalid" }, authority: { contractRevision: "c".repeat(64), permissionRevision: "d".repeat(64), configurationRevision: 1 },
         requestPath: "/api/quarantine/jobs" };
       const durableConfirmation = createQuarantineConfirmation(durableInput);
-      const durableJob = await quarantineRepository.submit({ tenantId: config.tenantId!, principalId }, { ...durableInput, idempotencyKey: "app-route-durable", confirmationHash: durableConfirmation.confirmationHash });
+      const durableJob = await quarantineRepository.submit({ tenantId: config.tenants[0].tenantId!, principalId }, { ...durableInput, idempotencyKey: "app-route-durable", confirmationHash: durableConfirmation.confirmationHash });
       const retryReads = vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length;
       const durableRetry = await request("/api/quarantine/jobs", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json", "Idempotency-Key": "app-route-durable" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], confirmationHash: durableConfirmation.confirmationHash }) });
@@ -1489,14 +1588,14 @@ describe.sequential("packaged API/session contracts", () => {
       expect((await request("/api/quarantine/audit", { headers: { Cookie: administratorCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/audit", { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
       cookie = originalCookie;
     }
   });
   it("returns a durable waiting inventory job when token acquisition fails after submission", async () => {
     const principalId="inventory-token-loss";
     const readerCookie=await roleCookie(principalId,["AgentControl.Viewer"]);
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:principalId,displayName:"Inventory token loss",username:"inventory-token-loss@example.invalid",roles:["AgentControl.Viewer"]};
+    authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:principalId,displayName:"Inventory token loss",username:"inventory-token-loss@example.invalid",roles:["AgentControl.Viewer"]};
     inventoryProviderFixture.queries=0;
     vi.mocked(acquireDelegatedToken).mockRejectedValueOnce(new AppError(401,"interaction_required","Interactive authorization is required."));
     try {
@@ -1505,10 +1604,10 @@ describe.sequential("packaged API/session contracts", () => {
       const job=await response.json();
       expect(job).toMatchObject({status:"waiting_authorization",environmentScope:"environment-a",requestedTypes:["microsoft.copilotstudio/agents"],snapshotId:null});
       expect(inventoryProviderFixture.queries).toBe(0);
-      const persisted=await new PowerPlatformInventoryRepository(fixture.runtime).getJob({tenantId:config.tenantId!,principalId},job.id);
+      const persisted=await new PowerPlatformInventoryRepository(fixture.runtime).getJob({tenantId:config.tenants[0].tenantId!,principalId},job.id);
       expect(persisted).toMatchObject({status:"waiting_authorization",snapshotId:null});
     } finally {
-      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
+      authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
     }
   });
   it("imports official usage through bounded multipart staging and enforces aggregate and user roles", async () => {
@@ -1849,7 +1948,7 @@ describe.sequential("packaged API/session contracts", () => {
     let secondUpload: ClientRequest | undefined;
     let lockReleased = false;
     try {
-      await lockClient.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [`official-usage:${config.tenantId}`]);
+      await lockClient.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [`official-usage:${config.tenants[0].tenantId}`]);
       const form = new FormData();
       form.append("bundleId", randomUUID());
       form.append("reportingStart", "2026-06-07");
@@ -1894,7 +1993,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(deniedResponse.status).toBe(429);
       expect(await deniedResponse.json()).toMatchObject({ code: "upload_admission_full" });
 
-      await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [`official-usage:${config.tenantId}`]);
+      await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [`official-usage:${config.tenants[0].tenantId}`]);
       lockReleased = true;
       secondUpload.destroy();
       await vi.waitFor(async () => {
@@ -1907,7 +2006,7 @@ describe.sequential("packaged API/session contracts", () => {
     } finally {
       controller.abort();
       secondUpload?.destroy();
-      if (!lockReleased) await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [`official-usage:${config.tenantId}`]);
+      if (!lockReleased) await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [`official-usage:${config.tenants[0].tenantId}`]);
       lockClient.release();
     }
   });
@@ -1973,14 +2072,14 @@ describe.sequential("packaged API/session contracts", () => {
         expect((await request("/api/me")).status).toBe(401);
       }
     } finally {
-      authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
+      authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
       cookie=originalCookie;
     }
   });
   it("applies authoritative demotion and complete role revocation before protected work", async () => {
     const originalCookie = cookie;
     try {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "demoted-principal", displayName: "Demoted", username: "demoted@example.invalid", roles: ["AgentControl.Viewer"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "demoted-principal", displayName: "Demoted", username: "demoted@example.invalid", roles: ["AgentControl.Viewer"] };
       const adminSession = await roleCookie("demoted-principal", ["AgentControl.Admin"], 0);
       expect((await request("/api/agents", { headers: { Cookie: adminSession } })).status).toBe(200);
       expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: adminSession, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
@@ -1989,7 +2088,7 @@ describe.sequential("packaged API/session contracts", () => {
       const viewerSession = await roleCookie("demoted-principal", ["AgentControl.Viewer"], 0);
       expect((await request("/api/agents", { headers: { Cookie: viewerSession } })).status).toBe(403);
     } finally {
-      authFixture.revalidatedUser = { tenantId: config.tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
+      authFixture.revalidatedUser = { tenantId: config.tenants[0].tenantId!, homeAccountId: "fixture-principal", displayName: "Fixture", username: "fixture@example.invalid", roles: ["AgentControl.Admin"] };
       cookie = originalCookie;
     }
   });
@@ -1998,7 +2097,7 @@ describe.sequential("packaged API/session contracts", () => {
     const logoutCookie=await roleCookie("race-principal",["AgentControl.Viewer"]);
     let release!: () => void;
     authFixture.pendingRevalidation=new Promise<void>(resolve => { release=resolve; });
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"race-principal",displayName:"Race",username:"race@example.invalid",roles:["AgentControl.Viewer"]};
+    authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"race-principal",displayName:"Race",username:"race@example.invalid",roles:["AgentControl.Viewer"]};
     const started=authFixture.revalidationStarted;
     const staleRequest=request("/api/me",{headers:{Cookie:staleCookie}});
     await vi.waitFor(() => expect(authFixture.revalidationStarted).toBe(started+1));
@@ -2007,11 +2106,11 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await staleRequest).status).toBe(401);
     expect((await fixture.runtime.query("SELECT 1 FROM sessions WHERE principal_id='race-principal'")).rowCount).toBe(0);
     authFixture.pendingRevalidation=undefined;
-    authFixture.revalidatedUser={tenantId:config.tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
+    authFixture.revalidatedUser={tenantId:config.tenants[0].tenantId!,homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"]};
   });
   it("deletes legacy sessions without a role-bearing user shape", async () => {
     const sid=randomUUID();
-    await fixture.operator.query("INSERT INTO sessions(sid,sess,expire) VALUES ($1,$2,clock_timestamp()+interval '1 hour')",[sid,{cookie:{originalMaxAge:60000,expires:new Date(Date.now()+60000),httpOnly:true,path:"/"},tenantId:config.tenantId,accountId:"legacy",user:{tenantId:config.tenantId,homeAccountId:"legacy",username:"legacy@example.invalid",displayName:"Legacy"}}]);
+    await fixture.operator.query("INSERT INTO sessions(sid,sess,expire) VALUES ($1,$2,clock_timestamp()+interval '1 hour')",[sid,{cookie:{originalMaxAge:60000,expires:new Date(Date.now()+60000),httpOnly:true,path:"/"},tenantId:config.tenants[0].tenantId,accountId:"legacy",user:{tenantId:config.tenants[0].tenantId,homeAccountId:"legacy",username:"legacy@example.invalid",displayName:"Legacy"}}]);
     expect((await request("/api/me",{headers:{Cookie:signedSessionCookie(sid)}})).status).toBe(401);
     expect((await fixture.operator.query("SELECT 1 FROM sessions WHERE sid=$1",[sid])).rowCount).toBe(0);
   });

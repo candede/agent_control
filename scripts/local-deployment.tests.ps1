@@ -31,6 +31,16 @@ function Read-Host {
     }
     return $answer
 }
+function Add-EditAnswers {
+    param([string[]]$Values,[string]$Domains='',[string]$DisplayName='')
+    foreach ($answer in $Values[0..2]) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($Domains,$DisplayName,'')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in $Values[3..4]) { $script:Answers.Enqueue($answer) }
+}
+function Read-FixtureRegistry {
+    param($Context)
+    return ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText((Join-Path $Context.State 'secrets/tenants.json')))
+}
 function Get-Command {
     param([string]$Name,$ErrorAction)
     if ($Name -eq 'docker') { if (-not $script:NoDocker) { return @{Name='docker'} }; return }
@@ -43,7 +53,7 @@ function Invoke-TestDocker {
         $script:MarkerCalls.Add(@{command=$line;maintenance=(Test-Path -LiteralPath $script:MonitoredMarker)})
     }
     if ($script:CheckProjectEnvironment -and $Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
-        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             if ($null -ne [Environment]::GetEnvironmentVariable($name)) { throw "Shell environment overrode project setting $name." }
         }
     }
@@ -93,13 +103,16 @@ function New-FixtureContext {
     $fixture=New-LocalContext $testRoot $Name
     [IO.Directory]::CreateDirectory($fixture.State) | Out-Null
     [IO.File]::WriteAllText((Join-Path $fixture.State 'settings.json'),(@{port=$Port;tenantId='';clientId=''} | ConvertTo-Json))
+    [IO.Directory]::CreateDirectory((Join-Path $fixture.State 'secrets')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $fixture.State 'secrets/client-secret'),'')
     return New-LocalContext $testRoot $Name
 }
 function Get-ConfigSnapshot {
     param($Context)
     $snapshot=@{}
-    foreach ($relative in @('settings.json','compose.env','secrets/client-secret','secrets/postgres-admin','secrets/postgres-app','secrets/session')) {
+    foreach ($relative in @('settings.json','compose.env','secrets/client-secret','secrets/tenants.json','secrets/postgres-admin','secrets/postgres-app','secrets/session')) {
         $path=Join-Path $Context.State $relative
+        if (-not (Test-Path -LiteralPath $path)) { continue }
         $snapshot[$relative]=@{hash=(Get-FileHash -LiteralPath $path).Hash;modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.Ticks}
     }
     return $snapshot
@@ -149,6 +162,24 @@ try {
     $tenant='11111111-1111-1111-1111-111111111111'
     $client='22222222-2222-2222-2222-222222222222'
     $clientSecret='fixture-client-secret'
+    $invalidDomainInputs=@(
+        "example$([char]0x3002)com","example$([char]0xff0e)com","example$([char]0xff61)com",
+        "exam$([char]0x200b)ple.com","exam$([char]0x200c)ple.com","exam$([char]0x200d)ple.com",
+        "exam$([char]0x2060)ple.com","exam$([char]0xfeff)ple.com",
+        'https://example.com','example.com/path','example.com\path','user@example.com','*.example.com',
+        'example.com:443','example.com?query=1','example.com#fragment','example.com%2fpath'
+    )
+    foreach ($domain in $invalidDomainInputs) {
+        Assert-True ($null -eq (ConvertTo-DeploymentDomain $domain)) 'A forbidden raw domain was accepted before IDNA normalization.'
+    }
+    foreach ($case in @(
+        @{raw=' Example.COM ';expected='example.com'},
+        @{raw="b$([char]0x00fc)cher.example";expected='xn--bcher-kva.example'},
+        @{raw="bu$([char]0x0308)cher.example";expected='xn--bcher-kva.example'},
+        @{raw='XN--BCHER-KVA.EXAMPLE';expected='xn--bcher-kva.example'}
+    )) {
+        Assert-True ((ConvertTo-DeploymentDomain $case.raw) -ceq $case.expected) 'Domain validation rejected or changed a supported Unicode-letter IDN or canonical ASCII domain.'
+    }
     $script:NoDocker=$true
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'approved Docker'
     $script:NoDocker=$false; $script:Failure='^info\|'
@@ -164,22 +195,24 @@ try {
     Assert-Fails { Invoke-LocalDeployment $context 'Reset' } 'reset denied'
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try { Assert-Fails { Assert-LocalPort $listener.LocalEndpoint.Port } 'occupied' } finally { $listener.Stop() }
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
     foreach ($failure in @('^build\|','\|migrate$','\|--wait-timeout\|90\|postgres$','\|--wait-timeout\|90\|app$')) {
         $script:Failure=$failure
         Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Simulated'
     }
-    Assert-True ($script:Prompts.Count -eq 3) 'New project did not onboard exactly once.'
+    Assert-True ($script:Prompts.Count -eq 4) 'New project did not onboard exactly once.'
     Assert-True ($script:Prompts[2] -match 'secure=True$') 'Client secret was not prompted securely.'
     $saved=Get-Content -LiteralPath (Join-Path $context.State 'settings.json') -Raw | ConvertFrom-Json
-    Assert-True ($saved.tenantId -ceq $tenant -and $saved.clientId -ceq $client) 'Onboarding identifiers were not saved.'
-    Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'secrets/client-secret')) -ceq $clientSecret) 'Client secret was not saved.'
+    Assert-True ($saved.tenants[0].tenantId -ceq $tenant -and $saved.tenants[0].clientId -ceq $client) 'Onboarding identifiers were not saved.'
+    Assert-True ((Read-FixtureRegistry $context)[0].clientSecret -ceq $clientSecret) 'Client secret was not saved.'
     $compose=[IO.File]::ReadAllText((Join-Path $context.State 'compose.env'))
-    Assert-True ($compose.Contains("TENANT_ID=$tenant") -and $compose.Contains("CLIENT_ID=$client")) 'Compose did not receive the saved identifiers.'
+    $composeTemplate=[IO.File]::ReadAllText((Join-Path $repositoryRoot 'compose.yaml'))
+    Assert-True ($composeTemplate.Contains('TENANTS_JSON_FILE: /run/secrets/tenants.json') -and $composeTemplate.Contains('target: tenants.json')) 'Compose did not mount the protected registry.'
+    Assert-True (-not $compose.Contains('TENANT_ID=') -and -not $compose.Contains('TENANTS_JSON=')) 'Compose environment duplicated the tenant registry.'
     Assert-True (-not $compose.Contains($clientSecret)) 'Client secret leaked into compose.env.'
     Assert-True (-not [IO.File]::ReadAllText((Join-Path $context.State 'settings.json')).Contains($clientSecret)) 'Client secret leaked into settings.json.'
     if (-not $IsWindows) {
-        Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State 'secrets/client-secret')) -eq 384) 'Client secret permissions are not 0600.'
+        Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State 'secrets/tenants.json')) -eq 384) 'Tenant registry permissions are not 0600.'
         Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State 'secrets')) -eq 448) 'Secret directory permissions are not 0700.'
     }
     $script:Failure=''
@@ -188,11 +221,13 @@ try {
     $before=[IO.File]::ReadAllText($secret)
     Invoke-LocalDeployment $context 'Deploy' 6>$null
     Invoke-LocalDeployment $context 'Start' 6>$null
-    Assert-True ($script:Prompts.Count -eq 3) 'Configured Deploy/Start prompted again.'
+    Assert-True ($script:Prompts.Count -eq 4) 'Configured Deploy/Start prompted again.'
     Assert-True ([IO.File]::ReadAllText($secret) -ceq $before) 'Repeat deploy rotated credentials.'
-    Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'secrets/client-secret')) -ceq $clientSecret) 'Repeat deploy changed the Entra secret.'
+    Assert-True ((Read-FixtureRegistry $context)[0].clientSecret -ceq $clientSecret) 'Repeat deploy changed the Entra secret.'
     Assert-True (($script:Calls -join "`n") -notlike "*$before*") 'Secret leaked to command arguments.'
     Assert-True (-not ($script:Calls -join "`n").Contains($clientSecret)) 'Entra secret leaked to command arguments.'
+    Assert-True (-not ($script:Calls -join "`n").Contains('/secrets,target=/run/secrets,readonly')) 'Database operator received the entire tenant credential directory.'
+    Assert-True (($script:Calls -join "`n").Contains('/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly')) 'Database operator lost its explicit administrator secret mount.'
     Assert-True (($script:Calls -join "`n").Contains($testRoot)) 'Paths containing spaces were not preserved.'
     Assert-True (-not (($script:Calls -join "`n") -match '\|-p\|fixture-project\|down\|--volumes')) 'Normal deployment reset the application volume.'
     Assert-Fails { Invoke-LocalDeployment $context 'Retain' } 'cleanup denied'
@@ -215,72 +250,143 @@ try {
     $otherClient='44444444-4444-4444-4444-444444444444'
     foreach ($target in @($defaultContext,$customerContext)) {
         $promptCount=$script:Prompts.Count
-        foreach ($answer in @($otherTenant,$otherClient,'other-fixture-secret','14392')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @($otherTenant,$otherClient,'other-fixture-secret','fabrikam.com','14392')) { $script:Answers.Enqueue($answer) }
         Initialize-LocalState $target $false -Onboard 6>$null
         Initialize-LocalState $target $true -Onboard 6>$null
-        Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Default/named project onboarding or reuse failed.'
-        Assert-True ([IO.File]::ReadAllText((Join-Path $target.State 'compose.env')).Contains("TENANT_ID=$otherTenant")) 'Project received the wrong identity.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Default/named project onboarding or reuse failed.'
+        Assert-True ((Read-FixtureRegistry $target)[0].tenantId -ceq $otherTenant) 'Project received the wrong identity.'
         $reloaded=New-LocalContext $testRoot $target.Project
         Assert-True ($reloaded.Port -eq 14392 -and $reloaded.Url -ceq 'http://localhost:14392') 'Project did not load its saved port.'
     }
     Assert-True ([IO.File]::ReadAllText((Join-Path $context.State 'settings.json')).Contains($tenant)) 'Another project changed the original identity.'
     Assert-True ([IO.File]::ReadAllText((Join-Path $customerContext.State 'secrets/postgres-app')) -cne $before) 'Projects shared generated database credentials.'
 
+    $migrated=New-FixtureContext 'legacy-tenant-upgrade'
+    Initialize-LocalState $migrated $false
+    $legacySettings=Join-Path $migrated.State 'settings.json'
+    [IO.File]::WriteAllText($legacySettings,(@{port=14391;publicUrl='https://legacy.example.com';tenantId=$tenant;clientId=$client;note='retained legacy settings'} | ConvertTo-Json))
+    $legacySecret=Join-Path $migrated.State 'secrets/client-secret'
+    [IO.File]::WriteAllText($legacySecret," $clientSecret`n")
+    $legacySnapshot=Get-ConfigSnapshot $migrated
+    $script:Volumes.Add($migrated.Volume) | Out-Null
+    $promptCount=$script:Prompts.Count
+    $callCount=$script:Calls.Count
+    $script:Answers.Enqueue('Contoso.com,contoso.onmicrosoft.com')
+    Initialize-LocalState $migrated $true -Onboard 6>$null
+    Assert-True ($script:Prompts.Count -eq $promptCount+1 -and $script:Prompts[$promptCount].StartsWith('Accepted username domains')) 'Legacy upgrade prompted for something other than newly required domains.'
+    Assert-True ($script:Calls.Count -eq $callCount) 'Tenant migration issued a container/database mutation.'
+    Assert-ConfigUnchanged $migrated $legacySnapshot @('settings.json','compose.env')
+    $migratedSettings=Read-LocalSettings $migrated.State
+    $migratedProfiles=Read-FixtureRegistry $migrated
+    Assert-True ($migratedProfiles.Count -eq 1 -and $migratedProfiles[0].tenantId -ceq $tenant -and $migratedProfiles[0].clientId -ceq $client -and $migratedProfiles[0].clientSecret -ceq $clientSecret) 'Migration lost the original identity or credential.'
+    Assert-True (($migratedProfiles[0].domains -join ',') -ceq 'contoso.com,contoso.onmicrosoft.com') 'Migration did not save explicit normalized domains.'
+    Assert-True ($migratedSettings.port -eq 14391 -and $migratedSettings.publicUrl -ceq 'https://legacy.example.com' -and $migratedSettings.note -ceq 'retained legacy settings') 'Migration lost port, public URL or unrelated saved settings.'
+    $snapshot=Get-ConfigSnapshot $migrated
+    Initialize-LocalState $migrated $true -Onboard 6>$null
+    Assert-True ($script:Prompts.Count -eq $promptCount+1) 'Registry migration prompted more than once.'
+    Assert-ConfigUnchanged $migrated $snapshot
+
+    $secondSecret='second-tenant-hidden-credential'
+    foreach ($answer in @('','','','','','y',$otherTenant,$otherClient,$secondSecret,'fabrikam.com','Fabrikam','','','')) { $script:Answers.Enqueue($answer) }
+    $messages=Invoke-LocalDeployment $migrated 'EditConfig' 6>&1
+    $added=Read-FixtureRegistry $migrated
+    Assert-True ($added.Count -eq 2 -and $added[0].clientSecret -ceq $clientSecret -and $added[1].tenantId -ceq $otherTenant -and $added[1].displayName -ceq 'Fabrikam') 'Adding a tenant replaced or lost a saved tenant.'
+    Assert-ConfigUnchanged $migrated $snapshot @('settings.json','secrets/tenants.json')
+    Assert-True (-not ($messages -join "`n").Contains($secondSecret) -and -not ($script:Calls -join "`n").Contains($secondSecret)) 'Added tenant credential leaked to messages or command arguments.'
+    foreach ($file in @('settings.json','compose.env')) {
+        Assert-True (-not [IO.File]::ReadAllText((Join-Path $migrated.State $file)).Contains($secondSecret)) 'Tenant credential leaked to public configuration.'
+    }
+    $snapshot=Get-ConfigSnapshot $migrated
+    $callCount=$script:Calls.Count
+    foreach ($answer in @('','','','','','','','','','','','','')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $migrated 'EditConfig' 6>$null
+    Assert-ConfigUnchanged $migrated $snapshot
+    Assert-True ($script:Calls.Count -eq $callCount+3) 'No-op edit of multiple named tenants stopped the app.'
+    foreach ($answer in @('','','','','','','','','CONTOSO.com','','','','')) { $script:Answers.Enqueue($answer) }
+    Assert-Fails { Invoke-LocalDeployment $migrated 'EditConfig' 6>$null } 'duplicate accepted domain'
+    Assert-ConfigUnchanged $migrated $snapshot
+    foreach ($answer in @('','','','','','','','updated-second-secret','fabrikam.com,login.fabrikam.com','','','','')) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $migrated 'EditConfig' 6>$null
+    $updatedProfiles=Read-FixtureRegistry $migrated
+    Assert-True ($updatedProfiles[0].clientSecret -ceq $clientSecret -and $updatedProfiles[1].clientSecret -ceq 'updated-second-secret' -and $updatedProfiles[1].domains.Count -eq 2) 'Editing the second tenant affected the wrong credential or domains.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $migrated.State 'control/reauthenticate')) 'Domain edits did not schedule reauthentication.'
+    $snapshot=Get-ConfigSnapshot $migrated
+    Invoke-LocalDeployment $migrated 'Deploy' -DbReset 3>$null 6>$null
+    Assert-ConfigUnchanged $migrated $snapshot
+    Assert-True ((Read-FixtureRegistry $migrated).Count -eq 2) 'Explicit database reset discarded tenant profiles.'
+
+    $registryFile=Join-Path $migrated.State 'secrets/tenants.json'
+    $registryText=[IO.File]::ReadAllText($registryFile)
+    foreach ($invalid in @(
+        '[]','{}',"[`"$secondSecret`"", '[{"tenantId":"invalid"}]',
+        (ConvertTo-Json -InputObject @($updatedProfiles[0],$updatedProfiles[0]) -Depth 20)
+    )) {
+        [IO.File]::WriteAllText($registryFile,$invalid)
+        try { Initialize-LocalState $migrated $true -Onboard; throw 'Expected registry rejection.' }
+        catch { Assert-True ($_.Exception.Message -match 'Tenant registry|tenantId' -and -not $_.Exception.Message.Contains($secondSecret)) 'Malformed registry was accepted or leaked credentials in errors.' }
+    }
+    Remove-Item -LiteralPath $registryFile
+    Assert-Fails { Initialize-LocalState $migrated $true -Onboard } 'registry is missing'
+    [IO.File]::WriteAllText($registryFile,$registryText)
+    Protect-LocalPath $registryFile
+
     $editContext=New-FixtureContext 'editable-project'
-    foreach ($answer in @($tenant,$client,"  $clientSecret  ")) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,"  $clientSecret  ",'contoso.com')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $editContext $false -Onboard 6>$null
     $script:Volumes.Add($editContext.Volume) | Out-Null
     $editSettings=Join-Path $editContext.State 'settings.json'
-    $editSecret=Join-Path $editContext.State 'secrets/client-secret'
-    [IO.File]::WriteAllText($editSettings,("{`n  `"port`":14391,`n  `"tenantId`":`"$tenant`",`n  `"clientId`":`"$client`",`n  `"note`":`"preserve me`"`n}"))
-    [IO.File]::WriteAllText($editSecret," $clientSecret`n")
+    $editSecret=Join-Path $editContext.State 'secrets/tenants.json'
+    $savedEditSettings=Read-LocalSettings $editContext.State
+    $savedEditSettings.note='preserve me'
+    [IO.File]::WriteAllText($editSettings,($savedEditSettings | ConvertTo-Json -Depth 20))
+    [IO.File]::WriteAllText($editSecret," `n$([IO.File]::ReadAllText($editSecret))`n")
     foreach ($relative in (Get-ConfigSnapshot $editContext).Keys) {
         [IO.File]::SetLastWriteTimeUtc((Join-Path $editContext.State $relative),[DateTime]::new(2001,1,1,0,0,0,[DateTimeKind]::Utc))
     }
     $snapshot=Get-ConfigSnapshot $editContext
     $callsBefore=$script:Calls.Count
-    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
     Assert-True ($script:Calls.Count -eq $callsBefore+3) 'No-op edit stopped containers or made unnecessary Docker changes.'
-    foreach ($answer in @($tenant,$client,$clientSecret,'14391','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @($tenant,$client,$clientSecret,'14391','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
 
-    foreach ($answer in @('','','','14393','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','14393','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     $edited=Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json
-    Assert-True ($edited.port -eq 14393 -and $edited.note -ceq 'preserve me' -and $edited.tenantId -ceq $tenant -and $edited.clientId -ceq $client) 'Port-only edit changed unrelated settings.'
+    Assert-True ($edited.port -eq 14393 -and $edited.note -ceq 'preserve me' -and $edited.tenants[0].tenantId -ceq $tenant -and $edited.tenants[0].clientId -ceq $client) 'Port-only edit changed unrelated settings.'
     Assert-True ($editContext.Url -ceq 'http://localhost:14393' -and (New-LocalContext $testRoot 'editable-project').Port -eq 14393) 'Edited port was not applied to saved/new contexts.'
     Assert-True ($script:Calls[$script:Calls.Count-1] -match '\|stop\|--timeout\|130\|app$') 'Configuration changed before stopping/draining the app.'
     Assert-True (Test-Path -LiteralPath (Join-Path $editContext.State 'control/maintenance')) 'Edited project was not left in maintenance.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @('','','replacement-fixture-secret','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','replacement-fixture-secret','','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
-    Assert-ConfigUnchanged $editContext $snapshot @('secrets/client-secret')
-    Assert-True ([IO.File]::ReadAllText($editSecret) -ceq 'replacement-fixture-secret') 'Secret-only edit did not save the new secret.'
+    Assert-ConfigUnchanged $editContext $snapshot @('secrets/tenants.json')
+    Assert-True ((Read-FixtureRegistry $editContext)[0].clientSecret -ceq 'replacement-fixture-secret') 'Secret-only edit did not save the new secret.'
     $reauthenticate=Join-Path $editContext.State 'control/reauthenticate'
     Assert-True (-not (Test-Path -LiteralPath $reauthenticate)) 'Port/secret-only edits unnecessarily scheduled session deletion.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @('',$otherClient,'','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('',$otherClient,'','','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
-    Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
-    Assert-True ((Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json).clientId -ceq $otherClient) 'Client-ID-only edit was not saved.'
+    Assert-ConfigUnchanged $editContext $snapshot @('settings.json','secrets/tenants.json')
+    Assert-True ((Get-Content -LiteralPath $editSettings -Raw | ConvertFrom-Json).tenants[0].clientId -ceq $otherClient) 'Client-ID-only edit was not saved.'
     Assert-True (Test-Path -LiteralPath $reauthenticate) 'Changed application ID did not schedule reauthentication.'
     Assert-True (-not ($script:Prompts -join "`n").Contains('replacement-fixture-secret')) 'Edit wizard displayed the saved secret.'
     Assert-True (-not ($script:Calls -join "`n").Contains('replacement-fixture-secret')) 'Edited secret leaked to Docker arguments.'
 
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @($otherTenant,'','','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @($otherTenant,'','','','')
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'retained data'
     Assert-ConfigUnchanged $editContext $snapshot
     foreach ($answer in @('','',"first`nsecond")) { $script:Answers.Enqueue($answer) }
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Configuration requires'
     Assert-ConfigUnchanged $editContext $snapshot
-    foreach ($answer in @('','','unsaved-secret','14394','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','unsaved-secret','14394','')
     $script:Failure='\|stop\|--timeout\|130\|app$'
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Simulated'
     $script:Failure=''
@@ -288,7 +394,7 @@ try {
 
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try {
-        foreach ($answer in @('','','',"$($listener.LocalEndpoint.Port)",'')) { $script:Answers.Enqueue($answer) }
+        Add-EditAnswers @('','','',"$($listener.LocalEndpoint.Port)",'')
         Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'occupied'
         Assert-ConfigUnchanged $editContext $snapshot
     } finally { $listener.Stop() }
@@ -312,7 +418,7 @@ try {
     foreach ($url in @($tunnelUrl,'https://test--tunnel.devtunnels.ms','https://example.com:8443','https://127.0.0.1')) {
         Assert-True (Test-LocalPublicUrl $url) "Valid public origin rejected: $url"
     }
-    foreach ($answer in (@('','','','') + $invalidUrls + @(" $tunnelUrl "))) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in (@('','','','','','','') + $invalidUrls + @(" $tunnelUrl "))) { $script:Answers.Enqueue($answer) }
     $messages=Invoke-LocalDeployment $editContext 'EditConfig' 3>$null 6>&1
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     Assert-True ($script:Calls.Count -eq $callsBefore+4 -and $script:Calls[$script:Calls.Count-1] -match '\|stop\|--timeout\|130\|app$') 'Public-URL edit did not stop/drain the app.'
@@ -331,11 +437,11 @@ try {
 
     $snapshot=Get-ConfigSnapshot $editContext
     $callsBefore=$script:Calls.Count
-    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
     Assert-True ($script:Calls.Count -eq $callsBefore+3) 'No-op public URL edit stopped the app.'
-    foreach ($answer in @('','','','','https://replacement.devtunnels.ms')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','','https://replacement.devtunnels.ms')
     $script:Failure='\|stop\|--timeout\|130\|app$'
     Assert-Fails { Invoke-LocalDeployment $editContext 'EditConfig' 6>$null } 'Simulated'
     $script:Failure=''
@@ -348,10 +454,10 @@ try {
     Assert-True (($messages -join "`n").Contains('devtunnel port update YOUR_TUNNEL_ID -p 14393 --host-header unchanged --origin-header unchanged')) 'Startup omitted persistent origin-preserving settings for the saved tunnel port.'
     Assert-True (($messages -join "`n").Contains('devtunnel host YOUR_TUNNEL_ID --host-header unchanged --origin-header unchanged')) 'Startup omitted the tunnel host command.'
 
-    foreach ($answer in @('','','','14394','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','14394','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-True ($editContext.PublicUrl -ceq $tunnelUrl -and $editContext.Url -ceq 'http://localhost:14394') 'Port edit altered the explicit public origin.'
-    foreach ($answer in @('','','','','local')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','','local')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     $reloaded=New-LocalContext $testRoot 'editable-project'
     Assert-True ($reloaded.PublicUrl -ceq 'http://localhost:14394' -and (Read-LocalSettings $editContext.State).publicUrl -ceq '') 'Reset did not restore automatic localhost origin.'
@@ -360,7 +466,7 @@ try {
         Assert-True ($compose.Contains($expected)) "Reset configuration omitted $expected."
     }
     $snapshot=Get-ConfigSnapshot $editContext
-    foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','','')
     Invoke-LocalDeployment $editContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $editContext $snapshot
 
@@ -371,11 +477,11 @@ try {
     }
 
     $unstarted=New-LocalContext $testRoot 'unstarted-project'
-    foreach ($answer in @($tenant,$client,$clientSecret,'14394',$tunnelUrl)) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @($tenant,$client,$clientSecret,'14394',$tunnelUrl) -Domains 'contoso.com'
     Invoke-LocalDeployment $unstarted 'EditConfig' 6>$null
-    foreach ($answer in @($otherTenant,'','','','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @($otherTenant,'','','','')
     Invoke-LocalDeployment $unstarted 'EditConfig' 6>$null
-    Assert-True ((Get-Content -LiteralPath (Join-Path $unstarted.State 'settings.json') -Raw | ConvertFrom-Json).tenantId -ceq $otherTenant) 'Tenant correction before first deployment was rejected.'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $unstarted.State 'settings.json') -Raw | ConvertFrom-Json).tenants[0].tenantId -ceq $otherTenant) 'Tenant correction before first deployment was rejected.'
     Assert-True (-not $script:Volumes.Contains($unstarted.Volume)) 'Edit-config provisioned a database.'
     Assert-True ((New-LocalContext $testRoot 'unstarted-project').PublicUrl -ceq $tunnelUrl) 'New project did not retain its public URL.'
 
@@ -400,7 +506,7 @@ try {
                 $unchanged[$relative]=@{hash=(Get-FileHash -LiteralPath $path).Hash;modified=(Get-Item -LiteralPath $path).LastWriteTimeUtc.Ticks}
             }
         }
-        foreach ($answer in @('','','','14395','')) { $script:Answers.Enqueue($answer) }
+        Add-EditAnswers @('','','','14395','')
         $messages=Invoke-LocalDeployment $portOnly 'EditConfig' 6>&1
         $updated=Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
         Assert-True ($updated.port -eq 14395 -and $updated.note -ceq $original.note) 'Port-only edit did not preserve unrelated settings.'
@@ -415,7 +521,7 @@ try {
         Assert-True (($messages -join "`n").Contains('Identity configuration is incomplete')) 'Partial configuration was incorrectly reported as complete.'
         $settingsBefore=[IO.File]::ReadAllText($settingsPath)
         $modified=(Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc.Ticks
-        foreach ($answer in @('','','','','')) { $script:Answers.Enqueue($answer) }
+        Add-EditAnswers @('','','','','')
         Invoke-LocalDeployment $portOnly 'EditConfig' 6>$null
         Assert-True ([IO.File]::ReadAllText($settingsPath) -ceq $settingsBefore -and (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc.Ticks -eq $modified) 'No-op edit rewrote incomplete settings.'
         $script:Answers.Enqueue('')
@@ -423,18 +529,37 @@ try {
     }
 
     $newPortOnly=New-LocalContext $testRoot 'new-port-only'
-    foreach ($answer in @('','','','14395','')) { $script:Answers.Enqueue($answer) }
+    Add-EditAnswers @('','','','14395','')
     Invoke-LocalDeployment $newPortOnly 'EditConfig' 6>$null
     $newSettings=Get-Content -LiteralPath (Join-Path $newPortOnly.State 'settings.json') -Raw | ConvertFrom-Json -AsHashtable
     Assert-True ($newSettings.Count -eq 1 -and $newSettings.port -eq 14395) 'New port-only configuration saved unwanted identity fields.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $newPortOnly.State 'secrets/client-secret'))) 'New port-only configuration created an unset client secret.'
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $newPortOnly 'Deploy' 6>$null
-    Assert-True ($newPortOnly.Port -eq 14395 -and [IO.File]::ReadAllText((Join-Path $newPortOnly.State 'secrets/client-secret')) -ceq $clientSecret) 'Start did not complete identity setup while retaining the edited port.'
+    Assert-True ($newPortOnly.Port -eq 14395 -and (Read-FixtureRegistry $newPortOnly)[0].clientSecret -ceq $clientSecret) 'Start did not complete identity setup while retaining the edited port.'
+
+    $partialDomains=New-LocalContext $testRoot 'partial-domain-settings'
+    Add-EditAnswers @('','','','14395','') -Domains 'contoso.com' -DisplayName 'Contoso'
+    Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null
+    $pendingSettings=Read-LocalSettings $partialDomains.State
+    Assert-True (($pendingSettings.tenantDomains -join ',') -ceq 'contoso.com' -and $pendingSettings.tenantDisplayName -ceq 'Contoso') 'Incomplete identity editing discarded entered domains or display name.'
+    $promptCount=$script:Prompts.Count
+    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    Invoke-LocalDeployment $partialDomains 'Deploy' 6>$null
+    Assert-True ($script:Prompts.Count -eq $promptCount+3 -and (Read-FixtureRegistry $partialDomains)[0].displayName -ceq 'Contoso') 'Completing a partial profile discarded or reprompted saved domain settings.'
+    Assert-True (-not (Get-ChildItem -LiteralPath $partialDomains.State -Recurse -File -Filter '*.pending-*')) 'Atomic configuration writes left pending credential files.'
+    Add-EditAnswers @('','','','','') -DisplayName '2026-09-26T00:00:00.000Z'
+    Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null
+    $snapshot=Get-ConfigSnapshot $partialDomains
+    $callCount=$script:Calls.Count
+    Add-EditAnswers @('','','','','')
+    Invoke-LocalDeployment $partialDomains 'EditConfig' 6>$null
+    Assert-ConfigUnchanged $partialDomains $snapshot
+    Assert-True ($script:Calls.Count -eq $callCount+3 -and (Read-FixtureRegistry $partialDomains)[0].displayName -ceq '2026-09-26T00:00:00.000Z') 'Reloading a date-like display name changed configuration or stopped the app.'
 
     $shellValues=@{}
     try {
-        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANT_ID','CLIENT_ID','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
+        foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY')) {
             $shellValues[$name]=[Environment]::GetEnvironmentVariable($name)
         }
         $script:CheckProjectEnvironment=$true
@@ -488,19 +613,20 @@ try {
         if (-not $savedTenant) { $script:Answers.Enqueue($tenant) }
         if (-not $savedClient) { $script:Answers.Enqueue($client) }
         if ($missing -notin @('tenant','client','port')) { $script:Answers.Enqueue($clientSecret) }
+        $script:Answers.Enqueue('contoso.com')
         if ($missing -in @('port','all')) { $script:Answers.Enqueue('14391') }
         Initialize-LocalState $partial $true -Onboard 6>$null
-        $expected=if ($missing -eq 'all') { 4 } else { 1 }
+        $expected=if ($missing -eq 'all') { 5 } else { 2 }
         Assert-True ($script:Prompts.Count -eq $promptCount+$expected) "Partial project $missing prompted for already saved values."
         $updated=Get-Content -LiteralPath $partialSettings -Raw | ConvertFrom-Json
-        Assert-True ($updated.tenantId -ceq $tenant -and $updated.clientId -ceq $client -and [IO.File]::ReadAllText($partialSecret) -ceq $clientSecret) "Partial project $missing was not completed."
+        Assert-True ($updated.tenants[0].tenantId -ceq $tenant -and $updated.tenants[0].clientId -ceq $client -and (Read-FixtureRegistry $partial)[0].clientSecret -ceq $clientSecret) "Partial project $missing was not completed."
         foreach ($name in $hashes.Keys) {
             Assert-True ((Get-FileHash -LiteralPath (Join-Path $partial.State "secrets/$name")).Hash -ceq $hashes[$name]) "Onboarding rotated $name."
         }
     }
 
     $invalidContext=New-LocalContext $testRoot 'invalid-input'
-    foreach ($answer in @('not-a-guid'," $tenant ",$client,$clientSecret,'abc','1023','65536','14391')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in (@('not-a-guid'," $tenant ",$client,$clientSecret) + $invalidDomainInputs + @('*.contoso.com','contoso.com,CONTOSO.com','contoso.com','abc','1023','65536','14391'))) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $invalidContext $false -Onboard 3>$null 6>$null
     Assert-True ([IO.File]::ReadAllText((Join-Path $invalidContext.State 'settings.json')).Contains($tenant)) 'Invalid GUID input was not retried and trimmed.'
     foreach ($invalidInput in @('blank-tenant','blank-client','blank-secret','multiline-secret')) {
@@ -529,44 +655,45 @@ try {
     Invoke-LocalDeployment $maintenanceContext 'Test' 6>$null
     Invoke-LocalDeployment $maintenanceContext 'Backup' 6>$null
     Assert-True ($script:Prompts.Count -eq $promptCount) 'Maintenance actions unexpectedly required onboarding.'
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $maintenanceContext 'Start' 6>$null
-    Assert-True ($script:Prompts.Count -eq $promptCount+3) 'Start did not onboard an existing unconfigured project.'
+    Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Start did not onboard an existing unconfigured project.'
     Assert-True ($script:Answers.Count -eq 0) 'Not all expected wizard answers were consumed.'
 
     $entryRoot=Join-Path $testRoot 'entrypoint'
     [IO.Directory]::CreateDirectory((Join-Path $entryRoot 'scripts')) | Out-Null
     Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $entryRoot 'deploy-local.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/local-deployment.ps1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'tenant-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/tenant-deployment.ps1')
     $entryPath=Join-Path $entryRoot 'deploy-local.ps1'
     $entryState=Join-Path $entryRoot '.local'
     $retainedContext=$context
     foreach ($projectArguments in @(@{},@{Project='newCustomer'})) {
         $promptCount=$script:Prompts.Count
-        foreach ($answer in @($tenant,$client,$clientSecret,'14391')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','14391')) { $script:Answers.Enqueue($answer) }
         $script:WizardTrace.Clear()
         $messages=. $entryPath @projectArguments 6>&1 | ForEach-Object { $script:WizardTrace.Add([string]$_); $_ }
         $trace=$script:WizardTrace -join "`n"
         Assert-True ($trace.IndexOf('Registered app permissions and setup') -ge 0 -and $trace.IndexOf('Registered app permissions and setup') -lt $trace.IndexOf('PROMPT:')) 'Registration guidance must appear before the first wizard prompt.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Public entry point did not onboard the selected project.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Public entry point did not onboard the selected project.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Public entry point printed the client secret.'
         $messages=. $entryPath start @projectArguments 6>&1
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Configured start unnecessarily repeated onboarding guidance.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Public entry point did not reuse saved onboarding values.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Public entry point did not reuse saved onboarding values.'
         $projectName=if ($projectArguments.Project) { 'newcustomer' } else { 'agent-control' }
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/settings.json")) 'Entry point did not save the selected project folder.'
         $messages=. $entryPath stop @projectArguments 6>&1
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Stop unexpectedly displayed onboarding guidance.'
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/control/maintenance")) 'Explicit stop did not close admissions.'
-        foreach ($answer in @('','','','',$tunnelUrl)) { $script:Answers.Enqueue($answer) }
+        Add-EditAnswers @('','','','',$tunnelUrl)
         $messages=. $entryPath -Action edit-config @projectArguments 6>&1
         Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the complete registration guidance.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Edit-config displayed the saved client secret.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+9) 'Explicit edit-config did not prompt for all settings.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+13) 'Explicit edit-config did not prompt for all settings.'
         $entrySettings=Read-LocalSettings (Join-Path $entryState $projectName)
         Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) '-Action edit-config did not persist the public URL independently of the port.'
         $messages=. $entryPath -Action start @projectArguments 6>&1
-        Assert-True ($script:Prompts.Count -eq $promptCount+9 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) '-Action start did not reuse the saved public URL.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+13 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) '-Action start did not reuse the saved public URL.'
         $savedEntry=Get-ConfigSnapshot $context
         $callOffset=$script:Calls.Count
         $messages=if ($projectArguments.Project) { . $entryPath start @projectArguments -db-reset 6>&1 }
@@ -574,7 +701,7 @@ try {
         $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
         Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'Public DbReset did not reset the selected application database exactly once.'
         Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' -and $_.Contains("|--network|${projectName}_default|") }).Count -eq 1) 'Public DbReset used another project network.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+9) 'DbReset prompted for existing configuration again.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+13) 'DbReset prompted for existing configuration again.'
         Assert-ConfigUnchanged $context $savedEntry
     }
     $context=$retainedContext
@@ -595,7 +722,7 @@ try {
     $context=$retainedContext
 
     $qualification=New-FixtureContext 'preflight-retained'
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $qualification $false -Onboard 6>$null
     $script:Volumes.Add($qualification.Volume) | Out-Null
     $snapshot=Get-ConfigSnapshot $qualification
@@ -696,7 +823,7 @@ try {
     }
 
     $resetContext=New-FixtureContext 'database-reset-project'
-    foreach ($answer in @($tenant,$client,$clientSecret)) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $resetContext $false -Onboard 6>$null
     $script:Volumes.Add($resetContext.Volume) | Out-Null
     $resetSnapshot=Get-ConfigSnapshot $resetContext

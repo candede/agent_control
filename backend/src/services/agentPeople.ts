@@ -105,14 +105,14 @@ export class AgentPeopleService {
     };
     const wait = <T>(operation: () => Promise<T>) => awaitResolution(signal, operation);
     fence();
-    const freshUser = await wait(() => this.dependencies.revalidateUser(scope.principalId));
+    const freshUser = await wait(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId));
     fence();
     requireSameUser(scope, freshUser);
     const token = await wait(() => commitAccountSessionValidation(validation, async () => {
       fence();
       await wait(() => this.dependencies.requireAvailable("graph.directory.read", freshUser));
       fence();
-      return wait(() => this.dependencies.delegatedToken(scope.principalId, "graph.directory.read"));
+      return wait(() => this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "graph.directory.read"));
     }));
     for (let offset = 0; offset < pending.length; offset += 8) {
       fence();
@@ -146,7 +146,7 @@ export class AgentPeopleService {
         }
       }));
       fence();
-      const current = await wait(() => this.dependencies.revalidateUser(scope.principalId));
+      const current = await wait(() => this.dependencies.revalidateUser(scope.tenantId, scope.principalId));
       fence();
       requireSameUser(scope, current);
       await wait(() => commitAccountSessionValidation(validation, async () => {
