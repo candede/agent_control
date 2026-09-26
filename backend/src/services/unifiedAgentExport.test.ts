@@ -39,7 +39,7 @@ function inventory(value = [record("first"), record("second")]): UnifiedAgentInv
       uniqueSourceCount: value.length, logicalAgentCount: value.length,
       checks: { sourceScopes: false, packageMetadata: false, identityLinks: true, sourceMemberships: true },
     },
-    facets: { environments: [], platforms: [] },
+    facets: { environments: [], platforms: [], types: [] },
     sources: {
       graphPackages: {
         state: "available", error: null,
@@ -135,7 +135,7 @@ describe("unified agent CSV projection", () => {
     expect(second.startsWith('"graph_packages:second","Second, ""quoted""",')).toBe(true);
     expect(first).toContain(csvValue(JSON.stringify([{
       packageId: "first", version: null, isBlocked: false, availableTo: null, deployedTo: null,
-      publisher: null, supportedHosts: [], snapshotId: null, observedAt: null,
+      publisher: null, type: null, supportedHosts: [], snapshotId: null, observedAt: null,
     }])));
     expect(trailing).toBe("");
     expect(csv.rowCount).toBe(2);

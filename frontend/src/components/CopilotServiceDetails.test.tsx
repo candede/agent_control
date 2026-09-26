@@ -14,14 +14,14 @@ describe("paid-feature evidence details", () => {
 
   it("does not infer no paid services from unknown assignments", () => {
     render(<CopilotServiceDetails servicePlans={[]} copilotServiceState="unknown" current />);
-    expect(screen.getByText(/Paid-feature evidence not reported.*Run Users Sync/)).toBeVisible();
+    expect(screen.getByText("Paid-feature status is unavailable. Refresh Users in Sync.")).toBeVisible();
     expect(screen.queryByText(/No paid Copilot services are assigned/)).not.toBeInTheDocument();
   });
 
   it("qualifies an old no-services observation without calling that evidence missing", () => {
     render(<CopilotServiceDetails servicePlans={[]} copilotServiceState="disabled" current={false} />);
     expect(screen.getByText("Last saved: no paid Copilot services were assigned.")).toBeVisible();
-    expect(screen.getByText(/Current paid-feature status is unverified until Users Sync/)).toBeVisible();
+    expect(screen.getByText("Refresh Users in Sync to verify current paid-feature status.")).toBeVisible();
     expect(screen.queryByText(/Paid-feature evidence not reported/)).not.toBeInTheDocument();
   });
 
@@ -39,7 +39,8 @@ describe("paid-feature evidence details", () => {
     }]);
     render(<CopilotServiceDetails servicePlans={[plan]} copilotServiceState="disabled" current />);
     expect(screen.getByRole("list", { name: "Paid feature states" })).toHaveTextContent("Not enabled");
-    expect(screen.getByText(/Raw capability status:/)).toHaveTextContent("Enabled");
-    expect(screen.getByText(/Assigned at:/)).toHaveTextContent("2026-01-01T00:00:00.000Z");
+    expect(screen.queryByText(/Raw capability status:/)).not.toBeInTheDocument();
+    expect(screen.getByText("Assigned Jan 1, 2026")).toBeVisible();
+    expect(document.querySelector("details")).toBeNull();
   });
 });

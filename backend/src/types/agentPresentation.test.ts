@@ -40,8 +40,12 @@ describe("agent quick views and independent filters", () => {
   it.each([
     { types: ["microsoft"], first: true, third: false },
     { types: [" MICROSOFT ", "microsoft"], first: true, third: false },
+    { types: ["firstParty"], first: true, third: false },
+    { types: [" FIRSTPARTY ", "microsoft"], first: true, third: false },
     { types: ["external"], first: false, third: true },
     { types: ["EXTERNAL", " external "], first: false, third: true },
+    { types: ["thirdParty"], first: false, third: true },
+    { types: [" THIRDPARTY ", "external"], first: false, third: true },
     ...[[], ["custom"], ["shared"], ["first_party"], ["third_party"], ["Microsoft Corporation"],
       [undefined], ["future"], ["microsoft", "external"], ["microsoft", "custom"], ["external", "shared"],
       ["microsoft", undefined], ["external", "future"]].map(types => ({ types, first: false, third: false })),
@@ -88,6 +92,7 @@ describe("agent quick views and independent filters", () => {
   it.each([
     personalPackage,
     { ...personalPackage, type: " SHARED " },
+    { ...personalPackage, type: "lob" },
     { ...personalPackage, authoringTool: "Copilot Studio Lite" },
     { ...personalPackage, authoringTool: null, platform: "Microsoft 365 Copilot Agent Builder" },
     { ...personalPackage, authoringTool: null, shortDescription: "Built using Microsoft 365 Copilot Agent Builder." },
@@ -305,7 +310,7 @@ describe("agent presentation and organizational relevance", () => {
     expect(agentUserAvailability(value)).toBe("unknown");
   });
 
-  it.each(["microsoft", "custom", "shared"])("includes documented %s origin without pretending it was used", type => {
+  it.each(["microsoft", "firstParty", "custom", "lob", "shared"])("includes documented %s origin without pretending it was used", type => {
     const value = record([{ type, deployedTo: "none", isBlocked: true }]);
     expect(matchesAgentView(value, "organization")).toBe(true);
     expect(matchesAgentView(value, "used")).toBe(false);
@@ -365,15 +370,21 @@ describe("agent presentation and organizational relevance", () => {
     expect(agentColumnValue(value, "origin")).toBeNull();
   });
 
-  it.each(["unknownFutureValue", "constructor", "__proto__"])("keeps unrecognized origin %s unknown without inheriting object properties", type => {
+  it.each(["unknownFutureValue", "constructor", "__proto__"])("preserves the raw type %s without inferring organizational relevance", type => {
     const value = record([{ type, publisher: "Microsoft", authoringTool: "Copilot Studio" }]);
-    expect(agentColumnValue(value, "origin")).toBeNull();
+    expect(agentColumnValue(value, "origin")).toBe(type);
     expect(matchesAgentView(value, "organization")).toBe(false);
+  });
+
+  it.each([
+    "firstParty", "thirdParty", "lob", "shared", "microsoft", "external", "custom",
+  ])("displays the original Graph package type %s", type => {
+    expect(agentColumnValue(record([{ type }]), "origin")).toBe(type);
   });
 
   it("retains unknown markers when only part of a grouped origin or version is known", () => {
     const value = record([{ type: "custom", version: "2" }, {}]);
-    expect(agentColumnValue(value, "origin")).toBe("Organization-created / Unknown");
+    expect(agentColumnValue(value, "origin")).toBe("custom / Unknown");
     expect(agentColumnValue(value, "versions")).toBe("2 / Unknown");
   });
 

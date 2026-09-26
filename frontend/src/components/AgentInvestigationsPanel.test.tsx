@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { getAgentInvestigationContext, getAgentPurviewRecords, resolveAgentInvestigationIdentity, type AgentInvestigationContext, type PurviewAuditRecord } from "../api/client";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
+import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(),
@@ -11,8 +12,8 @@ vi.mock("../api/client", async original => ({
   resolveAgentInvestigationIdentity: vi.fn(),
 }));
 vi.mock("./DefenderHuntingView", () => ({
-  DefenderHuntingView: ({ agentRecordId, entraAgentIds }: { agentRecordId: string; entraAgentIds: string[] }) =>
-    <div aria-label="Scoped Defender hunt">{agentRecordId} / {entraAgentIds.join(",")}</div>,
+  DefenderHuntingView: ({ agentRecordId, entraAgentIds, active }: { agentRecordId: string; entraAgentIds: string[]; active: boolean }) =>
+    active ? <div aria-label="Scoped Defender hunt">{agentRecordId} / {entraAgentIds.join(",")}</div> : null,
 }));
 
 const recordId = "power_platform:environment-a:agent-a";
@@ -44,8 +45,8 @@ const auditRecord: PurviewAuditRecord = {
   botComponentId: null, aiPluginOperationId: null, messages: [], contentAvailable: false, unknownFieldCount: 0,
 };
 
-function panel(id = recordId, roles: ("AgentControl.Viewer" | "AgentControl.Admin")[] = ["AgentControl.Viewer"], access = capability) {
-  return <CapabilityContext value={access}><AgentInvestigationsPanel recordId={id} agentName={id === recordId ? "Agent A" : "Agent B"} roles={roles} /></CapabilityContext>;
+function panel(id = recordId, roles: ("AgentControl.Viewer" | "AgentControl.Admin")[] = ["AgentControl.Viewer"], access = capability, revision = "1") {
+  return <CapabilityContext value={access}><AgentInvestigationsPanel recordId={id} agentName={id === recordId ? "Agent A" : "Agent B"} roles={roles} revision={revision} /></CapabilityContext>;
 }
 
 beforeEach(() => {
@@ -63,7 +64,7 @@ describe("agent investigations", () => {
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
     expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("Agent IDs")).not.toBeInTheDocument();
-    expect(screen.getByText("Metadata only. Hunts run only when requested.")).toBeVisible();
+    expect(screen.queryByText("Metadata only. Hunts run only when requested.")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Setup & permissions" }));
     expect(capability.openPermissions).toHaveBeenCalledOnce();
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
@@ -73,7 +74,7 @@ describe("agent investigations", () => {
     render(panel(recordId, []));
     expect(getAgentInvestigationContext).not.toHaveBeenCalled();
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
-    expect(screen.getByText(/Viewer is not assigned/)).toBeVisible();
+    expect(screen.getByText("An AgentControl.Viewer role is required to view agent logs.")).toBeVisible();
   });
 
   it("explains a missing identity without falling back to a tenant-wide hunt", async () => {
@@ -82,11 +83,9 @@ describe("agent investigations", () => {
     });
     render(panel());
     expect(await screen.findByRole("heading", { name: "Defender identity not mapped" })).toBeVisible();
-    expect(screen.getByText("No verified Entra agent identity.")).not.toBeVisible();
-    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
-    expect(screen.getByText(/Portal setup alone will not fix the mapping/)).toBeVisible();
-    fireEvent.click(screen.getByText("Technical details"));
     expect(screen.getByText("No verified Entra agent identity.")).toBeVisible();
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
   });
 
   it("keeps unavailable Purview concise without implying live collection or requesting records", async () => {
@@ -97,10 +96,10 @@ describe("agent investigations", () => {
     await screen.findByLabelText("Scoped Defender hunt");
     fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
     expect(screen.getByRole("heading", { name: "Purview identity not mapped" })).toBeVisible();
-    expect(screen.getByText("Saved Copilot Studio admin events only. No live collection.")).toBeVisible();
-    expect(screen.getByText("An exact bot ID and environment are missing.")).not.toBeVisible();
+    expect(screen.getByRole("region", { name: "Purview log coverage and setup" })).toHaveTextContent("Saved records only");
+    expect(screen.getByText("An exact bot ID and environment are missing.")).toBeVisible();
     expect(getAgentPurviewRecords).not.toHaveBeenCalled();
-    expect(screen.getByRole("link", { name: "Audit Search (not agent-scoped)" })).toHaveAttribute("href", "https://purview.microsoft.com/audit/auditsearch");
+    expect(screen.queryByRole("link", { name: "Tenant Audit Search" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Setup & permissions" }));
     expect(capability.openPermissions).toHaveBeenCalledOnce();
   });
@@ -210,7 +209,7 @@ describe("agent investigations", () => {
     });
     render(panel());
     expect(await screen.findByRole("heading", { name: "Defender linking not supported for this agent" })).toBeVisible();
-    expect(screen.getByText(/Microsoft may still hold its logs/)).toBeVisible();
+    expect(screen.getByText(/Changing permissions will not create a missing identity mapping/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Resolve log identity" })).not.toBeInTheDocument();
     expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
   });
@@ -248,8 +247,26 @@ describe("agent investigations", () => {
     fireEvent.click(screen.getByRole("button", { name: "Search saved audit" }));
     await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId,
       { limit: 50, offset: 0, search: "correlation-a", operation: "BotCreate" }, { signal: expect.any(AbortSignal) }));
-    expect(screen.getByText(/not a total of all activity/)).toBeVisible();
+    expect(screen.getByText("51 matching saved records.")).toBeVisible();
+    expect(screen.queryByText(/not a total of all activity/)).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "View audit search" })).not.toBeInTheDocument();
+  });
+
+  it("keeps empty audit guidance concise and useful event references visible", async () => {
+    vi.mocked(getAgentPurviewRecords)
+      .mockResolvedValueOnce({ recordId, mode: "saved_only", value: [], count: 0, limit: 50, offset: 0 })
+      .mockResolvedValueOnce({ recordId, mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0 });
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(await screen.findByText("No matching saved audit records. Try another search or check audit collection in Setup & permissions.")).toBeVisible();
+    expect(screen.getByText("0 matching saved records.")).toBeVisible();
+    expect(screen.queryByText(/does not prove inactivity|absence of risk/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Search saved audit" }));
+    expect(await screen.findByText("actor@example.invalid")).toBeVisible();
+    expect(screen.getByText("event-a")).toBeVisible();
+    expect(screen.getByText("correlation-a")).toBeVisible();
+    expect(screen.getByRole("region", { name: "Agent Purview audit" }).querySelector("details")).toBeNull();
   });
 
   it("surfaces denied saved reads instead of presenting an empty result", async () => {
@@ -273,9 +290,7 @@ describe("agent investigations", () => {
     const view = render(panel());
     view.rerender(panel("agent-b"));
     expect(signal.aborted).toBe(true);
-    expect(await screen.findByText("Agent B has no typed identity.")).not.toBeVisible();
-    fireEvent.click(screen.getByText("Technical details"));
-    expect(screen.getByText("Agent B has no typed identity.")).toBeVisible();
+    expect(await screen.findByText("Agent B has no typed identity.")).toBeVisible();
     await act(async () => complete(investigation));
     expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
   });
@@ -286,6 +301,98 @@ describe("agent investigations", () => {
     fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
     expect(await screen.findByText("actor@example.invalid")).toBeVisible();
     view.rerender(panel(recordId, []));
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+  });
+
+  it("explains source coverage and collection requirements even when an agent cannot be linked", async () => {
+    vi.mocked(getAgentInvestigationContext).mockResolvedValue({
+      ...investigation, defender: { status: "unavailable", reasonCode: "unsupported_identity_crosswalk", entraAgentIds: [] },
+      purview: { status: "unavailable", mode: "saved_only", reasonCode: "unsupported_identity_crosswalk" },
+    });
+    const { container } = render(panel());
+    await screen.findByRole("heading", { name: "Defender linking not supported for this agent" });
+    expect(screen.getByRole("region", { name: "Defender log coverage and setup" })).toHaveTextContent("SDK, gateway and MCP");
+    expect(screen.getByText("ThreatHunting.Read.All")).toBeVisible();
+    expect(screen.queryByText("AuditLogsQuery.Read.All")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(screen.getByRole("region", { name: "Purview log coverage and setup" })).toHaveTextContent("publishing, sharing, authentication changes");
+    expect(screen.getByText("AuditLogsQuery.Read.All")).toBeVisible();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(container.querySelector("details")).toBeNull();
+    expect(getAgentPurviewRecords).not.toHaveBeenCalled();
+  });
+
+  it("preserves the Purview source, draft search and applied filters through revision refresh and source switching", async () => {
+    const view = render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "correlation-a" } });
+    fireEvent.change(screen.getByLabelText("Exact audit operation"), { target: { value: "BotCreate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search saved audit" }));
+    await screen.findByText("actor@example.invalid");
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "unfinished edit" } });
+
+    let complete!: (value: AgentInvestigationContext) => void;
+    vi.mocked(getAgentInvestigationContext).mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    await act(async () => complete(investigation));
+    await screen.findByText("actor@example.invalid");
+    expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, { search: "correlation-a", operation: "BotCreate", limit: 50, offset: 0 }, { signal: expect.any(AbortSignal) });
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("unfinished edit");
+    fireEvent.click(screen.getByRole("button", { name: "Defender & Agent 365" }));
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("unfinished edit");
+    expect(screen.getByLabelText("Exact audit operation")).toHaveValue("BotCreate");
+  });
+
+  it("ignores permission-check timestamp renewals but rechecks real access changes without resetting the chosen source", async () => {
+    const definition = capabilityDefinitions.find(item => item.id === "purview.audit.search.delegated")!;
+    const access: typeof capability = { ...capability, views: [{
+      definition, decision: { capabilityId: definition.id, status: "available", authorized: true, fresh: true,
+        previewQualification: "not_required", remediation: [], checkedAt: "2026-09-26T10:00:00Z", expiresAt: "2026-09-26T10:05:00Z" },
+    }] };
+    const view = render(panel(recordId, ["AgentControl.Viewer"], access));
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const refreshed = structuredClone({ views: access.views });
+    refreshed.views[0].decision.checkedAt = "2026-09-26T10:01:00Z";
+    refreshed.views[0].decision.expiresAt = "2026-09-26T10:06:00Z";
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...access, ...refreshed }));
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    vi.mocked(getAgentInvestigationContext).mockRejectedValue(new Error("Saved access was revoked"));
+    refreshed.views[0].decision.authorized = false;
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...access, ...refreshed }));
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved access was revoked");
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("refreshes the selected Purview data without clearing its filters", async () => {
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "actor" } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh investigation access" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("actor");
+  });
+
+  it("rejects audit responses for a different agent and never displays their records", async () => {
+    vi.mocked(getAgentPurviewRecords).mockResolvedValue({
+      recordId: "other-agent", mode: "saved_only", value: [auditRecord], count: 1, limit: 50, offset: 0,
+    });
+    render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Audit records do not match the selected agent");
     expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
   });
 });

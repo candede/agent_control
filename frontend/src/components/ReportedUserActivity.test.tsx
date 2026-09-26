@@ -193,15 +193,15 @@ describe("reported user activity", () => {
     expect(summary).toHaveTextContent(license);
     expect(within(summary).queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
     expect(within(summary).getByText(label)).toHaveAttribute("class", `copilot-user-badge ${tone}`);
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
     expect(within(services).getByText(label)).toBeVisible();
-    const rawCapability = within(detail).getAllByText(/^Raw capability status:/)[0];
-    expect(rawCapability).not.toBeVisible();
-    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
-    expect(rawCapability).toHaveTextContent("Raw capability status: Enabled");
-    expect(rawCapability).toBeVisible();
+    expect(within(detail).queryByText(/^Raw capability status:/)).not.toBeInTheDocument();
+    expect(detail.querySelector("details")).toBeNull();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Overview" }));
     expect(within(summary).getByText(label)).toBeVisible();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     expect(within(services).getByText(label)).toBeVisible();
   });
 
@@ -223,8 +223,9 @@ describe("reported user activity", () => {
     const detail = (await openUser("Ada")).dialog;
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Not enabled");
     expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
-    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
-    expect(within(detail).getByText(/Service-plan ID:/)).toBeVisible();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
+    expect(within(detail).getByRole("list", { name: "Paid feature states" })).toBeVisible();
+    expect(within(detail).queryByText(/Service-plan ID:/)).not.toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(/E7|SKU|legacy-package|legacy-disabled|legacy-group|Group assignment|Direct assignment|Disabled plans/i);
   });
 
@@ -243,6 +244,7 @@ describe("reported user activity", () => {
     await userEvent.click(screen.getByRole("button", { name: "Close reported user details" }));
     expect(trigger).toHaveFocus();
     await userEvent.keyboard("{Enter}");
+    await userEvent.click(screen.getByRole("tab", { name: "Usage & agents" }));
     await userEvent.type(screen.getByRole("searchbox", { name: "Search this user's agents" }), "research");
     await userEvent.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -261,17 +263,19 @@ describe("reported user activity", () => {
     vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
     renderActivity();
     const { dialog } = await openUser("Ada");
-    expect(within(dialog).getByText("Responses (Users report)").parentElement).toHaveTextContent("999");
-    expect(within(dialog).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("215");
-    expect(within(dialog).getByText(/shown separately, never added/)).toBeVisible();
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("999");
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
+    expect(within(dialog).getByText(/^Responses across reported agents:/)).toHaveTextContent("215");
+    expect(within(dialog).getByText(/Report totals differ. Users total: 999; agent breakdown: 215/)).toBeVisible();
     await userEvent.click(within(dialog).getByRole("button", { name: "Close reported user details" }));
     const row = within(screen.getByRole("region", { name: "Active users without paid Copilot" })).getByRole("row", { name: /Bridge report user/ });
     expect(within(row).getAllByRole("cell").slice(0, 2).map(cell => cell.textContent)).toEqual(["Unknown", "Unknown"]);
     const bridgeDetail = (await openUser("Bridge report user")).dialog;
-    expect(within(bridgeDetail).getByText("Responses (Users report)").parentElement).toHaveTextContent("Unknown");
-    expect(within(bridgeDetail).getByText("Agents used (Users report)").parentElement).toHaveTextContent("Unknown");
-    expect(within(bridgeDetail).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("12");
-    expect(within(bridgeDetail).getByText("User last activity (Users report)").parentElement).toHaveTextContent("Not reported");
+    expect(within(bridgeDetail).getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
+    expect(within(bridgeDetail).getByText("Agents used").parentElement).toHaveTextContent("Unknown");
+    expect(within(bridgeDetail).getByRole("region", { name: "User reported activity" })).toHaveTextContent("Not reported");
+    await userEvent.click(within(bridgeDetail).getByRole("tab", { name: "Usage & agents" }));
+    expect(within(bridgeDetail).getByText(/^Responses across reported agents:/)).toHaveTextContent("12");
   });
 
   it("preserves zero relationships but describes absent rows as not reported", async () => {
@@ -282,16 +286,18 @@ describe("reported user activity", () => {
     vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(data);
     renderActivity();
     const ben = (await openUser("Ben")).dialog;
+    expect(within(ben).getByRole("region", { name: "User reported activity" })).toHaveTextContent("Not reported");
+    await userEvent.click(within(ben).getByRole("tab", { name: "Usage & agents" }));
     const row = within(ben).getByRole("row", { name: /Researcher/ });
     expect(within(row).getAllByRole("cell")[2]).toHaveTextContent(/^0$/);
-    expect(within(row).getByText("Anyone, not this user")).toBeVisible();
-    expect(within(ben).getByText("User last activity (Users report)").parentElement).toHaveTextContent("Not reported");
+    expect(within(ben).getByRole("columnheader", { name: "Agent-wide last activity" })).toBeVisible();
     await userEvent.click(within(ben).getByRole("button", { name: "Close reported user details" }));
     const cleoDetail = (await openUser("Cleo")).dialog;
+    expect(within(cleoDetail).getByText("Agent responses").parentElement).toHaveTextContent("40");
+    await userEvent.click(within(cleoDetail).getByRole("tab", { name: "Usage & agents" }));
     expect(within(cleoDetail).getByRole("heading", { name: "No agent relationships reported" })).toBeVisible();
-    expect(within(cleoDetail).getByText(/contains no agent rows for this user/)).toBeVisible();
-    expect(within(cleoDetail).getByText("Responses (Users report)").parentElement).toHaveTextContent("40");
-    expect(within(cleoDetail).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("Not reported");
+    expect(within(cleoDetail).getByText("No agents are listed for this user in the selected report.")).toBeVisible();
+    expect(within(cleoDetail).getByText(/^Responses across reported agents:/)).toHaveTextContent("Not reported");
     expect(within(cleoDetail).queryByText(/Import and activate/)).not.toBeInTheDocument();
   });
 
@@ -309,12 +315,14 @@ describe("reported user activity", () => {
     expect(within(row).getAllByRole("cell").slice(0, 2).map(cell => cell.textContent)).toEqual(["Unknown", "Unknown"]);
     expect(row).toHaveTextContent("No active M365 Copilot license");
     const { dialog } = await openUser("ada@example.invalid");
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("Unknown");
+    expect(within(dialog).getByText("Agents used").parentElement).toHaveTextContent("Unknown");
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
     const features = within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" });
     expect(features).toHaveTextContent("No paid Copilot services are assigned.");
     expect(features).not.toHaveTextContent(/unverified|evidence not reported|Run Users Sync/);
-    expect(within(dialog).getByText("Responses (Users report)").parentElement).toHaveTextContent("Unknown");
-    expect(within(dialog).getByText("Agents used (Users report)").parentElement).toHaveTextContent("Unknown");
-    expect(within(dialog).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("215");
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
+    expect(within(dialog).getByText(/^Responses across reported agents:/)).toHaveTextContent("215");
   });
 
   it("excludes unknown assignments even when no service plans are returned and activity is positive", async () => {
@@ -340,22 +348,25 @@ describe("reported user activity", () => {
     vi.mocked(api.getOfficialUsageUsers).mockResolvedValue(buildNonPaidView(published, { staleAfterDays: 35, now: usageFixtureNow }));
     renderActivity();
     const detail = (await openUser("Ada")).dialog;
+    await userEvent.click(within(detail).getByRole("tab", { name: "Usage & agents" }));
     expect(within(detail).getByRole("heading", { name: "Agent relationships unavailable" })).toBeVisible();
     expect(within(detail).queryByText(/contains no agent rows/)).not.toBeInTheDocument();
     expect(within(detail).queryByText(/Report totals differ/)).not.toBeInTheDocument();
-    expect(within(detail).getByText("Responses (all Users & agents rows)").parentElement).toHaveTextContent("Not reported");
+    expect(within(detail).getByText(/^Responses across reported agents:/)).toHaveTextContent("Not reported");
   });
 
   it("loads responsibility only for an already-established exact directory/report identity", async () => {
     const directory = directoryFixture();
     renderActivity(initialRoute, directory);
     const detail = (await openUser("Ada")).dialog;
+    expect(within(detail).getByText("Agent responses").parentElement).toHaveTextContent("215");
+    expect(api.getAgentResponsibility).not.toHaveBeenCalled();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Responsibility" }));
     expect(await within(detail).findByText("Responsible agent")).toBeVisible();
     expect(api.getAgentResponsibility).toHaveBeenCalledOnce();
     expect(api.getAgentResponsibility).toHaveBeenCalledWith(
       expect.objectContaining({ objectId: directory.users[0].directory.objectId }), expect.anything(),
     );
-    expect(within(detail).getByText("Responses (Users report)").parentElement).toHaveTextContent("215");
   });
 
   it.each(["set", "missing-set", "users-version", "bridge-version", "case", "ambiguous", "unmatched", "unavailable", "partial", "stale"])(
@@ -380,9 +391,12 @@ describe("reported user activity", () => {
       const detail = (await openUser("Ada")).dialog;
       expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
       expect(within(detail).queryByText(/^(Basic|Disabled|Unlicensed|M365 Copilot licensed|License not verified)$/)).not.toBeInTheDocument();
-      expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Unknown");
+      expect(within(detail).getByText("Organization details are unavailable for this report identity.")).toBeVisible();
+      await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
       expect(within(detail).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
-      expect(within(detail).getByText(/Responsibility unavailable: no exact verified directory object ID/)).toBeVisible();
+      expect(within(detail).getByText("Detailed license assignments are unavailable for this report identity.")).toBeVisible();
+      await userEvent.click(within(detail).getByRole("tab", { name: "Responsibility" }));
+      expect(within(detail).getByText(/Link this user to a directory identity/)).toBeVisible();
       expect(api.getAgentResponsibility).not.toHaveBeenCalled();
     },
   );
@@ -423,7 +437,8 @@ describe("reported user activity", () => {
     );
     const { dialog } = await openUser("Ada");
     expect(within(dialog).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
-    expect(within(dialog).getByText("Directory account").parentElement).toHaveTextContent("Unknown");
+    expect(within(dialog).getByText("Organization details are unavailable for this report identity.")).toBeVisible();
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
     expect(within(dialog).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
   });
 
@@ -467,6 +482,7 @@ describe("reported user activity", () => {
     await screen.findByRole("region", { name: "Active users without paid Copilot" });
     expect(screen.queryByRole("region", { name: "User agent breakdown" })).not.toBeInTheDocument();
     const { dialog } = await openUser("Ada");
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
     const breakdown = within(dialog).getByRole("region", { name: "User agent breakdown" });
     expect(within(breakdown).getAllByRole("row")).toHaveLength(51);
     expect(within(dialog).getByLabelText("User agent pages")).toHaveTextContent("1-50 of 1,005");
@@ -483,7 +499,8 @@ describe("reported user activity", () => {
     expect(reportedRows()).toHaveLength(2);
     expect(screen.getByLabelText("Selected report agent")).toHaveTextContent("helpdesk/report:2");
     const { dialog } = await openUser("Ada");
-    expect(within(dialog).getByText("Responses (Users report)").parentElement).toHaveTextContent("215");
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("215");
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
     expect(within(dialog).getByRole("row", { name: /Helpdesk/ })).toHaveTextContent("15");
     expect(within(dialog).queryByRole("button", { name: "Researcher: active users without paid Copilot" })).not.toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole("button", { name: "Show all this user's agents" }));
@@ -812,6 +829,8 @@ describe("reported user activity", () => {
     const original = table.textContent;
     const close = within(dialog).getByRole("button", { name: "Close reported user details" });
     expect(close).toHaveFocus();
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Licenses" }));
+    close.focus();
     vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
     view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={0} />);
     expect(table).toHaveTextContent(original!);
@@ -826,7 +845,8 @@ describe("reported user activity", () => {
     updated.users.value[0].reportedResponsesReceived = 202;
     await act(async () => pending.resolve(updated));
     expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
-    expect(within(dialog).getByText("Responses (Users report)").parentElement).toHaveTextContent("202");
+    expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("202");
+    expect(within(dialog).getByRole("tab", { name: "Licenses" })).toHaveAttribute("aria-selected", "true");
     expect(within(dialog).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
     view.rerender(<ReportedUserActivity {...props} dataRevision={1} directoryDataRevision={1} />);
     expect(within(dialog).getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toBeVisible();

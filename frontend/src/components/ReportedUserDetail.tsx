@@ -1,14 +1,9 @@
-import { useEffect, useId, useRef, type RefObject } from "react";
-import { X } from "lucide-react";
-import type { CopilotUsageUser, OfficialUsageUserSummary } from "../api/client";
-import { usageCount, usageDate } from "../usageInsights";
-import { CopilotServiceDetails } from "./CopilotServiceDetails";
-import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
-import { ReportedUserAgents, type UserRelationshipFilters } from "./ReportedUserAgents";
-import { UserAgentResponsibility } from "./UserAgentResponsibility";
-import { UserPurviewAudit } from "./UserPurviewAudit";
+import type { RefObject } from "react";
+import type { CopilotUsageSourceSummary, CopilotUsageUser, OfficialUsageUserSummary } from "../api/client";
+import type { UserRelationshipFilters } from "./ReportedUserAgents";
+import { UserDetailModal } from "./UserDetailModal";
 
-export function ReportedUserDetail({ user, directoryUser, hasRelationships, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision }: {
+export function ReportedUserDetail({ user, directoryUser, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, reportPeriod, appActivityState }: {
   user: OfficialUsageUserSummary;
   directoryUser?: CopilotUsageUser | null;
   hasRelationships: boolean;
@@ -19,52 +14,12 @@ export function ReportedUserDetail({ user, directoryUser, hasRelationships, filt
   onOpenAgent?: (id: string) => void;
   dataRevision?: number;
   agentInventoryRevision?: number;
+  reportPeriod?: { startDate: string | null; endDate: string | null };
+  appActivityState?: CopilotUsageSourceSummary["state"];
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const closeButton = useRef<HTMLButtonElement>(null);
-  const titleId = useId();
-  useEffect(() => {
-    const element = dialog.current;
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const fallbackFocus = returnFocusTo.current;
-    const previousOverflow = document.body.style.overflow;
-    element?.showModal();
-    closeButton.current?.focus();
-    document.body.style.overflow = "hidden";
-    return () => {
-      element?.close();
-      document.body.style.overflow = previousOverflow;
-      (previousFocus?.isConnected ? previousFocus : fallbackFocus)?.focus();
-    };
-  }, [returnFocusTo]);
-
-  return <dialog ref={dialog} className="copilot-user-dialog reported-user-dialog" aria-labelledby={titleId}
-    onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); onClose(); } }}
-    onCancel={event => { event.preventDefault(); onClose(); }}>
-    <header>
-      <div><h2 id={titleId}>{user.displayName || user.username}</h2><p>{user.username}</p></div>
-      <button ref={closeButton} type="button" className="secondary icon-button" aria-label="Close reported user details" onClick={onClose}><X size={20} aria-hidden="true" /></button>
-    </header>
-    <dl className="reported-user-facts" aria-label="Reported user totals">
-      <div><dt>Responses (Users report)</dt><dd>{usageCount(user.missingUserReport ? null : user.reportedResponsesReceived)}</dd></div>
-      <div><dt>Agents used (Users report)</dt><dd>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</dd></div>
-      <div><dt>User last activity (Users report)</dt><dd>{usageDate(user.userLastActivityDateUtc)}</dd></div>
-      <div><dt>M365 Copilot license</dt><dd><CopilotLicenseStatus user={directoryUser} licenseAssignmentStatus={user.licenseAssignmentStatus} /></dd></div>
-      <div><dt>Directory account</dt><dd>{directoryUser?.directory.accountEnabled === false ? "Account disabled" : directoryUser?.directory.accountEnabled === true ? "Enabled" : "Unknown"}</dd></div>
-      <div><dt>Responses (all Users &amp; agents rows)</dt><dd>{hasRelationships && user.rows.length ? usageCount(user.bridgeResponsesSentToUsers) : "Not reported"}</dd></div>
-    </dl>
-    {directoryUser ? <CopilotServiceDetails servicePlans={directoryUser.servicePlans} copilotServiceState={directoryUser.copilotServiceState} current /> : null}
-    <p className="reported-users-note">Users-report totals cover all agents, regardless of the selected relationship filters. The Users &amp; agents sum is independent evidence, not a replacement for a missing Users total.</p>
-    {user.missingUserReport ? <p className="copilot-users-notice">This identity has no Users-report row. Its response total, agents used and user recency are unknown.</p>
-      : user.hasReportMismatch ? <p className="copilot-users-notice">Report totals differ. The Users total and Users &amp; agents breakdown are shown separately, never added or reconciled by guessing.</p> : null}
-    <ReportedUserAgents user={user} filters={filters} onFocusAgent={onFocusAgent} />
-    <UserAgentResponsibility objectId={directoryUser?.directory.objectId} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
-    <UserPurviewAudit userPrincipalName={directoryUser?.directory.userPrincipalName} />
-    <details className="copilot-users-provenance">
-      <summary>Identity and report coverage</summary>
-      <p>Dataset {user.datasetScope.reportSetId ?? "unavailable"}; Users version {user.datasetScope.usersVersionId ?? "absent"}; Users &amp; agents version {user.datasetScope.userAgentsVersionId ?? "absent"}.</p>
-      <p>Cohort license status uses current saved licenses regardless of report period, not historical license assignments. Detailed directory and paid-feature evidence requires a unique, exact saved link to these report versions. Concealed and case-distinct identities are never matched by display name.</p>
-      <p>{hasRelationships ? `${user.rows.length.toLocaleString()} reported agent relationships.` : "Users & agents companion missing: relationships are unknown, not zero."}</p>
-    </details>
-  </dialog>;
+  return <UserDetailModal identity={JSON.stringify([user.username, user.datasetScope])} displayName={user.displayName || user.username}
+    username={user.username} directoryUser={directoryUser} directoryCurrent={Boolean(directoryUser)} reportUser={user}
+    reportPeriod={reportPeriod} appActivityState={appActivityState} filters={filters} returnFocusTo={returnFocusTo}
+    closeLabel="Close reported user details" onClose={onClose} onFocusAgent={onFocusAgent} onOpenAgent={onOpenAgent}
+    dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} />;
 }

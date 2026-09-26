@@ -7,6 +7,7 @@ import { permissionIssues, type PermissionIssue } from "../permissionIssues";
 import { PermissionDetails } from "./PermissionDetails";
 import { PermissionCheckProgress } from "./PermissionCheckProgress";
 import { WorkbenchDialog } from "./WorkbenchDialog";
+import { SignedInUserRoles } from "./SignedInUserRoles";
 import "./permissions.css";
 
 const permissionFeatureUses: Partial<Record<CapabilityId, Readonly<Record<string, string>>>> = {
@@ -121,6 +122,11 @@ function PermissionCenterContent() {
       </div>
     </header>
     <div className="permission-body">
+      <nav className="permission-role-topics" aria-label="Permissions sections">
+        <a href="#signed-in-user-roles-title">Signed-in user roles</a>
+        <a href="#app-prerequisites-title">App API permissions</a>
+        <a href="#permission-log-setup">Log setup</a>
+      </nav>
       {!selected && notice ? <div className="permission-notice" role="status">{notice}</div> : null}
       {canCheckPermissions && (loading || pending) ? <PermissionCheckProgress loading={loading} activeCheck={activeCheck} views={views} /> : null}
       <section className="permission-issues" aria-labelledby="permission-issues-title">
@@ -137,6 +143,7 @@ function PermissionCenterContent() {
       </section>
       <AppPrerequisites views={views} />
       <InvestigationSetup />
+      <SignedInUserRoles />
     </div>
     <WorkbenchDialog open={Boolean(selected)} title={selected?.name ?? "Permission details"}
       className="permission-details" fallbackFocusRef={heading} onClose={() => setSelectedId(undefined)}>
@@ -206,7 +213,7 @@ function PermissionReference({ label, permissions }: { label: string; permission
 function InvestigationSetup() {
   const defenderSetup = "https://security.microsoft.com/securitysettings/security_for_ai";
   const defenderDocs = "https://learn.microsoft.com/en-us/defender-xdr/security-for-ai/get-started-defender-security-for-ai";
-  return <section className="permission-log-setup permission-collection-setup" aria-label="Log setup">
+  return <section id="permission-log-setup" className="permission-log-setup permission-collection-setup" aria-label="Log setup">
     <details><summary>Log collection setup</summary>
     <p className="permission-setup-note">Configure connectors and auditing in Microsoft portals.</p>
     <ul className="permission-setup-list">

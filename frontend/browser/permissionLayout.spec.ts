@@ -90,7 +90,7 @@ test.beforeEach(async ({ context }) => {
 });
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
-test("healthy Permissions is concise, quiet and read-only with collapsed setup", async ({ page }, info) => {
+test("healthy Permissions keeps concise issues and setup alongside the user role reference", async ({ page }, info) => {
   const { unexpected, posts } = await mockPermissions(page, permissions);
   await page.goto("/permissions");
   await expect.poll(() => posts).toEqual(["/api/capabilities/check"]);
@@ -101,7 +101,9 @@ test("healthy Permissions is concise, quiet and read-only with collapsed setup",
   await expect(center.getByText("Required API permissions", { exact: true })).toBeVisible();
   await expect(center.getByText("Log collection setup", { exact: true })).toBeVisible();
   await expect(center.locator("details[open]")).toHaveCount(0);
-  expect((await center.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(110);
+  const overview = await center.locator(":scope > header, .permission-issues, .permission-prerequisites, .permission-collection-setup").allInnerTexts();
+  expect(overview.join(" ").trim().split(/\s+/).length).toBeLessThanOrEqual(110);
+  await expect(center.getByRole("region", { name: "Signed-in user roles", exact: true })).toBeVisible();
   await expect(center.getByRole("button", { name: /Request consent|Authorize|Grant admin consent/, includeHidden: true })).toHaveCount(0);
   expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);

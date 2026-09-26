@@ -35,7 +35,7 @@ export function AgentAccessManagement({ agent, detail, canManage, canEditAccess,
       <div>
         {showName ? <h4>{agent.displayName}</h4> : null}
         <p>{agent.version ? `Version ${agent.version}` : "Published version"}{agent.publisher ? ` / ${agent.publisher}` : ""}</p>
-        <code className="agent-control-target">{agent.id}</code>
+        <details><summary>Version details</summary><code className="agent-control-target">{agent.id}</code></details>
       </div>
       <div className="agent-block-control" role="group" aria-label={`Blocking for ${agent.id}`}>
         <strong>{isBlocked === true ? "Blocked" : isBlocked === false ? "Not blocked" : "Block status unknown"}</strong>

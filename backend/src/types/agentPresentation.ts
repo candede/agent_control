@@ -5,20 +5,15 @@ import type { SavedAgentPerson, UnifiedAgentInventoryQuery, UnifiedAgentRecord, 
 export type AgentRelevanceReason = "organization_created" | "organization_shared" | "microsoft" | "deployed" | "reported_usage";
 export type AgentColumnValue = string | number | null;
 
-const originLabels = new Map<string, string>([
-  ["microsoft", "Microsoft"],
-  ["external", "Third-party"],
-  ["shared", "Shared in organization"],
-  ["custom", "Organization-created"],
-]);
-
 export function agentRelevanceReasons(record: UnifiedAgentRecord): AgentRelevanceReason[] {
   const reasons = new Set<AgentRelevanceReason>();
   if (record.powerPlatformResource) reasons.add("organization_created");
   for (const item of record.packages) {
     switch (item.type?.trim().toLowerCase()) {
+      case "lob":
       case "custom": reasons.add("organization_created"); break;
       case "shared": reasons.add("organization_shared"); break;
+      case "firstparty":
       case "microsoft": reasons.add("microsoft"); break;
     }
     const deployment = normalizePackageStatus(item.deployedTo);
@@ -31,8 +26,8 @@ export function agentRelevanceReasons(record: UnifiedAgentRecord): AgentRelevanc
 export function matchesAgentView(record: UnifiedAgentRecord, view: UnifiedAgentView = "all") {
   if (view === "all") return true;
   if (view === "first_party" || view === "third_party") {
-    const origin = view === "first_party" ? "microsoft" : "external";
-    return record.packages.length > 0 && record.packages.every(item => item.type?.trim().toLowerCase() === origin);
+    const types = view === "first_party" ? ["firstparty", "microsoft"] : ["thirdparty", "external"];
+    return record.packages.length > 0 && record.packages.every(item => types.includes(item.type?.trim().toLowerCase() ?? ""));
   }
   if (view === "copilot_studio") return hasAuthoringTool(record, "copilotstudio");
   if (view === "user_managed" || view === "organization_managed") return agentManagement(record) === view;
@@ -52,16 +47,17 @@ export function agentManagement(record: UnifiedAgentRecord): "user_managed" | "o
     }))) return "organization_managed";
   if (record.packages.length > 0 && hasAuthoringTool(record, "microsoft365copilotagentbuilder")
     && record.packages.every(item => {
-      const origin = item.type?.trim().toLowerCase();
-      return (origin === "custom" || origin === "shared")
+      const type = item.type?.trim().toLowerCase();
+      return (type === "lob" || type === "custom" || type === "shared")
         && normalizePackageStatus(item.availableTo) === "none" && normalizePackageStatus(item.deployedTo) === "none";
     })) return "user_managed";
   return "unknown";
 }
 
 export function matchesAgentFilters(record: UnifiedAgentRecord,
-  query: Pick<UnifiedAgentInventoryQuery, "view" | "endUserAccess" | "reportedUsage" | "management" | "relevance">): boolean {
-  return matchesAgentView(record, query.view)
+  query: Pick<UnifiedAgentInventoryQuery, "type" | "view" | "endUserAccess" | "reportedUsage" | "management" | "relevance">): boolean {
+  return (query.type === undefined || record.packages.some(item => item.type === query.type))
+    && matchesAgentView(record, query.view)
     && (!query.endUserAccess || query.endUserAccess === "all" || agentUserAvailability(record) === query.endUserAccess)
     && (!query.reportedUsage || query.reportedUsage === "all" || matchesAgentView(record, "used"))
     && (!query.management || query.management === "all" || agentManagement(record) === query.management)
@@ -177,10 +173,7 @@ export function agentColumnValue(record: UnifiedAgentRecord, column: UnifiedAgen
     }
     case "hosts": return uniqueText(record.packages.flatMap(item => item.supportedHosts ?? []), formatPackageFacetLabel);
     case "publisher": return uniqueText(record.packages.map(item => item.publisher));
-    case "origin": return partiallyKnownText([
-      ...record.packages.map(item => originLabels.get(item.type?.trim().toLowerCase() ?? "")),
-      ...(resource ? ["Organization-created"] : []),
-    ]);
+    case "origin": return partiallyKnownText(record.packages.map(item => item.type));
     case "deployment": return agentAccessSummary(record, "deployedTo");
     case "owner": return agentPersonLabel(record.people?.owner, details?.ownerId);
     case "createdBy": return agentPersonLabel(record.people?.createdBy, resource?.createdBy);

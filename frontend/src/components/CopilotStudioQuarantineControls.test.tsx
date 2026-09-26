@@ -96,6 +96,27 @@ describe("on-demand quarantine changes", () => {
     }, expect.stringMatching(/^[0-9a-f-]{36}$/));
   });
 
+  it.each([false, true])("keeps detail guidance concise and shows a disagreement warning only when observed (%s)", async disagreesWithInventory => {
+    const result = preview();
+    result.statuses[0].disagreesWithInventory = disagreesWithInventory;
+    result.statuses[0].direct.isBotQuarantined = disagreesWithInventory;
+    result.summary.targets[0].currentState = disagreesWithInventory;
+    vi.mocked(previewQuarantine).mockResolvedValue(result);
+    renderControls(onDemandDecision());
+    expect(screen.getByText("Quarantine blocks connected channels; makers can still test in Copilot Studio. Package blocking is separate.")).toBeVisible();
+    expect(screen.getByText("Check direct status to load.")).toBeVisible();
+    expect(screen.queryByText(/Direct provider state and saved inventory state remain independent|A timestamp is evidence, not provider atomicity/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Direct and inventory states disagree.")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Quarantine" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Quarantine 1 agent" });
+    expect(within(confirmation).getByText("Not provider-atomic; each target is verified independently")).toBeVisible();
+    expect(within(confirmation).getByText(result.summary.makerBehavior)).toBeVisible();
+    await userEvent.click(within(confirmation).getByRole("button", { name: "Close quarantine confirmation" }));
+    if (disagreesWithInventory) expect(screen.getByText("Direct and inventory states disagree.")).toBeVisible();
+    else expect(screen.queryByText("Direct and inventory states disagree.")).not.toBeInTheDocument();
+    expect(submitQuarantine).not.toHaveBeenCalled();
+  });
+
   it.each([0, 1])("does not preview %s resolved targets while bookmarks are pending and permits cancellation", async count => {
     const onClear = vi.fn();
     renderControls(onDemandDecision(), user, { variant: "bulk", targets: count ? [target] : [], pendingTargetCount: 2, onClear });

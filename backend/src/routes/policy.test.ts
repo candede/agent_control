@@ -31,7 +31,7 @@ describe("route policy declarations", () => {
       "POST /official-usage/staging", "GET /official-usage/admin", "GET /official-usage/history", "GET /official-usage/overview", "DELETE /official-usage/staging/:id",
       "POST /official-usage/bundles/:id/preview", "POST /official-usage/bundles/:id/accept",
       "POST /official-usage/sets/:id/preview", "POST /official-usage/confirmations/:id", "POST /official-usage/legacy-cleanup-acknowledgements",
-      "GET /official-usage/aggregate", "GET /official-usage/aggregate.csv", "GET /official-usage/agents/:agentId", "GET /official-usage/users", "GET /official-usage/users.csv",
+      "GET /official-usage/aggregate", "GET /official-usage/aggregate.csv", "GET /official-usage/agents/:agentId", "GET /official-usage/agent-users", "GET /official-usage/users", "GET /official-usage/users.csv",
       "GET /audit-search/catalog", "POST /audit-search/qualifications", "POST /audit-search/qualifications/:id/start",
       "POST /audit-search/jobs", "GET /audit-search/jobs", "GET /audit-search/jobs/:id", "POST /audit-search/jobs/:id/resume",
       "POST /audit-search/jobs/:id/cancel", "DELETE /audit-search/jobs/:id", "GET /audit-search/jobs/:id/records", "GET /audit-search/jobs/:id/export.csv",

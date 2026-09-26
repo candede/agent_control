@@ -11,25 +11,93 @@
   min-width: 0;
 }
 
-.agent-investigations {
-  padding-bottom: 24px;
-  margin-bottom: 24px;
-  border-bottom: 1px solid var(--border);
-}
-
-.agent-investigations h3 {
+.agent-investigations h3,
+.agent-investigations h4 {
   margin: 0;
 }
 
-.agent-investigations summary,
-.agent-saved-observations > summary {
-  cursor: pointer;
-  padding: 8px 0;
-  color: var(--ink);
+.agent-log-sources {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
 
-.agent-saved-observations > summary {
-  font-weight: 600;
+.agent-log-source {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--ink);
+  background: #fff;
+  text-align: left;
+}
+
+.agent-log-source:hover {
+  color: #fff;
+}
+
+.agent-log-source span,
+.agent-log-source small {
+  font-weight: 400;
+  font-size: 0.8rem;
+}
+
+.agent-log-guide {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.agent-log-guide p,
+.agent-log-guide ul {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.agent-log-guide ul {
+  padding-left: 20px;
+}
+
+.agent-log-guide h4:not(:first-child) {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-audit-event-details {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+}
+
+.agent-audit-event-details dt {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.agent-audit-event-details dd {
+  margin: 2px 0 0;
+}
+
+.agent-log-template-description {
+  margin: 0;
+  line-height: 1.5;
+  font-size: 0.85rem;
+}
+
+@media (max-width: 640px) {
+  .agent-log-sources {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-log-guide {
+    padding: 14px;
+  }
 }
 
 .agent-investigations label {
@@ -40,6 +108,12 @@
 
 .agent-investigations .agent-insight-toolbar {
   align-items: end;
+}
+
+.agent-investigations .agent-log-toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
 }
 
 .agent-investigations [aria-pressed="true"] {
@@ -104,8 +178,43 @@
 
 .agent-usage-metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+
+.agent-usage-date-range,
+.agent-usage-users {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-usage-date-range > span,
+.agent-usage-date-range > small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.agent-usage-users h4 {
+  margin: 0;
+}
+
+.agent-usage-users input {
+  flex: 1;
+  min-width: 150px;
+}
+
+.agent-usage-users td {
+  overflow-wrap: anywhere;
+}
+
+.agent-usage-users th:first-child {
+  width: 70%;
+}
+
+.agent-usage-users th:last-child,
+.agent-usage-users td:last-child {
+  text-align: right;
 }
 
 .agent-usage-metric {
@@ -298,6 +407,64 @@
   min-width: 0;
 }
 
+.agent-audit-table td {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .agent-investigations .agent-log-toolbar {
+    grid-template-columns: 1fr auto;
+  }
+
+  .agent-log-toolbar h3 {
+    grid-column: 1 / -1;
+  }
+
+  .agent-audit-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .agent-audit-table tbody,
+  .agent-audit-table tbody th,
+  .agent-audit-table tbody td {
+    display: block;
+    min-width: 0;
+  }
+
+  .agent-audit-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-bottom: 1px solid var(--border);
+  }
+
+  .agent-audit-table tbody th,
+  .agent-audit-table tbody td {
+    border: 0;
+  }
+
+  .agent-audit-table td:nth-child(3),
+  .agent-audit-table td:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .agent-audit-table [data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 6px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+
+  .agent-audit-table .agent-audit-event-details {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .agent-usage-insights a {
   color: var(--ink);
 }
@@ -305,6 +472,10 @@
 @media (max-width: 800px) {
   .agent-usage-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .agent-usage-metric:last-child {
+    grid-column: 1 / -1;
   }
 }
 

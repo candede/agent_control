@@ -39,7 +39,7 @@ function inventory(agentCount: number | null = 1247): UnifiedAgentInventoryPage 
     value: [], count: 1561, offset: 0, limit: 50, summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 1010, powerPlatformAgentCount: 1247, logicalAgentCount: 1561 }),
     identityCollection: { checkedPackages: 1010, pendingPackages: 0 },
-    facets: { environments: [], platforms: [] },
+    facets: { environments: [], platforms: [], types: [] },
     sources: {
       graphPackages: { state: "available", observation: {
         id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, tokenMode: "delegated", scopeKind: "broad",

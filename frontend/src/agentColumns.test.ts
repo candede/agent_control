@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { agentAccessOptions, agentColumns, agentUsageOptions, agentViewOptions, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
+import { agentAccessOptions, agentColumns, agentUsageOptions, defaultAgentColumnVisibility, loadAgentColumns, saveAgentColumns } from "./agentColumns";
 import { unifiedAgentSortKeys } from "../../backend/src/types/unifiedAgents";
 
 afterEach(() => {
@@ -13,17 +13,17 @@ describe("agent column preferences", () => {
     expect(used.description).toContain("matched automatically by exact saved package ID");
     expect(used.description).toContain("existing administrator-reviewed association");
     expect(used.description).toContain("not a live or all-channel activity measure");
-    expect(agentViewOptions.map(option => option.label)).toEqual([
-      "All agents", "1st party agents", "3rd party agents", "User managed agents", "Copilot Studio agents", "Organization managed agents",
-    ]);
-    expect(agentViewOptions.find(option => option.value === "first_party")!.description).toContain("Using Microsoft authoring tools does not");
+    expect(agentColumns.find(column => column.id === "origin")!.label).toBe("Package type");
     expect(agentAccessOptions.find(option => option.value === "available")!.label).toBe("Available to end users");
   });
 
-  it("offers every supported data column exactly once and keeps the original defaults", () => {
+  it("orders the requested defaults by identity, usage and access while retaining every optional column", () => {
     expect(agentColumns.filter(column => column.id !== "actions").map(column => column.id).sort()).toEqual([...unifiedAgentSortKeys].sort());
     expect(Object.entries(defaultAgentColumnVisibility).filter(([, visible]) => visible).map(([id]) => id))
-      .toEqual(["displayName", "environment", "builtWith", "availability", "status", "actions"]);
+      .toEqual(["displayName", "publisher", "builtWith", "responses", "availability", "status", "actions"]);
+    expect(agentColumns.filter(column => defaultAgentColumnVisibility[column.id]).map(column => column.label))
+      .toEqual(["Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions"]);
+    expect(loadAgentColumns("new-account").visibility).toEqual(defaultAgentColumnVisibility);
   });
 
   it("persists only column choices and isolates accounts and tenants", () => {
@@ -34,6 +34,12 @@ describe("agent column preferences", () => {
     expect(loadAgentColumns("tenant-b:user-a").visibility).toEqual(defaultAgentColumnVisibility);
     expect(saveAgentColumns(undefined, choices)).toBeUndefined();
     expect(window.localStorage.length).toBe(1);
+  });
+
+  it("preserves existing admins' saved visibility rather than forcing the new defaults", () => {
+    const previousSelection = { ...defaultAgentColumnVisibility, publisher: false, responses: false, environment: true, createdBy: true };
+    saveAgentColumns("existing-admin", previousSelection);
+    expect(loadAgentColumns("existing-admin").visibility).toEqual(previousSelection);
   });
 
   it("never restores a hidden agent identity column", () => {

@@ -11,6 +11,20 @@ const filterEnums = {
 };
 
 describe("unified agent inventory query", () => {
+  it.each(["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", " firstParty "])(
+    "preserves the exact provider type %s for lists and exports", type => {
+      expect(unifiedAgentInventoryQuery({ type })).toMatchObject({ type });
+      expect(unifiedAgentExportInput({ revision: "a".repeat(64), query: { type } }).query).toMatchObject({ type });
+    },
+  );
+
+  it.each(["", " ", null, 1, true, {}, ["firstParty"], ["firstParty", "shared"], "bad\ntype", "bad\0type", "x".repeat(4097)])(
+    "rejects malformed provider type %j without dropping the filter", type => {
+      expect(() => unifiedAgentInventoryQuery({ type })).toThrowError(expect.objectContaining({ code: "invalid_agent_inventory_query" }));
+      expect(() => unifiedAgentExportInput({ revision: "a".repeat(64), query: { type } })).toThrow();
+    },
+  );
+
   it.each(Object.entries(filterEnums).flatMap(([key, values]) => values.map(value => ({ key, value }))))(
     "accepts exact $key=$value enum selections for lists and exports", ({ key, value }) => {
       expect(unifiedAgentInventoryQuery({ [key]: value })).toMatchObject({ [key]: value });

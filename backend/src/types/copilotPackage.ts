@@ -14,6 +14,16 @@ export type PackageAccessMutationMode = "add" | "replace";
 // Provider strings, including future values, stay raw until normalized for an access decision.
 export type PackageStatus = string;
 
+export function formatPackageType(value: string): string {
+  switch (value) {
+    case "firstParty": return "1st party agents";
+    case "thirdParty": return "3rd party agents";
+    case "shared": return "Shared in your organization";
+    case "lob": return "Built by your org";
+    default: return value;
+  }
+}
+
 export const packageStatusAliases = {
   all: ["all", "everyone", "allowedforall", "availabletoall", "deployedtoall", "installedforall"],
   some: ["some", "allowedforsome", "availabletosome", "deployedtosome", "installedforsome"],

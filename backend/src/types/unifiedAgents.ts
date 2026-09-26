@@ -23,6 +23,7 @@ export const unifiedAgentSortKeys = [
 ] as const;
 export type UnifiedAgentSort = typeof unifiedAgentSortKeys[number];
 export type UnifiedAgentSortDirection = "asc" | "desc";
+// Legacy API views; the category selector uses the catalog's raw type facets instead.
 export const unifiedAgentQuickViews = ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const;
 export type UnifiedAgentQuickView = typeof unifiedAgentQuickViews[number];
 export const unifiedAgentViews = [...unifiedAgentQuickViews, "available", "unavailable", "availability_unknown", "organization", "used", "unknown"] as const;
@@ -249,6 +250,7 @@ export type UnifiedAgentInventoryPage = {
   facets: {
     environments: Array<{ value: string; label: string }>;
     platforms: Array<{ value: string; label: string }>;
+    types: Array<{ value: string; label: string }>;
   };
   sources: {
     graphPackages: UnifiedAgentSourceStatus;
@@ -261,6 +263,8 @@ export type UnifiedAgentInventoryPage = {
 export type UnifiedAgentInventoryQuery = {
   /** Defaults to all for exact reads and other non-UI consumers. */
   inventoryScope?: UnifiedAgentInventoryScope;
+  /** Exact saved Graph package type; no inferred publisher or management classification. */
+  type?: string;
   view?: UnifiedAgentView;
   endUserAccess?: UnifiedAgentAccessFilter;
   reportedUsage?: UnifiedAgentUsageFilter;

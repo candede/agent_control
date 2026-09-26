@@ -47,7 +47,7 @@ const packages: PackagePage = {
     id: `layout-package-${index + 1}`, displayName, isBlocked: index === 1,
     publisher: index === 1 ? "Synthetic Finance" : "Synthetic Operations",
     shortDescription: "Representative saved catalog observation; no live provider requests.",
-    supportedHosts: ["Teams", "Microsoft 365"], platform: "Copilot Studio", type: "Agent",
+    supportedHosts: ["Teams", "Microsoft 365"], platform: "Copilot Studio", type: ["firstParty", "thirdParty", "shared"][index],
     availableTo: index === 1 ? "none" : "some", deployedTo: "none",
     sourceSystem: "graph_packages", authoringTool: "Copilot Studio", creatorType: "unknown",
     agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
@@ -85,7 +85,10 @@ export const unifiedAgents: UnifiedAgentInventoryPage = {
     observations: { graphPackages: graphObservation, packageSnapshots: {}, powerPlatform: null },
   })),
   count: 3, offset: 0, limit: 50, summary: agentSummary, filteredSummary: agentSummary,
-  facets: { environments: [], platforms: packages.facets.platforms },
+  facets: { environments: [], platforms: packages.facets.platforms, types: [
+    { value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" },
+    { value: "shared", label: "Shared in your organization" },
+  ] },
   sources: {
     graphPackages: { state: "available", observation: graphObservation, error: null },
     powerPlatform: { state: "unavailable", observation: null, error: {

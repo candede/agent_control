@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 import { matchesAgentFilters, summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
+import { formatPackageType } from "../../backend/src/types/copilotPackage";
 import {
   unifiedAgentAccessFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters, unifiedAgentUsageFilters, unifiedAgentViews,
 } from "../../backend/src/types/unifiedAgents";
@@ -18,6 +19,7 @@ const reportSetId = usageInsightsPublished.activeSet!.id;
 
 function filterQuery(query: URLSearchParams) {
   return {
+    type: query.get("type") ?? undefined,
     view: unifiedAgentViews.find(value => value === query.get("view")),
     endUserAccess: unifiedAgentAccessFilters.find(value => value === query.get("endUserAccess")),
     reportedUsage: unifiedAgentUsageFilters.find(value => value === query.get("reportedUsage")),
@@ -30,7 +32,35 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
-test("six quick views classify saved evidence and combine management with reported usage", async ({ page }, info) => {
+test("default columns group identity, usage and access and preserve saved selections until reset", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const defaults = ["Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions"];
+  await page.goto("/agents");
+  const table = page.getByRole("region", { name: "Unified agents" });
+  await expect(table.getByRole("columnheader")).toHaveText(defaults);
+  await table.getByRole("button", { name: "Columns", exact: true }).click();
+  const picker = page.getByRole("dialog", { name: "Choose agent columns" });
+  await picker.getByRole("checkbox", { name: "Publisher", exact: true }).uncheck();
+  await picker.getByRole("checkbox", { name: "Environment", exact: true }).check();
+  await picker.getByRole("checkbox", { name: "Created by", exact: true }).check();
+  await page.keyboard.press("Escape");
+  await page.reload();
+  await expect(table.getByRole("columnheader", { name: "Publisher", exact: true })).toHaveCount(0);
+  await expect(table.getByRole("columnheader", { name: "Environment", exact: true })).toHaveCount(1);
+  await expect(table.getByRole("columnheader", { name: "Created by", exact: true })).toHaveCount(1);
+  await table.getByRole("button", { name: "Columns", exact: true }).click();
+  await picker.getByRole("button", { name: "Reset defaults", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(table.getByRole("columnheader")).toHaveText(defaults);
+  await page.reload();
+  await expect(table.getByRole("columnheader")).toHaveText(defaults);
+  expect((await new AxeBuilder({ page }).include(".agent-grid").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath("agent-default-columns.png"), fullPage: true });
+  expect(unexpected).toEqual([]);
+});
+
+test("Graph package categories use provider values and combine with independent filters", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   const makeRecord = (id: string, displayName: string, fields: Partial<UnifiedAgentRecord["packages"][number]>): UnifiedAgentRecord => ({
     ...unifiedAgents.value[0], id: `graph_packages:${id}`, displayName,
@@ -40,17 +70,19 @@ test("six quick views classify saved evidence and combine management with report
     }],
   });
   const records = [
-    makeRecord("first", "Researcher", { type: "microsoft" }),
-    makeRecord("vendor", "Vendor agent", { type: "external" }),
+    makeRecord("first", "Researcher", { type: "firstParty" }),
+    makeRecord("vendor", "Vendor agent", { type: "thirdParty" }),
     makeRecord("personal", "Personal agent", { type: "shared", authoringTool: "Copilot Studio Lite" }),
-    makeRecord("studio", "Studio agent", { type: "custom", authoringTool: "Copilot Studio" }),
+    makeRecord("studio", "Studio agent", { type: "lob", authoringTool: "Copilot Studio" }),
     { ...makeRecord("managed", "Managed vendor", {
-      type: "external", availableTo: "some",
+      type: "thirdParty", availableTo: "some",
       controlObservations: { access: { snapshotId: "verified-control", observedAt: layoutTime, expiresAt: "2027-01-01T00:00:00.000Z" } },
     }), usage: automaticAgentUsageFixture() },
     makeRecord("unknown", "Unknown origin", { type: "unknownFutureValue", publisher: "Microsoft", authoringTool: "Microsoft 365 Copilot Agent Builder" }),
   ];
   const summary = { ...unifiedAgents.summary, total: records.length, graphOnly: records.length };
+  const types = [...new Set(records.flatMap(record => record.packages.flatMap(item => item.type ? [item.type] : [])))]
+    .map(value => ({ value, label: formatPackageType(value) })).sort((a, b) => a.label.localeCompare(b.label));
   const queries: URLSearchParams[] = [];
   await page.route("**/api/agent-inventory?*", route => {
     const query = new URL(route.request().url()).searchParams;
@@ -58,6 +90,7 @@ test("six quick views classify saved evidence and combine management with report
     const value = records.filter(record => matchesAgentFilters(record, filterQuery(query)));
     return route.fulfill({ json: {
       ...unifiedAgents, value, count: value.length, summary, scopeSummary: summary,
+      facets: { ...unifiedAgents.facets, types },
       inventoryOverview: summarizeAgentAvailability(records), usageContext: automaticUsageContext,
     } });
   });
@@ -66,28 +99,28 @@ test("six quick views classify saved evidence and combine management with report
   const view = page.getByRole("combobox", { name: "Show agents", exact: true });
   await expect(table.getByRole("row")).toHaveCount(7);
   expect(await view.locator("option").allTextContents()).toEqual([
-    "All agents", "1st party agents", "3rd party agents", "User managed agents", "Copilot Studio agents", "Organization managed agents",
+    "All agents", "1st party agents", "3rd party agents", "Built by your org", "Shared in your organization", "unknownFutureValue",
   ]);
   for (const [value, names] of [
-    ["first_party", ["Researcher"]], ["third_party", ["Vendor agent", "Managed vendor"]],
-    ["user_managed", ["Personal agent"]], ["copilot_studio", ["Studio agent"]],
-    ["organization_managed", ["Managed vendor"]],
+    ["firstParty", ["Researcher"]], ["thirdParty", ["Vendor agent", "Managed vendor"]],
+    ["shared", ["Personal agent"]], ["lob", ["Studio agent"]], ["unknownFutureValue", ["Unknown origin"]],
   ] as const) {
     await view.selectOption(value);
-    await expect.poll(() => queries.at(-1)?.get("view")).toBe(value);
+    await expect.poll(() => queries.at(-1)?.get("type")).toBe(value);
+    expect(queries.at(-1)?.has("view")).toBe(false);
     await expect(table.getByRole("row")).toHaveCount(names.length + 1);
     for (const name of names) await expect(table.getByRole("button", { name, exact: true })).toBeVisible();
   }
-  await view.selectOption("third_party");
+  await view.selectOption("thirdParty");
   await page.getByRole("button", { name: "Filters", exact: true }).click();
   await page.getByRole("combobox", { name: "Management", exact: true }).selectOption("organization_managed");
   await page.getByRole("combobox", { name: "Reported usage", exact: true }).selectOption("used");
   await page.keyboard.press("Escape");
-  await expect(page).toHaveURL(/show=third_party&usage=used&management=organization_managed/);
+  await expect(page).toHaveURL(/type=thirdParty&usage=used&management=organization_managed/);
   await expect(table.getByRole("row")).toHaveCount(2);
   await expect(table.getByRole("button", { name: "Managed vendor", exact: true })).toBeVisible();
   await page.reload();
-  await expect(view).toHaveValue("third_party");
+  await expect(view).toHaveValue("thirdParty");
   await expect(page.getByRole("button", { name: "Filters, 2 active", exact: true })).toBeVisible();
   await expect(table.getByRole("button", { name: "Managed vendor", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Filters, 2 active", exact: true }).click();
@@ -107,12 +140,12 @@ test("six quick views classify saved evidence and combine management with report
   expect(unexpected).toEqual([]);
 });
 
-test("repository cards filter actual end-user access and keep report dates in the existing toolbar", async ({ page }, info) => {
+test("repository cards filter actual end-user access and keep report dates in the overview", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   const records = unifiedAgents.value.map((record, index): UnifiedAgentRecord => ({
     ...record,
     packages: record.packages.map(item => ({
-      ...item, type: index === 0 ? "external" : "custom", isBlocked: false,
+      ...item, type: index === 0 ? "thirdParty" : "lob", isBlocked: false,
       availableTo: index === 0 ? "some" : index === 1 ? "none" : "unknown",
       supportedHosts: ["Copilot"],
     })),
@@ -135,7 +168,7 @@ test("repository cards filter actual end-user access and keep report dates in th
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(overview.getByText("Agents in catalog").locator("..")).toContainText("3");
   await expect(overview.getByText("Available to end users").locator("..")).toContainText("1");
-  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill(records[1].displayName);
   await expect(table.getByRole("row")).toHaveCount(2);
   await overview.getByRole("button", { name: "Show available to end users", exact: true }).click();
@@ -148,7 +181,7 @@ test("repository cards filter actual end-user access and keep report dates in th
   await expect(table.getByRole("button", { name: records[0].displayName, exact: true })).toBeVisible();
   await expect(table.getByRole("cell", { name: "Specific users or groups", exact: true })).toBeVisible();
   await page.reload();
-  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
   await expect(table.getByRole("row")).toHaveCount(2);
   await page.getByRole("button", { name: "Filters, 1 active", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "End-user access", exact: true })).toHaveValue("available");
@@ -160,12 +193,13 @@ test("repository cards filter actual end-user access and keep report dates in th
   await page.keyboard.press("Escape");
   await overview.getByRole("button", { name: "Show agents in catalog", exact: true }).click();
   await expect(table.getByRole("row")).toHaveCount(4);
-  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+  await expect(page.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
   await table.getByRole("button", { name: "Columns", exact: true }).click();
   await page.getByRole("checkbox", { name: "Responses", exact: true }).check();
   await page.keyboard.press("Escape");
   const toolbar = table.locator(".agent-grid-toolbar");
-  await expect(toolbar).toContainText("Observed activity range:");
+  await expect(toolbar).not.toContainText("Observed activity range:");
+  await expect(overview.getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
   await expect(toolbar.getByRole("button", { name: "Columns", exact: true })).toBeVisible();
   await expect(table.locator(".agent-usage-column-context")).toHaveCount(0);
   await expect(overview).not.toContainText("not additive");
@@ -180,7 +214,7 @@ test("reported used agents card filters the catalog and stays synchronized with 
   const unexpected = await mockLayoutApi(page);
   const records = unifiedAgents.value.map((record, index): UnifiedAgentRecord => ({
     ...record,
-    packages: record.packages.map(item => ({ ...item, type: index === 2 ? "microsoft" : "external" })),
+    packages: record.packages.map(item => ({ ...item, type: index === 2 ? "firstParty" : "thirdParty" })),
     usage: index === 2 ? undefined : automaticAgentUsageFixture({ responses: index === 0 ? 181 : 0 }),
   }));
   const queries: URLSearchParams[] = [];
@@ -202,18 +236,18 @@ test("reported used agents card filters the catalog and stays synchronized with 
   const search = page.getByRole("searchbox", { name: "Search", exact: true });
   await expect(used).toBeEnabled();
   await expect(used).toHaveAttribute("aria-pressed", "false");
-  await showAgents.selectOption("third_party");
+  await showAgents.selectOption("thirdParty");
   await search.fill(records[0].displayName);
   await expect(table.getByRole("row")).toHaveCount(2);
   await expect(table.getByRole("button", { name: records[0].displayName, exact: true })).toBeVisible();
   await used.focus();
   await page.keyboard.press("Enter");
-  await expect(showAgents).toHaveValue("third_party");
+  await expect(showAgents).toHaveValue("thirdParty");
   await expect(used).toHaveAttribute("aria-pressed", "true");
   await expect(search).toHaveValue(records[0].displayName);
-  await expect(page).toHaveURL(/show=third_party&usage=used/);
+  await expect(page).toHaveURL(/type=thirdParty&usage=used/);
   await expect.poll(() => queries.at(-1)?.get("reportedUsage")).toBe("used");
-  expect(queries.at(-1)?.get("view")).toBe("third_party");
+  expect(queries.at(-1)?.get("type")).toBe("thirdParty");
   expect(queries.at(-1)?.get("inventoryScope")).toBe("catalog");
   expect(queries.at(-1)?.get("search")).toBe(records[0].displayName);
   await search.fill("");
@@ -222,19 +256,19 @@ test("reported used agents card filters the catalog and stays synchronized with 
   await expect(table.getByRole("button", { name: records[1].displayName, exact: true })).toHaveCount(0);
   await expect(table.getByRole("button", { name: records[2].displayName, exact: true })).toHaveCount(0);
   await page.reload();
-  await expect(showAgents).toHaveValue("third_party");
+  await expect(showAgents).toHaveValue("thirdParty");
   await expect(used).toHaveAttribute("aria-pressed", "true");
   await expect(table.getByRole("button", { name: records[0].displayName, exact: true })).toBeVisible();
   await used.click();
   await expect(used).toHaveAttribute("aria-pressed", "false");
-  await expect(showAgents).toHaveValue("third_party");
+  await expect(showAgents).toHaveValue("thirdParty");
   await expect(table.getByRole("row")).toHaveCount(3);
   await used.click();
   await expect(table.getByRole("row")).toHaveCount(2);
   expect((await new AxeBuilder({ page }).include(".agent-inventory-overview").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("reported-used-agents-filter.png"), fullPage: true });
   await overview.getByRole("button", { name: "Show agents in catalog", exact: true }).click();
-  await expect(showAgents).toHaveValue("all");
+  await expect(showAgents).toHaveValue("");
   await expect(used).toHaveAttribute("aria-pressed", "false");
   await expect(table.getByRole("row")).toHaveCount(4);
   await page.getByRole("button", { name: "Filters", exact: true }).click();
@@ -272,7 +306,7 @@ test("party filters, server sorting and remembered columns stay usable and acces
   await page.clock.setFixedTime(new Date(layoutTime));
   const records = unifiedAgents.value.map((record, index): UnifiedAgentRecord => ({
     ...record,
-    packages: record.packages.map(item => ({ ...item, type: index === 1 ? "external" : "microsoft" })),
+    packages: record.packages.map(item => ({ ...item, type: index === 1 ? "thirdParty" : "firstParty" })),
     usage: {
       status: index === 1 ? "unlinked" : "linked", reportSetId, responses: index === 1 ? null : index === 0 ? 215 : 0,
       activeUsers: index === 1 ? null : 0, lastActivityDateUtc: null, associations: [],
@@ -299,19 +333,19 @@ test("party filters, server sorting and remembered columns stay usable and acces
   const table = page.getByRole("region", { name: "Unified agents" });
   await expect(table.getByRole("row")).toHaveCount(4);
   await expect(page.locator(".agent-table-stack")).toHaveAttribute("aria-busy", "false");
-  const initialCatalogReads = queries.filter(query => !query.has("view")).length;
+  const initialCatalogReads = queries.filter(query => !query.has("type")).length;
   phase = "first-party";
-  await page.getByRole("combobox", { name: "Show agents" }).selectOption("first_party");
+  await page.getByRole("combobox", { name: "Show agents" }).selectOption("firstParty");
   await expect(table.getByRole("row")).toHaveCount(3);
   await expect(table.getByRole("button", { name: records[1].displayName, exact: true })).toHaveCount(0);
-  await expect(page).toHaveURL(/show=first_party/);
+  await expect(page).toHaveURL(/type=firstParty/);
   phase = "return-all";
-  await page.getByRole("combobox", { name: "Show agents" }).selectOption("all");
+  await page.getByRole("combobox", { name: "Show agents" }).selectOption("");
   await expect(table.getByRole("row")).toHaveCount(4);
   await info.attach("agent-view-cache-requests", {
     body: JSON.stringify({ initialCatalogReads, cacheReads }, null, 2), contentType: "application/json",
   });
-  expect(queries.filter(query => !query.has("view"))).toHaveLength(initialCatalogReads);
+  expect(queries.filter(query => !query.has("type"))).toHaveLength(initialCatalogReads);
 
   await table.getByRole("button", { name: "Columns", exact: true }).click();
   const picker = page.getByRole("dialog", { name: "Choose agent columns" });
@@ -479,11 +513,13 @@ test("exact saved-package matches show selected-report usage in the table and mo
   let snapshot: "current" | "older" | "mismatched" | "unavailable" = "current";
   let candidateReads = 0;
   const mutations: string[] = [];
+  const userReads: URLSearchParams[] = [];
   page.on("request", request => {
     if (request.method() !== "GET" && /\/api\/(?:agent-inventory|official-usage)/.test(new URL(request.url()).pathname)) {
       mutations.push(`${request.method()} ${new URL(request.url()).pathname}`);
     }
   });
+
   const context = (): AgentUsageContext => ({
     ...automaticUsageContext,
     availability: snapshot === "unavailable" ? "deleted" : snapshot === "older" ? "stale" : "active",
@@ -524,6 +560,18 @@ test("exact saved-package matches show selected-report usage in the table and mo
     const item = inventory().value.flatMap(agent => agent.packages).find(item => item.id === id);
     return item ? route.fulfill({ json: item }) : route.fallback();
   });
+  await page.route("**/api/official-usage/agent-users?*", route => {
+    const query = new URL(route.request().url()).searchParams;
+    userReads.push(query);
+    const users = Array.from({ length: 7 }, (_, index) => ({
+      username: `person${index}@example.invalid`, displayName: `Person ${index}`,
+      responsesSentToUsers: index === 0 ? snapshot === "older" ? 173 : 175 : 1,
+    })).filter(user => !query.get("search") || user.username.includes(query.get("search")!));
+    return route.fulfill({ json: {
+      activeSet: context().reportSet, agentIds: [automaticUsagePackageId],
+      users: { count: users.length, value: users, limit: 25, offset: 0 },
+    } });
+  });
   await page.goto("/agents");
   const table = page.getByRole("region", { name: "Unified agents" });
   await table.getByRole("button", { name: "Columns", exact: true }).click();
@@ -538,7 +586,8 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await expect(excelRow.getByRole("cell", { name: "7", exact: true })).toBeVisible();
   await expect(zeroRow.getByRole("cell", { name: "0", exact: true })).toHaveCount(2);
   await expect(unmatchedRow.getByRole("cell", { name: "Unavailable", exact: true })).toHaveCount(2);
-  await expect(table.locator(".agent-grid-toolbar")).toContainText(usageCoverageLabel(automaticUsageContext.reportSet));
+  await expect(table.locator(".agent-grid-toolbar")).not.toContainText(usageCoverageLabel(automaticUsageContext.reportSet));
+  await expect(page.getByRole("region", { name: "Agent inventory overview" }).getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
   await expect(table.getByText(/Report Agent IDs are matched automatically to exact saved package IDs/)).toHaveCount(0);
   await page.screenshot({ path: info.outputPath("automatically-matched-agent-table.png"), fullPage: true });
 
@@ -552,12 +601,21 @@ test("exact saved-package matches show selected-report usage in the table and mo
   const dialog = page.getByRole("dialog", { name: record.displayName, exact: true });
   await dialog.getByRole("tab", { name: "Usage & users" }).click();
   await expect(dialog.getByLabel("Selected agent report metrics").getByText("181", { exact: true })).toBeVisible();
-  await expect(dialog.getByText(automaticUsageReportName, { exact: true })).toBeVisible();
-  await expect(dialog.getByText("Automatically matched: exact report Agent ID = saved Graph package ID.")).toBeVisible();
-  await expect(dialog.getByText(/Selected report snapshot:/)).toContainText(reportSetId);
-  const usersUrl = new URL((await dialog.getByRole("link", { name: "View active users without paid Copilot", exact: true }).getAttribute("href"))!, "http://localhost");
-  expect(usersUrl.searchParams.get("agent")).toBe(automaticUsagePackageId);
-  expect(usersUrl.searchParams.get("snapshot")).toBe(reportSetId);
+  await expect(dialog.getByLabel("CSV report dates")).toContainText("Aug 14, 2026 - Sep 12, 2026");
+  await expect(dialog.getByText("person0@example.invalid", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Person 0", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("cell", { name: "175", exact: true })).toBeVisible();
+  await expect(dialog.getByText("1-7 of 7 users", { exact: true })).toBeVisible();
+  expect(JSON.parse(userReads.at(-1)!.get("agentIds")!)).toEqual([automaticUsagePackageId]);
+  expect(userReads.at(-1)!.get("setId")).toBe(reportSetId);
+  expect(userReads.every(query => !query.has("licenseCohort"))).toBe(true);
+  await expect(dialog.getByText(/not a proven|source refresh time|matched automatically|not lifetime|Report provenance|Selected report snapshot:/i)).toHaveCount(0);
+  await expect(dialog.getByRole("link", { name: "View active users without paid Copilot" })).toHaveCount(0);
+  await dialog.getByRole("searchbox", { name: "Search agent users" }).fill("person3@");
+  await expect(dialog.getByText("1-1 of 1 users", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("person0@example.invalid", { exact: true })).toHaveCount(0);
+  await dialog.getByRole("searchbox", { name: "Search agent users" }).fill("");
+  await expect(dialog.getByText("1-7 of 7 users", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: /Remove association/ })).toHaveCount(0);
   await expect(dialog.getByRole("region", { name: "Usage report candidates" })).toHaveCount(0);
@@ -571,8 +629,8 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await table.getByRole("button", { name: unmatchedRecord.displayName, exact: true }).click();
   const unmatchedDialog = page.getByRole("dialog", { name: unmatchedRecord.displayName, exact: true });
   await unmatchedDialog.getByRole("tab", { name: "Usage & users" }).click();
-  await expect(unmatchedDialog.getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
-  await expect(unmatchedDialog.getByText(/Names alone are not used to match agents/)).toBeVisible();
+  await expect(unmatchedDialog.getByRole("heading", { name: "Usage unavailable" })).toBeVisible();
+  await expect(unmatchedDialog.getByText("This agent is not included in the selected CSV report.")).toBeVisible();
   await expect(unmatchedDialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
   await closeDetails();
 
@@ -584,7 +642,8 @@ test("exact saved-package matches show selected-report usage in the table and mo
   await dialog.getByRole("tab", { name: "Usage & users" }).click();
   await expect(dialog.getByLabel("Selected agent report metrics").getByText("179", { exact: true })).toBeVisible();
   await expect(dialog.getByText("Out-of-date report")).toBeVisible();
-  await expect(dialog.getByRole("link", { name: "View active users without paid Copilot", exact: true })).toHaveAttribute("href", new RegExp(`snapshot=${olderReportId}`));
+  await expect(dialog.getByRole("cell", { name: "173", exact: true })).toBeVisible();
+  expect(userReads.at(-1)!.get("setId")).toBe(olderReportId);
   await closeDetails();
 
   for (const unavailableSnapshot of ["mismatched", "unavailable"] as const) {
@@ -594,11 +653,54 @@ test("exact saved-package matches show selected-report usage in the table and mo
     await table.getByRole("button", { name: record.displayName, exact: true }).click();
     await dialog.getByRole("tab", { name: "Usage & users" }).click();
     await expect(dialog.getByLabel("Selected agent report metrics")).toHaveCount(0);
-    await expect(dialog.getByText(snapshot === "mismatched" ? /saved usage belongs to a different report snapshot/ : /No complete usable usage report is selected/)).toBeVisible();
+    await expect(dialog.getByText(snapshot === "mismatched" ? "The selected report changed. Reload usage to update this agent." : "Select a complete CSV report in Sync to see usage.")).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Associate a usage report" })).toHaveCount(0);
     await closeDetails();
   }
   expect(candidateReads).toBe(0);
   expect(mutations).toEqual([]);
+  expect(unexpected).toEqual([]);
+});
+
+test("agent users paginate all 53 names and emails without leaving the modal", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const record = { ...unifiedAgents.value[0], usage: automaticAgentUsageFixture({ responses: 482, activeUsers: 53 }) };
+  await page.route("**/api/agent-inventory?*", route => route.fulfill({
+    json: { ...unifiedAgents, value: [record], count: 1, usageContext: automaticUsageContext },
+  }));
+  const users = Array.from({ length: 53 }, (_, index) => ({
+    displayName: `Report user ${String(index + 1).padStart(2, "0")}`,
+    username: `report.user${index + 1}@example.invalid`,
+    responsesSentToUsers: index === 0 ? 430 : 1,
+  }));
+  await page.route("**/api/official-usage/agent-users?*", route => {
+    const query = new URL(route.request().url()).searchParams;
+    const filtered = users.filter(user => !query.get("search")
+      || `${user.displayName} ${user.username}`.toLowerCase().includes(query.get("search")!.toLowerCase()));
+    const offset = Number(query.get("offset"));
+    const limit = Number(query.get("limit"));
+    return route.fulfill({ json: { activeSet: automaticUsageContext.reportSet, agentIds: [automaticUsagePackageId],
+      users: { value: filtered.slice(offset, offset + limit), count: filtered.length, offset, limit } } });
+  });
+  await page.goto("/agents");
+  await page.getByRole("button", { name: record.displayName, exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: record.displayName, exact: true });
+  await dialog.getByRole("tab", { name: "Usage & users" }).click();
+  const list = dialog.getByRole("region", { name: "Agent users", exact: true });
+  await expect(list.getByRole("rowheader")).toHaveCount(25);
+  await expect(list.getByText("report.user1@example.invalid", { exact: true })).toBeVisible();
+  await list.getByRole("button", { name: "Next users" }).click();
+  await expect(list.getByText("26-50 of 53 users")).toBeVisible();
+  await list.getByRole("button", { name: "Next users" }).click();
+  await expect(list.getByRole("rowheader")).toHaveCount(3);
+  await expect(list.getByText("report.user53@example.invalid", { exact: true })).toBeVisible();
+  await expect(list.getByRole("button", { name: "Next users" })).toBeDisabled();
+  await list.getByRole("searchbox", { name: "Search agent users" }).fill("Report user 01");
+  await expect(list.getByText("1-1 of 1 users")).toBeVisible();
+  await expect(list.getByText("report.user1@example.invalid", { exact: true })).toBeVisible();
+  await expect(list.getByRole("button", { name: "Previous users" })).toBeDisabled();
+  expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".unified-agent-detail-modal").analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("agent-53-users.png"), fullPage: true });
   expect(unexpected).toEqual([]);
 });

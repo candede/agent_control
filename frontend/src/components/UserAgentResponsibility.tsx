@@ -9,6 +9,7 @@ import type { UsersRouteState } from "../workbenchRouting";
 import { hasAppRole } from "../../../backend/src/types/capability";
 
 type Props = {
+  compact?: boolean;
   objectId?: string;
   dataRevision?: number;
   agentInventoryRevision?: number;
@@ -17,7 +18,7 @@ type Props = {
   onRouteChange?: (route: UsersRouteState) => void;
 };
 
-export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, route, onRouteChange }: Props) {
+export function UserAgentResponsibility({ compact = false, objectId, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, route, onRouteChange }: Props) {
   const context = useContext(CapabilityContext);
   const canRead = !context || hasAppRole(context.user?.roles ?? [], "AgentControl.Viewer");
   const scope = JSON.stringify([context?.user?.tenantId, context?.user?.homeAccountId, context?.user?.roles]);
@@ -53,9 +54,9 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
   const changePage = (next: number) => route ? onRouteChange?.({ ...route, page: next }) : setLocalPage(next);
   return <section className="user-responsibility" aria-label="Agent responsibility">
     <h3>Agent responsibility</h3>
-    <p>Owner, Created by and Last modified by are explicit saved source relationships, not usage, access assignments or permission to manage agents. A last modifier is not necessarily a maintainer.</p>
+    {!compact ? <p>Owner, Created by and Last modified by are explicit saved source relationships, not usage, access assignments or permission to manage agents. A last modifier is not necessarily a maintainer.</p> : null}
     {!canRead ? <p role="alert">Responsibility unavailable: current Viewer access is required.</p>
-      : !valid ? <p>Responsibility unavailable: no exact verified directory object ID is established for this user. Report-only or concealed identities are not matched by name.</p>
+      : !valid ? <p>{compact ? "Link this user to a directory identity through Users sync to view agent responsibilities." : "Responsibility unavailable: no exact verified directory object ID is established for this user. Report-only or concealed identities are not matched by name."}</p>
       : <>
         {route && personId ? <button type="button" className="secondary" onClick={() => onRouteChange?.({ view: "responsibility", search: "", page: 0 })}>All responsible people</button> : null}
         {route && !personId ? <label>Search responsible people<input aria-label="Search responsible people" value={search}
@@ -64,22 +65,25 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
         {scoped?.error ? <p role="alert" className="error-banner">{scoped.error} <button type="button" className="secondary"
           onClick={() => setRetry(value => value + 1)}>Retry saved responsibility</button></p> : null}
         {data ? <>
-          <p className="copilot-users-notice">{data.coverage === "unavailable"
+          {compact ? <>
+            {data.coverage === "unavailable" ? <p className="copilot-users-notice" role="status">Agent responsibility is unavailable. {data.sources.powerPlatform.error?.message} Refresh agent inventory in Sync.</p>
+              : data.coverage === "partial" ? <p className="reported-users-note">Partial agent inventory</p> : null}
+          </> : <><p className="copilot-users-notice">{data.coverage === "unavailable"
             ? "Responsibility source unavailable. No current authorized saved Power Platform agent source is available; relationships are unknown, not zero."
             : data.coverage === "partial"
               ? `Partial responsibility coverage. ${data.unknownAgentCount.toLocaleString()} agents have missing or invalid responsibility fields; other agents may be outside the saved source scope.`
               : "Responsibility covers the current authorized saved Power Platform agent source, not all tenant relationships."}</p>
-          {data.invalidReferenceCount ? <p>{data.invalidReferenceCount} invalid responsibility identifiers were not joined to users.</p> : null}
+          {data.invalidReferenceCount ? <p>{data.invalidReferenceCount} invalid responsibility identifiers were not joined to users.</p> : null}</>}
           {selected ? <>
-            <ResponsibilityIdentity person={selected.person} />
+            {!compact ? <ResponsibilityIdentity person={selected.person} /> : null}
             {route ? <p>License and observed usage are not established by responsibility. Use the separate paid-license and report cohorts for that evidence.</p> : null}
-            {selected.state !== "unavailable" ? <p>{selected.count.toLocaleString()} {selected.count === 1 ? "agent" : "agents"} with reported responsibility in the saved source.</p> : null}
-            {selected.state === "no_reported_relationships" ? <p>No reported responsibility relationships for this exact user in the available saved source. This is not proof of no responsibility elsewhere.</p> : null}
+            {selected.state !== "unavailable" ? <p>{selected.count.toLocaleString()} {selected.count === 1 ? "agent" : "agents"} {compact ? "with a reported responsibility." : "with reported responsibility in the saved source."}</p> : null}
+            {selected.state === "no_reported_relationships" ? <p>{compact ? "No responsibilities reported for this user in the available inventory." : "No reported responsibility relationships for this exact user in the available saved source. This is not proof of no responsibility elsewhere."}</p> : null}
             <ul className="responsibility-list">{selected.agents.map(agent => <li key={agent.id}>
               <strong>{agent.displayName}</strong>
               <span>{agent.roles.map(role => responsibilityLabels[role]).join(" · ")}</span>
-              <small>{agent.presence === "power_platform" ? "Power Platform-only agent" : "Canonical agent"} · Source observed {usageDate(agent.observedAt)}</small>
-              {agent.environmentId ? <small>Environment: {agent.environmentId}</small> : null}
+              {!compact ? <><small>{agent.presence === "power_platform" ? "Power Platform-only agent" : "Canonical agent"} · Source observed {usageDate(agent.observedAt)}</small>
+              {agent.environmentId ? <small>Environment: {agent.environmentId}</small> : null}</> : null}
               {onOpenAgent ? <button type="button" className="secondary" onClick={() => onOpenAgent(agent.id)}>Open agent {agent.displayName}</button> : null}
             </li>)}</ul>
           </> : <>
@@ -98,14 +102,14 @@ export function UserAgentResponsibility({ objectId, dataRevision = 0, agentInven
             <span> Page {page + 1} of {Math.max(1, Math.ceil(count / 50))} </span>
             <button type="button" className="secondary" disabled={(page + 1) * 50 >= count} onClick={() => changePage(page + 1)}>Next</button>
           </nav> : null}
-          <details><summary>Responsibility source coverage</summary>
+          {!compact ? <details><summary>Responsibility source coverage</summary>
             {Object.entries(data.sources).map(([source, status]) => <p key={source}>
               {source === "powerPlatform" ? "Power Platform agents" : "Graph packages"}: {status.state}.
               {status.error ? ` ${status.error.message}` : ""}
               {status.observation ? ` Observed ${usageDate(status.observation.observedAt)}; expires ${usageDate(status.observation.expiresAt)}.` : ""}
             </p>)}
             <p>Relationships use exact tenant-scoped object IDs only. Graph package names, operation creators, connectors and reported usage do not create responsibility.</p>
-          </details>
+          </details> : null}
         </> : null}
       </>}
   </section>;

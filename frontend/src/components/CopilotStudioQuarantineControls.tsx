@@ -299,14 +299,14 @@ function QuarantineControls({ snapshot, targets, variant, canManage, pendingTarg
     const resource = targets[0];
     const disabledReason = quarantineTargetReason(resource, snapshot, eligibilityNow);
     return <section className="inventory-detail-section quarantine-control" aria-labelledby="quarantine-control-title">
-      <div className="quarantine-control-heading"><div><h3 id="quarantine-control-title">Copilot Studio quarantine</h3><p>Direct provider state and saved inventory state remain independent.</p></div>
+      <div className="quarantine-control-heading"><div><h3 id="quarantine-control-title">Copilot Studio quarantine</h3></div>
         <CapabilityGate capability="powerPlatform.quarantine.read" roles={["AgentControl.Viewer"]} compact>
           <button type="button" className="secondary" disabled={Boolean(disabledReason) || busy} onClick={() => void loadStatus(Boolean(status))}><RefreshCw aria-hidden="true" /> {status ? "Recheck direct status" : "Check direct status"}</button>
         </CapabilityGate>
       </div>
       {disabledReason ? <p className="quarantine-disabled"><CircleOff aria-hidden="true" /> {disabledReason}</p> : null}
       <StatusComparison status={status} resource={resource} snapshot={snapshot} />
-      <p className="quarantine-maker-note">Makers may still see and test a quarantined bot in Copilot Studio while users cannot use it through connected channels. Package blocking is a separate control.</p>
+      <p className="quarantine-maker-note">Quarantine blocks connected channels; makers can still test in Copilot Studio. Package blocking is separate.</p>
       {canManage ? <div className="quarantine-actions">
         <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="danger" disabled={!eligible || busy} onClick={() => void beginPreview("quarantine")}><Ban aria-hidden="true" /> Quarantine</button></WorkbenchActionGate>
         <WorkbenchActionGate actionId="quarantine.change" compact><button type="button" className="secondary" disabled={!eligible || busy} onClick={() => void beginPreview("unquarantine")}><CheckCircle2 aria-hidden="true" /> Restore from quarantine</button></WorkbenchActionGate>
@@ -333,9 +333,9 @@ function QuarantineControls({ snapshot, targets, variant, canManage, pendingTarg
 
 function StatusComparison({ status, resource, snapshot }: { status?: QuarantineStatusView; resource: QuarantineSelectableTarget; snapshot: QuarantineSelectionSnapshot | null }) {
   return <div className="quarantine-status-grid">
-    <div><span>Direct provider status</span><strong>{status ? status.direct.isBotQuarantined ? "Quarantined" : "Not quarantined" : "Not checked"}</strong><small>{status ? `${formatDate(status.direct.observedAt)} · ${status.direct.source}` : "Run an explicit target-scoped read."}</small></div>
+    <div><span>Direct provider status</span><strong>{status ? status.direct.isBotQuarantined ? "Quarantined" : "Not quarantined" : "Not checked"}</strong><small>{status ? `${formatDate(status.direct.observedAt)} · ${status.direct.source}` : "Check direct status to load."}</small></div>
     <div><span>Saved inventory status</span><strong>{typeof resource.details.isQuarantined !== "boolean" ? "Unknown" : resource.details.isQuarantined ? "Quarantined" : "Not quarantined"}</strong><small>{snapshot ? formatDate(snapshot.observedAt) : "No saved snapshot"}</small></div>
-    <div><span>Provider update time</span><strong>{status ? formatDate(status.direct.providerUpdatedAt) : "Unknown"}</strong><small>{status?.disagreesWithInventory ? "Direct and inventory states disagree." : "A timestamp is evidence, not provider atomicity."}</small></div>
+    <div><span>Provider update time</span><strong>{status ? formatDate(status.direct.providerUpdatedAt) : "Unknown"}</strong>{status?.disagreesWithInventory ? <small>Direct and inventory states disagree.</small> : null}</div>
   </div>;
 }
 

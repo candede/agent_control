@@ -1,18 +1,19 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Search, SlidersHorizontal, X } from "lucide-react";
 import type { UnifiedAgentInventoryPage } from "../api/client";
-import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions, agentViewOptions } from "../agentColumns";
+import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions } from "../agentColumns";
 import type { AgentRouteState } from "../workbenchRouting";
 import { EnvironmentFilter } from "./EnvironmentFilter";
 
 export type AgentFilterValues = Pick<AgentRouteState,
-  "search" | "agentView" | "endUserAccess" | "reportedUsage" | "management" | "relevance" | "platform" | "availability" | "host" | "status"
+  "search" | "packageType" | "endUserAccess" | "reportedUsage" | "management" | "relevance" | "platform" | "availability" | "host" | "status"
   | "createdWithinDays" | "publisher" | "environmentId" | "sortBy" | "sortDirection">;
 
 type Option = { value: string; label: string };
 type Props = {
   values: AgentFilterValues;
   options: {
+    types: Option[];
     platforms: Option[];
     availability: Option[];
     hosts: Option[];
@@ -20,6 +21,7 @@ type Props = {
     environments: UnifiedAgentInventoryPage["facets"]["environments"];
   };
   loading: boolean;
+  matchingCount?: number;
   onChange: (values: Partial<AgentFilterValues>) => void;
   onClear: () => void;
   onError: (message: string) => void;
@@ -31,7 +33,7 @@ const statusOptions = [
   { value: "blocked", label: "Blocked" },
 ] as const;
 
-export function AgentInventoryFilters({ values, options, loading, onChange, onClear, onError }: Props) {
+export function AgentInventoryFilters({ values, options, loading, matchingCount, onChange, onClear, onError }: Props) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const popover = useRef<HTMLDivElement>(null);
@@ -83,7 +85,7 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
     value: options.environments.find(option => option.value.toLowerCase() === values.environmentId.toLowerCase())?.label ?? values.environmentId,
     remove: () => onChange({ environmentId: "" }),
   });
-  const hasFilters = chips.length > 0 || Boolean(values.search.trim()) || values.agentView !== "all";
+  const hasFilters = chips.length > 0 || Boolean(values.search.trim()) || Boolean(values.packageType);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -143,19 +145,32 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
       </label>
       <label className="agent-view-control">
         <span className="sr-only">Show agents</span>
-        <select value={values.agentView} title={agentViewOptions.find(option => option.value === values.agentView)?.description}
-          className={values.agentView === "all" ? undefined : "active-filter-select"}
+        <select value={values.packageType} title={values.packageType ? `Graph package type: ${values.packageType}` : "Filter by the type returned by the Graph package catalog."}
+          className={values.packageType ? "active-filter-select" : undefined}
           onChange={event => {
-            const option = agentViewOptions.find(item => item.value === event.target.value);
-            if (!option) {
-              onError("Choose a supported agent view.");
+            const type = event.target.value;
+            if (event.target.selectedIndex < 0 || type && !options.types.some(item => item.value === type) && type !== values.packageType) {
+              onError("Choose a package type from the saved catalog.");
               return;
             }
-            onChange({ agentView: option.value });
+            onChange({ packageType: type });
           }}>
-          {agentViewOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          <option value="">All agents</option>
+          {values.packageType && !options.types.some(option => option.value === values.packageType)
+            ? <option value={values.packageType}>Not in saved catalog: {values.packageType}</option> : null}
+          {options.types.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
       </label>
+      <div className="agent-query-summary">
+        <span className="agent-match-count" role="status" aria-label="Matching agents" aria-atomic="true">
+          <strong>{loading ? "Updating..." : matchingCount === undefined ? "Unavailable" : matchingCount.toLocaleString()}</strong>{" "}
+          <span>{!loading && matchingCount === 1 ? "matching agent" : "matching agents"}</span>
+        </span>
+        {hasFilters ? <button type="button" className="clear-filters-button" onClick={() => {
+          onClear();
+          trigger.current?.focus();
+        }}>Clear filters</button> : null}
+      </div>
       <div className="agent-filter-picker" ref={root} onBlur={event => {
         if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
       }}>
@@ -224,7 +239,7 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
             </label>
           </div>
           <footer>
-            <span>Filters combine with the quick view. Missing management evidence stays unknown.</span>
+            <span>Filters combine with the Graph package type. Missing management evidence stays unknown.</span>
             <button type="button" className="secondary" disabled={!hasFilters} onClick={() => {
               onClear();
               firstField.current?.focus();
@@ -233,9 +248,9 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
         </div> : null}
       </div>
     </div>
-    {values.agentView === "user_managed" || values.agentView === "organization_managed" || values.management !== "all"
+    {values.management !== "all"
       ? <p className="notice" role="note">Management views show confirmed evidence only. Sharing, installation or missing data alone does not establish who manages an agent.</p> : null}
-    {hasFilters ? <div className="agent-filter-chips" aria-label="Active filters">
+    {chips.length ? <div className="agent-filter-chips" aria-label="Active filters">
       {chips.map(chip => <button key={chip.key} type="button" className="agent-filter-chip"
         aria-label={`Remove ${chip.label.toLowerCase()} filter`} title={`${chip.label}: ${chip.value}`}
         onClick={() => {
@@ -244,10 +259,6 @@ export function AgentInventoryFilters({ values, options, loading, onChange, onCl
         }}>
         <span>{chip.label}: <strong>{chip.value}</strong></span><X size={13} aria-hidden="true" />
       </button>)}
-      <button type="button" className="clear-filters-button" onClick={() => {
-        onClear();
-        trigger.current?.focus();
-      }}>Clear filters</button>
     </div> : null}
   </section>;
 }

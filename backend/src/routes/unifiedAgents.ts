@@ -219,7 +219,7 @@ export function unifiedAgentExportInput(value: unknown): { revision: string; que
   const allowed = new Set([
     "recordId", "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher",
     "availableTo", "host", "platform", "createdWithinDays", "sortBy", "sortDirection", "view", "inventoryScope",
-    "endUserAccess", "reportedUsage", "management", "relevance",
+    "endUserAccess", "reportedUsage", "management", "relevance", "type",
   ]);
   const normalized: Record<string, unknown> = {};
   for (const [key, field] of Object.entries(query)) {
@@ -251,6 +251,7 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
   const blocked = first(query.blocked);
   return {
     inventoryScope: oneOf(first(query.inventoryScope), "inventoryScope", unifiedAgentInventoryScopes) ?? "all",
+    type: packageTypeFilter(query.type),
     view: filterValue(query.view, "view", unifiedAgentViews),
     endUserAccess: filterValue(query.endUserAccess, "endUserAccess", unifiedAgentAccessFilters),
     reportedUsage: filterValue(query.reportedUsage, "reportedUsage", unifiedAgentUsageFilters),
@@ -276,6 +277,14 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
     limit: positiveInteger(first(query.limit), "limit", 50, 250),
     offset: positiveInteger(first(query.offset), "offset", 0, 100_000, true),
   };
+}
+
+function packageTypeFilter(value: unknown) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim() || value.length > 4096 || /[\r\n\0]/.test(value)) {
+    return invalidQuery("type must be a single non-empty Graph package type of at most 4096 characters.");
+  }
+  return value;
 }
 
 function operationReference(value: unknown) {

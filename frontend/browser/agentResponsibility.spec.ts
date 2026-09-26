@@ -116,8 +116,9 @@ test("Users responsibility cohort preserves same-name different IDs and creator 
   await expect(metrics.getByText("4", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByText("No reported responsibility relationships", { exact: false })).toBeVisible();
   await expect(dialog.getByText("200", { exact: true }).first()).toBeVisible();
+  await dialog.getByRole("tab", { name: "Responsibility", exact: true }).click();
+  await expect(dialog.getByText("No responsibilities reported for this user in the available inventory.", { exact: true })).toBeVisible();
   await dialog.getByRole("button", { name: "Close user details" }).click();
   await page.getByRole("combobox", { name: "User cohort" }).selectOption("responsibility");
   await expect(page.getByRole("button", { name: "View responsibility for Same name", exact: true })).toHaveCount(2);

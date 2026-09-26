@@ -14,8 +14,8 @@ vi.mock("../api/client", async original => ({
 }));
 vi.mock("./UserAgentResponsibility", () => ({ UserAgentResponsibility: () => null }));
 vi.mock("./PurviewAuditView", () => ({
-  PurviewAuditView: ({ userPrincipalName }: { userPrincipalName: string }) =>
-    <div aria-label="Scoped user search">{userPrincipalName}</div>,
+  PurviewAuditView: ({ userPrincipalName, active = true }: { userPrincipalName: string; active?: boolean }) =>
+    active ? <div aria-label="Scoped user search">{userPrincipalName}</div> : null,
 }));
 
 const capability: ReturnType<typeof useCapabilityContext> = {
@@ -35,12 +35,45 @@ beforeEach(() => {
 });
 
 describe("user audit entry point", () => {
+  it("uses consistent lazy tabs, keyboard navigation and retained user-agent filters", async () => {
+    const view = render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const element = screen.getByRole("dialog", { name: "Ada" });
+    const dialog = within(element);
+    expect(dialog.getAllByRole("tab").map(tab => tab.textContent)).toEqual([
+      "Overview", "Usage & agents", "Licenses", "Responsibility", "Purview audit",
+    ]);
+    expect(dialog.getByRole("tabpanel")).toHaveAccessibleName("Overview");
+    expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+    expect(dialog.queryByRole("list", { name: "Paid feature states" })).not.toBeInTheDocument();
+    const overview = dialog.getByRole("tab", { name: "Overview" });
+    overview.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(dialog.getByRole("tab", { name: "Usage & agents" })).toHaveFocus();
+    await userEvent.type(dialog.getByRole("searchbox", { name: "Search this user's agents" }), "research");
+    await userEvent.click(dialog.getByRole("tab", { name: "Licenses" }));
+    expect(dialog.getByRole("list", { name: "Paid feature states" })).toBeVisible();
+    await userEvent.click(dialog.getByRole("tab", { name: "Usage & agents" }));
+    expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
+    view.rerender(<CapabilityContext value={capability}><CopilotUsersView dataRevision={1} /></CapabilityContext>);
+    expect(dialog.getByRole("tab", { name: "Usage & agents" })).toHaveAttribute("aria-selected", "true");
+    expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
+    dialog.getByRole("tab", { name: "Usage & agents" }).focus();
+    await userEvent.keyboard("{End}");
+    expect(dialog.getByRole("tab", { name: "Purview audit" })).toHaveFocus();
+    expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    await userEvent.keyboard("{Home}");
+    expect(overview).toHaveFocus();
+    expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+    expect(element.querySelector("details")).toBeNull();
+  });
+
   it("starts in the paid-user details modal and passes its verified directory identity", async () => {
     render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const dialog = within(screen.getByRole("dialog", { name: "Ada" }));
-    await userEvent.click(dialog.getByRole("button", { name: "Open Purview audit search" }));
+    await userEvent.click(dialog.getByRole("tab", { name: "Purview audit" }));
     expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
     expect(window.location.pathname).not.toBe("/audit");
   });
@@ -54,7 +87,7 @@ describe("user audit entry point", () => {
     };
     const view = render(<CapabilityContext value={capability}><ReportedUserDetail {...props} directoryUser={directory} /></CapabilityContext>);
     const dialog = within(screen.getByRole("dialog", { name: "Ada" }));
-    await userEvent.click(dialog.getByRole("button", { name: "Open Purview audit search" }));
+    await userEvent.click(dialog.getByRole("tab", { name: "Purview audit" }));
     expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
     view.rerender(<CapabilityContext value={capability}><ReportedUserDetail {...props} /></CapabilityContext>);
     expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
@@ -62,17 +95,12 @@ describe("user audit entry point", () => {
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
   });
 
-  it("opens only on request and discards the search when the selected identity changes", async () => {
+  it("embeds the selected identity directly without another expandable control", () => {
     const view = render(panel("one@example.invalid"));
-    expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Open Purview audit search" }));
     expect(screen.getByLabelText("Scoped user search")).toHaveTextContent("one@example.invalid");
     view.rerender(panel("two@example.invalid"));
-    expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Open Purview audit search" }));
     expect(screen.getByLabelText("Scoped user search")).toHaveTextContent("two@example.invalid");
-    await userEvent.click(screen.getByRole("button", { name: "Close Purview audit search" }));
-    expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("does not guess a report-only identity or open searches without Viewer access", () => {

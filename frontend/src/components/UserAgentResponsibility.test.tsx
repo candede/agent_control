@@ -17,6 +17,19 @@ function scope(children: ReactNode, principal = "reader", roles: api.AppRole[] =
 }
 
 describe("saved Users responsibility", () => {
+  it("keeps compact user details focused on agents and roles without duplicate identity or source disclosures", async () => {
+    vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
+    const open = vi.fn();
+    render(scope(<UserAgentResponsibility compact objectId={responsibilityOwnerId} onOpenAgent={open} />));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Responsible agent" }));
+    expect(open).toHaveBeenCalledWith(responsibilityAgentId);
+    expect(screen.getByText("Owner")).toBeVisible();
+    expect(screen.getByText("Partial agent inventory")).toBeVisible();
+    expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
+    expect(screen.queryByText(/not usage, access assignments|Responsibility source coverage|ID:/)).not.toBeInTheDocument();
+    expect(document.querySelector("details")).toBeNull();
+  });
+
   it("keeps responsibility outside usage/licensing and navigates the exact canonical agent without provider calls", async () => {
     const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
     const lookup = vi.spyOn(api, "resolveAgentPeople");

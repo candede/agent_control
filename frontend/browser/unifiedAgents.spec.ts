@@ -140,6 +140,9 @@ test("catalog-first scopes stay compact and retain matched enrichment across nav
   await expect(page.getByRole("region", { name: "Agent inventory overview" }).getByRole("group", { name: "Inventory scope" })).toHaveCount(0);
   await expect(page.locator(".agent-inventory-overview > .agent-overview-metrics")).toBeVisible();
   await expect(page.getByRole("button", { name: "Show available to end users", exact: true })).toContainText("2");
+  await table.getByRole("button", { name: "Columns", exact: true }).click();
+  await page.getByRole("dialog", { name: "Choose agent columns" }).getByRole("checkbox", { name: "Environment", exact: true }).check();
+  await page.keyboard.press("Escape");
   await expect(table.getByText("Finance production", { exact: true })).toHaveCount(1);
   await expect(table.getByText(draft.displayName, { exact: true })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include(".agent-inventory-overview").analyze()).violations).toEqual([]);
@@ -214,6 +217,9 @@ test("one agent row selects all published versions and configuration controls wi
   for (const label of ["Sources", "Link", "Packages", "Power Platform"]) {
     await expect(table.getByRole("columnheader", { name: label, exact: true })).toHaveCount(0);
   }
+  await table.getByRole("button", { name: "Columns", exact: true }).click();
+  await page.getByRole("dialog", { name: "Choose agent columns" }).getByRole("checkbox", { name: "Environment", exact: true }).check();
+  await page.keyboard.press("Escape");
   await expect(table.getByText("Finance production", { exact: true })).toHaveCount(2);
   await expect(table.getByText("No verified link", { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -269,8 +275,7 @@ test("one agent row selects all published versions and configuration controls wi
   const status = dialog.locator(".agent-summary-status");
   expect(await status.evaluate(element => getComputedStyle(element).display)).toBe("grid");
   expect(await status.locator(":scope > span").evaluateAll(elements => elements.every(element => getComputedStyle(element).display === "block"))).toBe(true);
-  const technical = dialog.locator("details").filter({ has: page.locator("summary", { hasText: "Technical details" }) });
-  await expect(technical).not.toHaveAttribute("open", "");
+  await expect(dialog.locator("details:visible, summary:visible")).toHaveCount(0);
   await expect(dialog.getByRole("tablist", { name: "Agent details" })).toBeVisible();
   await dialog.getByRole("combobox", { name: "Published version details" }).selectOption(merged.packages[1].id);
   await expect(dialog.getByText("Microsoft Teams edition with its own saved configuration.")).toBeVisible();
@@ -285,7 +290,7 @@ test("one agent row selects all published versions and configuration controls wi
   await page.keyboard.press("Escape");
   await table.getByRole("button", { name: "View details for Unpublished helpdesk assistant", exact: true }).click();
   const nativeDialog = page.getByRole("dialog", { name: "Unpublished helpdesk assistant" });
-  await expect(nativeDialog.getByText("No description provided.")).toBeVisible();
+  await expect(nativeDialog.getByText("No description provided.")).toHaveCount(0);
   await expect(nativeDialog.getByText("Tenant maker", { exact: true })).toBeVisible();
   await expect(nativeDialog.getByText("0 references")).toHaveCount(0);
   await expect(nativeDialog.getByText("Microsoft Teams edition with its own saved configuration.")).toHaveCount(0);

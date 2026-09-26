@@ -54,7 +54,7 @@ export function buildUnifiedAgentCsv(inventory: UnifiedAgentInventoryPage, deadl
         packageIds: JSON.stringify(record.packages.map(value => value.id)),
         packageStates: JSON.stringify(record.packages.map(value => ({
           packageId: value.id, version: value.version ?? null, isBlocked: value.isBlocked, availableTo: value.availableTo ?? null,
-          deployedTo: value.deployedTo ?? null, publisher: value.publisher ?? null,
+          deployedTo: value.deployedTo ?? null, publisher: value.publisher ?? null, type: value.type ?? null,
           supportedHosts: value.supportedHosts ?? [],
           snapshotId: record.observations.packageSnapshots[value.id]?.snapshotId ?? null,
           observedAt: record.observations.packageSnapshots[value.id]?.observedAt ?? null,

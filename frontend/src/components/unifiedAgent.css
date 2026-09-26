@@ -218,19 +218,6 @@ button.agent-sort-heading {
   color: var(--muted);
 }
 
-.agent-technical-details {
-  margin-top: 1.5rem;
-}
-
-.agent-technical-details > summary {
-  cursor: pointer;
-  font-weight: 600;
-}
-
-.agent-technical-details[open] > summary {
-  margin-bottom: 1rem;
-}
-
 .agent-overview-description {
   margin: 0;
   overflow-wrap: anywhere;
@@ -242,6 +229,7 @@ button.agent-sort-heading {
 }
 
 .agent-overview,
+.agent-overview-information,
 .agent-overview-section {
   display: grid;
   gap: 16px;
@@ -249,10 +237,38 @@ button.agent-sort-heading {
 }
 
 .agent-overview-section {
+  align-content: start;
   padding: 20px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 12px;
   background: #fff;
+}
+
+.agent-overview-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: 16px;
+  min-width: 0;
+}
+
+.agent-overview-columns:empty {
+  display: none;
+}
+
+.agent-overview-columns .agent-property-grid,
+.agent-overview-identifiers .agent-property-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.agent-overview-dates {
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-overview-identifiers dd {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8rem;
+  font-weight: 400;
 }
 
 .agent-overview-section h3,
@@ -283,6 +299,10 @@ button.agent-sort-heading {
   overflow-wrap: anywhere;
 }
 
+.agent-property-wide {
+  grid-column: 1 / -1;
+}
+
 .agent-property-grid dt {
   color: var(--muted);
   font-size: 0.8rem;
@@ -302,6 +322,20 @@ button.agent-sort-heading {
 .agent-person small {
   color: var(--muted);
   font-weight: 400;
+}
+
+.agent-person-link {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
 }
 
 .agent-service-list {
@@ -516,6 +550,15 @@ button.agent-sort-heading {
 
   .agent-property-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .agent-overview-section {
+    padding: 16px;
+  }
+
+  .agent-overview-columns .agent-property-grid,
+  .agent-overview-identifiers .agent-property-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .agent-service-list {

@@ -15,6 +15,7 @@ import {
   type UnifiedPowerPlatformSourceResult,
 } from "../db/powerPlatformInventory.js";
 import {
+  formatPackageType,
   normalizePackageAuthoringTool,
   normalizePackageStatus,
   type CopilotPackage,
@@ -308,6 +309,8 @@ export class UnifiedAgentsService {
       facets: {
         environments: [...environments.values()].sort(byLabel),
         platforms: [...platforms.values()].sort(byLabel),
+        types: [...new Set(scopedRecords.flatMap(record => record.packages.flatMap(item => item.type ? [item.type] : [])))]
+          .map(value => ({ value, label: formatPackageType(value) })).sort(byLabel),
       },
       sources: { graphPackages: graphStatus, powerPlatform: powerPlatformStatus },
       partial: sourceErrors.length > 0,

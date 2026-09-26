@@ -3,7 +3,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import type { AgentInvestigationContext, CapabilityView, OfficialUsageAdminState, OfficialUsageAggregateView, OfficialUsageUserView, PackageRefreshJob, UnifiedAgentInventoryPage } from "../src/api/client";
-import { capabilityViews, mockLayoutApi } from "./layoutFixtures";
+import { capabilityViews, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { copilotUsageFixture } from "../src/test/copilotUsageFixture";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand } from "./permissionFixtures";
 import { isAutomaticRefreshRequest, mockAutomaticRefresh } from "./automaticRefreshFixtures";
@@ -60,6 +60,42 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
+test("signed-in user role guide separates task roles from registered-app permissions", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const commands: string[] = [];
+  page.on("request", request => {
+    if (request.method() !== "GET" && !isAutomaticRefreshRequest(request)
+      && new URL(request.url()).pathname !== "/api/capabilities/check") commands.push(new URL(request.url()).pathname);
+  });
+  await page.goto("/permissions");
+  const sections = page.getByRole("navigation", { name: "Permissions sections", exact: true });
+  await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
+  const guide = page.getByRole("region", { name: "Signed-in user roles", exact: true });
+  await expect(guide).toBeVisible();
+  await expect(guide.getByRole("article", { name: "Block or unblock Microsoft 365 agents", exact: true })).toContainText("AgentControl.Admin");
+  await expect(guide.getByRole("article", { name: "Sync users and Copilot licenses", exact: true })).toContainText("Directory Readers");
+  await expect(guide.getByRole("article", { name: "Download usage CSVs from Microsoft 365", exact: true })).toContainText("Reports Reader");
+  await expect(guide.getByRole("article", { name: "Quarantine or restore Copilot Studio agents", exact: true })).toContainText("AI Administrator");
+  await expect(guide.getByRole("article", { name: "Search Purview audit for a user", exact: true })).toContainText("Audit Reader");
+  await expect(guide.locator("details")).toHaveCount(0);
+  for (const link of await guide.getByRole("navigation", { name: "User role topics" }).getByRole("link").all()) {
+    const target = await link.getAttribute("href");
+    expect(target).toMatch(/^#user-roles-/);
+    await link.click();
+    await expect(page.locator(target!)).toBeInViewport();
+  }
+  expect(await guide.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".permission-user-roles").analyze()).violations).toEqual([]);
+  await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
+  await page.screenshot({ path: info.outputPath("signed-in-user-roles.png") });
+  await sections.getByRole("link", { name: "App API permissions", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "App prerequisites", exact: true })).toBeInViewport();
+  await expect(page.getByRole("region", { name: "App prerequisites", exact: true }).getByText("Required API permissions", { exact: true })).toBeVisible();
+  expect(commands).toEqual([]);
+  expect(unexpected).toEqual([]);
+});
+
 test("log setup is concise and agent blockers link to manual setup without running a hunt", async ({ page }, testInfo) => {
   const unexpectedRequests = await mockLayoutApi(page);
   const commands: string[] = [];
@@ -102,10 +138,10 @@ test("log setup is concise and agent blockers link to manual setup without runni
   const agent = page.getByRole("dialog");
   await agent.getByRole("tab", { name: "Activity", exact: true }).click();
   await expect(agent.getByRole("heading", { name: "Defender identity not mapped" })).toBeVisible();
-  await expect(agent.getByText("Synthetic agent has no verified calling identity.")).not.toBeVisible();
+  await expect(agent.getByText("Synthetic agent has no verified calling identity.")).toBeVisible();
   await agent.getByRole("button", { name: "Purview audit", exact: true }).click();
   await expect(agent.getByRole("heading", { name: "Purview identity not mapped" })).toBeVisible();
-  await expect(agent.getByText("Saved Copilot Studio admin events only. No live collection.")).toBeVisible();
+  await expect(agent.getByRole("region", { name: "Purview log coverage and setup" })).toContainText("Saved records only");
   await agent.getByRole("button", { name: "Setup & permissions", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -169,11 +205,11 @@ test("selected agent identity resolution is explicit and does not start a hunt",
   expect(commands.filter(command => command.path.includes("/investigations/"))).toEqual([]);
   await agent.getByRole("button", { name: "Resolve log identity", exact: true }).click();
   await expect(agent.getByRole("button", { name: "Refresh log identity", exact: true })).toBeVisible();
-  await expect(agent.getByText("Directory identity verified. This does not verify log collection.")).toBeVisible();
+  await expect(agent.getByText("Directory identity verified.", { exact: true })).toBeVisible();
   await expect(agent.getByRole("button", { name: "Run hunt", exact: true })).toBeEnabled();
-  await agent.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agent_activity");
+  await agent.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
   await expect(agent.getByRole("button", { name: "Run hunt", exact: true })).toBeEnabled();
-  await agent.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agent_tools");
+  await agent.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_tools");
   await expect(agent.getByRole("button", { name: "Run hunt", exact: true })).toBeEnabled();
   expect(commands.filter(command => /\/(?:hunting|audit-search)\/(?:jobs|qualifications)/.test(command.path))).toEqual([]);
   expect(commands.filter(command => command.path.includes("/investigations/"))).toEqual([
@@ -1036,11 +1072,12 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   await expect(page.getByRole("tab", { name: "Purview Audit Search" })).toHaveCount(0);
   await page.getByRole("button", { name: "Users", exact: true }).click();
   await page.getByRole("button", { name: "Ada", exact: true }).click();
-  await page.getByRole("button", { name: "Open Purview audit search", exact: true }).click();
+  await page.getByRole("tab", { name: "Purview audit", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Purview Audit Search" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveAttribute("readonly", "");
-  await expect(page.getByText(/not official Microsoft 365 Copilot Agents usage/)).toBeVisible();
-  await expect(page.getByText(/Local minimized results expire after 30 days/)).toBeVisible();
+  await expect(page.getByRole("region", { name: "Available audit logs", exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Purview access and setup", exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog").locator("details")).toHaveCount(0);
   expect(providerCommands).toEqual([]);
 
   await page.getByRole("button", { name: "Run Audit Search" }).click();
@@ -1050,8 +1087,8 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   await expect(page.getByText("Partial coverage", { exact: true })).toBeVisible();
   await expect(page.getByText("native-event-browser", { exact: true })).toBeVisible();
   await expect(page.getByText(/Prompt ID: message-browser/)).toBeVisible();
-  await expect(page.getByText("Content not present in Purview audit", { exact: true }).last()).toBeVisible();
-  await expect(page.getByText(/no documented cross source relation/)).toBeVisible();
+  await expect(page.getByText(/Metadata only: prompt and response text are not included/)).toBeVisible();
+  await expect(page.getByRole("dialog").locator("details")).toHaveCount(0);
   await expect(page.getByTitle("Stop local polling; remote work may continue")).toHaveCount(0);
   await expect(page.getByTitle("Delete local cache only")).toBeVisible();
 
@@ -1065,6 +1102,7 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   expect(unexpectedRequests).toEqual([]);
 });
 test("Defender hunting is explicit, fixed-template, scoped, partial-aware and content-free", async ({ page }) => {
+  const unexpectedRequests = await mockLayoutApi(page);
   const jobId = "88888888-8888-4888-8888-888888888888";
   const applicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const now = new Date();
@@ -1161,22 +1199,23 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
     } },
     purview: { status: "unavailable", mode: "saved_only", reason: "No saved bot identity in this fixture." },
   } }));
-  await page.route(url => url.pathname === "/api/capabilities", async route => {
-    const response = await route.fetch();
-    const body = await response.json();
-    await route.fulfill({ response, json: {
-      ...body,
-      value: body.value.map((view: { definition: { id: string }; decision: object }) => view.definition.id === "defender.hunting.delegated" ? {
+  await page.route(url => /^\/api\/capabilities(?:\/check)?$/.test(url.pathname), route =>
+    route.fulfill({ json: {
+      value: capabilityViews.map(view => view.definition.id === "defender.hunting.delegated" ? {
         ...view,
         decision: { ...view.decision, status: "available", authorized: true, fresh: true, checkedAt: endDateTime, expiresAt, remediation: [] },
       } : view),
-    } });
-  });
+    } }));
+  await page.route("**/api/me", route => route.fulfill({ json: {
+    user: { homeAccountId: "fixture-role-Viewer", tenantId: "fixture-tenant", displayName: "Fixture Viewer",
+      username: "viewer@example.invalid", roles: ["AgentControl.Viewer"] },
+    csrfToken: "layout-csrf", roleAssignmentRequired: false,
+  } }));
   await page.route(url => url.pathname.startsWith("/api/hunting/"), route => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
-    expect(url.searchParams.get("agentRecordId")).toBeTruthy();
+    expect(url.searchParams.get("agentRecordId")).toBe(unifiedAgents.value[0].id);
     if (request.method() !== "GET") {
       providerCommands.push(`${request.method()} ${path}`);
       providerBodies.push(request.postDataJSON());
@@ -1257,18 +1296,14 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
     return route.fulfill({ status: 404, json: { error: { code: "fixture_route", message: path } } });
   });
 
-  await login(page, "role-Viewer");
-  await collectSavedPackages(page);
-  await page.goto("/agents?detail=graph_packages%3Asynthetic-package&detailTab=audit-security");
-  await expect(page.getByRole("heading", { name: "Defender and Agent 365 hunting" })).toBeVisible();
-  await expect(page.getByText(/Messages, instructions, memory and tool arguments or results are not retained/)).not.toBeVisible();
-  await page.getByText("Access, scope & limits", { exact: true }).click();
-  await expect(page.getByText(/Messages, instructions, memory and tool arguments or results are not retained/)).toBeVisible();
+  await page.goto(`/agents?detail=${encodeURIComponent(unifiedAgents.value[0].id)}&detailTab=audit-security`);
+  await expect(page.getByRole("heading", { name: "Search Defender logs" })).toBeVisible();
+  await expect(page.getByText(/These views contain metadata, not conversation transcripts/)).toBeVisible();
+  await expect(page.getByRole("dialog").locator("details:visible")).toHaveCount(0);
   await expect(page.getByText(/Opening this view does not run a provider query/)).toHaveCount(0);
   expect(providerCommands).toEqual([]);
 
-  await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agent_activity");
-  await page.getByText("Agent scope (automatic)").click();
+  await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
   await expect(page.getByLabel("Agent IDs")).toHaveCount(0);
   await page.getByRole("button", { name: "Run hunt" }).click();
   await expect.poll(() => providerCommands).toEqual(["POST /api/hunting/jobs"]);
@@ -1281,7 +1316,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   await page.getByRole("button", { name: /View hunt 88888888/ }).click();
   await expect(page.getByText(/200-row local cap was reached/)).toBeVisible();
   await expect(page.getByText("CloudAppEvents", { exact: true }).last()).toBeVisible();
-  await expect(page.getByText(/content absent/i)).toBeVisible();
+  await expect(page.getByText(/metadata, not conversation transcripts/)).toBeVisible();
   await expect(page.getByText("Child of unobserved-root-span", { exact: true })).toBeVisible();
   await expect(page.getByText("Blueprint parent only", { exact: true })).toBeVisible();
   await expect(page.getByRole("textbox", { name: /KQL/i })).toHaveCount(0);
@@ -1291,6 +1326,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   await page.getByTitle("Export minimized CSV").click();
   expect((await download).suggestedFilename()).toBe(`defender-hunting-${jobId}.csv`);
   expect(providerCommands).toEqual(["POST /api/hunting/jobs"]);
+  expect(unexpectedRequests).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.screenshot({ path: test.info().outputPath("defender-hunting.png"), fullPage: true });

@@ -124,6 +124,7 @@ const createUnifiedPage = (): UnifiedAgentInventoryPage => ({
   facets: {
     environments: [{ value: "env-a", label: "Finance" }, { value: "env-b", label: "Development" }],
     platforms: [{ value: "studio", label: "Copilot Studio" }],
+    types: [{ value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" }],
   },
   summary: { total: 1, linked: 0, graphOnly: 1, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
   scopeSummary: { total: 1, linked: 0, graphOnly: 1, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 },
@@ -654,9 +655,12 @@ describe("App session revalidation", () => {
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
       await waitFor(() => expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-sync/auto-refresh", expect.anything()));
-      if (surface !== "responsibility") await userEvent.click(await screen.findByRole("button", {
-        name: surface === "licenses" ? "Ada" : `View reported details for ${reportUser.displayName}`,
-      }));
+      if (surface !== "responsibility") {
+        await userEvent.click(await screen.findByRole("button", {
+          name: surface === "licenses" ? "Ada" : `View reported details for ${reportUser.displayName}`,
+        }));
+        await userEvent.click(screen.getByRole("tab", { name: "Responsibility" }));
+      }
       await screen.findByText("Previous responsibility");
       const beforeResponsibilityReads = responsibilityReads;
       const dialog = surface === "responsibility" ? undefined : screen.getByRole("dialog", { name: surface === "licenses" ? "Ada" : reportUser.displayName! });
@@ -675,7 +679,7 @@ describe("App session revalidation", () => {
       if (dialog) {
         expect(dialog).toBeInTheDocument();
         expect(dialog).toHaveAttribute("open");
-        expect(within(dialog).getByText(surface === "licenses" ? "Agent responses" : "Responses (Users report)").parentElement)
+        expect(within(dialog).getByText("Agent responses").parentElement)
           .toHaveTextContent(String(surface === "licenses" ? directory.users[0].importedUsage!.reportedResponsesReceived : reportUser.reportedResponsesReceived));
       }
       expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method && init.method !== "GET").map(([input]) => input))
@@ -1559,7 +1563,7 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
     await userEvent.click(screen.getByRole("button", { name: "View details for Reconciled detail" }));
     await userEvent.click(within(await screen.findByRole("dialog", { name: "Reconciled detail" })).getByRole("tab", { name: "Manage" }));
-    expect(screen.getByText(/No published version is available for these controls/)).toBeInTheDocument();
+    expect(screen.getByText("No published version is available for availability or installation settings.")).toBeInTheDocument();
     reconciled = true;
     await act(async () => refresh.resolve(Response.json(automaticRefreshResponse())));
 
@@ -1755,7 +1759,7 @@ describe("App session revalidation", () => {
     const download = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
     await userEvent.click(screen.getByRole("button", { name: "Filters, 1 active" }));
     expect(screen.getByRole("combobox", { name: "Organization/usage evidence" })).toHaveValue("organization");
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("responses:desc");
@@ -1779,7 +1783,7 @@ describe("App session revalidation", () => {
       revision: unifiedRevision, query: { relevance: "organization", sortBy: "hosts", sortDirection: "asc" },
     });
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
-    await waitFor(() => expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all"));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue(""));
     await userEvent.click(screen.getByRole("button", { name: "Filters" }));
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("hosts:asc");
     expect(new URLSearchParams(window.location.search).has("show")).toBe(false);
@@ -1793,13 +1797,13 @@ describe("App session revalidation", () => {
     const download = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("thirdParty");
     expect(screen.getByRole("button", { name: "Show available to end users" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Show reported used agents" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
     const lastQuery = () => new URL(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/agent-inventory?")).at(-1)![0], "http://localhost").searchParams;
     expect(Object.fromEntries(lastQuery())).toMatchObject({
-      view: "third_party", endUserAccess: "available", reportedUsage: "used", management: "organization_managed",
+      type: "thirdParty", endUserAccess: "available", reportedUsage: "used", management: "organization_managed",
     });
     const exportButton = screen.getByRole("button", { name: "Export agent inventory CSV" });
     await waitFor(() => expect(exportButton).toBeEnabled());
@@ -1808,24 +1812,25 @@ describe("App session revalidation", () => {
     await waitFor(() => expect(download.filenames).toHaveLength(1));
     const exported = transport.fetchMock.mock.calls.find(([path]) => path === "/api/agent-inventory/export.csv")!;
     expect(JSON.parse(String(exported[1]?.body))).toMatchObject({
-      revision: unifiedRevision, query: { view: "third_party", endUserAccess: "available", reportedUsage: "used", management: "organization_managed" },
+      revision: unifiedRevision, query: { type: "thirdParty", endUserAccess: "available", reportedUsage: "used", management: "organization_managed" },
     });
     await userEvent.click(screen.getByRole("button", { name: "Remove reported usage filter" }));
     await waitFor(() => expect(lastQuery().has("reportedUsage")).toBe(false));
-    expect(lastQuery().get("view")).toBe("third_party");
+    expect(lastQuery().get("type")).toBe("thirdParty");
+    expect(lastQuery().has("view")).toBe(false);
     expect(lastQuery().get("management")).toBe("organization_managed");
     await act(async () => {
       window.history.pushState({}, "", "/agents?show=first_party&usage=used");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    await waitFor(() => expect(lastQuery().get("view")).toBe("first_party"));
+    await waitFor(() => expect(lastQuery().get("type")).toBe("firstParty"));
     expect(lastQuery().get("reportedUsage")).toBe("used");
     expect(lastQuery().has("endUserAccess")).toBe(false);
     expect(lastQuery().has("management")).toBe(false);
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("first_party");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("firstParty");
     await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     await waitFor(() => expect(lastQuery().has("reportedUsage")).toBe(false));
-    expect(lastQuery().has("view")).toBe(false);
+    expect(lastQuery().has("type")).toBe(false);
     expect(window.location.search).toBe("");
   });
 

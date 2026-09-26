@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { matchesAgentFilters } from "../../backend/src/types/agentPresentation";
 import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 
 test.afterEach(async ({ page }) => {
@@ -13,6 +14,108 @@ const inventoryWithEnvironments = {
     { value: "environment-b", label: "Development" },
   ] },
 };
+
+test("filtered results keep Clear filters inline and show the matching total without a duplicate report row", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.route("**/api/agent-inventory?*", route => {
+    const query = new URL(route.request().url()).searchParams;
+    const value = unifiedAgents.value.filter(record =>
+      matchesAgentFilters(record, { type: query.get("type") ?? undefined })
+      && (!query.get("publisher") || record.packages.some(item => item.publisher === query.get("publisher")))
+      && (!query.get("search") || record.displayName.includes(query.get("search")!)));
+    return route.fulfill({ json: { ...unifiedAgents, value, count: value.length } });
+  });
+  await page.goto("/agents");
+  const toolbar = page.locator(".agent-grid-toolbar");
+  const search = toolbar.getByRole("searchbox", { name: "Search", exact: true });
+  const category = toolbar.getByRole("combobox", { name: "Show agents", exact: true });
+  const clear = toolbar.getByRole("button", { name: "Clear filters", exact: true });
+  const count = toolbar.getByRole("status", { name: "Matching agents", exact: true });
+  const viewports = info.project.name === "desktop"
+    ? [{ width: 1440, height: 900 }, { width: 1280, height: 800 }, { width: 768, height: 900 }]
+    : [{ width: 360, height: 780 }];
+  for (const viewport of viewports) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(async () => { await document.fonts.ready; });
+    await expect(category).toHaveValue("");
+    const initialHeight = (await toolbar.boundingBox())!.height;
+    for (const type of ["firstParty", "thirdParty", "shared"]) {
+      await category.selectOption(type);
+      await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
+      await expect(count).toHaveText("1 matching agent");
+      await expect(toolbar.locator(".agent-filter-chips")).toHaveCount(0);
+      await expect(toolbar.locator(".agent-report-note")).toHaveCount(0);
+      expect((await toolbar.boundingBox())!.height, "Selecting a category adds no toolbar row").toBeCloseTo(initialHeight, 1);
+      if (viewport.width >= 768) {
+        const controls = await Promise.all([search, category, clear, toolbar.getByRole("button", { name: "Filters", exact: true }),
+          toolbar.getByRole("button", { name: "Columns", exact: true })].map(control => control.boundingBox()));
+        expect(Math.max(...controls.map(box => box!.y)) - Math.min(...controls.map(box => box!.y)),
+          "Clear filters shares the main control row").toBeLessThanOrEqual(1);
+        expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(64);
+      }
+    }
+    await expect(page.getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
+    await page.screenshot({ path: info.outputPath(`filtered-toolbar-${viewport.width}.png`), fullPage: true });
+    expect((await new AxeBuilder({ page }).include(".agent-grid-toolbar").analyze()).violations).toEqual([]);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    await search.fill("No matching fixture");
+    await expect(count).toHaveText("0 matching agents");
+    await clear.click();
+    await expect(count).toHaveText("3 matching agents");
+    await expect(clear).toHaveCount(0);
+    await expect(category).toHaveValue("");
+    await expect(search).toHaveValue("");
+    await toolbar.getByRole("button", { name: "Filters", exact: true }).click();
+    await page.getByRole("dialog", { name: "Filter agents" }).getByRole("combobox", { name: "Publisher", exact: true })
+      .selectOption("Synthetic Finance");
+    await page.keyboard.press("Escape");
+    await expect(count).toHaveText("1 matching agent");
+    await expect(toolbar.getByRole("button", { name: "Remove publisher filter" })).toBeVisible();
+    await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
+    await clear.click();
+    await expect(count).toHaveText("3 matching agents");
+    await expect(toolbar.locator(".agent-filter-chips")).toHaveCount(0);
+  }
+  expect(unexpected).toEqual([]);
+});
+
+test("matching count uses the full server total and distinguishes loading and failed reads from zero", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  let finishRead!: () => void;
+  const pendingRead = new Promise<void>(resolve => { finishRead = resolve; });
+  await page.route("**/api/agent-inventory?*", async route => {
+    const search = new URL(route.request().url()).searchParams.get("search");
+    if (search === "pending") {
+      await pendingRead;
+      return route.fulfill({ json: { ...unifiedAgents, count: 1093 } });
+    }
+    if (search === "failed") return route.fulfill({
+      status: 503, json: { code: "snapshot_unavailable", detail: "Synthetic inventory read failed." },
+    });
+    return route.fulfill({ json: unifiedAgents });
+  });
+  await page.goto("/agents");
+  const toolbar = page.locator(".agent-grid-toolbar");
+  const count = toolbar.getByRole("status", { name: "Matching agents", exact: true });
+  const search = toolbar.getByRole("searchbox", { name: "Search", exact: true });
+  await expect(count).toHaveText("3 matching agents");
+  await search.fill("pending");
+  try {
+    await expect(count).toHaveText("Updating... matching agents");
+    await expect(count).not.toContainText("3");
+  } finally {
+    finishRead();
+  }
+  await expect(count).toHaveText("1,093 matching agents");
+  await expect(page.locator(".unified-agent-table tbody tr")).toHaveCount(3);
+  await search.fill("failed");
+  await expect(count).toHaveText("Unavailable matching agents");
+  await expect(count).not.toContainText("1,093");
+  await expect(page.getByText(/^Synthetic inventory read failed\./)).toBeVisible();
+  await toolbar.getByRole("button", { name: "Clear filters", exact: true }).click();
+  await expect(count).toHaveText("3 matching agents");
+  expect(unexpected).toEqual([]);
+});
 
 test("one compact toolbar opens accessible detailed filters without moving the table at every viewport", async ({ page }, info) => {
   test.setTimeout(60_000);
@@ -69,7 +172,7 @@ test("one compact toolbar opens accessible detailed filters without moving the t
           trigger, toolbar.getByRole("button", { name: "Columns", exact: true }),
         ].map(control => control.boundingBox()));
         expect(Math.max(...controls.map(box => box!.y)) - Math.min(...controls.map(box => box!.y))).toBeLessThanOrEqual(1);
-        expect(await toolbar.evaluate(element => element.getBoundingClientRect().height)).toBeLessThanOrEqual(64);
+        expect((await toolbar.boundingBox())!.height, "The whole toolbar remains one compact row").toBeLessThanOrEqual(64);
       }
       await page.screenshot({ path: info.outputPath(`agents-toolbar-${viewport.width}.png`), fullPage: true });
       await trigger.focus();
@@ -232,8 +335,10 @@ test("filter dismissal supports the close button, Escape, outside click and nonm
   await expect(trigger).toBeFocused();
   await expect(dialog).toBeVisible();
   await page.keyboard.press("Shift+Tab");
-  await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toBeFocused();
+  await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeFocused();
   await expect(dialog).toHaveCount(0);
+  await page.keyboard.press("Shift+Tab");
+  await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toBeFocused();
   expect(unexpected).toEqual([]);
 });
 
@@ -387,7 +492,7 @@ test("each chip removes only its own restriction and Clear also resets search an
   await page.goto("/agents");
   await page.getByRole("searchbox", { name: "Search", exact: true }).fill("policy");
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("first_party");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("firstParty");
   const trigger = page.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "Filter agents", exact: true });
@@ -416,8 +521,8 @@ test("each chip removes only its own restriction and Clear also resets search an
     await expect.poll(() => queries.at(-1)?.get(key)).toBeNull();
     const latest = queries.at(-1)!;
     expect(Object.fromEntries(Object.keys(remaining).map(field => [field, latest.get(field)]))).toEqual(remaining);
-    expect(Object.fromEntries(["search", "view", "sortBy", "sortDirection"].map(field => [field, latest.get(field)]))).toEqual({
-      search: "policy", view: "first_party", sortBy: "lastModifiedAt", sortDirection: "desc",
+    expect(Object.fromEntries(["search", "type", "sortBy", "sortDirection"].map(field => [field, latest.get(field)]))).toEqual({
+      search: "policy", type: "firstParty", sortBy: "lastModifiedAt", sortDirection: "desc",
     });
     await expect(page.getByRole("button", { name: `Remove ${name} filter`, exact: true })).toHaveCount(0);
     await expect(trigger).toHaveAccessibleName(Object.keys(remaining).length ? `Filters, ${Object.keys(remaining).length} active` : "Filters");
@@ -428,10 +533,10 @@ test("each chip removes only its own restriction and Clear also resets search an
   await page.keyboard.press("Enter");
   await expect(trigger).toBeFocused();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
-  await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toHaveValue("all");
+  await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toHaveValue("");
   await expect(page).toHaveURL(/\/agents\?sort=lastModifiedAt&direction=desc$/);
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
-  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("first_party");
+  await page.getByRole("combobox", { name: "Show agents", exact: true }).selectOption("firstParty");
   await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
   expect(unexpected).toEqual([]);
 });

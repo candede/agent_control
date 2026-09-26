@@ -1,7 +1,7 @@
 import {
-  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys, unifiedAgentQuickViews,
+  parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentSortKeys,
   unifiedAgentInventoryScopes, unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
-  type UnifiedAgentInventoryScope, type UnifiedAgentSort, type UnifiedAgentQuickView,
+  type UnifiedAgentInventoryScope, type UnifiedAgentSort,
   type UnifiedAgentAccessFilter, type UnifiedAgentUsageFilter, type UnifiedAgentManagementFilter, type UnifiedAgentRelevanceFilter,
 } from "../../backend/src/types/unifiedAgents";
 import { isDirectoryObjectId } from "../../backend/src/types/copilotPackage";
@@ -13,7 +13,7 @@ export type WorkbenchViewId = "agents" | "users" | "sync" | "audit" | "permissio
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
-  agentView: UnifiedAgentQuickView;
+  packageType: string;
   endUserAccess: UnifiedAgentAccessFilter;
   reportedUsage: UnifiedAgentUsageFilter;
   management: UnifiedAgentManagementFilter;
@@ -168,11 +168,12 @@ export function parseAgentRoute(search: string): AgentRouteState {
     : rawDetailId;
   return {
     inventoryScope: unifiedAgentInventoryScopes.find(value => value === params.get("inventory")) ?? "catalog",
-    agentView: unifiedAgentQuickViews.find(value => value === params.get("show")) ?? "all",
+    packageType: bounded(params.get("type"), 4096) ?? (legacyView === "first_party" ? "firstParty" : legacyView === "third_party" ? "thirdParty" : ""),
     endUserAccess: unifiedAgentAccessFilters.find(value => value === params.get("access"))
       ?? (legacyView === "available" || legacyView === "unavailable" ? legacyView : legacyView === "availability_unknown" ? "unknown" : "all"),
     reportedUsage: unifiedAgentUsageFilters.find(value => value === params.get("usage")) ?? (legacyView === "used" ? "used" : "all"),
-    management: unifiedAgentManagementFilters.find(value => value === params.get("management")) ?? "all",
+    management: unifiedAgentManagementFilters.find(value => value === params.get("management"))
+      ?? (legacyView === "user_managed" || legacyView === "organization_managed" ? legacyView : "all"),
     relevance: unifiedAgentRelevanceFilters.find(value => value === params.get("relevance"))
       ?? (legacyView === "organization" || legacyView === "unknown" ? legacyView : "all"),
     search: query,
@@ -180,7 +181,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     publisher: bounded(params.get("publisher"), 256) ?? "all",
     availability: bounded(params.get("availability"), 128) ?? "all",
     host: bounded(params.get("host"), 256) ?? "all",
-    platform: bounded(params.get("platform"), 256) ?? "all",
+    platform: bounded(params.get("platform"), 256) ?? (legacyView === "copilot_studio" ? "Copilot Studio" : "all"),
     createdWithinDays: boundedIntegerText(params.get("createdWithinDays"), 3650),
     sortBy: unifiedAgentSortKeys.find(value => value === sortBy) ?? "displayName",
     sortDirection: params.get("direction") === "desc" ? "desc" : "asc",
@@ -205,7 +206,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
 export function agentRouteSearch(state: AgentRouteState) {
   const params = new URLSearchParams();
   if (state.inventoryScope !== "catalog") params.set("inventory", state.inventoryScope);
-  if (state.agentView !== "all") params.set("show", state.agentView);
+  if (state.packageType) params.set("type", state.packageType);
   if (state.endUserAccess !== "all") params.set("access", state.endUserAccess);
   if (state.reportedUsage !== "all") params.set("usage", state.reportedUsage);
   if (state.management !== "all") params.set("management", state.management);

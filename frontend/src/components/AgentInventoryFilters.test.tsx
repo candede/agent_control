@@ -7,12 +7,17 @@ import { AgentInventoryFilters, type AgentFilterValues } from "./AgentInventoryF
 afterEach(() => vi.restoreAllMocks());
 
 const defaults: AgentFilterValues = {
-  search: "", agentView: "all", platform: "all", availability: "all", host: "all",
+  search: "", packageType: "", platform: "all", availability: "all", host: "all",
   endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
   status: "all", createdWithinDays: "", publisher: "all", environmentId: "",
   sortBy: "displayName", sortDirection: "asc",
 };
 const options = {
+  types: [
+    { value: "firstParty", label: "1st party agents" }, { value: "thirdParty", label: "3rd party agents" },
+    { value: "shared", label: "Shared in your organization" }, { value: "lob", label: "Built by your org" },
+    { value: "futureType", label: "futureType" },
+  ],
   platforms: [{ value: "studio", label: "Copilot Studio" }],
   availability: [{ value: "available:some", label: "Some users" }],
   hosts: [{ value: "Teams", label: "Teams" }],
@@ -38,6 +43,51 @@ function setup(initial: Partial<AgentFilterValues> = {}) {
 }
 
 describe("inventory filter toolbar", () => {
+  it.each([
+    { matchingCount: 0, loading: false, text: "0 matching agents" },
+    { matchingCount: 1, loading: false, text: "1 matching agent" },
+    { matchingCount: 1093, loading: false, text: "1,093 matching agents" },
+    { matchingCount: 1093, loading: true, text: "Updating... matching agents" },
+    { matchingCount: undefined, loading: false, text: "Unavailable matching agents" },
+  ])("shows the current matching total without treating pending or missing data as zero: $text", ({ matchingCount, loading, text }) => {
+    render(<AgentInventoryFilters values={defaults} options={options} loading={loading}
+      matchingCount={matchingCount} onChange={vi.fn()} onClear={vi.fn()} onError={vi.fn()} />);
+    expect(screen.getByRole("status", { name: "Matching agents" })).toHaveTextContent(text);
+  });
+
+  it.each<Partial<AgentFilterValues>>([{ packageType: "firstParty" }, { search: "policy" }, { host: "Teams" }])(
+    "keeps Clear filters with the query controls and only renders a chip row for detailed restrictions: %j", initial => {
+      setup(initial);
+      const clear = screen.getByRole("button", { name: "Clear filters" });
+      expect(clear.closest(".agent-query-bar")).not.toBeNull();
+      expect(clear.closest(".agent-filter-chips")).toBeNull();
+      expect(document.querySelectorAll(".agent-filter-chips")).toHaveLength(initial.host ? 1 : 0);
+    },
+  );
+
+  it("offers only the saved Graph types and passes their exact values through", async () => {
+    const { user, changed } = setup();
+    const selector = screen.getByRole("combobox", { name: "Show agents" });
+    expect(within(selector).getAllByRole("option").map(option => option.getAttribute("value")))
+      .toEqual(["", ...options.types.map(option => option.value)]);
+    for (const type of options.types) {
+      await user.selectOptions(selector, type.value);
+      expect(changed).toHaveBeenLastCalledWith({ packageType: type.value });
+      expect(selector).toHaveAttribute("title", `Graph package type: ${type.value}`);
+    }
+    await user.selectOptions(selector, "Built by your org");
+    expect(changed).toHaveBeenLastCalledWith({ packageType: "lob" });
+    expect(selector).toHaveValue("lob");
+  });
+
+  it("retains a bookmarked type missing from the current catalog without silently broadening results", async () => {
+    const { user } = setup({ packageType: "noLongerPresent" });
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("noLongerPresent");
+    expect(screen.getByRole("option", { name: "Not in saved catalog: noLongerPresent" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
+  });
+
   it("keeps only everyday controls visible and makes every detailed filter keyboard accessible", async () => {
     const { user } = setup();
     expect(screen.getAllByRole("combobox")).toHaveLength(1);
@@ -79,7 +129,7 @@ describe("inventory filter toolbar", () => {
   it("applies filters immediately, preserves them on outside dismissal, and resets without changing sort", async () => {
     const { user, changed } = setup();
     await user.type(screen.getByRole("searchbox", { name: "Search" }), "policy");
-    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "first_party");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "firstParty");
     await user.click(screen.getByRole("button", { name: "Filters" }));
     await user.selectOptions(screen.getByRole("combobox", { name: "Built with" }), "studio");
     expect(changed).toHaveBeenLastCalledWith({ platform: "studio" });
@@ -91,7 +141,7 @@ describe("inventory filter toolbar", () => {
     await user.click(screen.getByRole("button", { name: "Clear filters" }));
     expect(screen.getByRole("button", { name: "Filters" })).toHaveFocus();
     expect(screen.getByRole("searchbox", { name: "Search" })).toHaveValue("");
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
     expect(screen.queryByRole("button", { name: "Remove built with filter" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Filters" }));
     expect(screen.getByRole("combobox", { name: "Sort" })).toHaveValue("lastModifiedAt:desc");
@@ -111,23 +161,23 @@ describe("inventory filter toolbar", () => {
     expect(screen.getByRole("button", { name: "Filters" })).toBeVisible();
   });
 
-  it("combines quick views with independent evidence filters and removes each without changing the view", async () => {
+  it("combines Graph types with independent evidence filters and removes each without changing the type", async () => {
     const { user, changed } = setup();
-    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "third_party");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Show agents" }), "thirdParty");
     await user.click(screen.getByRole("button", { name: "Filters" }));
     await user.selectOptions(screen.getByRole("combobox", { name: "End-user access" }), "available");
     await user.selectOptions(screen.getByRole("combobox", { name: "Reported usage" }), "used");
     await user.selectOptions(screen.getByRole("combobox", { name: "Management" }), "organization_managed");
     await user.keyboard("{Escape}");
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("thirdParty");
     expect(screen.getByRole("button", { name: "Filters, 3 active" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Remove reported usage filter" }));
     expect(changed).toHaveBeenLastCalledWith({ reportedUsage: "all" });
     expect(screen.getByRole("button", { name: "Remove end-user access filter" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Remove management filter" })).toBeVisible();
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("third_party");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("thirdParty");
     await user.click(screen.getByRole("button", { name: "Clear filters" }));
-    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("all");
+    expect(screen.getByRole("combobox", { name: "Show agents" })).toHaveValue("");
     expect(screen.queryByRole("button", { name: /Remove .* filter/ })).not.toBeInTheDocument();
   });
 
@@ -169,7 +219,7 @@ describe("inventory filter toolbar", () => {
   it("surfaces invalid view and sort choices instead of silently changing the query", async () => {
     const { user, error, changed } = setup();
     fireEvent.change(screen.getByRole("combobox", { name: "Show agents" }), { target: { value: "unsupported" } });
-    expect(error).toHaveBeenLastCalledWith("Choose a supported agent view.");
+    expect(error).toHaveBeenLastCalledWith("Choose a package type from the saved catalog.");
     await user.click(screen.getByRole("button", { name: "Filters" }));
     fireEvent.change(screen.getByRole("combobox", { name: "Sort" }), { target: { value: "unsupported" } });
     expect(error).toHaveBeenLastCalledWith("Choose a supported agent sort order.");

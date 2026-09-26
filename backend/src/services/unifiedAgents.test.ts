@@ -225,6 +225,57 @@ function quickViewDependencies() {
 }
 
 describe("UnifiedAgentsService", () => {
+  it.each(["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", "__proto__"])(
+    "uses raw Graph type %s for facets, counts, paging and export without inferring categories", async type => {
+      const types = ["firstParty", "thirdParty", "shared", "lob", "microsoft", "external", "custom", "futureType", "__proto__"];
+      const packages = types.flatMap(type => [0, 1].map(index => ({
+        ...packageValue(`${type}-${index}`, `Analyst ${index}`), type,
+        publisher: "Microsoft Corporation", availableTo: index === 0 ? "all" : "none",
+      })));
+      const service = new UnifiedAgentsService(dependencies({
+        packages: [...packages, { ...packageValue("missing-type", "Analyst"), publisher: "Microsoft Corporation" }],
+        resources: [resource(environmentA)],
+      }));
+      const scope = { tenantId, principalId: "viewer" };
+      const page = await service.list(scope, { type, inventoryScope: "catalog", limit: 1, offset: 1 });
+      expect(page.count).toBe(2);
+      expect(page.filteredSummary.total).toBe(2);
+      expect(page.value.map(record => record.packages[0].id)).toEqual([`${type}-1`]);
+      expect(page.facets.types.map(option => option.value).sort()).toEqual([...types].sort());
+      expect(page.facets.types).toContainEqual({ value: "lob", label: "Built by your org" });
+      const exported = await service.forExport(scope, page.revision!, { type, inventoryScope: "catalog" });
+      expect(exported.count).toBe(2);
+      expect(exported.value.flatMap(record => record.packages.map(item => item.type))).toEqual([type, type]);
+      const csv = buildUnifiedAgentCsv(exported, Date.now() + 15_000);
+      const rows = parseCsv(csv.buffer, { bom: true, columns: true }) as Array<Record<string, string>>;
+      expect(rows.map(row => row.origin)).toEqual([type, type]);
+      expect(rows.map(row => JSON.parse(row.packageStates)[0].type)).toEqual([type, type]);
+      const available = await service.list(scope, { type, endUserAccess: "available" });
+      expect(available.value.map(record => record.packages[0].id)).toEqual([`${type}-0`]);
+      const nativeOnly = await service.list(scope, { type, inventoryScope: "power_platform_only" });
+      expect(nativeOnly.count).toBe(0);
+      expect(nativeOnly.facets.types).toEqual([]);
+      expect((await service.list(scope, { type: type.toUpperCase() })).count).toBe(0);
+    },
+  );
+
+  it("matches a grouped agent by its actual package types without replacing conflicting or missing values", async () => {
+    const service = new UnifiedAgentsService(dependencies({
+      packages: [
+        { ...packageValue("first", "First", true), type: "firstParty" },
+        { ...packageValue("shared", "Shared", true), type: "shared" },
+        packageValue("missing", "Missing", true),
+      ],
+      resources: [resource(environmentA)],
+    }));
+    for (const type of ["firstParty", "shared"]) {
+      const page = await service.list({ tenantId, principalId: "viewer" }, { type });
+      expect(page.count).toBe(1);
+      expect(page.value[0].packages).toHaveLength(3);
+      expect(agentColumnValue(page.value[0], "origin")).toBe("firstParty / shared / Unknown");
+    }
+  });
+
   it.each([
     { query: { view: "first_party", endUserAccess: "available", management: "unknown" }, expected: ["first"] },
     { query: { view: "third_party", reportedUsage: "used", management: "unknown" }, expected: ["vendor"] },
@@ -890,7 +941,7 @@ describe("UnifiedAgentsService", () => {
       { ...packageValue("known-b", "Known B"), type: "microsoft", version: "10" },
     ] }));
     const scope = { tenantId, principalId: "viewer" };
-    const known = query.sortBy === "origin" ? ["known-b", "known-a"] : ["known-a", "known-b"];
+    const known = ["known-a", "known-b"];
     if (query.sortDirection === "desc") known.reverse();
     const page = await service.list(scope, { ...query, limit: 1, offset: 1 });
     expect(page.count).toBe(3);
@@ -1359,7 +1410,7 @@ describe("UnifiedAgentsService", () => {
     const unavailable = await new UnifiedAgentsService(dependencies({
       resources: [resource(environmentA)], environmentNames: { [environmentA]: "Must not be exposed" }, powerPlatformSnapshot: null,
     })).list({ tenantId, principalId: "viewer" });
-    expect(unavailable.facets).toEqual({ environments: [], platforms: [] });
+    expect(unavailable.facets).toEqual({ environments: [], platforms: [], types: [] });
   });
 
   it.each(["filtered", "paged"] as const)("retains the independent environment deadline when its agents are %s out", async mode => {

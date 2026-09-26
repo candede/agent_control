@@ -329,7 +329,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const [error, setError] = useState<string>();
   const [query, setQuery] = useState(initialAgentRoute.search);
   const [agentInventoryScope, setAgentInventoryScope] = useState(initialAgentRoute.inventoryScope);
-  const [agentView, setAgentView] = useState(initialAgentRoute.agentView);
+  const [packageType, setPackageType] = useState(initialAgentRoute.packageType);
   const [endUserAccess, setEndUserAccess] = useState(initialAgentRoute.endUserAccess);
   const [reportedUsage, setReportedUsage] = useState(initialAgentRoute.reportedUsage);
   const [agentManagement, setAgentManagement] = useState(initialAgentRoute.management);
@@ -534,7 +534,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const route = parseAgentRoute(window.location.search);
         setQuery(route.search);
         setAgentInventoryScope(route.inventoryScope);
-        setAgentView(route.agentView);
+        setPackageType(route.packageType);
         setEndUserAccess(route.endUserAccess);
         setReportedUsage(route.reportedUsage);
         setAgentManagement(route.management);
@@ -608,7 +608,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     if (!user || activeView !== "agents" || pendingStoredAgentSelectionCount !== undefined) return;
     const search = agentRouteSearch({
       inventoryScope: agentInventoryScope,
-      agentView,
+      packageType,
       endUserAccess,
       reportedUsage,
       management: agentManagement,
@@ -651,7 +651,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           : `The ${selectedAgentIds.size.toLocaleString()}-package selection remains active, but browser session storage is unavailable. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user]);
 
   useEffect(() => {
     if (!user || activeView !== "sync") return;
@@ -949,7 +949,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
     return () => agentListAbortController.current?.abort();
-  }, [agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, agentView, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
+  }, [agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, platformFilter, publisherFilter, reportedUsage, statusFilter, user]);
 
 
   useEffect(() => {
@@ -1216,7 +1216,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   ].join(" · ");
   const agentInventoryIssueSummary = inventoryAttentionReasons(unifiedAgentPage, unifiedAgentReadError).join(" ");
   const hasActiveAgentFilters =
-    agentView !== "all" ||
+    Boolean(packageType) ||
     endUserAccess !== "all" ||
     reportedUsage !== "all" ||
     agentManagement !== "all" ||
@@ -1357,7 +1357,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function currentUnifiedAgentQuery(): UnifiedAgentExportQuery {
     return {
-      ...(agentView !== "all" ? { view: agentView } : {}),
+      ...(packageType ? { type: packageType } : {}),
       ...(endUserAccess !== "all" ? { endUserAccess } : {}),
       ...(reportedUsage !== "all" ? { reportedUsage } : {}),
       ...(agentManagement !== "all" ? { management: agentManagement } : {}),
@@ -2239,7 +2239,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleAgentFilterChange(values: Partial<AgentFilterValues>) {
     if (values.search !== undefined) handleSearchQueryChange(values.search);
-    if (values.agentView !== undefined) setAgentView(values.agentView);
+    if (values.packageType !== undefined) setPackageType(values.packageType);
     if (values.endUserAccess !== undefined) setEndUserAccess(values.endUserAccess);
     if (values.reportedUsage !== undefined) setReportedUsage(values.reportedUsage);
     if (values.management !== undefined) setAgentManagement(values.management);
@@ -2260,7 +2260,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleClearAgentFilters() {
-    setAgentView("all");
+    setPackageType("");
     setEndUserAccess("all");
     setReportedUsage("all");
     setAgentManagement("all");
@@ -2769,13 +2769,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 records={displayedUnifiedAgents}
                 loading={loadingAgents && !unifiedAgentPage}
                 controls={<AgentInventoryFilters key={principalKey}
-                  values={{ search: query, agentView, endUserAccess, reportedUsage, management: agentManagement, relevance: agentRelevance,
+                  values={{ search: query, packageType, endUserAccess, reportedUsage, management: agentManagement, relevance: agentRelevance,
                     platform: effectivePlatformFilter, availability: availableToFilter,
                     host: hostFilter, status: statusFilter, createdWithinDays, publisher: publisherFilter,
                     environmentId: agentEnvironmentFilter, sortBy: agentSortBy, sortDirection: agentSortDirection }}
                   options={{ platforms: platformOptions, availability: availableToOptions, hosts: hostOptions,
-                    publishers: publisherOptions, environments: unifiedAgentPage?.facets?.environments ?? [] }}
-                  loading={loadingAgents} onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={setError} />}
+                    publishers: publisherOptions, environments: unifiedAgentPage?.facets?.environments ?? [],
+                    types: unifiedAgentPage?.facets?.types ?? [] }}
+                  matchingCount={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage?.count}
+                  loading={loadingAgents || deferredQuery !== query}
+                  onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={setError} />}
                 columnPreferenceOwner={user ? JSON.stringify([user.tenantId ?? "", user.homeAccountId]) : undefined}
                 sortBy={agentSortBy}
                 sortDirection={agentSortDirection}

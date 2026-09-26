@@ -7,6 +7,7 @@ import type {
   OfficialUsageAgent,
   OfficialUsageAgentDetailView,
   OfficialUsageAgentUser,
+  OfficialUsageAgentUsersView,
   OfficialUsageAggregateView,
   OfficialUsageAvailability,
   OfficialUsageReportingSummary,
@@ -120,33 +121,8 @@ export function buildOfficialUsageAgentDetailView(
   if (!agent) return undefined;
 
   const viewState = availability(published, options.staleAfterDays, options.now ?? new Date());
-  const displayNames = new Map(published.reports.users?.rows.map(row => [row.username, row.displayName]) ?? []);
-  const byUsername = new Map<string, OfficialUsageAgentUser>();
-  for (const row of published.reports.userAgents?.rows ?? []) {
-    if (row.agentId !== agentId) continue;
-    const user = byUsername.get(row.username);
-    if (user) user.responsesSentToUsers += row.responsesSentToUsers;
-    else byUsername.set(row.username, {
-      username: row.username,
-      displayName: displayNames.get(row.username) || row.username,
-      responsesSentToUsers: row.responsesSentToUsers,
-    });
-  }
-  const users = [...byUsername.values()];
-  const search = options.search?.trim();
-  const query = search?.toLowerCase();
-  const filteredUsers = query
-    ? users.filter(user => [user.username, user.displayName].some(value => value.toLowerCase().includes(query)))
-    : users;
-  const sortBy = options.sortBy ?? "responses";
-  const sortDirection = options.sortDirection ?? "desc";
-  const sortedUsers = [...filteredUsers].sort((left, right) => {
-    const comparison = sortBy === "displayName"
-      ? ordinal(left.displayName, right.displayName)
-      : left.responsesSentToUsers - right.responsesSentToUsers;
-    return (sortDirection === "asc" ? comparison : -comparison) || ordinal(left.username, right.username);
-  });
-  const paging = boundedPaging(options.limit ?? 100, options.offset, 500);
+  const users = collectAgentUsers(published, new Set([agentId]));
+  const page = pageAgentUsers(users, options);
 
   return {
     authority,
@@ -164,6 +140,60 @@ export function buildOfficialUsageAgentDetailView(
       zeroResponseUsers: published.reports.userAgents ? users.filter(user => user.responsesSentToUsers === 0).length : null,
       userBreakdownResponses: published.reports.userAgents ? sum(users, user => user.responsesSentToUsers) : null,
     },
+    ...page,
+  };
+}
+
+export function buildOfficialUsageAgentUsersView(
+  published: PublishedOfficialUsage,
+  agentIds: readonly string[],
+  options: AgentDetailViewOptions,
+): OfficialUsageAgentUsersView {
+  const ids = new Set(agentIds);
+  const reported = new Set(buildAgentUsage(published.reports).map(agent => agent.agentId));
+  if ([...ids].some(id => !reported.has(id))) {
+    throw new AppError(404, "official_usage_agent_not_found", "An agent was not found in this report. Reload agent usage.");
+  }
+  if (!published.reports.userAgents) {
+    throw new AppError(409, "official_usage_users_unavailable", "Import the Users and agents CSV to see this agent's users.");
+  }
+  const users = collectAgentUsers(published, ids).filter(user => user.responsesSentToUsers > 0);
+  return { activeSet: published.activeSet, agentIds: [...ids], users: pageAgentUsers(users, options).users };
+}
+
+function collectAgentUsers(published: PublishedOfficialUsage, agentIds: ReadonlySet<string>): OfficialUsageAgentUser[] {
+  const displayNames = new Map(published.reports.users?.rows.map(row => [row.username, row.displayName]) ?? []);
+  const byUsername = new Map<string, OfficialUsageAgentUser>();
+  for (const row of published.reports.userAgents?.rows ?? []) {
+    if (!agentIds.has(row.agentId)) continue;
+    const user = byUsername.get(row.username);
+    if (user) user.responsesSentToUsers = sum([user, row], item => item.responsesSentToUsers);
+    else byUsername.set(row.username, {
+      username: row.username,
+      displayName: displayNames.get(row.username) || row.username,
+      responsesSentToUsers: row.responsesSentToUsers,
+    });
+  }
+  return [...byUsername.values()];
+}
+
+function pageAgentUsers(users: OfficialUsageAgentUser[], options: AgentDetailViewOptions) {
+  const search = options.search?.trim();
+  const query = search?.toLowerCase();
+  const filteredUsers = query
+    ? users.filter(user => [user.username, user.displayName].some(value => value.toLowerCase().includes(query)))
+    : users;
+  const sortBy = options.sortBy ?? "responses";
+  const sortDirection = options.sortDirection ?? "desc";
+  const sortedUsers = [...filteredUsers].sort((left, right) => {
+    const comparison = sortBy === "displayName"
+      ? ordinal(left.displayName, right.displayName)
+      : left.responsesSentToUsers - right.responsesSentToUsers;
+    return (sortDirection === "asc" ? comparison : -comparison) || ordinal(left.username, right.username);
+  });
+  const paging = boundedPaging(options.limit ?? 100, options.offset, 500);
+
+  return {
     filters: { ...(search ? { search } : {}), sortBy, sortDirection },
     users: {
       value: sortedUsers.slice(paging.offset, paging.offset + paging.limit),

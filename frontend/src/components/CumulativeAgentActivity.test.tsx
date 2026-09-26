@@ -3,6 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api/client";
 import { usageOverviewFixture } from "../test/usageInsightsFixture";
+import { automaticUsageContext } from "../test/automaticAgentUsageFixture";
+import { createUnifiedVerification } from "../test/inventoryVerification";
+import { usageAvailabilityLabel, usageCoverageLabel } from "../usageInsights";
 import { CumulativeAgentActivity } from "./CumulativeAgentActivity";
 import { AgentInventoryOverview } from "./AgentInventoryOverview";
 import { SavedQueryProvider } from "./SavedQueryProvider";
@@ -250,6 +253,39 @@ describe("cumulative retained agent activity", () => {
 });
 
 describe("inventory dashboard source boundaries", () => {
+  it("owns report dates for read-only viewers and keeps report status beside the selector without repeating dates", async () => {
+    const summary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
+    const errors: api.UnifiedAgentInventoryPage["errors"] = [
+      { source: "graph_packages", code: "snapshot_unavailable", message: "No saved package catalog." },
+      { source: "power_platform", code: "snapshot_unavailable", message: "No saved Power Platform inventory." },
+    ];
+    const inventory: api.UnifiedAgentInventoryPage = {
+      value: [], count: 0, offset: 0, limit: 50, inventoryScope: "catalog",
+      summary, scopeSummary: summary, filteredSummary: summary,
+      verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
+      facets: { environments: [], platforms: [], types: [] },
+      sources: {
+        graphPackages: { state: "unavailable", observation: null, error: errors[0] },
+        powerPlatform: { state: "unavailable", observation: null, error: errors[1] },
+      },
+      partial: true, errors, usageContext: automaticUsageContext,
+    };
+    const { rerender } = render(<AgentInventoryOverview revision={0} inventory={inventory} />);
+    await waitFor(() => expect(screen.queryByText("Loading selected report evidence...")).not.toBeInTheDocument());
+    expect(screen.getByText(usageCoverageLabel(automaticUsageContext.reportSet))).toBeVisible();
+    const reportSelector = <select aria-label="Report set"><option>Selected dates</option></select>;
+    rerender(<AgentInventoryOverview revision={0} inventory={inventory} reportSelector={reportSelector} />);
+    expect(screen.queryByText(usageCoverageLabel(automaticUsageContext.reportSet))).not.toBeInTheDocument();
+    for (const availability of ["stale", "not_selected", "deleted", "incomplete", "never_imported"] as const) {
+      rerender(<AgentInventoryOverview revision={0} reportSelector={reportSelector}
+        inventory={{ ...inventory, usageContext: { ...automaticUsageContext, availability } }} />);
+      const status = screen.getByRole("status");
+      expect(status).toHaveTextContent(usageAvailabilityLabel(availability));
+      expect(status.closest(".agent-report-context")).not.toBeNull();
+      expect(screen.getByRole("combobox", { name: "Report set" })).toBeVisible();
+    }
+  });
+
   it.each([0, 2])("selects the used view when the selected report has %i used agents", async usedAgents => {
     const report = usageOverviewFixture();
     report.summary.usedAgents = usedAgents;

@@ -52,14 +52,13 @@ for (const scenario of cases) {
 
     if (scenario.name === "user-purview") {
       await page.getByRole("button", { name: "Ada", exact: true }).click();
-      await page.getByRole("button", { name: "Open Purview audit search", exact: true }).click();
+      await page.getByRole("tab", { name: "Purview audit", exact: true }).click();
       await expect(page.locator(".purview-history-table tbody tr")).toBeVisible();
       await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toBeVisible();
       await page.locator(".purview-history-table").getByRole("button", { name: /View/ }).click();
       await expect(page.locator(".purview-results tbody tr").first()).toBeVisible();
     }
     if (scenario.name === "agent-investigation") {
-      await page.getByText("Agent scope (automatic)", { exact: true }).click();
       await expect(page.getByLabel("Agent IDs", { exact: true })).toHaveCount(0);
       await page.getByRole("button", { name: /View hunt/ }).click();
       await expect(page.getByText("Saved service desk security observation", { exact: true })).toBeVisible();
@@ -119,12 +118,12 @@ for (const scenario of cases) {
           await expect(page.getByRole("button", { name: "Filters", exact: true })).toBeFocused();
         }
         if (scenario.name === "agent-investigation") {
-          await expect(page.locator(".hunting-readiness > div")).toHaveCount(5);
-          await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agent_activity");
+          await expect(page.getByRole("region", { name: "Defender log coverage and setup" })).toBeVisible();
+          await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
           await expect(page.getByLabel("Actor object IDs", { exact: true })).toHaveCount(0);
           await page.screenshot({ path: info.outputPath(`agent-investigation-${width}-activity-filters.png`), fullPage: true, animations: "disabled" });
           await assertLayout(page, scenario.fields, `agent-scoped activity form at ${width}px`);
-          await page.getByRole("combobox", { name: "Fixed template", exact: true }).selectOption("agents_inventory");
+          await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agents_inventory");
         }
         if (scenario.name === "report-snapshot") {
           const totals = page.getByRole("region", { name: "Snapshot tenant totals" });

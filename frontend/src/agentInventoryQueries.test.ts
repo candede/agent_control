@@ -14,7 +14,7 @@ function page(expiresAt = "2026-09-20T12:10:00.000Z"): UnifiedAgentInventoryPage
     inventoryScope: "all", scopeSummary: summary,
     revision: "a".repeat(64), value: [], count: 0, offset: 0, limit: 50, summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
-    facets: { environments: [], platforms: [] }, partial: true, errors: [],
+    facets: { environments: [], platforms: [], types: [] }, partial: true, errors: [],
     sources: {
       graphPackages: {
         state: "available", error: null,

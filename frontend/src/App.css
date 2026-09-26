@@ -2431,8 +2431,7 @@ button.audit-result-button:focus-visible {
 .purview-qualification,
 .purview-qualification-actions,
 .purview-row-actions,
-.purview-evidence-strip,
-.purview-evidence-strip span {
+.purview-access > header {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -2443,13 +2442,16 @@ button.audit-result-button:focus-visible {
 .purview-history > header,
 .purview-results > header,
 .purview-search-actions,
-.purview-qualification {
+.purview-qualification,
+.purview-access > header {
   justify-content: space-between;
 }
 
 .purview-audit-heading h2,
 .purview-history h3,
-.purview-results h3 {
+.purview-results h3,
+.purview-coverage h3,
+.purview-access h3 {
   margin: 0;
   color: var(--text-h);
 }
@@ -2462,27 +2464,57 @@ button.audit-result-button:focus-visible {
 .purview-audit-heading p:not(.eyebrow),
 .purview-history header p,
 .purview-results header p,
-.purview-qualification p {
+.purview-qualification p,
+.purview-coverage p,
+.purview-access p {
   margin: 4px 0 0;
   color: var(--muted);
 }
 
-.purview-evidence-strip {
-  flex-wrap: wrap;
-  justify-content: space-between;
-  padding: 11px 14px;
-  border-top: 1px solid #b8cec7;
-  border-bottom: 1px solid #b8cec7;
-  color: #173f38;
-  background: rgba(225, 240, 234, 0.72);
+.purview-coverage,
+.purview-access {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
   font-size: 13px;
-  font-weight: 750;
 }
 
-.purview-evidence-strip svg {
-  width: 17px;
-  height: 17px;
-  flex-shrink: 0;
+.purview-guidance {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.purview-coverage-grid {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.purview-access small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.purview-coverage h3,
+.purview-access h3 {
+  font-size: 14px;
+}
+
+.purview-coverage strong,
+.purview-access strong {
+  color: var(--text-h);
+}
+
+.purview-access .purview-row-actions {
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .purview-search-form {
@@ -2513,10 +2545,10 @@ button.audit-result-button:focus-visible {
   padding: 12px 0;
 }
 
-.purview-structured-filters summary {
-  margin-bottom: 12px;
+.purview-structured-filters h3 {
+  margin: 0 0 12px;
   color: var(--text-h);
-  cursor: pointer;
+  font-size: 13px;
   font-weight: 800;
 }
 

@@ -35,6 +35,7 @@ const retainedSetId = "22222222-2222-4222-8222-222222222222";
 const missingSetId = "33333333-3333-4333-8333-333333333333";
 const detailPath = "/api/official-usage/agents/Report-A";
 const usersPath = "/api/official-usage/users";
+const agentUsersPath = `/api/official-usage/agent-users?agentIds=${encodeURIComponent(JSON.stringify(["Report-A"]))}&setId=${activeSetId}`;
 const database = { query: vi.fn(), connect: vi.fn() };
 const readPublished = vi.fn<OfficialUsageRepository["getPublished"]>();
 const inventoryRead = vi.fn<PackageInventoryRepository["list"]>();
@@ -109,6 +110,38 @@ afterAll(async () => {
 });
 
 describe("official usage report-agent routes", () => {
+  it("lists active agent users of every license status, with report names and agent-specific responses", async () => {
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource");
+    const result = await get<import("../types/officialUsage.js").OfficialUsageAgentUsersView>(agentUsersPath);
+    expect(result.status).toBe(200);
+    expect(result.body!.users.count).toBe(2);
+    expect(result.body!.users.value.map(user => user.username)).toEqual(["CaseUser", "caseuser"]);
+    expect(result.body!.users.value.map(user => user.responsesSentToUsers)).toEqual([4, 1]);
+    expect(result.body!.users.value.every(user => user.displayName.length > 0)).toBe(true);
+    expect(readDirectory).not.toHaveBeenCalled();
+    expect(await get(agentUsersPath.replace(activeSetId, retainedSetId))).toMatchObject({
+      status: 200, body: { activeSet: { id: retainedSetId } },
+    });
+    expect(await get(agentUsersPath.replace(activeSetId, missingSetId))).toMatchObject({ status: 404 });
+    expect(await get(`${agentUsersPath}&limit=1&offset=1`)).toMatchObject({
+      status: 200, body: { users: { count: 2, value: [{ username: "caseuser" }] } },
+    });
+  });
+
+  it.each(["", "null", "{}", "[]", '[""]', "[1]", "not-json", JSON.stringify(Array(101).fill("Report-A"))])(
+    "rejects invalid agent user selection %s", async ids => {
+      expect(await get(`/api/official-usage/agent-users?setId=${activeSetId}&agentIds=${encodeURIComponent(ids)}`)).toMatchObject({ status: 400 });
+    },
+  );
+
+  it("requires one exact report set and rejects duplicate or unsupported filters", async () => {
+    for (const path of [
+      agentUsersPath.replace(`&setId=${activeSetId}`, ""),
+      `${agentUsersPath}&agentIds=[]`, `${agentUsersPath}&licenseCohort=active_without_paid`,
+      `${agentUsersPath}&offset=-1`, `${agentUsersPath}&limit=501`,
+    ]) expect(await get(path)).toMatchObject({ status: 400 });
+  });
+
   it("uses principal-private saved licensing before unpaid paging and excludes paid or unknown identities", async () => {
     const directory = savedDirectory();
     const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(directory);
@@ -204,7 +237,7 @@ describe("official usage report-agent routes", () => {
     expect(declaredRoutePolicies.has("POST /official-usage/agents/:agentId")).toBe(false);
   });
 
-  it.each([detailPath, `${usersPath}?agentId=Report-A`])("gates %s on the tenant session and Viewer or inherited Admin role", async path => {
+  it.each([detailPath, agentUsersPath, `${usersPath}?agentId=Report-A`])("gates %s on the tenant session and Viewer or inherited Admin role", async path => {
     expect(await get(path, null)).toMatchObject({ status: 401, body: { code: "unauthorized" } });
     expect(await get(path, "unassigned")).toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
     expect(await get(path, "viewer", "99999999-9999-4999-8999-999999999999")).toMatchObject({ status: 401, body: { code: "unauthorized" } });

@@ -3,7 +3,7 @@ import type { PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { CopilotServiceSummaryState } from "../types/copilotUsage.js";
 import type { SavedCopilotUsageSource } from "../db/dataSync.js";
 import type { CopilotDirectoryUser } from "./copilotUsageGraph.js";
-import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
+import { buildOfficialUsageAgentDetailView, buildOfficialUsageAgentUsersView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "./officialUsageViews.js";
 
 const set = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -84,6 +84,29 @@ function published(): PublishedOfficialUsage {
     },
   };
 }
+
+describe("combined agent user list", () => {
+  it("deduplicates users and report IDs, sums only this agent's responses, and retains exact report names", () => {
+    const view = buildOfficialUsageAgentUsersView(published(), ["usage-a", "usage-b", "usage-a"], { staleAfterDays: 35 });
+    expect(view.agentIds).toEqual(["usage-a", "usage-b"]);
+    expect(view.users.count).toBe(2);
+    expect(view.users.value).toEqual([
+      { username: "CaseSensitiveUser", displayName: "Pseudonym A", responsesSentToUsers: 9 },
+      { username: "casesensitiveuser", displayName: "Pseudonym B", responsesSentToUsers: 4 },
+    ]);
+  });
+
+  it("searches before paging, excludes zero activity and does not invent identities or fall back to other agents", () => {
+    const data = published();
+    data.reports.userAgents!.rows.push({ ...data.reports.userAgents!.rows[0], username: "zero", responsesSentToUsers: 0 });
+    expect(buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35, search: "Pseudonym", limit: 1, offset: 1 }).users)
+      .toMatchObject({ count: 2, value: [{ username: "casesensitiveuser", responsesSentToUsers: 4 }] });
+    expect(buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35, search: "missing" }).users.count).toBe(0);
+    expect(() => buildOfficialUsageAgentUsersView(data, ["USAGE-A"], { staleAfterDays: 35 })).toThrow("not found");
+    delete data.reports.userAgents;
+    expect(() => buildOfficialUsageAgentUsersView(data, ["usage-a"], { staleAfterDays: 35 })).toThrow("Users and agents CSV");
+  });
+});
 
 function drilldownPublished() {
   const source = published();

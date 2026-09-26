@@ -88,7 +88,7 @@ describe("workbench routing", () => {
   it("round trips bounded agent search, status and selection", () => {
     const query = agentRouteSearch({
       inventoryScope: "catalog",
-      agentView: "all",
+      packageType: "",
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "  owned bot  ",
       status: "blocked",
@@ -112,7 +112,7 @@ describe("workbench routing", () => {
     );
     expect(parseAgentRoute(query.toString())).toEqual({
       inventoryScope: "catalog",
-      agentView: "all",
+      packageType: "",
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "owned bot",
       status: "blocked",
@@ -154,7 +154,7 @@ describe("workbench routing", () => {
     const selectedIds = Array.from({ length: 5_000 }, (_, index) => `package-${index}-${"x".repeat(32)}`);
     const query = agentRouteSearch({
       inventoryScope: "catalog",
-      agentView: "all",
+      packageType: "",
       endUserAccess: "all", reportedUsage: "all", management: "all", relevance: "all",
       search: "",
       status: "all",
@@ -294,14 +294,14 @@ describe("workbench routing", () => {
       .toEqual({ view: "manage", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
   });
 
-  it("round trips quick views and combined evidence filters with all supported table sorts", () => {
-    for (const agentView of ["all", "first_party", "third_party", "user_managed", "copilot_studio", "organization_managed"] as const) {
+  it("round trips raw Graph types and combined evidence filters with all supported table sorts", () => {
+    for (const packageType of ["", "firstParty", "thirdParty", "shared", "lob", "futureType", "microsoft", "all", "a & b"]) {
       for (const sortBy of ["hosts", "responses", "activeUsers", "lastActivity", "owner", "publisher"] as const) {
-        const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a&access=available&usage=used&management=organization_managed&relevance=organization"), agentView, sortBy, sortDirection: "desc" as const };
+        const route = { ...parseAgentRoute("detail=graph_packages%3Apackage-a&access=available&usage=used&management=organization_managed&relevance=organization"), packageType, sortBy, sortDirection: "desc" as const };
         expect(parseAgentRoute(agentRouteSearch(route).toString())).toEqual(route);
       }
     }
-    expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ agentView: "all", sortBy: "displayName" });
+    expect(parseAgentRoute("show=unsupported&sortBy=unsupported")).toMatchObject({ packageType: "", sortBy: "displayName" });
     expect(agentRouteSearch(parseAgentRoute("")).has("show")).toBe(false);
   });
 
@@ -309,10 +309,13 @@ describe("workbench routing", () => {
     ["available", "access", "available"], ["unavailable", "access", "unavailable"],
     ["availability_unknown", "access", "unknown"], ["used", "usage", "used"],
     ["organization", "relevance", "organization"], ["unknown", "relevance", "unknown"],
+    ["first_party", "type", "firstParty"], ["third_party", "type", "thirdParty"],
+    ["user_managed", "management", "user_managed"], ["organization_managed", "management", "organization_managed"],
+    ["copilot_studio", "platform", "Copilot Studio"],
   ])("migrates legacy show=%s without broadening its result", (legacy, key, value) => {
     const route = parseAgentRoute(`show=${legacy}&inventory=power_platform_only&q=policy&page=3`);
     const query = agentRouteSearch(route);
-    expect(route.agentView).toBe("all");
+    expect(route.packageType).toBe(key === "type" ? value : "");
     expect(query.has("show")).toBe(false);
     expect(query.get(key)).toBe(value);
     expect(query.get("inventory")).toBe("power_platform_only");

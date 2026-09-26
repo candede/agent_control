@@ -86,12 +86,14 @@ test("legacy Agent Builder details use saved people without directory permission
     const person = information.getByText(label, { exact: true }).locator("..");
     await expect(person).toContainText("Saved agent owner");
     await expect(person).toContainText("saved.owner@example.invalid");
-    await expect(person).toContainText(ownerId);
+    await expect(person).not.toContainText(ownerId);
+    await expect(person.getByRole("button", { name: "View responsibility for Saved agent owner" })).toBeVisible();
+    await expect(person.locator("details")).toHaveCount(0);
   }
-  await expect(dialog.getByText(/does not establish whether the agent was deleted/)).toBeVisible();
-  await dialog.getByText("Technical details", { exact: true }).click();
-  await expect(dialog.getByText("Authoring tool (raw)").locator("..")).toContainText("Copilot Studio Lite");
-  await expect(dialog.getByText("Authoring tool", { exact: true }).locator("..")).toContainText("Microsoft 365 Copilot Agent Builder");
+  await expect(dialog.getByText("Agent name not reported; showing its resource ID.")).toBeVisible();
+  await expect(dialog.getByText("Technical details", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Authoring tool (raw)")).toHaveCount(0);
+  await expect(dialog.getByText("Agent ID").locator("..")).toContainText(nativeId);
   expect(lookups).toEqual([]);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

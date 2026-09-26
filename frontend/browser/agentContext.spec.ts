@@ -87,23 +87,28 @@ test("saved environment, distinct responsibilities and configured operations sta
   await expect(field("Region")).toContainText("europe");
   await expect(field("Managed environment")).toContainText("No");
   await expect(field("Managed solution")).toContainText("Yes");
-  await expect(field("Environment observed").locator("time")).toHaveAttribute("datetime", "2026-09-11T08:00:00Z");
-  await expect(field("Reported connector total")).toContainText("4");
-  await expect(field("Reported operation total")).toContainText("9");
-  await expect(dialog.getByText(/1 saved connector details; 1 saved operation details \(partial\)/)).toBeVisible();
+  await expect(field("Environment ID")).toContainText(environmentId);
+  await expect(field("Environment ID")).toHaveCount(1);
+  await expect(field("Environment observed")).toHaveCount(0);
+  await expect(field("Connectors")).toContainText("4");
+  await expect(field("Operations")).toContainText("9");
+  await expect(dialog.getByText("Some connector or operation details are unavailable.")).toBeVisible();
   await expect(field("Used as")).toContainText("Topic Tool");
   await expect(field("Enabled")).toContainText("No");
   await expect(field("End-user consent required")).toContainText("No");
   await expect(field("When available")).toContainText("Via Direct Reference Only");
   await expect(field("Operation configured by \\(ID\\)")).toContainText(creator);
-  await expect(dialog.getByText(/do not establish invoked-flow relationships/)).toBeVisible();
-  await expect(dialog.getByRole("link", { name: "Copilot Studio (console landing page)" })).toHaveAttribute("href", "https://copilotstudio.microsoft.com/");
-  await expect(dialog.getByRole("link", { name: "Power Platform admin center (console landing page)" })).toHaveAttribute("href", "https://admin.powerplatform.microsoft.com/");
-  await expect(dialog.getByText("Configuration and environment source evidence").locator("..")).not.toHaveAttribute("open");
+  await expect(field("Operation configured by \\(ID\\)")).toBeVisible();
+  await expect(dialog.locator("details:visible, summary:visible")).toHaveCount(0);
+  await expect(dialog.getByText(/Flow relationships|Invoked flows|source evidence|Technical details/)).toHaveCount(0);
+  await expect(dialog.getByRole("link", { name: /admin center|Copilot Studio/ })).toHaveCount(0);
+  await expect(dialog.getByText("Configuration", { exact: true })).toHaveCount(1);
+  await expect(field("Agent ID")).toContainText(record.powerPlatformResource!.nativeId);
   expect(await dialog.locator(".inventory-detail-section").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
-  await dialog.screenshot({ path: info.outputPath("agent-context-responsibility-environment.png") });
-  await field("Environment observed").scrollIntoViewIfNeeded();
+  await dialog.getByRole("region", { name: "About", exact: true }).scrollIntoViewIfNeeded();
+  await dialog.screenshot({ path: info.outputPath("agent-context-overview.png") });
+  await dialog.getByRole("region", { name: "Environment", exact: true }).scrollIntoViewIfNeeded();
   await dialog.screenshot({ path: info.outputPath("agent-context-environment.png") });
   await dialog.getByRole("region", { name: "Configured connectors and operations" }).scrollIntoViewIfNeeded();
   await dialog.screenshot({ path: info.outputPath("agent-context-configured-operations.png") });
@@ -111,33 +116,38 @@ test("saved environment, distinct responsibilities and configured operations sta
   expect(unexpected).toEqual([]);
 });
 
-test("sparse Graph-only metadata does not manufacture native dependencies or environment facts", async ({ page }) => {
+test("sparse Graph-only metadata omits irrelevant environment, responsibility and dependency sections", async ({ page }, info) => {
   const pkg = unifiedAgents.value[0].packages[0];
   const value: UnifiedAgentRecord = {
     ...record, presence: "graph_packages", environmentId: null, environment: null, packages: [pkg], powerPlatformResource: null,
     observations: unifiedAgents.value[0].observations,
   };
   const { dialog, unexpected, writes } = await open(page, value);
-  await expect(dialog.getByText(/did not establish an environment identity/)).toBeVisible();
-  await expect(dialog.getByText(/Missing details do not mean no configured connectors/)).toBeVisible();
-  await expect(dialog.getByText(/No configured connectors were reported/)).toHaveCount(0);
-  await expect(dialog.getByText(/do not establish invoked-flow relationships/)).toBeVisible();
-  await expect(dialog.getByRole("link", { name: "Microsoft 365 admin center (console landing page)" })).toHaveAttribute("href", "https://admin.microsoft.com/");
+  for (const name of ["Environment", "Configuration", "Responsibility", "Configured connectors and operations"]) {
+    await expect(dialog.getByRole("region", { name, exact: true })).toHaveCount(0);
+  }
+  await expect(dialog.getByText(/No environment|Flow relationships|Invoked flows|No configured connectors/)).toHaveCount(0);
+  await expect(dialog.getByRole("link", { name: /admin center|Copilot Studio/ })).toHaveCount(0);
+  await expect(dialog.getByText("Package ID").locator("..")).toContainText(pkg.id);
+  await expect(dialog.locator("details:visible, summary:visible")).toHaveCount(0);
+  expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
+  expect(await dialog.locator(".inventory-detail-section").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await dialog.screenshot({ path: info.outputPath("agent-context-catalog.png") });
   expect(writes).toEqual([]);
   expect(unexpected).toEqual([]);
 });
 
-test("explicit empty connectors and zero totals remain distinct from unavailable invoked flows", async ({ page }) => {
+test("explicit empty connectors retain zero totals without an unsupported flows section", async ({ page }) => {
   const value = { ...record, environment: null, powerPlatformResource: { ...record.powerPlatformResource!, details: {
     connectors: [], connectorDetailsStatus: "complete" as const, distinctPowerPlatformConnectors: 0, distinctPowerPlatformConnectorsOperations: 0,
   } } };
   const { dialog, unexpected, writes } = await open(page, value);
-  await expect(dialog.getByText("Reported connector total").locator("..")).toContainText("0");
-  await expect(dialog.getByText("Reported operation total").locator("..")).toContainText("0");
+  await expect(dialog.getByText("Connectors", { exact: true }).locator("..")).toContainText("0");
+  await expect(dialog.getByText("Operations", { exact: true }).locator("..")).toContainText("0");
   await expect(dialog.getByText("No configured connectors were reported.")).toBeVisible();
-  await expect(dialog.getByText(/No current authorized saved environment metadata/)).toBeVisible();
-  await expect(dialog.getByText(/do not establish invoked-flow relationships/)).toBeVisible();
-  await expect(dialog.getByText(/Capability details are partial/)).toHaveCount(0);
+  await expect(dialog.getByText("Environment details are unavailable. Check inventory coverage in Sync.")).toBeVisible();
+  await expect(dialog.getByText(/Flow relationships|Invoked flows/)).toHaveCount(0);
+  await expect(dialog.getByText("Some connector or operation details are unavailable.")).toHaveCount(0);
   expect(writes).toEqual([]);
   expect(unexpected).toEqual([]);
 });

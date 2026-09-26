@@ -162,7 +162,7 @@ export function UnifiedAgentTable({
           return { ...definition, visible: column.getIsVisible(), canHide: column.getCanHide() };
         })} onToggle={id => requiredColumn(id).toggleVisibility()} onReset={() => changeVisibility({ ...defaultAgentColumnVisibility })} />
         </div>
-        {showUsageContext || !controls ? <span className="muted-cell agent-report-note" title={showUsageContext
+        {!controls ? <span className="muted-cell agent-report-note" title={showUsageContext
           ? "Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero."
           : undefined}>
           {showUsageContext && usageContext

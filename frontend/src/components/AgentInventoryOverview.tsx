@@ -3,7 +3,7 @@ import type { UnifiedAgentInventoryPage } from "../api/client";
 import type { UnifiedAgentAccessFilter, UnifiedAgentInventoryScope, UnifiedAgentUsageFilter } from "../../../backend/src/types/unifiedAgents";
 import { agentInventoryScopeOptions, inventoryScopeAgentCount } from "../agentColumns";
 import { useOfficialUsageOverview } from "../useOfficialUsageOverview";
-import { usageCount, usageDate } from "../usageInsights";
+import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate } from "../usageInsights";
 import "./cumulativeUsage.css";
 
 function scopeCount(inventory: UnifiedAgentInventoryPage | undefined, scope: UnifiedAgentInventoryScope) {
@@ -48,6 +48,7 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   const selectedScope = agentInventoryScopeOptions.find(option => option.value === inventoryScope)!;
   const scopedInventory = inventory?.inventoryScope === inventoryScope ? inventory : undefined;
   const reports = data?.summary.retainedSets ? data.summary : undefined;
+  const usageContext = inventory?.usageContext;
   return <section className="agent-inventory-overview" aria-label="Agent inventory overview">
     {inventoryScope !== "catalog" && inventory && !hasCatalog ? <p className="agent-inventory-scope-warning" aria-live="polite">
       The package catalog is unavailable. Catalog matching is incomplete until that source is collected.
@@ -64,9 +65,11 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
         selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
       <Metric label="Reported active · 30 days" value={reports?.activeAgents30Days ?? null}
         hint={reports && data ? `${usageDate(data.summary.activeSinceDateUtc)} - ${usageDate(data.summary.asOf)} (UTC)` : "No selected report data"} />
-      <div className="agent-report-context">
+      <div className="agent-report-context" title="Usage columns show one imported report, not lifetime totals. Missing values are unavailable, not zero.">
         <span className="agent-context-label">Report context</span>
-        {reportSelector ?? <span>Selected report set</span>}
+        {reportSelector ?? <span>{usageContext ? usageCoverageLabel(usageContext.reportSet) : "Selected report set"}</span>}
+        {usageContext && usageContext.availability !== "active"
+          ? <span role="status">{usageAvailabilityLabel(usageContext.availability)}</span> : null}
       </div>
     </div>
     {loading ? <p role="status">Loading selected report evidence...</p> : null}

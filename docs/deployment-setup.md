@@ -45,6 +45,10 @@ http://localhost:3001/api/auth/callback
 
 All configured registrations use the deployment's **same** callback. Repeat app-role definitions, Enterprise-application assignments, required provider permissions and tenant administrator consent in every tenant. Consent or roles in one tenant do not authorize another.
 
+### Signed-in user's Microsoft roles
+
+Use the dedicated [user roles and permissions guide](user-roles-and-permissions.md) to assign **human** access for each task: agent inventory, block/unblock, Copilot Studio quarantine, user/license sync, Microsoft 365 usage-report downloads, Purview and Defender. It includes least-privilege choices, service-specific roles and PIM activation. This is separate from both the Enterprise application's Viewer/Admin assignment above and the registered-app API permissions below. The task reference is also available in **Permissions > Signed-in user roles**.
+
 ### API permissions: administrator prerequisite
 
 Before admitting users, open **Entra admin center > App registrations > the existing Agent Control app > API permissions**. Add permissions for the features being deployed using the exact API and permission type, then select **Grant admin consent** for the tenant. The app has no permission-request or enablement workflow; sign-in does not request additional feature scopes.

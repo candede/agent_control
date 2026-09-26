@@ -48,8 +48,10 @@ describe("Paid M365 Copilot license dashboard", () => {
     render(<CopilotUsersView onOpenAgent={open} />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const dialog = screen.getByRole("dialog");
-    await within(dialog).findByText("Responsible agent");
     expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("200");
+    expect(getAgentResponsibility).not.toHaveBeenCalled();
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Responsibility" }));
+    await within(dialog).findByText("Responsible agent");
     expect(getAgentResponsibility).toHaveBeenCalledWith(expect.objectContaining({ objectId: copilotUsageFixture.users[0].directory.objectId }), expect.anything());
     await userEvent.click(within(dialog).getByRole("button", { name: "Open agent Responsible agent" }));
     expect(open).toHaveBeenCalledWith("agent:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
@@ -102,7 +104,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     ]);
     expect(screen.queryByRole("button", { name: "M365 Copilot licenses" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Reported activity" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText(/^Effective paid M365 Copilot licenses and adoption/)).toBeVisible();
     expect(screen.queryByRole("region", { name: "Paid license scope and coverage" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "All checked users" })).not.toBeInTheDocument();
@@ -113,6 +115,66 @@ describe("Paid M365 Copilot license dashboard", () => {
       .toHaveTextContent("Verified paid access, not recent usage");
     expect(screen.queryByText(/Last successful sync:/)).not.toBeInTheDocument();
     expect(getOfficialUsageUsers).not.toHaveBeenCalled();
+  });
+
+  it("uses all four summary cards as filters with exact positive, zero and missing-response semantics", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    const missingTotal = licensedUser(5, "MissingTotal", 100);
+    missingTotal.importedUsage!.missingUserReport = true;
+    const inactive = licensedUser(6, "Inactive", 500);
+    inactive.copilotServiceState = inactive.servicePlans[0].state = "disabled";
+    const unverified = licensedUser(7, "Unverified", 900);
+    unverified.copilotServiceState = unverified.servicePlans[0].state = "unknown";
+    fixture.users.push(missingTotal, inactive, unverified);
+    fixture.counts.licensedUsers = 5;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    const summary = within(await screen.findByRole("group", { name: "M365 Copilot license summary" }));
+    expect(summary.getAllByRole("button")).toHaveLength(4);
+    expect(screen.queryByRole("group", { name: "Copilot user cohorts" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Licensed users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Usage unknown" })).not.toBeInTheDocument();
+    expect(summary.getByRole("button", { name: "Using agents" })).toHaveAccessibleDescription("2. Licensed users with agent responses");
+    expect(summary.getByRole("button", { name: "Agent usage unknown" })).toHaveAccessibleDescription("2. Licensed users; not proof of inactivity");
+    for (const [label, names] of [
+      ["Using agents", ["Ada", "Ben"]],
+      ["Needs attention", ["Ben", "Cleo"]],
+      ["Agent usage unknown", ["Drew", "MissingTotal"]],
+      ["Active M365 Copilot licensed users", ["Ada", "Ben", "Cleo", "Drew", "MissingTotal"]],
+    ] as const) {
+      const card = summary.getByRole("button", { name: label });
+      await userEvent.click(card);
+      expect(card).toHaveAttribute("aria-pressed", "true");
+      expect(summary.getAllByRole("button", { pressed: true })).toHaveLength(1);
+      expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(names);
+    }
+    const using = summary.getByRole("button", { name: "Using agents" });
+    await userEvent.click(using);
+    await userEvent.click(using);
+    expect(summary.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(userRows()).toHaveLength(5);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+    expect(getOfficialUsageUsers).not.toHaveBeenCalled();
+  });
+
+  it("keeps historical filters available without presenting unavailable current counts as zero", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.sources.directory.state = "partial";
+    fixture.sources.importedAgentUsage.state = "stale";
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    const summary = within(await screen.findByRole("group", { name: "M365 Copilot license summary" }));
+    for (const card of summary.getAllByRole("button")) {
+      expect(card).toBeEnabled();
+      expect(card.querySelector("strong")).toHaveTextContent("Unknown");
+    }
+    await userEvent.click(summary.getByRole("button", { name: "Using agents" }));
+    expect(userRows()).toHaveLength(2);
+    for (const row of userRows()) expect(row).toHaveTextContent("Historical report");
+    expect(screen.getByText(/Last saved: 2 previously licensed users shown/)).toBeVisible();
+    await userEvent.click(summary.getByRole("button", { name: "Agent usage unknown" }));
+    expect(userRows()).toHaveLength(1);
+    expect(userRows()[0]).toHaveTextContent("Drew");
   });
 
   it("excludes disabled and unknown candidates from paid search and adoption metrics", async () => {
@@ -129,7 +191,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     const active = within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement;
     expect(active).toHaveTextContent("2");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Drew"]);
-    expect(screen.getByRole("button", { name: "Licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText(/2 licensed users shown/)).toBeVisible();
     const usingAgents = within(screen.getByLabelText("M365 Copilot license summary")).getByText("Using agents").parentElement!;
     expect(within(usingAgents).getByText("1")).toBeVisible();
@@ -173,7 +235,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "enabled" });
-    expect(screen.getByRole("button", { name: "Licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["enabled", "warning", "partially_enabled"]);
     expect(userRows().every(row => within(row).queryByText("M365 Copilot licensed", { exact: true }))).toBe(true);
     expect(userRows()[0]).toHaveTextContent("Account disabled");
@@ -199,14 +261,18 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("51-100 of 102");
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Licensed users" }));
+    await userEvent.click(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }));
     expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 102");
     expect(userRows()[0]).toHaveTextContent("Person1");
     expect(screen.queryByRole("button", { name: "Person0" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Next" }));
-    await userEvent.click(screen.getByRole("button", { name: "Usage unknown" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
     expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Licensed users" }));
+    await userEvent.click(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }));
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 102");
+    expect(userRows()[0]).toHaveTextContent("Person1");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    await userEvent.click(screen.getByRole("button", { name: "Using agents" }));
     expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 102");
     expect(userRows()[0]).toHaveTextContent("Person1");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
@@ -267,9 +333,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Active", "Grace", "Partial"]);
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Grace", "Partial"]);
-    await userEvent.click(screen.getByRole("button", { name: "Usage unknown" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Partial"]);
-    await userEvent.click(screen.getByRole("button", { name: "Licensed users" }));
+    await userEvent.click(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }));
     expect(userRows()).toHaveLength(3);
     expect(screen.queryByText("No active M365 Copilot license", { exact: true })).not.toBeInTheDocument();
     assertCounts();
@@ -292,14 +358,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     expect(within(userRows()[0]).getAllByRole("cell")[1]).toHaveTextContent("M365 Copilot licensedPaid features: Active");
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
-    expect(within(services).getByText("M365_COPILOT_APPS")).toBeVisible();
     expect(within(services).getByText("Active")).toBeVisible();
-    expect(within(detail).getByText(/Service-plan ID:/)).not.toBeVisible();
-    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
-    expect(within(detail).getByText(/Service-plan ID:/)).toHaveTextContent(fixture.users[0].servicePlans[0].servicePlanId);
-    expect(within(detail).getByText(/Assigned at:/)).toHaveTextContent("2026-08-01T00:00:00.000Z");
+    expect(within(detail).queryByText(/Service-plan ID:|Technical service-plan evidence/)).not.toBeInTheDocument();
+    expect(within(detail).getByText("Assigned Aug 1, 2026")).toBeVisible();
+    expect(detail.querySelector("details")).toBeNull();
     expect(document.body).not.toHaveTextContent(/E7|SKU|legacy-package|legacy-disabled|legacy-group|Group assignment|Direct assignment|Disabled plans|Assignment error/i);
   });
 
@@ -350,6 +415,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Ada" }));
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Partially active");
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getAllByRole("listitem")).toHaveLength(3);
     expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps").parentElement).toHaveTextContent("Active");
@@ -357,14 +423,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(inactiveFeature).toHaveTextContent(label);
     expect(within(inactiveFeature).queryByText("Enabled")).not.toBeInTheDocument();
     expect(within(services).getByText("Microsoft 365 Copilot with Graph-grounded chat").parentElement).toHaveTextContent("Active");
-    expect(within(services).getByText("M365_COPILOT_BUSINESS_CHAT")).toBeVisible();
-    expect(within(detail).getAllByText(/^Raw capability status:/).every(item => !item.closest("details")?.open)).toBe(true);
-    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
-    expect(within(detail).getAllByText("Assigned at: Not reported")).toHaveLength(2);
-    for (const raw of within(detail).getAllByText(/^Raw capability status:/)) {
-      expect(raw).toBeVisible();
-      expect(raw).toHaveTextContent("Raw capability status: Enabled");
-    }
+    expect(within(detail).queryByText(/^Raw capability status:/)).not.toBeInTheDocument();
+    expect(within(detail).getAllByText(/^Assigned /)).toHaveLength(1);
+    expect(detail.querySelector("details")).toBeNull();
     expect(inactiveFeature).toHaveTextContent(label);
   });
 
@@ -387,6 +448,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(within(userRows()[0]).getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const plans = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(plans).getByText("Microsoft 365 Copilot in Productivity Apps").parentElement).toHaveTextContent("Not enabled");
     expect(within(plans).getByText("Microsoft 365 Copilot in Microsoft Teams").parentElement).toHaveTextContent("Active");
@@ -399,7 +461,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Ben", "Ada", "Drew"]);
     await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-desc");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo", "Drew"]);
-    await userEvent.click(screen.getByRole("button", { name: "Usage unknown" }));
+    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
     expect(userRows()).toHaveLength(1);
     expect(userRows()[0]).toHaveTextContent("Drew");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
@@ -573,8 +635,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "Ada" }));
     const organization = within(screen.getByRole("dialog", { name: "Ada" })).getByRole("region", { name: "Saved directory organization" });
-    expect(organization).toHaveTextContent("Company: Fabrikam Clinics");
-    expect(organization).toHaveTextContent("Department: Clinical Operations");
+    expect(within(organization).getByText("Company").parentElement).toHaveTextContent("Fabrikam Clinics");
+    expect(within(organization).getByText("Department").parentElement).toHaveTextContent("Clinical Operations");
     await userEvent.click(screen.getByRole("button", { name: "Close user details" }));
     await userEvent.clear(search);
     await userEvent.type(search, "clinical operations");
@@ -592,8 +654,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     expect(userRows()).toHaveLength(4);
     const organization = within(screen.getByRole("dialog", { name: "Ada" })).getByRole("region", { name: "Saved directory organization" });
-    expect(organization).toHaveTextContent("Company: Not reported");
-    expect(organization).toHaveTextContent("Department: Not reported");
+    expect(within(organization).getByText("Company").parentElement).toHaveTextContent("Not reported");
+    expect(within(organization).getByText("Department").parentElement).toHaveTextContent("Not reported");
     expect(organization).not.toHaveTextContent("undefined");
   });
 
@@ -635,6 +697,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     const trigger = await screen.findByRole("button", { name: "Ada" });
     await userEvent.click(trigger);
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Usage & agents" }));
     const breakdown = within(detail).getByRole("region", { name: "User agent breakdown" });
     const rows = () => within(breakdown).getAllByRole("row").slice(1);
     expect(rows()).toHaveLength(50);
@@ -732,14 +795,14 @@ describe("Paid M365 Copilot license dashboard", () => {
     const trigger = await screen.findByRole("button", { name: "Ada" });
     await userEvent.click(trigger);
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Usage & agents" }));
     expect(within(detail).getByText("Researcher")).toBeVisible();
     expect(within(detail).getByText("Microsoft")).toBeVisible();
     expect(within(detail).getByText("Outlook")).toBeVisible();
     expect(within(detail).getByText("Word").parentElement).toHaveTextContent("Sep 11, 2026");
     expect(within(detail).queryByRole("link")).not.toBeInTheDocument();
     expect(within(detail).getByText("Agent-wide last activity")).toBeVisible();
-    expect(within(detail).getByText("Anyone, not this user")).toBeVisible();
-    expect(within(detail).getByText(/not a daily event log/)).toBeVisible();
+    expect(within(detail).queryByText(/Anyone, not this user|not a daily event log/)).not.toBeInTheDocument();
     await userEvent.click(within(detail).getByRole("button", { name: "Close user details" }));
     expect(trigger).toHaveFocus();
   });
@@ -788,10 +851,10 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Ada" }));
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Active");
-    expect(within(detail).getByText(/Directory account:/)).toHaveTextContent("Account disabled");
+    expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
   });
 
-  it("shows usable grace-period services prominently and keeps raw capability evidence collapsed", async () => {
+  it("shows usable grace-period services without duplicate raw capability evidence", async () => {
     const fixture = structuredClone(copilotUsageFixture);
     fixture.users[0].copilotServiceState = "warning";
     fixture.users[0].servicePlans[0].state = "warning";
@@ -802,13 +865,12 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()[0]).toHaveTextContent("Active (grace period)");
     expect(userRows()[0]).toHaveTextContent("Review paid features");
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Active (grace period)")).toBeVisible();
-    expect(within(detail).getByText("Warning", { exact: true })).not.toBeVisible();
-    await userEvent.click(within(detail).getByText("Technical service-plan evidence"));
-    expect(within(detail).getByText("Warning", { exact: true })).toBeVisible();
-    expect(within(detail).getByText(/Service-plan ID:/)).toHaveTextContent(fixture.users[0].servicePlans[0].servicePlanId);
-    expect(within(detail).getByText(/Warning is a usable grace period/)).toBeVisible();
+    expect(within(detail).queryByText("Warning", { exact: true })).not.toBeInTheDocument();
+    expect(within(detail).queryByText(/Service-plan ID:|Warning is a usable grace period/)).not.toBeInTheDocument();
+    expect(detail.querySelector("details")).toBeNull();
     expect(within(detail).queryByText(/Direct assignment|Group assignment/)).not.toBeInTheDocument();
   });
 
@@ -844,13 +906,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
-  it("keeps verified counts, recommendations and filters usable throughout a background reload", async () => {
+  it.each(["Needs attention", "Using agents"])("keeps verified counts and the %s card selected throughout a background reload", async cohortLabel => {
     let finish!: (value: typeof copilotUsageFixture) => void;
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
       .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     const view = render(<CopilotUsersView dataRevision={0} />);
     await screen.findByRole("button", { name: "Ben" });
-    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    await userEvent.click(screen.getByRole("button", { name: cohortLabel }));
     await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Ben");
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order by" }), "name");
     const summary = screen.getByLabelText("M365 Copilot license summary");
@@ -864,7 +926,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText(/Loading saved Copilot|Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(summary).toHaveTextContent(summaryBefore!);
     expect(userRows()[0]).toHaveTextContent(rowBefore!);
-    expect(screen.getByRole("button", { name: "Needs attention" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: cohortLabel })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("combobox", { name: "Order by" })).toHaveValue("name");
     expect(search).toHaveValue("Ben");
     expect(search).toHaveFocus();
@@ -988,7 +1050,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("Last saved: M365 Copilot licensed")).toHaveClass("unknown");
     expect(within(detail).queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
-    expect(within(detail).getByText(/Last saved paid-feature evidence/)).toBeVisible();
+    await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
+    expect(within(detail).getByText("Refresh Users in Sync to verify current paid-feature status.")).toBeVisible();
     expect(within(detail).getAllByText("Last saved: Active")).toHaveLength(2);
     expect(screen.getByText(/Current paid license inventory is unverified/)).toBeVisible();
     expect(screen.queryByRole("region", { name: "Paid license scope and coverage" })).not.toBeInTheDocument();

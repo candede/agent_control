@@ -1,4 +1,4 @@
-import { unifiedAgentSortKeys, type UnifiedAgentInventoryScope, type UnifiedAgentInventorySummary, type UnifiedAgentQuickView, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
+import { unifiedAgentSortKeys, type UnifiedAgentInventoryScope, type UnifiedAgentInventorySummary, type UnifiedAgentSort } from "../../backend/src/types/unifiedAgents";
 
 export const agentInventoryScopeOptions = [
   {
@@ -19,15 +19,6 @@ export function inventoryScopeAgentCount(summary: UnifiedAgentInventorySummary, 
   return scope === "catalog" ? summary.linked + summary.graphOnly
     : scope === "power_platform_only" ? summary.powerPlatformOnly : summary.total;
 }
-
-export const agentViewOptions = [
-  { value: "all", label: "All agents", description: "All agents in the selected inventory scope, subject to the other active filters. Quick views can overlap." },
-  { value: "first_party", label: "1st party agents", description: "Agents classified by the package catalog as built by Microsoft, such as Researcher and Analyst. Using Microsoft authoring tools does not make an agent 1st party." },
-  { value: "third_party", label: "3rd party agents", description: "Agents classified by the package catalog as built by external vendors or partners." },
-  { value: "user_managed", label: "User managed agents", description: "Confirmed internal Agent Builder agents with explicitly no catalog distribution or installation. Incomplete or ambiguous management evidence remains unknown." },
-  { value: "copilot_studio", label: "Copilot Studio agents", description: "Agents with saved Copilot Studio authoring evidence, regardless of publisher or management. Excludes Copilot Studio Lite / Agent Builder." },
-  { value: "organization_managed", label: "Organization managed agents", description: "Agents with verified administrative access changes and current assigned access or installation. Generic availability or installation alone does not establish admin management." },
-] as const satisfies readonly { value: UnifiedAgentQuickView; label: string; description: string }[];
 
 export const agentAccessOptions = [
   { value: "all", label: "Any end-user access", description: "Do not restrict end-user access." },
@@ -67,17 +58,17 @@ type AgentColumnDefinition = {
 
 export const agentColumns: readonly AgentColumnDefinition[] = [
   { id: "displayName", label: "Agent", group: "Overview" },
+  { id: "publisher", label: "Publisher", group: "Overview" },
   { id: "environment", label: "Environment", group: "Overview" },
   { id: "builtWith", label: "Built with", group: "Overview" },
-  { id: "availability", label: "End-user access", group: "Overview", description: "Saved access settings, accounting for blocking and known quarantine. Specific users or groups does not mean everyone has access." },
-  { id: "status", label: "Status", group: "Overview" },
-  { id: "hosts", label: "Hosts", group: "Overview", description: "Supported hosts, not evidence of usage in each host." },
-  { id: "publisher", label: "Publisher", group: "Overview" },
-  { id: "origin", label: "Origin", group: "Overview" },
-  { id: "deployment", label: "Installed for", group: "Overview", description: "Deployment scope, not an installed-user count." },
   { id: "responses", label: "Responses", group: "Usage", format: "number", description: "Total responses in the selected report; not lifetime usage." },
   { id: "activeUsers", label: "Active users", group: "Usage", format: "number", description: "Distinct response-producing user identities in the selected report." },
   { id: "lastActivity", label: "Last used", group: "Usage", format: "date", description: "Last reported activity by anyone; may fall outside the reporting period." },
+  { id: "availability", label: "End-user access", group: "Overview", description: "Saved access settings, accounting for blocking and known quarantine. Specific users or groups does not mean everyone has access." },
+  { id: "status", label: "Status", group: "Overview" },
+  { id: "hosts", label: "Hosts", group: "Overview", description: "Supported hosts, not evidence of usage in each host." },
+  { id: "origin", label: "Package type", group: "Overview", description: "The original type value returned by the Graph package catalog, without inferred classification." },
+  { id: "deployment", label: "Installed for", group: "Overview", description: "Deployment scope, not an installed-user count." },
   { id: "owner", label: "Owner", group: "Ownership", description: "Saved owner identifier when reported by Power Platform." },
   { id: "createdBy", label: "Created by", group: "Ownership" },
   { id: "createdAt", label: "Created", group: "Ownership", format: "date" },
@@ -100,7 +91,7 @@ export const agentColumns: readonly AgentColumnDefinition[] = [
   { id: "actions", label: "Actions", group: "Overview" },
 ];
 
-const defaultColumns = new Set<AgentColumnId>(["displayName", "environment", "builtWith", "availability", "status", "actions"]);
+const defaultColumns = new Set<AgentColumnId>(["displayName", "publisher", "builtWith", "responses", "availability", "status", "actions"]);
 export const defaultAgentColumnVisibility: Record<string, boolean> = Object.fromEntries(agentColumns.map(column => [column.id, defaultColumns.has(column.id)]));
 export const agentColumnGroups: readonly AgentColumnGroup[] = ["Overview", "Usage", "Ownership", "Configuration", "Diagnostics"];
 

@@ -1,14 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useContext, useDeferredValue, useEffect, useRef, useState } from "react";
 import {
+  getOfficialUsageAgentUsers,
   removeAgentUsageAssociation,
   type AgentUsageAssociation,
   type AgentUsageContext,
   type AgentUsageTarget,
   type UnifiedAgentRecord,
 } from "../api/client";
-import { usageCount, usageCoverageLabel, usageDate, reportedUserActivityUrl } from "../usageInsights";
+import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate } from "../usageInsights";
+import { CapabilityContext } from "../capabilityContext";
+import { useSavedQuery } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { UsageReportContext } from "./UsageReportContext";
 import "./agentInsights.css";
 
 type Props = {
@@ -53,16 +55,16 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
   const currentConfirmation = confirmation?.contextKey === contextKey
     && usage?.associations.some(association => association.basis === "admin_reviewed"
       && association.reportAgentId === confirmation.association.reportAgentId) ? confirmation : undefined;
-  const automaticMatches = usage?.associations.filter(association => association.basis === "exact_package_id").length ?? 0;
+  const reviewedAssociations = usage?.associations.filter(association => association.basis === "admin_reviewed") ?? [];
   const missingReason = !context
-    ? "The selected report context is unavailable. Reload saved inventory and usage to load this agent's report metrics."
+    ? "Report data is unavailable. Reload usage to try again."
     : !usableReport
-      ? "No complete usable usage report is selected. Import or select a complete report bundle to see saved-inventory matches."
+      ? "Select a complete CSV report in Sync to see usage."
       : !record.usage || record.usage.status === "unavailable" || record.usage.reportSetId === null
-        ? "The selected report's usage projection is unavailable for this saved agent. Reload saved inventory and usage."
+        ? "Usage could not be loaded for this agent. Reload usage to try again."
         : record.usage.reportSetId !== report?.id
-          ? "This agent's saved usage belongs to a different report snapshot. Reload saved inventory and usage for the selected report."
-          : "No report Agent ID in this selected snapshot matches a full, case-sensitive package ID in this agent's saved inventory, and no existing administrator-reviewed association applies. Names alone are not used to match agents.";
+          ? "The selected report changed. Reload usage to update this agent."
+          : "This agent is not included in the selected CSV report.";
 
   function review(association: ReviewedAssociation) {
     reviewTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -95,37 +97,39 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
 
   return <section className="agent-usage-insights" aria-label={`Usage and users for ${record.displayName}`}>
     <h3>Usage &amp; users</h3>
-    {context ? <UsageReportContext data={{ availability: context.availability, activeSet: report ?? null, lineages: context.lineages }} /> : null}
+    {report ? <div className="agent-usage-date-range" aria-label="CSV report dates">
+      <span>CSV report dates</span>
+      <strong>{report.reportingPeriod.startDate && report.reportingPeriod.endDate
+        ? <><time dateTime={report.reportingPeriod.startDate}>{usageDate(report.reportingPeriod.startDate)}</time>{" - "}
+          <time dateTime={report.reportingPeriod.endDate}>{usageDate(report.reportingPeriod.endDate)}</time></>
+        : "Dates not supplied"}</strong>
+      {context?.availability === "stale" ? <small>{usageAvailabilityLabel(context.availability)}</small> : null}
+    </div> : null}
     {usage ? <>
       <dl className="agent-usage-metrics" aria-label="Selected agent report metrics">
-        <UsageMetric label="Responses" value={usageCount(usage.responses)} note="Total responses in this report." />
-        <UsageMetric label="Active users" value={usageCount(usage.activeUsers)} note="Distinct reported user identities with positive responses; licensed and unlicensed counts are not added." />
+        <UsageMetric label="Responses" value={usageCount(usage.responses)} />
+        <UsageMetric label="Active users" value={usageCount(usage.activeUsers)} />
         <UsageMetric label="Last reported activity" value={usageDate(usage.lastActivityDateUtc)} />
-        <UsageMetric label="Report identities" value={usage.associations.length.toLocaleString()} note="Each matched or reviewed report identity is counted once." />
       </dl>
-      {automaticMatches > 0 ? <p className="agent-insight-note">Usage matched automatically by exact report Agent ID and saved Graph package ID, including prefix and case. Existing saved inventory links determine the logical agent; display names are not used.</p> : null}
-      <p className="agent-insight-note">Totals cover this selected Microsoft 365 report only, not lifetime usage or every host and channel. Overlapping reports are not added. Reporting matches are not provider-verified identity links and do not grant management permissions. Last reported activity can fall outside the reporting period.</p>
-      <h4>Matched report identities</h4>
-      <ul className="agent-usage-association-list">{usage.associations.map(association => <li key={association.reportAgentId}>
+      <AgentUsers key={contextKey} contextKey={contextKey} setId={report!.id}
+        agentIds={usage.associations.map(association => association.reportAgentId)} />
+      {editable && reviewedAssociations.length ? <details className="agent-insight-provenance">
+        <summary>Reviewed report links</summary>
+      <ul className="agent-usage-association-list">{reviewedAssociations.map(association => <li key={association.reportAgentId}>
         <div><strong>{association.reportAgentName}</strong><code>{association.reportAgentId}</code>
           <span>{targetLabel(association.target)}</span>
-          <small>{association.basis === "exact_package_id"
-            ? "Automatically matched: exact report Agent ID = saved Graph package ID."
-            : `Existing administrator-reviewed association, reviewed on ${usageDate(association.reviewedAt)}.`}</small></div>
+          <small>Reviewed {usageDate(association.reviewedAt)}</small></div>
         <div className="agent-insight-actions">
-          <a href={reportedUserActivityUrl(association.reportAgentId, usage.reportSetId ?? undefined)}>View active users without paid Copilot</a>
-          {editable && association.basis === "admin_reviewed" ? <WorkbenchActionGate actionId="agentUsage.remove" compact><button type="button" className="secondary"
+          <WorkbenchActionGate actionId="agentUsage.remove" compact><button type="button" className="secondary"
             disabled={busy} aria-label={`Remove association for ${association.reportAgentName} (${association.reportAgentId})`}
-            onClick={() => review(association)}>Remove reviewed association</button></WorkbenchActionGate> : null}
+            onClick={() => review(association)}>Remove reviewed association</button></WorkbenchActionGate>
         </div>
-      </li>)}</ul>
+      </li>)}</ul></details> : null}
     </> : <div className="agent-insight-empty">
-      <h4>No matched usage data for this agent</h4>
-      <p>No matching usage is available for <strong>{record.displayName}</strong>. Its response totals, active users, and last-used date are unavailable.</p>
+      <h4>Usage unavailable</h4>
       <p>{missingReason}</p>
-      <p>Missing usage data does not mean zero usage. Availability and installation describe access, not who used this agent.</p>
+      {onChanged ? <button type="button" className="secondary" disabled={busy} onClick={onChanged}>Reload usage</button> : null}
     </div>}
-    {report ? <p className="agent-insight-note">Selected report snapshot: <code>{report.id}</code></p> : null}
 
     {error ? <div className="error-banner" role="alert"><span>{error}</span>
       {onChanged ? <button type="button" className="secondary" disabled={busy} onClick={onChanged}>Reload saved usage</button> : null}
@@ -154,13 +158,6 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
         <button type="button" className="secondary" disabled={saving} onClick={() => setConfirmation(undefined)}>Cancel association change</button>
       </div>
     </section> : null}
-    {context?.lineages.length ? <details className="agent-insight-provenance">
-      <summary>Report provenance</summary>
-      <ul>{context.lineages.map(lineage => <li key={lineage.versionId}>
-        {lineage.kind}: source as of {usageDate(lineage.sourceAsOf)} ({lineage.sourceAsOfProvenance}); accepted {usageDate(lineage.acceptedAt)}.
-        {lineage.warnings.length ? ` ${lineage.warnings.join(" ")}` : ""}
-      </li>)}</ul>
-    </details> : null}
   </section>;
 }
 
@@ -169,6 +166,52 @@ function targetLabel(target: AgentUsageTarget) {
     : `Power Platform: ${target.nativeId} - Environment: ${target.environmentId ?? "not reported"}`;
 }
 
-function UsageMetric({ label, value, note }: { label: string; value: string; note?: string }) {
-  return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong>{note ? <small>{note}</small> : null}</dd></div>;
+function UsageMetric({ label, value }: { label: string; value: string }) {
+  return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong></dd></div>;
+}
+
+function AgentUsers({ setId, agentIds, contextKey }: { setId: string; agentIds: string[]; contextKey: string }) {
+  const principal = useContext(CapabilityContext)?.user;
+  const [search, setSearch] = useState("");
+  const [offset, setOffset] = useState(0);
+  const deferredSearch = useDeferredValue(search);
+  const limit = 25;
+  const read = useSavedQuery({
+    queryKey: ["saved", "agent-users", principal?.tenantId, principal?.homeAccountId, contextKey, agentIds, deferredSearch, offset],
+    queryFn: async ({ signal }) => {
+      const result = await getOfficialUsageAgentUsers({ setId, agentIds, search: deferredSearch, offset, limit }, { signal });
+      if (result.activeSet?.id !== setId || result.agentIds.length !== new Set(agentIds).size
+        || agentIds.some(id => !result.agentIds.includes(id))) {
+        throw new Error("The report changed. Reload agent usage.");
+      }
+      return result;
+    },
+  });
+  const pending = read.isPending || read.isFetching || search !== deferredSearch;
+  const users = !pending && !read.isError ? read.data?.users : undefined;
+  return <section className="agent-usage-users" aria-label="Agent users">
+    <div className="agent-insight-toolbar">
+      <h4>Users{users ? ` (${users.count.toLocaleString()})` : ""}</h4>
+      <input type="search" aria-label="Search agent users" placeholder="Search by name or email" value={search}
+        onChange={event => { setSearch(event.target.value); setOffset(0); }} />
+    </div>
+    {pending ? <p role="status">Loading users...</p> : read.isError ? <div role="alert" className="error-banner">
+      {read.error.message} <button type="button" className="secondary" onClick={() => void read.refetch()}>Retry users</button>
+    </div> : users?.count === 0 ? <p>{search ? "No users match your search." : "No users listed in this report."}</p> : users ? <>
+      <div className="table-shell">
+        <table className="agent-insight-table"><caption className="sr-only">Users of this agent in the selected CSV report</caption>
+          <thead><tr><th scope="col">User</th><th scope="col">Responses</th></tr></thead>
+          <tbody>{users.value.map(user => <tr key={user.username}>
+            <th scope="row">{user.displayName !== user.username ? <><span>{user.displayName}</span><small>{user.username}</small></> : user.username}</th>
+            <td>{user.responsesSentToUsers.toLocaleString()}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <div className="agent-insight-pagination">
+        <span>{users.value.length ? offset + 1 : 0}-{Math.min(offset + users.value.length, users.count)} of {users.count.toLocaleString()} users</span>
+        <button type="button" className="secondary" disabled={offset === 0} onClick={() => setOffset(value => Math.max(0, value - limit))}>Previous users</button>
+        <button type="button" className="secondary" disabled={offset + limit >= users.count} onClick={() => setOffset(value => value + limit)}>Next users</button>
+      </div>
+    </> : null}
+  </section>;
 }

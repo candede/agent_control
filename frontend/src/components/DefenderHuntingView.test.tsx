@@ -103,6 +103,92 @@ afterEach(() => {
 });
 
 describe("DefenderHuntingView", () => {
+  it("preserves the log type and dates across permission renewals and inactive source refreshes", async () => {
+    const access = context();
+    const view = (active = true, value = access) => <CapabilityContext value={value}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent" active={active}
+        entraAgentIds={[entraAgentId]} entraAgentApplicationIds={[applicationId]} />
+    </CapabilityContext>;
+    const rendered = render(view());
+    await screen.findByText("No hunting history");
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_tools" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "ExecuteToolBySDK" }));
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
+    fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-09T11:00" } });
+    const renewed = { ...access, views: access.views.map(item => ({ ...item, decision: {
+      ...item.decision, checkedAt: "2026-09-09T11:02:00Z", expiresAt: "2026-09-09T11:07:00Z",
+    } })) };
+    rendered.rerender(view(true, renewed));
+    expect(screen.getByLabelText("Log type")).toHaveValue("agent_tools");
+    expect(getDefenderHuntingCatalog).toHaveBeenCalledOnce();
+    rendered.rerender(view(false, renewed));
+    expect(screen.queryByLabelText("Log type")).not.toBeInTheDocument();
+    rendered.rerender(view(true, renewed));
+    await waitFor(() => expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2));
+    expect(screen.getByLabelText("Log type")).toHaveValue("agent_tools");
+    expect(screen.getByLabelText("Start")).toHaveValue("2026-09-09T10:30");
+    expect(screen.getByLabelText("End")).toHaveValue("2026-09-09T11:00");
+    expect(screen.getByRole("checkbox", { name: "ExecuteToolBySDK" })).not.toBeChecked();
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+  });
+
+  it("aborts an in-flight hunt when inactive and ignores its late result on resume", async () => {
+    let finish!: (value: DefenderHuntingJob) => void;
+    vi.mocked(submitDefenderHunt).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const view = (active: boolean) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} active={active} />
+    </CapabilityContext>;
+    const rendered = render(view(true));
+    await screen.findByText("No hunting history");
+    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
+    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
+    const signal = vi.mocked(submitDefenderHunt).mock.calls[0][2]!.signal!;
+    rendered.rerender(view(false));
+    expect(signal.aborted).toBe(true);
+    rendered.rerender(view(true));
+    await waitFor(() => expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2));
+    await act(async () => finish(job()));
+    expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
+  });
+
+  it("defaults to runtime activity when all verified log types are available", async () => {
+    render(<CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} entraAgentApplicationIds={[applicationId]} templates={{
+          agents_inventory: { status: "available" }, agent_activity: { status: "available" }, agent_tools: { status: "available" },
+        }} />
+    </CapabilityContext>);
+    await screen.findByText("No hunting history");
+    expect(screen.getByLabelText("Log type")).toHaveValue("agent_activity");
+    expect(screen.getByText(/Agent invocations and model inference/)).toBeVisible();
+  });
+
+  it("revalidates selected results when resuming and removes jobs no longer in saved history", async () => {
+    const history = { value: [job()], count: 1, limit: 20, offset: 0 };
+    let finish!: (value: typeof history) => void;
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce(history)
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(job(), "Private selected agent"));
+    const view = (active: boolean) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} active={active} />
+    </CapabilityContext>;
+    const rendered = render(view(true));
+    fireEvent.click(await screen.findByRole("button", { name: /View hunt 11111111/ }));
+    expect(await screen.findByText("Private selected agent")).toBeVisible();
+    rendered.rerender(view(false));
+    rendered.rerender(view(true));
+    await waitFor(() => expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Private selected agent")).not.toBeInTheDocument();
+    await act(async () => finish({ value: [], count: 0, limit: 20, offset: 0 }));
+    expect(screen.getByText("No hunting history")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+  });
+
   it("starts with the supported runtime template and never substitutes an opaque object identity", async () => {
     vi.mocked(submitDefenderHunt).mockResolvedValue(job());
     render(<CapabilityContext value={context()}><AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Legacy agent"
@@ -111,27 +197,27 @@ describe("DefenderHuntingView", () => {
         agent_activity: { status: "available" }, agent_tools: { status: "available" },
       }} /></CapabilityContext>);
     await screen.findByText("No hunting history");
-    expect(screen.getByLabelText("Fixed template")).toHaveValue("agent_activity");
+    expect(screen.getByLabelText("Log type")).toHaveValue("agent_activity");
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
     expect(vi.mocked(submitDefenderHunt).mock.calls[0][1]).toMatchObject({ templateId: "agent_activity", entraAgentApplicationIds: [applicationId], agentIds: [] });
     expect(vi.mocked(submitDefenderHunt).mock.calls[0][1]).not.toHaveProperty("entraAgentIds");
-    fireEvent.change(screen.getByLabelText("Fixed template"), { target: { value: "agents_inventory" } });
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agents_inventory" } });
     expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
     expect(screen.getByRole("alert")).toHaveTextContent("No verified enterprise-application object ID.");
   });
 
-  it("loads only catalog and saved history on navigation and labels source/readiness boundaries", async () => {
+  it("loads only catalog and saved history and explains the selected log type without portal links or disclosures", async () => {
     renderView();
-    expect(await screen.findByRole("heading", { name: "Defender and Agent 365 hunting" })).toBeVisible();
-    expect(screen.getByText("AgentsInfo")).not.toBeVisible();
-    expect(screen.getByText("Not independently proven")).not.toBeVisible();
-    fireEvent.click(screen.getByText("Access, scope & limits"));
-    expect(screen.getByText("AgentsInfo")).toBeVisible();
-    expect(screen.getByText("Not independently proven")).toBeVisible();
-    expect(screen.getByText("See Log setup on Permissions")).toBeVisible();
-    expect(screen.getByText(/Messages and tool content are absent/)).toBeVisible();
-    expect(screen.getByText(/Opening this view does not run a provider query/)).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Search Defender logs" })).toBeVisible();
+    expect(screen.getByText("AgentsInfo (preview)")).toBeVisible();
+    expect(screen.getByText(/This is an inventory snapshot, not a log of conversations/)).toBeVisible();
+    expect(screen.queryByText("Not independently proven")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Microsoft Defender hunting" }).querySelector("details")).toBeNull();
+    expect(screen.getByText("Run a hunt to collect results for this agent.")).toBeVisible();
+    expect(screen.queryByText("Selected agent", { exact: true })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Opening this view does not run a provider query|Delegated results remain principal-private|authorization permits an explicit bounded hunt/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Tenant Defender portal" })).not.toBeInTheDocument();
     expect(getDefenderHuntingCatalog).toHaveBeenCalledOnce();
     expect(getDefenderHuntingCatalog).toHaveBeenCalledWith(expect.objectContaining({ agentRecordId }));
     expect(getDefenderHuntingJobs).toHaveBeenCalledExactlyOnceWith(
@@ -174,7 +260,7 @@ describe("DefenderHuntingView", () => {
     const filter = await screen.findByLabelText("Filter loaded metadata");
     fireEvent.change(filter, { target: { value: "not-in-these-results" } });
     expect(screen.getByText("No loaded rows match these filters.")).toBeVisible();
-    expect(screen.getByText(/Filters apply to this page only/)).toBeVisible();
+    expect(screen.getByText(/rows on this page. CSV includes all saved rows/)).toBeVisible();
     fireEvent.change(filter, { target: { value: "selected" } });
     expect(screen.getByRole("region", { name: "Minimized hunting rows" })).toHaveTextContent("Selected agent");
     expect(getDefenderHuntingRows).toHaveBeenCalledExactlyOnceWith(job().id, 100, 0, expect.objectContaining({ agentRecordId }));
@@ -309,7 +395,8 @@ describe("DefenderHuntingView", () => {
     renderView();
     fireEvent.click(await screen.findByRole("button", { name: /View hunt/ }));
     expect(await screen.findByText("No data returned")).toBeVisible();
-    expect(screen.getByText(/does not prove complete tenant coverage or identify a missing permission, connector, license or table/)).toBeVisible();
+    expect(screen.getByText("No rows matched this hunt. Try another time range or check log setup in Permissions.")).toBeVisible();
+    expect(screen.queryByText(/does not prove complete tenant coverage/)).not.toBeInTheDocument();
   });
 
   it("shows partial coverage, preview nulls, exact association and absent activity content honestly", async () => {
@@ -382,7 +469,7 @@ describe("DefenderHuntingView", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Approve one bounded/ }));
     fireEvent.click(screen.getByRole("button", { name: /Approve qualification/ }));
     await waitFor(() => expect(approveDefenderHuntingQualification).toHaveBeenCalledOnce());
-    fireEvent.change(screen.getByLabelText("Fixed template"), { target: { value: "agent_activity" } });
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_activity" } });
     await act(async () => resolveApproval(job({ status: "waiting_authorization", snapshotId: null, canResume: true })));
     expect(screen.queryByRole("button", { name: /Run approved qualification/ })).not.toBeInTheDocument();
     approvalView.unmount();
@@ -394,13 +481,13 @@ describe("DefenderHuntingView", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
     await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
-    fireEvent.change(screen.getByLabelText("Fixed template"), { target: { value: "agent_tools" } });
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_tools" } });
     await act(async () => resolveSearch(job()));
     expect(screen.queryByRole("heading", { name: /Defender agent inventory result/ })).not.toBeInTheDocument();
     expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
   });
 
-  it("clears prior rows on selection and shows full provenance without truncating scope IDs", async () => {
+  it("clears prior rows on selection and omits internal query-scope diagnostics", async () => {
     const first = job({ resultScope: { kind: "principal", scopeId: "principal-scope-with-a-full-untruncated-identifier", configurationRevision: null } });
     const second = job({ id: "22222222-2222-4222-8222-222222222222", localRequestId: "44444444-4444-4444-8444-444444444444" });
     vi.mocked(getDefenderHuntingJobs).mockResolvedValue({ value: [first, second], count: 2, limit: 20, offset: 0 });
@@ -410,8 +497,10 @@ describe("DefenderHuntingView", () => {
     renderView();
     fireEvent.click(await screen.findByRole("button", { name: "View hunt 11111111..." }));
     expect(await screen.findByText("First selected agent")).toBeVisible();
-    expect(screen.getByText(/principal-scope-with-a-full-untruncated-identifier/)).toBeVisible();
-    expect(screen.getByText(first.localRequestId)).toBeVisible();
+    expect(screen.queryByText(/principal-scope-with-a-full-untruncated-identifier/)).not.toBeInTheDocument();
+    expect(screen.queryByText(first.localRequestId)).not.toBeInTheDocument();
+    expect(screen.queryByText("provider-a")).not.toBeInTheDocument();
+    expect(screen.queryByText("Query details")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "View hunt 22222222..." }));
     expect(screen.queryByText("First selected agent")).not.toBeInTheDocument();
     await act(async () => resolveSecond(inventoryPage(second, "Second selected agent")));
@@ -503,7 +592,7 @@ describe("DefenderHuntingView", () => {
     });
     renderView();
     fireEvent.click(await screen.findByRole("button", { name: /View hunt 11111111/ }));
-    fireEvent.change(screen.getByLabelText("Fixed template"), { target: { value: "agent_activity" } });
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_activity" } });
     expect(signal.aborted).toBe(true);
     await act(async () => finish(inventoryPage(job(), "Obsolete filtered agent")));
     expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();

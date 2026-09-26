@@ -26,6 +26,8 @@ Upgrading local configuration retains the existing tenant/application credential
 
 ## App roles
 
+For the signed-in person's Entra directory and Microsoft service requirements, see the [task-by-task user roles guide](user-roles-and-permissions.md). Those assignments are independent of the two Agent Control app roles below; the app does not infer Microsoft administrator roles from its own role claims.
+
 Agent Control has exactly two app-role values. Assign `AgentControl.Viewer` or `AgentControl.Admin` through the Enterprise application. One assignment is sufficient and recommended because Admin includes every Viewer permission. If direct and group membership overlap, holding both values is accepted and evaluates to the Admin superset; it does not create another role or authorization tier.
 
 | Role | Authorized data and actions |

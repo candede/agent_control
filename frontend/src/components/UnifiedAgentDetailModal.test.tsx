@@ -1,18 +1,16 @@
 import { act, fireEvent, render, screen, waitFor, within, type RenderOptions } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 import { workbenchActions } from "../../../backend/src/services/workbenchMetadata";
 import * as api from "../api/client";
-import type { CapabilityView, CopilotPackage, CopilotPackageDetail, InventorySourceAwareDetail, PackageAccessTarget, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
+import type { CapabilityView, CopilotPackage, CopilotPackageDetail, PackageAccessTarget, QuarantinePreview, SessionUser, UnifiedAgentRecord } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { mockNativeDialogs } from "../test/dialog";
 import { WorkbenchActionProvider } from "../workbenchActionContext";
 import { UnifiedAgentDetailModal } from "./UnifiedAgentDetailModal";
-import { SavedQueryProvider } from "./SavedQueryProvider";
-import { createSavedQueryClient } from "../savedQueries";
 import { createInventoryVerification } from "../test/inventoryVerification";
 import { usageAggregateFixture, usageAgentDetailFixture } from "../test/usageInsightsFixture";
 import { automaticAgentUsageFixture, automaticUsageContext, automaticUsagePackageId, automaticUsageReportName } from "../test/automaticAgentUsageFixture";
@@ -207,9 +205,10 @@ describe("unified authoring and person evidence", () => {
     value.displayName = value.powerPlatformResource!.nativeId;
     renderDetail({ record: value, activeTab: "power-platform", roles: ["AgentControl.Viewer"] });
     expect(field("Built with")).toHaveTextContent("Microsoft 365 Copilot Agent Builder");
-    expect(screen.getByText("Authoring tool").nextElementSibling).toHaveTextContent("Microsoft 365 Copilot Agent Builder");
-    expect(screen.getByText("Authoring tool (raw)").nextElementSibling).toHaveTextContent("Copilot Studio Lite");
-    expect(screen.getByText(/This does not establish whether the agent was deleted/)).toBeVisible();
+    expect(screen.queryByText("Authoring tool")).not.toBeInTheDocument();
+    expect(screen.queryByText("Authoring tool (raw)")).not.toBeInTheDocument();
+    expect(screen.getByText("Agent name not reported; showing its resource ID.")).toBeVisible();
+    expect(screen.queryByText(/This does not establish whether the agent was deleted/)).not.toBeInTheDocument();
   });
 
   it("uses saved names and sign-in addresses without requiring live directory permission or lookup", () => {
@@ -219,8 +218,8 @@ describe("unified authoring and person evidence", () => {
     expect(field("Owner")).toHaveTextContent("Saved owner");
     expect(field("Owner")).toHaveTextContent("saved.owner@example.invalid");
     expect(field("Created by")).toHaveTextContent("Saved owner");
-    expect(field("Created by")).toHaveTextContent(`ID: ${ownerId}`);
-    expect(field("Owner")).toHaveTextContent("Saved directory:");
+    expect(field("Created by")).not.toHaveTextContent(`ID: ${ownerId}`);
+    expect(field("Owner")).not.toHaveTextContent("Saved directory:");
     expect(lookup).not.toHaveBeenCalled();
   });
 
@@ -335,7 +334,7 @@ describe("unified authoring and person evidence", () => {
     expect(screen.queryByRole("button", { name: "Look up people" })).not.toBeInTheDocument();
   });
 
-  it("keeps the original name observation separate from a later failed lookup attempt", () => {
+  it("keeps the last known name and explicit failure state without lookup-timestamp clutter", () => {
     const value = nativeRecord();
     const person = {
       ...savedPerson, status: "lookup_failed" as const, checkedAt: "2026-09-19T12:00:00Z",
@@ -345,8 +344,8 @@ describe("unified authoring and person evidence", () => {
     const lookup = vi.spyOn(api, "resolveAgentPeople");
     renderDetail({ record: value });
     expect(field("Owner")).toHaveTextContent("Saved owner");
-    expect(field("Owner")).toHaveTextContent("Saved directory: Sep 17, 2026");
-    expect(field("Owner")).toHaveTextContent("Last lookup attempt: Sep 19, 2026");
+    expect(field("Owner")).not.toHaveTextContent("Saved directory:");
+    expect(field("Owner")).not.toHaveTextContent("Last lookup attempt:");
     expect(field("Owner")).toHaveTextContent("Directory lookup failed. Last known identity shown.");
     expect(field("Owner")).not.toHaveTextContent("deleted");
     expect(lookup).not.toHaveBeenCalled();
@@ -404,7 +403,7 @@ describe("unified authoring and person evidence", () => {
       people: { createdBy: { ...resolved(), displayName: null, userPrincipalName: null, status: "not_found" } }, changed: true,
     });
     renderDetail({ record: value }, capabilitiesWithDirectory());
-    expect(field("Owner")).toHaveTextContent("not a resolvable Entra user ID");
+    expect(field("Owner")).toHaveTextContent("Invalid Entra user ID.");
     await userEvent.click(screen.getByRole("button", { name: "Look up people" }));
     await waitFor(() => expect(field("Created by")).toHaveTextContent("User not found"));
     expect(field("Created by")).toHaveTextContent(ownerId);
@@ -424,11 +423,12 @@ describe("unified authoring and person evidence", () => {
     await waitFor(() => expect(field("Owner")).toHaveTextContent("Directory person"));
     rendered.update({}, capabilities());
     expect(field("Owner")).toHaveTextContent("Directory person");
-    expect(field("Owner")).toHaveTextContent(ownerId.toUpperCase());
+    expect(field("Owner")).toHaveTextContent("person@example.invalid");
     expect(lookup).toHaveBeenCalledTimes(1);
     rendered.update({ roles: [] }, capabilitiesWithDirectory());
     expect(lookup).toHaveBeenCalledTimes(1);
     expect(field("Owner")).not.toHaveTextContent("Directory person");
+    expect(field("Owner")).toHaveTextContent(ownerId.toUpperCase());
   });
 
   it("rejects mismatched saved and live identities rather than attaching another user's name", async () => {
@@ -512,18 +512,6 @@ async function submitInlineAccess(item: CopilotPackage, target: PackageAccessTar
   await userEvent.click(screen.getByRole("button", { name: "Apply" }));
 }
 
-function sourceAwareDetail(observed = observedRecord()): InventorySourceAwareDetail {
-  const resource = observed.powerPlatformResource!;
-  const snapshot = observed.observations.powerPlatform!;
-  return {
-    source: "power_platform", nativeId: resource.nativeId,
-    resourceType: resource.type, environmentId: resource.environmentId, snapshotId: snapshot.id,
-    observedAt: snapshot.observedAt, expiresAt: snapshot.expiresAt, identifiers: [],
-    audit: { status: "available", count: 0, value: [] },
-    security: { status: "available", count: 0, value: [] },
-  };
-}
-
 function quarantinePreview(observed = observedRecord()): QuarantinePreview {
   const resource = observed.powerPlatformResource!;
   const snapshot = observed.observations.powerPlatform!;
@@ -558,9 +546,20 @@ function queueNativeCloseEvents() {
 }
 
 beforeEach(() => {
-  vi.spyOn(api, "getInventorySourceAwareDetail").mockResolvedValue(sourceAwareDetail());
+  vi.spyOn(api, "getInventorySourceAwareDetail").mockRejectedValue(new Error("Legacy association reads must not be requested."));
   vi.spyOn(api, "getOfficialUsageAggregate").mockResolvedValue(usageAggregateFixture());
   vi.spyOn(api, "getOfficialUsageAgentDetail").mockResolvedValue(usageAgentDetailFixture());
+  vi.spyOn(api, "getOfficialUsageAgentUsers").mockResolvedValue({
+    activeSet: automaticUsageContext.reportSet!,
+    agentIds: [automaticUsagePackageId],
+    users: {
+      value: Array.from({ length: 7 }, (_, index) => ({
+        username: `agent-user-${index + 1}@example.invalid`, displayName: `Agent user ${index + 1}`,
+        responsesSentToUsers: index === 0 ? 175 : 1,
+      })),
+      count: 7, limit: 25, offset: 0,
+    },
+  });
   vi.spyOn(api, "previewQuarantine");
   vi.spyOn(api, "submitQuarantine");
 });
@@ -574,6 +573,7 @@ describe("UnifiedAgentDetailModal", () => {
     const dialog = await screen.findByRole("dialog", { name: "Researcher" });
     expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentUsers).not.toHaveBeenCalled();
     expect(within(dialog).queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
     expect(within(dialog).queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("Tenant adoption snapshot")).not.toBeInTheDocument();
@@ -610,7 +610,7 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onClose).toHaveBeenCalledTimes(shouldClose ? 1 : 0);
   });
 
-  it("defaults to Overview with admin facts and collapsed technical evidence", async () => {
+  it("defaults to Overview with visible admin facts and identifiers, without technical disclosures", () => {
     const { props } = renderDetail({ roles: ["AgentControl.Viewer"] });
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
@@ -620,22 +620,19 @@ describe("UnifiedAgentDetailModal", () => {
     expect(within(dialog).getByText("Environment name").nextElementSibling).toHaveTextContent("Production");
     expect(within(dialog).getAllByText("Agent Builder").some(element => element.closest("details") === null)).toBe(true);
     expect(within(dialog).getByText("Quarantine status unknown")).toBeVisible();
-    expect(within(dialog).getByText("Linked by source metadata")).not.toBeVisible();
-    expect(within(dialog).getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).not.toBeVisible();
-    const technical = within(dialog).getByText("Technical details").closest("details");
-    expect(technical).not.toHaveAttribute("open");
-    await userEvent.click(within(dialog).getByText("Technical details"));
-    expect(technical).toHaveAttribute("open");
-    expect(within(dialog).getByText("Linked by source metadata")).toBeVisible();
-    expect(technical).toHaveTextContent("package-1");
-    expect(technical).toHaveTextContent("element-1");
-    expect(technical).toHaveTextContent("elementDetails.AgentMetadatas.definition.AgentIdentityId");
-    expect(within(dialog).getByText("agent-identity-1")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Linked by source metadata")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details")).toHaveLength(0);
+    expect(within(dialog).queryByText("Technical details")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("Package ID").nextElementSibling).toHaveTextContent("package-1");
+    expect(within(dialog).queryByText("element-1")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("elementDetails.AgentMetadatas.definition.AgentIdentityId")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("agent-identity-1")).toBeVisible();
     fireEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
     expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
     expect(within(dialog).getByText("Package one")).toBeInTheDocument();
     expect(within(dialog).getByRole("heading", { name: "Manage" })).toBeVisible();
-    expect(within(dialog).getByText(/Apply checks current settings before exact-target confirmation/)).toBeVisible();
+    expect(within(dialog).queryByText(/Apply checks current settings before exact-target confirmation/)).not.toBeInTheDocument();
     expect(within(dialog).getByText(/AgentControl.Admin role is required/)).toBeVisible();
   });
 
@@ -690,7 +687,7 @@ describe("UnifiedAgentDetailModal", () => {
     for (const value of ["Example vendor", "Team owner", "Tenant maker", "Tenant model", "Organization sign-in", "Configured connector"]) {
       expect(screen.getByText(value)).toBeVisible();
     }
-    expect(screen.getByText("Technical details").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelectorAll(".agent-overview details")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: /Details & services|Viewing details|Package details for/ })).not.toBeInTheDocument();
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
@@ -770,6 +767,26 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByText("Previous agent description")).not.toBeInTheDocument();
     expect(screen.getByText("Current agent description")).toBeVisible();
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(nextPackage);
+  });
+
+  it("keeps same-name versions distinct without displaying package IDs outside version details", async () => {
+    const first = { ...record.packages[0], displayName: "Same agent", version: "1" };
+    const second = { ...first, id: "second-package" };
+    const { props } = renderDetail({
+      record: { ...record, powerPlatformResource: null, presence: "graph_packages", packages: [first, second] },
+      activeTab: "controls",
+    });
+    const versions = screen.getByRole("combobox", { name: "Published version details" });
+    expect(within(versions).getAllByRole("option").map(option => option.textContent?.trim())).toEqual([
+      "Same agent - Version 1 (1)", "Same agent - Version 1 (2)",
+    ]);
+    await userEvent.selectOptions(versions, second.id);
+    const management = screen.getByRole("region", { name: "Manage Same agent (second-package)" });
+    expect(within(management).getByText(second.id)).not.toBeVisible();
+    await userEvent.click(within(management).getByText("Version details"));
+    expect(within(management).getByText(second.id)).toBeVisible();
+    await userEvent.click(within(management).getByRole("button", { name: "Block Same agent (second-package)" }));
+    expect(props.onSetPackageBlocked).toHaveBeenCalledExactlyOnceWith(second, true);
   });
 
   it("does not silently replace a withdrawn selected version with another management target", async () => {
@@ -853,7 +870,7 @@ describe("UnifiedAgentDetailModal", () => {
     const { props } = renderDetail({ roles: scenario === "missing role" ? [] : user.roles }, undefined,
       scenario === "missing action" ? [] : undefined);
     expect(props.onInspectPackage).not.toHaveBeenCalled();
-    expect(screen.getByText(/Additional saved details require the package read action/)).toBeVisible();
+    expect(screen.getByText("Additional details require package read access.")).toBeVisible();
   });
 
   it("pages saved configured connectors without reducing reported totals", async () => {
@@ -865,14 +882,14 @@ describe("UnifiedAgentDetailModal", () => {
         },
       },
     } });
-    expect(screen.getByText("Reported connector total").nextElementSibling).toHaveTextContent("40");
+    expect(screen.getByText("Connectors", { selector: "dt" }).nextElementSibling).toHaveTextContent("40");
     const list = screen.getByRole("list", { name: "Configured connector details" });
     expect(within(list).getAllByRole("listitem")).toHaveLength(10);
     for (let index = 0; index < 3; index++) await userEvent.click(screen.getByRole("button", { name: "Next connectors" }));
     expect(within(list).getAllByRole("listitem")).toHaveLength(5);
     expect(within(list).getByText("Service 34")).toBeVisible();
     expect(screen.getByText("31-35 of 35 saved connectors")).toBeVisible();
-    expect(screen.getByText("Reported connector total").nextElementSibling).toHaveTextContent("40");
+    expect(screen.getByText("Connectors", { selector: "dt" }).nextElementSibling).toHaveTextContent("40");
   });
 
   it("preserves useful native metadata for a sparse agent without inventing a vendor description or connections", () => {
@@ -880,7 +897,7 @@ describe("UnifiedAgentDetailModal", () => {
       ...record, packages: [], presence: "power_platform",
       powerPlatformResource: { ...record.powerPlatformResource, details: { ownerId: "Tenant owner", isWebSearchEnabledForKnowledge: false } },
     } });
-    expect(screen.getByText("No description provided.")).toBeVisible();
+    expect(screen.queryByText("No description provided.")).not.toBeInTheDocument();
     const information = screen.getByRole("region", { name: "Agent information" });
     expect(within(information).getByText("Tenant owner")).toBeVisible();
     expect(within(information).getByText("Web search for knowledge").nextElementSibling).toHaveTextContent("No");
@@ -930,15 +947,15 @@ describe("UnifiedAgentDetailModal", () => {
         }],
       },
     });
-    expect(screen.getByText("Reported connector total").nextElementSibling).toHaveTextContent("5");
+    expect(screen.getByText("Connectors", { selector: "dt" }).nextElementSibling).toHaveTextContent("5");
     expect(screen.queryByText("Reference one")).not.toBeInTheDocument();
     expect(screen.queryByText("Reference two")).not.toBeInTheDocument();
     expect(screen.getByText("retained-connector")).toBeVisible();
     const information = screen.getByRole("region", { name: "Agent information" });
-    expect(screen.getByText("Reported operation total").nextElementSibling).toHaveTextContent("9");
+    expect(screen.getByText("Operations", { selector: "dt" }).nextElementSibling).toHaveTextContent("9");
     expect(within(information).getByText("Channels").nextElementSibling).toHaveTextContent("Teams, Custom Channel");
     expect(within(information).getByText("Last quarantined").nextElementSibling?.querySelector("time")).toHaveAttribute("dateTime", "2026-09-18T12:00:00Z");
-    expect(screen.getByText(/Capability details are partial/)).not.toHaveTextContent("reached its projection limit");
+    expect(screen.getByText("Some connector or operation details are unavailable.")).not.toHaveTextContent("reached its projection limit");
   });
 
   it.each([0, 5])("retains a reported connector count of %s when connector details are missing", count => {
@@ -950,11 +967,11 @@ describe("UnifiedAgentDetailModal", () => {
         },
       },
     } });
-    expect(screen.getByText("Reported connector total").nextElementSibling).toHaveTextContent(String(count));
-    expect(screen.getByText("Reported operation total").nextElementSibling).toHaveTextContent("0");
+    expect(screen.getByText("Connectors", { selector: "dt" }).nextElementSibling).toHaveTextContent(String(count));
+    expect(screen.getByText("Operations", { selector: "dt" }).nextElementSibling).toHaveTextContent("0");
     expect(screen.getByText("Channels").nextElementSibling).toHaveTextContent("None reported");
     expect(screen.queryByText("No connected-service metadata was reported for this agent.")).not.toBeInTheDocument();
-    expect(screen.getByText(count ? /Configured connector details are not available/ : "No configured connectors were reported.")).toBeVisible();
+    expect(screen.getByText(count ? "Configured connector details are unavailable. Refresh inventory in Sync." : "No configured connectors were reported.")).toBeVisible();
   });
 
   it("does not present a partial retained connector list as the complete configured count", () => {
@@ -963,12 +980,13 @@ describe("UnifiedAgentDetailModal", () => {
         ...record.powerPlatformResource, details: { connectors: [{ connectorId: "retained" }], connectorDetailsStatus: "partial" },
       },
     } });
-    expect(screen.getByText(/1 saved connector details; 0 saved operation details \(partial\)/)).toBeVisible();
-    expect(screen.getByText("Reported connector total").nextElementSibling).toHaveTextContent("Unknown");
+    expect(screen.getByText("retained")).toBeVisible();
+    expect(screen.getByText("Some connector or operation details are unavailable.")).toBeVisible();
+    expect(screen.queryByText("Connectors", { selector: "dt" })).not.toBeInTheDocument();
     expect(screen.queryByText("1 configured")).not.toBeInTheDocument();
   });
 
-  it("includes exact package observations when showing the latest saved inventory time", () => {
+  it("does not present snapshot collection times as agent lifecycle dates", () => {
     const observedAt = "2026-09-19T12:00:00Z";
     renderDetail({ record: {
       ...record, observations: {
@@ -980,7 +998,9 @@ describe("UnifiedAgentDetailModal", () => {
         },
       },
     } });
-    expect(screen.getByText("Inventory observed").nextElementSibling?.querySelector("time")).toHaveAttribute("dateTime", observedAt);
+    expect(screen.queryByText("Inventory observed")).not.toBeInTheDocument();
+    expect(screen.queryByText("Created", { selector: "dt" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Last modified", { selector: "dt" })).not.toBeInTheDocument();
   });
 
   it("keeps assignment identities readable in Manage for viewers and pages long lists", async () => {
@@ -1213,12 +1233,13 @@ describe("UnifiedAgentDetailModal", () => {
     };
     const { props, update } = renderDetail({ record: current, activeTab: "reports" });
     const usage = await screen.findByRole("region", { name: "Usage and users for Researcher" });
-    expect(within(usage).getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
-    expect(within(usage).getByText(/Its response totals, active users, and last-used date are unavailable/)).toHaveTextContent("Researcher");
-    expect(within(usage).getByText(/Missing usage data does not mean zero usage/)).toBeVisible();
-    expect(screen.queryByRole("region", { name: "Users of the reported agent" })).not.toBeInTheDocument();
+    expect(within(usage).getByRole("heading", { name: "Usage unavailable" })).toBeVisible();
+    expect(within(usage).getByText("Report data is unavailable. Reload usage to try again.")).toBeVisible();
+    expect(within(usage).queryByText(/Missing usage data does not mean zero usage/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Agent users" })).not.toBeInTheDocument();
     expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentUsers).not.toHaveBeenCalled();
     if (presence === "graph_packages") expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     expect(within(usage).queryByRole("button")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
@@ -1250,7 +1271,7 @@ describe("UnifiedAgentDetailModal", () => {
     const { update } = renderDetail({ record: first, activeTab: "reports" });
     expect(await screen.findByRole("region", { name: "Usage and users for Researcher" })).toBeVisible();
     update({ record: { ...first, id: "different-agent" } });
-    expect(screen.getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Usage unavailable" })).toBeVisible();
     update({ record: { ...first, id: "different-agent", displayName: "Different agent" } });
     expect(screen.getByRole("region", { name: "Usage and users for Different agent" })).toBeVisible();
     expect(screen.queryByText("Researcher")).not.toBeInTheDocument();
@@ -1258,31 +1279,43 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByLabelText("Tenant report totals")).not.toBeInTheDocument();
     expect(api.getOfficialUsageAggregate).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
+    expect(api.getOfficialUsageAgentUsers).not.toHaveBeenCalled();
   });
 
-  it("shows automatically matched report identities in the modal without setup, candidates or writes", () => {
+  it("loads automatically matched agent users only on the Usage tab without setup, candidates or writes", async () => {
     const candidates = vi.spyOn(api, "getAgentUsageCandidates");
     const associate = vi.spyOn(api, "associateAgentUsage");
     const remove = vi.spyOn(api, "removeAgentUsageAssociation");
     const { update } = renderDetail({
-      activeTab: "reports", usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64), onUsageChanged: vi.fn(),
+      usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64), onUsageChanged: vi.fn(),
       record: {
         ...record, displayName: "Excel", packages: [{ ...record.packages[0], id: automaticUsagePackageId, displayName: "Excel" }],
         usage: automaticAgentUsageFixture(),
       },
     });
+    expect(api.getOfficialUsageAgentUsers).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("tab", { name: "Usage & users" }));
     const usage = screen.getByRole("region", { name: "Usage and users for Excel" });
     expect(within(usage).getByLabelText("Selected agent report metrics")).toHaveTextContent("181");
-    expect(within(usage).getByText(automaticUsageReportName)).toBeVisible();
-    expect(within(usage).getByText(/Automatically matched: exact report Agent ID/)).toBeVisible();
-    expect(within(usage).queryByRole("button")).not.toBeInTheDocument();
+    expect(await within(usage).findByRole("heading", { name: "Users (7)" })).toBeVisible();
+    expect(within(usage).getByText("Agent user 1")).toBeVisible();
+    expect(within(usage).getByText("agent-user-1@example.invalid")).toBeVisible();
+    expect(within(usage).queryByText(automaticUsageReportName)).not.toBeInTheDocument();
+    expect(within(usage).queryByText(/Automatically matched: exact report Agent ID/)).not.toBeInTheDocument();
+    expect(within(usage).queryByRole("button", { name: /association|candidate|setup/i })).not.toBeInTheDocument();
+    expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledExactlyOnceWith({
+      agentIds: [automaticUsagePackageId], setId: automaticUsageContext.reportSet!.id,
+      search: "", limit: 25, offset: 0,
+    }, { signal: expect.any(AbortSignal) });
     expect(candidates).not.toHaveBeenCalled();
     expect(associate).not.toHaveBeenCalled();
     expect(remove).not.toHaveBeenCalled();
     expect(api.getOfficialUsageAgentDetail).not.toHaveBeenCalled();
     update({ usageContext: { ...automaticUsageContext, reportSet: { ...automaticUsageContext.reportSet!, id: "other-snapshot" } } });
     expect(screen.queryByLabelText("Selected agent report metrics")).not.toBeInTheDocument();
-    expect(screen.getByText(/saved usage belongs to a different report snapshot/)).toBeVisible();
+    expect(screen.queryByText("agent-user-1@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByText("The selected report changed. Reload usage to update this agent.")).toBeVisible();
+    expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledOnce();
   });
 
   it("resets panel scroll when switching tasks", () => {
@@ -1299,37 +1332,34 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onTabChange).toHaveBeenCalledExactlyOnceWith("identities");
   });
 
-  it("renders corroborated schema/native evidence in collapsed diagnostics without claiming a Microsoft canonical identity", async () => {
+  it("keeps exact useful IDs visible without duplicating corroborated source proof", async () => {
     const corroborated = corroboratedRecord(true);
     renderDetail({ record: corroborated, activeTab: "identities" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
-    const technical = screen.getByText("Technical details").closest("details");
-    expect(technical).not.toHaveAttribute("open");
-    expect(screen.getAllByText("Environment schema native id")).toHaveLength(2);
-    for (const evidence of screen.getAllByText("Environment schema native id")) expect(evidence).not.toBeVisible();
-    const qualification = screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/);
-    expect(qualification).not.toBeVisible();
-    expect(qualification).toHaveTextContent(corroborated.identity.reason!);
-    await userEvent.click(screen.getByText("Technical details"));
-    expect(qualification).toBeVisible();
-    expect(technical).toHaveTextContent("metadata-1");
-    expect(technical).toHaveTextContent(corroborated.identity.evidence[0].packagePath);
-    expect(technical).toHaveTextContent(corroborated.identity.evidence[0].resourcePath);
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "Identifiers" })).toBeVisible();
+    expect(screen.getByText("Agent ID").nextElementSibling).toHaveTextContent(corroborated.powerPlatformResource!.nativeId);
+    expect(screen.getAllByText("Environment ID")).toHaveLength(1);
+    expect(screen.queryByText("Environment schema native id")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Control access is checked separately/)).not.toBeInTheDocument();
+    expect(screen.queryByText(corroborated.identity.evidence[0].packagePath)).not.toBeInTheDocument();
+    expect(screen.queryByText(corroborated.identity.evidence[0].resourcePath)).not.toBeInTheDocument();
+    expect(screen.getByRole("tabpanel", { name: "Overview" }).querySelector(".agent-overview details")).toBeNull();
   });
 
-  it("retains source-specific identity warnings without turning a valid native link into a conflict", async () => {
+  it("omits informational source-identity disagreements without changing native control eligibility", async () => {
     const observed = observedRecord();
     const message = "Graph and Power Platform supplied different source-specific agent identity IDs; the exact native environment and bot agree.";
     const { update } = renderDetail({
       record: { ...observed, identity: { ...observed.identity, warnings: [{ code: "source_specific_agent_identity", message }] } },
     });
-    await userEvent.click(screen.getByText("Technical details"));
-    expect(screen.getByRole("heading", { name: "Source identity warnings" })).toBeVisible();
-    expect(screen.getByText(message)).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Linked by source metadata" })).toBeVisible();
-    expect(screen.queryByRole("heading", { name: "Conflicting link evidence" })).not.toBeInTheDocument();
-    update({ record: observed });
+    expect(screen.queryByRole("heading", { name: "Source identity warnings" })).not.toBeInTheDocument();
     expect(screen.queryByText(message)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Conflicting link evidence" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    update({ record: observed });
+    expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
+    expect(api.previewQuarantine).not.toHaveBeenCalled();
   });
 
   it.each(["matched", "unmatched"] as const)("shows actionable invalid metadata without disabling exact package controls for a %s record", async state => {
@@ -1338,7 +1368,7 @@ describe("UnifiedAgentDetailModal", () => {
       record: { ...observed, identity: { ...observed.identity, state, invalidMetadata: true } },
       activeTab: "controls",
     });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     const diagnostic = screen.getByText("Invalid saved matching metadata.");
     expect(diagnostic).toBeVisible();
     expect(diagnostic.parentElement).toHaveTextContent("Select this agent on Agents");
@@ -1359,14 +1389,13 @@ describe("UnifiedAgentDetailModal", () => {
       ...record, presence: "graph_packages", powerPlatformResource: null,
       identity: { state: "unmatched", evidence: [], packageEvidence: [], reason },
     } });
-    await userEvent.click(screen.getByText("Technical details"));
-    expect(screen.getByText(reason)).toBeVisible();
+    expect(screen.queryByText(reason)).not.toBeInTheDocument();
     expect(screen.queryByText("Refresh matching details")).not.toBeInTheDocument();
   });
 
   it.each([false, true])("requires an explicit backend-supplied CDS bot identifier despite corroborated evidence (supplied=%s)", async supplied => {
     renderDetail({ record: corroboratedRecord(supplied), activeTab: "controls" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     if (supplied) expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     else {
       expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
@@ -1376,32 +1405,30 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
-  it("shows related opaque package proof in both shared custom-engine evidence sections", async () => {
+  it("shows only the selected package ID for shared custom-engine versions, not duplicate linking evidence", async () => {
     const grouped = sharedCustomEngineRecord();
     const { update } = renderDetail({ record: grouped });
-    await userEvent.click(screen.getByText("Technical details"));
-    const proofs = screen.getAllByRole("list", { name: "Related exact packages" });
-    expect(proofs).toHaveLength(2);
-    for (const proof of proofs) {
-      expect(within(proof).getAllByRole("listitem").map(item => item.textContent)).toEqual([grouped.packages[1].id]);
-    }
-    expect(screen.getAllByText("Shared custom engine bot id")).toHaveLength(2);
-    expect(screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).toBeVisible();
-    expect(screen.getByText(/not a Microsoft-guaranteed native foreign key/)).toBeVisible();
-    expect(screen.getByText(/does not grant or renew native controls/)).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Related exact packages" })).not.toBeInTheDocument();
+    expect(screen.getByText("Package ID").nextElementSibling).toHaveTextContent(grouped.packages[0].id);
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Published version details" }), grouped.packages[1].id);
+    expect(screen.getByText("Package ID").nextElementSibling).toHaveTextContent(grouped.packages[1].id);
+    expect(screen.queryByText("Shared custom engine bot id")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Control access is checked separately/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not a Microsoft-guaranteed native foreign key/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/does not grant or renew native controls/)).not.toBeInTheDocument();
     update({ record: observedRecord() });
     expect(screen.queryByRole("list", { name: "Related exact packages" })).not.toBeInTheDocument();
   });
 
-  it("keeps definition-backed identity evidence when every outer element label is empty", async () => {
+  it("keeps native management eligibility when linking proof labels are empty and absent from Overview", async () => {
     const grouped = sharedCustomEngineRecord();
     for (const evidence of grouped.identity.evidence) evidence.elementIds = ["", ""];
     renderDetail({ record: grouped });
-    await userEvent.click(screen.getByText("Technical details"));
-    expect(screen.getByRole("heading", { name: "Linked by source metadata" })).toBeVisible();
-    expect(screen.getAllByText(/element labels Not supplied/)).toHaveLength(4);
-    expect(screen.getAllByText("Bots.definition.botId + CustomEngineCopilots.definition.id")).toHaveLength(2);
-    expect(screen.getAllByRole("list", { name: "Related exact packages" })).toHaveLength(2);
+    expect(screen.queryByRole("heading", { name: "Linked by source metadata" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/element labels Not supplied/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Bots.definition.botId + CustomEngineCopilots.definition.id")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Related exact packages" })).not.toBeInTheDocument();
     expect(screen.queryByText("Invalid saved matching metadata.")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
     expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
@@ -1413,7 +1440,7 @@ describe("UnifiedAgentDetailModal", () => {
     const botApplicationId = "55555555-5555-4555-8555-555555555555";
     if (!supplied) grouped.powerPlatformResource!.nativeId = botApplicationId;
     const { props } = renderDetail({ record: grouped, activeTab: "controls" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     for (const item of grouped.packages) {
       await submitInlineAccess(item, "availability");
       expect(props.onUpdatePackageAccess).toHaveBeenLastCalledWith(item, { target: "availability", mode: "replace", scope: "none", principals: [] });
@@ -1441,7 +1468,7 @@ describe("UnifiedAgentDetailModal", () => {
   it.each([
     ["manifest_schema_native_id", "Manifest schema native id", "manifestId", "nativeId + details.schemaName"],
     ["environment_entra_app_id", "Environment entra app id", "SourceIds.EnvironmentId + BotDefinitions.msAppId", "environmentId + identifiers.entra_app_id"],
-  ] as const)("renders %s as source-declared evidence without deriving a CDS quarantine target", async (kind, heading, packagePath, resourcePath) => {
+  ] as const)("omits %s linking diagnostics without deriving a CDS quarantine target", async (kind, heading, packagePath, resourcePath) => {
     const observed = observedRecord();
     const evidence: UnifiedAgentRecord["identity"]["evidence"] = [{
       kind, basis: "source_declared_metadata", elementIds: ["metadata-1"], packagePath, resourcePath,
@@ -1457,10 +1484,9 @@ describe("UnifiedAgentDetailModal", () => {
         identity: { state: "matched", evidence, packageEvidence: [{ packageId: "package-1", evidence }], reason: null },
       },
     });
-    await userEvent.click(screen.getByText("Technical details"));
-    for (const label of screen.getAllByText(heading)) expect(label).toBeVisible();
-    expect(screen.getAllByText(/Source declared metadata/)).toHaveLength(2);
-    expect(screen.getByText(/not presented as a publicly documented Microsoft canonical identifier equivalence/)).toBeVisible();
+    expect(screen.queryByText(heading)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Source declared metadata/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Control access is checked separately/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Manage" }));
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
     expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
@@ -1495,192 +1521,45 @@ describe("UnifiedAgentDetailModal", () => {
     for (const value of ["native-owner", "native-schema", "configured-model", "configured-authentication", "configured-orchestration", "native-connector", "operation-1"]) {
       expect(screen.getByText(value)).toBeInTheDocument();
     }
-    expect(screen.getByText("Authoring tool (raw)").nextElementSibling).toHaveTextContent("FutureProvider.vNext_build-X");
-    expect(screen.getByText("Authoring tool").nextElementSibling).toHaveTextContent("Not supplied");
-    expect(screen.getByText(/Capability details are partial/)).toBeInTheDocument();
+    expect(screen.getByText("Authoring source").nextElementSibling).toHaveTextContent("FutureProvider.vNext_build-X");
+    expect(screen.queryByText("Authoring tool", { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByText("Some connector or operation details are unavailable.")).toBeInTheDocument();
   });
 
-  it("does not retain a prior source lookup error or show endless loading for a package-only record", async () => {
-    const lookup = vi.spyOn(api, "getInventorySourceAwareDetail").mockRejectedValue(new Error("Previous source lookup failed"));
-    const observed: UnifiedAgentRecord = {
-      ...record,
-      observations: {
-        ...record.observations,
-        powerPlatform: {
-          id: "snapshot-1", snapshotId: "snapshot-1", current: true,
-          observedAt: "2026-09-15T00:00:00Z", expiresAt: "2026-10-15T00:00:00Z",
-          roleScope: "full", environmentScope: null, coverage: "covered", coveredCount: 1,
-          observedCount: 1, totalRecords: 1, pageCount: 1, verification: createInventoryVerification(1),
-        },
-      },
-    };
-    const modal = (value: UnifiedAgentRecord) => <WorkbenchActionProvider value={[]}>
-      <UnifiedAgentDetailModal record={value} activeTab="audit-security" roles={["AgentControl.Viewer"]}
-        onTabChange={vi.fn()} onClose={vi.fn()} onInspectPackage={vi.fn()}
-        onUpdatePackageAccess={vi.fn().mockResolvedValue(undefined)} onSetPackageBlocked={vi.fn()} />
-    </WorkbenchActionProvider>;
-    const { rerender } = render(modal(observed));
-    expect(await screen.findByText("Previous source lookup failed")).toBeInTheDocument();
-    rerender(modal({ ...record, id: "package-only", powerPlatformResource: null }));
-    expect(screen.queryByText("Previous source lookup failed")).not.toBeInTheDocument();
-    expect(screen.queryByText(/Loading authorized exact source associations/)).not.toBeInTheDocument();
-    expect(screen.getByText("No saved activity is linked to this agent's inventory record.")).toBeVisible();
-    expect(screen.queryByRole("link", { name: "Search tenant interactions" })).not.toBeInTheDocument();
-    expect(lookup).toHaveBeenCalledOnce();
-  });
-
-  it.each(["success", "error"] as const)("ignores a late source lookup %s after changing exact targets", async outcome => {
-    const first = observedRecord();
-    const next: UnifiedAgentRecord = {
-      ...first, id: "unified-2",
-      powerPlatformResource: { ...first.powerPlatformResource!, nativeId: "agent-2" },
-    };
-    let finish!: () => void;
-    const pending = new Promise<InventorySourceAwareDetail>((resolve, reject) => {
-      finish = () => {
-        if (outcome === "error") reject(new Error("Previous target lookup failed"));
-        else resolve({
-          ...sourceAwareDetail(first),
-          audit: { status: "unavailable", reason: "Previous target audit" },
-        });
-      };
+  it.each(["identities", "reports", "controls", "audit-security"])("does not fetch or duplicate legacy source associations from %s", async activeTab => {
+    const context = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValue({
+      recordId: record.id, displayName: record.displayName,
+      defender: { status: "unavailable", entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" },
+      purview: { status: "unavailable", mode: "saved_only", reasonCode: "unsupported_identity_crosswalk" },
     });
-    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
-      .mockReturnValueOnce(pending)
-      .mockResolvedValueOnce({
-        ...sourceAwareDetail(next),
-        audit: { status: "unavailable", reason: "Current target audit" },
-      });
-    const { update, unmount } = renderDetail({ record: first, activeTab: "audit-security" });
-    expect(lookup).toHaveBeenNthCalledWith(1, {
-      snapshotId: first.observations.powerPlatform!.snapshotId,
-      nativeId: first.powerPlatformResource!.nativeId,
-      environmentId: first.powerPlatformResource!.environmentId,
-    }, { signal: expect.any(AbortSignal) });
-    update({ record: next });
-    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
-    expect(await screen.findByText("Unavailable: Current target audit")).not.toBeVisible();
-    fireEvent.click(screen.getByText(`Saved observations for ${next.displayName}`));
-    expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
-    await act(async () => { finish(); });
-    expect(screen.getByText("Unavailable: Current target audit")).toBeVisible();
-    expect(screen.queryByText(/Previous target/)).not.toBeInTheDocument();
-    unmount();
-    expect(lookup).toHaveBeenCalledTimes(2);
+    renderDetail({ record: observedRecord(), activeTab });
+    if (activeTab === "audit-security") {
+      expect(await screen.findByRole("heading", { name: "Defender linking not supported for this agent" })).toBeVisible();
+      expect(context).toHaveBeenCalledOnce();
+      expect(screen.getByRole("region", { name: /Investigations for/ }).querySelector("details")).toBeNull();
+    } else expect(context).not.toHaveBeenCalled();
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Saved observations for|No saved activity is linked/)).not.toBeInTheDocument();
   });
 
-  it("aborts an in-flight source lookup when the detail dialog unmounts", () => {
-    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
-      .mockImplementationOnce(() => new Promise<InventorySourceAwareDetail>(() => {}));
-    const { unmount } = renderDetail({ record: observedRecord(), activeTab: "audit-security" });
-    expect(lookup).toHaveBeenCalledOnce();
-    unmount();
-    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(true);
-  });
-
-  it("preserves pending and completed activity reads across equivalent inventory rerenders", async () => {
-    const observed = observedRecord();
-    let complete!: (value: InventorySourceAwareDetail) => void;
-    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
-      .mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
-    const { update } = renderDetail({ record: observed, activeTab: "audit-security" });
-    expect(lookup).toHaveBeenCalledOnce();
-    const signal = lookup.mock.calls[0][1]?.signal;
-
-    update({ record: structuredClone(observed) });
-    expect(signal?.aborted).toBe(false);
-    expect(lookup).toHaveBeenCalledOnce();
-    await act(async () => complete({
-      ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Stable saved activity" },
-    }));
-    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
-    expect(screen.getByText("Unavailable: Stable saved activity")).toBeVisible();
-
-    update({ record: structuredClone(observed) });
-    expect(lookup).toHaveBeenCalledOnce();
-    expect(screen.getByText("Unavailable: Stable saved activity")).toBeVisible();
-  });
-
-  it("does not retry failed activity reads on equivalent rerenders and supports explicit retry", async () => {
-    const observed = observedRecord();
-    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
-      .mockRejectedValueOnce(new Error("Saved activity unavailable"))
-      .mockResolvedValue({
-        ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Recovered saved activity" },
-      });
-    const { update } = renderDetail({ record: observed, activeTab: "audit-security" });
-    expect(await screen.findByText("Saved activity unavailable")).toBeVisible();
-    update({ record: structuredClone(observed) });
-    expect(lookup).toHaveBeenCalledOnce();
-    expect(screen.getByText("Saved activity unavailable")).toBeVisible();
-
-    await userEvent.click(screen.getByRole("button", { name: "Retry activity" }));
-    expect(await screen.findByText("Unavailable: Recovered saved activity")).not.toBeVisible();
-    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
-    expect(screen.getByText("Unavailable: Recovered saved activity")).toBeVisible();
-    expect(lookup).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not reuse a peer's pre-revision activity request for a fresh mutation follow-up", async () => {
-    const observed = observedRecord();
-    let completeOld!: (value: InventorySourceAwareDetail) => void;
-    const lookup = vi.mocked(api.getInventorySourceAwareDetail)
-      .mockReturnValueOnce(new Promise(resolve => { completeOld = resolve; }))
-      .mockResolvedValueOnce({
-        ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Fresh revision activity" },
-      });
-    const client = createSavedQueryClient();
-    const wrapper = ({ children }: { children: ReactNode }) => <SavedQueryProvider client={client}>{children}</SavedQueryProvider>;
-    const peer = renderDetail({ record: { ...observed, displayName: "Peer activity reader" }, activeTab: "audit-security" },
-      undefined, undefined, { wrapper });
-    const { container, update } = renderDetail({ record: observed, activeTab: "audit-security" }, undefined, undefined, { wrapper });
-    expect(lookup).toHaveBeenCalledOnce();
-
-    update({ dataRevision: 1 });
-    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(2));
-    expect(lookup.mock.calls[0][1]?.signal?.aborted).toBe(false);
-    const current = within(container).getByRole("dialog");
-    fireEvent.click(within(current).getByText(`Saved observations for ${observed.displayName}`));
-    expect(within(current).getByText("Unavailable: Fresh revision activity")).toBeVisible();
-    await act(async () => completeOld({
-      ...sourceAwareDetail(observed), audit: { status: "unavailable", reason: "Pre-revision activity" },
-    }));
-    expect(within(current).queryByText("Unavailable: Pre-revision activity")).not.toBeInTheDocument();
-    fireEvent.click(within(peer.container).getByText("Saved observations for Peer activity reader"));
-    expect(within(within(peer.container).getByRole("dialog"))
-      .getByText("Unavailable: Pre-revision activity")).toBeVisible();
-  });
-
-  it.each([0, 1, 20, 21])("distinguishes %s total activity associations from the bounded displayed rows", async count => {
-    const observed = observedRecord();
-    const shown = Math.min(count, 20);
-    const related = sourceAwareDetail(observed);
-    related.audit = {
-      status: "available", count,
-      value: Array.from({ length: shown }, (_, index) => ({
-        jobId: "audit-job", wrapperId: `wrapper-${index}`, nativeEventId: null,
-        observedAt: related.observedAt, operation: `Audit operation ${index}`,
-        resultStatus: null, correlationId: null, matchedKind: "cds_bot_id",
-      })),
+  it("keeps Purview selected through inventory and data refreshes without exposing previous scope results", async () => {
+    const context = {
+      recordId: record.id, displayName: record.displayName,
+      defender: { status: "unavailable" as const, entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" as const },
+      purview: { status: "unavailable" as const, mode: "saved_only" as const, reason: "No exact bot mapping." },
     };
-    related.security = {
-      status: "available", count,
-      value: Array.from({ length: shown }, (_, index) => ({
-        jobId: "security-job", snapshotId: "security-snapshot", nativeRecordId: `Security record ${index}`,
-        observedAt: related.observedAt, platform: null, lifecycleStatus: null, publishedStatus: null,
-        matchedKind: "entra_agent_id",
-      })),
-    };
-    vi.mocked(api.getInventorySourceAwareDetail).mockResolvedValue(related);
-    renderDetail({ record: observed, activeTab: "audit-security" });
-    const summary = count === 0 ? "Authorized and queried; no exact associated records."
-      : `${count} exact associated record${count === 1 ? "" : "s"}; showing ${shown}.`;
-    expect(await screen.findAllByText(summary)).toHaveLength(2);
-    expect(screen.getAllByText(summary)[0]).not.toBeVisible();
-    fireEvent.click(screen.getByText(`Saved observations for ${observed.displayName}`));
-    expect(screen.getAllByText(summary)[0]).toBeVisible();
-    expect(screen.queryAllByText(/^Audit operation \d+$/)).toHaveLength(shown);
-    expect(screen.queryAllByText(/^Security record \d+$/)).toHaveLength(shown);
+    const lookup = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValue(context);
+    const { update } = renderDetail({ activeTab: "audit-security", inventoryRevision: "first" });
+    await screen.findByRole("heading", { name: "Defender linking not supported for this agent" });
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(screen.getByText("No exact bot mapping.")).toBeVisible();
+    update({ dataRevision: 1, inventoryRevision: "second" });
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByText("No exact bot mapping.")).not.toBeInTheDocument();
+    await screen.findByText("No exact bot mapping.");
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
   });
 
   it("offers common Manage controls for every package and quarantine with exact target callbacks", async () => {
@@ -1690,7 +1569,7 @@ describe("UnifiedAgentDetailModal", () => {
       { ...record.packages[0], id: "package-2", displayName: "Package two", isBlocked: true },
     ];
     const { props } = renderDetail({ record: observed, activeTab: "controls" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     expect(screen.getByRole("heading", { name: "Manage" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Quarantine and restore" })).toBeVisible();
     expect(screen.getByRole("region", { name: "Availability settings" })).toHaveTextContent("Saved: All users");
@@ -1708,7 +1587,7 @@ describe("UnifiedAgentDetailModal", () => {
     }
     expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Restore from quarantine" })).toBeEnabled();
-    expect(screen.getByText(/Makers may still see and test a quarantined bot/)).toBeVisible();
+    expect(screen.getByText("Quarantine blocks connected channels; makers can still test in Copilot Studio. Package blocking is separate.")).toBeVisible();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
     expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
@@ -1756,7 +1635,7 @@ describe("UnifiedAgentDetailModal", () => {
       identifiers: [{ kind: "environment_id", value: environmentId }],
     };
     const { props } = renderDetail({ record: observed, activeTab: "controls" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     expect(screen.getByText(/one valid native CDS bot identity/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Quarantine" })).not.toBeInTheDocument();
     for (const item of observed.packages) {
@@ -1771,8 +1650,8 @@ describe("UnifiedAgentDetailModal", () => {
 
   it("offers quarantine for a resource-only agent without inventing package availability", async () => {
     renderDetail({ record: { ...observedRecord(), packages: [] }, activeTab: "controls" });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
-    expect(screen.getByText(/Availability and installation have not been observed/)).toBeVisible();
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
+    expect(screen.getByText("No published version is available for availability or installation settings.")).toBeVisible();
     expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block / })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Quarantine" })).toBeEnabled();
     expect(screen.getByText("Saved inventory status").parentElement).toHaveTextContent("Unknown");
@@ -1780,7 +1659,7 @@ describe("UnifiedAgentDetailModal", () => {
 
   it("keeps viewers read-only even on a directly opened Manage route", async () => {
     renderDetail({ record: observedRecord(), activeTab: "controls", roles: ["AgentControl.Viewer"] });
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     expect(screen.getByText(/AgentControl.Admin role is required/)).toBeVisible();
     expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block |^Quarantine$|Restore from quarantine/ })).not.toBeInTheDocument();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
@@ -1793,7 +1672,7 @@ describe("UnifiedAgentDetailModal", () => {
       if (scenario === "denied") view.decision.status = "missing_permission";
     }
     const { props } = renderDetail({ record: observedRecord(), activeTab: "controls" }, views, scenario === "missing-metadata" ? [] : workbenchActions);
-    await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+    expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
     for (const name of [
       "Block Package one (package-1)", "Quarantine", "Restore from quarantine",
     ]) {
@@ -1823,7 +1702,7 @@ describe("UnifiedAgentDetailModal", () => {
       if (scenario === "invalid-environment") resource.environmentId = "not-an-environment-id";
       if (scenario === "duplicate-bot") resource.identifiers.push({ kind: "cds_bot_id", value: "33333333-3333-4333-8333-333333333333" });
       renderDetail({ record: observed, activeTab: "controls" });
-      if (observed.observations.powerPlatform) await waitFor(() => expect(api.getInventorySourceAwareDetail).toHaveBeenCalledOnce());
+      if (observed.observations.powerPlatform) expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();
       await userEvent.click(screen.getByText("Additional control availability"));
       expect(screen.getByText(/Quarantine is unavailable/)).toBeVisible();
       if (scenario === "missing-bot") expect(screen.getByText(/one valid native CDS bot identity/)).toBeVisible();

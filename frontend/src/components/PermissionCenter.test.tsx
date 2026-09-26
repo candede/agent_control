@@ -36,6 +36,64 @@ async function openRequirements() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState({}, "", "/"); });
 
 describe("Permissions setup and issues", () => {
+  it("documents human roles separately without treating app roles as Microsoft role assignments", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Page value={{ ...context([]), user: { ...user, roles: [] } }} />);
+    const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
+    expect(guide.getByText(/not the API permissions on the app registration/)).toBeVisible();
+    expect(guide.getByText(/Admin includes Viewer; neither grants a Microsoft administrator role/)).toBeVisible();
+    expect(guide.getByText(/it does not enumerate or certify all of your Microsoft role assignments/)).toBeVisible();
+    expect(within(guide.getByRole("article", { name: "View, filter and export saved data" })).getByText("AgentControl.Viewer or AgentControl.Admin")).toBeVisible();
+    expect(within(guide.getByRole("article", { name: "Import and manage usage reports" })).getByText("AgentControl.Admin")).toBeVisible();
+    expect(guide.getByText(/activate it in My roles before the task/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
+    expect(screen.getByRole("region", { name: "Issues" })).toHaveTextContent("Ask an administrator to assign");
+    expect(screen.getByRole("navigation", { name: "Permissions sections" })).toHaveTextContent("Signed-in user roles");
+    expect(screen.getByRole("region", { name: "Signed-in user roles" }).querySelector("details")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("covers agent controls, directory reads, report downloads and service-specific log roles", () => {
+    render(<Page value={context([])} />);
+    const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
+    const task = (name: string) => guide.getByRole("article", { name });
+    expect(task("Block or unblock Microsoft 365 agents")).toHaveTextContent("AgentControl.Admin");
+    expect(task("Block or unblock Microsoft 365 agents")).toHaveTextContent("does not name an additional Entra role");
+    expect(task("Change agent availability and installation assignments")).toHaveTextContent("AgentControl.Admin");
+    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("AI Reader for agents/environments");
+    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("REST API does not publish a separate human-role minimum");
+    expect(task("Read Copilot Studio quarantine status")).toHaveTextContent("AgentControl.Viewer or AgentControl.Admin");
+    expect(task("Quarantine or restore Copilot Studio agents")).toHaveTextContent("AI Administrator, Power Platform Administrator or Global Administrator");
+    expect(task("Resolve a Studio agent's log identity")).toHaveTextContent("Agent ID Administrator");
+    expect(task("Sync users and Copilot licenses")).toHaveTextContent("Directory Readers");
+    expect(task("Refresh Copilot activity in Office apps")).toHaveTextContent("Reports Reader or AI Administrator");
+    expect(task("Download usage CSVs from Microsoft 365")).toHaveTextContent("No Agent Control role is needed");
+    expect(task("Download usage CSVs from Microsoft 365")).toHaveTextContent("summary-only reporting role is not sufficient");
+    expect(task("Import and manage usage reports")).toHaveTextContent("AgentControl.Admin");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("Purview Audit Reader");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("not Entra directory roles");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("Security Reader + Purview Audit Reader");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("not a proven endpoint-specific minimum");
+    expect(task("Run Defender and Agent 365 hunts")).toHaveTextContent("data sources and device groups");
+  });
+
+  it("links every topic and Microsoft requirement without adding role-assignment or consent actions", () => {
+    render(<Page value={context([])} />);
+    const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
+    const topics = within(guide.getByRole("navigation", { name: "User role topics" })).getAllByRole("link");
+    expect(topics).toHaveLength(4);
+    for (const link of topics) expect(document.querySelector(link.getAttribute("href")!)).not.toBeNull();
+    const references = guide.getAllByRole("link").filter(link => link.getAttribute("target") === "_blank");
+    expect(references.length).toBeGreaterThan(20);
+    for (const link of references) {
+      expect(link).toHaveAttribute("href", expect.stringMatching(/^https:\/\/learn\.microsoft\.com\//));
+      expect(link).toHaveAttribute("rel", "noreferrer");
+    }
+    expect(guide.queryByRole("button")).not.toBeInTheDocument();
+    expect(guide.queryByText(/CopilotPackages.ReadWrite.All|User.Read.All|Reports.Read.All/)).not.toBeInTheDocument();
+  });
+
   it("keeps app-only authentication failures out of user sign-in recovery, including issue details", async () => {
     const view = fixture("available", "graph.package.read.application");
     view.operationFailure = { status: "unknown", checkedAt: new Date(now - 1000).toISOString(),
@@ -257,8 +315,9 @@ describe("Permissions setup and issues", () => {
   it("makes missing app-role setup clear without a no-op retry button", () => {
     render(<Page value={{ ...context([]), user: { ...user, roles: [] } }} />);
     expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
-    expect(screen.getByText("AgentControl.Viewer")).toBeVisible();
-    expect(screen.getByText("AgentControl.Admin")).toBeVisible();
+    const issues = within(screen.getByRole("region", { name: "Issues" }));
+    expect(issues.getByText("AgentControl.Viewer")).toBeVisible();
+    expect(issues.getByText("AgentControl.Admin")).toBeVisible();
     expect(screen.getByRole("button", { name: "Permissions" })).toHaveAccessibleDescription("Permissions: app role required");
   });
 

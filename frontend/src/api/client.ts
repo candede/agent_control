@@ -4,7 +4,8 @@ import type { PackageDetailFreshness, PackageStatus } from "../../../backend/src
 export type { PackageStatus } from "../../../backend/src/types/copilotPackage";
 import type { InventoryRefreshJob, InventoryRefreshJobList, InventorySnapshot, PowerPlatformResource, PowerPlatformResourceType } from "../../../backend/src/types/powerPlatformInventory";
 export { powerPlatformResourceTypes } from "../../../backend/src/types/powerPlatformInventory";
-import type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+import type { OfficialUsageAgentDetailView, OfficialUsageAgentUsersView, OfficialUsageAggregateView, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportBase, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
+export type { OfficialUsageAgentUsersView } from "../../../backend/src/types/officialUsage";
 import type { CopilotUsageUsersResponse } from "../../../backend/src/types/copilotUsage";
 import type { PurviewAuditFilters, PurviewAuditHistory, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 import type { DefenderHuntingFilters, DefenderHuntingHistory, DefenderHuntingJob, DefenderHuntingQualificationEvidence, DefenderHuntingRetainedScope, DefenderHuntingRowPage, DefenderHuntingTokenMode } from "../../../backend/src/types/defenderHunting";
@@ -920,6 +921,16 @@ export function getOfficialUsageAgentDetail(
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) if (value !== undefined) params.set(key, String(value));
   return request<OfficialUsageAgentDetailView>(`/api/official-usage/agents/${encodeURIComponent(agentId)}${params.size ? `?${params}` : ""}`, { signal: options.signal });
+}
+
+export function getOfficialUsageAgentUsers(
+  query: { agentIds: string[]; setId: string; search?: string; limit?: number; offset?: number },
+  options: { signal?: AbortSignal } = {},
+) {
+  const { agentIds, ...rest } = query;
+  const params = new URLSearchParams({ agentIds: JSON.stringify(agentIds) });
+  for (const [key, value] of Object.entries(rest)) if (value !== undefined) params.set(key, String(value));
+  return request<OfficialUsageAgentUsersView>(`/api/official-usage/agent-users?${params}`, { signal: options.signal });
 }
 
 export function getCopilotUsageUsers(options: { signal?: AbortSignal } = {}) {

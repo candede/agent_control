@@ -12,7 +12,7 @@ import { requestScope } from "../middleware/auth.js";
 import { parseOfficialUsageReport, OfficialUsageValidationError } from "../services/officialUsageParser.js";
 import { OfficialUsageHistoryService } from "../services/officialUsageHistory.js";
 import { OfficialUsageOverviewService } from "../services/officialUsageOverview.js";
-import { buildOfficialUsageAgentDetailView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
+import { buildOfficialUsageAgentDetailView, buildOfficialUsageAgentUsersView, buildOfficialUsageAggregateView, buildOfficialUsageUserView } from "../services/officialUsageViews.js";
 import { getAuditLog } from "../services/auditLog.js";
 import { buildBoundedCsv, createExportPublicationValidator, publishBoundedCsv } from "../services/csvExport.js";
 import type { AppRole } from "../types/capability.js";
@@ -325,6 +325,28 @@ export function createOfficialUsageRouter(database: pg.Pool = pool) {
         };
       },
     });
+  });
+
+  policyRoute(router, "get", "/official-usage/agent-users", {
+    access: "authenticated", dataClass: "official_usage_user", roles: ["AgentControl.Viewer"],
+  }, async (request, response) => {
+    const { agentIds: rawIds, ...query } = request.query;
+    const options = agentDetailViewOptions(query);
+    let ids: unknown;
+    try {
+      ids = typeof rawIds === "string" ? JSON.parse(rawIds) : undefined;
+    } catch {
+      throw new AppError(400, "invalid_usage_query", "Choose valid report agent IDs.");
+    }
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100) {
+      throw new AppError(400, "invalid_usage_query", "Choose between 1 and 100 report agent IDs.");
+    }
+    const agentIds = ids.map(id => reportAgentId(id, "invalid_usage_query"));
+    const setId = querySetId(query);
+    if (!setId) throw new AppError(400, "invalid_usage_query", "Choose a report set.");
+    response.json(buildOfficialUsageAgentUsersView(
+      await repository.getPublished(requestScope(request).tenantId, setId), agentIds, options,
+    ));
   });
 
   policyRoute(router, "get", "/official-usage/agents/:agentId", {

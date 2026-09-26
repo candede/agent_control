@@ -4,13 +4,30 @@ Microsoft Purview Audit Search is compliance and security evidence. It is **not*
 
 ## Entity entry points
 
-- **Users > individual user details > Purview audit** opens the live search workflow without running a query. The verified directory UPN is fixed for new searches and qualification. History is restricted server-side to authorized jobs with that single UPN before counting or pagination, excluding broad and multi-user searches. Both paid-user and reported-user modals provide this entry point when a current exact directory link exists; concealed or unlinked report identities remain unavailable.
+- **Users > individual user details > Purview audit** displays the search workflow directly, without an extra open/close control or expandable sections. Opening the tab does not run a query. The verified directory UPN is read-only for new searches and qualification. History is restricted server-side to authorized jobs with that single UPN before counting or pagination, excluding broad and multi-user searches. Both paid-user and reported-user modals provide this entry point when a current exact directory link exists; concealed or unlinked report identities remain unavailable.
 - **Agents > individual agent details > Activity > Purview audit** retains search, operation filtering, pagination and details for saved Studio administrative records. The exact bot/environment identity is required. This is saved evidence, not live agent-scoped collection; unsupported mappings stay unavailable rather than running an unscoped search.
 - **Audit** shows only local administrative actions taken through this app. Old `source=purview`, `job` and `user` query parameters no longer select provider content and are removed while retaining valid local filters. Select an entity in Users or Agents to investigate and recover its searches there; there is no standalone Jobs page. Legacy broad/multi-user jobs are not presented as one user's history.
 
 The embedded user panel requires the selected directory UPN. It has no standalone unscoped mode, editable user selector, or bookmark-selected job entry point. Jobs created or resumed within the panel still retain their exact selection and recovery controls. The provider service, authorized saved-job APIs and retention remain shared infrastructure, not retired page code.
 
 The adapter and product workflow are fixture-qualified. No approved tenant lifecycle was run in Phase 07, so no live provider access is claimed. An automatic Permission Center check acquires the scoped token only, reports token verification, and never creates or runs a Microsoft query. Opening the view also creates no query. For delegated Viewer/Admin use, current capability authorization plus the user's explicit bounded search submission gates the selected create, poll and records lifecycle; that request establishes evidence for its principal without a separate approve/start qualification ritual. Application/shared mode remains separately Admin-approved and qualified.
+
+## Coverage And Setup In The User Tab
+
+The tab puts authorization, preset and date inputs first, followed by compact coverage/setup cards (side by side where space permits). Human-readable log labels, access state, current verification, required Graph permission, filters and result metadata remain directly visible; raw service/record-type identifiers are reserved for result metadata and this contract reference:
+
+| Preset | Selected service and record type | Coverage |
+| --- | --- | --- |
+| Copilot interactions | `Copilot` / `copilotInteraction` | `CopilotInteraction` events with actor, app/host and message identifiers when the provider supplies them. Not prompt or response text, transcripts, or usage-report totals. |
+| Copilot Studio administration | `PowerPlatform` / `powerPlatformAdministratorActivity` | The catalog's allowlisted bot create/delete/update/publish/share operations, component and component-collection changes, AI-plugin-operation changes, and environment-variable changes. Not bot conversations or general Power Platform activity. |
+
+**Check permissions** runs the same readiness refresh used by Permissions. For Purview delegated access, this checks token readiness, not the provider query lifecycle or complete Microsoft role/license entitlement. The tab distinguishes token verification from provider verification; **Run Audit Search** is the explicit functional create/poll/records check. Missing `AuditLogsQuery.Read.All` consent, Microsoft Purview Audit enablement, and the Audit Logs or View-Only Audit Logs role are surfaced as setup requirements, not empty results. **Open Permissions** remains available for configuration when access is not ready.
+
+Application mode requires configured application identity/credentials, the application permission, Admin-enabled mode and an approved shared data scope. **Check permissions** does not run application qualification. An Admin selects a window of at most one hour, approves it, then explicitly starts the qualification. Ordinary searches allow up to 168 hours; collection remains bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
+
+`PurviewAuditView` accepts `active?: boolean` (default `true`) for visited tabs that stay mounted. While inactive it renders no content, stops saved-history polling and aborts its owned reads/actions. Form fields and selected-job state are retained in memory for the same account, roles, selected UPN and meaningful capability access/configuration state. Capability timestamp, freshness and verification-only renewals do not remount the form.
+
+On return, the tab reloads the catalog and scoped history, revalidates the exact selected job, and reloads a previously viewed saved record page before displaying it. Saved-query keys include the account/access/user scope so another observer cannot retain a prior account's request for the new account. Denied, deleted, expired or mismatched selections fail closed. Switching tabs neither submits nor resumes provider work, and does not reset the five-minute/150-attempt UI polling budget; an explicit history refresh can restart that budget. Aborting a browser request does not undo an already accepted server query; its saved job can be recovered from history.
 
 ## Selected Graph Contract
 

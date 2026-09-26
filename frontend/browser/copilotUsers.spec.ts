@@ -44,6 +44,64 @@ async function mockReportedUsers(page: Page, published = activeWithoutPaidPublis
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("all user summary cards filter directly with readable selected, hover and keyboard states", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.goto("/users");
+  const summary = page.getByRole("group", { name: "M365 Copilot license summary", exact: true });
+  const cards = summary.getByRole("button");
+  const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
+  const all = summary.getByRole("button", { name: "Active M365 Copilot licensed users", exact: true });
+  const using = summary.getByRole("button", { name: "Using agents", exact: true });
+  const attention = summary.getByRole("button", { name: "Needs attention", exact: true });
+  const unknown = summary.getByRole("button", { name: "Agent usage unknown", exact: true });
+  await expect(cards).toHaveCount(4);
+  await expect(page.locator(".copilot-users-tabs")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Licensed users", exact: true })).toHaveCount(0);
+  await expect(all).toHaveAttribute("aria-pressed", "true");
+  await expect(cards.locator("strong")).toHaveText(["4", "2", "2", "1"]);
+  for (const card of await cards.all()) {
+    const contentInsets = await card.evaluate(element => {
+      const style = getComputedStyle(element);
+      const left = element.getBoundingClientRect().left + parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth);
+      return Array.from(element.children).map(child => child.getBoundingClientRect().left - left);
+    });
+    for (const inset of contentInsets) expect(Math.abs(inset)).toBeLessThanOrEqual(1);
+    const colors = await card.locator("span, strong, small").evaluateAll(elements => elements.map(element => getComputedStyle(element).color));
+    await card.hover();
+    expect(await card.locator("span, strong, small").evaluateAll(elements => elements.map(element => getComputedStyle(element).color))).toEqual(colors);
+    await expect(card).toHaveCSS("background-color", "rgb(240, 239, 255)");
+  }
+  await all.focus();
+  await page.keyboard.press("Tab");
+  await expect(using).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(table.locator("tbody tr")).toHaveCount(2);
+  await expect(table.locator("tbody tr").first()).toContainText("Ada");
+  await expect(table.locator("tbody tr").last()).toContainText("Ben");
+  await page.keyboard.press("Tab");
+  await expect(attention).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(table.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByLabel("Low agent usage threshold")).toBeVisible();
+  await page.keyboard.press("Tab");
+  await expect(unknown).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.locator("tbody tr")).toContainText("Drew");
+  await expect(summary.getByRole("button", { pressed: true })).toHaveCount(1);
+  await using.click();
+  await expect(table.locator("tbody tr")).toHaveCount(2);
+  await using.click();
+  await expect(all).toHaveAttribute("aria-pressed", "true");
+  await expect(table.locator("tbody tr")).toHaveCount(4);
+  await page.mouse.move(0, 0);
+  await expect(all).toHaveCSS("background-color", "rgb(248, 247, 255)");
+  expect(await summary.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("clickable-user-summary-cards.png") });
+  expect(unexpected).toEqual([]);
+});
+
 test("paid users remain searchable beyond four thousand without exposing checked nonpaid candidates", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   const fixture = structuredClone(copilotUsageFixture);
@@ -129,11 +187,12 @@ test("effectively licensed users lead with useful data and support ranked employ
 
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const detail = page.getByRole("dialog", { name: "Ada", exact: true });
+  await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await expect(detail.getByRole("cell", { name: "Researcher synthetic-researcher", exact: true })).toBeVisible();
   await expect(detail.getByText("Microsoft", { exact: true })).toBeVisible();
   await expect(detail.getByText("Outlook", { exact: true })).toBeVisible();
   await expect(detail.getByRole("link")).toHaveCount(0);
-  await expect(detail.getByText("Anyone, not this user", { exact: true })).toBeVisible();
+  await expect(detail.getByRole("columnheader", { name: "Agent-wide last activity", exact: true })).toBeVisible();
   await expect(page.locator(".copilot-users").getByRole("link")).toHaveCount(0);
   await expect(page.locator(".copilot-users").getByRole("button", { name: "Sync users" })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include(".copilot-user-dialog").analyze()).violations).toEqual([]);
@@ -171,7 +230,7 @@ test("disabled bundle candidates stay excluded from paid cohorts and licensed ad
   await page.getByRole("button", { name: "Needs attention", exact: true }).click();
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(table.getByRole("row", { name: /Ben/ })).toHaveCount(0);
-  await page.getByRole("button", { name: "Usage unknown", exact: true }).click();
+  await page.getByRole("button", { name: "Agent usage unknown", exact: true }).click();
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table.getByRole("row", { name: /Drew/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "All checked users", exact: true })).toHaveCount(0);
@@ -215,6 +274,7 @@ test("paid user details retain their agent breakdown without navigating to the n
   await page.goto("/users");
   await page.getByRole("button", { name: "Ada", exact: true }).click();
   const detail = page.getByRole("dialog", { name: "Ada", exact: true });
+  await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await expect(detail.getByRole("region", { name: "User agent breakdown" }).locator("tbody tr")).toHaveCount(2);
   await expect(detail.getByRole("row", { name: /Researcher/ })).toBeVisible();
   await expect(detail.getByRole("button", { name: "Researcher", exact: true })).toHaveCount(0);
@@ -266,7 +326,8 @@ test("the active nonpaid cohort excludes paid and unknown identities and explain
   await expect(details.getByText("No active M365 Copilot license", { exact: true })).toBeVisible();
   await expect(details.getByText("License not verified", { exact: true })).toHaveCount(0);
   await expect(details.getByRole("region", { name: "Microsoft 365 Copilot paid features" })).toHaveCount(0);
-  await expect(details.getByText(/Responsibility unavailable: no exact verified directory object ID/)).toBeVisible();
+  await details.getByRole("tab", { name: "Responsibility", exact: true }).click();
+  await expect(details.getByText(/Link this user to a directory identity/)).toBeVisible();
   expect(responsibilityReads).toEqual([]);
   expect(unexpected).toEqual([]);
 });
@@ -365,6 +426,7 @@ test("reported activity stays bounded with 2,053 users and 1,005 agents for one 
   await detailButton.focus();
   await page.keyboard.press("Enter");
   const dialog = page.getByRole("dialog", { name: largeUserName, exact: true });
+  await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   const agents = dialog.getByRole("region", { name: "User agent breakdown" });
   await expect(agents.locator("tbody tr")).toHaveCount(50);
   const readsBeforeAgentPaging = measurements.length;

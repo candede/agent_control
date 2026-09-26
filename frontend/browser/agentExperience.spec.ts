@@ -73,9 +73,10 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await mockUsageReports(page, unexpected);
   const reportReads: string[] = [];
   const otherReportRequests: string[] = [];
+  const overviewReads = ["/api/official-usage/admin", "/api/official-usage/history", "/api/official-usage/overview"];
   page.on("request", request => {
     const path = new URL(request.url()).pathname;
-    if (path.startsWith("/api/official-usage/") && path !== "/api/official-usage/overview") otherReportRequests.push(request.url());
+    if (path.startsWith("/api/official-usage/") && !overviewReads.includes(path)) otherReportRequests.push(request.url());
   });
   page.on("requestfinished", request => {
     if (new URL(request.url()).pathname.startsWith("/api/official-usage/")) reportReads.push(request.url());
@@ -88,7 +89,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Official usage", exact: true })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Agent inventory overview" })).toContainText("Reported used agents");
-  await expect.poll(() => reportReads.map(url => new URL(url).pathname)).toEqual(["/api/official-usage/overview"]);
+  await expect.poll(() => reportReads.map(url => new URL(url).pathname).sort()).toEqual(overviewReads);
   await page.screenshot({ path: info.outputPath("agents-inventory.png"), fullPage: true });
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
@@ -102,9 +103,9 @@ test("Agents separates its compact overview from agent details and snapshot resp
   const bounds = await dialog.boundingBox();
   await page.screenshot({ path: info.outputPath("agent-overview.png") });
   await dialog.getByRole("tab", { name: "Usage & users" }).click();
-  await expect(dialog.getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
-  await expect(dialog.getByRole("region", { name: "Usage and users for Service desk assistant" })).toContainText("Its response totals, active users, and last-used date are unavailable.");
-  await expect(dialog.getByText(/Missing usage data does not mean zero usage/)).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "Usage unavailable" })).toBeVisible();
+  await expect(dialog.getByRole("region", { name: "Usage and users for Service desk assistant" })).toContainText("Report data is unavailable. Reload usage to try again.");
+  await expect(dialog.getByText(/Missing usage data does not mean zero usage/)).toHaveCount(0);
   await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);
   await expect(dialog.getByLabel("Selected agent report metrics")).toHaveCount(0);
   await expect(dialog.getByLabel("Find a reported agent")).toHaveCount(0);
@@ -125,10 +126,11 @@ test("Agents separates its compact overview from agent details and snapshot resp
   expect(await dialog.boundingBox()).toEqual(bounds);
   await page.screenshot({ path: info.outputPath("agent-access.png") });
   await dialog.getByRole("tab", { name: "Activity" }).click();
-  await expect(dialog.getByRole("heading", { name: "Activity for Service desk assistant" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "Agent logs", exact: true })).toBeVisible();
   await expect(dialog.getByRole("link", { name: "Search tenant interactions" })).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: "View management audit" })).toHaveCount(0);
-  await expect(dialog.getByText("No saved activity is linked to this agent's inventory record.")).toBeVisible();
+  await expect(dialog.getByText("No saved activity is linked to this agent.")).toHaveCount(0);
+  await expect(dialog.getByRole("region", { name: "Defender log coverage and setup" })).toBeVisible();
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: info.outputPath("agent-activity.png") });
@@ -136,7 +138,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(dialog).not.toBeVisible();
   await expect(page.getByRole("button", { name: "Service desk assistant", exact: true })).toBeFocused();
   await expect(page.getByRole("region", { name: "Tenant adoption insights" })).toHaveCount(0);
-  expect(reportReads.map(url => new URL(url).pathname)).toEqual(["/api/official-usage/overview"]);
+  expect(reportReads.map(url => new URL(url).pathname).sort()).toEqual(overviewReads);
   expect(otherReportRequests).toEqual([]);
   expect(unexpected).toEqual([]);
 });
@@ -160,13 +162,15 @@ test("users can switch cohorts and traverse nonpaid activity without losing rout
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("reported-user-activity.png"), fullPage: true });
   await activity.getByRole("button", { name: "View reported details for Emery", exact: true }).click();
+  await page.getByRole("dialog", { name: "Emery" }).getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await page.getByRole("dialog", { name: "Emery" }).getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
   const selectedAgentUrl = new RegExp(`agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`);
   await expect(page).toHaveURL(selectedAgentUrl);
   await expect(activity.locator("tbody tr")).toHaveCount(1);
   await activity.getByRole("button", { name: "View reported details for Emery", exact: true }).click();
   const user = page.getByRole("dialog", { name: "Emery" });
-  await expect(user.getByText("Responses (Users report)", { exact: true })).toBeVisible();
+  await expect(user.getByText("Agent responses", { exact: true })).toBeVisible();
+  await user.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await user.getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
   await expect(user).not.toBeVisible();
   await expect(page).toHaveURL(selectedAgentUrl);
@@ -206,8 +210,8 @@ for (const state of ["missing", "unavailable"] as const) {
     await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
     await dialog.getByRole("tab", { name: "Usage & users" }).click();
-    await expect(dialog.getByRole("heading", { name: "No matched usage data for this agent" })).toBeVisible();
-    await expect(dialog.getByText(/Missing usage data does not mean zero usage/)).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "Usage unavailable" })).toBeVisible();
+    await expect(dialog.getByText("Report data is unavailable. Reload usage to try again.")).toBeVisible();
     await expect(dialog.getByRole("link", { name: "Open usage reports" })).toHaveCount(0);
     await expect(dialog.getByRole("alert")).toHaveCount(0);
     await expect(dialog.getByLabel("Tenant report totals")).toHaveCount(0);

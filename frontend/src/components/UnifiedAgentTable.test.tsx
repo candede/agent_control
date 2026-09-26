@@ -157,10 +157,17 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getByRole("columnheader", { name: "Hosts" })).toBeInTheDocument();
     expect(screen.getByText("Copilot / Teams")).toBeInTheDocument();
     fireEvent.click(within(picker).getByRole("checkbox", { name: "Environment" }));
-    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Environment" })).toBeInTheDocument();
+    fireEvent.click(within(picker).getByRole("checkbox", { name: "Publisher" }));
+    fireEvent.click(within(picker).getByRole("checkbox", { name: "Responses" }));
+    expect(screen.queryByRole("columnheader", { name: "Publisher" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Responses" })).not.toBeInTheDocument();
     fireEvent.click(within(picker).getByRole("button", { name: "Reset defaults" }));
     expect(screen.queryByRole("columnheader", { name: "Hosts" })).not.toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Environment" })).toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "Environment" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("columnheader").map(header => header.textContent)).toEqual([
+      "Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions",
+    ]);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Choose agent columns" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Columns" })).toHaveFocus();
@@ -177,9 +184,6 @@ describe("UnifiedAgentTable", () => {
     expect(onSortChange).toHaveBeenCalledWith("displayName", "desc");
     update({ sortDirection: "desc" });
     expect(screen.getByRole("columnheader", { name: "Agent" })).toHaveAttribute("aria-sort", "descending");
-    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
-    fireEvent.keyDown(document, { key: "Escape" });
     fireEvent.click(screen.getByRole("button", { name: "Sort by Responses" }));
     expect(onSortChange).toHaveBeenLastCalledWith("responses", "desc");
   });
@@ -208,9 +212,6 @@ describe("UnifiedAgentTable", () => {
       ...record,
       usage: automaticAgentUsageFixture({ responses: 0, activeUsers: 0, lastActivityDateUtc: null }),
     }] });
-    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
-    fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("cell", { name: "0" })).toBeInTheDocument();
     update({ records: [record] });
     expect(screen.getByRole("cell", { name: "Unavailable" })).toBeInTheDocument();
@@ -224,7 +225,6 @@ describe("UnifiedAgentTable", () => {
       records: [{ ...record, usage: automaticAgentUsageFixture() }], usageContext: automaticUsageContext,
     });
     fireEvent.click(screen.getByRole("button", { name: "Columns" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "Responses" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Active users" }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
@@ -242,6 +242,18 @@ describe("UnifiedAgentTable", () => {
     expect(screen.getAllByRole("cell", { name: "Unavailable" })).toHaveLength(2);
     update({ usageContext: { ...automaticUsageContext, availability: "stale" } });
     expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
+  });
+
+  it("leaves report context to the overview when embedded with inventory controls", () => {
+    const { update } = renderTable({
+      controls: <section aria-label="Filters">Inventory controls</section>,
+      records: [{ ...record, usage: automaticAgentUsageFixture() }], usageContext: automaticUsageContext,
+    });
+    expect(screen.getByRole("cell", { name: "181" })).toBeVisible();
+    expect(document.querySelector(".agent-report-note")).toBeNull();
+    expect(screen.queryByText(usageCoverageLabel(automaticUsageContext.reportSet))).not.toBeInTheDocument();
+    update({ controls: undefined });
+    expect(screen.getByText(usageCoverageLabel(automaticUsageContext.reportSet))).toBeVisible();
   });
 
   it("surfaces malformed optional timestamps without crashing the table or inventing dates", () => {
@@ -267,21 +279,25 @@ describe("UnifiedAgentTable", () => {
   });
 
   it("renders one logical agent with friendly columns, one checkbox, and one detail entry point", () => {
-    const { props } = renderTable({ environmentNames: { [record.environmentId!]: "Production" } });
+    const { props } = renderTable({
+      environmentNames: { [record.environmentId!]: "Production" },
+      records: [{ ...record, packages: record.packages.map(item => ({ ...item, publisher: "Synthetic publisher" })) }],
+    });
     expect(screen.getByRole("region", { name: "Unified agents" })).toContainElement(screen.getByRole("table"));
     expect(screen.getAllByRole("row")).toHaveLength(2);
     expect(screen.getAllByRole("columnheader").map(header => header.textContent)).toEqual([
-      "Select agents", "Agent", "Environment", "Built with", "End-user access", "Status", "Actions",
+      "Select agents", "Agent", "Publisher", "Built with", "Responses", "End-user access", "Status", "Actions",
     ]);
     expect(screen.getAllByRole("checkbox")).toHaveLength(1);
-    expect(screen.getByText("Production")).toBeInTheDocument();
+    expect(screen.getByText("Synthetic publisher")).toBeInTheDocument();
+    expect(screen.queryByText("Production")).not.toBeInTheDocument();
     expect(screen.getAllByText("Agent Builder")).toHaveLength(1);
     expect(screen.queryByText(/Graph|Linked by|No verified link|exact quarantine target/)).not.toBeInTheDocument();
     expect(screen.queryByText(/0 .*selected/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select Builder agent" }));
-    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(record);
+    expect(props.onToggleSelection).toHaveBeenCalledExactlyOnceWith(props.records[0]);
     fireEvent.click(screen.getByRole("button", { name: "View details for Builder agent" }));
-    expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(record);
+    expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(props.records[0]);
     expect(screen.queryByRole("button", { name: "Manage Builder agent" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Manage access|^Block / })).not.toBeInTheDocument();
   });
@@ -470,10 +486,13 @@ describe("UnifiedAgentTable", () => {
       records: [group], selectedPackageIds: new Set(group.packages.map(item => item.id)),
       environmentNames: { [record.environmentId!]: "Package-declared environment" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getAllByRole("row")).toHaveLength(2);
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(screen.getByText("2 published versions selected")).toBeVisible();
-    expect(within(screen.getAllByRole("row")[1]).getAllByRole("cell")[2]).toHaveTextContent(environmentId ? "Package-declared environment" : "Unknown");
+    expect(within(screen.getAllByRole("row")[1]).getAllByRole("cell")[3]).toHaveTextContent(environmentId ? "Package-declared environment" : "Unknown");
     expect(screen.queryByText(/exact quarantine target selected/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "View details for Builder agent" }));
     expect(props.onViewDetails).toHaveBeenCalledExactlyOnceWith(group);
@@ -481,6 +500,9 @@ describe("UnifiedAgentTable", () => {
 
   it("uses lowercase environment lookup keys with an honest ID fallback", () => {
     const { update } = renderTable({ records: [{ ...record, environmentId: "ENVIRONMENT-A" }], environmentNames: { "environment-a": "Friendly environment" } });
+    fireEvent.click(screen.getByRole("button", { name: "Columns" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Environment" }));
+    fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByText("Friendly environment")).toBeInTheDocument();
     update({ environmentNames: {} });
     expect(screen.getByText("ENVIRONMENT-A")).toBeInTheDocument();
@@ -490,10 +512,10 @@ describe("UnifiedAgentTable", () => {
     renderTable({ records: [{ ...record, packages: [], powerPlatformResource: { ...record.powerPlatformResource!, authoringTool: null, details: { createdIn: "FutureProvider.vNext_build-X" } } }] });
     const cells = within(screen.getAllByRole("row")[1]).getAllByRole("cell");
     expect(cells[3]).toHaveTextContent(/^Unknown$/);
-    expect(cells[4]).toHaveTextContent(/^Unknown$/);
-    expect(cells[5]).toHaveTextContent("Published");
-    expect(cells[5]).toHaveTextContent("Quarantine status unknown");
-    expect(cells[5]).not.toHaveTextContent(/Active|Allowed|Not blocked|Not quarantined/);
+    expect(cells[5]).toHaveTextContent(/^Unknown$/);
+    expect(cells[6]).toHaveTextContent("Published");
+    expect(cells[6]).toHaveTextContent("Quarantine status unknown");
+    expect(cells[6]).not.toHaveTextContent(/Active|Allowed|Not blocked|Not quarantined/);
   });
 
   it("keeps unknown publication and unmatched package metadata honest without source-link clutter", () => {

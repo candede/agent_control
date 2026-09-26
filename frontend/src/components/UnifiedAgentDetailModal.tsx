@@ -1,23 +1,19 @@
 import { useContext, useEffect, useEffectEvent, useId, useRef, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
 import {
-  getInventorySourceAwareDetail,
   type AppRole,
   type AgentUsageContext,
   type BulkActionResult,
   type CopilotPackage,
   type CopilotPackageDetail,
-  type InventorySourceAwareDetail,
   type PackageAccessUpdate,
   type UnifiedAgentRecord,
 } from "../api/client";
 import { hasAppRole } from "../../../backend/src/types/capability";
-import { powerPlatformAuthoringTool } from "../../../backend/src/types/powerPlatformInventory";
 import { quarantineTargetReason } from "../quarantineTarget";
 import { CapabilityContext } from "../capabilityContext";
 import { providerActionAllowed } from "../capabilityState";
 import { useAgentPeople } from "../useAgentPeople";
-import { useSavedRead } from "../savedQueries";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
@@ -34,10 +30,6 @@ const tabLabels: Record<DetailTab, string> = {
   "audit-security": "Activity",
   controls: "Manage",
 };
-type RelatedState =
-  | { key: string; status: "available"; value: InventorySourceAwareDetail }
-  | { key: string; status: "error"; message: string };
-
 type Props = {
   record: UnifiedAgentRecord;
   activeTab?: string;
@@ -92,13 +84,10 @@ export function UnifiedAgentDetailModal({
   onOpenPerson,
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
-  const readSaved = useSavedRead();
   const dialog = useRef<HTMLDialogElement>(null);
   const dialogMounted = useRef(false);
   const panel = useRef<HTMLElement>(null);
   const [internalTab, setInternalTab] = useState<DetailTab>("identities");
-  const [relatedState, setRelatedState] = useState<RelatedState>();
-  const [relatedRetry, setRelatedRetry] = useState(0);
   const [packageSelection, setPackageSelection] = useState(() => ({
     recordId: record.id,
     packageId: selectedPackageId ?? record.packages.find(item => item.id === packageDetail?.id)?.id ?? record.packages[0]?.id,
@@ -135,6 +124,7 @@ export function UnifiedAgentDetailModal({
     )));
   const preferredPackageId = packageSelection.recordId === record.id ? packageSelection.packageId : undefined;
   const selectedPackage = record.packages.find(item => item.id === preferredPackageId);
+  const packageLabels = record.packages.map(item => `${item.displayName}${item.version ? ` - Version ${item.version}` : ""}`);
   const missingPackageSelection = preferredPackageId !== undefined && !selectedPackage;
   const selectedDetail = packageDetail?.id === selectedPackage?.id ? packageDetail : undefined;
   const hasPackageConfirmation = Boolean(packageConfirmation);
@@ -148,18 +138,6 @@ export function UnifiedAgentDetailModal({
   const selectedTab = tabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
   const usesPackageDetails = selectedTab === "identities" || selectedTab === "controls";
   const resource = record.powerPlatformResource;
-  const snapshot = record.observations.powerPlatform;
-  const relatedKey = resource && snapshot
-    ? JSON.stringify([snapshot.snapshotId, resource.type, resource.environmentId, resource.nativeId, relatedRetry, dataRevision])
-    : undefined;
-  const scopedRelated = relatedState?.key === relatedKey ? relatedState : undefined;
-  const related = scopedRelated?.status === "available" ? scopedRelated.value : undefined;
-  const relatedError = scopedRelated?.status === "error" ? scopedRelated.message : "";
-  const relatedUnavailable = !resource
-    ? "No saved activity is linked to this agent's inventory record."
-    : !snapshot
-      ? "Saved activity cannot be loaded for this agent until its inventory observation is refreshed."
-      : undefined;
   const quarantineReason = quarantineTargetReason(resource ?? undefined, record.observations.powerPlatform);
   const canManage = hasAppRole(roles, "AgentControl.Admin");
   const inspectSelectedPackage = useEffectEvent(() => {
@@ -191,34 +169,6 @@ export function UnifiedAgentDetailModal({
       if (element?.open && typeof element.close === "function") element.close();
     };
   }, []);
-
-  const readRelated = useEffectEvent((signal: AbortSignal) => {
-    if (!resource || !snapshot || !relatedKey) return;
-    const input = {
-      snapshotId: snapshot.snapshotId,
-      nativeId: resource.nativeId,
-      environmentId: resource.environmentId,
-    };
-    readSaved(["inventory-source-aware-detail", input, relatedRetry, dataRevision], signal => getInventorySourceAwareDetail(input, { signal }), signal)
-      .then(result => {
-        if (!signal.aborted) setRelatedState({ key: relatedKey, status: "available", value: result });
-      })
-      .catch(error => {
-        if (!signal.aborted) {
-          setRelatedState({
-            key: relatedKey,
-            status: "error",
-            message: error instanceof Error ? error.message : "Source-aware details are unavailable.",
-          });
-        }
-      });
-  });
-
-  useEffect(() => {
-    const controller = new AbortController();
-    readRelated(controller.signal);
-    return () => controller.abort();
-  }, [readSaved, relatedKey]);
 
   function selectTab(tab: DetailTab) {
     setInternalTab(tab);
@@ -269,7 +219,7 @@ export function UnifiedAgentDetailModal({
       </div>
       {record.identity.invalidMetadata ? <div className="notice" role="status">
         <strong>Invalid saved matching metadata.</strong>{" "}
-        Select this agent on Agents, then open <strong>Sync &gt; View diagnostics</strong> and use <strong>Refresh matching details</strong> for 1-100 selected packages, or <strong>Refresh agents</strong> for the full inventory. A completed metadata check does not establish a match.
+        Select this agent on Agents, then choose <strong>Sync &gt; View diagnostics &gt; Refresh matching details</strong>.
       </div> : null}
       {packageDetailError ? <p className="error-banner unified-agent-detail-error" role="alert">{packageDetailError}</p> : null}
       <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
@@ -279,7 +229,9 @@ export function UnifiedAgentDetailModal({
             <select id={packageSelectId} value={selectedPackage?.id ?? ""} disabled={!record.packages.length || !canInspectPackage || packageActionsBusy || hasPackageConfirmation}
               onChange={event => setPackageSelection(current => ({ ...current, recordId: record.id, packageId: event.target.value }))}>
               {missingPackageSelection ? <option value="" disabled>Selected version unavailable</option> : null}
-              {record.packages.map(item => <option key={item.id} value={item.id}>{item.displayName}{item.version ? ` - Version ${item.version}` : ""} ({item.id})</option>)}
+              {record.packages.map((item, index) => <option key={item.id} value={item.id}>
+                {packageLabels[index]}{packageLabels.indexOf(packageLabels[index]) !== packageLabels.lastIndexOf(packageLabels[index]) ? ` (${index + 1})` : ""}
+              </option>)}
             </select>
           </div> : null}
           {missingPackageSelection ? <p className="error-banner" role="alert">
@@ -290,26 +242,18 @@ export function UnifiedAgentDetailModal({
             <button type="button" className="secondary" disabled={packageActionsBusy || packageDetailLoading} onClick={() => onInspectPackage(selectedPackage)}>Retry saved details</button>
           </WorkbenchActionGate> : canInspectPackage ? <p className="agent-metadata-status" role="status">{packageActionsBusy
             ? "Saved details will be loaded when the current management action finishes."
-            : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional saved details require the package read action to be available. The saved inventory information remains visible.</p> : null}
+            : "Loading saved agent details..."}</p> : <p className="agent-insight-note">Additional details require package read access.</p> : null}
         </> : null}
         {selectedTab === "identities" ? <AgentOverview onOpenPerson={onOpenPerson} key={`${record.id}:${selectedPackage?.id ?? "native"}:${selectedDetail?.observation?.observedAt ?? "saved"}`}
           record={record} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState} /> : null}
         {selectedTab === "reports" ? <AgentUsagePanel key={JSON.stringify([record.id, usageContext?.reportSet?.id, usageContext?.availability, usageContext?.revision, inventoryRevision])}
           record={record} context={usageContext} inventoryRevision={inventoryRevision} canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy} onChanged={onUsageChanged} /> : null}
-        {selectedTab === "identities" ? <details className="agent-technical-details">
-          <summary>Technical details</summary>
-          {resource ? <PowerPlatformPanel record={record} /> : null}
-          <IdentityPanel record={record} />
-        </details> : null}
-        {selectedTab === "audit-security" ? <>
+        {selectedTab === "audit-security" ?
           <AgentInvestigationsPanel recordId={record.id} agentName={record.displayName} roles={roles}
-            revision={JSON.stringify([inventoryRevision, dataRevision, relatedKey])} />
-          <AuditSecurityPanel agentName={record.displayName} related={related} error={relatedError} unavailable={relatedUnavailable} onRetry={() => setRelatedRetry(value => value + 1)} />
-        </> : null}
+            revision={JSON.stringify([inventoryRevision, dataRevision, record.observations.powerPlatform?.snapshotId])} /> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage</h3>
-          <p className="tab-description">Apply checks current settings before exact-target confirmation.</p>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
           {canManage && !canEditAccess ? <p className="agent-insight-note">Access settings are read-only until access-management permissions are available.</p> : null}
           {controlError ? <p className="error-banner" role="alert">{controlError}</p> : null}
@@ -327,12 +271,12 @@ export function UnifiedAgentDetailModal({
             onUpdate={onUpdatePackageAccess} onSetBlocked={onSetPackageBlocked} />
         </div> : null}
         {selectedTab === "controls" && !hasPackageConfirmation ? <>
-          {!record.packages.length ? <p>Availability and installation have not been observed. No published version is available for these controls.</p> : null}
+          {!record.packages.length ? <p>No published version is available for availability or installation settings.</p> : null}
           {!record.packages.length && quarantineReason ? <p className="agent-insight-note">No supported management target is present in the saved inventory. <a href="/sync">Refresh agent inventory</a> and <a href="/permissions">review permissions</a> before choosing a control.</p> : null}
           <div className="agent-management-sections">
             {resource && !quarantineReason ? <article className="agent-management-card">
               <div className="management-card-heading">
-                <div><h4>Quarantine and restore</h4><p>Restrict connected channels independently from availability and blocking of published versions.</p></div>
+                <h4>Quarantine and restore</h4>
               </div>
               <CopilotStudioQuarantineControls
                 key={JSON.stringify([resource.type, resource.environmentId, resource.nativeId])}
@@ -349,110 +293,4 @@ export function UnifiedAgentDetailModal({
       </section>
     </dialog>
   );
-}
-
-function IdentityPanel({ record }: { record: UnifiedAgentRecord }) {
-  return <>
-    <h3>{record.identity.state === "matched" ? "Linked by source metadata" : record.identity.state === "unmatched" ? "No verified link" : `${label(record.identity.state)} link evidence`}</h3>
-    <p className="association-status">{record.identity.reason ?? (record.identity.state === "matched"
-      ? "The sources share explicit source-declared provider metadata."
-      : "A source counterpart has not been proven.")}{record.identity.state === "matched" ? " This is correlation within the current authorized saved inventory, not a Microsoft-guaranteed native foreign key. This is not presented as a publicly documented Microsoft canonical identifier equivalence. Association does not grant or renew native controls." : ""}</p>
-    {record.identity.warnings?.length ? <>
-      <h4>Source identity warnings</h4>
-      <ul>{record.identity.warnings.map((warning, index) => <li key={`${warning.code}:${index}`}>{warning.message}</li>)}</ul>
-    </> : null}
-    <div className="inventory-detail-grid">
-      <Detail label="Unified record ID" value={record.id} />
-      <Detail label="Source presence" value={record.presence} />
-      <Detail label="Environment" value={record.environmentId} />
-      <Detail label="Graph packages" value={record.packages.length} />
-      <Detail label="Package IDs" value={record.packages.map(item => item.id).join(", ")} />
-      <Detail label="Power Platform resource" value={record.powerPlatformResource?.nativeId} />
-      <Detail label="Link state" value={record.identity.state} />
-    </div>
-    {record.identity.evidence.length ? <dl className="inventory-identifiers">{record.identity.evidence.map((evidence, index) => <div key={`${evidence.kind}:${evidence.packagePath}:${evidence.resourcePath}:${index}`}><dt>{label(evidence.kind)}</dt><dd><strong>{label(evidence.basis)}</strong> · element labels {formatElementLabels(evidence.elementIds)}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code><RelatedPackageEvidence packageIds={evidence.relatedPackageIds} /></dd></div>)}</dl> : null}
-    {record.identity.packageEvidence.length ? <><h4>Evidence by exact package</h4><dl className="inventory-identifiers">{record.identity.packageEvidence.map(item => <div key={item.packageId}><dt>{item.packageId}</dt><dd>{item.evidence.length ? <ul>{item.evidence.map((evidence, index) => <li key={`${evidence.kind}:${index}`}><strong>{label(evidence.kind)}</strong> · {label(evidence.basis)} · element labels {formatElementLabels(evidence.elementIds)}<br /><code>{evidence.packagePath}</code> ↔ <code>{evidence.resourcePath}</code><RelatedPackageEvidence packageIds={evidence.relatedPackageIds} /></li>)}</ul> : "No source-declared identity evidence retained for this exact package."}</dd></div>)}</dl></> : null}
-    <h4>Saved observations</h4>
-    <div className="inventory-detail-grid">
-      <Detail label="Graph snapshot" value={record.observations.graphPackages?.snapshotId} />
-      <Detail label="Graph observed" value={formatDate(record.observations.graphPackages?.observedAt)} />
-      <Detail label="Power Platform snapshot" value={record.observations.powerPlatform?.snapshotId} />
-      <Detail label="Power Platform observed" value={formatDate(record.observations.powerPlatform?.observedAt)} />
-    </div>
-  </>;
-}
-
-function formatElementLabels(labels: string[]) {
-  return labels.filter(value => value.trim().length > 0).join(", ") || "Not supplied";
-}
-
-function RelatedPackageEvidence({ packageIds }: { packageIds?: string[] }) {
-  if (!packageIds?.length) return null;
-  return <>
-    <br /><span>Related exact packages</span>
-    <ul aria-label="Related exact packages">{packageIds.map((id, index) => <li key={`${id}:${index}`}><code>{id}</code></li>)}</ul>
-  </>;
-}
-
-function PowerPlatformPanel({ record }: { record: UnifiedAgentRecord }) {
-  const resource = record.powerPlatformResource;
-  if (!resource) return <><h3>Configuration</h3><p>No configuration has been observed for this agent.</p></>;
-  return <>
-    <h3>Configuration</h3>
-    <div className="inventory-detail-grid">
-      <Detail label="Native resource ID" value={resource.nativeId} />
-      <Detail label="Environment" value={resource.environmentId} />
-      <Detail label="CDS bot ID" value={resource.identifiers.find(item => item.kind === "cds_bot_id")?.value} />
-      <Detail label="Entra agent ID" value={resource.identifiers.find(item => item.kind === "entra_agent_id")?.value} />
-      <Detail label="Schema name" value={resource.details.schemaName} />
-      <Detail label="Authoring tool (raw)" value={resource.details.createdIn} />
-      <Detail label="Authoring tool" value={powerPlatformAuthoringTool(resource)} />
-    </div>
-    <p>{resource.unknownFieldCount} unknown or malformed fields were omitted from the saved observation.</p>
-  </>;
-}
-
-function AuditSecurityPanel({ agentName, related, error, unavailable, onRetry }: { agentName: string; related?: InventorySourceAwareDetail; error: string; unavailable?: string; onRetry: () => void }) {
-  if (unavailable) return <p className="agent-insight-note">{unavailable}</p>;
-  if (error) return <div className="error-banner" role="alert">{error} <button type="button" className="secondary" onClick={onRetry}>Retry activity</button></div>;
-  return <details className="agent-saved-observations">
-    <summary>Saved observations for {agentName}</summary>
-    <p className="tab-description">Exact saved matches only. Missing evidence does not prove inactivity or safety.</p>
-      <article className="agent-management-card">
-        <RelatedState heading="Audit activity" source={related?.audit} />
-        {related?.audit.status === "available" && related.audit.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Agent audit events" tabIndex={0}>
-          <table className="agent-insight-table"><thead><tr><th scope="col">Operation</th><th scope="col">Observed</th><th scope="col">Result</th><th scope="col">Evidence</th></tr></thead><tbody>
-          {related.audit.value.map(item => <tr key={`${item.jobId}:${item.wrapperId}`}><th scope="row">{item.operation}</th><td>{formatDate(item.observedAt)}</td><td>{item.resultStatus ?? "Not reported"}</td><td><details><summary>Event reference</summary><p>Event: <code>{item.nativeEventId ?? item.wrapperId}</code></p><p>Correlation: <code>{item.correlationId ?? "Not supplied"}</code></p><p>Saved search: <code>{item.jobId}</code></p></details></td></tr>)}
-          </tbody></table>
-        </div> : null}
-      </article>
-      <article className="agent-management-card">
-        <RelatedState heading="Security observations" source={related?.security} />
-        {related?.security.status === "available" && related.security.value.length ? <dl className="inventory-identifiers">{related.security.value.map(item => <div key={`${item.snapshotId}:${item.nativeRecordId}`}><dt>{item.nativeRecordId}</dt><dd>{formatDate(item.observedAt)} · {item.lifecycleStatus ?? "Lifecycle not supplied"}<details><summary>Observation reference</summary><p>Snapshot: <code>{item.snapshotId}</code></p><p>Saved hunt: <code>{item.jobId}</code></p><p>Use Defender &amp; Agent 365 above for an exact agent-scoped investigation. Historical broad hunts are not opened as this agent's results.</p></details></dd></div>)}</dl> : null}
-      </article>
-  </details>;
-}
-
-function RelatedState({ heading, source }: {
-  heading: string;
-  source: InventorySourceAwareDetail["audit"] | InventorySourceAwareDetail["security"] | undefined;
-}) {
-  if (!source) return <><h4>{heading}</h4><p role="status">Loading saved activity associations...</p></>;
-  if (source.status !== "available") return <><h4>{heading}</h4><p>{label(source.status)}: {source.reason}</p></>;
-  return <><h4>{heading}</h4><p>{source.count === 0 ? "Authorized and queried; no exact associated records." : `${source.count} exact associated record${source.count === 1 ? "" : "s"}; showing ${source.value.length}.`}</p></>;
-}
-
-function Detail({ label: heading, value }: { label: string; value: ReactNode }) {
-  return <div><span>{heading}</span><strong>{value === null || value === undefined || value === "" ? "Not supplied" : value}</strong></div>;
-}
-
-function label(value: string) {
-  const result = value.replaceAll("_", " ").replaceAll("-", " ");
-  return result.charAt(0).toUpperCase() + result.slice(1);
-}
-
-function formatDate(value: string | null | undefined) {
-  if (!value) return "Not supplied";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Not supplied" : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }

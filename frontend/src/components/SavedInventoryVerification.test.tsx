@@ -11,7 +11,7 @@ function emptyInventory(): UnifiedAgentInventoryPage {
     value: [], count: 0, offset: 0, limit: 50, summary, filteredSummary: summary,
     verification: createUnifiedVerification({ graphPackageCount: 0, powerPlatformAgentCount: 0, logicalAgentCount: 0 }),
     identityCollection: { checkedPackages: 0, pendingPackages: 0 },
-    facets: { environments: [], platforms: [] },
+    facets: { environments: [], platforms: [], types: [] },
     sources: {
       graphPackages: { state: "available", observation: {
         id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, tokenMode: "delegated", scopeKind: "broad",

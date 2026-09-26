@@ -269,6 +269,12 @@ export type OfficialUsageAgentUser = {
   responsesSentToUsers: number;
 };
 
+export type OfficialUsageAgentUsersView = {
+  activeSet: OfficialUsageSetSummary | null;
+  agentIds: string[];
+  users: { value: OfficialUsageAgentUser[]; count: number; limit: number; offset: number };
+};
+
 export type OfficialUsageAgentDetailView = Pick<OfficialUsageAggregateView,
   | "authority"
   | "availability"

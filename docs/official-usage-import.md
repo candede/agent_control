@@ -23,7 +23,9 @@ New accepted-import job links are not legacy history bookmarks: **View snapshot*
 
 ## Export the three files
 
-1. Sign in to the Microsoft 365 admin center with access to usage reports.
+Use **Reports Reader** or another supported role with **user-level** Microsoft 365 usage-report access to download the original files. A summary-only reporting role is not sufficient for the Users and Users & agents files. This portal role is separate from **AgentControl.Admin**, which is required to import/manage the files in this app. **AgentControl.Viewer** is sufficient to read and export already accepted reports. See the [dedicated signed-in user role guide](user-roles-and-permissions.md#download-the-three-original-csvs-from-microsoft-365), including the separate report-name privacy requirement.
+
+1. Sign in to the Microsoft 365 admin center with the required user-level report access.
 2. Open **Reports** (use **Show all** if Reports is hidden), then **Usage**. Under **Reports**, select **Microsoft Copilot > Agents**.
 3. Select one documented reporting window: 7 days or 30 days.
 4. Select each **Agents**, **Users & agents**, and **Users** table/tab and use its **Export CSV** action for that same period.

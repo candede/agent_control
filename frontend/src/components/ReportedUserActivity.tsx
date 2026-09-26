@@ -325,6 +325,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
         <p>CSV filters select matching people, not individual exported relationships. Every agent relationship of each matching user is exported, not only this page or the selected agent. Repeated all-agent Users-report totals are not additive across relationship rows.</p>
       </details>
       {selected ? <ReportedUserDetail key={reportUserKey(selected)} user={selected} directoryUser={directoryMatches.get(reportUserKey(selected))}
+        reportPeriod={data.activeSet?.reportingPeriod} appActivityState={reportDirectory?.sources.appActivity.state}
         onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision}
         hasRelationships={hasRelationships} filters={data.filters} returnFocusTo={searchInput} onClose={() => setSelectedUser(undefined)}
         onFocusAgent={(id, setId) => {
