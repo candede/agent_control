@@ -116,7 +116,8 @@ button.agent-sort-heading {
   text-underline-offset: 3px;
 }
 
-.agent-name-button:hover {
+.agent-name-button:hover,
+.agent-person-link:hover {
   background: transparent;
   text-decoration-thickness: 2px;
 }

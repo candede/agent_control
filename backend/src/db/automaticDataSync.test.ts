@@ -3,6 +3,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { DataSyncRepository, type DataSyncScope } from "./dataSync.js";
 import type { DataSyncRun } from "../types/dataSync.js";
+import type { CopilotDirectoryUser } from "../services/copilotUsageGraph.js";
+import { CopilotUsageService } from "../services/copilotUsage.js";
+import { allowlistedPackage } from "../services/packageObservation.js";
+import { SavedAgentPeopleService } from "../services/savedAgentPeople.js";
+import { AgentPeopleRepository } from "./agentPeople.js";
+import { PackageInventoryRepository } from "./packageInventory.js";
+import { PowerPlatformInventoryRepository } from "./powerPlatformInventory.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let repository: DataSyncRepository;
@@ -31,6 +38,175 @@ describe("session-driven automatic sync admission", () => {
     expect(await repository.getRun(owner(), left.run!.id)).toBeUndefined();
     await complete(scope, left.run!);
     expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: left.run!.id } });
+  });
+
+  function directoryUser(objectId: string, displayName = "Directory person"): CopilotDirectoryUser {
+    return {
+      identity: { objectId, displayName, userPrincipalName: "person@example.invalid", accountEnabled: true,
+        userType: "Member", employeeType: null, department: null, companyName: null },
+      serviceEvidenceVersion: 1, copilotServiceState: "unknown", servicePlans: [],
+    };
+  }
+
+  function savedUsers(scope: DataSyncScope) {
+    const now = new Date();
+    const service = new CopilotUsageService(fixture.runtime, { now: () => now });
+    return () => service.users({
+      tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "reader@example.invalid",
+      displayName: "Reader", roles: ["AgentControl.Viewer"],
+    });
+  }
+
+  describe("persisted automatic revision boundaries", () => {
+    it("separates package, detail, native ownership and people publications/expiry from the Users license/activity response", async () => {
+      const scope = owner();
+      const personId = randomUUID();
+      const observedAt = new Date(Date.now() - 60_000).toISOString();
+      await repository.publishDirectory(scope, [directoryUser(personId)], observedAt, "Saved directory.");
+      await repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, observedAt, "Saved activity.");
+      const readUsers = savedUsers(scope);
+      const users = await readUsers();
+      let previous = await repository.automaticRevisions(scope);
+      const onlyChanged = async (source: "graph_packages" | "power_platform") => {
+        const next = await repository.automaticRevisions(scope);
+        for (const key of ["graph_packages", "power_platform", "users"] as const) {
+          if (key === source) expect(next[key]).not.toBe(previous[key]);
+          else expect(next[key]).toBe(previous[key]);
+        }
+        expect(await readUsers()).toEqual(users);
+        previous = next;
+      };
+
+      const packages = new PackageInventoryRepository(fixture.runtime);
+      const packageJob = await packages.submit(scope, {
+        idempotencyKey: "automatic-revision-package", tokenMode: "delegated", authorizationPrincipalId: scope.principalId,
+      });
+      await packages.markRunning(scope, packageJob.id);
+      const summary = allowlistedPackage({ id: "revision-package", displayName: "Saved package", isBlocked: false });
+      await packages.publish(scope, packageJob.id, { packages: [summary], totalRecords: 1, pages: 1 });
+      await onlyChanged("graph_packages");
+
+      await fixture.operator.query(`INSERT INTO package_detail_cache(
+          tenant_id,principal_id,token_mode,native_id,catalog_revision,package_data,observed_at,expires_at)
+        VALUES($1,$2,'delegated',$3,package_detail_revision($4::jsonb),$4::jsonb,clock_timestamp(),clock_timestamp()+interval '1 hour')
+        ON CONFLICT (tenant_id,principal_id,token_mode,native_id) DO UPDATE SET
+          generation=EXCLUDED.generation,package_data=EXCLUDED.package_data,
+          observed_at=EXCLUDED.observed_at,expires_at=EXCLUDED.expires_at`,
+      [scope.tenantId, scope.principalId, summary.id, JSON.stringify({ ...summary, longDescription: "Saved detail." })]);
+      await onlyChanged("graph_packages");
+
+      const native = new PowerPlatformInventoryRepository(fixture.runtime);
+      const nativeJob = await native.submit(scope, {
+        idempotencyKey: "automatic-revision-native", roleScope: "full", requestedTypes: ["microsoft.copilotstudio/agents"],
+      });
+      await native.markRunning(scope, nativeJob.id);
+      await native.publish(scope, nativeJob.id, {
+        resources: [{
+          tenantId: scope.tenantId, nativeId: "revision-native", environmentId: randomUUID(),
+          type: "microsoft.copilotstudio/agents", displayName: "Saved native agent", location: null,
+          createdAt: null, createdBy: personId, lastPublishedAt: null, sourceSystem: "power_platform",
+          authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "agent", lifecycle: "published",
+          identityConfidence: "exact_native", identifiers: [{ kind: "power_platform_resource_id", value: "revision-native" }],
+          provenance: {}, unknownFieldCount: 0, details: { ownerId: personId },
+        }],
+        queriedTypes: ["microsoft.copilotstudio/agents"], environmentScope: null,
+        totalRecords: 1, pages: 1, unknownFieldCount: 0,
+      });
+      await onlyChanged("power_platform");
+
+      const people = new AgentPeopleRepository(fixture.runtime);
+      await people.save(scope, [{
+        objectId: personId, status: "resolved", displayName: "Exact owner name",
+        userPrincipalName: "owner@example.invalid", checkedAt: observedAt,
+      }], { generation: "initial" });
+      await onlyChanged("power_platform");
+      const savedPeople = new SavedAgentPeopleService(repository, people);
+      expect((await savedPeople.read(scope, [personId])).get(personId)?.displayName).toBe("Exact owner name");
+
+      for (const [table, source] of [
+        ["package_inventory_snapshots", "graph_packages"],
+        ["package_detail_cache", "graph_packages"],
+        ["power_platform_inventory_snapshots", "power_platform"],
+        ["agent_people_cache", "power_platform"],
+      ] as const) {
+        await fixture.operator.query(`UPDATE ${table} SET expires_at=clock_timestamp()-interval '1 second'
+          WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId]);
+        await onlyChanged(source);
+        expect(await repository.automaticRevisions(scope)).toEqual(previous);
+      }
+      expect((await savedPeople.read(scope, [personId])).get(personId)?.displayName).toBe("Directory person");
+    });
+
+    it.each(["directory", "app_activity"] as const)("tracks %s publication, retained failure, recovery and expiry", async source => {
+      const scope = owner();
+      const observedAt = new Date().toISOString();
+      const person = directoryUser(randomUUID());
+      const publish = () => source === "directory"
+        ? repository.publishDirectory(scope, [person], observedAt, "Saved directory.")
+        : repository.publishAppActivity(scope, { users: [], reportRefreshDate: null }, observedAt, "Saved activity.");
+      const empty = await repository.automaticRevisions(scope);
+      await publish();
+      const before = await repository.automaticRevisions(scope);
+      expect(before.users).not.toBe(empty.users);
+      expect(before.graph_packages).toBe(empty.graph_packages);
+      if (source === "directory") expect(before.power_platform).not.toBe(empty.power_platform);
+      else expect(before.power_platform).toBe(empty.power_platform);
+      await repository.recordUserSourceFailure(scope, source, "permission_required", "Refresh permission unavailable.", observedAt);
+      const failed = await repository.automaticRevisions(scope);
+      expect(failed.users).not.toBe(before.users);
+      expect(failed.graph_packages).toBe(before.graph_packages);
+      expect(failed.power_platform).toBe(before.power_platform);
+      const readUsers = savedUsers(scope);
+      expect((await readUsers()).sources[source === "directory" ? "directory" : "appActivity"]).toMatchObject({
+        state: "partial", message: expect.stringContaining("Refresh permission unavailable."),
+      });
+
+      person.identity.displayName = "Renamed directory person";
+      const snapshotId = await publish();
+      const recovered = await repository.automaticRevisions(scope);
+      expect(recovered.users).not.toBe(failed.users);
+      expect(recovered.graph_packages).toBe(failed.graph_packages);
+      if (source === "directory") expect(recovered.power_platform).not.toBe(failed.power_platform);
+      else expect(recovered.power_platform).toBe(failed.power_platform);
+      if (source === "directory") expect((await readUsers()).users[0].directory.displayName).toBe("Renamed directory person");
+      await fixture.operator.query("UPDATE copilot_usage_snapshots SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [snapshotId]);
+      const expired = await repository.automaticRevisions(scope);
+      expect(expired.users).not.toBe(recovered.users);
+      expect(expired.graph_packages).toBe(recovered.graph_packages);
+      if (source === "directory") expect(expired.power_platform).not.toBe(recovered.power_platform);
+      else expect(expired.power_platform).toBe(recovered.power_platform);
+      expect((await readUsers()).sources[source === "directory" ? "directory" : "appActivity"]).toMatchObject({ state: "unavailable" });
+      expect(await repository.automaticRevisions(scope)).toEqual(expired);
+    });
+
+    it("ignores other scopes and unlinked snapshots, but detects source status without any retained data", async () => {
+      const scope = owner();
+      const observedAt = new Date().toISOString();
+      const before = await repository.automaticRevisions(scope);
+      const otherId = await repository.publishDirectory({ ...scope, principalId: "another-reader" }, [], observedAt, "Other account.");
+      await repository.publishAppActivity({ ...scope, tenantId: "another-tenant" }, { users: [], reportRefreshDate: null }, observedAt, "Other tenant.");
+      expect(await repository.automaticRevisions(scope)).toEqual(before);
+
+      await repository.recordUserSourceFailure(scope, "directory", "waiting_authorization", "Sign-in required.", observedAt);
+      const failed = await repository.automaticRevisions(scope);
+      expect(failed.users).not.toBe(before.users);
+      expect(failed.graph_packages).toBe(before.graph_packages);
+      expect(failed.power_platform).toBe(before.power_platform);
+      await fixture.operator.query(`UPDATE copilot_usage_source_state SET current_snapshot_id=$3
+        WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory'`, [scope.tenantId, scope.principalId, otherId]);
+      expect(await repository.automaticRevisions(scope)).toEqual(failed);
+
+      await repository.publishDirectory(scope, [], observedAt, "Own source.");
+      const linked = await repository.automaticRevisions(scope);
+      await fixture.operator.query(`UPDATE copilot_usage_source_state SET current_snapshot_id=NULL
+        WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory'`, [scope.tenantId, scope.principalId]);
+      const orphaned = await repository.automaticRevisions(scope);
+      expect(orphaned.users).not.toBe(linked.users);
+      expect(orphaned.power_platform).not.toBe(linked.power_platform);
+      await fixture.operator.query(`UPDATE copilot_usage_snapshots SET is_current=false
+        WHERE tenant_id=$1 AND principal_id=$2 AND source_id='directory'`, [scope.tenantId, scope.principalId]);
+      expect(await repository.automaticRevisions(scope)).toEqual(orphaned);
+    });
   });
 
   it("refreshes only sources whose saved success and latest attempt are at least 15 minutes old", async () => {

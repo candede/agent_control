@@ -1,15 +1,17 @@
-import { useContext, useDeferredValue, useEffect, useRef, useState } from "react";
+import { useContext, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   getOfficialUsageAgentUsers,
   removeAgentUsageAssociation,
   type AgentUsageAssociation,
   type AgentUsageContext,
   type AgentUsageTarget,
+  type OfficialUsageAgentUsersView,
   type UnifiedAgentRecord,
 } from "../api/client";
+import { hasRole } from "../authorization";
 import { usageAvailabilityLabel, usageCount, usageCoverageLabel, usageDate } from "../usageInsights";
 import { CapabilityContext } from "../capabilityContext";
-import { useSavedQuery } from "../savedQueries";
+import { useSavedRead } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import "./agentInsights.css";
 
@@ -17,14 +19,26 @@ type Props = {
   record: UnifiedAgentRecord;
   context?: AgentUsageContext;
   inventoryRevision?: string;
+  dataRevision?: number;
   canRemoveReviewedAssociations: boolean;
   disabled?: boolean;
   onChanged?: () => void;
 };
 type ReviewedAssociation = Extract<AgentUsageAssociation, { basis: "admin_reviewed" }>;
-type Confirmation = { association: ReviewedAssociation; contextKey: string };
+type Confirmation = { association: ReviewedAssociation; key: object };
 
-export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveReviewedAssociations, disabled = false, onChanged }: Props) {
+export function AgentUsagePanel(props: Props) {
+  const capability = useContext(CapabilityContext);
+  const principal = capability?.user;
+  const scope = JSON.stringify([principal?.tenantId, principal?.homeAccountId, [...(principal?.roles ?? [])].sort()]);
+  if (capability && !hasRole(principal, "AgentControl.Viewer")) {
+    return <section aria-label="Usage and users"><p role="alert">Current Viewer access is required to read agent usage.</p></section>;
+  }
+  return <AgentUsageSession key={JSON.stringify([scope, props.record.id, props.context?.reportSet?.id])} {...props} scope={scope} />;
+}
+
+function AgentUsageSession({ record, context, inventoryRevision, dataRevision = 0, canRemoveReviewedAssociations,
+  disabled = false, onChanged, scope }: Props & { scope: string }) {
   const [error, setError] = useState<string>();
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [confirmed, setConfirmed] = useState(false);
@@ -40,22 +54,19 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
     };
   }, []);
 
-  useEffect(() => {
-    if (confirmation) confirmationHeading.current?.focus();
-    else if (hadConfirmation.current && reviewTrigger.current?.isConnected) reviewTrigger.current.focus();
-    hadConfirmation.current = Boolean(confirmation);
-  }, [confirmation]);
-
   const report = context?.reportSet;
   const usableReport = Boolean(report?.complete && (context?.availability === "active" || context?.availability === "stale"));
   const usage = usableReport && record.usage?.status === "linked" && record.usage.reportSetId === report?.id ? record.usage : undefined;
   const editable = canRemoveReviewedAssociations && Boolean(usage && inventoryRevision && onChanged);
   const busy = disabled || saving;
-  const contextKey = JSON.stringify([record.id, report?.id, context?.availability, context?.revision, inventoryRevision]);
-  const currentConfirmation = confirmation?.contextKey === contextKey
+  const contextKey = JSON.stringify([scope, record.id, report?.id, context?.availability, context?.revision, inventoryRevision, dataRevision]);
+  const confirmationKey = useMemo(() => ({ contextKey, canRemoveReviewedAssociations, disabled }),
+    [contextKey, canRemoveReviewedAssociations, disabled]);
+  const currentConfirmation = confirmation?.key === confirmationKey
     && usage?.associations.some(association => association.basis === "admin_reviewed"
       && association.reportAgentId === confirmation.association.reportAgentId) ? confirmation : undefined;
   const reviewedAssociations = usage?.associations.filter(association => association.basis === "admin_reviewed") ?? [];
+  const agentIdsKey = JSON.stringify([...new Set(usage?.associations.map(association => association.reportAgentId) ?? [])].sort());
   const missingReason = !context
     ? "Report data is unavailable. Reload usage to try again."
     : !usableReport
@@ -66,9 +77,19 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
           ? "The selected report changed. Reload usage to update this agent."
           : "This agent is not included in the selected CSV report.";
 
+  useEffect(() => {
+    if (currentConfirmation) {
+      confirmationHeading.current?.focus();
+      hadConfirmation.current = true;
+    } else if (!busy && hadConfirmation.current) {
+      if (reviewTrigger.current?.isConnected) reviewTrigger.current.focus({ preventScroll: true });
+      hadConfirmation.current = false;
+    }
+  }, [currentConfirmation, busy]);
+
   function review(association: ReviewedAssociation) {
     reviewTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    setConfirmation({ association, contextKey });
+    setConfirmation({ association, key: confirmationKey });
     setConfirmed(false);
     setError(undefined);
   }
@@ -86,8 +107,10 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
         expectedInventoryRevision: inventoryRevision, expectedUsageRevision: context.revision, confirmed: true,
         reportAgentId: currentConfirmation.association.reportAgentId,
       });
-      onChanged?.();
-      if (mounted.current) setConfirmation(undefined);
+      if (mounted.current) {
+        onChanged?.();
+        setConfirmation(undefined);
+      }
     } catch (cause) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : "The reviewed usage association could not be removed.");
     } finally {
@@ -111,8 +134,7 @@ export function AgentUsagePanel({ record, context, inventoryRevision, canRemoveR
         <UsageMetric label="Active users" value={usageCount(usage.activeUsers)} />
         <UsageMetric label="Last reported activity" value={usageDate(usage.lastActivityDateUtc)} />
       </dl>
-      <AgentUsers key={contextKey} contextKey={contextKey} setId={report!.id}
-        agentIds={usage.associations.map(association => association.reportAgentId)} />
+      <AgentUsers key={agentIdsKey} contextKey={contextKey} setId={report!.id} agentIdsKey={agentIdsKey} scope={scope} />
       {editable && reviewedAssociations.length ? <details className="agent-insight-provenance">
         <summary>Reviewed report links</summary>
       <ul className="agent-usage-association-list">{reviewedAssociations.map(association => <li key={association.reportAgentId}>
@@ -170,33 +192,46 @@ function UsageMetric({ label, value }: { label: string; value: string }) {
   return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong></dd></div>;
 }
 
-function AgentUsers({ setId, agentIds, contextKey }: { setId: string; agentIds: string[]; contextKey: string }) {
-  const principal = useContext(CapabilityContext)?.user;
+function AgentUsers({ setId, agentIdsKey, contextKey, scope }: { setId: string; agentIdsKey: string; contextKey: string; scope: string }) {
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
+  const [retry, setRetry] = useState(0);
+  const [result, setResult] = useState<{ key: { query: object }; value?: OfficialUsageAgentUsersView; error?: string }>();
+  const readSaved = useSavedRead();
   const deferredSearch = useDeferredValue(search);
   const limit = 25;
-  const read = useSavedQuery({
-    queryKey: ["saved", "agent-users", principal?.tenantId, principal?.homeAccountId, contextKey, agentIds, deferredSearch, offset],
-    queryFn: async ({ signal }) => {
-      const result = await getOfficialUsageAgentUsers({ setId, agentIds, search: deferredSearch, offset, limit }, { signal });
-      if (result.activeSet?.id !== setId || result.agentIds.length !== new Set(agentIds).size
-        || agentIds.some(id => !result.agentIds.includes(id))) {
+  const query = useMemo(() => ({
+    setId, agentIds: JSON.parse(agentIdsKey) as string[], search: deferredSearch, offset, limit,
+  }), [setId, agentIdsKey, deferredSearch, offset]);
+  const key = useMemo(() => ({ query, contextKey, retry }), [query, contextKey, retry]);
+  const scoped = result?.key === key ? result : undefined;
+  const pending = !scoped || search !== deferredSearch;
+  const users = search === deferredSearch && result?.key.query === query ? result.value?.users : undefined;
+  useEffect(() => {
+    const controller = new AbortController();
+    void readSaved(["agent-users", scope, contextKey, query, retry], async signal => {
+      const value = await getOfficialUsageAgentUsers(query, { signal });
+      if (value.activeSet?.id !== setId || value.agentIds.length !== query.agentIds.length
+        || query.agentIds.some(id => !value.agentIds.includes(id))) {
         throw new Error("The report changed. Reload agent usage.");
       }
-      return result;
-    },
-  });
-  const pending = read.isPending || read.isFetching || search !== deferredSearch;
-  const users = !pending && !read.isError ? read.data?.users : undefined;
-  return <section className="agent-usage-users" aria-label="Agent users">
+      return value;
+    }, controller.signal).then(value => {
+      if (!controller.signal.aborted) setResult({ key, value });
+    }).catch((cause: unknown) => {
+      if (!controller.signal.aborted) setResult({ key, error: cause instanceof Error ? cause.message : "Saved agent users could not be loaded." });
+    });
+    return () => controller.abort();
+  }, [readSaved, scope, contextKey, query, retry, setId, key]);
+  return <section className="agent-usage-users" aria-label="Agent users" aria-busy={pending && !users}>
     <div className="agent-insight-toolbar">
       <h4>Users{users ? ` (${users.count.toLocaleString()})` : ""}</h4>
       <input type="search" aria-label="Search agent users" placeholder="Search by name or email" value={search}
         onChange={event => { setSearch(event.target.value); setOffset(0); }} />
     </div>
-    {pending ? <p role="status">Loading users...</p> : read.isError ? <div role="alert" className="error-banner">
-      {read.error.message} <button type="button" className="secondary" onClick={() => void read.refetch()}>Retry users</button>
+    {pending ? <p role="status" className={users ? "sr-only" : undefined}>{users ? "Refreshing saved users. Showing the last loaded results." : "Loading users..."}</p> : null}
+    {scoped?.error ? <div role="alert" className="error-banner">
+      {scoped.error} <button type="button" className="secondary" onClick={() => setRetry(value => value + 1)}>Retry users</button>
     </div> : users?.count === 0 ? <p>{search ? "No users match your search." : "No users listed in this report."}</p> : users ? <>
       <div className="table-shell">
         <table className="agent-insight-table"><caption className="sr-only">Users of this agent in the selected CSV report</caption>

@@ -3,7 +3,7 @@ import type { CopilotUsageSourceSummary, CopilotUsageUser, OfficialUsageUserSumm
 import type { UserRelationshipFilters } from "./ReportedUserAgents";
 import { UserDetailModal } from "./UserDetailModal";
 
-export function ReportedUserDetail({ user, directoryUser, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, reportPeriod, appActivityState }: {
+export function ReportedUserDetail({ user, directoryUser, filters, returnFocusTo, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, reportPeriod, appActivityState, refreshing }: {
   user: OfficialUsageUserSummary;
   directoryUser?: CopilotUsageUser | null;
   hasRelationships: boolean;
@@ -16,10 +16,12 @@ export function ReportedUserDetail({ user, directoryUser, filters, returnFocusTo
   agentInventoryRevision?: number;
   reportPeriod?: { startDate: string | null; endDate: string | null };
   appActivityState?: CopilotUsageSourceSummary["state"];
+  refreshing?: boolean;
 }) {
-  return <UserDetailModal identity={JSON.stringify([user.username, user.datasetScope])} displayName={user.displayName || user.username}
+  return <UserDetailModal identity={JSON.stringify([user.username, user.datasetScope.reportSetId,
+    user.datasetScope.usersVersionId, user.datasetScope.userAgentsVersionId])} displayName={user.displayName || user.username}
     username={user.username} directoryUser={directoryUser} directoryCurrent={Boolean(directoryUser)} reportUser={user}
     reportPeriod={reportPeriod} appActivityState={appActivityState} filters={filters} returnFocusTo={returnFocusTo}
     closeLabel="Close reported user details" onClose={onClose} onFocusAgent={onFocusAgent} onOpenAgent={onOpenAgent}
-    dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} />;
+    dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} refreshing={refreshing} />;
 }

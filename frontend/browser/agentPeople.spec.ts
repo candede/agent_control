@@ -87,7 +87,23 @@ test("legacy Agent Builder details use saved people without directory permission
     await expect(person).toContainText("Saved agent owner");
     await expect(person).toContainText("saved.owner@example.invalid");
     await expect(person).not.toContainText(ownerId);
-    await expect(person.getByRole("button", { name: "View responsibility for Saved agent owner" })).toBeVisible();
+    const link = person.getByRole("button", { name: "View responsibility for Saved agent owner" });
+    await expect(link).toBeVisible();
+    await link.scrollIntoViewIfNeeded();
+    const color = await link.evaluate(element => getComputedStyle(element).color);
+    const bounds = await link.boundingBox();
+    await link.hover();
+    await expect(link).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(link).toHaveCSS("color", color);
+    await expect(link).toHaveCSS("text-decoration-line", "underline");
+    await expect(link).toHaveCSS("text-decoration-thickness", "2px");
+    expect(await link.boundingBox()).toEqual(bounds);
+    await link.focus();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Shift+Tab");
+    await expect(link).toBeFocused();
+    await expect(link).toHaveCSS("outline-style", "solid");
+    await expect(link).not.toHaveCSS("outline-width", "0px");
     await expect(person.locator("details")).toHaveCount(0);
   }
   await expect(dialog.getByText("Agent name not reported; showing its resource ID.")).toBeVisible();

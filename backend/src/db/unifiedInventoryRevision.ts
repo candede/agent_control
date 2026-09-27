@@ -5,6 +5,25 @@ import type { PackageDataScope } from "./packageInventory.js";
 import { pool } from "./pool.js";
 
 export async function readUnifiedInventoryRevision(scope: PackageDataScope, database: Pick<pg.Pool, "query"> = pool) {
+  const rows = await readInventoryRevisionMarkers(scope, database);
+  return createHash("sha256").update(JSON.stringify(["unified-agent-inventory-v5", scope.tenantId, scope.principalId, rows])).digest("hex");
+}
+
+export async function readAutomaticInventoryRevisions(scope: PackageDataScope, database: Pick<pg.Pool, "query"> = pool) {
+  const rows = await readInventoryRevisionMarkers(scope, database);
+  const revision = (source: "graph_packages" | "power_platform", dependencies: readonly string[]) =>
+    createHash("sha256").update(JSON.stringify([
+      "automatic-inventory-v1", source, scope.tenantId, scope.principalId,
+      rows.filter(row => dependencies.includes(row.source)),
+    ])).digest("hex");
+  return {
+    graph_packages: revision("graph_packages", ["graph_packages", "graph_package_details"]),
+    // Saved native agents and responsibility use both directory fallback and exact people observations.
+    power_platform: revision("power_platform", ["power_platform", "directory", "agent_people"]),
+  };
+}
+
+async function readInventoryRevisionMarkers(scope: PackageDataScope, database: Pick<pg.Pool, "query">) {
   if (!scope.tenantId || !scope.principalId) throw new AppError(403, "scope_mismatch", "Inventory revision requires a tenant and principal.");
   const { rows } = await database.query<{ source: string; id: string; observed_at: Date; expires_at: Date }>(`
     SELECT 'graph_packages' AS source,id,observed_at,expires_at FROM package_inventory_snapshots
@@ -27,5 +46,5 @@ export async function readUnifiedInventoryRevision(scope: PackageDataScope, data
     SELECT 'agent_people' AS source,revision AS id,checked_at AS observed_at,expires_at FROM agent_people_cache
       WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
     ORDER BY source,id`, [scope.tenantId, scope.principalId]);
-  return createHash("sha256").update(JSON.stringify(["unified-agent-inventory-v5", scope.tenantId, scope.principalId, rows])).digest("hex");
+  return rows;
 }

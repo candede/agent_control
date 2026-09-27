@@ -1,8 +1,9 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers, type CopilotUsageUsersResponse } from "../api/client";
+import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers, type CopilotUsageUsersResponse, type SessionUser } from "../api/client";
 import { downloadBlob } from "../agentExport";
+import { CapabilityContext } from "../capabilityContext";
 import { copilotUsageFixture, licensedUser } from "../test/copilotUsageFixture";
 import { activeWithoutPaidUsersFixture, usageAgentDetailFixture, usageUsersFixture } from "../test/usageInsightsFixture";
 import { CopilotUsersView } from "./CopilotUsersView";
@@ -21,6 +22,12 @@ vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
 function userRows() {
   return within(screen.getByRole("region", { name: "M365 Copilot license status" })).getAllByRole("row").slice(1);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 describe("Paid M365 Copilot license dashboard", () => {
@@ -967,27 +974,132 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()).toHaveLength(3);
   });
 
-  it("leaves collection to Sync and preserves last saved data while a reload fails", async () => {
+  it.each(["directory", "report"] as const)(
+    "keeps a reported user's mounted responsibility, focus and scroll when %s reads finish first", async first => {
+      const directory = structuredClone(copilotUsageFixture);
+      directory.users = directory.users.map(user => ({
+        ...user, importedUsage: usageUsersFixture().users.value.find(row => row.username === user.directory.userPrincipalName) ?? null,
+      }));
+      directory.users[1].copilotServiceState = directory.users[1].servicePlans[0].state = "disabled";
+      directory.users[2].copilotServiceState = directory.users[2].servicePlans[0].state = "disabled";
+      const person = directory.users[1].directory.objectId;
+      const staleDirectory = deferred<typeof directory>();
+      const currentDirectory = deferred<typeof directory>();
+      const staleReport = deferred<Awaited<ReturnType<typeof getOfficialUsageUsers>>>();
+      const currentReport = deferred<Awaited<ReturnType<typeof getOfficialUsageUsers>>>();
+      const staleResponsibility = deferred<Awaited<ReturnType<typeof getAgentResponsibility>>>();
+      const currentResponsibility = deferred<Awaited<ReturnType<typeof getAgentResponsibility>>>();
+      vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(directory)
+        .mockReturnValueOnce(staleDirectory.promise).mockReturnValueOnce(currentDirectory.promise);
+      vi.mocked(getOfficialUsageUsers).mockResolvedValueOnce(activeWithoutPaidUsersFixture())
+        .mockReturnValueOnce(staleReport.promise).mockReturnValueOnce(currentReport.promise);
+      vi.mocked(getAgentResponsibility).mockResolvedValueOnce(responsibilityFixture(person))
+        .mockReturnValueOnce(staleResponsibility.promise).mockReturnValueOnce(currentResponsibility.promise);
+      const route = { view: "activity", search: "", page: 0 } as const;
+      const props = { route, onOpenAgent: vi.fn() };
+      const view = render(<CopilotUsersView {...props} />);
+      await userEvent.click(await screen.findByRole("button", { name: "View reported details for Ben" }));
+      const dialog = screen.getByRole("dialog", { name: "Ben" });
+      await userEvent.click(within(dialog).getByRole("tab", { name: "Responsibility" }));
+      await within(dialog).findByText("Responsible agent");
+      const panel = within(dialog).getByRole("tabpanel", { name: "Responsibility" });
+      const trigger = within(panel).getByRole("button", { name: "Open agent Responsible agent" });
+      trigger.focus();
+      panel.scrollTop = 147;
+      view.rerender(<CopilotUsersView {...props} dataRevision={1} />);
+      expect(within(panel).getByText("Responsible agent")).toBeVisible();
+      const oldSignals = [vi.mocked(getCopilotUsageUsers).mock.calls.at(-1)![0]!.signal!,
+        vi.mocked(getOfficialUsageUsers).mock.calls.at(-1)![1]!.signal!,
+        vi.mocked(getAgentResponsibility).mock.calls.at(-1)![1]!.signal!];
+      view.rerender(<CopilotUsersView {...props} dataRevision={2} />);
+      expect(oldSignals.every(signal => signal.aborted)).toBe(true);
+      const relationshipSignal = vi.mocked(getAgentResponsibility).mock.calls.at(-1)![1]!.signal!;
+      expect(trigger).toHaveFocus();
+      expect(panel.scrollTop).toBe(147);
+      const report = activeWithoutPaidUsersFixture();
+      report.users.value.find(user => user.displayName === "Ben")!.reportedResponsesReceived = 77;
+      await act(async () => {
+        if (first === "directory") currentDirectory.resolve(structuredClone(directory));
+        else currentReport.resolve(report);
+      });
+      expect(screen.getByRole("dialog", { name: "Ben" })).toBe(dialog);
+      expect(within(dialog).getByRole("tabpanel", { name: "Responsibility" })).toBe(panel);
+      expect(within(panel).getByText("Responsible agent")).toBeVisible();
+      expect(relationshipSignal.aborted).toBe(false);
+      expect(getAgentResponsibility).toHaveBeenCalledTimes(3);
+      expect(trigger).toHaveFocus();
+      expect(panel.scrollTop).toBe(147);
+      const relationships = responsibilityFixture(person);
+      relationships.selected!.agents[0].displayName = "Updated responsible agent";
+      await act(async () => {
+        if (first === "directory") currentReport.resolve(report);
+        else currentDirectory.resolve(structuredClone(directory));
+        currentResponsibility.resolve(relationships);
+        staleDirectory.resolve(structuredClone(directory));
+        staleReport.resolve(activeWithoutPaidUsersFixture());
+        staleResponsibility.resolve(responsibilityFixture(person));
+      });
+      expect(within(panel).getByText("Updated responsible agent")).toBeVisible();
+      expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("77");
+      expect(within(dialog).getByRole("tab", { name: "Responsibility" })).toHaveAttribute("aria-selected", "true");
+      expect(trigger).toHaveFocus();
+      expect(panel.scrollTop).toBe(147);
+      expect(getAgentResponsibility).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it.each(["tenant", "principal", "roles"] as const)("does not retain saved users or open details across a %s change", async change => {
+    const principal: SessionUser = {
+      tenantId: "tenant", homeAccountId: "reader", displayName: "Reader", username: "reader@example.invalid", roles: ["AgentControl.Viewer"],
+    };
+    const content = (revision: number, user = principal) => <CapabilityContext value={{
+      user, views: [], now: Date.now(), loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
+    }}><CopilotUsersView dataRevision={revision} /></CapabilityContext>;
+    const view = render(content(0));
+    await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
+    const pending = deferred<CopilotUsageUsersResponse>();
+    vi.mocked(getCopilotUsageUsers).mockReturnValue(pending.promise);
+    view.rerender(content(1));
+    const signal = vi.mocked(getCopilotUsageUsers).mock.calls.at(-1)![0]!.signal!;
+    const next: SessionUser = { ...principal, ...(change === "tenant" ? { tenantId: "other-tenant" }
+      : change === "principal" ? { homeAccountId: "other-reader" } : { roles: ["AgentControl.Admin"] as SessionUser["roles"] }) };
+    view.rerender(content(1, next));
+    expect(signal.aborted).toBe(true);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    const reads = vi.mocked(getCopilotUsageUsers).mock.calls.length;
+    view.rerender(content(1, { ...next, roles: [] }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Current Viewer access");
+    await act(async () => pending.resolve(structuredClone(copilotUsageFixture)));
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(getCopilotUsageUsers).toHaveBeenCalledTimes(reads);
+  });
+
+  it("leaves collection to Sync and clears retained presentation when a reload fails", async () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(structuredClone(copilotUsageFixture))
       .mockRejectedValueOnce(new Error("Authorization changed"))
       .mockResolvedValueOnce(structuredClone(copilotUsageFixture));
     const view = render(<CopilotUsersView dataRevision={0} />);
     await screen.findByRole("button", { name: "Ada" });
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Ada");
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order by" }), "name");
     expect(screen.queryByRole("button", { name: "Sync users" })).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
 
     view.rerender(<CopilotUsersView dataRevision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Authorization changed");
-    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
-    expect(screen.getByText(/Showing the last saved user snapshot/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Showing the last loaded snapshot/)).not.toBeInTheDocument();
     expect(screen.queryByText("Offer adoption help")).not.toBeInTheDocument();
-    expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Using agents").parentElement).toHaveTextContent("Unknown");
-    expect(screen.getByText(/Showing the last saved user snapshot/)).toHaveTextContent("unverified until saved users reload");
+    expect(screen.queryByLabelText("M365 Copilot license summary")).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Paid license scope and coverage" })).not.toBeInTheDocument();
-    expect(within(userRows()[0]).getAllByRole("cell")[1]).toHaveTextContent("Last saved: M365 Copilot licensed");
+    expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
 
     view.rerender(<CopilotUsersView dataRevision={2} />);
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.getByRole("searchbox", { name: "Search users or agents" })).toHaveValue("Ada");
+    expect(screen.getByRole("combobox", { name: "Order by" })).toHaveValue("name");
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(3);
   });
 
@@ -1011,10 +1123,11 @@ describe("Paid M365 Copilot license dashboard", () => {
     view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
     const refreshedActivity = await screen.findByRole("region", { name: "Active users without paid Copilot" });
     expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("No active M365 Copilot license");
-    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).not.toHaveTextContent("Paid features:");
+    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("Paid features:");
     await act(async () => reject(new Error("Saved users temporarily unavailable")));
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved users temporarily unavailable");
     expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("No active M365 Copilot license");
+    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).not.toHaveTextContent("Paid features:");
     await userEvent.click(within(refreshedActivity).getByRole("button", { name: "View reported details for Ben" }));
     expect(within(screen.getByRole("dialog", { name: "Ben" })).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
     expect(within(screen.getByRole("dialog", { name: "Ben" })).queryByRole("region", { name: "Microsoft 365 Copilot paid features" })).not.toBeInTheDocument();
@@ -1138,9 +1251,17 @@ describe("Paid M365 Copilot license dashboard", () => {
     const view = render(<CopilotUsersView dataRevision={0} />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const dialog = screen.getByRole("dialog", { name: "Ada" });
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Usage & agents" }));
+    const search = within(dialog).getByRole("searchbox", { name: "Search this user's agents" });
+    await userEvent.type(search, "research");
+    const panel = within(dialog).getByRole("tabpanel", { name: "Usage & agents" });
+    panel.scrollTop = 139;
     view.rerender(<CopilotUsersView dataRevision={1} />);
     view.rerender(<CopilotUsersView dataRevision={0} />);
     expect(dialog).toBeVisible();
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("research");
+    expect(panel.scrollTop).toBe(139);
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("4");
     const superseded = structuredClone(copilotUsageFixture);
@@ -1154,6 +1275,10 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Ada" })).toBe(dialog);
     expect(within(dialog).getByText("Agent responses").parentElement).toHaveTextContent("201");
+    expect(within(dialog).getByRole("tabpanel", { name: "Usage & agents" })).toBe(panel);
+    expect(search).toHaveValue("research");
+    expect(search).toHaveFocus();
+    expect(panel.scrollTop).toBe(139);
   });
 
   it("closes removed users without reopening their details on a later publication", async () => {
@@ -1166,9 +1291,11 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     view.rerender(<CopilotUsersView dataRevision={1} />);
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.getByText("The selected user is no longer present in this saved user snapshot.")).toBeVisible();
     view.rerender(<CopilotUsersView dataRevision={2} />);
     await screen.findByRole("button", { name: "Ada" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("The selected user is no longer present in this saved user snapshot.")).not.toBeInTheDocument();
   });
 
   it("closes the service-user dialog across external subview navigation without reviving it on return", async () => {

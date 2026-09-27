@@ -1,7 +1,7 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
-import { getAgentInvestigationContext, getAgentPurviewRecords, resolveAgentInvestigationIdentity, type AgentInvestigationContext, type PurviewAuditRecord } from "../api/client";
+import { ApiError, getAgentInvestigationContext, getAgentPurviewRecords, resolveAgentInvestigationIdentity, type AgentInvestigationContext, type PurviewAuditRecord } from "../api/client";
 import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
 
@@ -12,8 +12,8 @@ vi.mock("../api/client", async original => ({
   resolveAgentInvestigationIdentity: vi.fn(),
 }));
 vi.mock("./DefenderHuntingView", () => ({
-  DefenderHuntingView: ({ agentRecordId, entraAgentIds, active }: { agentRecordId: string; entraAgentIds: string[]; active: boolean }) =>
-    active ? <div aria-label="Scoped Defender hunt">{agentRecordId} / {entraAgentIds.join(",")}</div> : null,
+  DefenderHuntingView: ({ agentRecordId, entraAgentIds, active, contextCurrent }: { agentRecordId: string; entraAgentIds: string[]; active: boolean; contextCurrent: boolean }) =>
+    active ? <div aria-label="Scoped Defender hunt" data-current={contextCurrent}>{agentRecordId} / {entraAgentIds.join(",")}</div> : null,
 }));
 
 const recordId = "power_platform:environment-a:agent-a";
@@ -47,6 +47,13 @@ const auditRecord: PurviewAuditRecord = {
 
 function panel(id = recordId, roles: ("AgentControl.Viewer" | "AgentControl.Admin")[] = ["AgentControl.Viewer"], access = capability, revision = "1") {
   return <CapabilityContext value={access}><AgentInvestigationsPanel recordId={id} agentName={id === recordId ? "Agent A" : "Agent B"} roles={roles} revision={revision} /></CapabilityContext>;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -304,6 +311,18 @@ describe("agent investigations", () => {
     expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
   });
 
+  it("honors current principal role revocation even before the modal roles prop catches up", async () => {
+    const view = render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], { ...capability, user: { ...capability.user!, roles: [] } }));
+    expect(screen.getByText("An AgentControl.Viewer role is required to view agent logs.")).toBeVisible();
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentInvestigationContext).toHaveBeenCalledOnce();
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+  });
+
   it("explains source coverage and collection requirements even when an agent cannot be linked", async () => {
     vi.mocked(getAgentInvestigationContext).mockResolvedValue({
       ...investigation, defender: { status: "unavailable", reasonCode: "unsupported_identity_crosswalk", entraAgentIds: [] },
@@ -337,7 +356,7 @@ describe("agent investigations", () => {
     vi.mocked(getAgentInvestigationContext).mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
     view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByText("actor@example.invalid")).toBeVisible();
     await act(async () => complete(investigation));
     await screen.findByText("actor@example.invalid");
     expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, { search: "correlation-a", operation: "BotCreate", limit: 50, offset: 0 }, { signal: expect.any(AbortSignal) });
@@ -347,6 +366,139 @@ describe("agent investigations", () => {
     fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
     expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("unfinished edit");
     expect(screen.getByLabelText("Exact audit operation")).toHaveValue("BotCreate");
+  });
+
+  it("keeps the Defender presentation mounted but unverified during repeated context refresh", async () => {
+    const stale = deferred<AgentInvestigationContext>();
+    const current = deferred<AgentInvestigationContext>();
+    const view = render(panel());
+    const hunt = await screen.findByLabelText("Scoped Defender hunt");
+    vi.mocked(getAgentInvestigationContext).mockReturnValueOnce(stale.promise).mockReturnValueOnce(current.promise);
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+    const signal = vi.mocked(getAgentInvestigationContext).mock.calls.at(-1)![1]!.signal!;
+    expect(screen.getByLabelText("Scoped Defender hunt")).toBe(hunt);
+    expect(hunt).toHaveAttribute("data-current", "false");
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "3"));
+    expect(signal.aborted).toBe(true);
+    expect(screen.getByLabelText("Scoped Defender hunt")).toBe(hunt);
+    await act(async () => current.resolve(investigation));
+    await waitFor(() => expect(hunt).toHaveAttribute("data-current", "true"));
+    await act(async () => stale.resolve(unresolved));
+    expect(screen.getByLabelText("Scoped Defender hunt")).toBe(hunt);
+    expect(resolveAgentInvestigationIdentity).not.toHaveBeenCalled();
+  });
+
+  it("retains Purview rows, applied page, draft edits, focus and scroll through overlapping context and record reads", async () => {
+    vi.mocked(getAgentPurviewRecords).mockImplementation(async (_id, query) => ({
+      recordId, mode: "saved_only", value: [auditRecord], count: 101, limit: 50, offset: query?.offset ?? 0,
+    }));
+    const view = render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    const search = screen.getByLabelText("Search saved audit metadata");
+    fireEvent.change(search, { target: { value: "correlation-a" } });
+    fireEvent.change(screen.getByLabelText("Exact audit operation"), { target: { value: "BotCreate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search saved audit" }));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+    await screen.findByText("actor@example.invalid");
+    fireEvent.click(screen.getByRole("button", { name: "Next audit records" }));
+    await screen.findByText("51-51 of 101");
+    fireEvent.change(search, { target: { value: "unfinished edit" } });
+    search.focus();
+    const table = screen.getByRole("region", { name: "Agent Purview records" });
+    table.scrollTop = 143;
+    const staleContext = deferred<AgentInvestigationContext>();
+    const currentContext = deferred<AgentInvestigationContext>();
+    const staleRecords = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    const currentRecords = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+    vi.mocked(getAgentInvestigationContext).mockReturnValueOnce(staleContext.promise).mockReturnValueOnce(currentContext.promise);
+    vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(staleRecords.promise).mockReturnValueOnce(currentRecords.promise);
+
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+    const contextSignal = vi.mocked(getAgentInvestigationContext).mock.calls.at(-1)![1]!.signal!;
+    expect(screen.getByRole("region", { name: "Agent Purview records" })).toBe(table);
+    expect(search).toHaveFocus();
+    expect(table.scrollTop).toBe(143);
+    expect(getAgentPurviewRecords).toHaveBeenCalledTimes(3);
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "3"));
+    expect(contextSignal.aborted).toBe(true);
+    await act(async () => currentContext.resolve(investigation));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(4));
+    const recordSignal = vi.mocked(getAgentPurviewRecords).mock.calls.at(-1)![2]!.signal!;
+    expect(screen.getByRole("region", { name: "Agent Purview records" })).toBe(table);
+    expect(search).toHaveFocus();
+    expect(table.scrollTop).toBe(143);
+
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "4"));
+    await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(5));
+    expect(recordSignal.aborted).toBe(true);
+    expect(screen.getByRole("region", { name: "Agent Purview records" })).toBe(table);
+    expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("unfinished edit");
+    expect(screen.getByLabelText("Exact audit operation")).toHaveValue("BotCreate");
+    expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId,
+      { search: "correlation-a", operation: "BotCreate", offset: 50, limit: 50 }, expect.anything());
+    await act(async () => currentRecords.resolve({
+      recordId, mode: "saved_only", value: [{ ...auditRecord, actorUserPrincipalName: "updated@example.invalid" }], count: 101, offset: 50, limit: 50,
+    }));
+    expect(await within(table).findByText("updated@example.invalid")).toBeVisible();
+    expect(search).toHaveFocus();
+    expect(table.scrollTop).toBe(143);
+    await act(async () => {
+      staleContext.resolve({ ...investigation, purview: { mode: "saved_only", status: "unavailable", reason: "Superseded mapping" } });
+      staleRecords.resolve({ recordId, mode: "saved_only", value: [auditRecord], count: 101, offset: 50, limit: 50 });
+    });
+    expect(screen.queryByText("Superseded mapping")).not.toBeInTheDocument();
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByText("updated@example.invalid")).toBeVisible();
+  });
+
+  it.each([new Error("Saved audit refresh failed"), new ApiError(403, "forbidden", "Saved audit access denied")])(
+    "removes retained records on $message and retries without changing draft filters", async failure => {
+      const view = render(panel());
+      await screen.findByLabelText("Scoped Defender hunt");
+      fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+      await screen.findByText("actor@example.invalid");
+      fireEvent.change(screen.getByLabelText("Search saved audit metadata"), { target: { value: "draft" } });
+      const pending = deferred<Awaited<ReturnType<typeof getAgentPurviewRecords>>>();
+      vi.mocked(getAgentPurviewRecords).mockReturnValueOnce(pending.promise);
+      view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+      await waitFor(() => expect(getAgentPurviewRecords).toHaveBeenCalledTimes(2));
+      expect(screen.getByText("actor@example.invalid")).toBeVisible();
+      await act(async () => pending.reject(failure));
+      expect(await screen.findByRole("alert")).toHaveTextContent(failure.message);
+      expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("draft");
+      fireEvent.click(screen.getByRole("button", { name: "Refresh investigation access" }));
+      expect(await screen.findByText("actor@example.invalid")).toBeVisible();
+      expect(getAgentPurviewRecords).toHaveBeenLastCalledWith(recordId, expect.objectContaining({ search: "" }), expect.anything());
+      expect(screen.getByLabelText("Search saved audit metadata")).toHaveValue("draft");
+    },
+  );
+
+  it.each(["error", "unmapped"] as const)("removes loaded Purview records after refreshed context becomes %s", async outcome => {
+    const view = render(panel());
+    await screen.findByLabelText("Scoped Defender hunt");
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    await screen.findByText("actor@example.invalid");
+    if (outcome === "error") vi.mocked(getAgentInvestigationContext).mockRejectedValueOnce(new Error("Saved investigation access denied"));
+    else vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce({
+      ...investigation, purview: { status: "unavailable", mode: "saved_only", reason: "The saved bot mapping was removed." },
+    });
+    view.rerender(panel(recordId, ["AgentControl.Viewer"], capability, "2"));
+    await screen.findByText(outcome === "error" ? "Saved investigation access denied" : "The saved bot mapping was removed.");
+    expect(screen.queryByText("actor@example.invalid")).not.toBeInTheDocument();
+    expect(getAgentPurviewRecords).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("rejects investigation context for another agent before exposing either child", async () => {
+    vi.mocked(getAgentInvestigationContext).mockResolvedValueOnce({ ...investigation, recordId: "other-agent" });
+    render(panel());
+    expect(await screen.findByRole("alert")).toHaveTextContent("Investigation access does not match the selected agent");
+    expect(screen.queryByLabelText("Scoped Defender hunt")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
+    expect(getAgentPurviewRecords).not.toHaveBeenCalled();
   });
 
   it("ignores permission-check timestamp renewals but rechecks real access changes without resetting the chosen source", async () => {

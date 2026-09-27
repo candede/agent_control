@@ -12,8 +12,8 @@ type Props = { recordId: string; agentName: string; roles: AppRole[]; revision?:
 export function AgentInvestigationsPanel(props: Props) {
   const capability = useContext(CapabilityContext);
   const identity = JSON.stringify([capability?.user?.tenantId, capability?.user?.homeAccountId,
-    [...props.roles].sort(), props.recordId]);
-  if (!hasAppRole(props.roles, "AgentControl.Viewer")) {
+    [...(capability?.user?.roles ?? [])].sort(), [...props.roles].sort(), props.recordId]);
+  if (!hasAppRole(props.roles, "AgentControl.Viewer") || capability?.user && !hasAppRole(capability.user.roles, "AgentControl.Viewer")) {
     return <p className="agent-insight-note">An AgentControl.Viewer role is required to view agent logs.</p>;
   }
   if (!capability?.user) return <p className="agent-insight-note">Sign in to load agent investigation access.</p>;
@@ -24,10 +24,11 @@ function InvestigationSession({ recordId, agentName, identity, revision }: Props
   const capability = useContext(CapabilityContext);
   const [source, setSource] = useState<"defender" | "purview">("defender");
   const [refreshVersion, setRefreshVersion] = useState(0);
-  const contextKey = JSON.stringify([identity, revision,
+  const contextScope = JSON.stringify([identity,
     capability?.views.filter(view => /^(defender\.hunting\.|purview\.audit\.search\.|graph\.agentIdentity\.read$)/.test(view.definition.id))
       .map(view => [view.definition.id, view.decision.status, view.decision.authorized, view.decision.fresh,
         view.decision.verification, view.decision.previewQualification, view.enabled, view.configuration])]);
+  const contextKey = JSON.stringify([contextScope, revision]);
   const [resolution, setResolution] = useState<{ key: string; pending?: boolean; error?: string }>();
   const resolving = resolution?.key === contextKey && Boolean(resolution.pending);
   const resolutionError = resolution?.key === contextKey ? resolution.error : undefined;
@@ -37,15 +38,20 @@ function InvestigationSession({ recordId, agentName, identity, revision }: Props
     resolutionRequest.current = undefined;
   }, [contextKey]);
   const context = useSavedQuery({
-    queryKey: ["agent-investigation-context", contextKey],
-    queryFn: ({ signal }) => getAgentInvestigationContext(recordId, { signal }),
-    placeholderData: previous => previous,
+    queryKey: ["agent-investigation-context", contextScope, revision],
+    queryFn: async ({ signal }) => {
+      const value = await getAgentInvestigationContext(recordId, { signal });
+      if (value.recordId !== recordId) throw new Error("Investigation access does not match the selected agent.");
+      return value;
+    },
+    placeholderData: (previous, query) => query?.queryKey[1] === contextScope && query.state.status === "success" ? previous : undefined,
   });
   const current = !context.isFetching && !context.isError && !context.isPlaceholderData;
-  const defenderActive = current && source === "defender" && !resolving;
-  const purviewActive = current && source === "purview" && context.data?.purview.status === "available";
+  const data = context.isError ? undefined : context.data;
+  const defenderActive = source === "defender" && !resolving;
+  const purviewActive = source === "purview" && data?.purview.status === "available";
   async function resolveIdentity() {
-    if (resolutionRequest.current) return;
+    if (!current || !data?.defender.resolution?.canResolve || resolutionRequest.current) return;
     const controller = new AbortController();
     resolutionRequest.current = controller;
     setResolution({ key: contextKey, pending: true });
@@ -103,28 +109,29 @@ function InvestigationSession({ recordId, agentName, identity, revision }: Props
       </>}
     </section>
     {resolutionError ? <p className="error-banner" role="alert">Identity lookup: {resolutionError}</p> : null}
-    {context.isFetching ? <p role="status">Checking saved agent identity...</p>
-      : context.isError ? <p className="error-banner" role="alert">{context.error.message}</p>
-        : context.data && source === "defender" ? <>
-          {context.data.defender.resolution?.canResolve ? <div className="agent-insight-empty">
-            <p>{resolutionSummary(context.data.defender.resolution)}</p>
-            <button type="button" className="secondary" disabled={resolving} onClick={() => void resolveIdentity()}>
-              {resolving ? "Resolving log identity..." : context.data.defender.resolution.resolvedAt ? "Refresh log identity" : "Resolve log identity"}
+    {context.isFetching ? <p role="status" className={data ? "sr-only" : undefined}>{data ? "Refreshing investigation access. Showing the last loaded saved data." : "Checking saved agent identity..."}</p> : null}
+    {context.isError ? <p className="error-banner" role="alert">{context.error.message}</p>
+        : data && source === "defender" ? <>
+          {data.defender.resolution?.canResolve ? <div className="agent-insight-empty">
+            <p>{resolutionSummary(data.defender.resolution)}</p>
+            <button type="button" className="secondary" disabled={!current || resolving} onClick={() => void resolveIdentity()}>
+              {resolving ? "Resolving log identity..." : data.defender.resolution.resolvedAt ? "Refresh log identity" : "Resolve log identity"}
             </button>
             {resolving ? <p role="status">Verifying the selected agent with Microsoft Graph...</p> : null}
             <p>Identity lookup requires delegated <code>AgentIdentity.Read.All</code> with admin consent and access to the agent identity
               (Agent ID Administrator for nonowners).</p>
           </div> : null}
-          {context.data.defender.status !== "available" && !context.data.defender.resolution?.canResolve
-            ? <IdentityUnavailable source="Defender" reason={context.data.defender.reason} reasonCode={context.data.defender.reasonCode} /> : null}
+          {data.defender.status !== "available" && !data.defender.resolution?.canResolve
+            ? <IdentityUnavailable source="Defender" reason={data.defender.reason} reasonCode={data.defender.reasonCode} /> : null}
         </>
-        : context.data?.purview.status === "unavailable"
-          ? <IdentityUnavailable source="Purview" reason={context.data.purview.reason} reasonCode={context.data.purview.reasonCode} /> : null}
-    {context.data?.defender.status === "available" ? <DefenderHuntingView active={defenderActive}
-      agentRecordId={recordId} agentName={agentName} entraAgentIds={context.data.defender.entraAgentIds}
-      entraAgentApplicationIds={context.data.defender.entraAgentApplicationIds} templates={context.data.defender.templates} /> : null}
-    <AgentPurviewRecords recordId={recordId} expectedRecordId={context.data?.recordId} identity={identity}
-      revision={JSON.stringify([contextKey, refreshVersion])} active={purviewActive} />
+        : data?.purview.status === "unavailable"
+          ? <IdentityUnavailable source="Purview" reason={data.purview.reason} reasonCode={data.purview.reasonCode} /> : null}
+    {data?.defender.status === "available" ? <DefenderHuntingView active={defenderActive} contextCurrent={current}
+      revision={JSON.stringify([contextKey, refreshVersion])}
+      agentRecordId={recordId} agentName={agentName} entraAgentIds={data.defender.entraAgentIds}
+      entraAgentApplicationIds={data.defender.entraAgentApplicationIds} templates={data.defender.templates} /> : null}
+    <AgentPurviewRecords recordId={recordId} expectedRecordId={data?.recordId} identity={contextScope}
+      revision={JSON.stringify([contextKey, refreshVersion])} active={purviewActive} contextCurrent={current} />
   </section>;
 }
 
@@ -151,26 +158,31 @@ function resolutionSummary(resolution: NonNullable<AgentInvestigationContext["de
     : "Verify the agent's Entra identity to enable hunting.";
 }
 
-function AgentPurviewRecords({ recordId, expectedRecordId, identity, revision, active }: {
-  recordId: string; expectedRecordId?: string; identity: string; revision: string; active: boolean;
+function AgentPurviewRecords({ recordId, expectedRecordId, identity, revision, active, contextCurrent }: {
+  recordId: string; expectedRecordId?: string; identity: string; revision: string; active: boolean; contextCurrent: boolean;
 }) {
   const [search, setSearch] = useState("");
   const [operation, setOperation] = useState("");
   const [query, setQuery] = useState({ search: "", operation: "", limit: 50, offset: 0 });
   const records = useSavedQuery({
-    queryKey: ["agent-purview-records", identity, revision, query],
-    enabled: active,
+    queryKey: ["agent-purview-records", identity, query, revision],
+    enabled: active && contextCurrent,
     queryFn: async ({ signal }) => {
       const page = await getAgentPurviewRecords(recordId, query, { signal });
       if (page.recordId !== expectedRecordId) throw new Error("Audit records do not match the selected agent. Refresh investigation access.");
       return page;
     },
+    placeholderData: (previous, saved) => saved?.queryKey[1] === identity && saved.queryKey[2] === query
+      && saved.state.status === "success" ? previous : undefined,
   });
+  const data = records.isError ? undefined : records.data;
+  const pending = !contextCurrent || records.isFetching || records.isPending;
   if (!active) return null;
   return <section className="agent-investigation-records" aria-label="Agent Purview audit">
     <h4>Saved Purview audit records</h4>
     <form className="agent-insight-toolbar" onSubmit={event => {
       event.preventDefault();
+      if (!contextCurrent || records.isFetching) return;
       const next = { search: search.trim(), operation: operation.trim(), limit: 50, offset: 0 };
       if (JSON.stringify(query) === JSON.stringify(next)) void records.refetch();
       else setQuery(next);
@@ -180,24 +192,28 @@ function AgentPurviewRecords({ recordId, expectedRecordId, identity, revision, a
         <option value="">All supported operations</option>
         {purviewAuditPresets.copilot_studio_admin.operationFilters.map(value => <option key={value} value={value}>{value}</option>)}
       </select></label>
-      <button type="submit" className="secondary" disabled={records.isFetching}><Search size={15} aria-hidden="true" /> Search saved audit</button>
+      <button type="submit" className="secondary" disabled={!data && records.isFetching} aria-disabled={!contextCurrent || records.isFetching}><Search size={15} aria-hidden="true" /> Search saved audit</button>
     </form>
-    {records.isFetching ? <p role="status">Loading agent audit records...</p>
-      : records.isError ? <p className="error-banner" role="alert">{records.error.message}</p>
-        : records.data ? <>
-          <p>{records.data.count} matching saved records.</p>
-          {records.data.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Agent Purview records" tabIndex={0}>
+    {pending ? <p role="status" className={data ? "sr-only" : undefined}>{data ? "Refreshing saved audit records. Showing the last loaded results." : "Loading agent audit records..."}</p> : null}
+    {records.isError ? <p className="error-banner" role="alert">{records.error.message}</p>
+        : data ? <>
+          <p>{data.count} matching saved records.</p>
+          {data.value.length ? <div className="agent-insight-table-shell" role="region" aria-label="Agent Purview records" tabIndex={0}>
             <table className="agent-insight-table agent-audit-table"><thead><tr><th scope="col">Time</th><th scope="col">Operation</th><th scope="col">Actor</th><th scope="col">Result</th><th scope="col">Details</th></tr></thead>
-              <tbody>{records.data.value.map((record, index) => <tr key={`${record.wrapperId}:${index}`}>
+              <tbody>{data.value.map((record, index) => <tr key={`${record.wrapperId}:${index}`}>
                 <td data-label="Time">{new Date(record.eventDateTime).toLocaleString()}</td><th scope="row" data-label="Operation">{record.operation}</th>
                 <td data-label="Actor">{record.actorUserPrincipalName ?? record.actorUserId ?? "Not supplied"}</td><td data-label="Result">{record.resultStatus ?? "Not supplied"}</td>
                 <td data-label="Details"><AuditRecordDetails record={record} /></td>
               </tr>)}</tbody></table>
           </div> : <p className="agent-insight-note">No matching saved audit records. Try another search or check audit collection in Setup &amp; permissions.</p>}
           <div className="agent-insight-pagination">
-            <button type="button" className="secondary" disabled={query.offset === 0} onClick={() => setQuery(current => ({ ...current, offset: Math.max(0, current.offset - current.limit) }))}>Previous audit records</button>
-            <span>{records.data.value.length ? `${query.offset + 1}-${query.offset + records.data.value.length} of ${records.data.count}` : records.data.count ? "No records on this page; return to the previous page." : "0 records"}</span>
-            <button type="button" className="secondary" disabled={query.offset + query.limit >= records.data.count} onClick={() => setQuery(current => ({ ...current, offset: current.offset + current.limit }))}>Next audit records</button>
+            <button type="button" className="secondary" disabled={query.offset === 0} aria-disabled={!contextCurrent || query.offset === 0} onClick={() => {
+              if (contextCurrent) setQuery(current => ({ ...current, offset: Math.max(0, current.offset - current.limit) }));
+            }}>Previous audit records</button>
+            <span>{data.value.length ? `${query.offset + 1}-${query.offset + data.value.length} of ${data.count}` : data.count ? "No records on this page; return to the previous page." : "0 records"}</span>
+            <button type="button" className="secondary" disabled={query.offset + query.limit >= data.count} aria-disabled={!contextCurrent || query.offset + query.limit >= data.count} onClick={() => {
+              if (contextCurrent) setQuery(current => ({ ...current, offset: current.offset + current.limit }));
+            }}>Next audit records</button>
           </div>
         </> : null}
   </section>;

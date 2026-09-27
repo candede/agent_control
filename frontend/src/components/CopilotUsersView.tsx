@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { SortingState } from "@tanstack/react-table";
 import {
   ApiError,
@@ -8,6 +8,8 @@ import {
   type CopilotUsageUser,
   type CopilotUsageUsersResponse,
 } from "../api/client";
+import { hasRole } from "../authorization";
+import { CapabilityContext } from "../capabilityContext";
 import { copilotServicePresentation } from "../copilotServicePresentation";
 import { useListTable, type ListColumn } from "../listTable";
 import { useSavedRead } from "../savedQueries";
@@ -39,26 +41,39 @@ const licenseSorts = [
   ["follow-up-desc", "Follow-up Z–A", "followUp", true],
 ] as const;
 
-export function CopilotUsersView({
-  dataRevision = 0,
-  agentInventoryRevision = 0,
-  route,
-  onRouteChange,
-  onOpenAgent,
-  reportSelector,
-}: {
+type Props = {
   dataRevision?: number;
   agentInventoryRevision?: number;
   route?: UsersRouteState;
   onRouteChange?: (route: UsersRouteState, replace?: boolean) => void;
   onOpenAgent?: (id: string) => void;
   reportSelector?: ReactNode;
-}) {
+};
+
+export function CopilotUsersView(props: Props) {
+  const capability = useContext(CapabilityContext);
+  const principal = capability?.user;
+  const scope = JSON.stringify([principal?.tenantId, principal?.homeAccountId, [...(principal?.roles ?? [])].sort()]);
+  if (capability && !hasRole(principal, "AgentControl.Viewer")) {
+    return <section aria-label="Users and adoption"><p role="alert">Current Viewer access is required to read saved users.</p></section>;
+  }
+  return <CopilotUsersSession key={scope} {...props} scope={scope} />;
+}
+
+function CopilotUsersSession({
+  dataRevision = 0,
+  agentInventoryRevision = 0,
+  route,
+  onRouteChange,
+  onOpenAgent,
+  reportSelector,
+  scope,
+}: Props & { scope: string }) {
   const [data, setData] = useState<CopilotUsageUsersResponse>();
   const [read, setRead] = useState<ReadState>();
   const [reload, setReload] = useState(0);
   const [internalRoute, setInternalRoute] = useState<UsersRouteState>({ view: "licenses", search: "", page: 0 });
-  const [selectedUser, setSelectedUser] = useState<{ id: string; threshold: number; key: object }>();
+  const [selectedUser, setSelectedUser] = useState<{ id: string; threshold: number; key: object; removed?: boolean }>();
   const cohortSelect = useRef<HTMLSelectElement>(null);
   const directoryRequest = useRef<AbortController | null>(null);
   const readSaved = useSavedRead();
@@ -71,8 +86,8 @@ export function CopilotUsersView({
   const error = scopedRead?.status === "failed" ? scopedRead.error : undefined;
   const accessDenied = scopedRead?.status === "failed" && scopedRead.accessDenied;
   const selectionKey = useMemo(() => ({ view: currentRoute.view }), [currentRoute.view]);
-  const selected = selectedUser?.key === selectionKey
-    ? data?.users.find(user => user.directory.objectId === selectedUser.id)
+  const selected = selectedUser?.key === selectionKey && !selectedUser.removed
+    ? currentData?.users.find(user => user.directory.objectId === selectedUser.id)
     : undefined;
 
   function changeRoute(next: UsersRouteState, replace = false) {
@@ -84,27 +99,30 @@ export function CopilotUsersView({
     if (!needsDirectory) return;
     const controller = new AbortController();
     directoryRequest.current = controller;
-    void readSaved(["copilot-usage-users", dataRevision, reload], signal => getCopilotUsageUsers({ signal }), controller.signal).then(result => {
+    void readSaved(["copilot-usage-users", scope, dataRevision, reload], signal => getCopilotUsageUsers({ signal }), controller.signal).then(result => {
       if (!controller.signal.aborted) {
         setData(result);
         setRead({ key: readKey, status: "ready" });
-        setSelectedUser(selection => result.users.some(user => user.directory.objectId === selection?.id) ? selection : undefined);
+        setSelectedUser(selection => {
+          if (!selection) return selection;
+          return result.users.some(user => user.directory.objectId === selection.id)
+            ? selection.removed ? undefined : selection
+            : { ...selection, removed: true };
+        });
       }
     }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
         const denied = failure instanceof ApiError && (failure.status === 401 || failure.status === 403);
-        if (denied) {
-          setData(undefined);
-          setSelectedUser(undefined);
-        }
+        if (denied) setData(undefined);
+        setSelectedUser(undefined);
         setRead({ key: readKey, status: "failed", error: failure instanceof Error ? failure.message : "Paid Copilot licenses and usage could not be loaded.", accessDenied: denied });
       }
     });
     return () => controller.abort();
-  }, [needsDirectory, dataRevision, readKey, readSaved, reload]);
+  }, [needsDirectory, scope, dataRevision, readKey, readSaved, reload]);
 
   return (
-    <section className="copilot-users" aria-label="Users and adoption" aria-busy={loading && !data && currentRoute.view === "licenses"}>
+    <section className="copilot-users" aria-label="Users and adoption" aria-busy={loading && !currentData && currentRoute.view === "licenses"}>
       <header className="copilot-users-header">
         <div>
           <h2>Users & adoption</h2>
@@ -130,13 +148,14 @@ export function CopilotUsersView({
       {currentRoute.view !== "responsibility" ? reportSelector : null}
       {error && currentRoute.view !== "responsibility" ? <div className="error-banner" role="alert">{error} Use Permissions in the top navigation for connection recovery.
         {" "}<button type="button" className="secondary" onClick={() => setReload(value => value + 1)}>Retry saved users</button></div> : null}
-      {loading && !data && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}
-      {data && !currentData && currentRoute.view !== "responsibility" ? <p className="copilot-users-notice" role="status">Showing the last saved user snapshot. Current licensing and adoption recommendations are unverified until saved users reload.</p> : null}
+      {loading && !currentData && currentRoute.view === "licenses" ? <p role="status">Loading saved Copilot license status and usage snapshots...</p> : null}
+      {loading && currentData && currentRoute.view !== "responsibility" ? <p className="sr-only" role="status">Refreshing saved users. Showing the last loaded snapshot.</p> : null}
+      {selectedUser?.key === selectionKey && selectedUser.removed ? <p className="copilot-users-notice" role="status">The selected user is no longer present in this saved user snapshot.</p> : null}
       {currentRoute.view === "responsibility" ? <UserAgentResponsibility key={currentRoute.personId ?? "people"} route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
-        : currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} directoryData={currentData} directoryDataRevision={read?.key.dataRevision} onOpenAgent={onOpenAgent}
-        onAccessDenied={message => { directoryRequest.current?.abort(); setData(undefined); setRead({ key: readKey, status: "failed", error: message, accessDenied: true }); }} /> : null
+        : currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} directoryData={currentData} directoryDataRevision={read?.key.dataRevision} directoryPending={loading} onOpenAgent={onOpenAgent}
+        onAccessDenied={message => { directoryRequest.current?.abort(); setData(undefined); setSelectedUser(undefined); setRead({ key: readKey, status: "failed", error: message, accessDenied: true }); }} /> : null
         : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, key: selectionKey })} /> : null}
-      {selected && selectedUser && data ? <CopilotUserDetail user={selected} data={data} current={Boolean(currentData)} threshold={selectedUser.threshold} returnFocusTo={cohortSelect} onClose={() => setSelectedUser(undefined)} onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} /> : null}
+      {selected && selectedUser && data ? <CopilotUserDetail user={selected} data={data} current={Boolean(currentData)} refreshing={loading} threshold={selectedUser.threshold} returnFocusTo={cohortSelect} onClose={() => setSelectedUser(undefined)} onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} /> : null}
     </section>
   );
 }
@@ -208,6 +227,9 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
     setCohort(previous => previous === next ? "licensed" : next);
     setPage(0);
   }
+
+  // A failed read removes presentation, but a saved-read retry must not reset local filters.
+  if (!current) return null;
 
   return <>
     {data.snapshot?.state === "not_synced" ? <p className="copilot-users-notice" role="status">No saved user data. Run Users sync from Sync in the top navigation.</p>
@@ -302,8 +324,8 @@ function formatDateTime(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onClose, onOpenAgent, dataRevision, agentInventoryRevision }: {
-  user: CopilotUsageUser; data: CopilotUsageUsersResponse; current: boolean; threshold: number; onClose: () => void;
+function CopilotUserDetail({ user, data, current, refreshing, threshold, returnFocusTo, onClose, onOpenAgent, dataRevision, agentInventoryRevision }: {
+  user: CopilotUsageUser; data: CopilotUsageUsersResponse; current: boolean; refreshing: boolean; threshold: number; onClose: () => void;
   returnFocusTo: RefObject<HTMLSelectElement | null>;
   onOpenAgent?: (id: string) => void;
   dataRevision: number;
@@ -316,7 +338,7 @@ function CopilotUserDetail({ user, data, current, threshold, returnFocusTo, onCl
     directoryUser={user} directoryCurrent={directoryCurrent} reportUser={user.importedUsage}
     reportPeriod={data.sources.importedAgentUsage.period} reportCurrent={fresh} appActivityState={data.sources.appActivity.state}
     followUp={followUp} returnFocusTo={returnFocusTo} closeLabel="Close user details" onClose={onClose}
-    onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} />;
+    onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} refreshing={refreshing} />;
 }
 
 function responses(user: CopilotUsageUser): number | null {

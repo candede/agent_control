@@ -709,15 +709,64 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledOnce();
   });
 
-  it("reloads saved details after the parent invalidates a completed package read", () => {
+  it("reloads stale parent-owned details without replacing or remounting the same Overview", () => {
     const { props, update } = renderDetail();
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
-    update({ packageDetail: { ...record.packages[0], longDescription: "Previous saved description" } });
-    update({ packageDetail: undefined });
-    expect(screen.queryByText("Previous saved description")).not.toBeInTheDocument();
+    const observation = { observedAt: "2026-09-20T10:00:00Z", expiresAt: "2099-09-20T10:00:00Z", scopeKind: "exact" as const };
+    const previous = { ...record.packages[0], longDescription: "Previous saved description", observation };
+    update({ packageDetail: previous });
+    const information = screen.getByRole("region", { name: "Agent information" });
+    update({ packageDetail: previous, packageDetailStale: true, inventoryRevision: "next-saved-revision" });
+    update({ packageDetail: previous, packageDetailStale: true, packageDetailLoading: true, inventoryRevision: "next-saved-revision" });
+    expect(screen.getByText("Previous saved description")).toBeVisible();
+    expect(screen.queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent information" })).toBe(information);
     expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
     expect(props.onInspectPackage).toHaveBeenLastCalledWith(record.packages[0]);
+    update({ inventoryRevision: "next-saved-revision", packageDetailStale: false, packageDetailLoading: false, packageDetail: {
+      ...record.packages[0], longDescription: "Updated saved description",
+      observation: { ...observation, observedAt: "2026-09-20T10:01:00Z" },
+    } });
+    expect(screen.getByText("Updated saved description")).toBeVisible();
+    expect(screen.queryByText("Previous saved description")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent information" })).toBe(information);
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
   });
+
+  it("shows a failed parent-owned read and does not restore old details on retry", async () => {
+    const { props, update } = renderDetail({
+      packageDetail: { ...record.packages[0], longDescription: "Previously authorized details" },
+    });
+    update({ packageDetailStale: true, packageDetailLoading: true });
+    expect(screen.getByText("Previously authorized details")).toBeVisible();
+    update({ packageDetail: undefined, packageDetailLoading: false, packageDetailError: "Saved package access was denied." });
+    expect(screen.getByRole("alert")).toHaveTextContent("Saved package access was denied.");
+    expect(screen.queryByText("Previously authorized details")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+    update({ packageDetail: undefined, packageDetailError: undefined, packageDetailLoading: true });
+    expect(screen.queryByText("Previously authorized details")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading saved agent details...")).toBeVisible();
+  });
+
+  it.each(["tenant", "principal", "roles", "agent"] as const)(
+    "does not retain an invalidated Overview across a changed %s",
+    scope => {
+      const { update } = renderDetail({
+        packageDetail: { ...record.packages[0], longDescription: "Previous scope description" },
+      });
+      update({
+        packageDetail: undefined, packageDetailLoading: true,
+        record: scope === "agent" ? { ...record, id: "another-agent" } : record,
+        roles: scope === "roles" ? ["AgentControl.Viewer"] : user.roles,
+      }, capabilities(), {
+        ...user,
+        tenantId: scope === "tenant" ? "another-tenant" : user.tenantId,
+        homeAccountId: scope === "principal" ? "another-principal" : user.homeAccountId,
+      });
+      expect(screen.queryByText("Previous scope description")).not.toBeInTheDocument();
+    },
+  );
 
   it("requests the package again after returning from a resource-only agent", () => {
     const { props, update } = renderDetail();
@@ -808,6 +857,39 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(first);
     expect(screen.getByRole("region", { name: "Manage Package one (package-1)" })).toBeVisible();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps an access draft and focused action stable during a background detail replacement", async () => {
+    const detail = { ...record.packages[0], availableTo: "some" as const, allowedUsersAndGroups: [] };
+    const { props, update } = renderDetail({ activeTab: "controls", packageDetail: detail });
+    await userEvent.click(screen.getByRole("radio", { name: /No users/ }));
+    const apply = screen.getByRole("button", { name: "Apply" });
+    apply.focus();
+    update({ activeTab: "controls", packageDetail: detail, packageInventoryPending: true });
+    expect(apply).toHaveFocus();
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    update({ activeTab: "controls", packageDetail: detail, packageDetailStale: true, packageDetailLoading: true, inventoryRevision: "new-inventory" });
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Apply" })).toBe(apply);
+    expect(apply).toHaveFocus();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    update({ activeTab: "controls", packageDetail: { ...detail, isBlocked: true }, inventoryRevision: "new-inventory" });
+    expect(screen.getByRole("radio", { name: /No users/ })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Apply" })).toBe(apply);
+    expect(apply).toHaveFocus();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+  });
+
+  it("keeps the latest read-only access values rather than reverting to the first loaded detail", () => {
+    const first = { ...record.packages[0], availableTo: "some" as const, allowedUsersAndGroups: [] };
+    const latest = { ...first, availableTo: "none" as const };
+    const { update } = renderDetail({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: first });
+    update({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: latest });
+    const none = screen.getByRole("radio", { name: /No users/ });
+    expect(none).toBeChecked();
+    update({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: latest, packageDetailStale: true, packageDetailLoading: true });
+    expect(screen.getByRole("radio", { name: /No users/ })).toBe(none);
+    expect(none).toBeChecked();
   });
 
   it("rejects an unavailable restored version rather than reading or managing the first package", () => {
@@ -1282,6 +1364,58 @@ describe("UnifiedAgentDetailModal", () => {
     expect(api.getOfficialUsageAgentUsers).not.toHaveBeenCalled();
   });
 
+  it("refreshes the mounted agent users on a data revision without resetting the tab or search", async () => {
+    const { update } = renderDetail({
+      activeTab: "reports", usageContext: automaticUsageContext, inventoryRevision: "a".repeat(64),
+      record: { ...record, usage: automaticAgentUsageFixture() },
+    });
+    await screen.findByRole("heading", { name: "Users (7)" });
+    const search = screen.getByRole("searchbox", { name: "Search agent users" });
+    fireEvent.change(search, { target: { value: "Agent user" } });
+    await waitFor(() => expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledTimes(2));
+    search.focus();
+    update({ dataRevision: 1 });
+    await waitFor(() => expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("tab", { name: "Usage & users" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("searchbox", { name: "Search agent users" })).toBe(search);
+    expect(search).toHaveValue("Agent user");
+    expect(search).toHaveFocus();
+  });
+
+  it("blocks reviewed-link removal while parent inventory verification is pending or failed", async () => {
+    const retry = vi.fn();
+    const remove = vi.spyOn(api, "removeAgentUsageAssociation");
+    const association: api.AgentUsageAssociation = {
+      reportAgentId: automaticUsagePackageId, reportAgentName: "Reviewed report identity",
+      target: { source: "power_platform", nativeId: "native-1", environmentId: "environment-1" },
+      basis: "admin_reviewed", reviewedAt: "2026-09-18T10:00:00.000Z",
+    };
+    const { update } = renderDetail({
+      activeTab: "reports", roles: ["AgentControl.Admin"], usageContext: automaticUsageContext,
+      inventoryRevision: "a".repeat(64), onUsageChanged: vi.fn(), onRetryInventory: retry,
+      record: { ...record, usage: automaticAgentUsageFixture({ associations: [association] }) },
+    });
+    await userEvent.click(screen.getByText("Reviewed report links"));
+    const trigger = screen.getByRole("button", { name: /Remove association for Reviewed report identity/ });
+    expect(trigger).toBeEnabled();
+    await userEvent.click(trigger);
+    expect(screen.getByRole("checkbox")).toBeVisible();
+    update({ packageInventoryPending: true });
+    expect(trigger).toBeDisabled();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    update({ inventoryError: "Saved inventory verification failed." });
+    expect(trigger).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Saved inventory verification failed.");
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved inventory" }));
+    expect(retry).toHaveBeenCalledOnce();
+    update({});
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveFocus();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it("loads automatically matched agent users only on the Usage tab without setup, candidates or writes", async () => {
     const candidates = vi.spyOn(api, "getAgentUsageCandidates");
     const associate = vi.spyOn(api, "associateAgentUsage");
@@ -1542,21 +1676,24 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByText(/Saved observations for|No saved activity is linked/)).not.toBeInTheDocument();
   });
 
-  it("keeps Purview selected through inventory and data refreshes without exposing previous scope results", async () => {
+  it("keeps Purview and ready content during same-agent refreshes, then replaces the saved context", async () => {
     const context = {
       recordId: record.id, displayName: record.displayName,
       defender: { status: "unavailable" as const, entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" as const },
       purview: { status: "unavailable" as const, mode: "saved_only" as const, reason: "No exact bot mapping." },
     };
-    const lookup = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValue(context);
+    const lookup = vi.spyOn(api, "getAgentInvestigationContext").mockResolvedValueOnce(context).mockResolvedValueOnce({
+      ...context, purview: { ...context.purview, reason: "Updated saved mapping is unavailable." },
+    });
     const { update } = renderDetail({ activeTab: "audit-security", inventoryRevision: "first" });
     await screen.findByRole("heading", { name: "Defender linking not supported for this agent" });
     fireEvent.click(screen.getByRole("button", { name: "Purview audit" }));
     expect(screen.getByText("No exact bot mapping.")).toBeVisible();
     update({ dataRevision: 1, inventoryRevision: "second" });
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("No exact bot mapping.")).toBeVisible();
+    await screen.findByText("Updated saved mapping is unavailable.");
     expect(screen.queryByText("No exact bot mapping.")).not.toBeInTheDocument();
-    await screen.findByText("No exact bot mapping.");
     expect(lookup).toHaveBeenCalledTimes(2);
     expect(screen.getByRole("button", { name: "Purview audit" })).toHaveAttribute("aria-pressed", "true");
     expect(api.getInventorySourceAwareDetail).not.toHaveBeenCalled();

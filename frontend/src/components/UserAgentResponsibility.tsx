@@ -21,7 +21,7 @@ type Props = {
 export function UserAgentResponsibility({ compact = false, objectId, dataRevision = 0, agentInventoryRevision = 0, onOpenAgent, route, onRouteChange }: Props) {
   const context = useContext(CapabilityContext);
   const canRead = !context || hasAppRole(context.user?.roles ?? [], "AgentControl.Viewer");
-  const scope = JSON.stringify([context?.user?.tenantId, context?.user?.homeAccountId, context?.user?.roles]);
+  const scope = JSON.stringify([context?.user?.tenantId, context?.user?.homeAccountId, [...(context?.user?.roles ?? [])].sort()]);
   const [result, setResult] = useState<{ key: { query: object }; value?: AgentResponsibilityPage; error?: string }>();
   const [retry, setRetry] = useState(0);
   const [localPage, setLocalPage] = useState(0);
@@ -62,6 +62,7 @@ export function UserAgentResponsibility({ compact = false, objectId, dataRevisio
         {route && !personId ? <label>Search responsible people<input aria-label="Search responsible people" value={search}
           onChange={event => onRouteChange?.({ ...route, search: event.target.value, page: 0 })} /></label> : null}
         {!scoped && !data ? <p role="status">Loading saved responsibility...</p> : null}
+        {!scoped && data ? <p className="sr-only" role="status">Refreshing saved responsibility. Showing the last loaded relationships.</p> : null}
         {scoped?.error ? <p role="alert" className="error-banner">{scoped.error} <button type="button" className="secondary"
           onClick={() => setRetry(value => value + 1)}>Retry saved responsibility</button></p> : null}
         {data ? <>

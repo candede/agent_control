@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useId, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useEffectEvent, useId, useMemo, useRef, useState } from "react";
 import type { SortingState } from "@tanstack/react-table";
 import {
   ApiError,
@@ -11,6 +11,8 @@ import {
   type OfficialUsageUserView,
 } from "../api/client";
 import { downloadBlob } from "../agentExport";
+import { hasRole } from "../authorization";
+import { CapabilityContext } from "../capabilityContext";
 import { restoreTableSortFocus, useListTable, type ListColumn } from "../listTable";
 import { useSavedRead } from "../savedQueries";
 import type { UsersRouteState } from "../workbenchRouting";
@@ -48,22 +50,36 @@ const sorts: { value: string; label: string; sortBy: OfficialUsageUserView["filt
   { value: "name-desc", label: "Name Z–A", sortBy: "displayName", sortDirection: "desc" },
 ];
 
-export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, directoryData, directoryDataRevision = dataRevision, onAccessDenied, onOpenAgent }: {
+type Props = {
   route: UsersRouteState;
   onRouteChange: (route: UsersRouteState, replace?: boolean) => void;
   dataRevision?: number;
   agentInventoryRevision?: number;
   directoryData?: CopilotUsageUsersResponse;
   directoryDataRevision?: number;
+  directoryPending?: boolean;
   onAccessDenied?: (message: string) => void;
   onOpenAgent?: (id: string) => void;
-}) {
+};
+
+export function ReportedUserActivity(props: Props) {
+  const capability = useContext(CapabilityContext);
+  const principal = capability?.user;
+  const scope = JSON.stringify([principal?.tenantId, principal?.homeAccountId, [...(principal?.roles ?? [])].sort()]);
+  if (capability && !hasRole(principal, "AgentControl.Viewer")) {
+    return <section aria-label="Non-paid user activity"><p role="alert">Current Viewer access is required to read reported users.</p></section>;
+  }
+  return <ReportedUserActivitySession key={scope} {...props} scope={scope} />;
+}
+
+function ReportedUserActivitySession({ route, onRouteChange, dataRevision = 0, agentInventoryRevision = 0, directoryData,
+  directoryDataRevision = dataRevision, directoryPending = false, onAccessDenied, onOpenAgent, scope }: Props & { scope: string }) {
   const [result, setResult] = useState<ReadState>();
   const [retry, setRetry] = useState(0);
   const [applied, setApplied] = useState(defaultFilters);
   const [draft, setDraft] = useState(defaultFilters);
   const [sorting, setSorting] = useState<SortingState>(defaultReportedSorting);
-  const [selectedUser, setSelectedUser] = useState<{ key: object; username: string }>();
+  const [selectedUser, setSelectedUser] = useState<{ key: object; identity: string; removed?: boolean }>();
   const [exportState, setExportState] = useState<ExportState>();
   const exportController = useRef<AbortController | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
@@ -96,7 +112,9 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
   const validThreshold = /^\d+$/.test(draft.lowResponseThreshold)
     && Number(draft.lowResponseThreshold) >= 1 && Number(draft.lowResponseThreshold) <= 100_000_000;
   const hasRelationships = Boolean(data?.lineages.some(lineage => lineage.kind === "userAgents"));
-  const reportDirectory = directoryDataRevision === result?.key.dataRevision ? directoryData : undefined;
+  // Exact report lineage still fences joins while the two saved reads finish independently.
+  const reportDirectory = directoryDataRevision === result?.key.dataRevision || directoryPending || !scoped && data
+    ? directoryData : undefined;
   const directoryMatches = useMemo(() => {
     const matches = new Map<string, CopilotUsageUser | null>();
     if (reportDirectory?.sources.directory.state !== "available") return matches;
@@ -107,7 +125,8 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
     }
     return matches;
   }, [reportDirectory]);
-  const selected = selectedUser?.key === query ? data?.users.value.find(user => user.username === selectedUser.username) : undefined;
+  const selected = selectedUser?.key === query && !selectedUser.removed
+    ? data?.users.value.find(user => reportUserKey(user) === selectedUser.identity) : undefined;
   const hasFilters = Boolean(search || agentId || JSON.stringify(applied) !== JSON.stringify(defaultFilters) || draftChanged);
   const coverageUnavailable = data?.licenseCoverage?.state === "unavailable";
   const exportDisabled = !data?.activeSet || coverageUnavailable || draftChanged || scopedExport?.status === "pending";
@@ -145,10 +164,21 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
 
   useEffect(() => {
     const controller = new AbortController();
-    void readSaved(["official-usage-users", query, dataRevision, retry], signal => getOfficialUsageUsers(query, { signal }), controller.signal).then(value => {
+    void readSaved(["official-usage-users", scope, query, dataRevision, retry], async signal => {
+      const value = await getOfficialUsageUsers(query, { signal });
+      if (query.setId && value.activeSet && value.activeSet.id !== query.setId) {
+        throw new Error("The saved user report did not match the selected report.");
+      }
+      return value;
+    }, controller.signal).then(value => {
       if (!controller.signal.aborted) {
         setResult({ key, value });
-        setSelectedUser(selection => value.users.value.some(user => user.username === selection?.username) ? selection : undefined);
+        setSelectedUser(selection => {
+          if (!selection) return selection;
+          return value.users.value.some(user => reportUserKey(user) === selection.identity)
+            ? selection.removed ? undefined : selection
+            : { ...selection, removed: true };
+        });
       }
     }).catch((failure: unknown) => {
       if (controller.signal.aborted) return;
@@ -158,7 +188,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
       if (isAccessDenied(failure)) reportAccessDenied(message);
     });
     return () => controller.abort();
-  }, [dataRevision, key, query, readSaved, retry]);
+  }, [scope, dataRevision, key, query, readSaved, retry]);
 
   useEffect(() => () => exportController.current?.abort(), [exportKey]);
 
@@ -269,6 +299,8 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
     {scopedExport?.status === "failed" && !error ? <div className="error-banner" role="alert">{scopedExport.message} <button type="button" className="secondary" disabled={exportDisabled} onClick={() => void exportUsers()}>Retry user export</button></div> : null}
     {scopedExport?.status === "done" ? <p role="status">User CSV downloaded with all agent details for matching identities in the displayed report snapshot.</p> : null}
     {loading ? <p role="status">Loading reported user activity…</p> : null}
+    {!scoped && data ? <p className="sr-only" role="status">Refreshing reported user activity. Showing the last loaded snapshot.</p> : null}
+    {selectedUser?.key === query && selectedUser.removed ? <p className="reported-users-note" role="status">The selected user is no longer present in this report selection.</p> : null}
     {data ? <>
       {coverageUnavailable ? <p className="copilot-users-notice" role="status">
         License coverage is unavailable. {data.licenseCoverage?.message} Run Users sync from Sync in the top navigation, or use Permissions to recover the connection. CSV export is unavailable until license coverage recovers.
@@ -295,7 +327,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
               <td data-numeric>{usageCount(user.missingUserReport ? null : user.reportedAgentsUsed)}</td>
               <td><CopilotLicenseStatus user={directoryUser} licenseAssignmentStatus={user.licenseAssignmentStatus} /></td>
               <td>{usageDate(user.userLastActivityDateUtc)}</td>
-              <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key: query, username: user.username })}>View details</button></td>
+              <td><button type="button" className="secondary" aria-haspopup="dialog" aria-label={`View reported details for ${user.displayName || user.username}`} onClick={() => setSelectedUser({ key: query, identity: reportUserKey(user) })}>View details</button></td>
             </tr>;
             })}</tbody>
           </table>
@@ -327,6 +359,7 @@ export function ReportedUserActivity({ route, onRouteChange, dataRevision = 0, a
       {selected ? <ReportedUserDetail key={reportUserKey(selected)} user={selected} directoryUser={directoryMatches.get(reportUserKey(selected))}
         reportPeriod={data.activeSet?.reportingPeriod} appActivityState={reportDirectory?.sources.appActivity.state}
         onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision}
+        refreshing={!scoped || directoryPending}
         hasRelationships={hasRelationships} filters={data.filters} returnFocusTo={searchInput} onClose={() => setSelectedUser(undefined)}
         onFocusAgent={(id, setId) => {
           setSelectedUser(undefined);

@@ -40,6 +40,7 @@ type Props = {
   onOpenAgent?: (id: string) => void;
   dataRevision?: number;
   agentInventoryRevision?: number;
+  refreshing?: boolean;
 };
 
 export function UserDetailModal(props: Props) {
@@ -51,7 +52,7 @@ export function UserDetailModal(props: Props) {
 
 function UserDetailSession({ displayName, username, directoryUser, directoryCurrent, reportUser, reportPeriod,
   reportCurrent = true, appActivityState, followUp, filters, returnFocusTo, closeLabel, onClose, onFocusAgent,
-  onOpenAgent, dataRevision, agentInventoryRevision }: Props) {
+  onOpenAgent, dataRevision, agentInventoryRevision, refreshing = false }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const close = useRef<HTMLButtonElement>(null);
   const id = useId();
@@ -116,7 +117,9 @@ function UserDetailSession({ displayName, username, directoryUser, directoryCurr
           {reportUser?.hasReportMismatch ? <p className="copilot-users-notice">Report totals differ. Users total: {totals ? totals.reportedResponsesReceived.toLocaleString() : "Unknown"}; agent breakdown: {reportUser.bridgeResponsesSentToUsers.toLocaleString()}.</p> : null}
           {reportUser ? <>
             <p>Responses across reported agents: <strong>{reportUser.rows.length ? reportUser.bridgeResponsesSentToUsers.toLocaleString() : "Not reported"}</strong></p>
-            <ReportedUserAgents user={reportUser} filters={filters} onFocusAgent={onFocusAgent} />
+            <ReportedUserAgents key={JSON.stringify([reportUser.username, reportUser.datasetScope.reportSetId,
+              reportUser.datasetScope.usersVersionId, reportUser.datasetScope.userAgentsVersionId])}
+              user={reportUser} filters={filters} onFocusAgent={onFocusAgent} />
           </> : <p>No agent usage report is linked to this user.</p>}
         </section>
         <section className="user-detail-card" aria-label="User Office app activity">
@@ -145,6 +148,7 @@ function UserDetailSession({ displayName, username, directoryUser, directoryCurr
         {followUp ? <span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span> : null}</div>
       <button ref={close} type="button" className="secondary icon-button" aria-label={closeLabel} onClick={onClose}><X size={20} aria-hidden="true" /></button>
     </header>
+    {refreshing ? <p className="sr-only" role="status">Refreshing saved user details. Showing the last loaded snapshot.</p> : null}
     <div className="detail-tabs" role="tablist" aria-label="User details">
       {tabs.map(([tab, label], index) => <button key={tab} type="button" role="tab" id={`${id}-tab-${tab}`} aria-selected={selectedTab === tab}
         aria-controls={`${id}-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)}

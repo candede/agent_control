@@ -40,12 +40,31 @@ const reviewedRecord = { ...record, usage: automaticAgentUsageFixture({ associat
 
 function renderPanel(overrides: Partial<ComponentProps<typeof AgentUsagePanel>> = {}) {
   const props = { record, context, inventoryRevision, canRemoveReviewedAssociations: true, onChanged: vi.fn(), ...overrides };
-  const content = (next: Partial<typeof props> = {}) => <CapabilityContext value={{
-    user: { homeAccountId: "admin", username: "admin@example.invalid", displayName: "Admin", roles: ["AgentControl.Admin"] },
+  const principal: api.SessionUser = { tenantId: "tenant", homeAccountId: "admin", username: "admin@example.invalid", displayName: "Admin", roles: ["AgentControl.Admin"] };
+  const content = (next: Partial<typeof props> = {}, user = principal) => <CapabilityContext value={{
+    user,
     views: [], now: Date.now(), pending: false, loading: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
   }}><WorkbenchActionProvider value={workbenchActions}><AgentUsagePanel {...props} {...next} /></WorkbenchActionProvider></CapabilityContext>;
   const result = render(content());
-  return { ...result, props, update: (next: Partial<typeof props>) => result.rerender(content(next)) };
+  return { ...result, props, principal, update: (next: Partial<typeof props>, user = principal) => result.rerender(content(next, user)) };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function usersPage(query: Parameters<typeof api.getOfficialUsageAgentUsers>[0]): api.OfficialUsageAgentUsersView {
+  const users = Array.from({ length: 55 }, (_, index) => ({
+    username: `person${index}@example.invalid`, displayName: `Person ${index}`, responsesSentToUsers: 100 - index,
+  })).filter(user => !query.search || user.username.includes(query.search));
+  const offset = query.offset ?? 0;
+  return {
+    activeSet: { ...context.reportSet!, id: query.setId }, agentIds: query.agentIds,
+    users: { value: users.slice(offset, offset + 25), count: users.length, offset, limit: 25 },
+  };
 }
 
 function expectNoManualSetup() {
@@ -244,6 +263,157 @@ describe("AgentUsagePanel", () => {
     await userEvent.type(screen.getByRole("searchbox", { name: "Search agent users" }), "person0@");
     expect(await screen.findByText("1-1 of 1 users")).toBeVisible();
     expect(screen.getByRole("button", { name: "Previous users" })).toBeDisabled();
+  });
+
+  it("keeps search, paging, focus and scroll through repeated slow revisions and applies only the latest users", async () => {
+    vi.mocked(api.getOfficialUsageAgentUsers).mockImplementation(async query => usersPage(query));
+    const { update } = renderPanel({ record: automaticRecord });
+    await screen.findByText("person0@example.invalid");
+    const search = screen.getByRole("searchbox", { name: "Search agent users" });
+    await userEvent.type(search, "person");
+    await userEvent.click(screen.getByRole("button", { name: "Next users" }));
+    await screen.findByText("26-50 of 55 users");
+    const panel = screen.getByRole("region", { name: "Agent users" });
+    const table = within(panel).getByRole("table");
+    const scroller = table.parentElement!;
+    scroller.scrollTop = 128;
+    search.focus();
+    const obsolete = deferred<api.OfficialUsageAgentUsersView>();
+    const latest = deferred<api.OfficialUsageAgentUsersView>();
+    vi.mocked(api.getOfficialUsageAgentUsers).mockReturnValueOnce(obsolete.promise).mockReturnValueOnce(latest.promise);
+    const previousCalls = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.length;
+    update({ inventoryRevision: "b".repeat(64) });
+    await waitFor(() => expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledTimes(previousCalls + 1));
+    const staleSignal = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)![1]!.signal!;
+    expect(within(panel).getByRole("table")).toBe(table);
+    expect(screen.getByText("26-50 of 55 users")).toBeVisible();
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("person");
+    expect(scroller.scrollTop).toBe(128);
+    expect(screen.queryByText("Loading users...")).not.toBeInTheDocument();
+
+    update({ inventoryRevision: "b".repeat(64), dataRevision: 2 });
+    await waitFor(() => expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledTimes(previousCalls + 2));
+    expect(staleSignal.aborted).toBe(true);
+    expect(within(panel).getByRole("table")).toBe(table);
+    expect(search).toHaveFocus();
+    expect(scroller.scrollTop).toBe(128);
+    const query = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)![0];
+    expect(query).toMatchObject({ setId: reportSetId, search: "person", offset: 25 });
+    const current = usersPage(query);
+    current.users.value[0].responsesSentToUsers = 909;
+    await act(async () => latest.resolve(current));
+    expect(screen.getByRole("cell", { name: "909" })).toBeVisible();
+    expect(within(panel).getByRole("table")).toBe(table);
+    expect(search).toHaveFocus();
+    expect(scroller.scrollTop).toBe(128);
+    const old = usersPage(query);
+    old.users.value[0].displayName = "Superseded user";
+    await act(async () => obsolete.resolve(old));
+    expect(screen.queryByText("Superseded user")).not.toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "909" })).toBeVisible();
+  });
+
+  it.each([new Error("Saved users failed"), new api.ApiError(403, "forbidden", "Saved user access revoked")])(
+    "clears retained users on $message and retries the same search and page", async failure => {
+      vi.mocked(api.getOfficialUsageAgentUsers).mockImplementation(async query => usersPage(query));
+      const { update } = renderPanel({ record: automaticRecord });
+      await screen.findByText("person0@example.invalid");
+      await userEvent.type(screen.getByRole("searchbox", { name: "Search agent users" }), "person");
+      await userEvent.click(screen.getByRole("button", { name: "Next users" }));
+      await screen.findByText("26-50 of 55 users");
+      const pending = deferred<api.OfficialUsageAgentUsersView>();
+      vi.mocked(api.getOfficialUsageAgentUsers).mockReturnValueOnce(pending.promise);
+      update({ dataRevision: 1 });
+      expect(screen.getByText("person25@example.invalid")).toBeVisible();
+      await act(async () => pending.reject(failure));
+      expect(screen.getByRole("alert")).toHaveTextContent(failure.message);
+      expect(screen.queryByText("person25@example.invalid")).not.toBeInTheDocument();
+      expect(screen.getByRole("searchbox", { name: "Search agent users" })).toHaveValue("person");
+      await userEvent.click(screen.getByRole("button", { name: "Retry users" }));
+      expect(await screen.findByText("26-50 of 55 users")).toBeVisible();
+      expect(api.getOfficialUsageAgentUsers).toHaveBeenLastCalledWith(
+        expect.objectContaining({ search: "person", offset: 25 }), expect.anything());
+    },
+  );
+
+  it.each(["agent", "report", "associations"] as const)("clears users and cancels an old refresh when the selected %s changes", async selection => {
+    vi.mocked(api.getOfficialUsageAgentUsers).mockImplementation(async query => usersPage(query));
+    const { update } = renderPanel({ record: automaticRecord });
+    await screen.findByText("person0@example.invalid");
+    const oldSearch = screen.getByRole("searchbox", { name: "Search agent users" });
+    await userEvent.type(oldSearch, "person");
+    const stale = deferred<api.OfficialUsageAgentUsersView>();
+    const next = deferred<api.OfficialUsageAgentUsersView>();
+    vi.mocked(api.getOfficialUsageAgentUsers).mockReturnValueOnce(stale.promise).mockReturnValueOnce(next.promise);
+    update({ dataRevision: 1 });
+    const staleCall = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)!;
+    const nextSet = selection === "report" ? "other-report" : reportSetId;
+    const nextRecord = { ...automaticRecord, id: selection === "agent" ? "other-agent" : automaticRecord.id,
+      usage: { ...automaticRecord.usage, reportSetId: nextSet, associations: selection === "associations"
+        ? [{ ...automaticRecord.usage.associations[0], reportAgentId: "other-report-agent" }] : automaticRecord.usage.associations } };
+    update({ record: nextRecord, context: { ...context, reportSet: { ...context.reportSet!, id: nextSet } }, dataRevision: 1 });
+    expect(staleCall[1]!.signal!.aborted).toBe(true);
+    expect(screen.queryByText("person0@example.invalid")).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search agent users" })).toHaveValue("");
+    const nextCall = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)!;
+    await act(async () => next.resolve(usersPage(nextCall[0])));
+    const old = usersPage(staleCall[0]);
+    old.users.value[0].displayName = "Previous selection";
+    await act(async () => stale.resolve(old));
+    expect(screen.queryByText("Previous selection")).not.toBeInTheDocument();
+    expect(screen.getByText("person0@example.invalid")).toBeVisible();
+  });
+
+  it("replaces retained users with an explicit empty result after they are removed", async () => {
+    vi.mocked(api.getOfficialUsageAgentUsers).mockImplementation(async query => usersPage(query));
+    const { update } = renderPanel({ record: automaticRecord });
+    await screen.findByText("person0@example.invalid");
+    const pending = deferred<api.OfficialUsageAgentUsersView>();
+    vi.mocked(api.getOfficialUsageAgentUsers).mockReturnValueOnce(pending.promise);
+    update({ dataRevision: 1 });
+    expect(screen.getByText("person0@example.invalid")).toBeVisible();
+    await act(async () => pending.resolve({
+      activeSet: context.reportSet, agentIds: [automaticUsagePackageId],
+      users: { value: [], count: 0, offset: 0, limit: 25 },
+    }));
+    expect(screen.getByText("No users listed in this report.")).toBeVisible();
+    expect(screen.queryByText("person0@example.invalid")).not.toBeInTheDocument();
+  });
+
+  it.each(["tenant", "principal", "roles"] as const)("fences saved users on a %s change and immediately hides them after Viewer revocation", async change => {
+    vi.mocked(api.getOfficialUsageAgentUsers).mockImplementation(async query => usersPage(query));
+    const { update, principal } = renderPanel({ record: automaticRecord });
+    await screen.findByText("person0@example.invalid");
+    const pending = deferred<api.OfficialUsageAgentUsersView>();
+    vi.mocked(api.getOfficialUsageAgentUsers).mockReturnValue(pending.promise);
+    update({ dataRevision: 1 });
+    const signal = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)![1]!.signal!;
+    const next = { ...principal, ...(change === "tenant" ? { tenantId: "other-tenant" }
+      : change === "principal" ? { homeAccountId: "other-admin" } : { roles: ["AgentControl.Viewer"] as api.AppRole[] }) };
+    update({ dataRevision: 1 }, next);
+    expect(signal.aborted).toBe(true);
+    expect(screen.queryByText("person0@example.invalid")).not.toBeInTheDocument();
+    const currentSignal = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.at(-1)![1]!.signal!;
+    const reads = vi.mocked(api.getOfficialUsageAgentUsers).mock.calls.length;
+    update({ dataRevision: 1 }, { ...next, roles: [] });
+    expect(screen.getByRole("alert")).toHaveTextContent("Current Viewer access");
+    expect(currentSignal.aborted).toBe(true);
+    await act(async () => pending.resolve(usersPage({ setId: reportSetId, agentIds: [automaticUsagePackageId] })));
+    expect(screen.queryByText("person0@example.invalid")).not.toBeInTheDocument();
+    expect(api.getOfficialUsageAgentUsers).toHaveBeenCalledTimes(reads);
+  });
+
+  it.each(["dataRevision", "disabled"] as const)("invalidates reviewed removal across %s transitions even if old revision values return", async field => {
+    const { update } = renderPanel({ record: reviewedRecord });
+    await userEvent.click(screen.getByText("Reviewed report links"));
+    await userEvent.click(screen.getByRole("button", { name: /Remove association/ }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /I confirm this reporting association/ }));
+    update(field === "dataRevision" ? { dataRevision: 1 } : { disabled: true });
+    expect(screen.queryByRole("button", { name: "Confirm removal" })).not.toBeInTheDocument();
+    update(field === "dataRevision" ? { dataRevision: 0 } : { disabled: false });
+    expect(screen.queryByRole("button", { name: "Confirm removal" })).not.toBeInTheDocument();
+    expect(api.removeAgentUsageAssociation).not.toHaveBeenCalled();
   });
 
   it("cancels old reads on report change and never replaces new users with stale results", async () => {

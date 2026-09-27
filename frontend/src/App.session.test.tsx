@@ -358,10 +358,13 @@ describe("App session revalidation", () => {
     const usersBefore = count("/api/copilot-usage/users");
     expect(usersBefore).toBeGreaterThan(0);
     expect(count("/api/data-sync/auto-refresh")).toBe(1);
+    expect(count("/api/agent-inventory")).toBe(0);
+    expect(count("/api/agents")).toBe(0);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     version = 2;
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(count("/api/copilot-usage/users")).toBe(usersBefore + 1);
+    expect(count("/api/agent-inventory")).toBe(0);
     fireEvent.click(screen.getByRole("button", { name: "Agents" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByText("Published agent 2")).toBeVisible();
@@ -375,6 +378,314 @@ describe("App session revalidation", () => {
     expect(refreshRequests(transport.fetchMock)).toEqual([]);
     expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")
       .every(([input]) => ["/api/data-sync/auto-refresh", "/api/capabilities/check"].includes(input))).toBe(true);
+  });
+
+  it("defers unused inventory reads across repeated checks and loads the latest revision when Agents opens", async () => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", "/users");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let version = 1;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        const page = structuredClone(unifiedPage);
+        page.value[0].displayName = `Saved agent revision ${version}`;
+        return Response.json(page);
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const count = (path: string) => transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === path).length;
+    const usersReads = count("/api/copilot-usage/users");
+    expect(usersReads).toBeGreaterThan(0);
+    for (const nextVersion of [2, 3]) {
+      version = nextVersion;
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(count("/api/agents")).toBe(0);
+      expect(count("/api/agent-inventory")).toBe(0);
+      expect(count("/api/inventory/refresh-jobs")).toBe(0);
+      expect(count("/api/copilot-usage/users")).toBe(usersReads);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Saved agent revision 3")).toBeVisible();
+    expect(count("/api/agent-inventory")).toBe(1);
+    const inventoryReads = count("/api/agent-inventory");
+    fireEvent.click(screen.getByRole("button", { name: "Users" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    version = 5;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(count("/api/agent-inventory")).toBe(inventoryReads);
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Saved agent revision 5")).toBeVisible();
+    expect(count("/api/agent-inventory")).toBe(inventoryReads + 1);
+  });
+
+  it("does not reload saved content for unchanged revisions or job progress alone", async () => {
+    vi.useFakeTimers();
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    let progress = 0;
+    transport.fetchMock.mockImplementation(async (input, init) => input === "/api/data-sync/auto-refresh"
+      ? Response.json(automaticRefreshResponse({
+        detailJob: { id: "same-detail-job", status: "running", updatedAt: new Date().toISOString(), message: `Read ${progress} details` },
+      })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const contentReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      ["/api/agents", "/api/agent-inventory", "/api/copilot-usage/users"].includes(new URL(input, "http://localhost").pathname)).length;
+    const before = contentReads();
+    expect(before).toBeGreaterThan(0);
+    for (progress = 1; progress <= 2; progress += 1) {
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(contentReads()).toBe(before);
+      expect(screen.getByText(agent.displayName)).toBeVisible();
+    }
+  });
+
+  it("owns the open agent's saved details through repeated slow inventory refreshes", async () => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    let version = 1;
+    let pending: ReturnType<typeof deferredResponse> | undefined;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return Response.json({ ...unifiedPage, revision: String(version).repeat(64) });
+      }
+      if (input === `/api/agents/${agent.id}`) {
+        return pending ? pending.promise : Response.json({ ...agent, longDescription: `Saved description ${version}` });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: agent.displayName });
+    const information = within(dialog).getByRole("region", { name: "Agent information" });
+    expect(within(dialog).getByText("Saved description 1")).toBeVisible();
+
+    for (const nextVersion of [2, 3]) {
+      version = nextVersion;
+      pending = deferredResponse();
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}`)).toHaveLength(version);
+      expect(within(dialog).getByText(`Saved description ${version - 1}`)).toBeVisible();
+      expect(within(dialog).queryByText("Loading saved agent details...")).not.toBeInTheDocument();
+      expect(within(dialog).getByRole("region", { name: "Agent information" })).toBe(information);
+      await act(async () => pending!.resolve(Response.json({ ...agent, longDescription: `Saved description ${version}` })));
+      pending = undefined;
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.getByRole("dialog", { name: agent.displayName })).toBe(dialog);
+      expect(within(dialog).getByText(`Saved description ${version}`)).toBeVisible();
+      expect(within(dialog).getByRole("region", { name: "Agent information" })).toBe(information);
+    }
+  });
+
+  it("clears failed background agent details and requires an explicit successful retry", async () => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let refreshing = false;
+    let recovered = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: refreshing ? "packages-2" : "packages-1" },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return Response.json({ ...unifiedPage, revision: (refreshing ? "b" : "a").repeat(64) });
+      }
+      if (input === `/api/agents/${agent.id}`) return recovered
+        ? Response.json({ ...agent, longDescription: "Recovered saved details" })
+        : refreshing ? pending.promise : Response.json({ ...agent, longDescription: "Last successful details" });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: agent.displayName });
+    refreshing = true;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(within(dialog).getByText("Last successful details")).toBeVisible();
+    await act(async () => pending.resolve(Response.json({
+      code: "saved_details_unavailable", detail: "Saved details could not be read.",
+    }, { status: 500 })));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(within(dialog).getByRole("alert")).toHaveTextContent("Saved details could not be read.");
+    expect(within(dialog).queryByText("Last successful details")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}`)).toHaveLength(2);
+    recovered = true;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Retry saved details" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(within(dialog).getByText("Recovered saved details")).toBeVisible();
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}`)).toHaveLength(3);
+  });
+
+  it("shows a failed background inventory read inside the open dialog and retries saved data", async () => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    let version = 1;
+    let failed = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return failed ? Response.json({ code: "inventory_unavailable", detail: "Saved inventory could not be read." }, { status: 503 })
+          : Response.json({ ...unifiedPage, revision: String(version).repeat(64) });
+      }
+      if (input === `/api/agents/${agent.id}`) return Response.json({ ...agent, longDescription: `Saved description ${version}` });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: agent.displayName });
+    failed = true;
+    version = 2;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(within(dialog).getByRole("alert")).toHaveTextContent("Saved inventory could not be read.");
+    expect(within(dialog).getByText("Saved description 1")).toBeVisible();
+    failed = false;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Retry saved inventory" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("Saved description 2")).toBeVisible();
+    expect(refreshRequests(transport.fetchMock)).toEqual([]);
+  });
+
+  it("removes an unavailable selected agent instead of preserving its previous details after refresh", async () => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    let removed = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: removed ? "packages-2" : "packages-1" },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return Response.json(removed ? unifiedRecordsPage([]) : unifiedPage);
+      }
+      if (input === `/api/agents/${agent.id}`) return removed
+        ? Response.json({ code: "package_target_stale_or_absent", detail: "Selected agent is no longer in the saved inventory." }, { status: 409 })
+        : Response.json({ ...agent, longDescription: "Previously saved details" });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText("Previously saved details")).toBeVisible();
+    removed = true;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Previously saved details")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Selected agent is no longer in the saved inventory.");
+  });
+
+  it.each(["success", "failure"] as const)("ignores a late background detail %s after selecting another agent", async outcome => {
+    vi.useFakeTimers();
+    const transport = initialCatalogTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    const second = { ...agent, id: "second-package", displayName: "Another saved agent" };
+    const page = unifiedRecordsPage([
+      unifiedPage.value[0],
+      { ...unifiedPage.value[0], id: `graph_packages:${second.id}`, displayName: second.displayName, packages: [second] },
+    ]);
+    let refreshing = false;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: refreshing ? "packages-2" : "packages-1" },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return Response.json({ ...page, revision: (refreshing ? "b" : "a").repeat(64) });
+      }
+      if (input === `/api/agents/${agent.id}`) return refreshing
+        ? pending.promise : Response.json({ ...agent, longDescription: "First agent saved details" });
+      if (input === `/api/agents/${second.id}`) return Response.json({ ...second, longDescription: "Second agent saved details" });
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    refreshing = true;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(screen.getByText("First agent saved details")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Close unified agent details" }));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${second.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: second.displayName });
+    expect(within(dialog).getByText("Second agent saved details")).toBeVisible();
+    await act(async () => pending.resolve(outcome === "success"
+      ? Response.json({ ...agent, longDescription: "Late first agent data" })
+      : Response.json({ code: "provider_error", detail: "Late first agent error" }, { status: 500 })));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByRole("dialog", { name: second.displayName })).toBe(dialog);
+    expect(within(dialog).getByText("Second agent saved details")).toBeVisible();
+    expect(screen.queryByText(/Late first agent/)).not.toBeInTheDocument();
+    expect(screen.queryByText("First agent saved details")).not.toBeInTheDocument();
+  });
+
+  it("does not supersede fresh management verification when an automatic inventory read completes", async () => {
+    vi.useFakeTimers();
+    const transport = accessEditorTransport();
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pending = deferredResponse();
+    let version = 1;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
+        revisions: { ...automaticRefreshResponse().revisions, graph_packages: `packages-${version}` },
+      }));
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return Response.json({ ...unifiedPage, revision: String(version).repeat(64) });
+      }
+      if (input === `/api/agents/${agent.id}/refresh-jobs`) return pending.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const dialog = screen.getByRole("dialog", { name: agent.displayName });
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
+    fireEvent.click(within(dialog).getByRole("radio", { name: /No users/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Apply" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}/refresh-jobs`)).toHaveLength(1);
+    version = 2;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    await act(async () => pending.resolve(Response.json({
+      ...completedRefreshJob(), scopeKind: "exact", requestedIds: [agent.id],
+    })));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(within(dialog).getByRole("region", { name: /update availability package/i })).toBeVisible();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}/refresh-jobs`)).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/mutation-preview")).toHaveLength(1);
+    expect(transport.fetchMock.mock.calls.filter(([input, init]) => input === `/api/agents/${agent.id}/access` && init?.method === "PATCH")).toHaveLength(0);
   });
 
   it.each(["source", "running details", "starting details"] as const)(
@@ -3720,7 +4031,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByRole("button", { name: "Agents" });
-    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(route === "/permissions" ? 0 : 1));
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));

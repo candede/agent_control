@@ -63,10 +63,13 @@ describe("saved Users responsibility", () => {
     const data = responsibilityFixture(responsibilityOwnerId);
     data.selected = { ...data.selected!, state, agents: [], count: 0 };
     data.coverage = state === "unavailable" ? "unavailable" : "partial";
-    vi.spyOn(api, "getAgentResponsibility").mockResolvedValue(data);
-    render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
+    vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(responsibilityFixture(responsibilityOwnerId)).mockResolvedValueOnce(data);
+    const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
+    await screen.findByText("Responsible agent");
+    view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
     expect(await screen.findByText(state === "unavailable" ? /relationships are unknown, not zero/ : /This is not proof of no responsibility elsewhere/)).toBeVisible();
     expect(screen.queryByRole("button", { name: /Open agent/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("Responsible agent")).not.toBeInTheDocument();
   });
 
   it("keeps expired identity evidence explicit without automatically looking it up again", async () => {
@@ -99,20 +102,22 @@ describe("saved Users responsibility", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
-  it("retains relationships while reloading, but clears them on a permission error and retries only saved reads", async () => {
-    const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(responsibilityFixture(responsibilityOwnerId))
-      .mockRejectedValueOnce(new api.ApiError(403, "forbidden", "Saved access denied"))
-      .mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
-    const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
-    await screen.findByText("Responsible only");
-    view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
-    expect(screen.getByText("Responsible only")).toBeVisible();
-    expect(await screen.findByRole("alert")).toHaveTextContent("Saved access denied");
-    expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Retry saved responsibility" }));
-    expect(await screen.findByText("Responsible only")).toBeVisible();
-    expect(read).toHaveBeenCalledTimes(3);
-  });
+  it.each([new api.ApiError(403, "forbidden", "Saved access denied"), new Error("Saved responsibility failed")])(
+    "retains relationships only while reloading, clears them on $message and retries saved reads", async failure => {
+      const read = vi.spyOn(api, "getAgentResponsibility").mockResolvedValueOnce(responsibilityFixture(responsibilityOwnerId))
+        .mockRejectedValueOnce(failure)
+        .mockResolvedValue(responsibilityFixture(responsibilityOwnerId));
+      const view = render(<UserAgentResponsibility objectId={responsibilityOwnerId} />);
+      await screen.findByText("Responsible only");
+      view.rerender(<UserAgentResponsibility objectId={responsibilityOwnerId} dataRevision={1} />);
+      expect(screen.getByText("Responsible only")).toBeVisible();
+      expect(await screen.findByRole("alert")).toHaveTextContent(failure.message);
+      expect(screen.queryByText("Responsible only")).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Retry saved responsibility" }));
+      expect(await screen.findByText("Responsible only")).toBeVisible();
+      expect(read).toHaveBeenCalledTimes(3);
+    },
+  );
 
   it.each(["dataRevision", "agentInventoryRevision"] as const)(
     "keeps relationships usable and fences superseded responses when %s changes", async revisionProp => {
@@ -126,10 +131,16 @@ describe("saved Users responsibility", () => {
       const open = vi.fn();
       const view = render(scope(<UserAgentResponsibility objectId={responsibilityOwnerId} onOpenAgent={open} />));
       await screen.findByText("Responsible agent");
+      const button = screen.getByRole("button", { name: "Open agent Responsible agent" });
+      const panel = screen.getByRole("region", { name: "Agent responsibility" });
+      button.focus();
+      panel.scrollTop = 111;
       view.rerender(scope(<UserAgentResponsibility objectId={responsibilityOwnerId} onOpenAgent={open} {...{ [revisionProp]: 1 }} />));
       expect(screen.getByText("Responsible agent")).toBeVisible();
       expect(screen.getByRole("button", { name: "Open agent Responsible agent" })).toBeEnabled();
       expect(screen.queryByText("Loading saved responsibility...")).not.toBeInTheDocument();
+      expect(button).toHaveFocus();
+      expect(panel.scrollTop).toBe(111);
       await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
       const staleSignal = read.mock.calls[1][1]!.signal!;
       view.rerender(scope(<UserAgentResponsibility objectId={responsibilityOwnerId} onOpenAgent={open} {...{ [revisionProp]: 2 }} />));

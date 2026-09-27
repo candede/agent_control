@@ -869,6 +869,56 @@ describe("reported user activity", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("clears retained report rows and details after a non-authorization refresh failure without resetting filters", async () => {
+    const pending = deferred<api.OfficialUsageUserView>();
+    const props = { route: { ...initialRoute, search: "Ada" }, onRouteChange: vi.fn() };
+    const view = render(<ReportedUserActivity {...props} />);
+    const { dialog } = await openUser("Ada");
+    vi.mocked(api.getOfficialUsageUsers).mockReturnValueOnce(pending.promise);
+    view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
+    expect(dialog).toBeVisible();
+    expect(screen.getByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
+    await act(async () => pending.reject(new Error("Saved report read failed")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Saved report read failed");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Ada");
+    await userEvent.click(screen.getByRole("button", { name: "Retry reported activity" }));
+    expect(await screen.findByRole("region", { name: "Active users without paid Copilot" })).toBeVisible();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(api.getOfficialUsageUsers).toHaveBeenLastCalledWith(expect.objectContaining({ search: "Ada" }), expect.anything());
+  });
+
+  it.each(["reportSetId", "usersVersionId", "userAgentsVersionId"] as const)(
+    "does not transfer an open report identity to a refreshed %s or revive it later", async field => {
+      const props = { route: initialRoute, onRouteChange: vi.fn() };
+      const view = render(<ReportedUserActivity {...props} />);
+      await openUser("Ada");
+      const changed = usageUsersFixture();
+      if (field === "reportSetId") changed.activeSet = { ...changed.activeSet!, id: "replacement-snapshot" };
+      changed.users.value = changed.users.value.map(user => ({
+        ...user, datasetScope: { ...user.datasetScope, [field]: "replacement-snapshot" },
+      }));
+      vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(changed);
+      view.rerender(<ReportedUserActivity {...props} dataRevision={1} />);
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(screen.getByText("The selected user is no longer present in this report selection.")).toBeVisible();
+      view.rerender(<ReportedUserActivity {...props} dataRevision={2} />);
+      await waitFor(() => expect(api.getOfficialUsageUsers).toHaveBeenCalledTimes(3));
+      expect(screen.getByRole("button", { name: "View reported details for Ada" })).toBeVisible();
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(screen.queryByText("The selected user is no longer present in this report selection.")).not.toBeInTheDocument();
+    },
+  );
+
+  it("rejects a saved response for another explicitly selected report", async () => {
+    vi.mocked(api.getOfficialUsageUsers).mockResolvedValueOnce(usageUsersFixture());
+    renderActivity({ ...initialRoute, reportSetId: "different-saved-report" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("did not match the selected report");
+    expect(screen.queryByRole("region", { name: "Active users without paid Copilot" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+  });
+
   it("distinguishes missing reports, missing companions, empty matches and out-of-range pages", async () => {
     const empty = usageUsersFixture();
     empty.activeSet = null;

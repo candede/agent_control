@@ -18,7 +18,7 @@ import type {
   CopilotUsageUser,
   CopilotUsageUsersResponse,
 } from "../types/copilotUsage.js";
-import { copilotUsagePeriod, isCopilotServiceActive } from "../types/copilotUsage.js";
+import { copilotAppActivityStaleAfterDays, copilotUsagePeriod, isCopilotAppActivityFresh, isCopilotServiceActive } from "../types/copilotUsage.js";
 import type { OfficialUsageUserSummary, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus, type DataSyncSourceState } from "../types/dataSync.js";
@@ -35,8 +35,6 @@ import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
 import { hasReportedAgentActivity, matchCopilotIdentities, matchImportedUsage } from "./copilotUsageIdentity.js";
-
-const appReportStaleAfterDays = 3;
 
 type CopilotUsageDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
@@ -348,7 +346,7 @@ export function composeCopilotUsageUsers(input: {
     const matching = matchImportedUsage(directoryUsers, importedView?.users.value ?? [], directory.ok);
     const appMatching = matchAppActivity(directoryUsers, appActivity.ok ? appActivity.value.users : []);
     const importedMetricsFresh = Boolean(importedView && importedView.availability === "active");
-    const appMetricsFresh = Boolean(appActivity.ok && isFreshAppReport(appActivity, new Date(generatedAt)));
+    const appMetricsFresh = Boolean(appActivity.ok && isCopilotAppActivityFresh(appActivity.value.reportRefreshDate, new Date(generatedAt)));
     const users = directoryUsers.map(directoryUser => {
       const importedUsage = matching.byObjectId.get(directoryUser.identity.objectId) ?? null;
       const activity = appMatching.get(directoryUser.identity.objectId) ?? null;
@@ -592,18 +590,13 @@ function appActivitySource(result: Extract<Loaded<CopilotReportResult>, { ok: tr
   const incomplete = result.value.reportRefreshDate === null;
   const state = stale ? "stale" as const : unmatched > 0 || incomplete ? "partial" as const : "available" as const;
   const message = stale
-    ? `The app activity report refresh is older than ${appReportStaleAfterDays} days; retained dates remain source-labelled.${unmatched > 0 ? ` ${unmatched} hidden, unmatched, or duplicate identities were not joined.` : ""}`
+    ? `The app activity report refresh is older than ${copilotAppActivityStaleAfterDays} days; retained dates remain source-labelled.${unmatched > 0 ? ` ${unmatched} hidden, unmatched, or duplicate identities were not joined.` : ""}`
     : incomplete
       ? "The app activity report contained no rows or report refresh date; user activity remains unknown."
     : unmatched > 0
     ? `Loaded ${result.value.users.length} app activity rows; ${unmatched} hidden, unmatched, or duplicate identities were not joined.`
     : `Loaded ${result.value.users.length} app activity rows.`;
   return source(state, message, result.fetchedAt, copilotUsagePeriod, null, null, result.value.reportRefreshDate, "v1");
-}
-
-function isFreshAppReport(result: Extract<Loaded<CopilotReportResult>, { ok: true }>, now: Date) {
-  return result.value.reportRefreshDate !== null
-    && civilDateAgeDays(result.value.reportRefreshDate, now) <= appReportStaleAfterDays;
 }
 
 function importedUsageSource(view: OfficialUsageUserView) {
@@ -632,11 +625,6 @@ function importedUsageSource(view: OfficialUsageUserView) {
 
 function latest(values: Array<string | undefined>) {
   return values.filter((value): value is string => Boolean(value)).sort().at(-1) ?? null;
-}
-
-function civilDateAgeDays(value: string, now: Date) {
-  const endOfDay = Date.parse(`${value}T23:59:59.999Z`);
-  return Math.max(0, Math.floor((now.getTime() - endOfDay) / 86_400_000));
 }
 
 function sourceErrorMessage(error: unknown, label: string, permission?: "User.Read.All and LicenseAssignment.Read.All" | "Reports.Read.All") {

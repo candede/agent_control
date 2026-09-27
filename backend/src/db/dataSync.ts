@@ -13,13 +13,14 @@ import {
 } from "../types/dataSync.js";
 import type { CopilotDirectoryUser, CopilotReportResult } from "../services/copilotUsageGraph.js";
 import {
+  isCopilotAppActivityFresh,
   isCopilotServiceSummaryState,
   type CopilotUsageAttemptStatus,
   type CopilotUsageSnapshotSource,
   type SavedCopilotUsageSource,
 } from "../types/copilotUsage.js";
 import { pool, transaction } from "./pool.js";
-import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
+import { readAutomaticInventoryRevisions } from "./unifiedInventoryRevision.js";
 
 export type { CopilotUsageAttemptStatus, CopilotUsageSnapshotSource, SavedCopilotUsageSource } from "../types/copilotUsage.js";
 
@@ -139,12 +140,27 @@ export class DataSyncRepository {
   async automaticRevisions(scope: DataSyncScope) {
     validateScope(scope);
     const [inventory, users] = await Promise.all([
-      readUnifiedInventoryRevision(scope, this.database),
-      this.database.query(`SELECT id,source_id FROM copilot_usage_snapshots
-        WHERE tenant_id=$1 AND principal_id=$2 AND is_current AND expires_at>clock_timestamp()
-        ORDER BY source_id,id`, [scope.tenantId, scope.principalId]),
+      readAutomaticInventoryRevisions(scope, this.database),
+      this.database.query<{ source_id: CopilotUsageSnapshotSource; report_refresh_date: string | null }>(`
+        SELECT state.source_id,state.attempt_status,state.message,state.attempted_at,
+          state.last_success_at,state.row_count,snapshot.id,snapshot.observed_at,
+          CASE WHEN state.source_id='app_activity' THEN snapshot.snapshot_data->>'reportRefreshDate' END AS report_refresh_date
+        FROM copilot_usage_source_state state
+        LEFT JOIN copilot_usage_snapshots snapshot
+          ON snapshot.id=state.current_snapshot_id AND snapshot.tenant_id=state.tenant_id
+          AND snapshot.principal_id=state.principal_id AND snapshot.source_id=state.source_id
+          AND snapshot.is_current AND snapshot.expires_at>clock_timestamp()
+        WHERE state.tenant_id=$1 AND state.principal_id=$2 AND state.source_id IN ('directory','app_activity')
+        ORDER BY state.source_id`, [scope.tenantId, scope.principalId]),
     ]);
-    return { graph_packages: inventory, power_platform: inventory, users: hash([inventory, users.rows]) };
+    const now = new Date();
+    return {
+      ...inventory,
+      users: hash(["automatic-users-v1", scope.tenantId, scope.principalId, users.rows.map(row => ({
+        ...row,
+        ...(row.source_id === "app_activity" ? { fresh: isCopilotAppActivityFresh(row.report_refresh_date, now) } : {}),
+      }))]),
+    };
   }
 
   async finishAutomatic(scope: DataSyncScope, runId: string) {

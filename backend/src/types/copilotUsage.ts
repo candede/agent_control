@@ -1,6 +1,14 @@
 import type { OfficialUsageUserSummary } from "./officialUsage.js";
 
 export const copilotUsagePeriod = "D30" as const;
+export const copilotAppActivityStaleAfterDays = 3;
+
+export function isCopilotAppActivityFresh(reportRefreshDate: string | null, now: Date): boolean {
+  if (reportRefreshDate === null) return false;
+  const endOfDay = Date.parse(`${reportRefreshDate}T23:59:59.999Z`);
+  const ageDays = Math.max(0, Math.floor((now.getTime() - endOfDay) / 86_400_000));
+  return ageDays <= copilotAppActivityStaleAfterDays;
+}
 
 export type CopilotUsageSnapshotSource = "directory" | "app_activity";
 export type CopilotUsageAttemptStatus = "available" | "waiting_authorization" | "permission_required" | "failed";

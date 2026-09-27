@@ -23,7 +23,7 @@ export function AgentAccessManagement({ agent, detail, canManage, canEditAccess,
   if (previousRevision !== revision) {
     setPreviousRevision(revision);
     setInitialDetail(detail);
-  } else if (!initialDetail && detail) setInitialDetail(detail);
+  } else if (detail && (!initialDetail || !canEditAccess && initialDetail !== detail)) setInitialDetail(detail);
   const initial = canEditAccess ? initialDetail ?? detail : detail ?? initialDetail;
   const readOnlyKey = !canEditAccess ? JSON.stringify([initial?.availableTo, initial?.deployedTo, initial?.allowedUsersAndGroups, initial?.acquireUsersAndGroups]) : "";
   const [target, setTarget] = useState<PackageAccessTarget>("availability");

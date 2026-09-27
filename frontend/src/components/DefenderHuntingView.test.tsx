@@ -73,6 +73,13 @@ function inventoryPage(sourceJob: DefenderHuntingJob, agentName: string): Defend
     byteCount: sourceJob.byteCount, expiresAt: sourceJob.expiresAt } };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 function context(available = true, roles: SessionUser["roles"] = ["AgentControl.Admin"], homeAccountId = "security-a"): ReturnType<typeof useCapabilityContext> {
   return { user: { homeAccountId, tenantId: "tenant-a", displayName: "Security", username: `${homeAccountId}@example.invalid`, roles: [...roles] }, loading: false,
     pending: false, error: undefined,
@@ -154,6 +161,79 @@ describe("DefenderHuntingView", () => {
     expect(submitDefenderHunt).toHaveBeenCalledOnce();
   });
 
+  it("finishes an admitted hunt across passive scope refresh and revalidates before admitting another action", async () => {
+    const pending = deferred<DefenderHuntingJob>();
+    const latestCatalog = deferred<DefenderHuntingCatalog>();
+    const result = job();
+    vi.mocked(submitDefenderHunt).mockReturnValueOnce(pending.promise);
+    vi.mocked(getDefenderHuntingJob).mockResolvedValue(result);
+    const content = (revision: string, contextCurrent = true) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} revision={revision} contextCurrent={contextCurrent} />
+    </CapabilityContext>;
+    const view = render(content("1"));
+    await screen.findByText("No hunting history");
+    fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
+    await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
+    const signal = vi.mocked(submitDefenderHunt).mock.calls[0][2]!.signal!;
+    vi.mocked(getDefenderHuntingCatalog).mockReturnValueOnce(latestCatalog.promise);
+
+    view.rerender(content("2", false));
+    expect(signal.aborted).toBe(false);
+    view.rerender(content("2"));
+    view.rerender(content("3", false));
+    view.rerender(content("3"));
+    expect(signal.aborted).toBe(false);
+    expect(getDefenderHuntingCatalog).toHaveBeenCalledOnce();
+    expect(getDefenderHuntingJobs).toHaveBeenCalledOnce();
+    fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
+
+    await act(async () => pending.resolve(result));
+    await waitFor(() => expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2));
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBeVisible();
+    expect(getDefenderHuntingJob).toHaveBeenCalledExactlyOnceWith(result.id, expect.objectContaining({ agentRecordId }));
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revoke saved-data access" })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
+    await act(async () => latestCatalog.resolve(catalog));
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
+    expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBeVisible();
+    expect(submitDefenderHunt).toHaveBeenCalledOnce();
+  });
+
+  it.each(["tenant", "principal", "role", "agent", "capability", "typed identity"] as const)(
+    "still aborts an admitted hunt immediately when its actual %s scope changes", async change => {
+      const pending = deferred<DefenderHuntingJob>();
+      vi.mocked(submitDefenderHunt).mockReturnValueOnce(pending.promise);
+      const content = (changed = false) => {
+        const access = context(!changed || change !== "capability",
+          changed && change === "role" ? ["AgentControl.Viewer"] : ["AgentControl.Admin"],
+          changed && change === "principal" ? "other-principal" : "security-a");
+        if (changed && change === "tenant") access.user = { ...access.user!, tenantId: "other-tenant" };
+        return <CapabilityContext value={access}><AgentDefenderHuntingView
+          agentRecordId={changed && change === "agent" ? "other-agent" : agentRecordId} agentName="Selected agent"
+          entraAgentIds={[changed && change === "typed identity" ? "cccccccc-cccc-4ccc-8ccc-cccccccccccc" : entraAgentId]} />
+        </CapabilityContext>;
+      };
+      const view = render(content());
+      await screen.findByText("No hunting history");
+      fireEvent.click(screen.getByRole("button", { name: "Run hunt" }));
+      await waitFor(() => expect(submitDefenderHunt).toHaveBeenCalledOnce());
+      const signal = vi.mocked(submitDefenderHunt).mock.calls[0][2]!.signal!;
+      view.rerender(content(true));
+      expect(signal.aborted).toBe(true);
+      await waitFor(() => expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2));
+      await act(async () => pending.resolve(job()));
+      expect(screen.queryByRole("region", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
+      expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2);
+      expect(getDefenderHuntingJob).not.toHaveBeenCalled();
+      expect(submitDefenderHunt).toHaveBeenCalledOnce();
+    },
+  );
+
   it("defaults to runtime activity when all verified log types are available", async () => {
     render(<CapabilityContext value={context()}>
       <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
@@ -164,6 +244,32 @@ describe("DefenderHuntingView", () => {
     await screen.findByText("No hunting history");
     expect(screen.getByLabelText("Log type")).toHaveValue("agent_activity");
     expect(screen.getByText(/Agent invocations and model inference/)).toBeVisible();
+  });
+
+  it("keeps the chosen log type and dates when refreshed template coverage changes without changing identity", async () => {
+    const content = (toolsAvailable: boolean) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} entraAgentApplicationIds={[applicationId]} templates={{
+          agents_inventory: { status: "available" }, agent_activity: { status: "available" },
+          agent_tools: toolsAvailable ? { status: "available" } : { status: "unavailable", reason: "Tool identity mapping is no longer verified." },
+        }} />
+    </CapabilityContext>;
+    const view = render(content(true));
+    await screen.findByText("No hunting history");
+    fireEvent.change(screen.getByLabelText("Log type"), { target: { value: "agent_tools" } });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
+    fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-09T11:00" } });
+    const start = screen.getByLabelText("Start");
+    start.focus();
+    view.rerender(content(false));
+    expect(screen.getByLabelText("Log type")).toHaveValue("agent_tools");
+    expect(screen.getByLabelText("Start")).toBe(start);
+    expect(start).toHaveValue("2026-09-09T10:30");
+    expect(start).toHaveFocus();
+    expect(screen.getByRole("alert")).toHaveTextContent("Tool identity mapping is no longer verified.");
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+    await waitFor(() => expect(getDefenderHuntingCatalog).toHaveBeenCalledTimes(2));
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
 
   it("revalidates selected results when resuming and removes jobs no longer in saved history", async () => {
@@ -188,6 +294,144 @@ describe("DefenderHuntingView", () => {
     expect(screen.queryByRole("heading", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
     expect(submitDefenderHunt).not.toHaveBeenCalled();
   });
+
+  it("keeps selected rows, page, metadata filters, focus and scroll across repeated refresh without authorizing stale actions", async () => {
+    const original = job({ storedRowCount: 201 });
+    const history = { value: [original], count: 1, offset: 0, limit: 20 };
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValue(history);
+    vi.mocked(getDefenderHuntingRows).mockImplementation(async (_id, _limit, offset = 0) => ({
+      ...inventoryPage(original, `Retained page ${offset}`), offset, count: 201,
+    }));
+    const content = (revision: string, contextCurrent = true) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent"
+        entraAgentIds={[entraAgentId]} revision={revision} contextCurrent={contextCurrent} />
+    </CapabilityContext>;
+    const view = render(content("1"));
+    await screen.findByRole("button", { name: /View hunt 11111111/ });
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
+    fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-09T11:00" } });
+    fireEvent.click(screen.getByRole("button", { name: /View hunt 11111111/ }));
+    await screen.findByText("Retained page 0");
+    fireEvent.click(within(screen.getByRole("region", { name: "Defender agent inventory result" })).getByRole("button", { name: "Next" }));
+    await screen.findByText("Retained page 100");
+    const filter = screen.getByLabelText("Filter loaded metadata");
+    fireEvent.change(filter, { target: { value: "Retained" } });
+    filter.focus();
+    const results = screen.getByRole("region", { name: "Defender agent inventory result" });
+    const table = screen.getByRole("region", { name: "Minimized hunting rows" });
+    table.scrollTop = 137;
+    const staleHistory = deferred<typeof history>();
+    const currentHistory = deferred<typeof history>();
+    const staleCatalog = deferred<DefenderHuntingCatalog>();
+    const currentCatalog = deferred<DefenderHuntingCatalog>();
+    const currentRows = deferred<DefenderHuntingRowPage>();
+    vi.mocked(getDefenderHuntingJobs).mockReturnValueOnce(staleHistory.promise).mockReturnValueOnce(currentHistory.promise);
+    vi.mocked(getDefenderHuntingCatalog).mockReturnValueOnce(staleCatalog.promise).mockReturnValueOnce(currentCatalog.promise);
+    vi.mocked(getDefenderHuntingRows).mockReturnValueOnce(currentRows.promise);
+
+    view.rerender(content("2", false));
+    expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBe(results);
+    expect(screen.getByText("Retained page 100")).toBeVisible();
+    expect(filter).toHaveFocus();
+    expect(table.scrollTop).toBe(137);
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revoke saved-data access" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Delete hunt 11111111/ })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("button", { name: "Run hunt" }).closest("form")!);
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+    view.rerender(content("2"));
+    await waitFor(() => expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(2));
+    const staleSignal = vi.mocked(getDefenderHuntingJobs).mock.calls.at(-1)![2]!.signal!;
+    expect(screen.getByText("Retained page 100")).toBeVisible();
+    view.rerender(content("3", false));
+    expect(staleSignal.aborted).toBe(true);
+    view.rerender(content("3"));
+    await waitFor(() => expect(getDefenderHuntingJobs).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("region", { name: "Minimized hunting rows" })).toBe(table);
+    expect(filter).toHaveFocus();
+    expect(filter).toHaveValue("Retained");
+    const latest = { ...original, updatedAt: "2026-09-09T11:03:00.000Z", snapshotId: "66666666-6666-4666-8666-666666666666" };
+    await act(async () => {
+      currentCatalog.resolve(catalog);
+      currentHistory.resolve({ ...history, value: [latest] });
+    });
+    await waitFor(() => expect(getDefenderHuntingRows).toHaveBeenCalledTimes(3));
+    expect(getDefenderHuntingRows).toHaveBeenLastCalledWith(original.id, 100, 100, expect.objectContaining({ agentRecordId }));
+    expect(screen.getByText("Retained page 100")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeDisabled();
+    expect(filter).toHaveFocus();
+    await act(async () => currentRows.resolve({ ...inventoryPage(latest, "Retained updated result"), count: 201, offset: 100 }));
+    expect(screen.getByText("Retained updated result")).toBeVisible();
+    expect(screen.getByRole("region", { name: "Defender agent inventory result" })).toBe(results);
+    expect(screen.getByRole("region", { name: "Minimized hunting rows" })).toBe(table);
+    expect(screen.getByLabelText("Start")).toHaveValue("2026-09-09T10:30");
+    expect(screen.getByLabelText("Filter loaded metadata")).toBe(filter);
+    expect(filter).toHaveValue("Retained");
+    expect(filter).toHaveFocus();
+    expect(table.scrollTop).toBe(137);
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
+    await act(async () => {
+      staleCatalog.resolve(catalog);
+      staleHistory.resolve({ ...history, value: [] });
+    });
+    expect(screen.getByText("Retained updated result")).toBeVisible();
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+    expect(approveDefenderHuntingQualification).not.toHaveBeenCalled();
+    expect(startDefenderHuntingQualification).not.toHaveBeenCalled();
+    expect(revokeDefenderHuntingRetainedScope).not.toHaveBeenCalled();
+    expect(deleteDefenderHunt).not.toHaveBeenCalled();
+  });
+
+  it("finishes background saved reads after draft date edits without restoring a cleared job selection", async () => {
+    const history = { value: [job()], count: 1, limit: 20, offset: 0 };
+    vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce(history);
+    vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(job(), "Previous selected result"));
+    const content = (revision: string) => <CapabilityContext value={context()}>
+      <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent" entraAgentIds={[entraAgentId]} revision={revision} />
+    </CapabilityContext>;
+    const view = render(content("1"));
+    fireEvent.click(await screen.findByRole("button", { name: /View hunt 11111111/ }));
+    await screen.findByText("Previous selected result");
+    const pending = deferred<typeof history>();
+    vi.mocked(getDefenderHuntingJobs).mockReturnValueOnce(pending.promise);
+    view.rerender(content("2"));
+    fireEvent.change(screen.getByLabelText("Start"), { target: { value: "2026-09-09T10:30" } });
+    fireEvent.change(screen.getByLabelText("End"), { target: { value: "2026-09-09T11:00" } });
+    await act(async () => pending.resolve(history));
+    expect(screen.getByLabelText("Start")).toHaveValue("2026-09-09T10:30");
+    expect(screen.queryByText("Previous selected result")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading hunting history...")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run hunt" })).toBeEnabled();
+    expect(getDefenderHuntingRows).toHaveBeenCalledOnce();
+    expect(submitDefenderHunt).not.toHaveBeenCalled();
+  });
+
+  it.each(["history denial", "row failure", "mismatched rows", "removed job"] as const)(
+    "does not retain selected presentation after a background %s", async failure => {
+      const history = { value: [job()], count: 1, limit: 20, offset: 0 };
+      vi.mocked(getDefenderHuntingJobs).mockResolvedValue(history);
+      vi.mocked(getDefenderHuntingRows).mockResolvedValue(inventoryPage(job(), "Selected private result"));
+      const content = (revision: string) => <CapabilityContext value={context()}>
+        <AgentDefenderHuntingView agentRecordId={agentRecordId} agentName="Selected agent" entraAgentIds={[entraAgentId]} revision={revision} />
+      </CapabilityContext>;
+      const view = render(content("1"));
+      fireEvent.click(await screen.findByRole("button", { name: /View hunt 11111111/ }));
+      await screen.findByText("Selected private result");
+      if (failure === "history denial") vi.mocked(getDefenderHuntingJobs).mockRejectedValueOnce(new ApiError(403, "forbidden", "Saved hunting access denied"));
+      else if (failure === "row failure") vi.mocked(getDefenderHuntingRows).mockRejectedValueOnce(new Error("Saved selected rows failed"));
+      else if (failure === "mismatched rows") vi.mocked(getDefenderHuntingRows).mockResolvedValueOnce(inventoryPage(job({ id: "other-job" }), "Other private result"));
+      else vi.mocked(getDefenderHuntingJobs).mockResolvedValueOnce({ ...history, value: [], count: 0 });
+      view.rerender(content("2"));
+      expect(screen.getByText("Selected private result")).toBeVisible();
+      if (failure === "removed job") expect(await screen.findByText("No hunting history")).toBeVisible();
+      else expect(await screen.findByRole("alert")).toHaveTextContent(failure === "history denial" ? "Saved hunting access denied"
+        : failure === "row failure" ? "Saved selected rows failed" : "Saved hunting rows do not match the selected job");
+      expect(screen.queryByText("Selected private result")).not.toBeInTheDocument();
+      expect(screen.queryByText("Other private result")).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Defender agent inventory result" })).not.toBeInTheDocument();
+      expect(submitDefenderHunt).not.toHaveBeenCalled();
+    },
+  );
 
   it("starts with the supported runtime template and never substitutes an opaque object identity", async () => {
     vi.mocked(submitDefenderHunt).mockResolvedValue(job());
