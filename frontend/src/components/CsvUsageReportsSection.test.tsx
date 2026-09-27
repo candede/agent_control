@@ -43,22 +43,17 @@ describe("CSV usage reports section", () => {
     expect(within(section).getByRole("heading", { level: 2, name: "CSV usage reports" })).toBeVisible();
     await screen.findByText("Reports available");
     expect(getHistory).toHaveBeenCalledExactlyOnceWith({ limit: 1, offset: 0 }, { signal: expect.any(AbortSignal) });
-    expect(within(section).getByRole("heading", { name: "Retained activity date range" })).toBeVisible();
+    expect(within(section).getByRole("heading", { name: "8 saved report sets" })).toBeVisible();
     const range = screen.getByText("Observed activity dates (UTC)").closest("div")!;
     expect([...range.querySelectorAll("time")].map(time => time.dateTime)).toEqual(["2026-04-05", "2026-09-18"]);
     expect(range).toHaveTextContent("to");
     expect(screen.queryByText("Known reporting windows (UTC)")).not.toBeInTheDocument();
     expect(screen.queryByText("Reporting dates (UTC)")).not.toBeInTheDocument();
     expect(screen.queryByText(/Cumulative report range/)).not.toBeInTheDocument();
-    expect(section).toHaveTextContent("8 retained report sets · 24 distinct CSV reports · 1,234 report rows");
-    expect(section).toHaveTextContent("Latest acceptance");
-    expect(section).toHaveTextContent("not just the current selection or latest upload");
-    expect(section).toHaveTextContent("across all retained, complete CSV report sets in history");
-    expect(section).toHaveTextContent("not reporting-window bounds or proof of continuous reporting coverage");
-    expect(section).toHaveTextContent("The range may contain gaps");
-    expect(section).toHaveTextContent("Overlapping snapshots are not added together");
-    expect(section).toHaveTextContent("separate from automatic data sync");
-    expect(section).toHaveTextContent("No manual dates are needed");
+    expect(section).toHaveTextContent("Last imported");
+    expect(section).toHaveTextContent("Observed activity across all saved report sets, not continuous reporting coverage");
+    expect(section).toHaveTextContent("Report totals are kept separate");
+    expect(within(section).queryByRole("button", { name: /Refresh/ })).not.toBeInTheDocument();
   });
 
   it.each([true, false])("keeps report management available with upload permission %s", async canUploadUsage => {
@@ -67,7 +62,7 @@ describe("CSV usage reports section", () => {
     const onOpenUsageImport = vi.fn();
     render(<CsvUsageReportsSection {...props} {...{ canUploadUsage, onManageUsageReports, onOpenUsageImport }} />);
     await screen.findByText("Import needed");
-    expect(screen.getByText(/No complete CSV report sets are retained/)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "No reports yet" })).toBeVisible();
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Manage reports" }));
     expect(onManageUsageReports).toHaveBeenCalledOnce();
@@ -128,7 +123,7 @@ describe("CSV usage reports section", () => {
     let resolve!: (value: api.OfficialUsageHistoryView) => void;
     getHistory.mockReturnValueOnce(new Promise(done => { resolve = done; }));
     view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
-    expect(screen.getByRole("status")).toHaveTextContent("Loading retained activity date range");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading reports");
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
     await act(async () => resolve(reportHistoryFixture([])));
     expect(await screen.findByText("Import needed")).toBeVisible();
@@ -139,13 +134,13 @@ describe("CSV usage reports section", () => {
     const getHistory = vi.spyOn(api, "getOfficialUsageHistory").mockResolvedValueOnce(history())
       .mockRejectedValueOnce(new api.ApiError(status, "summary_unavailable", "Report summary unavailable."))
       .mockResolvedValue(history());
-    render(<CsvUsageReportsSection {...props} />);
+    const view = render(<CsvUsageReportsSection {...props} />);
     await screen.findByText("Reports available");
-    await userEvent.click(screen.getByRole("button", { name: "Refresh report summary" }));
+    view.rerender(<CsvUsageReportsSection {...props} revision={1} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Report summary unavailable.");
     expect(screen.queryByText("Reports available")).not.toBeInTheDocument();
     expect(screen.queryByText("Observed activity dates (UTC)")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Retry report summary" }));
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("Reports available")).toBeVisible();
     expect(getHistory).toHaveBeenCalledTimes(3);
   });

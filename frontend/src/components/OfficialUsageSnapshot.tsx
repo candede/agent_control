@@ -3,12 +3,11 @@ import { ApiError, getOfficialUsageAggregate, type OfficialUsageAgentQuery, type
 import { useSavedRead } from "../savedQueries";
 import { ReportingView, type AgentFilters } from "./ReportingView";
 
-export function OfficialUsageSnapshot({ setId, activityWindowDays, revision, onBack, onCurrentSnapshot }: {
+export function OfficialUsageSnapshot({ setId, activityWindowDays, revision, onBack }: {
   setId?: string;
   activityWindowDays: number;
   revision: number;
   onBack: () => void;
-  onCurrentSnapshot: () => void;
 }) {
   const [query, setQuery] = useState<AgentFilters>({});
   const [offset, setOffset] = useState(0);
@@ -22,7 +21,6 @@ export function OfficialUsageSnapshot({ setId, activityWindowDays, revision, onB
   const currentRead = read?.key === readKey ? read : undefined;
   const data = result?.scope === scope ? result.data : undefined;
   const loading = !dateError && !currentRead;
-  const unavailable = Boolean(currentRead?.error) || dateError || (!loading && !data?.activeSet);
 
   useEffect(() => {
     if (dateError) return;
@@ -48,16 +46,8 @@ export function OfficialUsageSnapshot({ setId, activityWindowDays, revision, onB
 
   return <section className="usage-snapshot" aria-label="Snapshot inspection" tabIndex={0}>
     <header className="report-section-header">
-      <div>
-        <h3>{setId ? `Retained snapshot ${setId.slice(0, 8)}` : "Current snapshot"}</h3>
-        {setId ? <p role="status"><strong>{loading ? "Loading retained set" : unavailable ? "Retained set unavailable" : "Showing retained set"}</strong> {setId}</p> : null}
-        <p>This read-only inspection includes report-only identities, not an inventory comparison. Opening a snapshot does not change the tenant&apos;s current report selection.</p>
-      </div>
-      <div className="table-actions">
-        <button type="button" className="secondary" onClick={onBack}>Back to reports</button>
-        <button type="button" className="secondary" disabled={dateError} onClick={() => setReload(value => value + 1)}>Refresh snapshot</button>
-        {setId ? <button type="button" className="secondary" onClick={onCurrentSnapshot}>View current snapshot</button> : null}
-      </div>
+      <button type="button" className="secondary" onClick={onBack}>Back to reports</button>
+      <p>Viewing this report does not change the selected report set.</p>
     </header>
     <ReportingView data={data} query={query} offset={offset} loading={loading} error={currentRead?.error}
       onRetry={() => setReload(value => value + 1)} onAgentPageChange={setOffset}

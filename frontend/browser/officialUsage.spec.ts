@@ -1,13 +1,17 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { createHash } from "node:crypto";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
-import { parseOfficialUsageReport } from "../../backend/src/services/officialUsageParser";
+import { OfficialUsageValidationError, parseOfficialUsageReport } from "../../backend/src/services/officialUsageParser";
 import { buildOfficialUsageAggregateView } from "../../backend/src/services/officialUsageViews";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import type { AcceptedOfficialUsageReports, ParsedOfficialUsageReport, PublishedOfficialUsage } from "../../backend/src/types/officialUsage";
-import type { OfficialUsageAdminState, OfficialUsageHistoryView, OfficialUsageStagingPreview } from "../src/api/client";
+import type {
+  OfficialUsageAdminState, OfficialUsageBundlePreview, OfficialUsageConfirmation,
+  OfficialUsageHistoryView, OfficialUsageStagingPreview,
+} from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
-import { downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
+import { captureCsvReportScreenshot, csvFilePayloads, downloadedCsvRows, usageCsvFixture } from "./usageCsvFixture";
 import { activeWithoutPaidUsersFixture } from "./userCohortFixtures";
 
 const instant = "2026-09-12T14:45:00.000Z";
@@ -52,16 +56,37 @@ function accepted<T extends ParsedOfficialUsageReport>(report: T, index: number)
   };
 }
 
-async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; active?: boolean; historical?: boolean } = {}) {
+async function mockUsage(page: Page, options: {
+  role?: "Admin" | "Viewer";
+  active?: boolean;
+  historical?: boolean;
+  staged?: boolean;
+  additionalSavedSets?: number;
+  selectedSetId?: string;
+  reusedExistingSet?: boolean;
+  loseAcceptanceResponse?: boolean;
+  stageResponseGate?: Promise<void>;
+} = {}) {
   await page.clock.setFixedTime(new Date(instant));
   unexpectedApiRequests.set(page, await mockLayoutApi(page));
   let bundleId = "22222222-2222-4222-8222-222222222222";
   let isAccepted = options.active ?? false;
   let hasImportHistory = isAccepted;
   let activeRevision = isAccepted ? 2 : 1;
+  let selectedSetId: string | null = options.selectedSetId ?? (isAccepted ? setId : null);
   const stages: OfficialUsageStagingPreview[] = [];
+  const stagedReports = new Map<string, ParsedOfficialUsageReport>();
   const reports: AcceptedOfficialUsageReports = {};
   const uploadBodies: string[] = [];
+  const discardedStages: string[] = [];
+  const bundlePreviews: OfficialUsageBundlePreview[] = [];
+  const acceptRequests: Array<{ bundleId: string; bundleHash: string; expectedActiveRevision: number }> = [];
+  const acceptanceReceipts = new Map<string, {
+    setId: string; versionId: string; activeRevision: number; complete: boolean; reusedExistingSet: boolean;
+  }>();
+  const setPreviews: OfficialUsageConfirmation[] = [];
+  const confirmations: OfficialUsageConfirmation[] = [];
+  const adminReads: OfficialUsageAdminState[] = [];
   const userRequests: URLSearchParams[] = [];
   const agentRequests: URLSearchParams[] = [];
   const exportRequests: URLSearchParams[] = [];
@@ -84,6 +109,9 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     reportingPeriod: { startDate: "2026-06-01", endDate: "2026-06-01", provenance: "activity_range" as const },
     acceptedAt: "2026-06-02T10:00:00.000Z", createdAt: "2026-06-02T10:00:00.000Z",
   };
+  const additionalSets = Array.from({ length: options.additionalSavedSets ?? 0 }, (_, index) => ({
+    ...historicalSet, id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(index + 1).padStart(12, "0")}`,
+  }));
   const historicalReports: AcceptedOfficialUsageReports = {};
   if (options.historical) {
     const rows = [
@@ -97,13 +125,40 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     for (const report of Object.values(historicalReports)) report.lineage.acceptedAt = historicalSet.acceptedAt;
   }
-  function published(selectedSetId?: string | null): PublishedOfficialUsage {
-    const historical = options.historical && selectedSetId === historicalSetId;
+  function createStage(report: ParsedOfficialUsageReport, stagedBundleId: string) {
+    const index = stages.length + 1;
+    const stage: OfficialUsageStagingPreview = {
+      id: `33333333-3333-4333-8333-${String(index).padStart(12, "0")}`, revision: 1, status: "active",
+      kind: report.kind, fileHash: `${index}`.repeat(64).slice(0, 64), parserVersion: report.parserVersion,
+      schemaVersion: report.schemaVersion, bundleId: stagedBundleId, correctionOfSetId: null,
+      reportingPeriod: report.reportingPeriod, sourceAsOf: null, sourceAsOfProvenance: "absent",
+      sourceFreshness: "unknown", downloadedAt: null, rowCount: report.rows.length,
+      warnings: report.warnings, reconciliation: {}, activeRevision, acceptedVersionId: null,
+      acceptedSetId: null, createdAt: instant, expiresAt: "2026-09-12T15:15:00.000Z", acceptedAt: null,
+    };
+    stages.push(stage);
+    stagedReports.set(stage.id, report);
+    return stage;
+  }
+  if (options.staged) createStage(parseOfficialUsageReport(Buffer.from(csvFiles[0].content)), bundleId);
+  function published(requestedSetId?: string | null): PublishedOfficialUsage {
+    const historical = options.historical && (requestedSetId ?? selectedSetId) === historicalSetId;
     return {
       activeRevision,
       activeSet: historical ? { ...historicalSet, kinds: [...historicalSet.kinds] } : isAccepted ? { ...activeSet, bundleId, kinds: [...activeSet.kinds] } : null,
-      reports: historical ? historicalReports : isAccepted ? reports : {}, retainedCompleteSets: (isAccepted ? 1 : 0) + (options.historical ? 1 : 0),
+      reports: historical ? historicalReports : isAccepted ? reports : {},
+      retainedCompleteSets: (isAccepted ? 1 : 0) + (options.historical ? 1 : 0) + additionalSets.length,
       retainedIncompleteSets: 0, hasImportHistory, activeSelectionIncomplete: false,
+    };
+  }
+  function adminState(): OfficialUsageAdminState {
+    return {
+      activeSetId: selectedSetId, activeRevision,
+      staging: stages.filter(stage => stage.status === "active").map(stage => ({ ...stage })), sets: [
+        ...isAccepted ? [{ ...activeSet, bundleId, kinds: [...activeSet.kinds] }] : [],
+        ...options.historical ? [{ ...historicalSet, kinds: [...historicalSet.kinds] }] : [],
+        ...additionalSets.map(set => ({ ...set, kinds: [...set.kinds] })),
+      ],
     };
   }
   await page.route(url => url.pathname.startsWith("/api/"), async route => {
@@ -118,6 +173,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
       unexpectedApiRequests.get(page)!.push(`Forbidden Viewer request: ${request.method()} ${path}`);
       return respond({ code: "forbidden", detail: "Viewer report inspection must not request administration." }, 403);
     }
+    if (path === "/api/official-usage/aggregate") agentRequests.push(url.searchParams);
     if (["/api/official-usage/aggregate", "/api/official-usage/users", "/api/official-usage/aggregate.csv"].includes(path)) {
       expect(request.method()).toBe("GET");
       const requestedSet = url.searchParams.get("setId");
@@ -140,63 +196,107 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
       })),
     });
     if (path === "/api/official-usage/admin") {
-      const state: OfficialUsageAdminState = {
-        activeSetId: isAccepted ? setId : null, activeRevision,
-        staging: isAccepted ? [] : stages, sets: [
-          ...isAccepted ? [{ ...activeSet, bundleId, kinds: [...activeSet.kinds] }] : [],
-          ...options.historical ? [{ ...historicalSet, kinds: [...historicalSet.kinds] }] : [],
-        ],
-      };
+      const state = adminState();
+      adminReads.push(state);
       return respond(state);
     }
     if (path === "/api/official-usage/staging") {
+      expect(request.method()).toBe("POST");
       const body = request.postDataBuffer()!.toString("utf8");
       uploadBodies.push(body);
-      const file = csvFiles.find(value => body.includes(`filename="${value.name}"`));
-      if (!file) throw new Error("Unexpected upload fixture");
       const boundary = request.headers()["content-type"].split("boundary=")[1];
       const part = body.split(`--${boundary}`).find(value => value.includes('name="file";'));
       if (!part) throw new Error("Missing CSV multipart part");
       const csv = part.slice(part.indexOf("\r\n\r\n") + 4).replace(/\r\n$/, "");
-      const report = parseOfficialUsageReport(Buffer.from(csv));
-      bundleId = body.match(/name="bundleId"\r\n\r\n([^\r]+)/)![1];
-      const index = csvFiles.indexOf(file) + 1;
-      const stage: OfficialUsageStagingPreview = {
-        id: `33333333-3333-4333-8333-33333333333${index}`, revision: 1, status: "active",
-        kind: report.kind, fileHash: `${index}`.repeat(64), parserVersion: report.parserVersion,
-        schemaVersion: report.schemaVersion, bundleId, correctionOfSetId: null,
-        reportingPeriod: report.reportingPeriod, sourceAsOf: null, sourceAsOfProvenance: "absent",
-        sourceFreshness: "unknown", downloadedAt: null, rowCount: report.rows.length,
-        warnings: report.warnings, reconciliation: {}, activeRevision: 1, acceptedVersionId: null,
-        acceptedSetId: null, createdAt: instant, expiresAt: "2026-09-12T15:15:00.000Z", acceptedAt: null,
+      let report: ParsedOfficialUsageReport;
+      try {
+        report = parseOfficialUsageReport(Buffer.from(csv));
+      } catch (error) {
+        if (error instanceof OfficialUsageValidationError) return respond({ code: error.code, detail: error.message }, 400);
+        throw error;
+      }
+      const stagedBundleId = body.match(/name="bundleId"\r\n\r\n([^\r]+)/)![1];
+      if (stages.some(stage => stage.status === "active" && stage.bundleId === stagedBundleId && stage.kind === report.kind)) {
+        return respond({ code: "duplicate_report_kind", detail: "This import already contains that report type. Keep the staged report or cancel and choose three different exports." }, 409);
+      }
+      const stage = createStage(report, stagedBundleId);
+      const response = { ...stage };
+      await options.stageResponseGate;
+      return respond(response, 201);
+    }
+    if (path.startsWith("/api/official-usage/staging/") && request.method() === "DELETE") {
+      const id = path.split("/").at(-1)!;
+      const stage = stages.find(value => value.id === id);
+      expect(stage?.status).toBe("active");
+      stage!.status = "cancelled";
+      discardedStages.push(id);
+      return route.fulfill({ status: 204 });
+    }
+    if (path.endsWith("/preview") && path.includes("/sets/")) {
+      const preview: OfficialUsageConfirmation = {
+        id: `confirmation-${setPreviews.length + 1}`, operation: request.postDataJSON().operation,
+        setId: path.split("/")[4], expectedRevision: activeRevision, confirmationHash: "c".repeat(64),
+        activeSetId: selectedSetId, expiresAt: "2026-09-12T15:00:00.000Z",
       };
-      stages.push(stage);
-      storeReport(report, index);
-      return respond(stage, 201);
+      setPreviews.push(preview);
+      return respond(preview);
     }
-    if (path.endsWith("/preview") && path.includes("/sets/")) return respond({
-      id: "confirmation-1", operation: request.postDataJSON().operation, setId,
-      expectedRevision: 2, confirmationHash: "c".repeat(64), activeSetId: setId,
-      expiresAt: "2026-09-12T15:00:00.000Z",
-    });
     if (path.includes("/confirmations/")) {
-      isAccepted = false;
+      const confirmation = request.postDataJSON() as OfficialUsageConfirmation;
+      expect(confirmation).toEqual(setPreviews.find(preview => preview.id === path.split("/").at(-1)));
+      expect(confirmation.expectedRevision).toBe(activeRevision);
+      confirmations.push(confirmation);
+      if (confirmation.operation === "select") selectedSetId = confirmation.setId;
+      else {
+        isAccepted = false;
+        selectedSetId = null;
+      }
       activeRevision += 1;
-      return respond({ activeSetId: null, activeRevision });
+      return respond({ activeSetId: selectedSetId, activeRevision });
     }
-    if (path.endsWith("/preview") && path.includes("/bundles/")) return respond({
-      bundleId, bundleHash: "a".repeat(64), expectedActiveRevision: 1, staging: stages,
-      acceptedVersions: [], missingKinds: activeSet.kinds.filter(kind => !stages.some(stage => stage.kind === kind)),
-      reconciliation: {},
-    });
+    if (path.endsWith("/preview") && path.includes("/bundles/")) {
+      const previewBundleId = path.split("/")[4];
+      const selectedStages = stages.filter(stage => stage.bundleId === previewBundleId && stage.status === "active");
+      const preview: OfficialUsageBundlePreview = {
+        bundleId: previewBundleId,
+        bundleHash: createHash("sha256").update(JSON.stringify([previewBundleId, activeRevision, selectedStages])).digest("hex"),
+        expectedActiveRevision: activeRevision,
+        staging: selectedStages.map(stage => ({ ...stage })), acceptedVersions: [],
+        missingKinds: activeSet.kinds.filter(kind => !selectedStages.some(stage => stage.kind === kind)),
+        reconciliation: {},
+      };
+      bundlePreviews.push(preview);
+      return respond(preview);
+    }
     if (path.endsWith("/accept") && path.includes("/bundles/")) {
+      const requestBundleId = path.split("/")[4];
+      const body = request.postDataJSON() as { bundleHash: string; expectedActiveRevision: number };
+      acceptRequests.push({ bundleId: requestBundleId, ...body });
+      const reviewed = bundlePreviews.filter(preview => preview.bundleId === requestBundleId).at(-1);
+      expect(reviewed?.missingKinds).toEqual([]);
+      expect(body).toEqual({ bundleHash: reviewed!.bundleHash, expectedActiveRevision: reviewed!.expectedActiveRevision });
+      const receipt = acceptanceReceipts.get(requestBundleId);
+      if (receipt) return respond(receipt);
+      expect(body.expectedActiveRevision).toBe(activeRevision);
+      for (const stage of stages.filter(stage => stage.bundleId === requestBundleId && stage.status === "active")) {
+        storeReport(stagedReports.get(stage.id)!, activeSet.kinds.indexOf(stage.kind) + 1);
+        stage.status = "accepted";
+        stage.acceptedSetId = setId;
+        stage.acceptedAt = instant;
+      }
       isAccepted = true;
       hasImportHistory = true;
-      activeRevision += 1;
-      return respond({ setId, versionId: "version-1", activeRevision, complete: true });
+      if (!options.reusedExistingSet) {
+        bundleId = requestBundleId;
+        selectedSetId = setId;
+        activeRevision += 1;
+      }
+      const result = { setId, versionId: "version-1", activeRevision, complete: true, reusedExistingSet: options.reusedExistingSet ?? false };
+      acceptanceReceipts.set(requestBundleId, result);
+      if (options.loseAcceptanceResponse) return route.abort("failed");
+      return respond(result);
     }
     if (path === "/api/official-usage/aggregate") {
-      agentRequests.push(url.searchParams);
       return respond(buildOfficialUsageAggregateView(published(url.searchParams.get("setId")), [], {
         staleAfterDays: 35, now: new Date(instant),
         ...Object.fromEntries(url.searchParams),
@@ -237,6 +337,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
       const retained = [
         ...isAccepted ? [{ set: { ...activeSet, bundleId }, reports }] : [],
         ...options.historical ? [{ set: historicalSet, reports: historicalReports }] : [],
+        ...additionalSets.map(set => ({ set, reports })),
       ];
       const bundles = retained.map(({ set, reports: sourceReports }): OfficialUsageHistoryView["bundles"]["value"][number] => {
         const observations = Object.values(sourceReports).map(report => ({
@@ -245,13 +346,15 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
         }));
         const rowCount = observations.reduce((sum, report) => sum + report.rowCount, 0);
         return {
-          ...set, kinds: [...set.kinds], isActive: isAccepted && set.id === setId,
+          ...set, kinds: [...set.kinds], isActive: set.id === selectedSetId,
           observationCount: observations.length, rowCount, uniquePayloadCount: rowCount, repeatedRowsReused: 0,
           reportingWindowKnown: false, activityRangeIsCoverage: false, observations,
         };
       });
       const observations = bundles.flatMap(bundle => bundle.observations);
       const rowCount = observations.reduce((sum, report) => sum + report.rowCount, 0);
+      const limit = Number(url.searchParams.get("limit") ?? 25);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
       const history: OfficialUsageHistoryView = {
         summary: {
           importCount: bundles.length, uniqueObservationCount: observations.length,
@@ -267,7 +370,7 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
           warning: { code: "rolling_snapshots_not_additive", message: "Report snapshots are not additive." },
         },
         bundles: {
-          value: bundles, count: bundles.length, limit: 25, offset: 0,
+          value: bundles.slice(offset, offset + limit), count: bundles.length, limit, offset,
         },
       };
       return respond(history);
@@ -278,10 +381,20 @@ async function mockUsage(page: Page, options: { role?: "Admin" | "Viewer"; activ
     });
     return route.fallback();
   });
-  return { uploadBodies, userRequests, agentRequests, exportRequests, apiRequests, historyRequests, commands };
+  return {
+    uploadBodies, userRequests, agentRequests, exportRequests, apiRequests, historyRequests, commands,
+    discardedStages, stages, bundlePreviews, acceptRequests, setPreviews, confirmations, adminReads,
+    selectedSetId: () => selectedSetId,
+    selectReport: (id: string) => { selectedSetId = id; activeRevision += 1; },
+    deleteImportedReport: () => {
+      isAccepted = false;
+      if (selectedSetId === setId) selectedSetId = null;
+      activeRevision += 1;
+    },
+  };
 }
 
-async function expectReportPaneScrolling(page: Page, pane: Locator, name: string) {
+async function expectReportPaneScrolling(page: Page, pane: Locator, name: string, dismissal: string) {
   await test.step(`${name}: bounded wheel and keyboard scrolling`, async () => {
     const modal = page.locator("dialog.official-usage-modal");
     await expect(modal.locator(".usage-modal-content")).toHaveCSS("overflow-y", "hidden");
@@ -322,13 +435,53 @@ async function expectReportPaneScrolling(page: Page, pane: Locator, name: string
     await expect.poll(scrollTop, { message: "PageDown must scroll the directly focused report pane" }).toBeGreaterThan(0);
     const keyboardScrollTop = await scrollTop();
     await expect(modal.locator(".usage-modal-header")).toBeInViewport({ ratio: 1 });
-    await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport({ ratio: 1 });
+    const dismiss = modal.getByRole("button", { name: dismissal, exact: true });
+    await dismiss.scrollIntoViewIfNeeded();
+    await expect(dismiss).toBeInViewport({ ratio: 1 });
     expect(await page.evaluate(() => window.scrollY), "The document must not scroll behind the dialog").toBe(documentScroll);
     await test.info().attach(`${name}-scroll-measurements`, {
       body: JSON.stringify({ ...metrics, bounds, wheelScrollTop, keyboardScrollTop }, null, 2),
       contentType: "application/json",
     });
   });
+}
+
+function csvUploads(files = csvFiles) {
+  return csvFilePayloads(files);
+}
+
+function expectExactImportReads(queries: URLSearchParams[]) {
+  const verification = queries.filter(query => query.get("limit") === "1");
+  expect(verification.length).toBeGreaterThan(0);
+  for (const query of verification) expect(Object.fromEntries(query)).toEqual({ setId, limit: "1", offset: "0" });
+}
+
+async function expectSimpleImporter(modal: Locator) {
+  await expect(modal).toHaveAccessibleName("Add CSV reports");
+  await expect(modal.getByRole("button", { name: "Close reports", exact: true })).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: /^(?:Close|Add CSV reports|Manage reports|Next|Validate and stage|Continue to review|Accept reviewed bundle)$/ })).toHaveCount(0);
+  await expect(modal.getByRole("tab")).toHaveCount(0);
+  await expect(modal.getByRole("group", { name: "Report workflow" })).toHaveCount(0);
+  await expect(modal.getByLabel("Import progress")).toHaveCount(0);
+  await expect(modal.getByText(/Bundle hash|Technical validation details|expected active revision/i)).toHaveCount(0);
+  await expect(modal).not.toContainText(/[a-f0-9]{64}/i);
+}
+
+async function expectImported(modal: Locator, duplicate = false) {
+  await expect(modal.getByRole("heading", { name: duplicate ? "Reports already imported" : "Reports imported", exact: true })).toBeVisible();
+  await expect(modal.getByRole("status")).toContainText("Your report set is ready in Agents.");
+  await expect(modal.getByRole("button")).toHaveText(["OK"]);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).not.toHaveClass(/secondary/);
+  await expectSimpleImporter(modal);
+}
+
+async function expectSnapshotShell(modal: Locator) {
+  await expect(modal).toHaveAccessibleName("Report details");
+  await expect(modal.getByRole("button", { name: "Back to reports", exact: true })).toHaveCount(1);
+  await expect(modal.getByRole("button", { name: /Close|Refresh|Make current|Current snapshot/i })).toHaveCount(0);
+  await expect(modal.getByText("Viewing this report does not change the selected report set.", { exact: true })).toBeVisible();
+  await expect(modal.locator(".usage-modal-footer")).toHaveCount(0);
 }
 
 test.beforeEach(async ({ context }) => {
@@ -344,10 +497,10 @@ test.afterEach(async ({ page }) => {
 for (const scenario of [
   { legacy: "/official-usage", canonical: "/sync?reports=manage", title: "Manage reports" },
   { legacy: "/official-usage?view=history", canonical: "/sync?reports=manage", title: "Manage reports" },
-  { legacy: "/official-usage?view=snapshot", canonical: "/sync?reports=snapshot", title: "Report snapshot" },
-  { legacy: `/official-usage?snapshot=${setId}`, canonical: `/sync?reports=snapshot&snapshot=${setId}`, title: "Report snapshot" },
+  { legacy: "/official-usage?view=snapshot", canonical: "/sync?reports=snapshot", title: "Report details" },
+  { legacy: `/official-usage?snapshot=${setId}`, canonical: `/sync?reports=snapshot&snapshot=${setId}`, title: "Report details" },
   { legacy: `/official-usage?view=history&snapshot=${setId}`, canonical: "/sync?reports=manage", title: "Manage reports" },
-  { legacy: "/official-usage?view=snapshot&window=90", canonical: "/sync?reports=snapshot&window=90", title: "Report snapshot" },
+  { legacy: "/official-usage?view=snapshot&window=90", canonical: "/sync?reports=snapshot&window=90", title: "Report details" },
 ]) {
   test(`legacy link ${scenario.legacy} redirects to its exact Sync report workflow`, async ({ page }) => {
     const { agentRequests } = await mockUsage(page, { active: true, role: "Viewer" });
@@ -358,16 +511,19 @@ for (const scenario of [
     await expect(page.getByRole("dialog")).toHaveCount(1);
     await expect(page.getByRole("button", { name: "Official usage", exact: true, includeHidden: true })).toHaveCount(0);
     await expect(page.locator(".official-usage-workbench")).toHaveCount(0);
-    if (scenario.title === "Report snapshot") {
+    if (scenario.title === "Report details") {
       await expect(modal.getByRole("region", { name: "Report agent rows" })).toBeVisible();
       const canonical = new URL(scenario.canonical, "http://localhost");
       expect(agentRequests.at(-1)?.get("setId")).toBe(canonical.searchParams.get("snapshot"));
       expect(agentRequests.at(-1)?.get("activityWindowDays")).toBe(canonical.searchParams.get("window") ?? (canonical.searchParams.has("snapshot") ? "365" : "30"));
+      await expectSnapshotShell(modal);
+      await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
+      await expect(page).toHaveURL("/sync?reports=manage");
     } else {
-      await expect(modal.getByRole("region", { name: "Retained official usage snapshots" })).toBeVisible();
+      await expect(modal.getByRole("region", { name: "Saved reports", exact: true })).toBeVisible();
       expect(agentRequests).toEqual([]);
     }
-    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByRole("dialog", { name: "Manage reports", exact: true }).getByRole("button", { name: "Close reports", exact: true }).click();
     await expect(page).toHaveURL(/\/sync$/);
     await expect(page.getByRole("dialog")).toHaveCount(0);
   });
@@ -384,21 +540,24 @@ test("Viewer manages one read-only history and inspects historical report-only s
   await manage.click();
   await expect(page).toHaveURL(/\/sync\?reports=manage$/);
   const modal = page.locator("dialog.official-usage-modal");
-  const history = modal.getByRole("region", { name: "Retained official usage snapshots" });
+  const history = modal.getByRole("region", { name: "Saved reports", exact: true });
+  await expect(modal.getByRole("region", { name: "Saved report sets", exact: true })).toContainText("2 saved report sets");
   await expect(history.locator("tbody tr")).toHaveCount(2);
   await expect(modal.getByRole("table")).toHaveCount(1);
-  await expect(history.getByRole("columnheader")).toHaveText(["Imported", "Reporting coverage", "Source files", "Status", "View"]);
-  await expect(modal.getByRole("button", { name: /Add CSV reports|Make current|Delete retained set|Resume import|Validate and stage/ })).toHaveCount(0);
+  await expect(history.getByRole("columnheader", { name: "Imported", exact: true })).toBeVisible();
+  await expect(history.getByRole("columnheader", { name: "Status", exact: true })).toBeVisible();
+  await expect(modal.getByRole("button", { name: /Add CSV reports|Make current|Delete report set|Resume import|Validate and stage|Refresh/ })).toHaveCount(0);
   await expect(modal.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/admin");
   expect(apiRequests).not.toContain("/api/official-usage/overview");
-  const oldRow = history.getByRole("row").filter({ has: page.getByRole("cell", { name: "Retained", exact: true }) });
+  const oldRow = history.getByRole("row").filter({ has: page.getByRole("cell", { name: "Saved", exact: true }) });
   await expect(oldRow).toContainText("Jun 1, 2026");
-  await oldRow.getByText("3 exports", { exact: true }).click();
-  await expect(oldRow).toContainText("5 rows; 0 duplicate rows reused.");
-  await expect(oldRow).toContainText("Original acceptance");
+  await expect(oldRow).toContainText(/3 (?:files|reports|CSVs|exports)/);
+  await expect(oldRow).toContainText("5 rows");
   await expect(oldRow).toContainText("Jun 2, 2026");
-  await expect(oldRow).toContainText("content 444444444444");
+  await expect(history.locator("details")).toHaveCount(0);
+  await expect(history).not.toContainText(historicalSetId);
+  await expect(history).not.toContainText("444444444444");
   let releaseSnapshot!: () => void;
   const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
   await page.route(url => url.pathname === "/api/official-usage/aggregate" && url.searchParams.get("setId") === historicalSetId, async route => {
@@ -406,24 +565,24 @@ test("Viewer manages one read-only history and inspects historical report-only s
     await route.fallback();
   });
   try {
-    await oldRow.getByRole("button", { name: "View snapshot", exact: true }).click();
+    await oldRow.getByRole("button", { name: "View report", exact: true }).click();
     await expect(page).toHaveURL(new RegExp(`/sync\\?reports=snapshot&snapshot=${historicalSetId}$`));
-    await expect(modal).toHaveAccessibleName("Report snapshot");
+    await expect(modal).toHaveAccessibleName("Report details");
     await expect(page.getByRole("dialog")).toHaveCount(1);
-    await expect(modal.getByRole("status").filter({ hasText: "Loading retained set" })).toContainText(historicalSetId);
+    await expect(modal.getByRole("status").filter({ hasText: /loading/i })).toBeVisible();
     await expect(modal.getByRole("region", { name: "Report agent rows" })).toHaveCount(0);
   } finally {
     releaseSnapshot();
   }
   const rows = modal.getByRole("region", { name: "Report agent rows" });
   await expect(rows.locator("tbody tr")).toHaveCount(2);
-  await expect(modal.getByRole("status").filter({ hasText: "Showing retained set" })).toContainText(historicalSetId);
   await expect(rows).toContainText("Historical report-only assistant");
   const bridgeRow = rows.getByRole("row", { name: /Bridge-only retained assistant/ });
   await expect(bridgeRow).toContainText("Users & agents only");
   await expect(bridgeRow.getByRole("cell").nth(1)).toContainText("5");
   await expect(rows).not.toContainText("Clinical assistant");
   await expect(modal.getByRole("region", { name: "Snapshot tenant totals" })).toContainText("17");
+  await expectSnapshotShell(modal);
   expect(agentRequests.at(-1)?.get("setId")).toBe(historicalSetId);
   expect(agentRequests.at(-1)?.get("activityWindowDays")).toBe("365");
   await rows.getByRole("button", { name: "Historical report-only assistant", exact: true }).click();
@@ -457,11 +616,41 @@ test("Viewer manages one read-only history and inspects historical report-only s
   expect(apiRequests).not.toContain("/api/official-usage/admin");
   expect(apiRequests).not.toContain("/api/official-usage/users");
   expect(commands).toEqual([]);
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await modal.getByRole("button", { name: "Close reports", exact: true }).click();
   await expect(manage).toBeFocused();
 });
 
-test("Sync is the single report entry point and opens an accessible import dialog on demand", async ({ page }, info) => {
+test("an unavailable saved report retries the exact snapshot without substituting the current report", async ({ page }) => {
+  const state = await mockUsage(page, { active: true, historical: true, role: "Viewer" });
+  let available = false;
+  const attemptedSets: Array<string | null> = [];
+  await page.route(url => url.pathname === "/api/official-usage/aggregate", route => {
+    const id = new URL(route.request().url()).searchParams.get("setId");
+    attemptedSets.push(id);
+    return available
+      ? route.fallback()
+      : route.fulfill({ status: 503, json: { code: "snapshot_unavailable", detail: "This saved report is temporarily unavailable." } });
+  });
+  await page.goto("/sync?reports=manage");
+  const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  const saved = manager.getByRole("row").filter({ has: page.getByRole("cell", { name: "Saved", exact: true }) });
+  await saved.getByRole("button", { name: "View report", exact: true }).click();
+  const details = page.getByRole("dialog", { name: "Report details", exact: true });
+  await expect(details.getByRole("alert")).toContainText("This saved report is temporarily unavailable.");
+  await expect(details.getByRole("region", { name: "Report agent rows" })).toHaveCount(0);
+  await expect(details).not.toContainText("Clinical assistant");
+  await expect(details.getByRole("button", { name: "Export agents CSV", exact: true })).toBeDisabled();
+  available = true;
+  await details.getByRole("button", { name: "Retry report", exact: true }).click();
+  await expect(details.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(2);
+  expect(attemptedSets).toEqual([historicalSetId, historicalSetId]);
+  await expect(details.getByRole("button", { name: "Retry report", exact: true })).toHaveCount(0);
+  expect(state.commands).toEqual([]);
+  await details.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await expect(manager.getByRole("row").filter({ has: page.getByRole("cell", { name: "Current", exact: true }) })).toBeVisible();
+});
+
+test("Sync opens a fresh accessible importer with one upload action and Cancel", async ({ page }, info) => {
   const { apiRequests } = await mockUsage(page);
   await page.goto("/sync");
   await expect(page.getByRole("heading", { name: "CSV usage reports", exact: true })).toBeVisible();
@@ -471,40 +660,35 @@ test("Sync is the single report entry point and opens an accessible import dialo
   await expect(page.getByRole("button", { name: "Manage reports", exact: true })).toHaveCount(1);
   await expect(page.getByRole("button", { name: "View report history", exact: true })).toHaveCount(0);
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Choose CSVs" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Choose CSV files" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Retained sets" })).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/admin");
   const trigger = page.getByRole("button", { name: "Add CSV reports", exact: true });
   await trigger.click();
   await expect(page).toHaveURL(/\/sync\?reports=import$/);
-  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
   await expect(modal).toBeVisible();
-  await expect(modal.getByRole("button", { name: "Choose CSVs", exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(modal.getByRole("button", { name: "Close", exact: true })).toHaveClass(/secondary/);
-  await expect(modal.getByRole("button", { name: "Close reports" })).toBeFocused();
-  await expect(modal.getByRole("button", { name: "Close reports" })).toHaveCSS("width", "44px");
-  await expect(modal.getByRole("button", { name: "Close reports" })).toHaveCSS("height", "44px");
-  await expect(modal.getByRole("button", { name: "Close reports" })).toBeInViewport({ ratio: 1 });
+  await expectSimpleImporter(modal);
+  const choose = modal.getByRole("button", { name: "Choose CSV files", exact: true });
+  const cancel = modal.getByRole("button", { name: "Cancel", exact: true });
+  await expect(modal.getByRole("button", { name: "Start over", exact: true })).toHaveCount(0);
+  await expect(choose).toBeInViewport({ ratio: 1 });
+  await expect(cancel).toBeInViewport({ ratio: 1 });
+  await expect(cancel).toHaveClass(/secondary/);
+  await expect.poll(() => modal.evaluate(element => element.contains(document.activeElement))).toBe(true);
+  await choose.focus();
   await page.keyboard.press("Shift+Tab");
-  await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeFocused();
+  await expect(cancel).toBeFocused();
   await page.keyboard.press("Tab");
-  await expect(modal.getByRole("button", { name: "Close reports" })).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(modal.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(modal.getByRole("button", { name: "Manage reports", exact: true })).toBeFocused();
-  await expect(modal.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
-  await expect(modal.getByLabel("Import progress").locator("li")).toHaveCount(4);
-  await expect(modal.getByLabel("Import progress").locator('[aria-current="step"]')).toHaveText("1Files");
+  await expect(choose).toBeFocused();
   await expect(modal.getByRole("region", { name: "Retained report sets" })).toHaveCount(0);
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
   await expect(page.getByLabel("Reporting start", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Reporting end", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Source as-of, if shown", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Validate and stage" })).toBeDisabled();
-  await expect(modal.getByRole("link", { name: "Microsoft report export guidance" })).toBeVisible();
-  await expect(modal.getByText("Technical validation details", { exact: true })).toHaveCount(0);
+  await expect(modal.getByRole("link", { name: /download.*reports/i })).toBeVisible();
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect(apiRequests).not.toContain("/api/official-usage/admin");
   await page.screenshot({ path: info.outputPath("automatic-import.png"), fullPage: true });
   await page.keyboard.press("Escape");
   await expect(modal).toBeHidden();
@@ -512,71 +696,78 @@ test("Sync is the single report entry point and opens an accessible import dialo
   await expect(trigger).toBeFocused();
   await expect(page.locator("body")).not.toHaveCSS("overflow", "hidden");
   await trigger.click();
-  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await cancel.click();
   await expect(modal).toBeHidden();
   await expect(trigger).toBeFocused();
 });
 
-test("imports all CSV rows without date prompts and preserves source discrepancies", async ({ page }, info) => {
-  const { uploadBodies, userRequests } = await mockUsage(page);
-  await page.goto("/sync");
+test("automatically imports all CSV rows, verifies the exact report and preserves source discrepancies", async ({ page }, info) => {
+  const { uploadBodies, userRequests, acceptRequests, bundlePreviews, adminReads, agentRequests } = await mockUsage(page);
+  await page.goto("/agents");
+  await expect.poll(() => adminReads.length).toBeGreaterThan(0);
+  expect(adminReads.at(-1)?.activeSetId).toBeNull();
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
-  await expect(modal.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await expectSimpleImporter(modal);
   await expect(page.getByLabel("Reporting start", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Reporting end", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Source as-of, if shown", { exact: true })).toHaveCount(0);
-  await page.getByLabel("Official usage CSV files").setInputFiles(csvFiles.map(file => ({
-    name: file.name, mimeType: "text/csv", buffer: Buffer.from(file.content),
-  })));
-  await page.getByRole("button", { name: "Close reports" }).click();
-  await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  await expect(modal.getByText("3 file(s) selected", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Validate and stage" }).click();
-  await expect(modal.getByRole("region", { name: "Server validation" })).toBeVisible();
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
-  await modal.getByRole("button", { name: "Continue to review" }).click();
-  await expect(page.getByRole("button", { name: "Accept reviewed bundle" })).toBeEnabled();
-  const firstReport = modal.getByRole("region", { name: "Validated report rows" }).locator("tbody tr").first();
-  await expect(firstReport.getByRole("rowheader").locator("span")).toBeInViewport({ ratio: 1 });
-  await expect(firstReport.getByRole("cell").first().locator("span")).toHaveText("103");
-  await expect(firstReport.getByRole("cell").first().locator("span")).toBeInViewport({ ratio: 1 });
-  await expect(modal.getByText("Bundle hash", { exact: true })).toBeHidden();
-  await expect(modal.getByRole("region", { name: "Retained report sets" })).toHaveCount(0);
-  await expect(modal.locator(".usage-wizard-body")).toHaveCSS("overflow-y", "auto");
-  expect(await modal.locator(".usage-wizard-body").evaluate(element => element.clientHeight)).toBeGreaterThan(150);
-  await expect(modal.getByRole("button", { name: "Close reports" })).toBeInViewport({ ratio: 1 });
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toBeInViewport();
-  const headerBounds = await modal.locator(".usage-modal-header").boundingBox();
-  const closeBounds = await modal.getByRole("button", { name: "Close reports" }).boundingBox();
-  expect(closeBounds!.x + closeBounds!.width).toBeLessThanOrEqual(headerBounds!.x + headerBounds!.width);
-  expect(closeBounds!.y).toBeGreaterThanOrEqual(0);
-  expect(closeBounds!.y + closeBounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height);
+  await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeInViewport({ ratio: 1 });
+  await captureCsvReportScreenshot(page, info, "upload");
+  const fileChooser = page.waitForEvent("filechooser");
+  await modal.getByRole("button", { name: "Choose CSV files", exact: true }).click();
+  await (await fileChooser).setFiles(csvUploads());
+  await expectImported(modal);
+  expect(acceptRequests).toHaveLength(1);
+  const reviewed = bundlePreviews.at(-1)!;
+  expect(reviewed.staging.map(stage => stage.rowCount)).toEqual([103, 103, 104]);
+  expect(acceptRequests[0]).toEqual({
+    bundleId: reviewed.bundleId, bundleHash: reviewed.bundleHash, expectedActiveRevision: reviewed.expectedActiveRevision,
+  });
+  expect(adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 2, staging: [] });
+  expectExactImportReads(agentRequests);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toBeInViewport({ ratio: 1 });
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
-  await expect(modal.getByRole("button", { name: "Close reports" })).toBeInViewport({ ratio: 1 });
-  await page.screenshot({ path: info.outputPath("review-import.png") });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await captureCsvReportScreenshot(page, info, "success");
   expect(uploadBodies).toHaveLength(3);
   for (const body of uploadBodies) {
     expect(body).not.toMatch(/name="(?:reportingStart|reportingEnd|sourceAsOf|downloadedAt)"/);
     expect(body).not.toContain('name="correctionOfSetId"');
     expect(body).toMatch(/name="rejectDuplicateKind"\r?\n\r?\ntrue/);
   }
-  await page.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(page).toHaveURL(/\/sync$/);
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(page).toHaveURL(/\/agents$/);
   await expect(modal).toBeHidden();
+  await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(setId);
+  await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-  await expect(modal.getByRole("region", { name: "Validated report previews" })).toBeVisible();
-  await page.getByRole("button", { name: "Accept reviewed bundle" }).click();
-  await expect(page.getByText(/three-file snapshot was added to retained history and is current/)).toBeVisible();
-  await expect(modal.getByLabel("Import progress").locator('[aria-current="step"]')).toContainText("Result");
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
-  expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
-  await page.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(modal).toBeHidden();
+  await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("heading", { name: /Reports (?:already )?imported/ })).toHaveCount(0);
+  expect(await modal.getByLabel("Official usage CSV files").evaluate((input: HTMLInputElement) => input.files?.length)).toBe(0);
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect(acceptRequests).toHaveLength(1);
   await page.getByRole("button", { name: "Manage reports", exact: true }).click();
   const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
-  await manager.getByRole("button", { name: "View current snapshot", exact: true }).click();
-  await expect(page).toHaveURL(/\/sync\?reports=snapshot$/);
+  await expect(manager.getByRole("region", { name: "Saved reports", exact: true }).locator("tbody tr")).toHaveCount(1);
+  await expect(manager.getByRole("button", { name: "View report", exact: true })).toBeEnabled();
+  const list = manager.getByRole("region", { name: "Saved reports", exact: true });
+  expect(await list.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const listBounds = await list.boundingBox();
+  const actionBounds = await manager.getByRole("button", { name: "View report", exact: true }).boundingBox();
+  expect(listBounds).not.toBeNull();
+  expect(actionBounds).not.toBeNull();
+  expect(actionBounds!.x).toBeGreaterThanOrEqual(listBounds!.x);
+  expect(actionBounds!.x + actionBounds!.width).toBeLessThanOrEqual(listBounds!.x + listBounds!.width);
+  const deleteBounds = await manager.getByRole("button", { name: /^Delete report set:/ }).boundingBox();
+  expect(deleteBounds).not.toBeNull();
+  expect(Math.abs(deleteBounds!.y + deleteBounds!.height / 2 - actionBounds!.y - actionBounds!.height / 2)).toBeLessThanOrEqual(1);
+  expect(deleteBounds!.x + deleteBounds!.width).toBeLessThanOrEqual(listBounds!.x + listBounds!.width);
+  await captureCsvReportScreenshot(page, info, "management");
+  await manager.getByRole("button", { name: "View report", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sync\\?reports=snapshot&snapshot=${setId}$`));
+  await expect(page.getByRole("dialog", { name: "Report details", exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "Snapshot tenant totals" })).toContainText("2,061");
   const report = page.getByRole("region", { name: "Agent activity report" });
   await expect(report.getByText("Source totals differ", { exact: true }).first()).toBeVisible();
@@ -600,37 +791,383 @@ test("imports all CSV rows without date prompts and preserves source discrepanci
   expect(userRequests).toEqual([]);
 });
 
-test("allows closing during validation without dropping the staged result", async ({ page }) => {
-  await mockUsage(page);
+test("Cancel during validation disposes late staging and does not restore it into a fresh import", async ({ page }) => {
   let releaseUpload!: () => void;
   const uploadGate = new Promise<void>(resolve => { releaseUpload = resolve; });
-  await page.route("**/api/official-usage/staging", async route => {
-    await uploadGate;
-    await route.fallback();
-  });
+  const state = await mockUsage(page, { stageResponseGate: uploadGate });
   try {
     await page.goto("/sync");
     await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-    await page.getByLabel("Official usage CSV files").setInputFiles({
-      name: csvFiles[0].name, mimeType: "text/csv", buffer: Buffer.from(csvFiles[0].content),
-    });
+    const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
     const uploading = page.waitForRequest("**/api/official-usage/staging");
-    await page.getByRole("button", { name: "Validate and stage" }).click();
+    await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([csvFiles[0]]));
     await uploading;
-    await page.getByRole("button", { name: "Close reports" }).click();
-    await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
-    const completed = page.waitForResponse("**/api/official-usage/staging");
-    releaseUpload();
-    await completed;
+    await expect.poll(() => state.stages.length).toBe(1);
+    await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(page).toHaveURL(/\/sync$/);
     await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
     await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
-    await expect(page.getByRole("region", { name: "Server validation" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Continue to review" })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Accept reviewed bundle" })).toHaveCount(0);
-    await expect(page.getByText("Missing Users & agents, Users", { exact: true })).toBeVisible();
+    await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+    releaseUpload();
+    await expect.poll(() => state.discardedStages.length).toBe(1);
+    expect(state.stages.every(stage => stage.status === "cancelled")).toBe(true);
+    expect(state.acceptRequests).toEqual([]);
+    await expect(modal).not.toContainText(csvFiles[0].name);
+    expect(await modal.getByLabel("Official usage CSV files").evaluate((input: HTMLInputElement) => input.files?.length)).toBe(0);
+    await expectSimpleImporter(modal);
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
   } finally {
     releaseUpload();
   }
+});
+
+test("Add CSV reports ignores old staging instead of resuming it from management", async ({ page }) => {
+  const state = await mockUsage(page, { staged: true });
+  await page.goto("/sync?reports=manage");
+  const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(manager.getByRole("region", { name: "Staged imports", exact: true })).toHaveCount(0);
+  await expect(manager.getByRole("button", { name: /Resume import/ })).toHaveCount(0);
+  await manager.getByRole("button", { name: "Add CSV reports", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+  await expectSimpleImporter(modal);
+  expect(await modal.getByLabel("Official usage CSV files").evaluate((input: HTMLInputElement) => input.files?.length)).toBe(0);
+  expect(state.bundlePreviews).toEqual([]);
+  expect(state.uploadBodies).toEqual([]);
+  expect(state.adminReads).toEqual([]);
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(modal).toBeHidden();
+  expect(state.acceptRequests).toEqual([]);
+  expect(state.discardedStages).toEqual([]);
+  expect(state.stages[0].status).toBe("active");
+});
+
+test("missing report types remain actionable and adding companions completes one atomic import", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([csvFiles[0]]));
+  await expect.poll(() => state.stages.length).toBe(1);
+  await expect(modal).toContainText(/missing|still need|add.*remaining/i);
+  await expect(modal).toContainText("Users & agents");
+  await expect(modal).toContainText("Users");
+  await expect(modal.getByRole("button", { name: "Add CSV files", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "Start over", exact: true })).toBeEnabled();
+  expect(state.acceptRequests).toEqual([]);
+  await expectSimpleImporter(modal);
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads(csvFiles.slice(1)));
+  await expectImported(modal);
+  expect(state.uploadBodies).toHaveLength(3);
+  expect(new Set(state.stages.map(stage => stage.bundleId)).size).toBe(1);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.stages.every(stage => stage.status === "accepted")).toBe(true);
+});
+
+test("Start over disposes the partial import before choosing a new bundle", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([csvFiles[0]]));
+  await expect(modal.getByRole("button", { name: "Add CSV files", exact: true })).toBeEnabled();
+  const first = state.stages[0];
+  await modal.getByRole("button", { name: "Start over", exact: true }).click();
+  await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "Start over", exact: true })).toHaveCount(0);
+  await expect(modal).not.toContainText(csvFiles[0].name);
+  expect(state.discardedStages).toEqual([first.id]);
+  expect(state.adminReads.some(read => read.staging.some(stage => stage.id === first.id && stage.status === "active"))).toBe(true);
+  expect(state.acceptRequests).toEqual([]);
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expectImported(modal);
+  expect(state.uploadBodies).toHaveLength(4);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.acceptRequests[0].bundleId).not.toBe(first.bundleId);
+  expect(state.stages.slice(1).every(stage => stage.bundleId === state.acceptRequests[0].bundleId && stage.status === "accepted")).toBe(true);
+});
+
+test("a rejected CSV preserves successful companions and a corrected missing file completes the import", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([
+    ...csvFiles.slice(0, 2), { name: "users-invalid.csv", content: "Unsupported,CSV\ninvalid,report" },
+  ]));
+  await expect(modal.getByRole("alert")).toContainText(/users-invalid.csv|CSV headers/);
+  await expect(modal).toContainText(/choose|replace|add/i);
+  await expect(modal.getByRole("button", { name: "Choose replacement CSVs", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "Start over", exact: true })).toBeEnabled();
+  expect(state.stages.map(stage => stage.kind)).toEqual(["agents", "userAgents"]);
+  expect(state.acceptRequests).toEqual([]);
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([csvFiles[2]]));
+  await expectImported(modal);
+  expect(state.uploadBodies).toHaveLength(4);
+  expect(new Set(state.stages.map(stage => stage.bundleId)).size).toBe(1);
+  expect(state.acceptRequests).toHaveLength(1);
+});
+
+test("three valid companions never publish when another selected file is rejected", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([
+    ...csvFiles, { name: "unexpected.csv", content: "Unsupported,CSV\ninvalid,report" },
+  ]));
+  await expect(modal.getByRole("alert")).toContainText(/one per report type|three CSV exports|CSV headers/);
+  await expect(modal.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
+  expect(state.acceptRequests).toEqual([]);
+  await expect(modal.getByRole("heading", { name: "Reports imported", exact: true })).toHaveCount(0);
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(modal).toBeHidden();
+  expect(state.stages.every(stage => stage.status === "cancelled")).toBe(true);
+  expect(state.acceptRequests).toEqual([]);
+});
+
+test("Escape cannot cancel a save in progress and acknowledges success like OK", async ({ page }) => {
+  const state = await mockUsage(page);
+  let releaseAcceptance!: () => void;
+  const acceptanceGate = new Promise<void>(resolve => { releaseAcceptance = resolve; });
+  await page.route("**/api/official-usage/bundles/*/accept", async route => {
+    await acceptanceGate;
+    await route.fallback();
+  });
+  try {
+    await page.goto("/sync?reports=import");
+    const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+    const saving = page.waitForRequest("**/api/official-usage/bundles/*/accept");
+    await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+    await saving;
+    await expect(modal.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeVisible();
+    await expect(page).toHaveURL(/\/sync\?reports=import$/);
+    expect(state.discardedStages).toEqual([]);
+    releaseAcceptance();
+    await expectImported(modal);
+    const ok = modal.getByRole("button", { name: "OK", exact: true });
+    await expect(modal.getByRole("heading", { name: "Reports imported", exact: true })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(ok).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(ok).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(page).toHaveURL(/\/agents$/);
+    await expect(modal).toBeHidden();
+    await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(setId);
+    expect(state.acceptRequests).toHaveLength(1);
+    expect(state.discardedStages).toEqual([]);
+  } finally {
+    releaseAcceptance();
+  }
+});
+
+test("OK waits for fresh admin and exact-report reads before navigating without publishing again", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expectImported(modal);
+  const adminReads = state.adminReads.length;
+  const reportReads = state.agentRequests.length;
+  const previews = state.bundlePreviews.length;
+  let releaseAdmin!: () => void;
+  let releaseReport!: () => void;
+  const adminGate = new Promise<void>(resolve => { releaseAdmin = resolve; });
+  const reportGate = new Promise<void>(resolve => { releaseReport = resolve; });
+  await page.route("**/api/official-usage/admin", async route => {
+    await adminGate;
+    await route.fallback();
+  });
+  await page.route("**/api/official-usage/aggregate?*", async route => {
+    expect(Object.fromEntries(new URL(route.request().url()).searchParams)).toEqual({ setId, limit: "1", offset: "0" });
+    await reportGate;
+    await route.fallback();
+  });
+  try {
+    const rechecking = Promise.all([
+      page.waitForRequest("**/api/official-usage/admin"),
+      page.waitForRequest(request => new URL(request.url()).pathname === "/api/official-usage/aggregate"),
+    ]);
+    await modal.getByRole("button", { name: "OK", exact: true }).click();
+    await rechecking;
+    await expect(page).toHaveURL(/\/sync\?reports=import$/);
+    await expect(modal).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeVisible();
+    const adminCompleted = page.waitForResponse("**/api/official-usage/admin");
+    releaseAdmin();
+    await adminCompleted;
+    await expect(page).toHaveURL(/\/sync\?reports=import$/);
+    releaseReport();
+    await expect(page).toHaveURL(/\/agents$/);
+    await expect(modal).toBeHidden();
+    await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(setId);
+    expect(state.adminReads.length).toBeGreaterThan(adminReads);
+    expect(state.agentRequests.length).toBeGreaterThan(reportReads);
+    expectExactImportReads(state.agentRequests);
+    expect(state.uploadBodies).toHaveLength(3);
+    expect(state.acceptRequests).toHaveLength(1);
+    expect(state.bundlePreviews).toHaveLength(previews);
+    expect(state.discardedStages).toEqual([]);
+  } finally {
+    releaseAdmin();
+    releaseReport();
+  }
+});
+
+test("OK detects a selection change made after success and requires explicit reselection", async ({ page }) => {
+  const state = await mockUsage(page, { historical: true });
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expectImported(modal);
+  const reads = state.agentRequests.length;
+  state.selectReport(historicalSetId);
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(modal.getByRole("alert")).toContainText("The report selection changed.");
+  await expect(page).toHaveURL(/\/sync\?reports=import$/);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+  expect(state.selectedSetId()).toBe(historicalSetId);
+  expect(state.setPreviews).toEqual([]);
+  expect(state.confirmations).toEqual([]);
+  expect(state.agentRequests.length).toBeGreaterThan(reads);
+  await modal.getByRole("button", { name: "Use imported reports", exact: true }).click();
+  await expectImported(modal);
+  expect(state.confirmations).toHaveLength(1);
+  expect(state.confirmations[0]).toMatchObject({ setId, operation: "select", expectedRevision: 3 });
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(setId);
+  expectExactImportReads(state.agentRequests);
+  expect(state.uploadBodies).toHaveLength(3);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.bundlePreviews).toHaveLength(1);
+});
+
+test("OK blocks a report deleted after success without reuploading or accepting on Retry", async ({ page }) => {
+  const state = await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expectImported(modal);
+  const reads = state.agentRequests.length;
+  state.deleteImportedReport();
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(modal.getByRole("alert")).toContainText("The exact synthetic report set is unavailable.");
+  await expect(page).toHaveURL(/\/sync\?reports=import$/);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+  expect(state.agentRequests.length).toBeGreaterThan(reads);
+  const retried = page.waitForResponse(response => new URL(response.url()).pathname === "/api/official-usage/aggregate" && response.status() === 404);
+  await modal.getByRole("button", { name: "Retry", exact: true }).click();
+  await retried;
+  await expect(modal.getByRole("alert")).toContainText("The exact synthetic report set is unavailable.");
+  expectExactImportReads(state.agentRequests);
+  expect(state.uploadBodies).toHaveLength(3);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.bundlePreviews).toHaveLength(1);
+  expect(state.setPreviews).toEqual([]);
+  expect(state.confirmations).toEqual([]);
+  expect(state.discardedStages).toEqual([]);
+  await modal.getByRole("button", { name: "Back to Sync", exact: true }).click();
+  await expect(modal).toBeHidden();
+  await expect(page).toHaveURL(/\/sync$/);
+});
+
+test("a lost acceptance response retries the same reviewed request without uploading or publishing twice", async ({ page }) => {
+  const state = await mockUsage(page, { loseAcceptanceResponse: true });
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expect(modal.getByRole("alert")).toBeVisible();
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+  expect(state.acceptRequests).toHaveLength(1);
+  const previewCount = state.bundlePreviews.length;
+  await modal.getByRole("button", { name: /^Retry/ }).click();
+  await expectImported(modal);
+  expect(state.acceptRequests).toHaveLength(2);
+  expect(state.acceptRequests[1]).toEqual(state.acceptRequests[0]);
+  expect(state.bundlePreviews).toHaveLength(previewCount);
+  expect(state.uploadBodies).toHaveLength(3);
+  expect(state.adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 2 });
+  expect(state.discardedStages).toEqual([]);
+});
+
+for (const failedRead of ["admin", "aggregate"] as const) {
+  test(`post-accept ${failedRead} verification retries reads without accepting or uploading again`, async ({ page }) => {
+    const state = await mockUsage(page);
+    let failed = false;
+    await page.route(url => url.pathname === `/api/official-usage/${failedRead}`, async route => {
+      if (state.acceptRequests.length && !failed) {
+        failed = true;
+        return route.fulfill({ status: 503, json: { code: "verification_unavailable", detail: "Saved report verification is temporarily unavailable." } });
+      }
+      return route.fallback();
+    });
+    await page.goto("/sync?reports=import");
+    const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+    await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+    await expect(modal.getByRole("alert")).toContainText("Saved report verification is temporarily unavailable.");
+    await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+    expect(state.acceptRequests).toHaveLength(1);
+    const previewCount = state.bundlePreviews.length;
+    await modal.getByRole("button", { name: /^Retry/ }).click();
+    await expectImported(modal);
+    expect(state.acceptRequests).toHaveLength(1);
+    expect(state.uploadBodies).toHaveLength(3);
+    expect(state.bundlePreviews).toHaveLength(previewCount);
+    expect(state.adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 2 });
+    expectExactImportReads(state.agentRequests);
+  });
+}
+
+test("a duplicate saved report is selected through the revision-fenced confirmation before OK", async ({ page }) => {
+  const state = await mockUsage(page, { active: true, historical: true, selectedSetId: historicalSetId, reusedExistingSet: true });
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expectImported(modal, true);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.setPreviews).toHaveLength(1);
+  expect(state.setPreviews[0]).toMatchObject({ operation: "select", setId, activeSetId: historicalSetId, expectedRevision: 2 });
+  expect(state.confirmations).toEqual(state.setPreviews);
+  expect(state.selectedSetId()).toBe(setId);
+  expect(state.adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 3 });
+  expectExactImportReads(state.agentRequests);
+  await modal.getByRole("button", { name: "OK", exact: true }).click();
+  await expect(page).toHaveURL(/\/agents$/);
+  await expect(page.getByRole("region", { name: "Report set selection" }).getByRole("combobox")).toHaveValue(setId);
+});
+
+test("a newer report selection requires Use imported reports before a duplicate can replace it", async ({ page }) => {
+  const state = await mockUsage(page, { active: true, historical: true, reusedExistingSet: true });
+  let selectionChanged = false;
+  await page.route("**/api/official-usage/admin", route => {
+    if (state.acceptRequests.length && !selectionChanged) {
+      state.selectReport(historicalSetId);
+      selectionChanged = true;
+    }
+    return route.fallback();
+  });
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads());
+  await expect(modal.getByRole("alert")).toContainText(/changed|newer|selection/i);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toHaveCount(0);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.setPreviews).toEqual([]);
+  expect(state.confirmations).toEqual([]);
+  expect(state.selectedSetId()).toBe(historicalSetId);
+  const useImported = modal.getByRole("button", { name: "Use imported reports", exact: true });
+  await expect(useImported).toBeEnabled();
+  await useImported.click();
+  await expectImported(modal, true);
+  expect(state.acceptRequests).toHaveLength(1);
+  expect(state.uploadBodies).toHaveLength(3);
+  expect(state.setPreviews).toHaveLength(1);
+  expect(state.setPreviews[0]).toMatchObject({ operation: "select", setId, activeSetId: historicalSetId, expectedRevision: 3 });
+  expect(state.confirmations).toEqual(state.setPreviews);
+  expect(state.adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 4 });
+  expectExactImportReads(state.agentRequests);
 });
 
 test("snapshot inspection preserves raw source totals and read-only access", async ({ page }, info) => {
@@ -638,6 +1175,7 @@ test("snapshot inspection preserves raw source totals and read-only access", asy
   await page.goto("/sync?reports=snapshot");
   const modal = page.locator("dialog.official-usage-modal");
   await expect(modal).toBeVisible();
+  await expectSnapshotShell(modal);
   await expect(modal.getByRole("heading", { name: "Report agent rows", exact: true })).toBeVisible();
   const summary = page.getByRole("region", { name: "Snapshot tenant totals" });
   await expect(summary).toBeVisible();
@@ -672,59 +1210,65 @@ test("snapshot inspection preserves raw source totals and read-only access", asy
 for (const role of ["Admin", "Viewer"] as const) {
   for (const view of ["manage", "snapshot"] as const) {
     test(`${role} ${view} pane supports wheel and keyboard scrolling`, async ({ page }) => {
-      const { apiRequests, commands } = await mockUsage(page, { role, active: true, historical: true });
+      const { apiRequests, commands } = await mockUsage(page, { role, active: true, historical: true, additionalSavedSets: 28 });
       await page.goto(`/sync?reports=${view}`);
       const modal = page.locator("dialog.official-usage-modal");
       if (view === "manage") {
-        const history = modal.getByRole("region", { name: "Retained official usage snapshots" });
-        await expect(history.locator("tbody tr")).toHaveCount(2);
-        const sourceDetails = history.locator("summary").filter({ hasText: /^3 exports$/ });
-        await expect(sourceDetails).toHaveCount(2);
-        await sourceDetails.nth(0).click();
-        await sourceDetails.nth(1).click();
-        await modal.getByText("Retention and source accounting", { exact: true }).click();
-        const pane = role === "Admin"
-          ? modal.locator(".usage-modal-import-pane:not([hidden]) .usage-wizard-body")
-          : modal.getByRole("region", { name: "Saved reports", exact: true });
-        if (role === "Viewer") await expect(pane).toHaveAttribute("tabindex", "0");
-        await expectReportPaneScrolling(page, pane, `${role} manage reports`);
+        const history = modal.getByRole("region", { name: "Saved reports", exact: true });
+        await expect(history.locator("tbody tr")).toHaveCount(25);
+        await expect(history.locator("details")).toHaveCount(0);
+        const pane = modal.getByRole("region", { name: "Manage saved reports", exact: true });
+        await expectReportPaneScrolling(page, pane, `${role} manage reports`, "Close reports");
       } else {
-        await expect(modal).toHaveAccessibleName("Report snapshot");
+        await expect(modal).toHaveAccessibleName("Report details");
         await expect(modal.getByRole("region", { name: "Report agent rows" }).locator("tbody tr")).toHaveCount(25);
         const pane = modal.getByRole("region", { name: "Snapshot inspection", exact: true });
         await expect(pane).toHaveAttribute("tabindex", "0");
-        await expectReportPaneScrolling(page, pane, `${role} snapshot inspection`);
+        await expectReportPaneScrolling(page, pane, `${role} snapshot inspection`, "Back to reports");
       }
       expect(commands).toEqual([]);
-      if (role === "Viewer") expect(apiRequests).not.toContain("/api/official-usage/admin");
+      expect(apiRequests).not.toContain("/api/official-usage/admin");
     });
   }
 }
 
-test("CSV review pane supports wheel and keyboard scrolling", async ({ page }) => {
-  const { commands } = await mockUsage(page);
+test("import validation errors leave upload and Cancel reachable on desktop and mobile", async ({ page }, info) => {
+  const { acceptRequests, discardedStages } = await mockUsage(page);
   await page.goto("/sync?reports=import");
-  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
-  await modal.getByLabel("Official usage CSV files").setInputFiles(csvFiles.map(file => ({
-    name: file.name, mimeType: "text/csv", buffer: Buffer.from(file.content),
-  })));
-  await modal.getByRole("button", { name: "Validate and stage" }).click();
-  await modal.getByRole("button", { name: "Continue to review" }).click();
-  await expect(modal.getByRole("region", { name: "Validated report rows" }).locator("tbody tr")).toHaveCount(3);
-  await modal.getByText("Technical validation details", { exact: true }).click();
-  await expectReportPaneScrolling(page, modal.locator(".usage-modal-import-pane:not([hidden]) .usage-wizard-body"), "CSV import review");
-  await expect(modal.getByRole("button", { name: "Accept reviewed bundle", exact: true })).toBeInViewport({ ratio: 1 });
-  expect(commands.some(command => command.endsWith("/accept"))).toBe(false);
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvUploads([
+    csvFiles[0], { name: "users-and-agents-with-unsupported-columns.csv", content: "Unsupported,CSV\ninvalid,report" },
+  ]));
+  await expect(modal.getByRole("alert")).toBeVisible();
+  const choose = modal.getByRole("button", { name: "Choose replacement CSVs", exact: true });
+  await expect(choose).toBeEnabled();
+  await choose.scrollIntoViewIfNeeded();
+  await expect(choose).toBeInViewport({ ratio: 1 });
+  await expect(modal.getByRole("button", { name: "Cancel", exact: true })).toBeInViewport({ ratio: 1 });
+  await expectSimpleImporter(modal);
+  expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath("csv-validation-error.png"), fullPage: true });
+  expect(acceptRequests).toEqual([]);
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(modal).toBeHidden();
+  await expect.poll(() => discardedStages.length).toBe(1);
 });
 
-test("opens exact staging links in the dialog and reports unavailable staging without fallback", async ({ page }) => {
-  await mockUsage(page);
-  await page.goto("/official-usage?staging=33333333-3333-4333-8333-333333333333");
-  await expect(page).toHaveURL(/\/sync\?reports=import&staging=33333333-3333-4333-8333-333333333333$/);
-  const modal = page.getByRole("dialog", { name: "Import CSV reports", exact: true });
+test("legacy staging links open the new importer without automatically publishing saved staging", async ({ page }) => {
+  const state = await mockUsage(page, { staged: true });
+  const stagingId = state.stages[0].id;
+  await page.goto(`/official-usage?staging=${stagingId}`);
+  await expect(page).toHaveURL(`/sync?reports=import&staging=${stagingId}`);
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
   await expect(modal).toBeVisible();
-  await expect(modal.getByText(/exact staging record is expired, deleted, or unavailable/)).toBeVisible();
-  await page.getByRole("button", { name: "Close reports" }).click();
+  await expect(modal.getByRole("button", { name: "Add CSV files", exact: true })).toBeEnabled();
+  await expectSimpleImporter(modal);
+  expect(state.adminReads.length).toBeGreaterThan(0);
+  expect(state.bundlePreviews.at(-1)?.bundleId).toBe(state.stages[0].bundleId);
+  expect(state.acceptRequests).toEqual([]);
+  expect(state.uploadBodies).toEqual([]);
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(modal).toBeHidden();
   await expect(page).toHaveURL(/\/sync$/);
   await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toBeFocused();
@@ -785,57 +1329,108 @@ test("uses one agent table for response rankings, reach, date filters and a snap
   expect(userRequests).toEqual([]);
 });
 
-test("one manage table combines retained reports and collapsed source accounting", async ({ page }, info) => {
+for (const source of ["summary", "history"] as const) {
+  test(`CSV ${source} offers Retry only after a failed read`, async ({ page }) => {
+    const state = await mockUsage(page, { active: true, historical: true });
+    let reads = 0;
+    let available = false;
+    await page.route(url => url.pathname === "/api/official-usage/history"
+      && url.searchParams.get("limit") === (source === "summary" ? "1" : "25"), route => {
+      reads += 1;
+      return available
+        ? route.fallback()
+        : route.fulfill({ status: 503, json: { code: "history_unavailable", detail: "Saved reports are temporarily unavailable." } });
+    });
+    await page.goto(source === "summary" ? "/sync" : "/sync?reports=manage");
+    const section = source === "summary"
+      ? page.getByRole("region", { name: "CSV usage reports", exact: true })
+      : page.getByRole("dialog", { name: "Manage reports", exact: true });
+    await expect(section.getByRole("alert")).toContainText("Saved reports are temporarily unavailable.");
+    const retry = section.getByRole("button", { name: /^Retry/ });
+    await expect(retry).toBeEnabled();
+    await expect(section.getByRole("button", { name: /Refresh/ })).toHaveCount(0);
+    const beforeRetry = reads;
+    available = true;
+    await retry.click();
+    await expect.poll(() => reads).toBeGreaterThan(beforeRetry);
+    await expect(section.getByRole("alert")).toHaveCount(0);
+    await expect(retry).toHaveCount(0);
+    await expect(section.getByRole("button", { name: /Refresh/ })).toHaveCount(0);
+    if (source === "summary") {
+      await expect(section.locator("time[datetime='2026-06-01']")).toBeVisible();
+      await expect(section.locator("time[datetime='2026-09-12']")).toBeVisible();
+      await expect(section).toContainText("Last imported");
+      await expect(section).not.toContainText("proof of continuous reporting coverage");
+    } else {
+      await expect(section.getByRole("region", { name: "Saved reports", exact: true }).locator("tbody tr")).toHaveCount(2);
+      await expect(section.getByRole("button", { name: "View report", exact: true }).first()).toBeEnabled();
+    }
+    expect(state.commands).toEqual([]);
+  });
+}
+
+test("Manage reports contains saved history and opens read-only details without selection controls", async ({ page }, info) => {
   const { apiRequests, agentRequests, commands } = await mockUsage(page, { active: true });
   await page.goto("/sync?reports=manage");
   const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
   await expect(modal).toBeVisible();
-  const history = modal.getByRole("region", { name: "Retained official usage snapshots" });
+  const history = modal.getByRole("region", { name: "Saved reports", exact: true });
+  await expect(modal.getByRole("region", { name: "Saved report sets", exact: true })).toContainText("1 saved report set");
   await expect(history).toBeVisible();
   await expect(modal.getByRole("table")).toHaveCount(1);
-  await expect(history.getByRole("columnheader")).toHaveText(["Imported", "Reporting coverage", "Source files", "Status", "Actions"]);
-  await expect(history.getByRole("button", { name: /^Delete retained set for/ })).toBeEnabled();
+  await expect(history.getByRole("columnheader", { name: "Imported", exact: true })).toBeVisible();
+  await expect(history.getByRole("columnheader", { name: "Status", exact: true })).toBeVisible();
+  const remove = history.getByRole("button", { name: /^Delete report set/ });
+  await expect(remove).toBeEnabled();
+  await expect(remove).toHaveClass(/icon-button/);
+  const header = modal.locator(".usage-modal-header");
+  await expect(header.getByRole("button")).toHaveCount(2);
+  await expect(header.getByRole("button", { name: "Add CSV reports", exact: true })).toBeVisible();
+  const close = header.getByRole("button", { name: "Close reports", exact: true });
+  await expect(close).toHaveCount(1);
+  await expect(close).toHaveCSS("width", "44px");
+  await expect(close).toHaveCSS("height", "44px");
+  await expect(modal.getByRole("button", { name: "Close", exact: true })).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: /Make current|Refresh|View current snapshot|Resume import/ })).toHaveCount(0);
+  await expect(modal.getByRole("tab")).toHaveCount(0);
+  await expect(modal.getByRole("group", { name: "Report workflow" })).toHaveCount(0);
+  await expect(modal.getByText("Retention and source accounting", { exact: true })).toHaveCount(0);
+  await expect(modal.getByText("Find an agent across reports", { exact: true })).toHaveCount(0);
+  await expect(history.locator("details")).toHaveCount(0);
   const currentRow = history.getByRole("row").filter({ has: page.getByRole("cell", { name: "Current", exact: true }) });
-  await expect(currentRow.getByRole("button", { name: "View snapshot", exact: true })).toBeEnabled();
-  await expect(modal.getByRole("button", { name: "View current snapshot", exact: true })).toBeEnabled();
-  await expect(page.getByLabel("Official usage history summary")).toBeHidden();
+  await expect(currentRow.getByRole("button", { name: "View report", exact: true })).toBeEnabled();
+  await expect(currentRow).toContainText("310 rows");
+  await expect(currentRow).toContainText(/3 (?:files|reports|CSVs|exports)/);
+  await expect(currentRow).toContainText("Sep 12, 2026");
+  await expect(currentRow).not.toContainText(setId);
+  await expect(currentRow).not.toContainText("111111111111");
+  await expect(page.getByLabel("Official usage history summary")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Report agent rows" })).toHaveCount(0);
   await expect(modal.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
   expect(apiRequests).not.toContain("/api/official-usage/overview");
   expect(apiRequests).not.toContain("/api/official-usage/aggregate");
-  await expect(page.getByText("Aggregate snapshots are non-additive.")).toBeVisible();
+  expect(apiRequests).not.toContain("/api/official-usage/admin");
+  await expect(modal.getByText("Aggregate snapshots are non-additive.")).toHaveCount(0);
   await page.screenshot({ path: info.outputPath("manage-reports.png") });
   if (info.project.name === "mobile") {
     await history.scrollIntoViewIfNeeded();
     await page.screenshot({ path: info.outputPath("manage-reports-history.png") });
   }
-  await history.getByText("3 exports", { exact: true }).click();
-  await expect(history).toContainText("310 rows; 0 duplicate rows reused.");
-  await expect(history).toContainText("Original acceptance");
-  await expect(history).toContainText("content 111111111111");
-  await expect(history).toContainText("Independent cumulative snapshot");
-  await page.getByText("Retention and source accounting", { exact: true }).click();
-  await expect(page.getByLabel("Official usage history summary")).toBeVisible();
-  await page.getByText("Retention and source accounting", { exact: true }).click();
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("report-history.png"), fullPage: true });
-  await currentRow.getByRole("button", { name: "View snapshot", exact: true }).click();
+  await currentRow.getByRole("button", { name: "View report", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/sync\\?reports=snapshot&snapshot=${setId}$`));
   await expect(page.getByRole("region", { name: "Report agent rows" })).toBeVisible();
   expect(agentRequests.at(-1)?.get("setId")).toBe(setId);
   await expect(page.getByRole("dialog")).toHaveCount(1);
+  const details = page.getByRole("dialog", { name: "Report details", exact: true });
+  await expectSnapshotShell(details);
   await page.screenshot({ path: info.outputPath("snapshot-inspection.png") });
   await page.getByRole("button", { name: "Back to reports", exact: true }).click();
   await expect(page).toHaveURL(/\/sync\?reports=manage$/);
   await expect(history).toBeVisible();
   await expect(modal.getByRole("table")).toHaveCount(1);
-  await expect(currentRow).toBeVisible();
-  await modal.getByRole("button", { name: "View current snapshot", exact: true }).click();
-  await expect(page).toHaveURL(/\/sync\?reports=snapshot$/);
-  await expect(page.getByRole("region", { name: "Report agent rows" })).toBeVisible();
-  expect(agentRequests.at(-1)?.has("setId")).toBe(false);
-  await page.getByRole("button", { name: "Back to reports", exact: true }).click();
   await expect(currentRow).toBeVisible();
   expect(commands).toEqual([]);
   expect(apiRequests).not.toContain("/api/official-usage/users");
@@ -847,73 +1442,63 @@ test("keeps retained-set confirmation inside manage reports and refreshes source
   const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
   await expect(modal.getByLabel("Import progress")).toHaveCount(0);
   await expect(modal.getByLabel("Official usage CSV files")).toHaveCount(0);
-  const deleteSet = modal.getByRole("button", { name: /Delete retained set for/ });
+  const deleteSet = modal.getByRole("button", { name: /^Delete report set/ });
   await expect(deleteSet).toBeEnabled();
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
   await deleteSet.click();
-  const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
+  const confirmation = page.getByRole("dialog", { name: "Delete report set?", exact: true });
   await expect(confirmation).toBeVisible();
+  await expect(confirmation.getByRole("button", { name: "Delete report set", exact: true })).toBeEnabled();
   await page.keyboard.press("Escape");
   await expect(confirmation).toHaveCount(0);
   await expect(modal).toBeVisible();
   await expect(deleteSet).toBeFocused();
   await deleteSet.click();
-  await confirmation.getByRole("button", { name: "Confirm", exact: true }).click();
+  await confirmation.getByRole("button", { name: "Delete report set", exact: true }).click();
   await expect(confirmation).toHaveCount(0);
   await expect(modal).toBeVisible();
-  await expect(modal.getByText(/retained set was deleted/)).toBeVisible();
-  await expect(modal.getByRole("heading", { name: "Manage retained reports", exact: true })).toBeFocused();
-  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(modal.getByText(/(?:report|retained).*deleted/i)).toBeVisible();
+  await expect(modal.getByRole("region", { name: "Manage saved reports", exact: true })).toBeFocused();
+  await modal.getByRole("button", { name: "Close reports", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
   await page.goto("/sync?reports=snapshot");
   await expect(page.getByRole("heading", { name: "Selected report deleted", exact: true })).toBeVisible();
 });
 
-for (const leaveManagement of [false, true]) {
-  test(`preserves the user's new focus when a closed deletion finishes ${leaveManagement ? "outside" : "inside"} management`, async ({ page }) => {
-    await mockUsage(page, { active: true });
-    let releaseConfirmation!: () => void;
-    const confirmationGate = new Promise<void>(resolve => { releaseConfirmation = resolve; });
-    await page.route("**/api/official-usage/confirmations/*", async route => {
-      expect(route.request().method()).toBe("POST");
-      await confirmationGate;
-      await route.fallback();
-    });
-    try {
-      await page.goto("/sync?reports=manage");
-      const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
-      await modal.getByRole("button", { name: /Delete retained set for/ }).click();
-      const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
-      const submitted = page.waitForRequest("**/api/official-usage/confirmations/*");
-      await confirmation.getByRole("button", { name: "Confirm", exact: true }).click();
-      await submitted;
-      await expect(confirmation.getByRole("button", { name: "Confirm", exact: true })).toBeDisabled();
-      await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
-      await expect(confirmation).toHaveCount(0);
-      await expect(modal.getByRole("heading", { name: "Manage retained reports", exact: true })).toBeFocused();
-      if (leaveManagement) await modal.getByRole("button", { name: "Close", exact: true }).click();
-      const newControl = leaveManagement
-        ? page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ })
-        : modal.getByRole("button", { name: "Manage reports", exact: true });
-      await newControl.click();
-      await expect(newControl).toBeFocused();
-      const completed = page.waitForResponse("**/api/official-usage/confirmations/*");
-      releaseConfirmation();
-      await completed;
-      if (leaveManagement) {
-        await expect(page).toHaveURL(/\/sync$/);
-        await expect(modal).toBeHidden();
-      } else {
-        await expect(modal.getByText(/retained set was deleted/)).toBeVisible();
-        await expect(modal.getByRole("button", { name: /Delete retained set for/ })).toHaveCount(0);
-      }
-      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-      await expect(newControl).toBeFocused();
-    } finally {
-      releaseConfirmation();
-    }
+test("an in-flight report deletion cannot be dismissed or submitted twice", async ({ page }) => {
+  const state = await mockUsage(page, { active: true });
+  let releaseConfirmation!: () => void;
+  const confirmationGate = new Promise<void>(resolve => { releaseConfirmation = resolve; });
+  await page.route("**/api/official-usage/confirmations/*", async route => {
+    expect(route.request().method()).toBe("POST");
+    await confirmationGate;
+    await route.fallback();
   });
-}
+  try {
+    await page.goto("/sync?reports=manage");
+    const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
+    await modal.getByRole("button", { name: /^Delete report set/ }).click();
+    const confirmation = page.getByRole("dialog", { name: "Delete report set?", exact: true });
+    const submitted = page.waitForRequest("**/api/official-usage/confirmations/*");
+    const remove = confirmation.getByRole("button", { name: "Delete report set", exact: true });
+    await remove.click();
+    await submitted;
+    await expect(remove).toBeDisabled();
+    await expect(confirmation.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(confirmation).toBeVisible();
+    await expect(modal).toBeVisible();
+    releaseConfirmation();
+    await expect(confirmation).toHaveCount(0);
+    await expect(modal.getByText("Report set deleted.", { exact: true })).toBeVisible();
+    await expect(modal.getByRole("button", { name: /^Delete report set/ })).toHaveCount(0);
+    expect(state.confirmations).toHaveLength(1);
+    expect(state.confirmations[0]).toMatchObject({ setId, operation: "delete", expectedRevision: 2 });
+    expect(state.acceptRequests).toEqual([]);
+  } finally {
+    releaseConfirmation();
+  }
+});
 
 test("keeps a failed confirmation's error and dismissal accessible inside the native dialog", async ({ page }) => {
   await mockUsage(page, { active: true });
@@ -922,14 +1507,16 @@ test("keeps a failed confirmation's error and dismissal accessible inside the na
   }));
   await page.goto("/sync?reports=manage");
   const modal = page.getByRole("dialog", { name: "Manage reports", exact: true });
-  const opener = modal.getByRole("button", { name: /Delete retained set for/ });
+  const opener = modal.getByRole("button", { name: /^Delete report set/ });
   await opener.click();
-  const confirmation = page.getByRole("dialog", { name: "Confirm delete", exact: true });
-  await confirmation.getByRole("button", { name: "Confirm", exact: true }).click();
+  const confirmation = page.getByRole("dialog", { name: "Delete report set?", exact: true });
+  await confirmation.getByRole("button", { name: "Delete report set", exact: true }).click();
   await expect(confirmation.getByRole("alert")).toContainText("The reviewed deletion expired.");
   await expect(confirmation.getByRole("button", { name: "Cancel", exact: true })).toBeEnabled();
+  await expect(confirmation.getByRole("button", { name: "Retry", exact: true })).toBeEnabled();
   await page.keyboard.press("Escape");
   await expect(confirmation).toHaveCount(0);
   await expect(opener).toBeFocused();
-  await expect(modal.getByRole("alert")).toContainText("The reviewed deletion expired.");
+  await expect(modal.getByRole("row").filter({ has: page.getByRole("cell", { name: "Current", exact: true }) })).toBeVisible();
+  await expect(opener).toBeEnabled();
 });

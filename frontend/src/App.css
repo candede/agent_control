@@ -1860,38 +1860,6 @@ button.icon-button.danger:hover {
   background: rgba(255, 255, 255, 0.64);
 }
 
-.official-usage-import,
-.official-usage-preview {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  min-width: 0;
-  gap: 16px;
-}
-
-.official-usage-import {
-  padding: 18px 0;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-}
-
-.official-usage-preview {
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-
-.official-usage-preview h3 {
-  margin: 0;
-}
-
-.official-usage-preview table {
-  min-width: 760px;
-}
-
-.official-usage-warnings {
-  margin: 0;
-  padding-left: 18px;
-}
-
 .pagination-controls {
   display: flex;
   align-items: center;

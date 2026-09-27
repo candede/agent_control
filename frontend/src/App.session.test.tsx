@@ -12,6 +12,7 @@ import {
   type AutomaticRefreshResult,
   type CopilotPackage,
   type InventoryRefreshJob,
+  type OfficialUsageHistoryView,
   type PackagePage,
   type PackageMutationPreview,
   type PackageRefreshJob,
@@ -30,6 +31,7 @@ import { createInventoryVerification, createUnifiedVerification } from "./test/i
 import { responsibilityFixture, responsibilityOwnerId } from "./test/agentResponsibilityFixture";
 import { summarizeAgentAvailability } from "../../backend/src/types/agentPresentation";
 import { unifiedAgentInventoryScopes } from "../../backend/src/types/unifiedAgents";
+import { reportHistoryFixture } from "./components/reportHistoryFixture";
 
 mockNativeDialogs();
 
@@ -1016,7 +1018,8 @@ describe("App session revalidation", () => {
         }
       });
       vi.spyOn(savedQueries, "createSavedQueryClient").mockReturnValue(client);
-      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+      const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage(),
+        reportHistory: usage ? reportHistoryFixture() : undefined });
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
       if (detail) {
@@ -1038,7 +1041,8 @@ describe("App session revalidation", () => {
       const before = reads();
       try {
         if (usage) {
-          await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
+          await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
+          await userEvent.click(await screen.findByRole("button", { name: "View report" }));
         } else {
           if (detail) await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
           await userEvent.click(await screen.findByText("View diagnostics"));
@@ -4534,7 +4538,7 @@ describe("App session revalidation", () => {
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
       expect(await screen.findByRole("dialog", { name: "Manage reports" })).toBeVisible();
-      await screen.findByRole("heading", { name: "Report history" });
+      await screen.findByRole("region", { name: "Saved report sets" });
       expect(window.location.pathname).toBe("/sync");
       expect(new URLSearchParams(window.location.search).get("reports")).toBe("manage");
       expect(screen.queryByRole("button", { name: "Official usage" })).not.toBeInTheDocument();
@@ -4551,7 +4555,7 @@ describe("App session revalidation", () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await screen.findByRole("heading", { name: "Report history" });
+    await screen.findByRole("region", { name: "Saved report sets" });
     await act(async () => {
       window.history.pushState({}, "", "/sync?reports=snapshot");
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -4561,7 +4565,7 @@ describe("App session revalidation", () => {
       window.history.pushState({}, "", "/sync?reports=manage");
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    expect(await screen.findByRole("heading", { name: "Report history" })).toBeVisible();
+    expect(await screen.findByRole("region", { name: "Saved report sets" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Close reports" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -4583,7 +4587,7 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Retained snapshot 11111111" })).toBeVisible();
+    expect(await screen.findByRole("dialog", { name: "Report details" })).toBeVisible();
     await waitFor(() => {
       expect(transport.fetchMock.mock.calls.some(([input]) =>
         input.startsWith(`/api/official-usage/aggregate?setId=${reportSetId}&activityWindowDays=365`))).toBe(true);
@@ -4592,7 +4596,7 @@ describe("App session revalidation", () => {
     const officialUsageCalls = transport.fetchMock.mock.calls.filter(([input]) =>
       input.startsWith("/api/official-usage/"));
     expect(officialUsageCalls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
-    expect(screen.getByText("Showing retained set").parentElement).toHaveTextContent(reportSetId);
+    expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
     expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(reportSetId);
     expect(new URLSearchParams(window.location.search).has("window")).toBe(false);
     expect(window.location.pathname).toBe("/sync");
@@ -4620,8 +4624,7 @@ describe("App session revalidation", () => {
     render(<App />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("The retained official usage set is unavailable.");
-    expect(screen.getByText("Retained set unavailable").parentElement).toHaveTextContent(reportSetId);
-    expect(screen.queryByText(/Showing retained set/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     const exactCalls = transport.fetchMock.mock.calls.filter(([input]) =>
       input.includes(`setId=${reportSetId}`));
     expect(exactCalls.some(([input]) => input.startsWith("/api/official-usage/aggregate"))).toBe(true);
@@ -4629,7 +4632,7 @@ describe("App session revalidation", () => {
     expect(exactCalls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
   });
 
-  it.each(["current", "historical"] as const)("hides a superseded %s snapshot summary until the new revision loads", async scope => {
+  it.each(["current", "historical"] as const)("hides a superseded %s snapshot summary until its new activity window loads", async scope => {
     const data = usageAggregateFixture();
     window.history.replaceState({}, "", scope === "current"
       ? "/official-usage?view=snapshot" : `/official-usage?snapshot=${data.activeSet!.id}`);
@@ -4646,7 +4649,12 @@ describe("App session revalidation", () => {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
-    await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
+    await act(async () => {
+      const params = new URLSearchParams(window.location.search);
+      params.set("window", "7");
+      window.history.pushState({}, "", `/sync?${params}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
     await waitFor(() => expect(reads).toBe(2));
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
@@ -4681,7 +4689,7 @@ describe("App session revalidation", () => {
   });
 
   it("keeps report evidence in Sync without duplicating inventory analytics or navigation", async () => {
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const transport = appTransport({ revalidatedRoles: viewer.roles, reportHistory: reportHistoryFixture() });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await screen.findByText(agent.displayName);
@@ -4693,12 +4701,13 @@ describe("App session revalidation", () => {
     expect(screen.queryByRole("button", { name: "Official usage" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(await screen.findByRole("button", { name: "Manage reports" }));
-    expect(await screen.findByRole("heading", { name: "Report history" })).toBeVisible();
+    expect(await screen.findByRole("region", { name: "Saved report sets" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "Retained activity summary" })).not.toBeInTheDocument();
     expect(aggregateReads()).toHaveLength(0);
-    await userEvent.click(screen.getByRole("button", { name: "View current snapshot" }));
+    await userEvent.click(await screen.findByRole("button", { name: "View report" }));
     expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
     expect(aggregateReads()).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
     await userEvent.click(screen.getByRole("button", { name: "Close reports" }));
     await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     await screen.findByText(agent.displayName);
@@ -4707,23 +4716,16 @@ describe("App session revalidation", () => {
     expect(aggregateReads()).toHaveLength(1);
   });
 
-  it("preserves a chosen cumulative date range when inspecting a source snapshot and returning", async () => {
+  it("keeps cross-report agent exploration out of report management", async () => {
     window.history.replaceState({}, "", "/official-usage");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await userEvent.click(await screen.findByText("Find an agent across reports"));
-    await screen.findByRole("region", { name: "Retained agent activity rows" });
-    fireEvent.change(screen.getByLabelText("Observed activity on or after (UTC)"), { target: { value: "2026-06-01" } });
-    fireEvent.change(screen.getByLabelText("Observed activity on or before (UTC)"), { target: { value: "2026-07-15" } });
-    await userEvent.click(await screen.findByRole("button", { name: "View source snapshot for Researcher" }));
-    expect(await screen.findByRole("region", { name: "Report agent rows" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
-    expect(await screen.findByRole("region", { name: "Retained agent activity rows" })).toBeVisible();
-    expect(screen.getByLabelText("Observed activity on or after (UTC)")).toHaveValue("2026-06-01");
-    expect(screen.getByLabelText("Observed activity on or before (UTC)")).toHaveValue("2026-07-15");
-    expect(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/overview")).at(-1)?.[0])
-      .toContain("startDate=2026-06-01&endDate=2026-07-15");
+    await screen.findByRole("region", { name: "Saved report sets" });
+    expect(screen.queryByText("Find an agent across reports")).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Retained agent activity rows" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/overview"))).toHaveLength(0);
   });
 
   it("keeps known inventory dashboard counts when retained reporting is unavailable", async () => {
@@ -4842,26 +4844,26 @@ describe("App session revalidation", () => {
 
   it("loads the cumulative summary on Sync but opens report history only on demand without person-level data", async () => {
     window.history.replaceState({}, "", "/official-usage?view=snapshot");
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const transport = appTransport({ revalidatedRoles: viewer.roles, reportHistory: reportHistoryFixture() });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeEnabled());
     await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input === "/api/official-usage/history?limit=1&offset=0")).toBe(true));
-    expect(screen.queryByRole("heading", { name: "Report history" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Saved report sets" })).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/users"))).toBe(false);
     expect(screen.getByRole("region", { name: "Report agent rows" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
     await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/official-usage/history"))).toBe(true));
     expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Report history" })).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "View current snapshot" }));
+    expect(screen.getByRole("region", { name: "Saved report sets" })).toBeVisible();
+    await userEvent.click(await screen.findByRole("button", { name: "View report" }));
     expect(await screen.findByRole("region", { name: "Report agent rows" })).toBeVisible();
-    expect(screen.queryByRole("heading", { name: "Report history" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Saved report sets" })).not.toBeInTheDocument();
   });
 
   it("ignores a late aggregate when activity returns after visiting report history", async () => {
     window.history.replaceState({}, "", "/official-usage?view=snapshot");
-    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const transport = appTransport({ revalidatedRoles: viewer.roles, reportHistory: reportHistoryFixture() });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
     let reads = 0;
@@ -4878,7 +4880,7 @@ describe("App session revalidation", () => {
     const originalRead = transport.fetchMock.mock.calls.find(([input]) => input.startsWith("/api/official-usage/aggregate?"))!;
     await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
     expect(originalRead[1]?.signal?.aborted).toBe(true);
-    await userEvent.click(screen.getByRole("button", { name: "View current snapshot" }));
+    await userEvent.click(await screen.findByRole("button", { name: "View report" }));
     const rows = await screen.findByRole("region", { name: "Report agent rows" });
     expect(within(rows).getByRole("button", { name: "Researcher" })).toBeVisible();
     const obsolete = usageAggregateFixture();
@@ -4905,12 +4907,11 @@ describe("App session revalidation", () => {
     await screen.findByRole("region", { name: "Report agent rows" });
     await userEvent.click(screen.getByText("Last-activity filters"));
     fireEvent.change(screen.getByLabelText("Agent last activity on or after (UTC)"), { target: { value: "2026-09-12" } });
-    expect(await screen.findByText(/Loading retained set/)).toBeVisible();
+    expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "true");
     const pendingRequest = transport.fetchMock.mock.calls.find(([input]) => new URL(input, "http://localhost").searchParams.has("startDate"))!;
     fireEvent.change(screen.getByLabelText("Agent last activity on or before (UTC)"), { target: { value: "2026-09-01" } });
     expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before the end date");
     expect(pendingRequest[1]?.signal?.aborted).toBe(true);
-    expect(screen.queryByText(/Loading retained set/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Report source rows" })).toHaveAttribute("aria-busy", "false");
     expect(transport.fetchMock.mock.calls.filter(([input]) => input.startsWith("/api/official-usage/aggregate?"))).toHaveLength(2);
     await act(async () => pending.resolve(Response.json(data)));
@@ -5669,6 +5670,7 @@ function appTransport({
   revalidatedUser = viewer,
   unifiedResponse = unifiedPage,
   inventoryReadAuthorized = false,
+  reportHistory,
 }: {
   revalidatedRoles: SessionUser["roles"];
   deferRevalidation?: boolean;
@@ -5677,6 +5679,7 @@ function appTransport({
   revalidatedUser?: SessionUser;
   unifiedResponse?: UnifiedAgentInventoryPage;
   inventoryReadAuthorized?: boolean;
+  reportHistory?: OfficialUsageHistoryView;
 }) {
   let currentUserCalls = 0;
   let resolveRevalidation!: (response: Response) => void;
@@ -5747,7 +5750,7 @@ function appTransport({
       })),
     });
     if (input === "/api/official-usage/admin") return Response.json({ activeSetId: null, activeRevision: 1, sets: [], staging: [] });
-    if (input.startsWith("/api/official-usage/history")) return Response.json({
+    if (input.startsWith("/api/official-usage/history")) return Response.json(reportHistory ?? {
       summary: {
         importCount: 0,
         uniqueObservationCount: 0,

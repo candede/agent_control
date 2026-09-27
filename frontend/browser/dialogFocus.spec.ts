@@ -110,6 +110,40 @@ test("Tab traps a native modal through its own keydown handler", async ({ page }
   await expect(dialog).toBeFocused();
 });
 
+test("CSV import focus stays contained during saving and in the single-action result", async ({ page }) => {
+  await renderDialog(page, `
+    <h2 tabindex="-1">Add CSV reports</h2>
+    <input type="file" hidden multiple aria-label="Official usage CSV files">
+    <button>Choose CSV files</button>
+    <button>Cancel</button>
+  `, "dialog");
+  const dialog = page.getByRole("dialog");
+  const choose = dialog.getByRole("button", { name: "Choose CSV files", exact: true });
+  const cancel = dialog.getByRole("button", { name: "Cancel", exact: true });
+  await choose.focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(choose).toBeFocused();
+  await dialog.getByRole("button").evaluateAll(buttons => {
+    for (const button of buttons) (button as HTMLButtonElement).disabled = true;
+  });
+  await dialog.getByRole("heading").focus();
+  await page.keyboard.press("Tab");
+  await expect(dialog).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog).toBeFocused();
+  await dialog.evaluate(element => {
+    element.innerHTML = '<h2 tabindex="-1">Reports imported</h2><button>OK</button>';
+  });
+  await dialog.getByRole("heading").focus();
+  const ok = dialog.getByRole("button", { name: "OK", exact: true });
+  for (const key of ["Tab", "Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key);
+    await expect(ok).toBeFocused();
+  }
+});
+
 test("Tab retains native disclosure navigation and tracks open state", async ({ page }) => {
   await renderDialog(page, `
     <button>First</button>

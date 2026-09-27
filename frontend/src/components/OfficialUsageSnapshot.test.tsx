@@ -7,7 +7,7 @@ import { OfficialUsageSnapshot } from "./OfficialUsageSnapshot";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
-const props = { activityWindowDays: 30, revision: 0, onBack: vi.fn(), onCurrentSnapshot: vi.fn() };
+const props = { activityWindowDays: 30, revision: 0, onBack: vi.fn() };
 beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(api, "getOfficialUsageAggregate").mockImplementation(async query => {
@@ -19,21 +19,19 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("controlled snapshot inspection", () => {
-  it("loads the exact set and window and retains source details, tenant totals and back/current actions", async () => {
+  it("loads the exact set and window with source details, tenant totals, and one back action", async () => {
     render(<OfficialUsageSnapshot {...props} setId="retained-set" activityWindowDays={7} />);
     expect(screen.getByRole("region", { name: "Snapshot inspection" })).toHaveAttribute("tabindex", "0");
     await screen.findByRole("region", { name: "Report agent rows" });
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledWith(
       expect.objectContaining({ setId: "retained-set", activityWindowDays: 7, limit: 25, offset: 0 }), { signal: expect.any(AbortSignal) });
     expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
-    expect(screen.getByText(/does not change the tenant's current report selection/)).toBeVisible();
+    expect(screen.getByText(/does not change the selected report set/)).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Researcher" }));
     expect(screen.getByRole("region", { name: "Source details for Researcher" })).toBeVisible();
-    expect(screen.getByText("Showing retained set")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Back to reports" }));
-    await userEvent.click(screen.getByRole("button", { name: "View current snapshot" }));
     expect(props.onBack).toHaveBeenCalledOnce();
-    expect(props.onCurrentSnapshot).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /View current snapshot|Refresh snapshot/ })).not.toBeInTheDocument();
   });
 
   it("pages and resets the offset for search, date and sort changes", async () => {
@@ -107,23 +105,21 @@ describe("controlled snapshot inspection", () => {
     expect(signal?.aborted).toBe(true);
   });
 
-  it("discards the old summary on explicit refresh and never substitutes the current set after a retained read fails", async () => {
-    render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
+  it("discards the old summary after a report change and never substitutes the current set after a retained read fails", async () => {
+    const view = render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
     await screen.findByRole("region", { name: "Snapshot tenant totals" });
     let reject!: (failure: Error) => void;
     vi.mocked(api.getOfficialUsageAggregate).mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail; }));
-    await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
-    expect(screen.getByText("Loading retained set")).toBeVisible();
+    view.rerender(<OfficialUsageSnapshot {...props} revision={1} setId="retained-set" />);
+    expect(screen.getByText("Loading official usage...")).toBeVisible();
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     await act(async () => reject(new api.ApiError(404, "not_found", "The retained set was deleted.")));
-    expect(await screen.findByText("Retained set unavailable")).toBeVisible();
-    expect(screen.getByRole("alert")).toHaveTextContent("The retained set was deleted.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("The retained set was deleted.");
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     expect(vi.mocked(api.getOfficialUsageAggregate).mock.calls.every(([query]) => query?.setId === "retained-set")).toBe(true);
-    await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
-    expect(await screen.findByText("Showing retained set")).toBeVisible();
-    expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
+    await userEvent.click(screen.getByRole("button", { name: "Retry report" }));
+    expect(await screen.findByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
   });
 
   it("preserves the same-generation summary on filter failure, but not stale rows or exports", async () => {
@@ -135,10 +131,9 @@ describe("controlled snapshot inspection", () => {
     expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toHaveTextContent("270");
     expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agents CSV" })).toBeDisabled();
-    expect(screen.getByText("Retained set unavailable")).toBeVisible();
   });
 
-  it.each(["refresh", "revision"] as const)("isolates %s from a pre-action read kept alive by a parallel saved observer", async action => {
+  it("isolates revisions from a pre-action read kept alive by a parallel saved observer", async () => {
     const client = createSavedQueryClient();
     const renderSnapshot = (revision: number) => <SavedQueryProvider client={client}>
       <OfficialUsageSnapshot {...props} revision={revision} setId="retained-set" />
@@ -156,8 +151,7 @@ describe("controlled snapshot inspection", () => {
       signal => api.getOfficialUsageAggregate(request, { signal }), lease.signal);
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(2);
     const oldSignal = vi.mocked(api.getOfficialUsageAggregate).mock.calls[1][1]?.signal;
-    if (action === "refresh") await userEvent.click(screen.getByRole("button", { name: "Refresh snapshot" }));
-    else view.rerender(renderSnapshot(1));
+    view.rerender(renderSnapshot(1));
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(3);
     expect(oldSignal?.aborted).toBe(false);
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
@@ -186,8 +180,7 @@ describe("controlled snapshot inspection", () => {
     fireEvent.change(screen.getByLabelText("Agent last activity on or before (UTC)"), { target: { value: "2026-09-01" } });
     expect(signal?.aborted).toBe(true);
     expect(screen.getByRole("alert")).toHaveTextContent("start date must be on or before");
-    expect(screen.getByRole("button", { name: "Refresh snapshot" })).toBeDisabled();
-    expect(screen.queryByText("Loading retained set")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh snapshot" })).not.toBeInTheDocument();
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledTimes(2);
     const obsolete = usageAggregateFixture();
     obsolete.summary.usage.totalResponses = 9999;
@@ -201,8 +194,7 @@ describe("controlled snapshot inspection", () => {
     if (response === "missing") unexpected.activeSet = null;
     vi.mocked(api.getOfficialUsageAggregate).mockResolvedValue(unexpected);
     render(<OfficialUsageSnapshot {...props} setId="retained-set" />);
-    expect(await screen.findByText("Retained set unavailable")).toBeVisible();
-    expect(screen.getByRole("alert")).toHaveTextContent("No current snapshot has been substituted");
+    expect(await screen.findByRole("alert")).toHaveTextContent("No current snapshot has been substituted");
     expect(screen.queryByRole("region", { name: "Snapshot tenant totals" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Report agent rows" })).not.toBeInTheDocument();
     expect(api.getOfficialUsageAggregate).toHaveBeenCalledOnce();

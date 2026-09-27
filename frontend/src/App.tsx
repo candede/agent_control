@@ -1183,6 +1183,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     handleSyncReportRouteChange({ view, activityWindowDays: 30 });
   }
 
+  function finishUsageImport() {
+    handleReportSetSelected(true);
+    navigateToView("agents");
+    requestAnimationFrame(() => document.getElementById("agents-heading")?.focus({ preventScroll: true }));
+  }
+
   function handleDataSyncSourcesChanged(sources: DataSyncSourceId[]) {
     setSyncHistoryRevision(revision => revision + 1);
     const changed = new Set(sources);
@@ -2665,6 +2671,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           canManage={canImportReports}
           revision={officialUsageDashboardRevision}
           onChanged={handleOfficialUsageChanged}
+          onImported={finishUsageImport}
           onLegacyCleared={() => setLegacyUsagePresent(false)}
         />
       ) : null}
@@ -2695,7 +2702,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
           <div className="agent-catalog-heading">
             <div className="agent-catalog-title">
-              <h2>Agents <span>{visibleUnifiedAgentPage?.count.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
+              <h2 id="agents-heading" tabIndex={-1}>Agents <span>{visibleUnifiedAgentPage?.count.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
             </div>
             {canReadSensitiveUsage ? <AgentInventoryScopes
               inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}

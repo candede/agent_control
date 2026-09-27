@@ -1,7 +1,18 @@
 import { readFile } from "node:fs/promises";
-import type { Download } from "@playwright/test";
+import type { Download, Page, TestInfo } from "@playwright/test";
 import { parse } from "csv-parse/sync";
 import { buildBoundedCsv } from "../../backend/src/services/csvExport";
+
+export function csvFilePayloads(files: ReadonlyArray<{ name: string; content: string }>) {
+  return files.map(({ name, content }) => ({ name, mimeType: "text/csv", buffer: Buffer.from(content) }));
+}
+
+export async function captureCsvReportScreenshot(page: Page, info: TestInfo, phase: "upload" | "success" | "management") {
+  const name = `csv-reports-${phase}-${info.project.name}`;
+  const path = info.outputPath(`${name}.png`);
+  await page.getByRole("dialog").screenshot({ path, animations: "disabled" });
+  await info.attach(name, { path, contentType: "image/png" });
+}
 
 export function usageCsvFixture(columns: string[], rows: Array<Record<string, unknown>>) {
   return buildBoundedCsv(columns, rows, {

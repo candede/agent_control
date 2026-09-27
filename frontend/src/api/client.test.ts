@@ -439,6 +439,16 @@ describe("access API client", () => {
     expect(form.get("bundleId")).toBe("bundle-id");
   });
 
+  it("forwards cancellation to the CSV upload transport", async () => {
+    const fetchMock = mockJsonResponse({ id: "staging-id" });
+    const controller = new AbortController();
+    await stageOfficialUsageReport(new File(["report"], "agents.csv"), { bundleId: "bundle-id", rejectDuplicateKind: true }, { signal: controller.signal });
+    const signal = fetchMock.mock.calls[0][1]?.signal;
+    expect(signal?.aborted).toBe(false);
+    controller.abort();
+    expect(signal?.aborted).toBe(true);
+  });
+
   it("preserves explicitly supplied legacy import metadata", async () => {
     const fetchMock = mockJsonResponse({ id: "staging-id" });
     await stageOfficialUsageReport(new File(["report"], "agents.csv"), {

@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
+import { buildOfficialUsageAggregateView } from "../../backend/src/services/officialUsageViews";
 import type { OfficialUsageConfirmation } from "../src/api/client";
 import { reportHistoryFixture } from "../src/components/reportHistoryFixture";
 import { usageInsightsPublished, usageOverviewFixture } from "../src/test/usageInsightsFixture";
@@ -18,6 +19,7 @@ async function mockReportSelection(page: Page) {
   let revision = 1;
   const mutations: string[] = [];
   const overviewScopes: Array<string | null> = [];
+  const snapshotRequests: URLSearchParams[] = [];
   let directoryReads = 0;
   page.on("request", request => {
     if (new URL(request.url()).pathname === "/api/copilot-usage/users") directoryReads++;
@@ -34,7 +36,18 @@ async function mockReportSelection(page: Page) {
     data.summary.usedAgents = selected === first.id ? 2 : 7;
     return route.fulfill({ json: data });
   });
+  await page.route("**/api/official-usage/aggregate?*", route => {
+    const params = new URL(route.request().url()).searchParams;
+    snapshotRequests.push(params);
+    const id = params.get("setId") ?? selected;
+    expect([first.id, second.id]).toContain(id);
+    return route.fulfill({ json: buildOfficialUsageAggregateView({
+      ...usageInsightsPublished, activeRevision: revision, activeSet: id === first.id ? first : second,
+    }, [], { staleAfterDays: 35, limit: Number(params.get("limit") ?? 25), offset: Number(params.get("offset") ?? 0) }) });
+  });
   await page.route("**/api/official-usage/sets/*/preview", route => {
+    expect(route.request().method()).toBe("POST");
+    expect(route.request().postDataJSON()).toEqual({ operation: "select" });
     mutations.push("preview");
     const setId = new URL(route.request().url()).pathname.split("/")[4];
     const preview: OfficialUsageConfirmation = {
@@ -44,12 +57,15 @@ async function mockReportSelection(page: Page) {
     return route.fulfill({ json: preview });
   });
   await page.route("**/api/official-usage/confirmations/*", route => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      operation: "select", activeSetId: selected, expectedRevision: revision, confirmationHash: "a".repeat(64),
+    });
     mutations.push("confirm");
     selected = route.request().postDataJSON().setId;
     revision++;
     return route.fulfill({ json: { activeSetId: selected, activeRevision: revision } });
   });
-  return { unexpected, first, second, mutations, overviewScopes, directoryReads: () => directoryReads };
+  return { unexpected, first, second, mutations, overviewScopes, snapshotRequests, directoryReads: () => directoryReads };
 }
 
 test("report selection updates Agents and Users without navigating away or combining snapshots", async ({ page }, info) => {
@@ -111,6 +127,34 @@ test("switching the shared report clears a pinned historical Users report", asyn
   await selector.getByRole("combobox").selectOption(state.second.id);
   await expect(selector.getByRole("combobox")).toHaveValue(state.second.id);
   await expect(page).toHaveURL(/\/users\?view=activity$/);
+  expect(state.unexpected).toEqual([]);
+});
+
+test("viewing a different saved report never changes the Agents report selection", async ({ page }) => {
+  const state = await mockReportSelection(page);
+  await page.goto("/agents");
+  const selector = page.getByRole("region", { name: "Report set selection" });
+  await selector.getByRole("combobox").selectOption(state.second.id);
+  await expect(selector.getByRole("combobox")).toHaveValue(state.second.id);
+  const navigation = page.getByRole("navigation", { name: "Primary views" });
+  await navigation.getByRole("button", { name: /^Sync/ }).click();
+  await page.getByRole("button", { name: "Manage reports", exact: true }).click();
+  const manager = page.getByRole("dialog", { name: "Manage reports", exact: true });
+  await expect(manager.getByRole("button", { name: /Make current|View current snapshot/ })).toHaveCount(0);
+  await expect(manager.getByRole("combobox", { name: "Report set", exact: true })).toHaveCount(0);
+  const saved = manager.getByRole("row").filter({ has: page.getByRole("cell", { name: "Saved", exact: true }) });
+  await saved.getByRole("button", { name: "View report", exact: true }).click();
+  const details = page.getByRole("dialog", { name: "Report details", exact: true });
+  await expect(details.getByRole("region", { name: "Report agent rows" })).toBeVisible();
+  expect(state.snapshotRequests.at(-1)?.get("setId")).toBe(state.first.id);
+  expect(state.mutations).toEqual(["preview", "confirm"]);
+  await details.getByRole("button", { name: "Back to reports", exact: true }).click();
+  await expect(manager.getByRole("row").filter({ has: page.getByRole("cell", { name: "Current", exact: true }) })).toContainText("Jul 1, 2026");
+  await manager.getByRole("button", { name: "Close reports", exact: true }).click();
+  await navigation.getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(selector.getByRole("combobox")).toHaveValue(state.second.id);
+  await expect(page.getByRole("region", { name: "Agent inventory overview" }).getByText("Reported used agents").locator("..")).toContainText("7");
+  expect(state.mutations).toEqual(["preview", "confirm"]);
   expect(state.unexpected).toEqual([]);
 });
 

@@ -799,13 +799,13 @@ export function stageOfficialUsageReport(file: File, input: {
   sourceAsOf?: string;
   sourceAsOfProvenance?: "source_metadata" | "operator_asserted";
   downloadedAt?: string;
-}) {
+}, options: { signal?: AbortSignal } = {}) {
   const form = new FormData();
   form.append("file", file);
   for (const [key, value] of Object.entries(input)) {
     if (value !== undefined) form.append(key, String(value));
   }
-  return request<OfficialUsageStagingPreview>("/api/official-usage/staging", { method: "POST", body: form });
+  return request<OfficialUsageStagingPreview>("/api/official-usage/staging", { method: "POST", body: form, signal: options.signal });
 }
 
 export function discardOfficialUsageStaging(id: string) {

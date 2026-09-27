@@ -1,38 +1,28 @@
 import { useEffect, useState } from "react";
-import { RefreshCw, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import {
   ApiError,
   getOfficialUsageHistory,
   type OfficialUsageHistoryBundleSummary,
   type OfficialUsageHistoryView,
-  type OfficialUsageReportKind,
 } from "../api/client";
 import { useSavedRead } from "../savedQueries";
+import { reportDates } from "./officialUsageImportPresentation";
+import { formatSyncInstant } from "./syncPresentation";
 import "./officialUsage.css";
 
 const pageSize = 25;
 
 export type ReportHistoryAdminControls = {
-  verified: boolean;
   busy: boolean;
-  onResume: (bundleId: string) => void;
-  onOperation: (setId: string, operation: "select" | "delete") => void;
+  onDelete: (report: OfficialUsageHistoryBundleSummary) => void;
+  onResume?: (bundleId: string) => void;
 };
 
-export function OfficialUsageHistoryPanel({
-  revision,
-  selectedSetId,
-  onSelect,
-  admin,
-  onRefresh,
-  onVerificationChange,
-}: {
+export function OfficialUsageHistoryPanel({ revision, onSelect, admin }: {
   revision: number;
-  selectedSetId?: string;
-  onSelect?: (setId: string | undefined) => void;
+  onSelect?: (setId: string) => void;
   admin?: ReportHistoryAdminControls;
-  onRefresh?: () => void;
-  onVerificationChange?: (verified: boolean) => void;
 }) {
   const [history, setHistory] = useState<OfficialUsageHistoryView>();
   const [offset, setOffset] = useState(0);
@@ -45,9 +35,6 @@ export function OfficialUsageHistoryPanel({
   const error = scopedRead?.error;
   const displayedHistory = history?.bundles.offset === offset ? history : undefined;
   const verified = !loading && !error && Boolean(displayedHistory);
-  const mutationsDisabled = !verified || !admin?.verified || admin.busy;
-
-  useEffect(() => { onVerificationChange?.(verified); }, [onVerificationChange, verified]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -65,210 +52,71 @@ export function OfficialUsageHistoryPanel({
       .catch(reason => {
         if (controller.signal.aborted || (reason instanceof ApiError && reason.kind === "aborted")) return;
         if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) setHistory(undefined);
-        setRead({ key: readKey, error: reason instanceof Error ? reason.message : "Official usage history is unavailable." });
+        setRead({ key: readKey, error: reason instanceof Error ? reason.message : "Reports could not be loaded." });
       });
     return () => controller.abort();
   }, [offset, readKey, readSaved, reload, revision]);
 
-  const selected = selectedSetId
-    ? displayedHistory?.bundles.value.find(bundle => bundle.id === selectedSetId)
-    : undefined;
-  const first = displayedHistory?.bundles.count ? displayedHistory.bundles.offset + 1 : 0;
-  const last = displayedHistory ? Math.min(displayedHistory.bundles.offset + displayedHistory.bundles.value.length, displayedHistory.bundles.count) : 0;
+  useEffect(() => {
+    const refresh = () => { if (!admin?.busy) setReload(value => value + 1); };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [admin?.busy]);
 
-  return (
-    <section className="official-usage-history-panel" aria-labelledby="official-usage-history-title" aria-busy={loading}>
-      <header className="report-section-header">
-        <div>
-          <h3 id="official-usage-history-title">Report history</h3>
-          <p>Open a retained snapshot without changing the tenant&apos;s current report selection.</p>
-        </div>
-        <div className="table-actions">
-        {onSelect ? <button type="button" className="secondary" onClick={() => onSelect(undefined)}>View current snapshot</button> : null}
-        <button type="button" className="secondary" disabled={loading || admin?.busy} onClick={() => { setReload(value => value + 1); onRefresh?.(); }}>
-          <RefreshCw size={15} aria-hidden="true" />Refresh history
-        </button>
-        </div>
-      </header>
+  const first = displayedHistory?.bundles.count ? offset + 1 : 0;
+  const last = displayedHistory ? Math.min(offset + displayedHistory.bundles.value.length, displayedHistory.bundles.count) : 0;
+  const disabled = !verified || admin?.busy;
 
-      {selectedSetId ? (
-        <div className="usage-history-selection" role="status">
-          <div>
-            <strong>Viewing retained snapshot {selectedSetId.slice(0, 8)}</strong>
-            <span>
-              {selected ? windowLabel(selected) : "The selected snapshot is outside this history page."}
-              {" "}This read-only view does not change the active snapshot.
-            </span>
-          </div>
-          {onSelect ? <button type="button" className="secondary" onClick={() => onSelect(undefined)}>Return to current snapshot</button> : null}
-        </div>
-      ) : null}
-
-      {error ? <div className="error-banner" role="alert">{error}{displayedHistory ? <p>Showing the last loaded history. Refresh successfully before opening another snapshot.</p> : null}</div> : null}
-      {admin && !admin.verified ? <p className="usage-context-warning">Report administration is not verified. Refresh successfully before changing the saved selection, resuming, or deleting reports.</p> : null}
-      {loading ? <p role="status">{displayedHistory
-        ? "Showing the last loaded history while refreshing. Snapshot actions are unavailable until the refresh succeeds."
-        : "Loading retained official usage snapshots..."}</p> : null}
-      {displayedHistory ? (
-        <>
-          <div className="usage-history-warning" role="note">
-            <strong>Aggregate snapshots are non-additive.</strong>
-            <span>{displayedHistory.summary.warning.message}</span>
-          </div>
-          <p className="usage-result-summary">{displayedHistory.bundles.count.toLocaleString()} retained snapshots. Each row opens one report, not a cumulative total.</p>
-          {displayedHistory.bundles.value.length ? (
-            <div className="table-shell usage-history-table" role="region" aria-label="Retained official usage snapshots" tabIndex={0}>
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Imported</th>
-                    <th scope="col">Reporting coverage</th>
-                    <th scope="col">Source files</th>
-                    <th scope="col">Status</th>
-                    <th scope="col">{admin ? "Actions" : "View"}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayedHistory.bundles.value.map(bundle => (
-                    <tr key={bundle.id}>
-                      <td>{bundle.acceptedAt ? formatInstant(bundle.acceptedAt) : "Incomplete"}</td>
-                      <td>
-                        {windowLabel(bundle)}
-                        <small>{windowBasis(bundle)}</small>
-                      </td>
-                      <td>
-                        <details>
-                          <summary>{bundle.kinds.length} exports</summary>
-                          <p>{bundle.kinds.map(kindLabel).join(", ")}. {bundle.rowCount.toLocaleString()} rows; {bundle.repeatedRowsReused.toLocaleString()} duplicate rows reused.</p>
-                          <p>{bundleLineage(bundle)}. {bundleRetention(bundle)}.</p>
-                          <p>Snapshot {bundle.id}; bundle {bundle.bundleId}; content hash {bundle.contentHash ?? "Not recorded"}.</p>
-                          <ul className="usage-history-observations">
-                            {bundle.observations.map(observation => (
-                              <li key={observation.versionId}>
-                                <strong>{kindLabel(observation.kind)}</strong>: {observation.rowCount.toLocaleString()} rows,{" "}
-                                {observation.uniquePayloadCount.toLocaleString()} unique payloads,{" "}
-                                {observation.repeatedRowsReused.toLocaleString()} duplicate rows reused
-                                <small>
-                                  Original acceptance {formatInstant(observation.lineage.acceptedAt)} · content {observation.contentHash}
-                                  {observation.lineage.supersedesVersionId
-                                    ? ` · corrects observation ${observation.lineage.supersedesVersionId.slice(0, 8)}`
-                                    : ""}
-                                </small>
-                                <small>File hash {observation.lineage.fileHash} · schema {observation.lineage.schemaVersion} / parser {observation.lineage.parserVersion}</small>
-                                {observation.lineage.warnings.length ? <ul>{observation.lineage.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul> : null}
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
-                      </td>
-                      <td>
-                        <strong>{bundleStatus(bundle)}</strong>
-                      </td>
-                      <td><div className="table-actions">
-                        {selectedSetId === bundle.id ? (
-                          <span className="usage-state">Viewing</span>
-                        ) : bundle.complete && !bundle.deletedAt && onSelect ? (
-                          <button type="button" className="secondary" disabled={!verified || admin?.busy} onClick={() => onSelect(bundle.id)}>
-                            View snapshot
-                          </button>
-                        ) : <span>Unavailable</span>}
-                        {admin && !bundle.deletedAt ? <>
-                          {!bundle.complete ? <button type="button" className="secondary" disabled={mutationsDisabled} onClick={() => admin.onResume(bundle.bundleId)}>Resume</button> : null}
-                          {bundle.complete && !bundle.isActive ? <button type="button" className="secondary" disabled={mutationsDisabled} onClick={() => admin.onOperation(bundle.id, "select")}>Make current</button> : null}
-                          <button type="button" className="icon-button danger" aria-label={`Delete retained set for ${windowLabel(bundle)}`}
-                            disabled={mutationsDisabled} onClick={() => admin.onOperation(bundle.id, "delete")}><Trash2 size={16} aria-hidden="true" /></button>
-                        </> : null}
-                      </div></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : <p>No accepted official usage snapshots are retained.</p>}
-
-          {displayedHistory.bundles.count > pageSize ? (
-            <nav className="table-pagination" aria-label="Official usage history pages">
-              <button type="button" className="secondary" disabled={offset === 0 || loading} onClick={() => setOffset(value => Math.max(0, value - pageSize))}>Previous</button>
-              <span>{first}-{last} of {displayedHistory.bundles.count.toLocaleString()}</span>
-              <button type="button" className="secondary" disabled={last >= displayedHistory.bundles.count || loading} onClick={() => setOffset(value => value + pageSize)}>Next</button>
-            </nav>
-          ) : null}
-          <details className="usage-report-details">
-            <summary>Retention and source accounting</summary>
-            <div className="usage-history-metrics" aria-label="Official usage history summary">
-              <HistoryMetric label="Accepted imports" value={displayedHistory.summary.importCount} />
-              <HistoryMetric label="Report observations" value={displayedHistory.summary.uniqueObservationCount} />
-              <HistoryMetric label="Observed rows" value={displayedHistory.summary.observationRowCount} />
-              <HistoryMetric label="Unique payloads" value={displayedHistory.summary.uniquePayloadCount} />
-              <HistoryMetric label="Duplicate rows reused" value={displayedHistory.summary.repeatedRowsReused} />
-            </div>
-            <p>{displayedHistory.summary.reportingWindows.knownCount} source window(s) known;{" "}
-              {displayedHistory.summary.reportingWindows.unknownCount} unknown;{" "}
-              {displayedHistory.summary.reportingWindows.overlappingKnownWindowCount} overlapping known window(s).</p>
-            <p>{activityRangeLabel(displayedHistory)}</p>
-            <p>Semantic duplicate observations reuse their original identity and acceptance time; they do not refresh historical acceptance dates.</p>
-            <p>Pseudonymous usernames remain scoped to each retained report set and are not assumed to identify the same person across snapshots.</p>
-          </details>
-        </>
-      ) : null}
-      {!displayedHistory && !loading && error && offset > 0 ? <button type="button" className="secondary" onClick={() => setOffset(0)}>First history page</button> : null}
-    </section>
-  );
-}
-
-function HistoryMetric({ label, value }: { label: string; value: number }) {
-  return <div><span>{label}</span><strong>{value.toLocaleString()}</strong></div>;
-}
-
-function activityRangeLabel(history: OfficialUsageHistoryView) {
-  const { earliestDateUtc, latestDateUtc } = history.summary.activityDateRange;
-  if (!earliestDateUtc || !latestDateUtc) return "No last-activity date range has been observed.";
-  return `Observed last-activity dates span ${formatDate(earliestDateUtc)} to ${formatDate(latestDateUtc)}. This does not prove report-window coverage.`;
-}
-
-function windowLabel(bundle: OfficialUsageHistoryBundleSummary) {
-  const { startDate, endDate } = bundle.reportingPeriod;
-  if (bundle.reportingWindowKnown && startDate && endDate) return `${formatDate(startDate)} to ${formatDate(endDate)}`;
-  if (startDate && endDate) return `Observed activity ${formatDate(startDate)} to ${formatDate(endDate)}`;
-  return "Reporting window unknown";
-}
-
-function windowBasis(bundle: OfficialUsageHistoryBundleSummary) {
-  if (!bundle.reportingWindowKnown) return "Last-activity range only; not proven report coverage";
-  return bundle.reportingPeriod.provenance === "source_metadata"
-    ? "Source-supplied reporting window"
-    : "Administrator-supplied reporting window";
-}
-
-function bundleStatus(bundle: OfficialUsageHistoryBundleSummary) {
-  if (bundle.deletedAt) return "Deleted";
-  if (bundle.isActive) return "Current";
-  if (!bundle.complete) return "Incomplete";
-  return "Retained";
-}
-
-function bundleLineage(bundle: OfficialUsageHistoryBundleSummary) {
-  return bundle.supersedesSetId
-    ? `Intentional correction of ${bundle.supersedesSetId.slice(0, 8)}`
-    : "Independent cumulative snapshot";
-}
-
-function bundleRetention(bundle: OfficialUsageHistoryBundleSummary) {
-  if (bundle.deletedAt) return `Deleted ${formatInstant(bundle.deletedAt)}`;
-  if (!bundle.expiresAt) return "Retained until explicitly deleted";
-  const expiresAt = new Date(bundle.expiresAt);
-  if (Number.isNaN(expiresAt.getTime())) return "Retention date unavailable";
-  return `Legacy retention timestamp ${formatInstant(bundle.expiresAt)}; accepted history remains retained until explicitly deleted`;
-}
-
-function kindLabel(kind: OfficialUsageReportKind) {
-  return kind === "agents" ? "Agents" : kind === "userAgents" ? "Users & agents" : "Users";
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(new Date(value));
-}
-
-function formatInstant(value: string) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+  return <section className="official-usage-history-panel" aria-label="Saved report sets" aria-busy={loading}>
+    {error ? <div className="error-banner" role="alert">
+      <p>{error}</p>
+      {displayedHistory ? <p>The list below could not be updated.</p> : null}
+      <button type="button" className="secondary" disabled={admin?.busy} onClick={() => setReload(value => value + 1)}>Retry</button>
+    </div> : null}
+    {loading ? <p role="status">Loading reports...</p> : null}
+    {displayedHistory ? <>
+      <p className="usage-history-count">{displayedHistory.bundles.count.toLocaleString()} saved report {displayedHistory.bundles.count === 1 ? "set" : "sets"}</p>
+      {displayedHistory.bundles.value.length ? <div className="table-shell usage-history-table" role="region" aria-label="Saved reports" tabIndex={0}>
+        <table role="table">
+          <thead><tr>
+            <th scope="col">Imported</th>
+            <th scope="col">Activity dates</th>
+            <th scope="col">Reports</th>
+            <th scope="col">Status</th>
+            <th scope="col"><span className="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody>{displayedHistory.bundles.value.map(bundle => <tr key={bundle.id}>
+            <td><span className="usage-mobile-label" aria-hidden="true">Imported</span>
+              {bundle.acceptedAt ? <time dateTime={bundle.acceptedAt}>{formatSyncInstant(bundle.acceptedAt)}</time> : "Not finished"}</td>
+            <td><span className="usage-mobile-label" aria-hidden="true">Activity dates</span>
+              {reportDates(bundle)}<small>{bundle.reportingWindowKnown ? "Reporting period" : "Observed activity"}</small></td>
+            <td><span className="usage-mobile-label" aria-hidden="true">Reports</span>
+              {bundle.kinds.length} CSVs<small>{bundle.rowCount.toLocaleString()} rows</small></td>
+            <td><span className="usage-mobile-label" aria-hidden="true">Status</span>
+              <span className={`usage-report-badge${bundle.isActive && !bundle.deletedAt ? " is-current" : ""}`}>
+              {bundle.deletedAt ? "Deleted" : !bundle.complete ? "Incomplete" : bundle.isActive ? "Current" : "Saved"}
+            </span></td>
+            <td><div className="table-actions">
+              {bundle.complete && !bundle.deletedAt && onSelect ? <button type="button" className="secondary"
+                disabled={disabled} onClick={() => onSelect(bundle.id)}>View report</button> : null}
+              {!bundle.complete && !bundle.deletedAt && admin?.onResume ? <button type="button" className="secondary"
+                disabled={disabled} onClick={() => admin.onResume?.(bundle.bundleId)}>Continue import</button> : null}
+              {admin && !bundle.deletedAt ? <button type="button" className="icon-button danger"
+                aria-label={`Delete report set: ${reportDates(bundle)}`} disabled={disabled}
+                onClick={() => admin.onDelete(bundle)}><Trash2 size={16} aria-hidden="true" /></button> : null}
+            </div></td>
+          </tr>)}</tbody>
+        </table>
+      </div> : <div className="usage-empty-state"><h3>No reports yet</h3><p>Add the three Microsoft 365 CSV exports to see agent usage.</p></div>}
+      {displayedHistory.bundles.count > pageSize ? <nav className="table-pagination" aria-label="Report history pages">
+        <button type="button" className="secondary" disabled={offset === 0 || loading || admin?.busy}
+          onClick={() => setOffset(value => Math.max(0, value - pageSize))}>Previous</button>
+        <span>{first}-{last} of {displayedHistory.bundles.count.toLocaleString()}</span>
+        <button type="button" className="secondary" disabled={last >= displayedHistory.bundles.count || loading || admin?.busy}
+          onClick={() => setOffset(value => value + pageSize)}>Next</button>
+      </nav> : null}
+      {displayedHistory.bundles.count ? <p className="usage-import-hint">Switch report sets in Agents to explore usage. Activity dates do not imply continuous coverage.</p> : null}
+    </> : null}
+    {!displayedHistory && !loading && error && offset > 0 ? <button type="button" className="secondary" onClick={() => setOffset(0)}>First page</button> : null}
+  </section>;
 }
