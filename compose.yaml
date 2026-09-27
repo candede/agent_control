@@ -38,6 +38,7 @@ services:
   test-postgres:
     profiles: [test-db]
     image: postgres:17-bookworm
+    command: [postgres, -c, shared_buffers=32MB, -c, min_wal_size=32MB, -c, max_wal_size=64MB]
     network_mode: none
     cpus: 0.5
     mem_limit: 512m

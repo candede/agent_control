@@ -198,6 +198,18 @@ describe.sequential("Data sync repository", () => {
     expect((await repository.getDirectorySource({ ...owner, principalId: "other-reader" })).value).toBeNull();
   });
 
+  it.each([0, 1, 2, 501])("measures the exact unencoded JSONB bytes in bounded batches for %i users", async count => {
+    const users = Array.from({ length: count }, (_, index) => {
+      const user = directoryUser(`person${index}@example.com`);
+      user.identity.department = 'Caf\u00e9 "Engineering"\n\\Support';
+      return user;
+    });
+    const whole = await fixture.runtime.query<{ bytes: number }>(
+      "SELECT octet_length($1::jsonb::text) AS bytes", [JSON.stringify({ serviceEvidenceVersion: 1, users })],
+    );
+    expect(await measureUnencodedDirectoryBytes(users)).toBe(whole.rows[0].bytes);
+  });
+
   it("persists and reloads all 30,001 paid-license users with all three paid features within the snapshot byte bound", async () => {
     const owner = { ...scope, principalId: "large-paid-license-roster" };
     const servicePlans = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
@@ -215,10 +227,7 @@ describe.sequential("Data sync repository", () => {
     const bytes = Buffer.byteLength(original);
     expect(bytes).toBeGreaterThan(30 * 1024 * 1024);
     expect(bytes).toBeLessThan(32 * 1024 * 1024);
-    const unencoded = await fixture.runtime.query<{ bytes: number }>(
-      "SELECT octet_length($1::jsonb::text) AS bytes", [original],
-    );
-    expect(unencoded.rows[0].bytes).toBeGreaterThan(32 * 1024 * 1024);
+    expect(await measureUnencodedDirectoryBytes(users)).toBeGreaterThan(32 * 1024 * 1024);
     await repository.publishDirectory(owner, users, new Date().toISOString(), "Saved all matching paid-license users.");
 
     const saved = await new DataSyncRepository(fixture.runtime).getDirectorySource(owner);
@@ -398,6 +407,23 @@ describe.sequential("Data sync repository", () => {
     expect((await repository.listRuns(retryScope)).map(run => run.id)).toEqual([newer.run.id, older.run.id]);
   });
 });
+
+async function measureUnencodedDirectoryBytes(users: readonly CopilotDirectoryUser[]) {
+  const query = "SELECT octet_length($1::jsonb::text) AS bytes";
+  const empty = await fixture.runtime.query<{ bytes: number }>(
+    query, [JSON.stringify({ serviceEvidenceVersion: 1, users: [] })],
+  );
+  let bytes = empty.rows[0].bytes;
+  // Parsing the full legacy roster exhausts the 512 MiB PostgreSQL fixture.
+  for (let offset = 0; offset < users.length; offset += 500) {
+    const batch = await fixture.runtime.query<{ bytes: number }>(
+      query, [JSON.stringify(users.slice(offset, offset + 500))],
+    );
+    // The empty envelope owns the brackets; JSONB separates array entries with ", ".
+    bytes += batch.rows[0].bytes - 2 + (offset === 0 ? 0 : 2);
+  }
+  return bytes;
+}
 
 function directoryUser(userPrincipalName: string): CopilotDirectoryUser {
   return {
