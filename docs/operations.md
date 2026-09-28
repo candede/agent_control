@@ -340,6 +340,47 @@ Reset destroys that project's containers, volume and local state, including secr
 
 Follow the six-name/five-runtime-consumer contract in `docs/deployment-setup.md`. Before expiry, obtain separate administrator approval and a maintenance window. Add new secret versions directly in the prepared vault, preview references/role assignments, stop admissions and drain/reconcile jobs, back up, update native versioned references, use the administrator password only for short-lived bootstrap/migration input, remove that input, restart and verify least privilege. A session-secret replacement invalidates all sessions. A database-password replacement must coordinate the fixed `agentcontrol_admin` and `agentcontrol_app` PostgreSQL roles with their prepared vault versions; no managed-identity/password fallback exists. The Azure deployment wizard never writes or silently rotates a vault value.
 
+## Validation
+
+Run the full software gate without a configured tenant or running application:
+
+```powershell
+. ./scripts/local-deployment.ps1
+$context = New-LocalContext -Root $PWD.Path -Project agent-control-phase01
+Invoke-LocalDeployment $context 'Test'
+```
+
+This runs backend/frontend tests, backend type checking, frontend lint, and the production build in an isolated container environment. Every local `start` runs the same checks. See [operator-only helpers](#operator-only-local-helpers) for fixture isolation and cleanup.
+
+Check the deployment script contracts separately:
+
+```powershell
+pwsh -NoProfile -File ./scripts/local-deployment.tests.ps1
+```
+
+For an existing local installation, run the runtime and persistence checks with its project name:
+
+```powershell
+pwsh -NoProfile -File ./scripts/restart-runtime.tests.ps1 -Project agent-control-phase01
+pwsh -NoProfile -File ./scripts/persistence.tests.ps1 -Project agent-control-phase01
+```
+
+These checks use synthetic databases on the project's PostgreSQL service. Run them serially and check cleanup results before continuing.
+
+### Permission Center qualification
+
+With the local project's PostgreSQL service running:
+
+```powershell
+pwsh -NoProfile -File ./scripts/permission-browser.tests.ps1 -Project agent-control-phase01
+```
+
+The script builds a disposable browser-test container with the built React app, Express API, isolated PostgreSQL databases, Chromium, and axe. Auth and Microsoft providers are mocked; the tests do not call live providers. It covers desktop/mobile layouts, keyboard interaction, access controls, and accessibility. Screenshots and the JSON report are saved under `artifacts/phase03/`.
+
+Normal completion or test failure removes the fixture container and databases. After a hard interruption, inspect the exact test database names printed by that run and remove only those fixtures. Keep the application database and project secrets.
+
+For focused component checks, use [the frontend Vitest suite](../frontend/vitest.config.ts) in the test image. Permission tests include [PermissionCenter.test.tsx](../frontend/src/components/PermissionCenter.test.tsx); the full suite is included in the software gate above.
+
 ## Release, scanners and load
 
 The repeatable preproduction checks are:

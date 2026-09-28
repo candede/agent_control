@@ -104,8 +104,6 @@ function PermissionCenterContent() {
   const issues = permissionIssues(views, now, awaitingInitialCheck);
   const selected = issues.find(issue => issue.view.definition.id === selectedId);
   if (selectedId && !selected) setSelectedId(undefined);
-  const role = hasRole(user, "AgentControl.Admin") ? "App administrator" : canCheckPermissions ? "App viewer" : "App role required";
-
   return <section className="permission-center" aria-labelledby="permissions-title" aria-busy={loading || pending}>
     <header className="permission-heading">
       <div className="permission-page-icon"><ShieldCheck size={24} aria-hidden="true" /></div>
@@ -114,7 +112,6 @@ function PermissionCenterContent() {
         <p>Setup and troubleshooting for {user?.displayName || "your account"}.</p>
       </div>
       <div className="permission-actions">
-        <span className="permission-setup-tag">{role}</span>
         <button type="button" className="secondary" disabled={!canCheckPermissions || loading || pending} onClick={() => void reload()}>
           {loading || pending ? <LoaderCircle className="permission-spinner" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}
           {loading || pending ? "Checking..." : "Check status"}

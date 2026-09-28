@@ -60,7 +60,7 @@ test.afterEach(async ({ page }) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
-test("signed-in user role guide separates task roles from registered-app permissions", async ({ page }, info) => {
+test("signed-in user role guide maps actions to Microsoft access without app-role clutter", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   const commands: string[] = [];
   page.on("request", request => {
@@ -72,24 +72,25 @@ test("signed-in user role guide separates task roles from registered-app permiss
   await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
   const guide = page.getByRole("region", { name: "Signed-in user roles", exact: true });
   await expect(guide).toBeVisible();
-  await expect(guide.getByRole("article", { name: "Block or unblock Microsoft 365 agents", exact: true })).toContainText("AgentControl.Admin");
+  await expect(guide.getByRole("article", { name: "Refresh Microsoft 365 agent inventory", exact: true })).toContainText("CopilotPackages.Read.All");
+  const controls = guide.getByRole("article", { name: "Block, unblock or change agent access", exact: true });
+  await expect(controls).toContainText("CopilotPackages.ReadWrite.All");
+  await expect(controls).toContainText("Entra role: not specified by the package API.");
   await expect(guide.getByRole("article", { name: "Sync users and Copilot licenses", exact: true })).toContainText("Directory Readers");
-  await expect(guide.getByRole("article", { name: "Download usage CSVs from Microsoft 365", exact: true })).toContainText("Reports Reader");
-  await expect(guide.getByRole("article", { name: "Quarantine or restore Copilot Studio agents", exact: true })).toContainText("AI Administrator");
+  await expect(guide.getByRole("article", { name: "Download usage CSVs for import", exact: true })).toContainText("Reports Reader");
+  await expect(guide.getByRole("article", { name: "Check quarantine status, quarantine or restore Studio agents", exact: true })).toContainText("AI Administrator");
   await expect(guide.getByRole("article", { name: "Search Purview audit for a user", exact: true })).toContainText("Audit Reader");
+  await expect(guide).not.toContainText(/AgentControl\.|In Agent Control|documentation reviewed|certify/i);
+  await expect(guide.getByRole("article")).toHaveCount(11);
+  expect((await guide.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(600);
   await expect(guide.locator("details")).toHaveCount(0);
-  for (const link of await guide.getByRole("navigation", { name: "User role topics" }).getByRole("link").all()) {
-    const target = await link.getAttribute("href");
-    expect(target).toMatch(/^#user-roles-/);
-    await link.click();
-    await expect(page.locator(target!)).toBeInViewport();
-  }
+  await expect(guide.getByRole("navigation")).toHaveCount(0);
   expect(await guide.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".permission-user-roles").analyze()).violations).toEqual([]);
   await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
   await page.screenshot({ path: info.outputPath("signed-in-user-roles.png") });
-  await sections.getByRole("link", { name: "App API permissions", exact: true }).click();
+  await guide.getByRole("link", { name: "App API permissions", exact: true }).click();
   await expect(page.getByRole("heading", { name: "App prerequisites", exact: true })).toBeInViewport();
   await expect(page.getByRole("region", { name: "App prerequisites", exact: true }).getByText("Required API permissions", { exact: true })).toBeVisible();
   expect(commands).toEqual([]);
@@ -259,7 +260,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
   await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
   await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions and setup");
   await expect(page.getByRole("region", { name: "Issues", exact: true }).getByRole("status")).toHaveText("No issues reported.");
-  await expect(page.getByText("App administrator", { exact: true })).toBeVisible();
+  await expect(page.getByText("App administrator", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
   const packageIssue = page.locator(".permission-issue-list > li").filter({ hasText: "Package blocking" });
   await expect(packageIssue).toHaveCount(0);
@@ -471,7 +472,7 @@ for (const [status, message] of [
     page.on("pageerror", error => errors.push(error.message));
     const roleDenied = status === "missing_internal_role";
     await login(page, roleDenied ? "role-Viewer" : status);
-    await expect(page.getByText(roleDenied ? "App viewer" : "App administrator", { exact: true })).toBeVisible();
+    await expect(page.getByText(/App viewer|App administrator/, { exact: true })).toHaveCount(0);
     const issues = page.getByRole("region", { name: "Issues", exact: true });
     if (message) {
       for (const [name, permission, audience] of [

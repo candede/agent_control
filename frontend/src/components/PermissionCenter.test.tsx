@@ -36,17 +36,17 @@ async function openRequirements() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); window.history.replaceState({}, "", "/"); });
 
 describe("Permissions setup and issues", () => {
-  it("documents human roles separately without treating app roles as Microsoft role assignments", () => {
+  it("keeps the user guide focused on Microsoft roles, even without an app-role assignment", () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     render(<Page value={{ ...context([]), user: { ...user, roles: [] } }} />);
     const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
-    expect(guide.getByText(/not the API permissions on the app registration/)).toBeVisible();
-    expect(guide.getByText(/Admin includes Viewer; neither grants a Microsoft administrator role/)).toBeVisible();
-    expect(guide.getByText(/it does not enumerate or certify all of your Microsoft role assignments/)).toBeVisible();
-    expect(within(guide.getByRole("article", { name: "View, filter and export saved data" })).getByText("AgentControl.Viewer or AgentControl.Admin")).toBeVisible();
-    expect(within(guide.getByRole("article", { name: "Import and manage usage reports" })).getByText("AgentControl.Admin")).toBeVisible();
-    expect(guide.getByText(/activate it in My roles before the task/)).toBeVisible();
+    expect(guide.getByText(/Microsoft roles for actions you run with your signed-in account/)).toBeVisible();
+    expect(guide.getByRole("link", { name: "App API permissions" })).toHaveAttribute("href", "#app-prerequisites-title");
+    expect(guide.queryByText(/AgentControl\.|In Agent Control|Enterprise application|does not verify|documentation reviewed|certify/i)).not.toBeInTheDocument();
+    expect(guide.queryByRole("article", { name: /saved data|Import and manage|application access|read jobs/i })).not.toBeInTheDocument();
+    expect(guide.getByRole("link", { name: "Activate your role" })).toBeVisible();
+    expect(screen.queryByText("App administrator", { exact: true })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
     expect(screen.getByRole("region", { name: "Issues" })).toHaveTextContent("Ask an administrator to assign");
     expect(screen.getByRole("navigation", { name: "Permissions sections" })).toHaveTextContent("Signed-in user roles");
@@ -54,44 +54,56 @@ describe("Permissions setup and issues", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("covers agent controls, directory reads, report downloads and service-specific log roles", () => {
+  it("maps app actions to Microsoft roles and the documented package API permissions", () => {
     render(<Page value={context([])} />);
     const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
     const task = (name: string) => guide.getByRole("article", { name });
-    expect(task("Block or unblock Microsoft 365 agents")).toHaveTextContent("AgentControl.Admin");
-    expect(task("Block or unblock Microsoft 365 agents")).toHaveTextContent("does not name an additional Entra role");
-    expect(task("Change agent availability and installation assignments")).toHaveTextContent("AgentControl.Admin");
-    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("AI Reader for agents/environments");
-    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("REST API does not publish a separate human-role minimum");
-    expect(task("Read Copilot Studio quarantine status")).toHaveTextContent("AgentControl.Viewer or AgentControl.Admin");
-    expect(task("Quarantine or restore Copilot Studio agents")).toHaveTextContent("AI Administrator, Power Platform Administrator or Global Administrator");
+    const packageRead = task("Refresh Microsoft 365 agent inventory");
+    const packageWrite = task("Block, unblock or change agent access");
+    expect(packageRead).toHaveTextContent("CopilotPackages.Read.All");
+    expect(packageWrite).toHaveTextContent("CopilotPackages.ReadWrite.All");
+    expect(packageWrite).toHaveTextContent("Delegated access");
+    expect(packageWrite).toHaveTextContent("availability and installation assignments");
+    for (const row of [packageRead, packageWrite]) {
+      expect(row).toHaveTextContent("Entra role: not specified by the package API.");
+      expect(row).toHaveTextContent("Microsoft Agent 365 license");
+      expect(row).not.toHaveTextContent(/AI Administrator|Global Administrator|No role required/);
+    }
+    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("AI Reader or Global Reader");
+    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("inventory feature");
+    expect(task("Refresh Copilot Studio agents and environments")).toHaveTextContent("REST API does not publish a separate role minimum");
+    expect(task("Check quarantine status, quarantine or restore Studio agents")).toHaveTextContent("AI Administrator or Power Platform Administrator");
+    expect(task("Check quarantine status, quarantine or restore Studio agents")).toHaveTextContent("same roles are needed to read quarantine status");
+    expect(task("Look up people and assignment users/groups")).toHaveTextContent("Guests cannot list users");
     expect(task("Resolve a Studio agent's log identity")).toHaveTextContent("Agent ID Administrator");
+    expect(task("Resolve a Studio agent's log identity")).toHaveTextContent("Entra blueprint you own");
     expect(task("Sync users and Copilot licenses")).toHaveTextContent("Directory Readers");
     expect(task("Refresh Copilot activity in Office apps")).toHaveTextContent("Reports Reader or AI Administrator");
-    expect(task("Download usage CSVs from Microsoft 365")).toHaveTextContent("No Agent Control role is needed");
-    expect(task("Download usage CSVs from Microsoft 365")).toHaveTextContent("summary-only reporting role is not sufficient");
-    expect(task("Import and manage usage reports")).toHaveTextContent("AgentControl.Admin");
-    expect(task("Search Purview audit for a user")).toHaveTextContent("Purview Audit Reader");
-    expect(task("Search Purview audit for a user")).toHaveTextContent("not Entra directory roles");
-    expect(task("Search Purview audit for a user")).toHaveTextContent("Security Reader + Purview Audit Reader");
-    expect(task("Search Purview audit for a user")).toHaveTextContent("not a proven endpoint-specific minimum");
+    expect(task("Download usage CSVs for import")).toHaveTextContent("Reports Reader or AI Administrator");
+    expect(task("Download usage CSVs for import")).toHaveTextContent("Usage Summary Reports Reader does not include user details");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("Recommended: Security Reader + Purview Audit Reader");
+    expect(task("Search Purview audit for a user")).toHaveTextContent("Audit Reader is a Purview role group");
+    expect(task("Run Defender and Agent 365 hunts")).toHaveTextContent("Security Reader");
     expect(task("Run Defender and Agent 365 hunts")).toHaveTextContent("data sources and device groups");
   });
 
-  it("links every topic and Microsoft requirement without adding role-assignment or consent actions", () => {
+  it("provides a compact, fully visible reference with Microsoft sources and no extra controls", () => {
     render(<Page value={context([])} />);
-    const guide = within(screen.getByRole("region", { name: "Signed-in user roles" }));
-    const topics = within(guide.getByRole("navigation", { name: "User role topics" })).getAllByRole("link");
-    expect(topics).toHaveLength(4);
-    for (const link of topics) expect(document.querySelector(link.getAttribute("href")!)).not.toBeNull();
+    const region = screen.getByRole("region", { name: "Signed-in user roles" });
+    const guide = within(region);
+    const tasks = guide.getAllByRole("article");
+    expect(tasks).toHaveLength(11);
+    expect(region.textContent!.trim().split(/\s+/).length).toBeLessThanOrEqual(600);
+    expect(guide.queryByRole("navigation")).not.toBeInTheDocument();
+    for (const task of tasks) expect(within(task).getAllByRole("link").length).toBeGreaterThan(0);
     const references = guide.getAllByRole("link").filter(link => link.getAttribute("target") === "_blank");
-    expect(references.length).toBeGreaterThan(20);
+    expect(references.length).toBeLessThanOrEqual(16);
     for (const link of references) {
       expect(link).toHaveAttribute("href", expect.stringMatching(/^https:\/\/learn\.microsoft\.com\//));
       expect(link).toHaveAttribute("rel", "noreferrer");
     }
     expect(guide.queryByRole("button")).not.toBeInTheDocument();
-    expect(guide.queryByText(/CopilotPackages.ReadWrite.All|User.Read.All|Reports.Read.All/)).not.toBeInTheDocument();
+    expect(region.querySelector("details")).toBeNull();
   });
 
   it("keeps app-only authentication failures out of user sign-in recovery, including issue details", async () => {
@@ -163,7 +175,7 @@ describe("Permissions setup and issues", () => {
     }));
     render(<Page value={context(views)} />);
     expect(screen.getByText("No issues reported.")).toBeVisible();
-    expect(screen.getByText("App administrator")).toBeVisible();
+    expect(screen.queryByText("App administrator", { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByText(/Ready to try|Microsoft checks access when used|not verified|no proof|Account access|Shared application modes/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Provider verified|Local access|Needs attention/)).not.toBeInTheDocument();
@@ -309,7 +321,8 @@ describe("Permissions setup and issues", () => {
     render(<Page value={{ ...context([fixture("missing_internal_role", "graph.package.block.manage")]), user: { ...user, roles: [role] } }} />);
     expect(screen.getByText("No issues reported.")).toBeVisible();
     expect(screen.queryByRole("button", { name: /Details:/ })).not.toBeInTheDocument();
-    expect(screen.getByText(role === "AgentControl.Admin" ? "App administrator" : "App viewer")).toBeVisible();
+    expect(screen.queryByText(/App administrator|App viewer/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check status" })).toBeEnabled();
   });
 
   it("makes missing app-role setup clear without a no-op retry button", () => {

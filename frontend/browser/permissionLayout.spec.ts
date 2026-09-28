@@ -96,7 +96,7 @@ test("healthy Permissions keeps concise issues and setup alongside the user role
   await expect.poll(() => posts).toEqual(["/api/capabilities/check"]);
   await expectQuietPermissions(page);
   const center = page.locator(".permission-center");
-  await expect(center.getByText("App administrator", { exact: true })).toBeVisible();
+  await expect(center.getByText("App administrator", { exact: true })).toHaveCount(0);
   await expect(center.getByRole("region", { name: "App prerequisites" })).toBeVisible();
   await expect(center.getByText("Required API permissions", { exact: true })).toBeVisible();
   await expect(center.getByText("Log collection setup", { exact: true })).toBeVisible();
@@ -165,7 +165,8 @@ test("unchecked, stale, disabled, unregistered and app-role decisions are not is
   } }));
   await page.goto("/permissions");
   await expectQuietPermissions(page);
-  await expect(page.getByText("App viewer", { exact: true })).toBeVisible();
+  await expect(page.getByText("App viewer", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Check status", exact: true })).toBeEnabled();
   expect(unexpected).toEqual([]);
 });
 
