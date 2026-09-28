@@ -18,7 +18,7 @@ import type {
   CopilotUsageUser,
   CopilotUsageUsersResponse,
 } from "../types/copilotUsage.js";
-import { copilotAppActivityStaleAfterDays, copilotUsagePeriod, isCopilotAppActivityFresh, isCopilotServiceActive } from "../types/copilotUsage.js";
+import { copilotAgentActivity, copilotAppActivityStaleAfterDays, copilotUsagePeriod, hasReportedAgentActivity, isCopilotAppActivityFresh, isCopilotServiceActive } from "../types/copilotUsage.js";
 import type { OfficialUsageUserSummary, OfficialUsageUserView, PublishedOfficialUsage } from "../types/officialUsage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus, type DataSyncSourceState } from "../types/dataSync.js";
@@ -34,7 +34,7 @@ import {
 import { buildOfficialUsageUserView } from "./officialUsageViews.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
-import { hasReportedAgentActivity, matchCopilotIdentities, matchImportedUsage } from "./copilotUsageIdentity.js";
+import { matchCopilotIdentities, matchImportedUsage } from "./copilotUsageIdentity.js";
 
 type CopilotUsageDependencies = {
   requireAvailable: typeof capabilities.requireAvailable;
@@ -350,11 +350,11 @@ export function composeCopilotUsageUsers(input: {
     const users = directoryUsers.map(directoryUser => {
       const importedUsage = matching.byObjectId.get(directoryUser.identity.objectId) ?? null;
       const activity = appMatching.get(directoryUser.identity.objectId) ?? null;
-      return buildUser(directoryUser, importedUsage, activity, importedMetricsFresh, appMetricsFresh);
+      return buildUser(directoryUser, importedUsage, activity, importedMetricsFresh, appMetricsFresh, matching.unresolved.length > 0);
     }).sort(compareUsers);
     const licensedUsers = users.filter(value => isCopilotServiceActive(value.copilotServiceState));
     let directorySource = directory.ok
-      ? source("available", `Checked ${directoryUsers.length} directory users from products containing paid M365 Copilot and exact active report identities. Product assignment alone does not establish a Copilot license. All matching directory pages were checked against Graph totals. This is not the total number of tenant accounts or basic Copilot Chat users.`, directory.fetchedAt)
+      ? source("available", `Checked ${directoryUsers.length} directory users.`, directory.fetchedAt)
       : unavailableSource(directory.message);
     let appSource = appActivity.ok
       ? appActivitySource(appActivity, appMatching.size, appMetricsFresh)
@@ -525,11 +525,13 @@ function buildUser(
   appActivity: CopilotReportUser["activity"] | null,
   importedMetricsFresh: boolean,
   appMetricsFresh: boolean,
+  hasUnresolvedIdentities: boolean,
 ): CopilotUsageUser {
   const attention: CopilotUsageAttention[] = [];
-  if (!importedMetricsFresh || !importedUsage || importedUsage.reviewCohort === "unknown") attention.push("agent_usage_unknown");
-  else if (importedUsage.reviewCohort === "zero_responses") attention.push("agent_usage_zero");
-  else if (importedUsage.reviewCohort === "low_responses") attention.push("agent_usage_low");
+  const agentActivity = copilotAgentActivity(importedUsage, importedMetricsFresh, hasUnresolvedIdentities);
+  if (agentActivity === "unknown") attention.push("agent_usage_unknown");
+  else if (agentActivity === "none") attention.push("agent_usage_zero");
+  else if (importedUsage?.reviewCohort === "low_responses") attention.push("agent_usage_low");
   if (!appMetricsFresh || !appActivity) attention.push("app_activity_unknown");
   else if (!appActivity.lastActivityDate) attention.push("app_activity_unknown");
   else if (!hasRecentAppActivity(appActivity)) attention.push("app_activity_inactive");
@@ -548,7 +550,7 @@ function buildUser(
 }
 
 function hasMeasuredActivity(user: CopilotUsageUser, importedMetricsFresh: boolean, appMetricsFresh: boolean) {
-  return Boolean((importedMetricsFresh && user.importedUsage && user.importedUsage.reportedResponsesReceived > 0)
+  return Boolean((importedMetricsFresh && user.importedUsage && hasReportedAgentActivity(user.importedUsage))
     || (appMetricsFresh && user.appActivity && hasRecentAppActivity(user.appActivity)));
 }
 

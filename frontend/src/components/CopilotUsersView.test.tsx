@@ -99,7 +99,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText("Concealed report user")).not.toBeInTheDocument();
     const metrics = screen.getByLabelText("M365 Copilot license summary");
     expect(within(metrics).getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("4");
-    expect(within(metrics).getByText("Agent usage unknown").parentElement).toHaveTextContent("1");
+    expect(within(metrics).getByText("No reported agent activity").parentElement).toHaveTextContent("1");
     expect(screen.queryByText("Unavailable in exports")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     const cohort = screen.getByRole("combobox", { name: "User cohort" });
@@ -124,6 +124,39 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(getOfficialUsageUsers).not.toHaveBeenCalled();
   });
 
+  it("keeps expanded source coverage to status, counts and dates without disclaimer paragraphs", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.sources.directory.message = "Checked 4 directory users.";
+    fixture.sources.appActivity.state = "partial";
+    fixture.sources.appActivity.message = "Loaded 4 app activity rows; 1 unmatched identity was not joined.";
+    fixture.notices = [
+      "This dashboard is read-only and never changes license assignments.",
+      "Missing source data remains unknown and is never converted to zero or an unlicensed state.",
+    ];
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    const summary = await screen.findByText("Data sources and coverage");
+    const details = summary.closest("details")!;
+    expect(details).not.toHaveAttribute("open");
+    await userEvent.click(summary);
+    expect(details).toHaveAttribute("open");
+    const coverage = within(details);
+    expect(coverage.getByText("Checked directory users: Connected")).toBeVisible();
+    expect(coverage.getByText("Checked 4 directory users.")).toBeVisible();
+    expect(coverage.getByText("Agent activity: Connected")).toBeVisible();
+    expect(coverage.getByText("Office app activity: Incomplete")).toBeVisible();
+    expect(coverage.getByText(fixture.sources.appActivity.message)).toBeVisible();
+    expect(coverage.getByText(/Directory observed:.*App activity observed:/)).toBeVisible();
+    expect(coverage.getAllByText(/^Checked:/)).toHaveLength(3);
+    expect(coverage.getByText(/Report refreshed:.*Version: v1/)).toBeVisible();
+    expect(coverage.getAllByText("Range: 2026-08-14 to 2026-09-12")).toHaveLength(2);
+    for (const notice of fixture.notices) expect(coverage.queryByText(notice)).not.toBeInTheDocument();
+    expect(coverage.queryByText(/Identities are matched|Only verified active paid|reports can lag|coaching signal/)).not.toBeInTheDocument();
+    expect(details.querySelectorAll(":scope > p")).toHaveLength(1);
+    expect(userRows()).toHaveLength(4);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
   it("uses all four summary cards as filters with exact positive, zero and missing-response semantics", async () => {
     const fixture = structuredClone(copilotUsageFixture);
     const missingTotal = licensedUser(5, "MissingTotal", 100);
@@ -141,12 +174,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByRole("group", { name: "Copilot user cohorts" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Licensed users" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Usage unknown" })).not.toBeInTheDocument();
-    expect(summary.getByRole("button", { name: "Using agents" })).toHaveAccessibleDescription("2. Licensed users with agent responses");
-    expect(summary.getByRole("button", { name: "Agent usage unknown" })).toHaveAccessibleDescription("2. Licensed users; not proof of inactivity");
+    expect(summary.getByRole("button", { name: "Using agents" })).toHaveAccessibleDescription("3. Licensed users with agent responses");
+    expect(summary.getByRole("button", { name: "No reported agent activity" })).toHaveAccessibleDescription("1. Licensed users with no agent activity in the selected reports");
+    expect(screen.queryByText(/not proof of inactivity/)).not.toBeInTheDocument();
     for (const [label, names] of [
-      ["Using agents", ["Ada", "Ben"]],
+      ["Using agents", ["Ada", "Ben", "MissingTotal"]],
       ["Needs attention", ["Ben", "Cleo"]],
-      ["Agent usage unknown", ["Drew", "MissingTotal"]],
+      ["No reported agent activity", ["Cleo"]],
       ["Active M365 Copilot licensed users", ["Ada", "Ben", "Cleo", "Drew", "MissingTotal"]],
     ] as const) {
       const card = summary.getByRole("button", { name: label });
@@ -179,9 +213,102 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()).toHaveLength(2);
     for (const row of userRows()) expect(row).toHaveTextContent("Historical report");
     expect(screen.getByText(/Last saved: 2 previously licensed users shown/)).toBeVisible();
-    await userEvent.click(summary.getByRole("button", { name: "Agent usage unknown" }));
-    expect(userRows()).toHaveLength(1);
-    expect(userRows()[0]).toHaveTextContent("Drew");
+    await userEvent.click(summary.getByRole("button", { name: "No reported agent activity" }));
+    expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "No last-saved users in this cohort" })).toBeVisible();
+  });
+
+  it("includes identifiable absence and explicit zero while positive evidence in either report wins", async () => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.unresolvedImportedIdentities = [];
+    fixture.counts.unresolvedImportedIdentities = 0;
+    fixture.users[0].importedUsage!.rows = [];
+    fixture.users[0].importedUsage!.bridgeResponsesSentToUsers = 0;
+    const bridge = licensedUser(5, "Bridge", 100);
+    bridge.importedUsage!.missingUserReport = true;
+    const conflict = licensedUser(6, "Conflict", 100);
+    conflict.importedUsage!.reportedResponsesReceived = 0;
+    conflict.importedUsage!.reviewCohort = "zero_responses";
+    conflict.attention = ["agent_usage_zero"];
+    const bridgeZero = licensedUser(7, "BridgeZero", 1);
+    bridgeZero.importedUsage!.missingUserReport = true;
+    bridgeZero.importedUsage!.reportedResponsesReceived = 0;
+    bridgeZero.importedUsage!.bridgeResponsesSentToUsers = 0;
+    bridgeZero.importedUsage!.rows[0].responsesSentToUsers = 0;
+    const inactive = licensedUser(8, "Inactive", null);
+    inactive.copilotServiceState = inactive.servicePlans[0].state = "disabled";
+    const unverified = licensedUser(9, "Unverified", 0);
+    unverified.copilotServiceState = unverified.servicePlans[0].state = "unknown";
+    fixture.users.push(bridge, conflict, bridgeZero, inactive, unverified);
+    fixture.counts.licensedUsers = 7;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    const summary = within(await screen.findByRole("group", { name: "M365 Copilot license summary" }));
+    expect(summary.getByRole("button", { name: "Using agents" })).toHaveAccessibleDescription("4. Licensed users with agent responses");
+    expect(summary.getByRole("button", { name: "No reported agent activity" })).toHaveAccessibleDescription("3. Licensed users with no agent activity in the selected reports");
+    await userEvent.click(summary.getByRole("button", { name: "Using agents" }));
+    expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["Ada", "Ben", "Bridge", "Conflict"]);
+    for (const displayName of ["Bridge", "Conflict"]) {
+      const row = screen.getByRole("row", { name: new RegExp(displayName) });
+      expect(within(row).getByText("Using agents")).toBeVisible();
+      expect(within(row).queryByText("Usage unknown")).not.toBeInTheDocument();
+    }
+    const conflictRow = screen.getByRole("row", { name: /Conflict/ });
+    expect(within(conflictRow).getAllByRole("cell")[2]).toHaveTextContent(/^0$/);
+    await userEvent.click(summary.getByRole("button", { name: "Needs attention" }));
+    expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["Ben", "BridgeZero", "Cleo", "Drew"]);
+    await userEvent.click(summary.getByRole("button", { name: "No reported agent activity" }));
+    expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["BridgeZero", "Cleo", "Drew"]);
+    const drew = screen.getByRole("row", { name: /Drew/ });
+    expect(within(drew).getByText("No reported agent activity")).toBeVisible();
+    expect(within(drew).queryByText("Unknown")).not.toBeInTheDocument();
+    await userEvent.click(within(drew).getByRole("button", { name: "Drew" }));
+    const detail = within(screen.getByRole("dialog", { name: "Drew" }));
+    expect(detail.getByText("No reported agent activity")).toBeVisible();
+    expect(detail.getByText("Agent responses").parentElement).toHaveTextContent("Not reported");
+    await userEvent.click(detail.getByRole("tab", { name: "Usage & agents" }));
+    expect(detail.getByText("No agent activity in the selected reports.")).toBeVisible();
+    expect(fixture.users[3].importedUsage).toBeNull();
+  });
+
+  it.each(["unavailable", "not_imported", "partial", "stale"] as const)("does not infer no activity from %s reports", async state => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.unresolvedImportedIdentities = [];
+    fixture.sources.importedAgentUsage.state = state;
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    const card = await screen.findByRole("button", { name: "No reported agent activity" });
+    expect(card.querySelector("strong")).toHaveTextContent("Unknown");
+    await userEvent.click(card);
+    expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agent usage unavailable" })).toBeVisible();
+  });
+
+  it("recomputes the no-activity cohort and open details when selected report data changes", async () => {
+    const previous = structuredClone(copilotUsageFixture);
+    previous.unresolvedImportedIdentities = [];
+    previous.counts.unresolvedImportedIdentities = 0;
+    const next = structuredClone(previous);
+    next.users[0].importedUsage = null;
+    next.users[1] = licensedUser(2, "Ben", 0);
+    next.users[2] = licensedUser(3, "Cleo", 40);
+    next.users[3] = licensedUser(4, "Drew", 12);
+    for (const user of next.users) {
+      if (user.importedUsage) user.importedUsage.datasetScope.reportSetId = "new-selection";
+    }
+    vi.mocked(getCopilotUsageUsers).mockResolvedValueOnce(previous).mockResolvedValueOnce(next);
+    const view = render(<CopilotUsersView dataRevision={0} />);
+    await userEvent.click(await screen.findByRole("button", { name: "No reported agent activity" }));
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Drew"]);
+    await userEvent.click(screen.getByRole("button", { name: "Drew" }));
+    expect(within(screen.getByRole("dialog", { name: "Drew" })).getByText("No reported agent activity")).toBeVisible();
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    await waitFor(() => expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ben", "Ada"]));
+    const detail = within(screen.getByRole("dialog", { name: "Drew" }));
+    expect(detail.getByText("Using agents")).toBeVisible();
+    expect(detail.queryByText("No reported agent activity")).not.toBeInTheDocument();
+    expect(detail.getByText("Agent responses").parentElement).toHaveTextContent("12");
+    expect(screen.getByRole("button", { name: "No reported agent activity" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("excludes disabled and unknown candidates from paid search and adoption metrics", async () => {
@@ -273,7 +400,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()[0]).toHaveTextContent("Person1");
     expect(screen.queryByRole("button", { name: "Person0" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Next" }));
-    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
+    await userEvent.click(screen.getByRole("button", { name: "No reported agent activity" }));
     expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }));
     expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 102");
@@ -299,7 +426,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     await screen.findByRole("heading", { name: "No active M365 Copilot licenses found" });
     const metrics = within(screen.getByLabelText("M365 Copilot license summary"));
     expect(within(metrics.getByText("Active M365 Copilot licensed users").parentElement!).getByText("0")).toBeVisible();
-    for (const label of ["Using agents", "Needs attention", "Agent usage unknown"]) {
+    for (const label of ["Using agents", "Needs attention", "No reported agent activity"]) {
       const metric = metrics.getByText(label).parentElement!;
       expect(within(metric).getByText("0")).toBeVisible();
       expect(metric).toHaveTextContent("Licensed users");
@@ -312,7 +439,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText("30,000")).not.toBeInTheDocument();
   });
 
-  it("restricts every adoption cohort and KPI to licensed users while keeping agent-only unknown distinct from app coverage", async () => {
+  it("restricts adoption cohorts to licensed users and excludes unresolved activity from the no-activity count", async () => {
     const fixture = structuredClone(copilotUsageFixture);
     fixture.users = [
       licensedUser(1, "Active", 20), licensedUser(2, "Grace", 2), licensedUser(3, "Partial", null),
@@ -332,7 +459,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     await screen.findByRole("button", { name: "Active" });
     const metrics = within(screen.getByLabelText("M365 Copilot license summary"));
     const assertCounts = () => {
-      for (const [label, count] of [["Active M365 Copilot licensed users", "3"], ["Using agents", "2"], ["Needs attention", "2"], ["Agent usage unknown", "1"]]) {
+      for (const [label, count] of [["Active M365 Copilot licensed users", "3"], ["Using agents", "2"], ["Needs attention", "2"], ["No reported agent activity", "0"]]) {
         expect(within(metrics.getByText(label).parentElement!).getByText(count)).toBeVisible();
       }
     };
@@ -340,8 +467,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Active", "Grace", "Partial"]);
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Grace", "Partial"]);
-    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
-    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Partial"]);
+    await userEvent.click(screen.getByRole("button", { name: "No reported agent activity" }));
+    expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }));
     expect(userRows()).toHaveLength(3);
     expect(screen.queryByText("No active M365 Copilot license", { exact: true })).not.toBeInTheDocument();
@@ -393,7 +521,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByRole("button", { name: "All checked users" })).not.toBeInTheDocument();
     expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByText(/^(Explore agents|Offer adoption help|Review app activity)$/)).not.toBeInTheDocument();
-    expect(screen.getByText(/not a recommendation to remove a paid license/)).not.toBeVisible();
+    expect(screen.queryByText(/not a recommendation to remove a paid license/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -468,9 +596,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Ben", "Ada", "Drew"]);
     await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-desc");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo", "Drew"]);
-    await userEvent.click(screen.getByRole("button", { name: "Agent usage unknown" }));
+    await userEvent.click(screen.getByRole("button", { name: "No reported agent activity" }));
     expect(userRows()).toHaveLength(1);
-    expect(userRows()[0]).toHaveTextContent("Drew");
+    expect(userRows()[0]).toHaveTextContent("Cleo");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
@@ -508,7 +636,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     ["Agent responses", "responses-asc", "responses-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
     ["Agents used", "agents-asc", "agents-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
     ["Agent-report last activity", "activity-asc", "activity", [2, 1, 0, 3], [0, 1, 2, 3]],
-    ["Follow-up", "follow-up-asc", "follow-up-desc", [1, 2, 3, 0], [0, 3, 1, 2]],
+    ["Follow-up", "follow-up-asc", "follow-up-desc", [1, 2, 0, 3], [0, 3, 1, 2]],
   ] as const)("compares %s values in both directions and synchronizes keyboard headers with the selector", async (header, ascending, descending, ascOrder, descOrder) => {
     const data = structuredClone(copilotUsageFixture);
     data.users = [

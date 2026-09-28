@@ -2,7 +2,9 @@ import { useContext, useEffect, useMemo, useRef, useState, type ReactNode, type 
 import type { SortingState } from "@tanstack/react-table";
 import {
   ApiError,
+  copilotAgentActivity,
   getCopilotUsageUsers,
+  hasReportedAgentActivity,
   isCopilotServiceActive,
   type CopilotUsageSourceSummary,
   type CopilotUsageUser,
@@ -21,7 +23,7 @@ import { UserAgentResponsibility } from "./UserAgentResponsibility";
 import { UserDetailModal } from "./UserDetailModal";
 import "./copilotUsers.css";
 
-type Cohort = "licensed" | "using" | "attention" | "unknown";
+type Cohort = "licensed" | "using" | "attention" | "no-activity";
 type ReadKey = { dataRevision: number; reload: number; needsDirectory: boolean };
 type ReadState = { key: ReadKey; status: "ready" } | { key: ReadKey; status: "failed"; error: string; accessDenied?: boolean };
 const pageSize = 50;
@@ -172,10 +174,10 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
   const directoryCurrent = current && directoryKnown;
   const agentUsageFresh = current && data.sources.importedAgentUsage.state === "available";
   const appActivityFresh = current && ["available", "partial"].includes(data.sources.appActivity.state);
+  const hasUnresolvedIdentities = data.unresolvedImportedIdentities.length > 0;
   const licensedUsers = useMemo(() => data.users.filter(user => isCopilotServiceActive(user.copilotServiceState)), [data.users]);
-  const attention = licensedUsers.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh)).length;
-  const measured = licensedUsers.filter(user => responses(user) !== null).length;
-  const unknown = licensedUsers.length - measured;
+  const attention = licensedUsers.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities)).length;
+  const noActivity = licensedUsers.filter(user => copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none").length;
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return licensedUsers.filter(user => {
@@ -185,11 +187,11 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
         ...(user.importedUsage?.rows.flatMap(row => [row.displayAgentName, row.creatorType]) ?? []),
       ].some(value => value?.toLowerCase().includes(query))) return false;
       if (cohort === "using") return hasAgentResponses(user);
-      if (cohort === "attention") return directoryCurrent && needsAttention(user, threshold, agentUsageFresh, appActivityFresh);
-      if (cohort === "unknown") return responses(user) === null;
+      if (cohort === "attention") return directoryCurrent && needsAttention(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities);
+      if (cohort === "no-activity") return copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none";
       return true;
     });
-  }, [agentUsageFresh, appActivityFresh, cohort, directoryCurrent, licensedUsers, search, threshold]);
+  }, [agentUsageFresh, appActivityFresh, cohort, directoryCurrent, hasUnresolvedIdentities, licensedUsers, search, threshold]);
   const columns = useMemo<ListColumn<CopilotUsageUser>[]>(() => [
     { id: "user", header: "User", accessorFn: name },
     { id: "license", header: "M365 Copilot license", accessorFn: user => copilotServicePresentation(user.copilotServiceState).label },
@@ -203,10 +205,10 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
     {
       id: "followUp", header: "Follow-up",
       accessorFn: user => directoryCurrent
-        ? recommendation(user, threshold, agentUsageFresh, appActivityFresh).label
+        ? recommendation(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities).label
         : "Verify paid license inventory",
     },
-  ], [agentUsageFresh, appActivityFresh, directoryCurrent, threshold]);
+  ], [agentUsageFresh, appActivityFresh, directoryCurrent, hasUnresolvedIdentities, threshold]);
   const table = useListTable({
     data: filtered,
     columns,
@@ -241,8 +243,8 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
         selected={cohort === "using"} onClick={() => selectCohort("using")} />
       <Metric label="Needs attention" value={directoryCurrent ? attention : null} hint="Licensed users needing follow-up"
         selected={cohort === "attention"} onClick={() => selectCohort("attention")} />
-      <Metric label="Agent usage unknown" value={directoryCurrent ? unknown : null} hint="Licensed users; not proof of inactivity"
-        selected={cohort === "unknown"} onClick={() => selectCohort("unknown")} />
+      <Metric label="No reported agent activity" value={directoryCurrent && agentUsageFresh ? noActivity : null} hint="Licensed users with no agent activity in the selected reports"
+        selected={cohort === "no-activity"} onClick={() => selectCohort("no-activity")} />
     </div>
 
     {!directoryKnown ? <div className="copilot-users-notice" role="status"><p>Current paid license inventory is unverified. {data.sources.directory.message} Use Sync or Permissions in the top navigation to refresh or reconnect.</p></div> : null}
@@ -277,21 +279,24 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
         <ListTableHead table={table} />
         <tbody>{visible.map(row => {
           const user = row.original;
-          const followUp = directoryCurrent ? recommendation(user, threshold, agentUsageFresh, appActivityFresh) : { label: "Verify paid license inventory", tone: "unknown" };
+          const noReportedActivity = copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none";
+          const responseCount = responses(user);
+          const agentCount = user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : null;
+          const followUp = directoryCurrent ? recommendation(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities) : { label: "Verify paid license inventory", tone: "unknown" };
           return <tr key={row.id}>
             <td><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => onInspectUser(user, threshold)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</td>
             <td><CopilotLicenseStatus user={user} current={directoryCurrent} /></td>
-            <td data-numeric>{formatCount(responses(user))}{!agentUsageFresh && responses(user) !== null ? <small>Historical report</small> : null}</td>
-            <td data-numeric>{formatCount(user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : null)}</td>
+            <td data-numeric>{responseCount === null && noReportedActivity ? "Not reported" : formatCount(responseCount)}{!agentUsageFresh && responseCount !== null ? <small>Historical report</small> : null}</td>
+            <td data-numeric>{agentCount === null && noReportedActivity ? "Not reported" : formatCount(agentCount)}</td>
             <td>{formatDate(user.importedUsage?.userLastActivityDateUtc)}<small>Users report only</small></td>
             <td><span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span></td>
           </tr>;
         })}</tbody>
       </table>
     </div> : <div className="copilot-users-empty">
-      <h3>{directoryCurrent ? noLicensedUsers ? "No active M365 Copilot licenses found" : "No users match" : "No last-saved users in this cohort"}</h3>
+      <h3>{directoryCurrent ? cohort === "no-activity" && !agentUsageFresh ? "Agent usage unavailable" : noLicensedUsers ? "No active M365 Copilot licenses found" : "No users match" : "No last-saved users in this cohort"}</h3>
       <p>{directoryCurrent
-        ? noLicensedUsers ? "No users have verified active paid features in the saved inventory." : "Try a different cohort or search."
+        ? cohort === "no-activity" && !agentUsageFresh ? "Select a complete, current usage report in Sync." : noLicensedUsers ? "No users have verified active paid features in the saved inventory." : "Try a different cohort or search."
         : "Current licensing is unverified. Run Users sync from Sync in the top navigation."}</p>
       {search || cohort !== "licensed" ? <button className="secondary" type="button" onClick={() => { setSearch(""); selectCohort("licensed"); }}>Reset filters</button> : null}
     </div>}
@@ -311,11 +316,6 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
         ["Agent activity", data.sources.importedAgentUsage],
         ["Office app activity", data.sources.appActivity],
       ] as const).map(([label, source]) => <div key={label}><dt>{label}: {sourceLabel(source)}</dt><dd>{source.message}</dd><dd>Checked: {formatDate(source.fetchedAt)}{source.reportRefreshDate ? ` | Report refreshed: ${formatDate(source.reportRefreshDate)}` : ""}{source.reportVersion ? ` | Version: ${source.reportVersion}` : ""}</dd>{source.period.startDate || source.period.endDate ? <dd>Range: {source.period.startDate ?? "Unknown"} to {source.period.endDate ?? "Unknown"}</dd> : null}</div>)}</dl>
-      <p>{directoryCurrent ? `${measured.toLocaleString()} licensed users have matched agent response totals.` : "Current licensing cannot be determined until the directory inventory is available."} Identities are matched by exact identifiers, never by display name; renamed, hidden or unmatched users stay unresolved.</p>
-      <p>Only verified active paid features establish current M365 Copilot licensing.</p>
-      <p>App reports can lag by 48 hours and show last-known dates, not counts of prompts or daily activity. Current paid entitlement does not prove activity or coverage throughout the usage period.</p>
-      <p>Low agent usage is a coaching signal, not a recommendation to remove a paid license. Review Office app activity and the employee&apos;s context first. No assignments are changed.</p>
-      {data.notices.map(notice => <p key={notice}>{notice}</p>)}
     </details>
   </>;
 }
@@ -333,10 +333,13 @@ function CopilotUserDetail({ user, data, current, refreshing, threshold, returnF
 }) {
   const fresh = current && data.sources.importedAgentUsage.state === "available";
   const directoryCurrent = current && data.sources.directory.state === "available";
-  const followUp = directoryCurrent ? recommendation(user, threshold, fresh, ["available", "partial"].includes(data.sources.appActivity.state)) : { label: "Verify paid license inventory", tone: "unknown" };
+  const hasUnresolvedIdentities = data.unresolvedImportedIdentities.length > 0;
+  const noReportedActivity = copilotAgentActivity(user.importedUsage, fresh, hasUnresolvedIdentities) === "none";
+  const followUp = directoryCurrent ? recommendation(user, threshold, fresh, ["available", "partial"].includes(data.sources.appActivity.state), hasUnresolvedIdentities) : { label: "Verify paid license inventory", tone: "unknown" };
   return <UserDetailModal identity={user.directory.objectId} displayName={name(user)} username={user.directory.userPrincipalName}
     directoryUser={user} directoryCurrent={directoryCurrent} reportUser={user.importedUsage}
     reportPeriod={data.sources.importedAgentUsage.period} reportCurrent={fresh} appActivityState={data.sources.appActivity.state}
+    noReportedAgentActivity={noReportedActivity}
     followUp={followUp} returnFocusTo={returnFocusTo} closeLabel="Close user details" onClose={onClose}
     onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} refreshing={refreshing} />;
 }
@@ -346,29 +349,32 @@ function responses(user: CopilotUsageUser): number | null {
 }
 
 function hasAgentResponses(user: CopilotUsageUser) {
-  return (responses(user) ?? 0) > 0;
+  return user.importedUsage !== null && hasReportedAgentActivity(user.importedUsage);
 }
 
 function name(user: CopilotUsageUser) {
   return user.directory.displayName || user.directory.userPrincipalName;
 }
 
-function needsAttention(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean) {
+function needsAttention(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean, hasUnresolvedIdentities: boolean) {
   const count = responses(user);
+  const activity = copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities);
   return copilotServicePresentation(user.copilotServiceState).needsAttention || user.directory.accountEnabled === false
-    || (appActivityFresh && user.attention.includes("app_activity_inactive")) || (agentUsageFresh && count !== null && count <= threshold);
+    || (appActivityFresh && user.attention.includes("app_activity_inactive")) || activity === "none"
+    || (activity === "active" && count !== null && count > 0 && count <= threshold);
 }
 
-function recommendation(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean) {
+function recommendation(user: CopilotUsageUser, threshold: number, agentUsageFresh: boolean, appActivityFresh: boolean, hasUnresolvedIdentities: boolean) {
   const count = responses(user);
+  const activity = copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities);
   const service = copilotServicePresentation(user.copilotServiceState);
   if (user.directory.accountEnabled === false) return { label: "Review disabled account", tone: "attention" };
   if (service.needsAttention) return { label: user.copilotServiceState === "unknown" ? "Verify paid features" : "Review paid features", tone: service.tone };
-  if (agentUsageFresh && count === 0) return { label: "Explore agents", tone: "attention" };
-  if (agentUsageFresh && count !== null && count <= threshold) return { label: "Offer adoption help", tone: "attention" };
+  if (activity === "none") return { label: "No reported agent activity", tone: "attention" };
+  if (activity === "active" && count !== null && count > 0 && count <= threshold) return { label: "Offer adoption help", tone: "attention" };
   if (appActivityFresh && user.attention.includes("app_activity_inactive")) return { label: "Review app activity", tone: "attention" };
   if (!agentUsageFresh && count !== null) return { label: "Refresh agent report", tone: "unknown" };
-  if (count === null) return { label: "Usage unknown", tone: "unknown" };
+  if (activity === "unknown") return { label: "Usage unknown", tone: "unknown" };
   return { label: "Using agents", tone: "" };
 }
 

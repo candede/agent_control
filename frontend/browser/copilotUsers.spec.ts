@@ -44,6 +44,35 @@ async function mockReportedUsers(page: Page, published = activeWithoutPaidPublis
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("expanded data sources and coverage stays concise without disclaimer paragraphs", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const fixture = structuredClone(copilotUsageFixture);
+  fixture.sources.directory.message = "Checked 4 directory users.";
+  fixture.sources.appActivity.state = "partial";
+  fixture.sources.appActivity.message = "Loaded 4 app activity rows; 1 unmatched identity was not joined.";
+  fixture.notices = ["This dashboard is read-only and never changes license assignments."];
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  await page.goto("/users");
+  const coverage = page.locator(".copilot-users-provenance");
+  const summary = coverage.getByText("Data sources and coverage", { exact: true });
+  await expect(coverage).not.toHaveAttribute("open", "");
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  await expect(coverage).toHaveAttribute("open", "");
+  await expect(coverage.getByText("Checked 4 directory users.", { exact: true })).toBeVisible();
+  await expect(coverage.getByText("Office app activity: Incomplete", { exact: true })).toBeVisible();
+  await expect(coverage.getByText(fixture.sources.appActivity.message, { exact: true })).toBeVisible();
+  await expect(coverage.getByText(/Directory observed:.*App activity observed:/)).toBeVisible();
+  await expect(coverage.getByText(/^Checked:/)).toHaveCount(3);
+  await expect(coverage.locator(":scope > p")).toHaveCount(1);
+  await expect(coverage).not.toContainText(/read-only|license assignments|Identities are matched|Only verified active paid|reports can lag|coaching signal/);
+  expect((await coverage.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(110);
+  expect(await coverage.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".copilot-users-provenance").analyze()).violations).toEqual([]);
+  await coverage.screenshot({ path: info.outputPath("concise-source-coverage.png") });
+  expect(unexpected).toEqual([]);
+});
+
 test("all user summary cards filter directly with readable selected, hover and keyboard states", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.goto("/users");
@@ -53,7 +82,7 @@ test("all user summary cards filter directly with readable selected, hover and k
   const all = summary.getByRole("button", { name: "Active M365 Copilot licensed users", exact: true });
   const using = summary.getByRole("button", { name: "Using agents", exact: true });
   const attention = summary.getByRole("button", { name: "Needs attention", exact: true });
-  const unknown = summary.getByRole("button", { name: "Agent usage unknown", exact: true });
+  const noActivity = summary.getByRole("button", { name: "No reported agent activity", exact: true });
   await expect(cards).toHaveCount(4);
   await expect(page.locator(".copilot-users-tabs")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Licensed users", exact: true })).toHaveCount(0);
@@ -84,10 +113,10 @@ test("all user summary cards filter directly with readable selected, hover and k
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(page.getByLabel("Low agent usage threshold")).toBeVisible();
   await page.keyboard.press("Tab");
-  await expect(unknown).toBeFocused();
+  await expect(noActivity).toBeFocused();
   await page.keyboard.press("Enter");
   await expect(table.locator("tbody tr")).toHaveCount(1);
-  await expect(table.locator("tbody tr")).toContainText("Drew");
+  await expect(table.locator("tbody tr")).toContainText("Cleo");
   await expect(summary.getByRole("button", { pressed: true })).toHaveCount(1);
   await using.click();
   await expect(table.locator("tbody tr")).toHaveCount(2);
@@ -99,6 +128,59 @@ test("all user summary cards filter directly with readable selected, hover and k
   expect(await summary.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   await page.screenshot({ path: info.outputPath("clickable-user-summary-cards.png") });
+  expect(unexpected).toEqual([]);
+});
+
+test("no reported activity includes identifiable absence and follows the selected reports", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const fixture = structuredClone(copilotUsageFixture);
+  fixture.unresolvedImportedIdentities = [];
+  fixture.counts.unresolvedImportedIdentities = 0;
+  const bridge = licensedUser(5, "Bridge", 100);
+  bridge.importedUsage!.missingUserReport = true;
+  const conflict = licensedUser(6, "Conflict", 100);
+  conflict.importedUsage!.reportedResponsesReceived = 0;
+  conflict.importedUsage!.reviewCohort = "zero_responses";
+  fixture.users.push(bridge, conflict);
+  fixture.counts.licensedUsers = 6;
+  await page.route("**/api/copilot-usage/users", route => route.fulfill({ json: fixture }));
+  await page.goto("/users");
+  const summary = page.getByRole("group", { name: "M365 Copilot license summary", exact: true });
+  const table = page.getByRole("region", { name: "M365 Copilot license status", exact: true });
+  const noActivity = summary.getByRole("button", { name: "No reported agent activity", exact: true });
+  await expect(noActivity).toHaveAccessibleDescription("2. Licensed users with no agent activity in the selected reports");
+  await expect(page.getByText(/not proof of inactivity/)).toHaveCount(0);
+  await summary.getByRole("button", { name: "Using agents", exact: true }).click();
+  await expect(table.locator("tbody tr")).toHaveCount(4);
+  await expect(table.getByRole("row", { name: /Bridge|Conflict/ })).toHaveCount(2);
+  await noActivity.click();
+  await expect(table.locator("tbody tr")).toHaveCount(2);
+  await expect(table.getByRole("row", { name: /Cleo|Drew/ })).toHaveCount(2);
+  await expect(table.getByText("Usage unknown", { exact: true })).toHaveCount(0);
+  expect(await summary.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("no-reported-agent-activity.png") });
+  await table.getByRole("button", { name: "Drew", exact: true }).click();
+  const detail = page.getByRole("dialog", { name: "Drew", exact: true });
+  await expect(detail.getByText("No reported agent activity", { exact: true })).toBeVisible();
+  await detail.getByRole("tab", { name: "Usage & agents", exact: true }).click();
+  await expect(detail.getByText("No agent activity in the selected reports.", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  fixture.users[3] = licensedUser(4, "Drew", 20);
+  for (const user of fixture.users) {
+    if (user.importedUsage) user.importedUsage.datasetScope.reportSetId = "new-selection";
+  }
+  await page.reload();
+  await expect(noActivity.locator("strong")).toHaveText("1");
+  await noActivity.click();
+  await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.getByRole("row", { name: /Cleo/ })).toBeVisible();
+  fixture.sources.importedAgentUsage.state = "stale";
+  await page.reload();
+  await expect(noActivity.locator("strong")).toHaveText("Unknown");
+  await noActivity.click();
+  await expect(table).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Agent usage unavailable", exact: true })).toBeVisible();
   expect(unexpected).toEqual([]);
 });
 
@@ -230,9 +312,9 @@ test("disabled bundle candidates stay excluded from paid cohorts and licensed ad
   await page.getByRole("button", { name: "Needs attention", exact: true }).click();
   await expect(table.locator("tbody tr")).toHaveCount(2);
   await expect(table.getByRole("row", { name: /Ben/ })).toHaveCount(0);
-  await page.getByRole("button", { name: "Agent usage unknown", exact: true }).click();
+  await page.getByRole("button", { name: "No reported agent activity", exact: true }).click();
   await expect(table.locator("tbody tr")).toHaveCount(1);
-  await expect(table.getByRole("row", { name: /Drew/ })).toBeVisible();
+  await expect(table.getByRole("row", { name: /Cleo/ })).toBeVisible();
   await expect(page.getByRole("button", { name: "All checked users", exact: true })).toHaveCount(0);
   await expect(table.getByRole("row", { name: /Ben/ })).toHaveCount(0);
   await expect(table.getByText(/^(Basic|Disabled|Copilot Disabled|Paid license assigned)$/)).toHaveCount(0);

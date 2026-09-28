@@ -30,6 +30,7 @@ type Props = {
   reportUser?: OfficialUsageUserSummary | null;
   reportPeriod?: { startDate: string | null; endDate: string | null };
   reportCurrent?: boolean;
+  noReportedAgentActivity?: boolean;
   appActivityState?: CopilotUsageSourceSummary["state"];
   followUp?: { label: string; tone: string };
   filters?: UserRelationshipFilters;
@@ -51,7 +52,7 @@ export function UserDetailModal(props: Props) {
 }
 
 function UserDetailSession({ displayName, username, directoryUser, directoryCurrent, reportUser, reportPeriod,
-  reportCurrent = true, appActivityState, followUp, filters, returnFocusTo, closeLabel, onClose, onFocusAgent,
+  reportCurrent = true, noReportedAgentActivity = false, appActivityState, followUp, filters, returnFocusTo, closeLabel, onClose, onFocusAgent,
   onOpenAgent, dataRevision, agentInventoryRevision, refreshing = false }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const close = useRef<HTMLButtonElement>(null);
@@ -91,11 +92,11 @@ function UserDetailSession({ displayName, username, directoryUser, directoryCurr
           <div className="copilot-user-metric"><span>M365 Copilot license</span>
             <CopilotLicenseStatus user={directoryUser} current={directoryCurrent} licenseAssignmentStatus={reportUser?.licenseAssignmentStatus} />
           </div>
-          <div className="copilot-user-metric"><span>Agent responses</span><strong>{totals ? totals.reportedResponsesReceived.toLocaleString() : "Unknown"}</strong><small>Users report</small></div>
-          <div className="copilot-user-metric"><span>Agents used</span><strong>{totals ? totals.reportedAgentsUsed.toLocaleString() : "Unknown"}</strong><small>Users report</small></div>
+          <div className="copilot-user-metric"><span>Agent responses</span><strong>{totals ? totals.reportedResponsesReceived.toLocaleString() : noReportedAgentActivity ? "Not reported" : "Unknown"}</strong><small>Users report</small></div>
+          <div className="copilot-user-metric"><span>Agents used</span><strong>{totals ? totals.reportedAgentsUsed.toLocaleString() : noReportedAgentActivity ? "Not reported" : "Unknown"}</strong><small>Users report</small></div>
         </div>
-        {reportUser ? <p className="user-report-period"><strong>Agent report dates</strong><span>{reportRange}</span></p> : null}
-        {reportUser?.missingUserReport ? <p className="copilot-users-notice">User totals are not included in this report.</p> : null}
+        {reportUser || noReportedAgentActivity ? <p className="user-report-period"><strong>Agent report dates</strong><span>{reportRange}</span></p> : null}
+        {reportUser?.missingUserReport && !noReportedAgentActivity ? <p className="copilot-users-notice">User totals are not included in this report.</p> : null}
         {directoryUser && !directoryCurrent ? <p className="copilot-users-notice">Showing saved user details. Refresh Users in Sync to verify current licensing.</p> : null}
         <section className="user-detail-card" aria-label="Saved directory organization">
           <h3>Organization</h3>
@@ -120,7 +121,7 @@ function UserDetailSession({ displayName, username, directoryUser, directoryCurr
             <ReportedUserAgents key={JSON.stringify([reportUser.username, reportUser.datasetScope.reportSetId,
               reportUser.datasetScope.usersVersionId, reportUser.datasetScope.userAgentsVersionId])}
               user={reportUser} filters={filters} onFocusAgent={onFocusAgent} />
-          </> : <p>No agent usage report is linked to this user.</p>}
+          </> : <p>{noReportedAgentActivity ? "No agent activity in the selected reports." : "No agent usage report is linked to this user."}</p>}
         </section>
         <section className="user-detail-card" aria-label="User Office app activity">
           <h3>Copilot in Office apps</h3>

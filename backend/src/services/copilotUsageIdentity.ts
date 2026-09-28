@@ -5,11 +5,6 @@ export function normalizeCopilotIdentity(value: string) {
   return value.trim().toLowerCase();
 }
 
-export function hasReportedAgentActivity(user: OfficialUsageUserSummary): boolean {
-  return (!user.missingUserReport && user.reportedResponsesReceived > 0)
-    || user.rows.some(row => row.responsesSentToUsers > 0);
-}
-
 export function matchImportedUsage(
   directoryUsers: readonly CopilotDirectoryUser[],
   imported: readonly OfficialUsageUserSummary[],

@@ -1,6 +1,6 @@
 import { AppError } from "../errors.js";
-import { isCopilotServiceActive, type CopilotDirectoryUser, type SavedCopilotUsageSource } from "../types/copilotUsage.js";
-import { hasReportedAgentActivity, matchImportedUsage } from "./copilotUsageIdentity.js";
+import { hasReportedAgentActivity, isCopilotServiceActive, type CopilotDirectoryUser, type SavedCopilotUsageSource } from "../types/copilotUsage.js";
+import { matchImportedUsage } from "./copilotUsageIdentity.js";
 import type { CopilotPackage } from "../types/copilotPackage.js";
 import type {
   AcceptedOfficialUsageReports,

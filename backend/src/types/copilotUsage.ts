@@ -63,6 +63,23 @@ export function isCopilotServiceActive(state: CopilotServiceSummaryState): boole
   return state === "enabled" || state === "warning" || state === "partially_enabled";
 }
 
+export function hasReportedAgentActivity(user: OfficialUsageUserSummary): boolean {
+  return (!user.missingUserReport && user.reportedResponsesReceived > 0)
+    || user.rows.some(row => row.responsesSentToUsers > 0);
+}
+
+export function copilotAgentActivity(
+  usage: OfficialUsageUserSummary | null,
+  reportAvailable: boolean,
+  hasUnresolvedIdentities: boolean,
+): "active" | "none" | "unknown" {
+  if (!reportAvailable) return "unknown";
+  if (usage && hasReportedAgentActivity(usage)) return "active";
+  if (usage && !usage.missingUserReport) return "none";
+  // Unmatched report rows could belong to a user absent from the exact identity join.
+  return hasUnresolvedIdentities ? "unknown" : "none";
+}
+
 export type CopilotServicePlan = {
   servicePlanId: string;
   service: string;

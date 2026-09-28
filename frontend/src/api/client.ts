@@ -32,7 +32,7 @@ export type {
 } from "../../../backend/src/types/unifiedAgents";
 export type { OfficialUsageAgentDetailView, OfficialUsageAggregateView, OfficialUsageHistoryBundleSummary, OfficialUsageHistoryObservationSummary, OfficialUsageHistoryView, OfficialUsageOverviewView, OfficialUsageReportKind, OfficialUsageSetSummary, OfficialUsageUserSummary, OfficialUsageUserView } from "../../../backend/src/types/officialUsage";
 export type { CopilotAppActivity, CopilotServicePlan, CopilotServiceSummaryState, CopilotUsageUser, CopilotUsageUsersResponse, CopilotUsageSourceSummary } from "../../../backend/src/types/copilotUsage";
-export { isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
+export { copilotAgentActivity, hasReportedAgentActivity, isCopilotServiceActive } from "../../../backend/src/types/copilotUsage";
 export type { PurviewAuditFilters, PurviewAuditJob, PurviewAuditQualification, PurviewAuditRecord, PurviewAuditRecordPage, PurviewAuditTokenMode } from "../../../backend/src/types/purviewAudit";
 export type { DefenderHuntingFilters, DefenderHuntingJob, DefenderHuntingRow, DefenderHuntingRowPage, DefenderHuntingTokenMode, DefenderInventoryDetailState } from "../../../backend/src/types/defenderHunting";
 export type { AutomaticRefreshResult, DataSyncMode, DataSyncRun, DataSyncSourceId, DataSyncSourceState, DataSyncSourceStatus, DataSyncState, StartDataSyncInput } from "../../../backend/src/types/dataSync";

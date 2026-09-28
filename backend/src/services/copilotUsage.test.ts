@@ -229,8 +229,7 @@ describe("CopilotUsageService", () => {
     expect(result.users.find(value => value.copilotServiceState === "partially_enabled")?.attention).toContain("copilot_service_partial");
     expect(result.users.find(value => value.copilotServiceState === "warning")?.attention).toContain("copilot_service_warning");
     expect(JSON.stringify(result.users)).not.toMatch(/skuId|skuPartNumber|assignmentStates|licenses/);
-    expect(result.sources.directory.message).toContain("Checked 7 directory users from products containing paid M365 Copilot and exact active report identities");
-    expect(result.sources.directory.message).toContain("not the total number of tenant accounts");
+    expect(result.sources.directory.message).toBe("Checked 7 directory users.");
     expect(result.notices).toContain("Active M365 Copilot licensed users counts only users with at least one verified active paid feature, including usable grace-period features. Active describes paid-feature availability, not recent usage or account sign-in status.");
     expect(result.notices.some(notice => notice.includes("Basic access and usage are not measured here"))).toBe(true);
     expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
@@ -265,7 +264,7 @@ describe("CopilotUsageService", () => {
     expect(result.counts).toEqual({
       licensedUsers: 2,
       measuredActivityUsers: 1,
-      needsAttentionUsers: 0,
+      needsAttentionUsers: 1,
       unknownMetricsUsers: 1,
       unresolvedImportedIdentities: 0,
     });
@@ -1000,7 +999,7 @@ describe("CopilotUsageService", () => {
     expect(JSON.stringify(result)).not.toContain("sensitive text");
   });
 
-  it("distinguishes zero agent usage from missing metrics for a fresh import", async () => {
+  it("classifies explicit zero and absence from complete identifiable reports as no reported agent activity", async () => {
     const published = importedPublished(
       [{ username: "11111111-1111-4111-8111-111111111111", displayName: "Zero", numberOfAgentsUsed: 0, agentResponsesReceived: 0 }],
       [],
@@ -1021,8 +1020,11 @@ describe("CopilotUsageService", () => {
     const missing = result.users.find(row => row.directory.userPrincipalName === "missing@example.com")!;
     expect(zero.attention).toEqual(expect.arrayContaining(["agent_usage_zero", "app_activity_inactive"]));
     expect(zero.attention).not.toContain("agent_usage_unknown");
-    expect(missing.attention).toContain("agent_usage_unknown");
-    expect(missing.attention).not.toContain("agent_usage_zero");
+    expect(missing.attention).not.toContain("agent_usage_unknown");
+    expect(missing.attention).toContain("agent_usage_zero");
+    expect(missing.importedUsage).toBeNull();
+    expect(result.counts.needsAttentionUsers).toBe(2);
+    expect(result.counts.unknownMetricsUsers).toBe(0);
     expect(result.sources.importedAgentUsage.state).toBe("available");
   });
 
@@ -1041,6 +1043,57 @@ describe("CopilotUsageService", () => {
     expect(result.users[0].importedUsage?.reportedResponsesReceived).toBe(0);
     expect(result.users[0].attention).toContain("agent_usage_unknown");
     expect(result.users[0].attention).not.toContain("agent_usage_zero");
+  });
+
+  it.each([
+    { total: 12, bridge: null, unresolved: false, expected: "active" },
+    { total: null, bridge: 12, unresolved: false, expected: "active" },
+    { total: 0, bridge: 12, unresolved: true, expected: "active" },
+    { total: 0, bridge: 0, unresolved: true, expected: "none" },
+    { total: null, bridge: 0, unresolved: false, expected: "none" },
+    { total: null, bridge: null, unresolved: false, expected: "none" },
+    { total: null, bridge: null, unresolved: true, expected: "unknown" },
+    { total: null, bridge: 0, unresolved: true, expected: "unknown" },
+  ] as const)("classifies both selected reports without replacing their totals: $total/$bridge/$unresolved", async ({ total, bridge, unresolved, expected }) => {
+    const username = "reported@example.com";
+    const users: UserUsageRow[] = total === null ? [] : [{
+      username, displayName: "Reported", numberOfAgentsUsed: total > 0 ? 1 : 0, agentResponsesReceived: total,
+    }];
+    if (unresolved) users.push({
+      username: "hidden-identity", displayName: "Hidden", numberOfAgentsUsed: 1, agentResponsesReceived: 20,
+    });
+    const result = await service({
+      directory: [directoryUser("11111111-1111-4111-8111-111111111111", username)],
+      report: { users: [], reportRefreshDate: null },
+      published: importedPublished(users, bridge === null ? [] : [{
+        username, agentId: "agent-one", agentName: "One", creatorType: "User", responsesSentToUsers: bridge,
+      }]),
+    }).users(user);
+    const row = result.users[0];
+    expect(row.attention.filter(reason => reason.startsWith("agent_usage_")))
+      .toEqual(expected === "active" ? [] : [expected === "none" ? "agent_usage_zero" : "agent_usage_unknown"]);
+    expect(result.counts.measuredActivityUsers).toBe(expected === "active" ? 1 : 0);
+    expect(result.counts.needsAttentionUsers).toBe(expected === "none" ? 1 : 0);
+    expect(result.unresolvedImportedIdentities).toHaveLength(unresolved ? 1 : 0);
+    if (total !== null) expect(row.importedUsage?.reportedResponsesReceived).toBe(total);
+    else if (bridge !== null) expect(row.importedUsage?.missingUserReport).toBe(true);
+    else expect(row.importedUsage).toBeNull();
+    if (bridge !== null) expect(row.importedUsage?.bridgeResponsesSentToUsers).toBe(bridge);
+  });
+
+  it.each(["not_selected", "incomplete", "stale"] as const)("keeps absent users unknown for %s reports", async state => {
+    const published = state === "not_selected" ? emptyPublished()
+      : importedPublished([], [], state === "stale" ? "2026-01-01" : "2026-09-12");
+    if (state === "incomplete") published.activeSelectionIncomplete = true;
+    const result = await service({
+      directory: [directoryUser("11111111-1111-4111-8111-111111111111", "absent@example.com")],
+      report: { users: [appUser("absent@example.com", "2026-09-12")], reportRefreshDate: "2026-09-13" },
+      published,
+    }).users(user);
+    expect(result.sources.importedAgentUsage.state).not.toBe("available");
+    expect(result.users[0].attention).toEqual(["agent_usage_unknown"]);
+    expect(result.counts.needsAttentionUsers).toBe(0);
+    expect(result.counts.unknownMetricsUsers).toBe(1);
   });
 
   it("keeps a blank fresh report date unknown instead of calling it inactive", async () => {
@@ -1079,7 +1132,7 @@ describe("CopilotUsageService", () => {
     const fresh = await value.users(user);
     expect(fresh.sources.appActivity.state).toBe("available");
     expect(fresh.counts.measuredActivityUsers).toBe(withImport ? 2 : 1);
-    expect(fresh.counts.needsAttentionUsers).toBe(1);
+    expect(fresh.counts.needsAttentionUsers).toBe(withImport ? 2 : 1);
     readAt = new Date("2026-09-17T23:59:59.998Z");
     expect((await value.users(user)).sources.appActivity.state).toBe("available");
     readAt = new Date("2026-09-17T23:59:59.999Z");
@@ -1093,7 +1146,7 @@ describe("CopilotUsageService", () => {
     expect(stale.users.every(row => row.attention.includes("app_activity_unknown"))).toBe(true);
     expect(stale.users.every(row => !row.attention.includes("app_activity_inactive"))).toBe(true);
     expect(stale.counts).toMatchObject({
-      licensedUsers: 2, measuredActivityUsers: withImport ? 1 : null, needsAttentionUsers: 0, unknownMetricsUsers: 2,
+      licensedUsers: 2, measuredActivityUsers: withImport ? 1 : null, needsAttentionUsers: withImport ? 1 : 0, unknownMetricsUsers: 2,
     });
     if (withImport) expect(stale.sources.importedAgentUsage.state).toBe("available");
     expect(harness.graph.listCopilotUsers).not.toHaveBeenCalled();
