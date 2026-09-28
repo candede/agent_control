@@ -471,7 +471,7 @@ export class OfficialUsageRepository {
         const retained = await client.query<{ deleted_at: Date | null; bundle_id: string }>(`SELECT deleted_at,bundle_id FROM official_usage_sets
           WHERE id=$1 AND tenant_id=$2`, [receipt.result_set_id, scope.tenantId]);
         if (retained.rows[0]?.deleted_at) {
-          throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
+          throw new AppError(409, "deleted_report_duplicate", "The report set from this import was deleted. Start a new upload to import these CSV files again.");
         }
         if (!retained.rows[0]) {
           throw new AppError(409, "bundle_unavailable", "The retained report bundle no longer exists.");
@@ -498,13 +498,10 @@ export class OfficialUsageRepository {
         const duplicate = (await client.query<SetRow>(`SELECT report_set.*,'{}'::text[] AS kinds
           FROM official_usage_sets report_set
           WHERE report_set.tenant_id=$1 AND report_set.content_hash=$2 AND report_set.complete
-          ORDER BY report_set.deleted_at NULLS FIRST,
-            CASE WHEN report_set.id=$3::uuid THEN 0 WHEN report_set.supersedes_set_id=$3::uuid THEN 1 ELSE 2 END,
+            AND report_set.deleted_at IS NULL
+          ORDER BY CASE WHEN report_set.id=$3::uuid THEN 0 WHEN report_set.supersedes_set_id=$3::uuid THEN 1 ELSE 2 END,
             report_set.accepted_at,report_set.id
           LIMIT 1 FOR UPDATE`, [scope.tenantId, preview.contentHash, correctionOfSetId])).rows[0];
-        if (duplicate?.deleted_at) {
-          throw new AppError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted and cannot be silently restored.");
-        }
         if (duplicate && (!correctionOfSetId || duplicate.id === correctionOfSetId || duplicate.supersedes_set_id === correctionOfSetId)) {
           const versions = await client.query<{ kind: ParsedOfficialUsageReport["kind"]; version_id: string }>(
             `SELECT kind,version_id FROM official_usage_set_versions

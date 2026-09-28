@@ -727,6 +727,11 @@ test("automatically imports all CSV rows, verifies the exact report and preserve
   });
   expect(adminReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: 2, staging: [] });
   expectExactImportReads(agentRequests);
+  const summary = modal.getByLabel("Imported CSV summary");
+  await expect(summary.locator("dt")).toHaveText(["Agents", "Users", "Responses"]);
+  await expect(summary.locator("dd")).toHaveText(["103", "104", "2,061"]);
+  await expect(summary).toBeInViewport({ ratio: 1 });
+  expect(await summary.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await expect(modal.getByRole("button", { name: "OK", exact: true })).toBeInViewport({ ratio: 1 });
   expect((await new AxeBuilder({ page }).include(".official-usage-modal").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -789,6 +794,25 @@ test("automatically imports all CSV rows, verifies the exact report and preserve
   await page.getByRole("button", { name: "Reset agent filters" }).click();
   await expect(agents.locator("tbody tr")).toHaveCount(25);
   expect(userRequests).toEqual([]);
+});
+
+test("success keeps maximum response totals readable without hiding OK", async ({ page }, info) => {
+  await mockUsage(page);
+  await page.goto("/sync?reports=import");
+  const modal = page.getByRole("dialog", { name: "Add CSV reports", exact: true });
+  const files = csvFiles.map((file, index) => index === 0 ? {
+    ...file,
+    content: `${file.content.split("\r\n")[0]}\r\nagent-power,Clinical assistant,User-created agent,2,1,${Number.MAX_SAFE_INTEGER},"Sep 12, 2026"\r\n`,
+  } : file);
+  await modal.getByLabel("Official usage CSV files").setInputFiles(csvFilePayloads(files));
+  await expectImported(modal);
+  const summary = modal.getByLabel("Imported CSV summary");
+  await expect(summary.locator("dd")).toHaveText(["1", "104", Number.MAX_SAFE_INTEGER.toLocaleString("en-US")]);
+  await expect(summary).toBeInViewport({ ratio: 1 });
+  expect(await summary.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  expect(await summary.locator("dd").last().evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await expect(modal.getByRole("button", { name: "OK", exact: true })).toBeInViewport({ ratio: 1 });
+  await captureCsvReportScreenshot(page, info, "success");
 });
 
 test("Cancel during validation disposes late staging and does not restore it into a fresh import", async ({ page }) => {

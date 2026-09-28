@@ -138,11 +138,58 @@ describe("automatic CSV report import", () => {
     expect(api.aggregate).toHaveBeenCalledWith({ setId, limit: 1, offset: 0 }, { signal: expect.any(AbortSignal) });
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(callbacks.onDone).not.toHaveBeenCalled();
+    const summary = within(screen.getByLabelText("Imported CSV summary"));
+    expect(summary.getAllByRole("term").map(term => term.textContent)).toEqual(["Agents", "Users", "Responses"]);
+    expect(summary.getAllByRole("definition").map(value => value.textContent)).toEqual(["2", "4", "270"]);
     expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["OK"]);
     expect(screen.queryByText(/hash|Review|Source totals differ/)).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Reports imported" })).toHaveFocus();
     await userEvent.click(screen.getByRole("button", { name: "OK" }));
     expect(callbacks.onDone).toHaveBeenCalledWith(setId);
+  });
+
+  it("uses full CSV counts, not the inventory, paged agents, or active-user count", async () => {
+    const snapshot = usageAggregateFixture();
+    snapshot.activeSet = reportSet;
+    snapshot.agents.value = snapshot.agents.value.slice(0, 1);
+    snapshot.agents.limit = 1;
+    snapshot.summary.catalog.totalAgents = 999;
+    expect(snapshot.summary.usage.totalActiveUsers).toBe(3);
+    api.aggregate.mockResolvedValueOnce(snapshot);
+    render(<OfficialUsageImportPanel {...callbacks} />);
+    await choose();
+    await imported();
+    expect(within(screen.getByLabelText("Imported CSV summary")).getAllByRole("definition").map(value => value.textContent))
+      .toEqual(["2", "4", "270"]);
+  });
+
+  it("formats large CSV totals without abbreviating or adding overlapping response sources", async () => {
+    const snapshot = usageAggregateFixture();
+    snapshot.activeSet = reportSet;
+    snapshot.lineages = snapshot.lineages.map(lineage => ({
+      ...lineage, rowCount: lineage.kind === "agents" ? 1234 : 56789,
+    }));
+    snapshot.summary.usage.totalResponses = Number.MAX_SAFE_INTEGER;
+    api.aggregate.mockResolvedValueOnce(snapshot);
+    render(<OfficialUsageImportPanel {...callbacks} />);
+    await choose();
+    await imported();
+    expect(within(screen.getByLabelText("Imported CSV summary")).getAllByRole("definition").map(value => value.textContent))
+      .toEqual([1234, 56789, Number.MAX_SAFE_INTEGER].map(value => value.toLocaleString()));
+  });
+
+  it.each([false, true])("distinguishes empty CSVs from unavailable statistics (unavailable=%s)", async unavailable => {
+    const snapshot = usageAggregateFixture();
+    snapshot.activeSet = reportSet;
+    snapshot.lineages = unavailable ? [] : snapshot.lineages.map(lineage => ({ ...lineage, rowCount: 0 }));
+    snapshot.summary.usage.totalResponses = unavailable ? null : 0;
+    api.aggregate.mockResolvedValueOnce(snapshot);
+    render(<OfficialUsageImportPanel {...callbacks} />);
+    await choose();
+    await imported();
+    expect(within(screen.getByLabelText("Imported CSV summary")).getAllByRole("definition").map(value => value.textContent))
+      .toEqual(Array(3).fill(unavailable ? "Unknown" : "0"));
+    expect(screen.getAllByRole("button").map(button => button.textContent)).toEqual(["OK"]);
   });
 
   it("accepts drag-and-drop without an extra upload or acceptance action", async () => {
@@ -330,11 +377,12 @@ describe("automatic CSV report import", () => {
     expect(api.stage).toHaveBeenCalledTimes(3);
   });
 
-  it("never turns a deleted-duplicate conflict into import success", async () => {
-    api.accept.mockRejectedValue(new ApiError(409, "deleted_report_duplicate", "This exact report bundle was explicitly deleted."));
+  it("requires a fresh upload when an earlier import's report set was deleted", async () => {
+    api.accept.mockRejectedValue(new ApiError(409, "deleted_report_duplicate", "The report set from this import was deleted. Start a new upload to import these CSV files again."));
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose();
-    expect(await screen.findByRole("alert")).toHaveTextContent("explicitly deleted");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Start a new upload");
+    expect(screen.getByRole("button", { name: "Start over" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "OK" })).not.toBeInTheDocument();
     expect(callbacks.onChanged).not.toHaveBeenCalled();
   });
@@ -345,8 +393,11 @@ describe("automatic CSV report import", () => {
     await choose();
     expect(await screen.findByRole("alert")).toHaveTextContent("Your reports were saved");
     expect(screen.queryByRole("button", { name: "OK" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Imported CSV summary")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     await imported();
+    expect(within(screen.getByLabelText("Imported CSV summary")).getAllByRole("definition").map(value => value.textContent))
+      .toEqual(["2", "4", "270"]);
     expect(api.accept).toHaveBeenCalledOnce();
     expect(api.stage).toHaveBeenCalledTimes(3);
   });
@@ -367,6 +418,8 @@ describe("automatic CSV report import", () => {
     await imported();
     expect(screen.getByRole("heading", { name: "Reports already imported" })).toBeVisible();
     expect(screen.getByText(/No duplicate was created/)).toBeVisible();
+    expect(within(screen.getByLabelText("Imported CSV summary")).getAllByRole("definition").map(value => value.textContent))
+      .toEqual(["2", "4", "270"]);
     expect(api.selection).not.toHaveBeenCalled();
     expect(state.sets).toEqual([]);
   });

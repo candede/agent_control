@@ -285,7 +285,7 @@ describe.sequential("official usage cumulative history", () => {
       .rejects.toMatchObject({ code: "official_usage_set_not_found" });
   });
 
-  it("keeps unknown activity ranges non-coverage, survives old expiry dates, and never resurrects deletion", async () => {
+  it("keeps unknown ranges non-coverage and old deletions intact when their content is reimported", async () => {
     const unknownScope = { tenantId: "tenant-official-history-unknown", principalId: "history-unknown-a" };
     const imported = await importBundle({
       owner: unknownScope,
@@ -334,8 +334,13 @@ describe.sequential("official usage cumulative history", () => {
       },
       reformatted: true,
     });
-    await expect(reupload.accept()).rejects.toMatchObject({ code: "deleted_report_duplicate" });
-    expect((await history.getHistory(unknownScope.tenantId)).summary.importCount).toBe(1);
+    const reimported = await reupload.accept();
+    expect(reimported).toMatchObject({ complete: true, reusedExistingSet: false });
+    expect(reimported.setId).not.toBe(accepted.setId);
+    const refreshedHistory = await history.getHistory(unknownScope.tenantId);
+    expect(refreshedHistory.summary.importCount).toBe(2);
+    expect(refreshedHistory.bundles.value).toEqual(expect.arrayContaining([expect.objectContaining({ id: reimported.setId, isActive: true })]));
+    expect(refreshedHistory.bundles.value.some(bundle => bundle.id === accepted.setId)).toBe(false);
     await expect(repository.getPublished(unknownScope.tenantId, accepted.setId))
       .rejects.toMatchObject({ code: "official_usage_set_not_found" });
 

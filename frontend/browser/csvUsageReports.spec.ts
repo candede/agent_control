@@ -28,6 +28,7 @@ async function uploadBundle(page: Page, dates: [string, string, string], identit
   expect(result.reusedExistingSet).toBe(expectedDuplicate);
   await expect(modal.getByRole("heading", { name: expectedDuplicate ? "Reports already imported" : "Reports imported", exact: true })).toBeVisible();
   await expect(modal.getByRole("status")).toContainText("Your report set is ready in Agents.");
+  await expect(modal.getByLabel("Imported CSV summary").locator("dd")).toHaveText(["1", "1", "7"]);
   await expect(modal.getByRole("button")).toHaveText(["OK"]);
   await modal.getByRole("button", { name: "OK", exact: true }).click();
   await expect(page).toHaveURL(/\/agents$/);
@@ -110,4 +111,12 @@ test("CSV section reflects retained observed activity dates across history after
   await deleteBundle(page, second, "2026-08-01");
   await expect(reports.getByRole("heading", { name: "No reports yet", exact: true })).toBeVisible();
   await expect(reports.locator("time")).toHaveCount(0);
+  const reimported = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name);
+  expect(reimported).not.toBe(first);
+  await expect(reports.getByRole("heading", { name: "1 saved report set", exact: true })).toBeVisible();
+  const duplicate = await uploadBundle(page, ["2026-01-02", "2026-01-15", "2026-01-30"], info.project.name, true);
+  expect(duplicate).toBe(reimported);
+  await expect(reports.getByRole("heading", { name: "1 saved report set", exact: true })).toBeVisible();
+  await deleteBundle(page, reimported, "2026-01-02");
+  await expect(reports.getByRole("heading", { name: "No reports yet", exact: true })).toBeVisible();
 });

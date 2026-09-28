@@ -10,13 +10,13 @@ import {
   previewOfficialUsageBundle,
   previewOfficialUsageSetOperation,
   stageOfficialUsageReport,
+  type OfficialUsageAggregateView,
   type OfficialUsageBundlePreview,
-  type OfficialUsageSetSummary,
   type OfficialUsageStagingPreview,
 } from "../api/client";
 import { useSavedRead } from "../savedQueries";
 import { companionMetadata, errorMessage, kindLabel, type FileValidation } from "./officialUsageImportPresentation";
-import { usageDate } from "../usageInsights";
+import { usageCount, usageDate } from "../usageInsights";
 import "./officialUsage.css";
 
 const reportGuideUrl = "https://learn.microsoft.com/en-us/microsoft-365/admin/activity-reports/microsoft-365-copilot-agents-new?view=o365-worldwide";
@@ -46,7 +46,7 @@ export function OfficialUsageImportPanel({
   const [files, setFiles] = useState<FileValidation[]>([]);
   const [preview, setPreview] = useState<OfficialUsageBundlePreview>();
   const [accepted, setAccepted] = useState<Accepted>();
-  const [report, setReport] = useState<OfficialUsageSetSummary>();
+  const [report, setReport] = useState<OfficialUsageAggregateView>();
   const [problem, setProblem] = useState<{ text: string; recovery?: Recovery; denied?: boolean }>();
   const [dragging, setDragging] = useState(false);
   const [restored, setRestored] = useState(false);
@@ -191,7 +191,7 @@ export function OfficialUsageImportPanel({
         throw new Error("The report selection changed. Try again to use your imported reports.");
       }
     }
-    setReport(snapshot.activeSet);
+    setReport(snapshot);
     setProblem(undefined);
     changePhase("complete");
   }
@@ -373,6 +373,7 @@ export function OfficialUsageImportPanel({
     ...(preview?.acceptedVersions.map(item => item.kind) ?? []),
   ]);
   const missing = reportKinds.filter(kind => !present.has(kind));
+  const reportingPeriod = report?.activeSet?.reportingPeriod;
   const pickerLabel = rejected ? "Choose replacement CSVs" : files.length || restored ? "Add CSV files" : "Choose CSV files";
   const status = phase === "checking" ? "Checking CSV files..."
     : phase === "saving" ? "Importing reports..."
@@ -385,9 +386,14 @@ export function OfficialUsageImportPanel({
         <CheckCircle2 size={44} aria-hidden="true" />
         <h3 ref={statusHeading} tabIndex={-1}>{accepted?.reusedExistingSet ? "Reports already imported" : "Reports imported"}</h3>
         <p role="status">{accepted?.reusedExistingSet ? "No duplicate was created. " : ""}Your report set is ready in Agents.</p>
-        {report?.reportingPeriod.startDate && report.reportingPeriod.endDate ? <p className="usage-import-dates">
-          {report.reportingPeriod.provenance === "activity_range" ? "Observed activity" : "Reporting period"}:{" "}
-          {usageDate(report.reportingPeriod.startDate)} to {usageDate(report.reportingPeriod.endDate)}
+        {report ? <dl className="usage-import-statistics" aria-label="Imported CSV summary">
+          <div><dt>Agents</dt><dd>{usageCount(report.lineages.find(lineage => lineage.kind === "agents")?.rowCount)}</dd></div>
+          <div><dt>Users</dt><dd>{usageCount(report.lineages.find(lineage => lineage.kind === "users")?.rowCount)}</dd></div>
+          <div><dt>Responses</dt><dd>{usageCount(report.summary.usage.totalResponses)}</dd></div>
+        </dl> : null}
+        {reportingPeriod?.startDate && reportingPeriod.endDate ? <p className="usage-import-dates">
+          {reportingPeriod.provenance === "activity_range" ? "Observed activity" : "Reporting period"}:{" "}
+          {usageDate(reportingPeriod.startDate)} to {usageDate(reportingPeriod.endDate)}
         </p> : null}
       </div> : <>
         {problem ? <div className="report-status error" role="alert">

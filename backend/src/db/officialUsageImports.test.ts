@@ -117,6 +117,85 @@ describe("official usage automatic import semantics", () => {
     await expect(duplicate.accept()).rejects.toMatchObject({ code: "deleted_report_duplicate" });
   });
 
+  it.each([false, true])("imports deleted content as a new set without reviving old receipts (purged=%s)", async purged => {
+    const scope = owner();
+    const original = await bundle(scope);
+    const removed = await original.accept();
+    const originalReport = await repository.getPublished(scope.tenantId);
+    const deletion = await setOperation(scope, "delete", removed.setId);
+    if (purged) {
+      await fixture.operator.query(`UPDATE official_usage_sets
+        SET deleted_at=clock_timestamp()-interval '91 days' WHERE id=$1`, [removed.setId]);
+      await fixture.operator.query(`UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days'
+        WHERE id IN (SELECT version_id FROM official_usage_set_versions WHERE set_id=$1)`, [removed.setId]);
+      await retain(fixture.operator);
+    }
+    const oldReceiptError = { code: purged ? "bundle_unavailable" : "deleted_report_duplicate" };
+    await expect(original.accept()).rejects.toMatchObject(oldReceiptError);
+    const reimport = await bundle({ ...scope, principalId: "reimport-administrator" }, { reformatted: purged });
+    const [accepted, retried] = await Promise.all([reimport.accept(), reimport.accept()]);
+    expect(retried).toEqual(accepted);
+    expect(accepted).toMatchObject({
+      complete: true, reusedExistingSet: false, activeRevision: deletion.activeRevision + 1,
+    });
+    expect(accepted.setId).not.toBe(removed.setId);
+    const published = await repository.getPublished(scope.tenantId);
+    expect(published.activeSet).toMatchObject({
+      id: accepted.setId, bundleId: reimport.bundleId, complete: true, supersedesSetId: null,
+    });
+    expect(published.activeSet?.acceptedAt).not.toBe(originalReport.activeSet?.acceptedAt);
+    for (const kind of kinds) expect(published.reports[kind]?.rows).toEqual(originalReport.reports[kind]?.rows);
+    const oldSet = (await fixture.runtime.query("SELECT bundle_id,deleted_at FROM official_usage_sets WHERE id=$1", [removed.setId])).rows;
+    expect(oldSet).toEqual(purged ? [] : [{ bundle_id: original.bundleId, deleted_at: expect.any(Date) }]);
+    await expect(repository.getPublished(scope.tenantId, removed.setId)).rejects.toMatchObject({ code: "official_usage_set_not_found" });
+    const expectedCounts = { sets: purged ? 1 : 2, versions: purged ? 3 : 6, facts: 3, rows: 3, memberships: purged ? 3 : 6 };
+    expect(await counts(scope)).toEqual(expectedCounts);
+    const duplicate = await bundle(scope);
+    expect(await duplicate.accept()).toMatchObject({
+      setId: accepted.setId, reusedExistingSet: true, activeRevision: accepted.activeRevision,
+    });
+    expect(await counts(scope)).toEqual(expectedCounts);
+    await expect(original.accept()).rejects.toMatchObject(oldReceiptError);
+    expect((await repository.getPublished(scope.tenantId)).activeSet?.id).toBe(accepted.setId);
+  });
+
+  it("reimports a deleted historical set without changing reports that share its versions", async () => {
+    const scope = owner();
+    const original = await (await bundle(scope)).accept();
+    const otherBundleId = randomUUID();
+    await Promise.all(kinds.map(kind => stage(scope, otherBundleId, kind, { responses: kind === "agents" ? 7 : 4 })));
+    const other = await repository.acceptBundle(scope, otherBundleId, await repository.previewBundle(scope, otherBundleId));
+    const otherReport = await repository.getPublished(scope.tenantId, other.setId);
+    await setOperation(scope, "delete", original.setId);
+    expect((await repository.getPublished(scope.tenantId)).activeSet?.id).toBe(other.setId);
+    const reimported = await (await bundle(scope)).accept();
+    expect(reimported).toMatchObject({ complete: true, reusedExistingSet: false });
+    expect([original.setId, other.setId]).not.toContain(reimported.setId);
+    expect((await repository.getPublished(scope.tenantId)).activeSet?.id).toBe(reimported.setId);
+    expect((await repository.getPublished(scope.tenantId, other.setId)).reports).toEqual(otherReport.reports);
+    await expect(repository.getPublished(scope.tenantId, original.setId)).rejects.toMatchObject({ code: "official_usage_set_not_found" });
+    expect(await counts(scope)).toEqual({ sets: 3, versions: 5, facts: 4, rows: 4, memberships: 9 });
+  });
+
+  it("serializes simultaneous reuploads and deduplicates a fresh retry", async () => {
+    const scope = owner();
+    const original = await (await bundle(scope)).accept();
+    await setOperation(scope, "delete", original.setId);
+    const drafts = await Promise.all([bundle(scope), bundle(scope)]);
+    const results = await Promise.allSettled(drafts.map(draft => draft.accept()));
+    expect(results.map(result => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const accepted = results.find(result => result.status === "fulfilled");
+    if (!accepted) throw new Error("Expected one reupload to complete.");
+    const retryIndex = results.findIndex(result => result.status === "rejected");
+    expect(results[retryIndex]).toMatchObject({ reason: { code: "active_revision_mismatch" } });
+    await Promise.all(drafts[retryIndex].stages.map(stage => repository.discardStaging(scope, stage.id)));
+    const retry = await bundle(scope);
+    expect(await retry.accept()).toMatchObject({
+      setId: accepted.value.setId, complete: true, reusedExistingSet: true, activeRevision: accepted.value.activeRevision,
+    });
+    expect(await counts(scope)).toEqual({ sets: 2, versions: 6, facts: 3, rows: 3, memberships: 6 });
+  });
+
   it.each([false, true])("creates a correction using another set's report versions (resumed legacy draft=%s)", async resumeDraft => {
     const scope = owner();
     const original = await (await bundle(scope)).accept();
@@ -186,15 +265,20 @@ describe("official usage automatic import semantics", () => {
     })).rejects.toMatchObject({ code: "invalid_correction" });
   });
 
-  it("keeps deleted correction content fenced even when its correction target is still available", async () => {
+  it("allows deleted content in a new correction while still requiring an available correction target", async () => {
     const scope = owner();
     const original = await (await bundle(scope)).accept();
     const removed = await (await bundle(scope, { responses: 7 })).accept();
     await setOperation(scope, "delete", removed.setId);
     await setOperation(scope, "select", original.setId);
     const correction = await bundle(scope, { responses: 7, correctionOfSetId: original.setId });
-    await expect(correction.accept()).rejects.toMatchObject({ code: "deleted_report_duplicate" });
-    expect((await repository.getPublished(scope.tenantId)).activeSet?.id).toBe(original.setId);
+    const accepted = await correction.accept();
+    expect(accepted).toMatchObject({ complete: true, reusedExistingSet: false });
+    expect([removed.setId, original.setId]).not.toContain(accepted.setId);
+    expect((await repository.getPublished(scope.tenantId)).activeSet).toMatchObject({
+      id: accepted.setId, supersedesSetId: original.setId,
+    });
+    await expect(repository.getPublished(scope.tenantId, removed.setId)).rejects.toMatchObject({ code: "official_usage_set_not_found" });
     await setOperation(scope, "delete", original.setId);
     await expect(bundle(scope, { correctionOfSetId: original.setId })).rejects.toMatchObject({ code: "invalid_correction" });
   });
