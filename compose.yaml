@@ -41,7 +41,8 @@ services:
     command: [postgres, -c, shared_buffers=32MB, -c, min_wal_size=32MB, -c, max_wal_size=64MB]
     network_mode: none
     cpus: 0.5
-    mem_limit: 512m
+    # The 32 MiB JSONB boundary tests need working memory in addition to the data tmpfs.
+    mem_limit: 1g
     environment:
       POSTGRES_DB: agentcontrol_test_control
       POSTGRES_USER: agentcontrol_admin

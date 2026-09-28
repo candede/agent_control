@@ -517,7 +517,8 @@
   flex-shrink: 0;
 }
 
-.agent-workspace select.active-filter-select {
+.agent-workspace select.active-filter-select,
+.user-activity-controls select.active-filter-select {
   border-color: #a9a2e8;
   background-color: #f6f5ff;
   box-shadow: none;
@@ -553,7 +554,8 @@
   font-variant-numeric: tabular-nums;
 }
 
-.agent-workspace .agent-filter-chip {
+.agent-workspace .agent-filter-chip,
+.user-activity-controls .agent-filter-chip {
   display: inline-flex;
   gap: 6px;
   min-height: 28px;
@@ -575,7 +577,8 @@
   flex-shrink: 0;
 }
 
-.agent-workspace .clear-filters-button {
+.agent-workspace .clear-filters-button,
+.user-activity-controls .clear-filters-button {
   min-height: 36px;
   padding: 3px 6px;
   border: 0;
@@ -585,7 +588,8 @@
   white-space: nowrap;
 }
 
-.agent-workspace .clear-filters-button:hover {
+.agent-workspace .clear-filters-button:hover,
+.user-activity-controls .clear-filters-button:hover {
   color: var(--ink);
   text-decoration: underline;
 }
@@ -732,7 +736,8 @@
     gap: 12px;
   }
 
-  .agent-workspace button {
+  .agent-workspace button,
+  .user-activity-controls button {
     width: auto;
   }
 
@@ -872,7 +877,8 @@
     padding-inline: 8px;
   }
 
-  .agent-workspace .agent-filter-chip {
+  .agent-workspace .agent-filter-chip,
+  .user-activity-controls .agent-filter-chip {
     font-size: 10px;
   }
 

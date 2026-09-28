@@ -17,6 +17,36 @@ import { UnifiedAgentRegistry } from "./unifiedAgentRegistry.js";
 import { readUnifiedInventoryRevision } from "./unifiedInventoryRevision.js";
 
 describe("package control observation upgrade", () => {
+  it.each([
+    ["preserves earlier expiry", "2026-10-28T08:58:32.601495+00:00", "2026-10-28T08:58:32.601495+00:00"],
+    ["preserves expiry at the cap", "2026-10-28T08:58:32.601496+00:00", "2026-10-28T08:58:32.601496+00:00"],
+    ["clamps expiry one microsecond past the cap", "2026-10-28T08:58:32.601497+00:00", "2026-10-28T08:58:32.601496+00:00"],
+  ])("%s", async (_name, expiresAt, expectedExpiry) => {
+    const fixture = await testDatabase(false);
+    try {
+      await bootstrap(fixture.operator, fixturePassword);
+      await migrate(fixture.operator, migrations.filter(step => step.version < 44));
+      const observedAt = "2026-09-28T08:58:32.601496+00:00";
+      const snapshotId = randomUUID();
+      await fixture.operator.query(`INSERT INTO package_inventory_snapshots(
+        id,tenant_id,principal_id,token_mode,query_hash,scope_kind,requested_ids,
+        observed_count,total_records,page_count,observed_at,expires_at)
+        VALUES($1,'expiry-tenant','expiry-reader','delegated',$2,'broad','[]',0,0,1,$3,$4)`,
+      [snapshotId, "a".repeat(64), observedAt, expiresAt]);
+
+      await migrate(fixture.operator);
+      const result = await fixture.operator.query(`SELECT
+        to_jsonb(observed_at) AS observed_at,to_jsonb(read_started_at) AS read_started_at,
+        to_jsonb(expires_at) AS expires_at
+        FROM package_inventory_snapshots WHERE id=$1`, [snapshotId]);
+      expect(result.rows).toEqual([{
+        observed_at: observedAt, read_started_at: observedAt, expires_at: expectedExpiry,
+      }]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("reclassifies proven legacy readbacks and reunites split source records without a Microsoft resync", async () => {
     const fixture = await testDatabase(false);
     try {

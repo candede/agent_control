@@ -414,7 +414,7 @@ async function measureUnencodedDirectoryBytes(users: readonly CopilotDirectoryUs
     query, [JSON.stringify({ serviceEvidenceVersion: 1, users: [] })],
   );
   let bytes = empty.rows[0].bytes;
-  // Parsing the full legacy roster exhausts the 512 MiB PostgreSQL fixture.
+  // Measure the legacy representation in batches to bound PostgreSQL working memory.
   for (let offset = 0; offset < users.length; offset += 500) {
     const batch = await fixture.runtime.query<{ bytes: number }>(
       query, [JSON.stringify(users.slice(offset, offset + 500))],

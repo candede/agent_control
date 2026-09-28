@@ -1,9 +1,10 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { Search, SlidersHorizontal, X } from "lucide-react";
+import { useRef } from "react";
+import { Search, X } from "lucide-react";
 import type { UnifiedAgentInventoryPage } from "../api/client";
 import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions } from "../agentColumns";
 import type { AgentRouteState } from "../workbenchRouting";
 import { EnvironmentFilter } from "./EnvironmentFilter";
+import { FilterPopover } from "./FilterPopover";
 
 export type AgentFilterValues = Pick<AgentRouteState,
   "search" | "packageType" | "endUserAccess" | "reportedUsage" | "management" | "relevance" | "platform" | "availability" | "host" | "status"
@@ -34,12 +35,8 @@ const statusOptions = [
 ] as const;
 
 export function AgentInventoryFilters({ values, options, loading, matchingCount, onChange, onClear, onError }: Props) {
-  const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
-  const popover = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const firstField = useRef<HTMLSelectElement>(null);
-  const id = useId();
   function changeChoice<T extends string>(value: string, choices: readonly { value: T }[], change: (value: T) => void) {
     const choice = choices.find(option => option.value === value);
     if (!choice) {
@@ -87,54 +84,6 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
   });
   const hasFilters = chips.length > 0 || Boolean(values.search.trim()) || Boolean(values.packageType);
 
-  useLayoutEffect(() => {
-    if (!open) return;
-    const positionPopover = () => {
-      const panel = popover.current;
-      const anchor = root.current;
-      if (!panel || !anchor) return;
-      if (window.innerWidth <= 760 || window.innerHeight <= 640) {
-        panel.dataset.side = "below";
-        panel.style.removeProperty("--agent-filter-max-height");
-        return;
-      }
-      const bounds = anchor.getBoundingClientRect();
-      // Reserve the 10px anchor gap and a 16px viewport inset.
-      const below = Math.max(0, window.innerHeight - bounds.bottom - 26);
-      const above = Math.max(0, bounds.top - 26);
-      const opensAbove = below < 320 && above > below;
-      panel.dataset.side = opensAbove ? "above" : "below";
-      panel.style.setProperty("--agent-filter-max-height", `${Math.min(560, opensAbove ? above : below)}px`);
-    };
-    positionPopover();
-    window.addEventListener("resize", positionPopover);
-    window.addEventListener("scroll", positionPopover, true);
-    return () => {
-      window.removeEventListener("resize", positionPopover);
-      window.removeEventListener("scroll", positionPopover, true);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    firstField.current?.focus();
-    const dismissOutside = (event: PointerEvent) => {
-      if (event.target instanceof Node && !root.current?.contains(event.target)) setOpen(false);
-    };
-    const dismissEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      setOpen(false);
-      trigger.current?.focus();
-    };
-    document.addEventListener("pointerdown", dismissOutside);
-    document.addEventListener("keydown", dismissEscape);
-    return () => {
-      document.removeEventListener("pointerdown", dismissOutside);
-      document.removeEventListener("keydown", dismissEscape);
-    };
-  }, [open]);
-
   return <section className="catalog-controls" aria-label="Filters">
     <div className="agent-query-bar">
       <label className="agent-search-field">
@@ -171,25 +120,8 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
           trigger.current?.focus();
         }}>Clear filters</button> : null}
       </div>
-      <div className="agent-filter-picker" ref={root} onBlur={event => {
-        if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
-      }}>
-        <button ref={trigger} type="button" className="secondary agent-filter-trigger"
-          aria-label={chips.length ? `Filters, ${chips.length} active` : "Filters"}
-          title="Filter agents and choose sort order"
-          aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? id : undefined}
-          onClick={() => setOpen(value => !value)}>
-          <SlidersHorizontal size={16} aria-hidden="true" /> Filters
-          {chips.length ? <span className="filter-count" aria-hidden="true">{chips.length}</span> : null}
-        </button>
-        {open ? <div ref={popover} id={id} className="agent-filter-popover" role="dialog" aria-label="Filter agents">
-          <header>
-            <div><strong>Filter agents</strong><p>Refine this inventory. Changes apply immediately.</p></div>
-            <button type="button" className="secondary icon-button" aria-label="Close filters" onClick={() => {
-              setOpen(false);
-              trigger.current?.focus();
-            }}><X size={18} aria-hidden="true" /></button>
-          </header>
+      <FilterPopover label="Filter agents" activeCount={chips.length} triggerRef={trigger}
+        description="Refine this inventory. Changes apply immediately.">
           <div className="agent-filter-fields">
             {fields.map((field, index) => <label key={field.key}>
               <span>{field.label}</span>
@@ -245,8 +177,7 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
               firstField.current?.focus();
             }}>Reset filters</button>
           </footer>
-        </div> : null}
-      </div>
+      </FilterPopover>
     </div>
     {values.management !== "all"
       ? <p className="notice" role="note">Management views show confirmed evidence only. Sharing, installation or missing data alone does not establish who manages an agent.</p> : null}

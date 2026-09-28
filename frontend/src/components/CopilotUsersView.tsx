@@ -16,14 +16,24 @@ import { copilotServicePresentation } from "../copilotServicePresentation";
 import { useListTable, type ListColumn } from "../listTable";
 import { useSavedRead } from "../savedQueries";
 import type { UsersRouteState } from "../workbenchRouting";
+import { isValidLowResponseThreshold } from "../usageInsights";
 import { ListTableHead } from "./ListTableHead";
-import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { ReportedUserActivity } from "./ReportedUserActivity";
+import { UserActivityFilters, type UserActivityFilterValues } from "./UserActivityFilters";
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
 import { UserDetailModal } from "./UserDetailModal";
 import "./copilotUsers.css";
 
 type Cohort = "licensed" | "using" | "attention" | "no-activity";
+const defaultFilters: UserActivityFilterValues<Cohort> = {
+  company: "", department: "", cohort: "licensed", lowResponseThreshold: "5",
+};
+const cohorts = [
+  { value: "licensed", label: "All paid users" },
+  { value: "using", label: "Using agents" },
+  { value: "attention", label: "Needs attention" },
+  { value: "no-activity", label: "No reported agent activity" },
+] as const;
 type ReadKey = { dataRevision: number; reload: number; needsDirectory: boolean };
 type ReadState = { key: ReadKey; status: "ready" } | { key: ReadKey; status: "failed"; error: string; accessDenied?: boolean };
 const pageSize = 50;
@@ -33,14 +43,10 @@ const licenseSorts = [
   ["responses-asc", "Fewest agent responses", "responses", false],
   ["name", "Name A–Z", "user", false],
   ["name-desc", "Name Z–A", "user", true],
-  ["license-asc", "Paid feature state A–Z", "license", false],
-  ["license-desc", "Paid feature state Z–A", "license", true],
   ["agents-desc", "Most reported agents used", "agentsUsed", true],
   ["agents-asc", "Fewest reported agents used", "agentsUsed", false],
-  ["activity", "Latest agent-report activity", "activity", true],
-  ["activity-asc", "Oldest agent-report activity", "activity", false],
-  ["follow-up-asc", "Follow-up A–Z", "followUp", false],
-  ["follow-up-desc", "Follow-up Z–A", "followUp", true],
+  ["activity", "Latest user activity", "activity", true],
+  ["activity-asc", "Oldest user activity", "activity", false],
 ] as const;
 
 type Props = {
@@ -131,7 +137,7 @@ function CopilotUsersSession({
           <p>{currentRoute.view === "licenses"
             ? "Effective paid M365 Copilot licenses and adoption."
             : currentRoute.view === "responsibility" ? "People explicitly responsible for saved agents, independent of licenses and usage."
-              : "Active report users with verified current non-paid Copilot status."}</p>
+              : "Agent activity by users without paid Copilot."}</p>
         </div>
         <div className="copilot-users-header-actions">
           <label className="copilot-users-cohort"><span>User cohort</span>
@@ -156,31 +162,41 @@ function CopilotUsersSession({
       {currentRoute.view === "responsibility" ? <UserAgentResponsibility key={currentRoute.personId ?? "people"} route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
         : currentRoute.view === "activity" ? !accessDenied ? <ReportedUserActivity route={currentRoute} onRouteChange={changeRoute} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} directoryData={currentData} directoryDataRevision={read?.key.dataRevision} directoryPending={loading} onOpenAgent={onOpenAgent}
         onAccessDenied={message => { directoryRequest.current?.abort(); setData(undefined); setSelectedUser(undefined); setRead({ key: readKey, status: "failed", error: message, accessDenied: true }); }} /> : null
-        : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, key: selectionKey })} /> : null}
+        : data ? <CopilotUsersDashboard data={data} current={Boolean(currentData)} refreshing={loading} onInspectUser={(user, threshold) => setSelectedUser({ id: user.directory.objectId, threshold, key: selectionKey })} /> : null}
       {selected && selectedUser && data ? <CopilotUserDetail user={selected} data={data} current={Boolean(currentData)} refreshing={loading} threshold={selectedUser.threshold} returnFocusTo={cohortSelect} onClose={() => setSelectedUser(undefined)} onOpenAgent={onOpenAgent} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} /> : null}
     </section>
   );
 }
 
-function CopilotUsersDashboard({ data, current, onInspectUser }: {
-  data: CopilotUsageUsersResponse; current: boolean; onInspectUser: (user: CopilotUsageUser, threshold: number) => void;
+function CopilotUsersDashboard({ data, current, refreshing, onInspectUser }: {
+  data: CopilotUsageUsersResponse; current: boolean; refreshing: boolean; onInspectUser: (user: CopilotUsageUser, threshold: number) => void;
 }) {
   const [search, setSearch] = useState("");
-  const [cohort, setCohort] = useState<Cohort>("licensed");
+  const [filters, setFilters] = useState(defaultFilters);
+  const [draft, setDraft] = useState(defaultFilters);
   const [sorting, setSorting] = useState<SortingState>(defaultLicenseSorting);
-  const [threshold, setThreshold] = useState(5);
   const [page, setPage] = useState(0);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const { cohort, company, department } = filters;
+  const threshold = Number(filters.lowResponseThreshold);
+  const validThreshold = isValidLowResponseThreshold(draft.lowResponseThreshold);
   const directoryKnown = data.sources.directory.state === "available";
   const directoryCurrent = current && directoryKnown;
   const agentUsageFresh = current && data.sources.importedAgentUsage.state === "available";
   const appActivityFresh = current && ["available", "partial"].includes(data.sources.appActivity.state);
   const hasUnresolvedIdentities = data.unresolvedImportedIdentities.length > 0;
   const licensedUsers = useMemo(() => data.users.filter(user => isCopilotServiceActive(user.copilotServiceState)), [data.users]);
+  const organizations = useMemo(() => ({
+    companies: [...new Set(licensedUsers.map(user => user.directory.companyName?.trim()).filter((value): value is string => Boolean(value)))].sort((a, b) => a.localeCompare(b)),
+    departments: [...new Set(licensedUsers.map(user => user.directory.department?.trim()).filter((value): value is string => Boolean(value)))].sort((a, b) => a.localeCompare(b)),
+  }), [licensedUsers]);
   const attention = licensedUsers.filter(user => needsAttention(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities)).length;
   const noActivity = licensedUsers.filter(user => copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none").length;
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return licensedUsers.filter(user => {
+      if (company && user.directory.companyName?.trim() !== company) return false;
+      if (department && user.directory.department?.trim() !== department) return false;
       if (query && ![
         user.directory.displayName, user.directory.userPrincipalName, user.directory.objectId,
         user.directory.companyName, user.directory.department,
@@ -191,24 +207,19 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
       if (cohort === "no-activity") return copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none";
       return true;
     });
-  }, [agentUsageFresh, appActivityFresh, cohort, directoryCurrent, hasUnresolvedIdentities, licensedUsers, search, threshold]);
+  }, [agentUsageFresh, appActivityFresh, cohort, company, department, directoryCurrent, hasUnresolvedIdentities, licensedUsers, search, threshold]);
   const columns = useMemo<ListColumn<CopilotUsageUser>[]>(() => [
     { id: "user", header: "User", accessorFn: name },
-    { id: "license", header: "M365 Copilot license", accessorFn: user => copilotServicePresentation(user.copilotServiceState).label },
     { id: "responses", header: "Agent responses", accessorFn: user => responses(user) ?? undefined, sortDescFirst: true },
     {
       id: "agentsUsed", header: "Agents used",
       accessorFn: user => user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : undefined,
       sortDescFirst: true,
     },
-    { id: "activity", header: "Agent-report last activity", accessorFn: user => user.importedUsage?.userLastActivityDateUtc, sortDescFirst: true },
-    {
-      id: "followUp", header: "Follow-up",
-      accessorFn: user => directoryCurrent
-        ? recommendation(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities).label
-        : "Verify paid license inventory",
-    },
-  ], [agentUsageFresh, appActivityFresh, directoryCurrent, hasUnresolvedIdentities, threshold]);
+    { id: "company", header: "Company", enableSorting: false },
+    { id: "department", header: "Department", enableSorting: false },
+    { id: "activity", header: "Last activity", accessorFn: user => user.importedUsage?.userLastActivityDateUtc, sortDescFirst: true },
+  ], []);
   const table = useListTable({
     data: filtered,
     columns,
@@ -223,10 +234,26 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
   const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
   const visible = sortedRows.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
-  const noLicensedUsers = cohort === "licensed" && licensedUsers.length === 0 && !search.trim();
+  const noLicensedUsers = cohort === "licensed" && licensedUsers.length === 0 && !search.trim() && !company && !department;
 
   function selectCohort(next: Cohort) {
-    setCohort(previous => previous === next ? "licensed" : next);
+    const value = cohort === next ? "licensed" : next;
+    setFilters(previous => ({ ...previous, cohort: value }));
+    setDraft(previous => ({ ...previous, cohort: value }));
+    setPage(0);
+  }
+
+  function updateFilters(next: UserActivityFilterValues<Cohort>) {
+    setDraft(next);
+    if (!isValidLowResponseThreshold(next.lowResponseThreshold)) return;
+    setFilters(next);
+    setPage(0);
+  }
+
+  function resetFilters() {
+    setSearch("");
+    setFilters(defaultFilters);
+    setDraft(defaultFilters);
     setPage(0);
   }
 
@@ -237,7 +264,7 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
     {data.snapshot?.state === "not_synced" ? <p className="copilot-users-notice" role="status">No saved user data. Run Users sync from Sync in the top navigation.</p>
       : data.snapshot?.state === "partial" ? <p className="copilot-users-notice" role="status">Saved user snapshot is partial. Run Users sync from Sync in the top navigation.</p> : null}
     <div className="copilot-user-metrics" role="group" aria-label="M365 Copilot license summary">
-      <Metric label="Active M365 Copilot licensed users" value={directoryCurrent ? data.counts.licensedUsers : null} hint="Verified paid access, not recent usage"
+      <Metric label="Active M365 Copilot licensed users" value={directoryCurrent ? data.counts.licensedUsers : null} hint="Licensed users with active paid features"
         selected={cohort === "licensed"} onClick={() => selectCohort("licensed")} />
       <Metric label="Using agents" value={directoryCurrent && agentUsageFresh ? licensedUsers.filter(hasAgentResponses).length : null} hint="Licensed users with agent responses"
         selected={cohort === "using"} onClick={() => selectCohort("using")} />
@@ -247,63 +274,57 @@ function CopilotUsersDashboard({ data, current, onInspectUser }: {
         selected={cohort === "no-activity"} onClick={() => selectCohort("no-activity")} />
     </div>
 
-    {!directoryKnown ? <div className="copilot-users-notice" role="status"><p>Current paid license inventory is unverified. {data.sources.directory.message} Use Sync or Permissions in the top navigation to refresh or reconnect.</p></div> : null}
+    {!directoryKnown ? <p className="copilot-users-notice" role="status">License data unavailable. Run Users sync in Sync or review Permissions.</p> : null}
     {data.sources.importedAgentUsage.state !== "available" ? <div className="copilot-users-notice" role="status">
-      <p>{data.sources.importedAgentUsage.state === "stale" ? "Agent usage is out of date. Historical totals are shown, but are not used for low-usage recommendations." : "Agent usage is not available yet. Saved license status remains visible; missing usage is not zero."}</p>
-      <p>Use <a href="/sync?reports=manage">Sync &gt; Manage reports</a> to inspect saved agent reports.</p>
+      <p>{data.sources.importedAgentUsage.state === "stale" ? "Reports are out of date." : "Agent reports unavailable."}{" "}
+        <a href="/sync?reports=manage">Manage reports in Sync</a>.</p>
     </div> : null}
-    {data.sources.appActivity.state === "unavailable" ? <div className="copilot-users-notice" role="status">
-      <p>Office app activity unavailable. {data.sources.appActivity.message}</p>
-      <p>Use Permissions in the top navigation to review the connection.</p>
-    </div> : data.sources.appActivity.state === "stale" ? <p><small>Office app activity is out of date. Last-known dates remain visible in user details.</small></p> : null}
+    {data.sources.appActivity.state === "unavailable" ? <p className="copilot-users-notice" role="status">
+      Office app activity unavailable. Review the connection in Permissions.
+    </p> : data.sources.appActivity.state === "stale" ? <p className="copilot-users-notice" role="status">Office app activity is out of date. Run Users sync in Sync.</p> : null}
 
-    <div className="copilot-users-toolbar" aria-label="Copilot user filters">
-      <label><span>Search users or agents</span><input type="search" placeholder="Name, email, company, department or agent" value={search} onChange={event => { setSearch(event.target.value); setPage(0); }} /></label>
-      <label><span>Order by</span><select value={licenseSorts.find(([, , id, desc]) => id === sorting[0]?.id && desc === sorting[0]?.desc)?.[0]} onChange={event => {
-        const next = licenseSorts.find(([value]) => value === event.target.value);
+    <UserActivityFilters values={draft} companies={organizations.companies} departments={organizations.departments}
+      cohorts={cohorts} defaultCohort="licensed" cohortLabel="Activity" searchLabel="Search users or agents"
+      search={search} searchRef={searchInput} sort={licenseSorts.find(([, , id, desc]) => id === sorting[0]?.id && desc === sorting[0]?.desc)?.[0] ?? licenseSorts[0][0]}
+      sorts={licenseSorts.map(([value, label]) => ({ value, label }))} matchingCount={filtered.length}
+      loading={refreshing} validThreshold={validThreshold} onChange={updateFilters}
+      onSearch={value => { setSearch(value); setPage(0); }}
+      onSort={value => {
+        const next = licenseSorts.find(([key]) => key === value);
         if (next) {
           setSorting([{ id: next[2], desc: next[3] }]);
           setPage(0);
         }
-      }}>{licenseSorts.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-      {cohort === "attention" ? <label><span>Low agent usage threshold</span><select value={threshold} onChange={event => { setThreshold(Number(event.target.value)); setPage(0); }}>
-        {[5, 10, 20, 50].map(value => <option key={value} value={value}>{value} responses or fewer</option>)}
-      </select></label> : null}
-    </div>
-    <p><small>{directoryCurrent
-      ? `${filtered.length.toLocaleString()} licensed users shown`
-      : `Last saved: ${filtered.length.toLocaleString()} previously licensed users shown; current licensing unverified`}{data.sources.importedAgentUsage.period.startDate && data.sources.importedAgentUsage.period.endDate ? ` | Agent report: ${data.sources.importedAgentUsage.period.startDate} to ${data.sources.importedAgentUsage.period.endDate}` : ""}. Rankings use agent responses, not total Copilot utilization.</small></p>
+      }} onClear={resetFilters} />
 
     {visible.length ? <div className="copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
-      <table className="copilot-users-table">
+      <table className="copilot-users-table reported-users-table">
         <ListTableHead table={table} />
         <tbody>{visible.map(row => {
           const user = row.original;
           const noReportedActivity = copilotAgentActivity(user.importedUsage, agentUsageFresh, hasUnresolvedIdentities) === "none";
           const responseCount = responses(user);
           const agentCount = user.importedUsage && !user.importedUsage.missingUserReport ? user.importedUsage.reportedAgentsUsed : null;
-          const followUp = directoryCurrent ? recommendation(user, threshold, agentUsageFresh, appActivityFresh, hasUnresolvedIdentities) : { label: "Verify paid license inventory", tone: "unknown" };
           return <tr key={row.id}>
-            <td><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => onInspectUser(user, threshold)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</td>
-            <td><CopilotLicenseStatus user={user} current={directoryCurrent} /></td>
+            <th scope="row"><button type="button" className="user-name-button" aria-haspopup="dialog" onClick={() => onInspectUser(user, threshold)}>{name(user)}</button><small>{user.directory.userPrincipalName}</small>{user.directory.accountEnabled === false ? <small>Account disabled</small> : null}</th>
             <td data-numeric>{responseCount === null && noReportedActivity ? "Not reported" : formatCount(responseCount)}{!agentUsageFresh && responseCount !== null ? <small>Historical report</small> : null}</td>
             <td data-numeric>{agentCount === null && noReportedActivity ? "Not reported" : formatCount(agentCount)}</td>
-            <td>{formatDate(user.importedUsage?.userLastActivityDateUtc)}<small>Users report only</small></td>
-            <td><span className={`copilot-user-badge ${followUp.tone}`}>{followUp.label}</span></td>
+            <td>{user.directory.companyName?.trim() || "Not set"}</td>
+            <td>{user.directory.department?.trim() || "Not set"}</td>
+            <td>{formatDate(user.importedUsage?.userLastActivityDateUtc)}</td>
           </tr>;
         })}</tbody>
       </table>
-    </div> : <div className="copilot-users-empty">
+    </div> : <div className="reported-users-empty">
       <h3>{directoryCurrent ? cohort === "no-activity" && !agentUsageFresh ? "Agent usage unavailable" : noLicensedUsers ? "No active M365 Copilot licenses found" : "No users match" : "No last-saved users in this cohort"}</h3>
       <p>{directoryCurrent
-        ? cohort === "no-activity" && !agentUsageFresh ? "Select a complete, current usage report in Sync." : noLicensedUsers ? "No users have verified active paid features in the saved inventory." : "Try a different cohort or search."
+        ? cohort === "no-activity" && !agentUsageFresh ? "Select a complete, current usage report in Sync." : noLicensedUsers ? "No users have verified active paid features in the saved inventory." : "Try another search or clear filters."
         : "Current licensing is unverified. Run Users sync from Sync in the top navigation."}</p>
-      {search || cohort !== "licensed" ? <button className="secondary" type="button" onClick={() => { setSearch(""); selectCohort("licensed"); }}>Reset filters</button> : null}
     </div>}
 
-    {filtered.length > pageSize ? <div className="copilot-users-pagination" aria-label="Copilot user pages">
+    {filtered.length ? <div className="copilot-users-pagination" aria-label="Copilot user pages">
+      <span>{currentPage * pageSize + 1}-{Math.min((currentPage + 1) * pageSize, filtered.length)} of {filtered.length.toLocaleString()} users</span>
       <button type="button" className="secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button>
-      <span>{currentPage * pageSize + 1}-{Math.min((currentPage + 1) * pageSize, filtered.length)} of {filtered.length.toLocaleString()}</span>
       <button type="button" className="secondary" disabled={currentPage >= lastPage} onClick={() => setPage(currentPage + 1)}>Next</button>
     </div> : null}
 

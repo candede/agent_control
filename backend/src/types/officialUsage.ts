@@ -311,6 +311,8 @@ export type OfficialUsageUserAgentRow = UserAgentUsageRow & {
 export type OfficialUsageUserSummary = {
   username: string;
   displayName: string;
+  companyName?: string | null;
+  department?: string | null;
   reportedAgentsUsed: number;
   reportedResponsesReceived: number;
   userLastActivityDateUtc?: string;
@@ -351,6 +353,10 @@ export type OfficialUsageUserView = {
   };
   filters: {
     creatorTypes: string[];
+    companies: string[];
+    departments: string[];
+    company?: string;
+    department?: string;
     search?: string;
     agentId?: string;
     creatorType?: string;

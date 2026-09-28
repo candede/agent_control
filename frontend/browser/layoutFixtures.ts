@@ -164,7 +164,7 @@ const aggregate: OfficialUsageAggregateView = {
   },
 };
 const users: OfficialUsageUserView = {
-  ...lineage, filters: { creatorTypes: ["Your org"], activity: "all", responsesOnly: false, lowResponseThreshold: 5, cohort: "all", licenseCohort: "active_without_paid", sortBy: "responses", sortDirection: "desc" },
+  ...lineage, filters: { creatorTypes: ["Your org"], companies: [], departments: [], activity: "all", responsesOnly: false, lowResponseThreshold: 5, cohort: "all", licenseCohort: "active_without_paid", sortBy: "responses", sortDirection: "desc" },
   licenseCoverage: { state: "available", observedAt, activeReportUsers: 2, paidUsers: 0, unpaidUsers: 2, unknownUsers: 0, message: null },
   counts: { users: 2, filteredUsers: 2, userRows: 2, accessRows: 2, reportOnlyRows: 2, totalResponsesReceived: 200, mismatchCount: 0 },
   cohorts: { zeroResponses: 0, lowResponses: 0, reviewCandidates: 0, unknownUserMetrics: 0, missingBridgeRows: 0, threshold: 5 },

@@ -42,6 +42,8 @@ type ViewOptions = {
   lowResponseThreshold?: number;
   cohort?: "all" | "zero" | "low" | "review";
   licenseCohort?: "active_without_paid";
+  company?: string;
+  department?: string;
   licenseDirectory?: SavedCopilotUsageSource<CopilotDirectoryUser[]>;
   agentSortBy?: OfficialUsageAgentSort;
   userSortBy?: OfficialUsageUserSort;
@@ -207,6 +209,9 @@ export function buildOfficialUsageUserView(
   published: PublishedOfficialUsage,
   options: ViewOptions,
 ): OfficialUsageUserView {
+  if (!options.licenseCohort && (options.company !== undefined || options.department !== undefined)) {
+    throw new AppError(400, "invalid_usage_query", "Company and department filters require the active_without_paid license cohort.");
+  }
   const viewState = availability(published, options.staleAfterDays, options.now ?? new Date());
   const lowResponseThreshold = boundedThreshold(options.lowResponseThreshold, 5);
   const allSummaries = buildUserSummaries(published.reports, published.activeSet?.id ?? null, lowResponseThreshold);
@@ -233,6 +238,10 @@ export function buildOfficialUsageUserView(
     ...(licenseScope ? { licenseCoverage: licenseScope.coverage } : {}),
     filters: {
       creatorTypes: [...new Set(summaries.flatMap(summary => summary.creatorTypes))].sort(ordinal),
+      companies: organizationValues(licenseScope?.users ?? [], "companyName"),
+      departments: organizationValues(licenseScope?.users ?? [], "department"),
+      ...(options.company?.trim() ? { company: options.company.trim() } : {}),
+      ...(options.department?.trim() ? { department: options.department.trim() } : {}),
       ...(options.search?.trim() ? { search: options.search.trim() } : {}),
       ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
       ...(options.creatorType && options.creatorType !== "all" ? { creatorType: options.creatorType } : {}),
@@ -287,9 +296,14 @@ function activeUnpaidUsers(
   const available = verifiedUsers !== null;
   const directoryUsers = verifiedUsers ?? [];
   const matches = matchImportedUsage(directoryUsers, summaries, available);
-  const linked = new Map(directoryUsers.flatMap(user => {
-    const summary = matches.byObjectId.get(user.identity.objectId);
-    return summary ? [[summary.username, user] as const] : [];
+  const uniqueDirectoryUsers = new Map<string, CopilotDirectoryUser | null>();
+  for (const user of directoryUsers) {
+    const objectId = user.identity.objectId;
+    uniqueDirectoryUsers.set(objectId, uniqueDirectoryUsers.has(objectId) ? null : user);
+  }
+  const linked = new Map([...matches.byObjectId].flatMap(([objectId, summary]) => {
+    const user = uniqueDirectoryUsers.get(objectId);
+    return user ? [[summary.username, user] as const] : [];
   }));
   const active = summaries.filter(hasReportedAgentActivity);
   const coverage: NonNullable<OfficialUsageUserView["licenseCoverage"]> = {
@@ -305,17 +319,27 @@ function activeUnpaidUsers(
   };
   const users: OfficialUsageUserSummary[] = [];
   for (const summary of active) {
-    const state = linked.get(summary.username)?.copilotServiceState;
+    const directoryUser = linked.get(summary.username);
+    const state = directoryUser?.copilotServiceState;
     if (state && isCopilotServiceActive(state)) {
       coverage.paidUsers += 1;
-    } else if (state === "disabled" || state === "suspended" || state === "locked_out") {
+    } else if (directoryUser && (state === "disabled" || state === "suspended" || state === "locked_out")) {
       coverage.unpaidUsers += 1;
-      users.push({ ...summary, licenseAssignmentStatus: "no_active_paid_license" });
+      users.push({
+        ...summary,
+        licenseAssignmentStatus: "no_active_paid_license",
+        companyName: directoryUser.identity.companyName?.trim() || null,
+        department: directoryUser.identity.department?.trim() || null,
+      });
     } else {
       coverage.unknownUsers += 1;
     }
   }
   return { users, coverage };
+}
+
+function organizationValues(users: readonly OfficialUsageUserSummary[], field: "companyName" | "department") {
+  return [...new Set(users.map(user => user[field]).filter((value): value is string => Boolean(value)))].sort(ordinal);
 }
 
 function availability(published: PublishedOfficialUsage, staleAfterDays: number, now: Date): { value: OfficialUsageAvailability; periodAgeDays: number | null; acceptedAgeDays: number | null } {
@@ -549,9 +573,13 @@ function lineages(reports: AcceptedOfficialUsageReports) {
 
 function filterUserSummaries(summaries: OfficialUsageUserSummary[], options: ViewOptions, anchorDateUtc: string | undefined) {
   const query = options.search?.trim().toLowerCase();
+  const company = options.company?.trim();
+  const department = options.department?.trim();
   const inactiveDays = boundedDays(options.inactiveDays, 30);
   return summaries.filter(summary => {
     if (query && !summary.searchableText.includes(query)) return false;
+    if (company && summary.companyName !== company) return false;
+    if (department && summary.department !== department) return false;
     const creatorType = options.creatorType && options.creatorType !== "all" ? options.creatorType : undefined;
     if ((options.agentId !== undefined || creatorType || options.responsesOnly) && !summary.rows.some(row =>
       (options.agentId === undefined || row.agentId === options.agentId)

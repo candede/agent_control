@@ -137,6 +137,136 @@ function savedLicenses(entries: Array<[string, CopilotServiceSummaryState]>): Sa
   };
 }
 
+function organizationFixture() {
+  const source = published();
+  const organizations = [
+    ["first", " Alpha ", " Engineering "],
+    ["second", "Alpha", "Sales"],
+    ["third", "Beta", "Engineering"],
+    ["fourth", "Alpha", "Engineering"],
+    ["fifth", "alpha", "engineering"],
+    ["missing", " \t ", null],
+    ["paid", "Paid only", "Paid department"],
+    ["unknown", "Unknown only", "Unknown department"],
+    ["inactive", "Inactive only", "Inactive department"],
+  ] as const;
+  source.reports.userAgents!.rows = [];
+  source.reports.users!.rows = organizations.map(([username], index) => ({
+    username, displayName: username, numberOfAgentsUsed: 1,
+    agentResponsesReceived: username === "inactive" ? 0 : 10 - index,
+  }));
+  const licenseDirectory = savedLicenses(organizations.map(([username]) => [
+    username, username === "paid" ? "enabled" : username === "unknown" ? "unknown" : "disabled",
+  ]));
+  licenseDirectory.value!.forEach((user, index) => {
+    user.identity.companyName = organizations[index][1];
+    user.identity.department = organizations[index][2];
+  });
+  return { source, options: { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory } };
+}
+
+describe("active unpaid organization filters", () => {
+  it("builds trimmed, unique, case-preserving facets only from the eligible cohort before all filters", () => {
+    const { source, options } = organizationFixture();
+    const baseline = buildOfficialUsageUserView(source, options);
+    expect(baseline.filters).toMatchObject({
+      companies: ["Alpha", "Beta", "alpha"], departments: ["Engineering", "Sales", "engineering"],
+    });
+    expect(baseline.users.value[0]).toMatchObject({ companyName: "Alpha", department: "Engineering" });
+    expect(baseline.users.value.find(user => user.username === "missing")).toMatchObject({ companyName: null, department: null });
+    const selected = buildOfficialUsageUserView(source, {
+      ...options, company: " Alpha ", department: " Engineering ", search: "first", limit: 1,
+    });
+    expect(selected.filters).toMatchObject({
+      companies: baseline.filters.companies, departments: baseline.filters.departments,
+      company: "Alpha", department: "Engineering",
+    });
+    expect(selected.users).toMatchObject({ count: 1, value: [{ username: "first" }] });
+    expect(selected.counts).toEqual({ ...baseline.counts, filteredUsers: 1 });
+    expect(selected.licenseCoverage).toEqual(baseline.licenseCoverage);
+    expect(selected.cohorts).toEqual(baseline.cohorts);
+    expect(buildOfficialUsageUserView(source, { ...options, search: "absent", startDate: "2026-01-01", cohort: "zero" }).filters)
+      .toMatchObject({ companies: baseline.filters.companies, departments: baseline.filters.departments });
+  });
+
+  it("includes organization options beyond the maximum API page and can select those users", () => {
+    const source = published();
+    source.reports.userAgents!.rows = [];
+    source.reports.users!.rows = Array.from({ length: 501 }, (_, index) => ({
+      username: `person-${index}`, displayName: `Person ${index}`, numberOfAgentsUsed: 1, agentResponsesReceived: 501 - index,
+    }));
+    const licenseDirectory = savedLicenses(source.reports.users!.rows.map(user => [user.username, "disabled"]));
+    licenseDirectory.value!.forEach((user, index) => {
+      user.identity.companyName = index === 500 ? "Tail company" : "First company";
+      user.identity.department = index === 500 ? "Tail department" : "First department";
+    });
+    const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory, limit: 500 };
+    const firstPage = buildOfficialUsageUserView(source, options);
+    expect(firstPage.users.value).toHaveLength(500);
+    expect(firstPage.users.value.some(user => user.username === "person-500")).toBe(false);
+    expect(firstPage.filters).toMatchObject({
+      companies: ["First company", "Tail company"], departments: ["First department", "Tail department"],
+    });
+    const tail = buildOfficialUsageUserView(source, {
+      ...options, company: "Tail company", department: "Tail department", search: "person-500", limit: 1,
+    });
+    expect(tail.users).toMatchObject({ count: 1, value: [{ username: "person-500" }] });
+    expect(tail.filters.companies).toEqual(firstPage.filters.companies);
+  });
+
+  it.each([
+    [{ company: "Alpha" }, ["first", "second", "fourth"]],
+    [{ department: "Engineering" }, ["first", "third", "fourth"]],
+    [{ company: " Alpha ", department: " Engineering " }, ["first", "fourth"]],
+    [{ company: "Alpha", department: "engineering" }, []],
+    [{ company: "alpha", department: "engineering" }, ["fifth"]],
+    [{ company: "Al" }, []],
+    [{ department: "Missing" }, []],
+    [{ company: "Paid only" }, []],
+  ] as const)("matches exact organization values with AND semantics (%j)", (filters, usernames) => {
+    const { source, options } = organizationFixture();
+    const view = buildOfficialUsageUserView(source, { ...options, ...filters });
+    expect(view.users.value.map(user => user.username)).toEqual(usernames);
+    expect(view.topUsersByResponses.map(user => user.username)).toEqual(usernames);
+  });
+
+  it("keeps raw report users and other review cohorts unchanged without directory enrichment", () => {
+    const { source, options } = organizationFixture();
+    for (const cohort of ["all", "zero", "low", "review"] as const) {
+      const baseline = buildOfficialUsageUserView(source, { staleAfterDays: 35, cohort });
+      const result = buildOfficialUsageUserView(source, { staleAfterDays: 35, cohort, licenseDirectory: options.licenseDirectory });
+      expect(result).toEqual(baseline);
+      expect(result.filters).toMatchObject({ companies: [], departments: [] });
+      expect(result.licenseCoverage).toBeUndefined();
+      for (const user of result.users.value) {
+        expect(user).not.toHaveProperty("companyName");
+        expect(user).not.toHaveProperty("department");
+      }
+    }
+    for (const filters of [{ company: "Alpha" }, { department: "Engineering" }]) {
+      expect(() => buildOfficialUsageUserView(source, { staleAfterDays: 35, ...filters }))
+        .toThrow("require the active_without_paid license cohort");
+    }
+  });
+
+  it("does not infer directory identities from names or use non-unique directory object IDs", () => {
+    const { source, options } = organizationFixture();
+    const users = options.licenseDirectory.value!;
+    users[1].identity.objectId = users[0].identity.objectId;
+    users[1].identity.userPrincipalName = "not-in-report";
+    users[2].identity.displayName = "Report-only name";
+    source.reports.users!.rows.push({
+      username: "Report-only name", displayName: "third", numberOfAgentsUsed: 1, agentResponsesReceived: 100,
+    });
+    const view = buildOfficialUsageUserView(source, options);
+    expect(view.users.value.map(user => user.username)).toEqual(["third", "fourth", "fifth", "missing"]);
+    expect(view.filters).toMatchObject({
+      companies: ["Alpha", "Beta", "alpha"], departments: ["Engineering", "engineering"],
+    });
+    expect(view.licenseCoverage).toMatchObject({ paidUsers: 1, unpaidUsers: 4, unknownUsers: 4 });
+  });
+});
+
 describe("official usage views", () => {
   it("filters active unpaid users before paging, rankings, counts and relationship search", () => {
     const source = published();
@@ -158,6 +288,8 @@ describe("official usage views", () => {
       ["suspended@example.com", "suspended"], ["unknown@example.com", "unknown"],
       ["zero@example.com", "disabled"], ["bridge@example.com", "disabled"],
     ]);
+    licenseDirectory.value![5].identity.companyName = "Bridge company";
+    licenseDirectory.value![5].identity.department = "Bridge department";
     const options = { staleAfterDays: 35, licenseCohort: "active_without_paid" as const, licenseDirectory };
     const result = buildOfficialUsageUserView(source, { ...options, limit: 1, offset: 1 });
     expect(result.users).toMatchObject({ count: 3, limit: 1, offset: 1, value: [{ username: "suspended@example.com", licenseAssignmentStatus: "no_active_paid_license" }] });
@@ -172,7 +304,10 @@ describe("official usage views", () => {
     expect(searched.users.count).toBe(2);
     expect(searched.users.value[0].rows.map(row => row.agentId)).toEqual(["agent-b", "agent-a"]);
     const bridge = buildOfficialUsageUserView(source, { ...options, search: "bridge@example.com" }).users.value[0];
-    expect(bridge).toMatchObject({ missingUserReport: true, reportedResponsesReceived: 0, bridgeResponsesSentToUsers: 1, licenseAssignmentStatus: "no_active_paid_license" });
+    expect(bridge).toMatchObject({
+      missingUserReport: true, reportedResponsesReceived: 0, bridgeResponsesSentToUsers: 1,
+      licenseAssignmentStatus: "no_active_paid_license", companyName: "Bridge company", department: "Bridge department",
+    });
   });
 
   it("moves users between exclusive current-license cohorts without consulting the activity period", () => {
@@ -225,6 +360,7 @@ describe("official usage views", () => {
     ]) {
       expect(buildOfficialUsageUserView(source, { ...options, licenseDirectory: directory })).toMatchObject({
         users: { count: 0, value: [] }, licenseCoverage: { state: "unavailable", paidUsers: 0, unpaidUsers: 0, unknownUsers: 1 },
+        filters: { companies: [], departments: [] },
       });
     }
     expect(buildOfficialUsageUserView(source, {
@@ -244,6 +380,10 @@ describe("official usage views", () => {
       ...(ambiguity === "directory" ? [["CASE@example.com", "disabled"] as [string, CopilotServiceSummaryState]] : []),
     ]);
     const directory = licenseDirectory.value!;
+    directory.forEach(user => {
+      user.identity.companyName = user.identity.userPrincipalName === "control@example.com" ? "Verified company" : "Ambiguous company";
+      user.identity.department = user.identity.userPrincipalName === "control@example.com" ? "Verified department" : "Ambiguous department";
+    });
     source.reports.userAgents!.rows = [];
     source.reports.users!.rows = [
       "case@example.com",
@@ -259,6 +399,7 @@ describe("official usage views", () => {
       state: "available", activeReportUsers: 4, paidUsers: 0, unpaidUsers: 1, unknownUsers: 3,
     });
     expect(result.users).toMatchObject({ count: 1, value: [{ username: "control@example.com" }] });
+    expect(result.filters).toMatchObject({ companies: ["Verified company"], departments: ["Verified department"] });
     expect(result.topUsersByResponses.map(user => user.username)).toEqual(["control@example.com"]);
   });
 

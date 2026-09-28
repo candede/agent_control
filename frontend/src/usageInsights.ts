@@ -25,6 +25,10 @@ export function usageCount(value: number | null | undefined) {
   return value === null || value === undefined ? "Unknown" : value.toLocaleString();
 }
 
+export function isValidLowResponseThreshold(value: string) {
+  return /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= 100_000_000;
+}
+
 export function usageDate(value: string | null | undefined) {
   if (!value) return "Not reported";
   const date = new Date(value);

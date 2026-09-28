@@ -32,7 +32,7 @@ const evidence: UnifiedAgentLinkEvidence = {
 const canonicalId = (record: UnifiedAgentRecord) => record.id.slice("agent:".length);
 
 describe("canonical agent registry", () => {
-  it("upgrades migration31 without changing its checksums or saved source data", async () => {
+  it("upgrades migration31 preserving checksums and source data with the retention cap", async () => {
     const upgrade = await testDatabase(false);
     try {
       await bootstrap(upgrade.operator, fixturePassword);
@@ -40,7 +40,11 @@ describe("canonical agent registry", () => {
       await grantRuntime(upgrade.operator);
       const scope = newScope();
       const records = await observeGroups(scope, [{ packageIds: ["upgrade"], resource: { nativeId: nativeGuid } }], upgrade.runtime, true);
-      const before = await upgrade.runtime.query(`SELECT to_jsonb(snapshot) AS value FROM package_inventory_snapshots snapshot`);
+      await upgrade.operator.query(`UPDATE package_inventory_snapshots
+        SET expires_at=observed_at+interval '30 days 1 microsecond'`);
+      // Migration 44 caps legacy expiry at read start + 30 days; compare it at PostgreSQL microsecond precision.
+      const before = await upgrade.runtime.query(`SELECT jsonb_set(to_jsonb(snapshot),
+        '{expires_at}',to_jsonb(observed_at+interval '30 days')) AS value FROM package_inventory_snapshots snapshot`);
       const resourcesBefore = await upgrade.runtime.query("SELECT to_jsonb(resource) AS value,xmin::text AS row_version FROM package_inventory_resources resource");
       const boundaries = () => upgrade.operator.query<{ conname: string; definition: string }>(`
         SELECT conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint

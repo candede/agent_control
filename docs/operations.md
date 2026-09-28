@@ -57,6 +57,8 @@ Invoke-LocalDeployment $context 'Test'
 
 This helper also works before the selected project has an initialized installation. It uses a random, run-owned Compose project with network-disabled, memory-only PostgreSQL and synthetic fixture passwords. The first failing step or cleanup stops qualification with a nonzero error and its cause; only that run's temporary resources are removed. No maintenance or reauthentication markers are changed. Do not invoke the aggregate runner through the application's credential-mounted operator command.
 
+The isolated PostgreSQL fixture has a 1 GiB memory limit, including its 256 MiB data tmpfs; the test runner has a separate 1536 MiB limit. The full-size 32 MiB JSONB boundary tests require additional working copies during parsing and insertion. A 512 MiB database limit can OOM-kill a PostgreSQL process during the aggregate gate even when the focused suite passes, followed by connection termination, recovery-mode and cleanup errors. Keep the full-size boundary assertions enabled rather than masking these failures with retries. These resource limits apply only to qualification fixtures, not the application database.
+
 Expected 4xx/5xx logs from passing negative-path tests are suppressed by Vitest's `silent: "passed-only"` mode. Failed-test output, names and assertions remain visible, and unhandled errors still fail the run. For investigation, rerun a focused test in the isolated container with `--silent=false`.
 
 After public `start`, the summary reports **AUTOMATED CHECKS: PASSED** and **LOCAL READINESS: PASSED**. Local readiness covers database/schema health and sign-in configuration. The internal existing-image `Start` helper reports automated checks **NOT RUN**, because it does not execute the software gate.

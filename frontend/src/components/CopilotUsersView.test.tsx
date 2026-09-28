@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, downloadOfficialUsageCsv, getAgentResponsibility, getCopilotUsageUsers, getOfficialUsageAgentDetail, getOfficialUsageUsers, type CopilotUsageUsersResponse, type SessionUser } from "../api/client";
@@ -22,6 +22,50 @@ vi.mock("../agentExport", () => ({ downloadBlob: vi.fn() }));
 
 function userRows() {
   return within(screen.getByRole("region", { name: "M365 Copilot license status" })).getAllByRole("row").slice(1);
+}
+
+async function paidFilters() {
+  if (!screen.queryByRole("dialog", { name: "Filter users" })) {
+    await userEvent.click(screen.getByRole("button", { name: /^Filters(?:, \d+ active)?$/ }));
+  }
+  return within(screen.getByRole("dialog", { name: "Filter users" }));
+}
+
+async function sortPaidUsers(value: string) {
+  await userEvent.selectOptions((await paidFilters()).getByRole("combobox", { name: "Sort" }), value);
+  await userEvent.click(screen.getByRole("button", { name: "Close filters" }));
+}
+
+async function expectPaidSort(value: string) {
+  expect((await paidFilters()).getByRole("combobox", { name: "Sort" })).toHaveValue(value);
+  await userEvent.click(screen.getByRole("button", { name: "Close filters" }));
+}
+
+function organizationFixture() {
+  const fixture = structuredClone(copilotUsageFixture);
+  fixture.users = Array.from({ length: 103 }, (_, index) => {
+    const user = licensedUser(index + 1, `Person${String(index).padStart(3, "0")}`, 200 - index);
+    user.directory.companyName = index < 51 ? index % 2 ? "Contoso" : " Contoso " : "Fabrikam";
+    user.directory.department = index % 2 ? "Sales" : " Engineering ";
+    return user;
+  });
+  const lowercase = licensedUser(104, "Lowercase", 3);
+  lowercase.directory.companyName = "contoso";
+  lowercase.directory.department = "Engineering";
+  const missing = licensedUser(105, "Missing", null);
+  missing.directory.companyName = null;
+  missing.directory.department = "  ";
+  const disabled = licensedUser(106, "Disabled", 999);
+  disabled.copilotServiceState = disabled.servicePlans[0].state = "disabled";
+  disabled.directory.companyName = "Excluded company";
+  disabled.directory.department = "Excluded department";
+  const unverified = licensedUser(107, "Unverified", 999);
+  unverified.copilotServiceState = unverified.servicePlans[0].state = "unknown";
+  unverified.directory.companyName = "Unverified company";
+  unverified.directory.department = "Unverified department";
+  fixture.users.push(lowercase, missing, disabled, unverified);
+  fixture.counts.licensedUsers = 105;
+  return fixture;
 }
 
 function deferred<T>() {
@@ -119,7 +163,18 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByText(/directory users checked|Containing bundles identify candidates|All matching Graph pages/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Basic Copilot Chat may be available/)).not.toBeInTheDocument();
     expect(within(metrics).getByText("Active M365 Copilot licensed users").parentElement)
-      .toHaveTextContent("Verified paid access, not recent usage");
+      .toHaveTextContent("Licensed users with active paid features");
+    expect(within(screen.getByRole("region", { name: "M365 Copilot license status" })).getAllByRole("columnheader")
+      .map(header => header.textContent)).toEqual(["User", "Agent responses", "Agents used", "Company", "Department", "Last activity"]);
+    for (const row of userRows()) {
+      expect(within(row).getByRole("rowheader")).toHaveAttribute("scope", "row");
+      expect(within(within(row).getByRole("rowheader")).getByRole("button")).toHaveAttribute("aria-haspopup", "dialog");
+      expect(within(row).getAllByRole("cell")).toHaveLength(5);
+      expect(row).not.toHaveTextContent(/M365 Copilot licensed|Paid features:|Users report only|Offer adoption help/);
+    }
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("4 matching users");
+    expect(screen.getByTitle("Filter users and choose sort order")).toHaveAccessibleName("Filters");
+    expect(screen.queryByRole("button", { name: /Export.*CSV/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/Last successful sync:/)).not.toBeInTheDocument();
     expect(getOfficialUsageUsers).not.toHaveBeenCalled();
   });
@@ -211,8 +266,10 @@ describe("Paid M365 Copilot license dashboard", () => {
     }
     await userEvent.click(summary.getByRole("button", { name: "Using agents" }));
     expect(userRows()).toHaveLength(2);
-    for (const row of userRows()) expect(row).toHaveTextContent("Historical report");
-    expect(screen.getByText(/Last saved: 2 previously licensed users shown/)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("2 matching users");
+    await userEvent.click(screen.getByRole("button", { name: "Ada" }));
+    expect(within(screen.getByRole("dialog", { name: "Ada" })).getByText("Verify paid license inventory")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Close user details" }));
     await userEvent.click(summary.getByRole("button", { name: "No reported agent activity" }));
     expect(screen.queryByRole("region", { name: "M365 Copilot license status" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No last-saved users in this cohort" })).toBeVisible();
@@ -250,17 +307,20 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["Ada", "Ben", "Bridge", "Conflict"]);
     for (const displayName of ["Bridge", "Conflict"]) {
       const row = screen.getByRole("row", { name: new RegExp(displayName) });
-      expect(within(row).getByText("Using agents")).toBeVisible();
-      expect(within(row).queryByText("Usage unknown")).not.toBeInTheDocument();
+      await userEvent.click(within(row).getByRole("button", { name: displayName }));
+      const detail = within(screen.getByRole("dialog", { name: displayName }));
+      expect(detail.getByText("Using agents")).toBeVisible();
+      expect(detail.queryByText("Usage unknown")).not.toBeInTheDocument();
+      await userEvent.click(detail.getByRole("button", { name: "Close user details" }));
     }
     const conflictRow = screen.getByRole("row", { name: /Conflict/ });
-    expect(within(conflictRow).getAllByRole("cell")[2]).toHaveTextContent(/^0$/);
+    expect(within(conflictRow).getAllByRole("cell")[0]).toHaveTextContent(/^0$/);
     await userEvent.click(summary.getByRole("button", { name: "Needs attention" }));
     expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["Ben", "BridgeZero", "Cleo", "Drew"]);
     await userEvent.click(summary.getByRole("button", { name: "No reported agent activity" }));
     expect(userRows().map(row => within(row).getByRole("button").textContent).sort()).toEqual(["BridgeZero", "Cleo", "Drew"]);
     const drew = screen.getByRole("row", { name: /Drew/ });
-    expect(within(drew).getByText("No reported agent activity")).toBeVisible();
+    expect(within(drew).getAllByRole("cell")[0]).toHaveTextContent("Not reported");
     expect(within(drew).queryByText("Unknown")).not.toBeInTheDocument();
     await userEvent.click(within(drew).getByRole("button", { name: "Drew" }));
     const detail = within(screen.getByRole("dialog", { name: "Drew" }));
@@ -326,7 +386,7 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(active).toHaveTextContent("2");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Drew"]);
     expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByText(/2 licensed users shown/)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("2 matching users");
     const usingAgents = within(screen.getByLabelText("M365 Copilot license summary")).getByText("Using agents").parentElement!;
     expect(within(usingAgents).getByText("1")).toBeVisible();
     expect(screen.queryByRole("button", { name: "All checked users" })).not.toBeInTheDocument();
@@ -371,10 +431,14 @@ describe("Paid M365 Copilot license dashboard", () => {
     await screen.findByRole("button", { name: "enabled" });
     expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["enabled", "warning", "partially_enabled"]);
-    expect(userRows().every(row => within(row).queryByText("M365 Copilot licensed", { exact: true }))).toBe(true);
     expect(userRows()[0]).toHaveTextContent("Account disabled");
-    expect(userRows()[1]).toHaveTextContent("Active (grace period)");
-    expect(userRows()[2]).toHaveTextContent("Partially active");
+    for (const [name, state] of [["enabled", "Active"], ["warning", "Active (grace period)"], ["partially_enabled", "Partially active"]]) {
+      await userEvent.click(screen.getByRole("button", { name }));
+      const detail = within(screen.getByRole("dialog", { name }));
+      expect(detail.getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
+      expect(detail.getByText("M365 Copilot license").parentElement).toHaveTextContent(state);
+      await userEvent.click(detail.getByRole("button", { name: "Close user details" }));
+    }
     expect(screen.queryByRole("button", { name: "All checked users" })).not.toBeInTheDocument();
     for (const excluded of ["disabled", "suspended", "locked_out", "unknown"]) {
       expect(screen.queryByRole("button", { name: excluded })).not.toBeInTheDocument();
@@ -491,8 +555,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
-    expect(within(userRows()[0]).getAllByRole("cell")[1]).toHaveTextContent("M365 Copilot licensedPaid features: Active");
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("M365 Copilot licensedPaid features: Active");
     await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Microsoft 365 Copilot in Productivity Apps")).toBeVisible();
@@ -545,10 +609,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    expect(userRows()[0]).toHaveTextContent("Partially active");
-    expect(userRows()[0]).toHaveTextContent("Review paid features");
     await userEvent.click(screen.getByRole("button", { name: "Ada" }));
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    expect(within(detail).getByText("Review paid features")).toBeVisible();
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Partially active");
     await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
@@ -580,7 +643,6 @@ describe("Paid M365 Copilot license dashboard", () => {
     render(<CopilotUsersView />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     expect(userRows()).toHaveLength(1);
-    expect(within(userRows()[0]).getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
     await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
@@ -592,9 +654,9 @@ describe("Paid M365 Copilot license dashboard", () => {
   it("ranks measured users in both directions without treating unknown as zero", async () => {
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-asc");
+    await sortPaidUsers("responses-asc");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo", "Ben", "Ada", "Drew"]);
-    await userEvent.selectOptions(screen.getByLabelText("Order by"), "responses-desc");
+    await sortPaidUsers("responses-desc");
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo", "Drew"]);
     await userEvent.click(screen.getByRole("button", { name: "No reported agent activity" }));
     expect(userRows()).toHaveLength(1);
@@ -618,13 +680,13 @@ describe("Paid M365 Copilot license dashboard", () => {
 
     await userEvent.click(within(responseHeader).getByRole("button", { name: "Sort by Agent responses" }));
     expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 2,053");
-    expect(screen.getByLabelText("Order by")).toHaveValue("responses-asc");
+    await expectPaidSort("responses-asc");
     expect(responseHeader).toHaveAttribute("aria-sort", "ascending");
     expect(userRows()[0]).toHaveTextContent("Person2049");
     expect(userRows().some(row => row.textContent?.includes("Unknown"))).toBe(false);
 
     await userEvent.click(within(responseHeader).getByRole("button", { name: "Sort by Agent responses" }));
-    expect(screen.getByLabelText("Order by")).toHaveValue("responses-desc");
+    await expectPaidSort("responses-desc");
     expect(responseHeader).toHaveAttribute("aria-sort", "descending");
     expect(userRows()[0]).toHaveTextContent("Person0000");
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
@@ -632,11 +694,9 @@ describe("Paid M365 Copilot license dashboard", () => {
 
   it.each([
     ["User", "name", "name-desc", [2, 1, 0, 3], [3, 0, 1, 2]],
-    ["M365 Copilot license", "license-asc", "license-desc", [0, 3, 1, 2], [2, 1, 0, 3]],
     ["Agent responses", "responses-asc", "responses-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
     ["Agents used", "agents-asc", "agents-desc", [2, 1, 0, 3], [0, 1, 2, 3]],
-    ["Agent-report last activity", "activity-asc", "activity", [2, 1, 0, 3], [0, 1, 2, 3]],
-    ["Follow-up", "follow-up-asc", "follow-up-desc", [1, 2, 0, 3], [0, 3, 1, 2]],
+    ["Last activity", "activity-asc", "activity", [2, 1, 0, 3], [0, 1, 2, 3]],
   ] as const)("compares %s values in both directions and synchronizes keyboard headers with the selector", async (header, ascending, descending, ascOrder, descOrder) => {
     const data = structuredClone(copilotUsageFixture);
     data.users = [
@@ -656,9 +716,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
     render(<CopilotUsersView />);
     const table = await screen.findByRole("region", { name: "M365 Copilot license status" });
-    const order = screen.getByLabelText("Order by");
     const names = () => userRows().map(row => within(row).getByRole("button").textContent);
-    await userEvent.selectOptions(order, ascending);
+    await sortPaidUsers(ascending);
     expect(names()).toEqual(ascOrder.map(index => data.users[index].directory.displayName));
     const heading = within(table).getByRole("columnheader", { name: header });
     expect(heading).toHaveAttribute("aria-sort", "ascending");
@@ -667,11 +726,11 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.keyboard("{Enter}");
     expect(names()).toEqual(descOrder.map(index => data.users[index].directory.displayName));
     expect(heading).toHaveAttribute("aria-sort", "descending");
-    expect(order).toHaveValue(descending);
     expect(sortButton).toHaveFocus();
+    await expectPaidSort(descending);
     const unknown = userRows().find(row => within(row).queryByRole("button", { name: "PersonMissing" }))!;
-    expect(within(unknown).getAllByRole("cell")[2]).toHaveTextContent(/^Unknown$/);
-    expect(within(unknown).getAllByRole("cell")[3]).toHaveTextContent(/^Unknown$/);
+    expect(within(unknown).getAllByRole("cell")[0]).toHaveTextContent(/^Unknown$/);
+    expect(within(unknown).getAllByRole("cell")[1]).toHaveTextContent(/^Unknown$/);
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
@@ -735,11 +794,13 @@ describe("Paid M365 Copilot license dashboard", () => {
       expect.objectContaining({ licenseCohort: "active_without_paid", sortBy: "displayName", sortDirection: "asc", offset: 0 }),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     ));
-    expect(screen.getByLabelText("Order reported users by")).toHaveValue("name");
     const ascendingHeader = within(screen.getByRole("region", { name: "Active users without paid Copilot" }))
       .getByRole("columnheader", { name: "Reported user" });
     expect(ascendingHeader).toHaveAttribute("aria-sort", "ascending");
     expect(within(ascendingHeader).getByRole("button", { name: "Sort by Reported user" })).toHaveFocus();
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByLabelText("Sort")).toHaveValue("name");
+    await userEvent.click(screen.getByRole("button", { name: "Close filters" }));
 
     await userEvent.click(within(screen.getByRole("region", { name: "Active users without paid Copilot" }))
       .getByRole("button", { name: "Sort by Reported user" }));
@@ -747,7 +808,9 @@ describe("Paid M365 Copilot license dashboard", () => {
       expect.objectContaining({ licenseCohort: "active_without_paid", sortBy: "displayName", sortDirection: "desc", offset: 0 }),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     ));
-    expect(screen.getByLabelText("Order reported users by")).toHaveValue("name-desc");
+    await userEvent.click(screen.getByRole("button", { name: "Filters" }));
+    expect(screen.getByLabelText("Sort")).toHaveValue("name-desc");
+    await userEvent.click(screen.getByRole("button", { name: "Close filters" }));
 
     await userEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
     await waitFor(() => expect(downloadOfficialUsageCsv).toHaveBeenCalledWith(
@@ -788,10 +851,191 @@ describe("Paid M365 Copilot license dashboard", () => {
     render(<CopilotUsersView />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     expect(userRows()).toHaveLength(4);
+    expect(within(userRows()[0]).getAllByRole("cell").slice(2, 4).map(cell => cell.textContent)).toEqual(["Not set", "Not set"]);
     const organization = within(screen.getByRole("dialog", { name: "Ada" })).getByRole("region", { name: "Saved directory organization" });
     expect(within(organization).getByText("Company").parentElement).toHaveTextContent("Not reported");
     expect(within(organization).getByText("Department").parentElement).toHaveTextContent("Not reported");
     expect(organization).not.toHaveTextContent("undefined");
+  });
+
+  it("builds trimmed exact organization facets from all paid users before search, activity and pagination", async () => {
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(organizationFixture());
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Person000" });
+    expect(userRows()).toHaveLength(50);
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("105 matching users");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("51-100 of 105");
+    const search = screen.getByRole("searchbox", { name: "Search users or agents" });
+    await userEvent.type(search, "person102");
+    expect(userRows()).toHaveLength(1);
+    expect(userRows()[0]).toHaveTextContent("Person102");
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("1 matching user");
+    let filters = await paidFilters();
+    const options = (label: string) => within(filters.getByRole("combobox", { name: label }))
+      .getAllByRole("option").map(option => option.getAttribute("value"));
+    expect(options("Company").sort()).toEqual(["", "Contoso", "Fabrikam", "contoso"]);
+    expect(options("Department").sort()).toEqual(["", "Engineering", "Sales"]);
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "Contoso");
+    expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
+    expect(options("Company").sort()).toEqual(["", "Contoso", "Fabrikam", "contoso"]);
+    await userEvent.clear(search);
+    expect(userRows()).toHaveLength(50);
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 51");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(userRows()).toHaveLength(1);
+    expect(userRows()[0]).toHaveTextContent("Person050");
+    filters = await paidFilters();
+    const threshold = filters.getByRole("spinbutton", { name: "Low-response threshold" });
+    fireEvent.change(threshold, { target: { value: "200" } });
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 51");
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    filters = await paidFilters();
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Department" }), "Engineering");
+    expect(userRows()).toHaveLength(26);
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-26 of 26");
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("26 matching users");
+    expect(userRows()[0]).toHaveTextContent("Person000");
+    expect(userRows().at(-1)).toHaveTextContent("Person050");
+    for (const row of userRows()) {
+      expect(within(row).getAllByRole("cell")[2]).toHaveTextContent(/^Contoso$/);
+      expect(within(row).getAllByRole("cell")[3]).toHaveTextContent(/^Engineering$/);
+    }
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "contoso");
+    expect(userRows()).toHaveLength(1);
+    expect(userRows()[0]).toHaveTextContent("Lowercase");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Activity" }), "no-activity");
+    expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
+    expect(options("Company").sort()).toEqual(["", "Contoso", "Fabrikam", "contoso"]);
+    expect(options("Department").sort()).toEqual(["", "Engineering", "Sales"]);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+    expect(getOfficialUsageUsers).not.toHaveBeenCalled();
+  });
+
+  it("synchronizes the activity popup, summary cards and removable filter chips", async () => {
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    let filters = await paidFilters();
+    const activity = filters.getByRole("combobox", { name: "Activity" });
+    expect(within(activity).getAllByRole("option").map(option => [option.getAttribute("value"), option.textContent])).toEqual([
+      ["licensed", "All paid users"], ["using", "Using agents"], ["attention", "Needs attention"],
+      ["no-activity", "No reported agent activity"],
+    ]);
+    expect(filters.queryByRole("combobox", { name: "Agent responses" })).not.toBeInTheDocument();
+    const threshold = filters.getByRole("spinbutton", { name: "Low-response threshold" });
+    expect(threshold).toHaveValue(5);
+    expect(threshold).toHaveAttribute("min", "1");
+    expect(threshold).toHaveAttribute("max", "100000000");
+    const sortOptions = within(filters.getByRole("combobox", { name: "Sort" })).getAllByRole("option");
+    expect(sortOptions.map(option => option.getAttribute("value")).sort()).toEqual([
+      "activity", "activity-asc", "agents-asc", "agents-desc", "name", "name-desc", "responses-asc", "responses-desc",
+    ]);
+    for (const [value, label, names] of [
+      ["using", "Using agents", ["Ada", "Ben"]], ["attention", "Needs attention", ["Ben", "Cleo"]],
+      ["no-activity", "No reported agent activity", ["Cleo"]],
+      ["licensed", "Active M365 Copilot licensed users", ["Ada", "Ben", "Cleo", "Drew"]],
+    ] as const) {
+      filters = await paidFilters();
+      await userEvent.selectOptions(filters.getByRole("combobox", { name: "Activity" }), value);
+      expect(screen.getByRole("button", { name: label })).toHaveAttribute("aria-pressed", "true");
+      expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(names);
+    }
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    filters = await paidFilters();
+    expect(filters.getByRole("combobox", { name: "Activity" })).toHaveValue("attention");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "Contoso Health");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Department" }), "Operations");
+    await userEvent.clear(filters.getByRole("spinbutton", { name: "Low-response threshold" }));
+    await userEvent.type(filters.getByRole("spinbutton", { name: "Low-response threshold" }), "20");
+    await userEvent.click(filters.getByRole("button", { name: "Close filters" }));
+    const chips = within(screen.getByLabelText("Active filters"));
+    expect(chips.getAllByRole("button")).toHaveLength(4);
+    expect(screen.getByTitle("Filter users and choose sort order")).toHaveAccessibleName("Filters, 4 active");
+    expect(chips.getByRole("button", { name: "Remove company filter" })).toHaveTextContent("Contoso Health");
+    expect(chips.getByRole("button", { name: "Remove department filter" })).toHaveTextContent("Operations");
+    expect(chips.getByRole("button", { name: "Remove activity filter" })).toHaveTextContent("Needs attention");
+    expect(chips.getByRole("button", { name: "Remove low-response threshold filter" })).toHaveTextContent("20");
+    for (const label of ["company", "department", "low-response threshold", "activity"]) {
+      await userEvent.click(screen.getByRole("button", { name: `Remove ${label} filter` }));
+      expect(screen.getByTitle("Filter users and choose sort order")).toHaveFocus();
+    }
+    expect(screen.queryByLabelText("Active filters")).not.toBeInTheDocument();
+    expect(screen.getByTitle("Filter users and choose sort order")).toHaveAccessibleName("Filters");
+    expect(userRows()).toHaveLength(4);
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
+    filters = await paidFilters();
+    expect(filters.getByRole("combobox", { name: "Company" })).toHaveValue("");
+    expect(filters.getByRole("combobox", { name: "Department" })).toHaveValue("");
+    expect(filters.getByRole("combobox", { name: "Activity" })).toHaveValue("licensed");
+    expect(filters.getByRole("spinbutton", { name: "Low-response threshold" })).toHaveValue(5);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Clear filters", "Reset filters"])("%s resets paid search, organization, activity, threshold and page but preserves sort", async reset => {
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(organizationFixture());
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Person000" });
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Researcher");
+    let filters = await paidFilters();
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "Contoso");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Department" }), "Engineering");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Activity" }), "using");
+    const threshold = filters.getByRole("spinbutton", { name: "Low-response threshold" });
+    await userEvent.clear(threshold);
+    await userEvent.type(threshold, "100000000");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Sort" }), "name-desc");
+    await userEvent.click(filters.getByRole("button", { name: "Close filters" }));
+    if (reset === "Reset filters") await paidFilters();
+    await userEvent.click(screen.getByRole("button", { name: reset }));
+    expect(screen.getByRole("searchbox", { name: "Search users or agents" })).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByLabelText("Active filters")).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("105 matching users");
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 105");
+    expect(userRows()[0]).toHaveTextContent("Person102");
+    filters = await paidFilters();
+    expect(filters.getByRole("combobox", { name: "Company" })).toHaveValue("");
+    expect(filters.getByRole("combobox", { name: "Department" })).toHaveValue("");
+    expect(filters.getByRole("combobox", { name: "Activity" })).toHaveValue("licensed");
+    expect(filters.getByRole("spinbutton", { name: "Low-response threshold" })).toHaveValue(5);
+    expect(filters.getByRole("combobox", { name: "Sort" })).toHaveValue("name-desc");
+    expect(filters.getByRole("button", { name: "Reset filters" })).toBeDisabled();
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Activity" }), "using");
+    await userEvent.click(filters.getByRole("button", { name: "Close filters" }));
+    await userEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("51-100 of 104");
+    if (reset === "Reset filters") await paidFilters();
+    await userEvent.click(screen.getByRole("button", { name: reset }));
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-50 of 105");
+    expect(userRows()[0]).toHaveTextContent("Person102");
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
+    expect(downloadOfficialUsageCsv).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "0", "-1", "1.5", "100000001"])("keeps the last valid attention filter when the threshold is invalid (%s)", async invalid => {
+    const fixture = structuredClone(copilotUsageFixture);
+    fixture.users[0] = licensedUser(1, "Ada", 12);
+    vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
+    render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByRole("button", { name: "Needs attention" }));
+    const filters = await paidFilters();
+    const threshold = filters.getByRole("spinbutton", { name: "Low-response threshold" });
+    await userEvent.clear(threshold);
+    await userEvent.type(threshold, "20");
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo"]);
+    fireEvent.change(threshold, { target: { value: invalid } });
+    expect(threshold).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a whole-number threshold between 1 and 100,000,000.");
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ada", "Ben", "Cleo"]);
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("3 matching users");
+    expect(screen.getByRole("button", { name: "Needs attention" }).querySelector("strong")).toHaveTextContent("3");
+    await userEvent.clear(threshold);
+    await userEvent.type(threshold, "1");
+    expect(threshold).toHaveAttribute("aria-invalid", "false");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Cleo"]);
+    expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
   });
 
   it("requests the server-filtered active-without-paid cohort even when the local directory roster is unavailable", async () => {
@@ -867,7 +1111,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     await screen.findByRole("button", { name: "Ada" });
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(userRows()).toHaveLength(2);
-    await userEvent.selectOptions(screen.getByLabelText("Low agent usage threshold"), "20");
+    const threshold = (await paidFilters()).getByRole("spinbutton", { name: "Low-response threshold" });
+    await userEvent.clear(threshold);
+    await userEvent.type(threshold, "20");
     expect(userRows()).toHaveLength(3);
     expect(screen.queryByRole("button", { name: "Drew" })).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
@@ -879,7 +1125,8 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    expect(screen.getByText(/Agent usage is out of date/)).toBeVisible();
+    expect(screen.getByText(/Reports are out of date/)).toHaveTextContent("Manage reports in Sync");
+    expect(screen.getByRole("link", { name: "Manage reports in Sync" })).toHaveAttribute("href", "/sync?reports=manage");
     expect(screen.queryByText("Offer adoption help")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
     expect(screen.getByText("No users match")).toBeVisible();
@@ -915,7 +1162,6 @@ describe("Paid M365 Copilot license dashboard", () => {
     const trigger = await screen.findByRole("button", { name: "Ada" });
     expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Needs attention").parentElement)
       .toHaveTextContent(stale ? "0" : "1");
-    expect(userRows()[0]).toHaveTextContent(stale ? "Usage unknown" : "Review app activity");
     await userEvent.click(trigger);
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText(stale ? "Usage unknown" : "Review app activity")).toBeVisible();
@@ -949,11 +1195,14 @@ describe("Paid M365 Copilot license dashboard", () => {
     fixture.sources.appActivity = { ...fixture.sources.appActivity, state: "unavailable", message: "Reports.Read.All and Reports Reader are required." };
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
-    expect(await screen.findByText(/Current paid license inventory is unverified/)).toHaveTextContent("User.Read.All");
+    expect(await screen.findByRole("group", { name: "M365 Copilot license summary" })).toBeVisible();
+    expect(screen.getByText(/License data unavailable/)).toHaveTextContent(/Sync.*Permissions/);
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText(/Office app activity unavailable/)).toBeVisible();
-    expect(screen.getByText(/Office app activity unavailable/)).toHaveTextContent("Reports.Read.All and Reports Reader");
-    expect(screen.getByText(/current licensing unverified/)).toBeVisible();
+    expect(screen.getByText(/Office app activity unavailable/)).toHaveTextContent("Permissions");
+    await userEvent.click(screen.getByText("Data sources and coverage"));
+    expect(screen.getByText("User.Read.All permission required.")).toBeVisible();
+    expect(screen.getByText("Reports.Read.All and Reports Reader are required.")).toBeVisible();
     expect(screen.queryByText(/^0 licensed users shown/)).not.toBeInTheDocument();
     expect(within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent("Unknown");
     expect(screen.queryByText(/Unlinked report identities/)).not.toBeInTheDocument();
@@ -970,8 +1219,10 @@ describe("Paid M365 Copilot license dashboard", () => {
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
     expect(userRows()).toHaveLength(4);
-    expect(screen.getByText(/Office app activity unavailable/)).toHaveTextContent("Reports Reader");
+    expect(screen.getByText(/Office app activity unavailable/)).toHaveTextContent("Permissions");
     expect(screen.getByText(/Office app activity unavailable/)).toBeVisible();
+    await userEvent.click(screen.getByText("Data sources and coverage"));
+    expect(screen.getByText(fixture.sources.appActivity.message)).toBeVisible();
   });
 
   it("keeps a disabled directory account separate from a paid license with active features", async () => {
@@ -980,13 +1231,12 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    expect(within(userRows()[0]).getAllByRole("cell")[1]).toHaveTextContent("M365 Copilot licensedPaid features: Active");
     expect(userRows()[0]).toHaveTextContent("Account disabled");
-    expect(userRows()[0]).toHaveTextContent("Review disabled account");
     await userEvent.click(screen.getByRole("button", { name: "Ada" }));
     const detail = screen.getByRole("dialog", { name: "Ada" });
     expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Paid features: Active");
     expect(within(detail).getByText("Directory account").parentElement).toHaveTextContent("Account disabled");
+    expect(within(detail).getByText("Review disabled account")).toBeVisible();
   });
 
   it("shows usable grace-period services without duplicate raw capability evidence", async () => {
@@ -997,9 +1247,9 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(fixture);
     render(<CopilotUsersView />);
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
-    expect(userRows()[0]).toHaveTextContent("Active (grace period)");
-    expect(userRows()[0]).toHaveTextContent("Review paid features");
     const detail = screen.getByRole("dialog", { name: "Ada" });
+    expect(within(detail).getByText("M365 Copilot license").parentElement).toHaveTextContent("Active (grace period)");
+    expect(within(detail).getByText("Review paid features")).toBeVisible();
     await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     const services = within(detail).getByRole("list", { name: "Paid feature states" });
     expect(within(services).getByText("Active (grace period)")).toBeVisible();
@@ -1031,8 +1281,11 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(userRows()).toHaveLength(1);
     expect(userRows()[0]).toHaveTextContent("Person4002");
     expect(userRows()[0]).toHaveTextContent("Unknown");
-    expect(userRows()[0]).toHaveTextContent("M365 Copilot licensed");
-    expect(screen.queryByLabelText("Copilot user pages")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Person4002" }));
+    expect(within(screen.getByRole("dialog", { name: "Person4002" })).getByText("M365 Copilot licensed", { exact: true })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Close user details" }));
+    expect(screen.getByLabelText("Copilot user pages")).toHaveTextContent("1-1 of 1");
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
     await userEvent.clear(search);
     await userEvent.type(search, "person4052");
     expect(screen.getByRole("heading", { name: "No users match" })).toBeVisible();
@@ -1049,7 +1302,11 @@ describe("Paid M365 Copilot license dashboard", () => {
     await screen.findByRole("button", { name: "Ben" });
     await userEvent.click(screen.getByRole("button", { name: cohortLabel }));
     await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Ben");
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order by" }), "name");
+    const filters = await paidFilters();
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "Contoso Health");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Department" }), "Operations");
+    fireEvent.change(filters.getByRole("spinbutton", { name: "Low-response threshold" }), { target: { value: "20" } });
+    await sortPaidUsers("name");
     const summary = screen.getByLabelText("M365 Copilot license summary");
     const summaryBefore = summary.textContent;
     const rowBefore = userRows()[0].textContent;
@@ -1062,9 +1319,15 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(summary).toHaveTextContent(summaryBefore!);
     expect(userRows()[0]).toHaveTextContent(rowBefore!);
     expect(screen.getByRole("button", { name: cohortLabel })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("combobox", { name: "Order by" })).toHaveValue("name");
     expect(search).toHaveValue("Ben");
     expect(search).toHaveFocus();
+    await expectPaidSort("name");
+    const retainedFilters = await paidFilters();
+    expect(retainedFilters.getByRole("combobox", { name: "Company" })).toHaveValue("Contoso Health");
+    expect(retainedFilters.getByRole("combobox", { name: "Department" })).toHaveValue("Operations");
+    expect(retainedFilters.getByRole("combobox", { name: "Activity" })).toHaveValue(cohortLabel === "Using agents" ? "using" : "attention");
+    expect(retainedFilters.getByRole("spinbutton", { name: "Low-response threshold" })).toHaveValue(20);
+    await userEvent.click(retainedFilters.getByRole("button", { name: "Close filters" }));
     await userEvent.clear(search);
     expect(userRows()).toHaveLength(2);
     await userEvent.type(search, "Ben");
@@ -1210,7 +1473,12 @@ describe("Paid M365 Copilot license dashboard", () => {
     const view = render(<CopilotUsersView dataRevision={0} />);
     await screen.findByRole("button", { name: "Ada" });
     await userEvent.type(screen.getByRole("searchbox", { name: "Search users or agents" }), "Ada");
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Order by" }), "name");
+    const filters = await paidFilters();
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Company" }), "Contoso Health");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Department" }), "Operations");
+    await userEvent.selectOptions(filters.getByRole("combobox", { name: "Activity" }), "using");
+    fireEvent.change(filters.getByRole("spinbutton", { name: "Low-response threshold" }), { target: { value: "20" } });
+    await sortPaidUsers("name");
     expect(screen.queryByRole("button", { name: "Sync users" })).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledOnce();
 
@@ -1227,7 +1495,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
     expect(screen.getByRole("searchbox", { name: "Search users or agents" })).toHaveValue("Ada");
-    expect(screen.getByRole("combobox", { name: "Order by" })).toHaveValue("name");
+    await expectPaidSort("name");
+    const restoredFilters = await paidFilters();
+    expect(restoredFilters.getByRole("combobox", { name: "Company" })).toHaveValue("Contoso Health");
+    expect(restoredFilters.getByRole("combobox", { name: "Department" })).toHaveValue("Operations");
+    expect(restoredFilters.getByRole("combobox", { name: "Activity" })).toHaveValue("using");
+    expect(restoredFilters.getByRole("spinbutton", { name: "Low-response threshold" })).toHaveValue(20);
+    expect(userRows()).toHaveLength(1);
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(3);
   });
 
@@ -1245,16 +1519,15 @@ describe("Paid M365 Copilot license dashboard", () => {
     const route = { view: "activity", search: "", page: 0 } as const;
     const view = render(<CopilotUsersView route={route} dataRevision={0} />);
     const activity = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    await waitFor(() => expect(within(activity).getByRole("row", { name: /Ben/ })).toHaveTextContent("No active M365 Copilot license"));
+    await waitFor(() => expect(within(activity).getByRole("row", { name: /Ben/ })).toBeVisible());
     expect(within(activity).queryByRole("row", { name: /Ada/ })).not.toBeInTheDocument();
 
     view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
     const refreshedActivity = await screen.findByRole("region", { name: "Active users without paid Copilot" });
-    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("No active M365 Copilot license");
-    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("Paid features:");
+    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toBeVisible();
     await act(async () => reject(new Error("Saved users temporarily unavailable")));
     expect(await screen.findByRole("alert")).toHaveTextContent("Saved users temporarily unavailable");
-    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toHaveTextContent("No active M365 Copilot license");
+    expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).toBeVisible();
     expect(within(refreshedActivity).getByRole("row", { name: /Ben/ })).not.toHaveTextContent("Paid features:");
     await userEvent.click(within(refreshedActivity).getByRole("button", { name: "View reported details for Ben" }));
     expect(within(screen.getByRole("dialog", { name: "Ben" })).getByText("M365 Copilot license").parentElement).toHaveTextContent("No active M365 Copilot license");
@@ -1294,13 +1567,15 @@ describe("Paid M365 Copilot license dashboard", () => {
     await userEvent.click(within(detail).getByRole("tab", { name: "Licenses" }));
     expect(within(detail).getByText("Refresh Users in Sync to verify current paid-feature status.")).toBeVisible();
     expect(within(detail).getAllByText("Last saved: Active")).toHaveLength(2);
-    expect(screen.getByText(/Current paid license inventory is unverified/)).toBeVisible();
+    expect(screen.getByText(/License data unavailable/)).toHaveTextContent(/Sync.*Permissions/);
     expect(screen.queryByRole("region", { name: "Paid license scope and coverage" })).not.toBeInTheDocument();
     const metric = within(screen.getByLabelText("M365 Copilot license summary")).getByText("Active M365 Copilot licensed users").parentElement!;
     expect(within(metric).getByText("Unknown")).toBeVisible();
     await userEvent.click(within(detail).getByRole("button", { name: "Close user details" }));
+    await userEvent.click(screen.getByText("Data sources and coverage"));
+    expect(screen.getByText(data.sources.directory.message)).toBeVisible();
     expect(userRows()).toHaveLength(3);
-    expect(screen.getByText(/Last saved: 3 previously licensed users shown; current licensing unverified/)).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("3 matching users");
     expect(screen.queryByText("M365 Copilot licensed", { exact: true })).not.toBeInTheDocument();
     expect(screen.queryByText(/^(Offer adoption help|Explore agents|Review paid features)$/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "All checked users" })).not.toBeInTheDocument();
@@ -1360,12 +1635,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     }
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "User cohort" }), "licenses");
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
-    expect(userRows()[0]).toHaveTextContent("M365 Copilot licensed");
-    expect(userRows()[0]).not.toHaveTextContent("Last saved:");
+    expect(userRows()[0]).toHaveTextContent("Ada");
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("Updating...");
     expect(within(screen.getByLabelText("M365 Copilot license summary"))
       .getByText("Active M365 Copilot licensed users").parentElement).toHaveTextContent(String(previous.counts.licensedUsers));
     await act(async () => resolveCurrent(current));
     expect(userRows().map(row => within(row).getByRole("button").textContent)).toEqual(["Ben", "Drew"]);
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("2 matching users");
     expect(screen.queryByText(/Showing the last saved user snapshot/)).not.toBeInTheDocument();
     expect(getCopilotUsageUsers).toHaveBeenCalledTimes(2);
   });
@@ -1490,12 +1766,13 @@ describe("Paid M365 Copilot license dashboard", () => {
     vi.mocked(getCopilotUsageUsers).mockResolvedValue(data);
     render(<CopilotUsersView />);
     await screen.findByRole("button", { name: "Ada" });
-    await userEvent.selectOptions(screen.getByLabelText("Order by"), "activity");
+    await sortPaidUsers("activity");
     expect(userRows()[0]).toHaveTextContent("Ben");
     const ada = userRows().find(row => within(row).queryByRole("button", { name: "Ada" }))!;
     expect(ada).toHaveTextContent("Not reported");
     expect(ada).not.toHaveTextContent("Sep 19");
-    expect(ada).toHaveTextContent("Users report only");
+    expect(ada).not.toHaveTextContent("Users report only");
+    expect(within(ada).getAllByRole("cell")[4]).toHaveTextContent("Not reported");
   });
 
   it("never searches a concealed identity in another snapshot when its saved report scope is missing", async () => {
@@ -1560,8 +1837,9 @@ describe("Paid M365 Copilot license dashboard", () => {
       expect(screen.queryByText(/Saved user snapshot is partial/)).not.toBeInTheDocument();
     } else {
       expect(screen.getByText(/Saved user snapshot is partial/)).toBeVisible();
-      expect(screen.getByText(/Run Users Sync to verify the saved paid licenses/, { selector: "p" })).toBeVisible();
-      expect(screen.getByText(/current licensing unverified/)).toBeVisible();
+      expect(screen.getByText(/License data unavailable/)).toHaveTextContent(/Sync.*Permissions/);
+      await userEvent.click(screen.getByText("Data sources and coverage"));
+      expect(screen.getByText(data.sources.directory.message)).toBeVisible();
       expect(screen.queryByRole("heading", { name: "No active M365 Copilot licenses found" })).not.toBeInTheDocument();
       expect(screen.queryByText(/^0 licensed users shown/)).not.toBeInTheDocument();
     }

@@ -172,9 +172,91 @@ describe("official usage report-agent routes", () => {
     expect(await get(`${usersPath}?licenseCohort=active_without_paid`)).toMatchObject({
       status: 200, body: {
         users: { value: [], count: 0 },
+        filters: { companies: [], departments: [] },
         licenseCoverage: { state: "unavailable", unknownUsers: 5, message: "Directory refresh failed." },
       },
     });
+  });
+
+  it("returns complete organization facets before search and paging while applying trimmed AND filters", async () => {
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(savedOrganizations());
+    const baseline = await get<OfficialUsageUserView>(`${usersPath}?licenseCohort=active_without_paid&limit=1`);
+    expect(baseline).toMatchObject({
+      status: 200, body: {
+        filters: { companies: ["Contoso", "Fabrikam"], departments: ["Engineering", "Sales"] },
+        users: { count: 2, value: [{ username: "only-lower", companyName: "Contoso", department: "Engineering" }] },
+      },
+    });
+    const query = new URLSearchParams({
+      licenseCohort: "active_without_paid", company: " Fabrikam ", department: " Sales ",
+      search: "only-set", limit: "1", sortDirection: "asc", setId: retainedSetId,
+    });
+    expect(await get(`${usersPath}?${query}`)).toMatchObject({
+      status: 200, body: {
+        filters: { companies: ["Contoso", "Fabrikam"], departments: ["Engineering", "Sales"], company: "Fabrikam", department: "Sales" },
+        counts: { users: 2, filteredUsers: 1, totalResponsesReceived: 13 },
+        users: { count: 1, value: [{ username: "only-set", datasetScope: { reportSetId: retainedSetId } }] },
+      },
+    });
+    expect(readPublished).toHaveBeenLastCalledWith(config.tenants[0].tenantId, retainedSetId);
+    expect(readDirectory).toHaveBeenLastCalledWith({ tenantId: config.tenants[0].tenantId, principalId: "report-reader" });
+    query.set("company", "fabrikam");
+    expect(await get(`${usersPath}?${query}`)).toMatchObject({
+      status: 200, body: { filters: { companies: ["Contoso", "Fabrikam"], departments: ["Engineering", "Sales"] }, users: { count: 0 } },
+    });
+  });
+
+  it("does not read organization data or enrich ordinary report cohorts", async () => {
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource");
+    const result = await get<OfficialUsageUserView>(`${usersPath}?cohort=review`);
+    expect(result.status).toBe(200);
+    expect(result.body!.filters).toMatchObject({ companies: [], departments: [] });
+    expect(result.body!.users.value.every(user => !("companyName" in user) && !("department" in user))).toBe(true);
+    expect(readDirectory).not.toHaveBeenCalled();
+  });
+
+  it("exports the same organization-filtered identities and full rows, ignoring only list pagination", async () => {
+    vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(savedOrganizations());
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }), completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
+    for (const filters of [
+      { company: " Contoso ", department: " Engineering " },
+      { company: "Fabrikam", department: "Sales" },
+      { company: "Contoso", department: "Sales" },
+    ]) {
+      const query = new URLSearchParams({
+        ...filters, licenseCohort: "active_without_paid", search: "only", sortBy: "displayName", sortDirection: "asc",
+        setId: retainedSetId,
+      });
+      const listed = await get<OfficialUsageUserView>(`${usersPath}?${query}`);
+      expect(listed.status).toBe(200);
+      const exported = await get(`${usersPath}.csv?${query}&limit=1&offset=1`);
+      expect(exported.status).toBe(200);
+      const rows = parseCsv(exported.text, { columns: true, bom: true }) as Array<Record<string, string>>;
+      expect([...new Set(rows.map(row => row.username))]).toEqual(listed.body!.users.value.map(user => user.username));
+      expect(rows.every(row => row.licenseAssignmentStatus === "no_active_paid_license" && row.reportSetId === retainedSetId)).toBe(true);
+      expect(rows.some(row => row.username === "users-only" || row.username === "zero-user")).toBe(false);
+    }
+  });
+
+  it.each(["directory", "report"] as const)("revalidates the %s snapshot for organization-filtered CSV", async changedSource => {
+    const directory = savedOrganizations();
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(directory);
+    if (changedSource === "directory") {
+      const changed = structuredClone(directory);
+      changed.value![0].identity.companyName = "Changed company";
+      readDirectory.mockResolvedValue(changed).mockResolvedValueOnce(directory);
+    } else {
+      readPublished.mockResolvedValue({ ...active, activeRevision: active.activeRevision + 1 }).mockResolvedValueOnce(active);
+    }
+    vi.spyOn(auditLog, "getAuditLog").mockReturnValue({
+      startEvent: vi.fn().mockResolvedValue({ id: "export-event" }), completeEvent: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof auditLog.getAuditLog>);
+    vi.spyOn(csvExport, "createExportPublicationValidator").mockReturnValue(validateExportSource);
+    expect(await get(`${usersPath}.csv?licenseCohort=active_without_paid&company=Contoso&department=Engineering`))
+      .toMatchObject({ status: 409, body: { code: "dataset_invalidated" } });
   });
 
   it("exports only verified active unpaid users and revalidates saved licensing at publication", async () => {
@@ -478,6 +560,50 @@ describe("official usage report-agent routes", () => {
 });
 
 describe("official usage report-agent query validation", () => {
+  it.each([usersPath, `${usersPath}.csv`])("rejects invalid organization filters at %s before source reads", async path => {
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource");
+    for (const field of ["company", "department"]) {
+      for (const query of [
+        `${field}=Contoso`, `${field}=`, `${field}=Contoso&licenseCohort=`,
+        ...[
+          `${field}=first&${field}=second`, `${field}[]=Contoso`, `${field}[nested]=Contoso`,
+          `${field}=${"x".repeat(257)}`, `${field}=%20${"x".repeat(256)}%20`,
+          `${field}=bad%0Atext`, `${field}=bad%0Dtext`, `${field}=bad%00text`,
+        ].map(value => `licenseCohort=active_without_paid&${value}`),
+      ]) {
+        expect(await get(`${path}?${query}`)).toMatchObject({ status: 400, body: { code: "invalid_usage_query" } });
+      }
+    }
+    expect(readDirectory).not.toHaveBeenCalled();
+    expect(readPublished).not.toHaveBeenCalled();
+  });
+
+  it("accepts bounded opaque organization values and treats blank cohort filters as unselected", async () => {
+    const directory = savedOrganizations();
+    vi.spyOn(DataSyncRepository.prototype, "getDirectorySource").mockResolvedValue(directory);
+    for (const value of ["x".repeat(256), "All", "Company / %?x=1#[]&:=+"]) {
+      directory.value![0].identity.companyName = value;
+      directory.value![0].identity.department = value;
+      const query = new URLSearchParams({ licenseCohort: "active_without_paid", company: value, department: value });
+      expect(await get(`${usersPath}?${query}`)).toMatchObject({
+        status: 200, body: { filters: { company: value, department: value }, users: { count: 1, value: [{ username: "only-lower" }] } },
+      });
+    }
+    const result = await get<OfficialUsageUserView>(`${usersPath}?licenseCohort=active_without_paid&company=%20&department=`);
+    expect(result).toMatchObject({ status: 200, body: { users: { count: 2 } } });
+    expect(result.body!.filters).not.toHaveProperty("company");
+    expect(result.body!.filters).not.toHaveProperty("department");
+  });
+
+  it.each([usersPath, `${usersPath}.csv`])("preserves authentication fences for organization queries at %s", async path => {
+    const readDirectory = vi.spyOn(DataSyncRepository.prototype, "getDirectorySource");
+    const query = "?licenseCohort=active_without_paid&company=Contoso&department=Engineering";
+    expect(await get(`${path}${query}`, null)).toMatchObject({ status: 401, body: { code: "unauthorized" } });
+    expect(await get(`${path}${query}`, "unassigned")).toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
+    expect(readDirectory).not.toHaveBeenCalled();
+    expect(readPublished).not.toHaveBeenCalled();
+  });
+
   it.each([usersPath, `${usersPath}.csv`])("rejects invalid date and threshold filters at %s before source reads", async path => {
     for (const query of [
       "startDate=2026-02-29", "endDate=2026-09-31", "startDate=2026-09-10&endDate=2026-09-09",
@@ -564,6 +690,15 @@ function savedDirectory(): SavedCopilotUsageSource<CopilotDirectoryUser[]> {
       },
     })),
   };
+}
+
+function savedOrganizations() {
+  const directory = savedDirectory();
+  directory.value!.forEach(user => {
+    user.identity.companyName = user.identity.userPrincipalName === "only-set" ? " Fabrikam " : "Contoso";
+    user.identity.department = user.identity.userPrincipalName === "only-set" ? " Sales " : "Engineering";
+  });
+  return directory;
 }
 
 function published(setId: string, responses: number): PublishedOfficialUsage {

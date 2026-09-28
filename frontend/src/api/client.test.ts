@@ -485,6 +485,8 @@ describe("access API client", () => {
       setId: "11111111-1111-4111-8111-111111111111",
       licenseCohort: "active_without_paid",
       search: "User + one",
+      company: "Contoso & Co",
+      department: "Research + Development",
       cohort: "low",
       lowResponseThreshold: 5,
       startDate: "2026-01-01",
@@ -496,7 +498,7 @@ describe("access API client", () => {
     });
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/official-usage/aggregate?setId=11111111-1111-4111-8111-111111111111&search=Agent+%26+one&creatorType=Agent+built+by+your+org&startDate=2026-01-01&endDate=2026-09-12&sortBy=unlicensedUsers&sortDirection=asc&limit=100&offset=200");
-    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&licenseCohort=active_without_paid&search=User+%2B+one&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/official-usage/users?setId=11111111-1111-4111-8111-111111111111&licenseCohort=active_without_paid&search=User+%2B+one&company=Contoso+%26+Co&department=Research+%2B+Development&cohort=low&lowResponseThreshold=5&startDate=2026-01-01&endDate=2026-09-12&sortBy=responses&sortDirection=desc&limit=100&offset=100");
   });
 
   it("loads paginated cumulative official usage history without changing active selection", async () => {

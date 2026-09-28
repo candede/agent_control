@@ -480,7 +480,8 @@ function aggregateOptions(query: Record<string, unknown>) {
 function userViewOptions(query: Record<string, unknown>) {
   validateViewQuery(query, [
     "setId", "search", "agentId", "creatorType", "activity", "responsesOnly", "inactiveDays",
-    "startDate", "endDate", "lowResponseThreshold", "cohort", "licenseCohort", "sortBy", "sortDirection", "limit", "offset",
+    "startDate", "endDate", "lowResponseThreshold", "cohort", "licenseCohort", "company", "department",
+    "sortBy", "sortDirection", "limit", "offset",
   ]);
   const activity = first(query.activity);
   if (activity !== undefined && !["all", "recent", "inactive", "no-activity"].includes(activity)) {
@@ -492,6 +493,9 @@ function userViewOptions(query: Record<string, unknown>) {
   }
   const cohort = queryEnum(first(query.cohort), ["all", "zero", "low", "review"] as const, "review cohort");
   const licenseCohort = queryEnum(first(query.licenseCohort), ["active_without_paid"] as const, "license cohort");
+  if (!licenseCohort && (query.company !== undefined || query.department !== undefined)) {
+    throw new AppError(400, "invalid_usage_query", "Company and department filters require the active_without_paid license cohort.");
+  }
   const sortBy = queryEnum(first(query.sortBy), ["displayName", "responses", "agentsUsed", "lastActivity"] as const, "user sort");
   const sortDirection = queryEnum(first(query.sortDirection), ["asc", "desc"] as const, "sort direction");
   const [startDate, endDate] = queryDateRange(query);
@@ -508,6 +512,8 @@ function userViewOptions(query: Record<string, unknown>) {
     lowResponseThreshold: queryInteger(first(query.lowResponseThreshold), 5, 100_000_000, true),
     cohort,
     licenseCohort,
+    company: queryText(first(query.company), 256)?.trim() || undefined,
+    department: queryText(first(query.department), 256)?.trim() || undefined,
     userSortBy: sortBy,
     sortDirection,
     limit: queryInteger(first(query.limit), 100, 500, true),
