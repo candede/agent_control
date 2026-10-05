@@ -28,6 +28,29 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.useRealTimers(); });
 
 describe("selected users and reports client boundary", () => {
+  it.each(["licenses", "activity"] as const)("shows refresh progress rather than sync-again warnings for the %s cohort", async view => {
+    const data = reportPage([]);
+    data.sources.directory = { ...data.sources.directory, state: "unavailable", attemptStatus: "running" };
+    data.sources.app_activity = { ...data.sources.app_activity, state: "stale", attemptStatus: "running" };
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(data);
+    render(<CopilotUsersView route={{ view, search: "", page: 0 }} />);
+    await screen.findByText("Refreshing license data. Showing the last saved data until sync completes.");
+    if (view === "licenses") expect(screen.getByText("Refreshing Office app activity. Showing the last saved data until sync completes.")).toBeVisible();
+    expect(screen.queryByText(/Run Users sync|Office app activity is out of date/)).not.toBeInTheDocument();
+  });
+  it.each(["available", "stale"] as const)("withholds old Office freshness notices during a read and reports the settled %s state", async state => {
+    const stale = reportPage([combinedUser()]);
+    stale.sources.app_activity.state = "stale";
+    const pending = deferred<typeof stale>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(stale).mockReturnValueOnce(pending.promise);
+    render(<CopilotUsersView />);
+    await screen.findByText("Office app activity is out of date. Run Users sync in Sync.");
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(screen.queryByText(/Office app activity is out of date/)).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "User 1" })).toBeVisible();
+    await act(async () => pending.resolve({ ...stale, sources: { ...stale.sources, app_activity: { ...stale.sources.app_activity, state } } }));
+    await waitFor(() => expect(screen.queryByText(/Office app activity is out of date/) !== null).toBe(state === "stale"));
+  });
   it.each(["company", "department"] as const)("keeps SQL null and every literal %s facet distinct through rendering, change and serialization", async field => {
     const values = [null, "null", "~null", "", "~string:", "~string:null"];
     vi.mocked(api.readReportFacet).mockResolvedValue({ value: values.map((value, index) => ({ value, count: index + 1 })),

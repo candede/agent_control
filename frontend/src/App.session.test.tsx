@@ -3568,9 +3568,8 @@ describe("App session revalidation", () => {
     await userEvent.click(button);
     await userEvent.click(screen.getByRole("button", { name: /Download matching agents/ }));
     await completeNativeInventoryDownload(download);
-    expect(transport.fetchMock).toHaveBeenCalledWith("/api/data-exports", expect.objectContaining({
-      headers: expect.objectContaining({ "X-CSRF-Token": "csrf-1" }),
-    }));
+    const exportRequest = transport.fetchMock.mock.calls.find(([path]) => path === "/api/data-exports");
+    expect(new Headers(exportRequest?.[1]?.headers).get("X-CSRF-Token")).toBe("csrf-1");
     expect(inventoryExportRequest(transport.fetchMock)).toEqual({
       selectionId: currentInventorySelection(transport.fetchMock), kind: "unified_agents", idempotencyKey: expect.any(String),
     });
@@ -4494,7 +4493,8 @@ describe("App session revalidation", () => {
       path === "/api/data-sync/runs" && init?.method === "POST");
     expect(request).toBeDefined();
     if (!request) throw new Error("Expected the durable initial sync request.");
-    expect(request[1]).toMatchObject({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-1" }) });
+    expect(request[1]).toMatchObject({ method: "POST" });
+    expect(new Headers(request[1]?.headers).get("X-CSRF-Token")).toBe("csrf-1");
     expect(JSON.parse(String(request[1]?.body))).toEqual({ mode: "initial" });
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
@@ -4667,7 +4667,8 @@ describe("App session revalidation", () => {
     expect(start).toBeGreaterThan(-1);
     expect(poll).toBeGreaterThan(start);
     expect(detail).toBeGreaterThan(poll);
-    expect(calls[start][1]).toMatchObject({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-1" }) });
+    expect(calls[start][1]).toMatchObject({ method: "POST" });
+    expect(new Headers(calls[start][1]?.headers).get("X-CSRF-Token")).toBe("csrf-1");
     expect(calls.some(([path]) => String(path).includes("mutation-preview") || String(path).endsWith("/access"))).toBe(false);
   });
 
@@ -6268,7 +6269,7 @@ function appTransport({
         canRetry: false,
       })),
     });
-    if (new URL(input, "http://localhost").pathname === "/api/official-usage/history" && reportHistory) return Response.json(reportHistory);
+    if (["/api/official-usage/history", "/api/official-usage/history/options"].includes(new URL(input, "http://localhost").pathname) && reportHistory) return Response.json(reportHistory);
     const reportData = selectedFixtureRead(input);
     if (reportData) return Response.json(reportData);
     if (input.startsWith("/api/agent-inventory")) {

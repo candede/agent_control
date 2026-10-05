@@ -7,9 +7,9 @@ export function kindLabel(kind: OfficialReportPreview["kind"]) {
 export function companionMetadata(preview?: Pick<OfficialReportPreview, "reportingPeriod" | "sourceAsOf" | "sourceAsOfProvenance">): ReportUploadMetadata {
   const period = preview?.reportingPeriod;
   return {
-    ...(period?.startDate && period.endDate && (period.provenance === "operator_asserted" || period.provenance === "source_metadata")
+    ...(period?.startDate && period.endDate && period.provenance === "operator_asserted"
       ? { reportingStart: period.startDate, reportingEnd: period.endDate, periodProvenance: period.provenance } : {}),
-    ...(preview?.sourceAsOf && (preview.sourceAsOfProvenance === "source_metadata" || preview.sourceAsOfProvenance === "operator_asserted")
+    ...(preview?.sourceAsOf && preview.sourceAsOfProvenance === "operator_asserted"
       ? { sourceAsOf: preview.sourceAsOf, sourceAsOfProvenance: preview.sourceAsOfProvenance } : {}),
   };
 }

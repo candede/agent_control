@@ -6,7 +6,7 @@ import { UserSourcesRepository, facts, userSourceSqlParameters, type UserSourceM
 import { OfficialReportHistory, readableHistorySql } from "../db/officialReportHistory.js";
 import { reportRelationsSql, selectedDirectoryReportRelationsSql, selectedOfficialReportRelationsSql } from "../db/officialReportQueries.js";
 import { reportUuid } from "../db/officialReportImports.js";
-import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
+import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
 import type { ReportEndpoint, ReportMetadata, ReportPage, ReportQuery, ReportRow, ReportSummary } from "../types/officialReportData.js";
 import type { UserSourceScope, UserSourceSelection } from "../types/userSources.js";
 import type { GenerationLease } from "../db/dataGenerations.js";
@@ -28,12 +28,12 @@ const sorts = {
 export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportQuery {
   if (!(endpoint in sorts) || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
   const query = { ...input };
-  for (const key of ["search", "company", "department", "creatorType", "agentId", "username"] as const) {
+  for (const key of ["company", "department", "creatorType", "agentId", "username"] as const) {
     const value = query[key];
     if (value !== undefined && !(value === null && ["company", "department"].includes(key))
       && (typeof value !== "string" || value.length > (key === "agentId" || key === "username" ? 512 : 256)
         || (key === "agentId" || key === "username") && !value.trim()
-        || /[\0\r\n]/.test(value) || key === "search" && /[\p{Cc}\p{Cs}]/u.test(value))) throw new SelectionError("invalid_cursor");
+        || /[\0\r\n]/.test(value))) throw new SelectionError("invalid_cursor");
   }
   if (query.setId !== undefined) reportUuid(query.setId);
   for (const [key, values] of [
@@ -57,7 +57,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
   query.sort ??= endpoint === "history" ? "acceptedAt" : endpoint === "official_agents" ? "responses" : "name";
   if (!(sorts[endpoint] as readonly string[]).includes(query.sort)) throw new SelectionError("invalid_cursor");
   query.order ??= endpoint === "history" || endpoint === "official_agents" ? "desc" : "asc";
-  if (query.search !== undefined) query.search = query.search.trim().normalize("NFKC").toLowerCase();
+  if (query.search !== undefined) query.search = reportSearch(query.search);
   // A accepted filter must be meaningful on the chosen endpoint, never ignored.
   const organization = ["company", "department", "entitlement", "serviceState", "appActivity", "cohort", "licenseCohort"];
   if (!["copilot_users", "official_users"].includes(endpoint) && organization.some(key => key in input)
@@ -110,10 +110,36 @@ export class LargeTenantUsersReports {
     return structuredClone(found);
   }
 
+  private rowCursor(input: Omit<Parameters<CursorCodec["encode"]>[0], "boundary">, row: pg.QueryResultRow) {
+    if (row.identity.length > 0 && row.identity.length <= 512) {
+      try {
+        return this.codec.encode({ ...input,
+          boundary: { key: row.page_key, id: row.identity, nullRank: row.page_key === null ? 1 : 0 } });
+      } catch (error) {
+        if (!(error instanceof SelectionError) || error.code !== "invalid_cursor") throw error;
+      }
+    }
+    // PostgreSQL text cannot contain NUL. Resolve compact boundaries only
+    // inside the same immutable selected relation.
+    return this.codec.encode({ ...input, boundary: { key: "\0", id: digest(row.identity), nullRank: 0 } });
+  }
+
+  private async cursorBoundary(client: pg.PoolClient, base: string, values: readonly unknown[], edge?: CursorBoundary): Promise<CursorBoundary | undefined> {
+    if (edge?.key !== "\0") return edge;
+    const found = (await client.query(`${base} SELECT page_key,identity FROM ordered
+      WHERE encode(sha256(convert_to(identity,'UTF8')),'hex')=$${values.length + 1} LIMIT 2`, [...values, edge.id])).rows;
+    if (found.length !== 1) throw new SelectionError("selection_invalidated");
+    return { key: found[0].page_key, id: found[0].identity, nullRank: found[0].page_key === null ? 1 : 0 };
+  }
+
+  private async prepareHistoryCapture(tenantId: string) {
+    await this.history.ensure(tenantId);
+    while (await this.history.expire(tenantId) > 0) { /* bounded maintenance transactions */ }
+  }
+
   async capture(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"], endpoint: ReportEndpoint, input: ReportQuery = {}) {
     const query = reportQuery(endpoint, input), sourceScope = await this.sources.ensureScope(identity, tokenMode);
-    await this.history.ensure(identity.tenantId);
-    while (await this.history.expire(identity.tenantId) === 100) { /* bounded maintenance transactions */ }
+    await this.prepareHistoryCapture(identity.tenantId);
     return this.selections.captureWith(identity, endpoint, { values: query, allowed: reportQueryFields }, async (client, evaluatedAt) => {
       const metadata = await this.sources.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
       const state = (await client.query("SELECT epoch::text FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0];
@@ -266,8 +292,8 @@ export class LargeTenantUsersReports {
       ORDER BY v.id,s.accepted_at DESC,s.id DESC), evidence AS (
       SELECT f.*,v.id AS version_id,v.accepted_at,v.set_id,
         (($7::date IS NULL OR f.last_activity>=$7) AND ($8::date IS NULL OR f.last_activity<=$8)
-          AND ($9::text IS NULL OR strpos(lower(normalize(f.agent_id,NFKC) COLLATE "default"),$9)>0
-            OR strpos(lower(normalize(f.agent_name,NFKC) COLLATE "default"),$9)>0)) AS query_match
+          AND ($9::text IS NULL OR strpos(${reportSearchSql("f.agent_id")},$9)>0
+            OR strpos(${reportSearchSql("f.agent_name")},$9)>0)) AS query_match
       FROM versions v JOIN official_usage_version_rows r ON r.version_id=v.id
       JOIN official_usage_row_facts f ON f.tenant_id=r.tenant_id AND f.kind=r.kind AND f.payload_hash=r.payload_hash
       WHERE f.kind IN ('agents','userAgents')), names AS (
@@ -286,12 +312,12 @@ export class LargeTenantUsersReports {
   filter(context: ReportReadContext, endpoint: ReportEndpoint, values: unknown[], omit?: "company" | "department") {
     const q = context.query, clauses = ["true"], add = (value: unknown) => { values.push(value); return `$${values.length}`; };
     if (endpoint === "overview") clauses.push("query_match");
-    if (q.search) clauses.push(`(strpos(lower(normalize(COALESCE(name,''),NFKC) COLLATE "default"),${add(q.search)})>0 OR strpos(lower(normalize(identity,NFKC) COLLATE "default"),${add(q.search)})>0
-      ${endpoint === "copilot_users" ? `OR strpos(upn_key,${add(q.search)})>0` : ""}
-      ${["copilot_users", "official_users"].includes(endpoint) ? `OR strpos(lower(normalize(COALESCE(company,''),NFKC) COLLATE "default"),${add(q.search)})>0
-        OR strpos(lower(normalize(COALESCE(department,''),NFKC) COLLATE "default"),${add(q.search)})>0` : ""}
-      ${["official_agents", "relationships"].includes(endpoint) ? `OR strpos(lower(normalize(creator_type,NFKC) COLLATE "default"),${add(q.search)})>0` : ""}
-      ${endpoint === "relationships" ? `OR strpos(lower(normalize(username,NFKC) COLLATE "default"),${add(q.search)})>0 OR strpos(lower(normalize(agent_id,NFKC) COLLATE "default"),${add(q.search)})>0` : ""}
+    if (q.search) clauses.push(`(strpos(${reportSearchSql("COALESCE(name,'')")},${add(q.search)})>0 OR strpos(${reportSearchSql("identity")},${add(q.search)})>0
+      ${endpoint === "copilot_users" ? `OR strpos(${reportSearchSql("upn_key")},${add(q.search)})>0` : ""}
+      ${["copilot_users", "official_users"].includes(endpoint) ? `OR strpos(${reportSearchSql("COALESCE(company,'')")},${add(q.search)})>0
+        OR strpos(${reportSearchSql("COALESCE(department,'')")},${add(q.search)})>0` : ""}
+      ${["official_agents", "relationships"].includes(endpoint) ? `OR strpos(${reportSearchSql("creator_type")},${add(q.search)})>0` : ""}
+      ${endpoint === "relationships" ? `OR strpos(${reportSearchSql("username")},${add(q.search)})>0 OR strpos(${reportSearchSql("agent_id")},${add(q.search)})>0` : ""}
       ${["copilot_users", "official_users"].includes(endpoint) ? `OR EXISTS(SELECT 1 FROM official_usage_set_versions sm JOIN official_usage_version_rows vr ON vr.version_id=sm.version_id
         JOIN official_usage_row_facts rf ON rf.tenant_id=vr.tenant_id AND rf.kind=vr.kind AND rf.payload_hash=vr.payload_hash
         WHERE sm.set_id=${add(context.report.setId)} AND sm.tenant_id=${add(context.identity.tenantId)} AND rf.kind='userAgents'
@@ -299,7 +325,7 @@ export class LargeTenantUsersReports {
           ${q.agentId !== undefined ? `AND rf.agent_id=${add(q.agentId)}` : ""}
           ${q.creatorType !== undefined ? `AND rf.creator_type=${add(q.creatorType)}` : ""}
           ${q.responsesOnly ? "AND rf.responses>0" : ""}
-          AND (strpos(lower(normalize(rf.agent_name,NFKC) COLLATE "default"),${add(q.search)})>0 OR strpos(lower(normalize(rf.agent_id,NFKC) COLLATE "default"),${add(q.search)})>0))` : ""})`);
+          AND (strpos(${reportSearchSql("rf.agent_name")},${add(q.search)})>0 OR strpos(${reportSearchSql("rf.agent_id")},${add(q.search)})>0))` : ""})`);
     if (["copilot_users", "official_users"].includes(endpoint)) {
       if (q.username !== undefined) clauses.push(`${endpoint === "copilot_users" ? "reported_username" : "username"}=${add(q.username)}`);
       for (const field of ["company", "department"] as const) if (q[field] !== undefined && field !== omit) clauses.push(`${field} IS NOT DISTINCT FROM ${add(q[field])}::text`);
@@ -381,13 +407,7 @@ export class LargeTenantUsersReports {
     const previous = cursor?.direction === "previous", descending = options.exportAfter !== undefined ? false : childContext.query.order === "desc";
     const direction = previous !== descending ? "DESC" : "ASC";
     const identityDirection = endpoint === "overview" ? previous ? "DESC" : "ASC" : direction;
-    let edge = cursor?.boundary;
-    if (edge?.key === "\0") {
-      const found = (await client.query(`${base} SELECT page_key,identity FROM ordered
-        WHERE encode(sha256(convert_to(identity,'UTF8')),'hex')=$${values.length + 1} LIMIT 2`, [...values, edge.id])).rows;
-      if (found.length !== 1) throw new SelectionError("selection_invalidated");
-      edge = { key: found[0].page_key, id: found[0].identity, nullRank: found[0].page_key === null ? 1 : 0 };
-    }
+    const edge = await this.cursorBoundary(client, base, values, cursor?.boundary);
     let boundary = "true", nonNullBoundary = "true";
     if (edge) {
       values.push(edge.nullRank, edge.key ?? "", edge.id);
@@ -503,17 +523,7 @@ export class LargeTenantUsersReports {
     if (!raw.length && counts.filtered > 0 && !cursor && options.exportAfter === undefined) throw new AppError(413, "data_row_limit", "A selected row exceeds the response budget.");
     const more = raw.length > 0 && exactCount(raw[0].batch_total) > Math.min(raw.length, limit), rows = raw.slice(0, limit);
     if (previous) rows.reverse();
-    const encode = (row: pg.QueryResultRow, dir: "next" | "previous") => {
-      try {
-        return this.codec.encode({ ...expected, direction: dir,
-          boundary: { key: row.page_key, id: row.identity, nullRank: row.page_key === null ? 1 : 0 } });
-      } catch (error) {
-        if (!(error instanceof SelectionError) || error.code !== "invalid_cursor") throw error;
-        // PostgreSQL text cannot contain NUL. Wide keys use a signed identity
-        // digest resolved only inside this same immutable selected dataset.
-        return this.codec.encode({ ...expected, direction: dir, boundary: { key: "\0", id: digest(row.identity), nullRank: 0 } });
-      }
-    };
+    const encode = (row: pg.QueryResultRow, direction: "next" | "previous") => this.rowCursor({ ...expected, direction }, row);
     return { raw: rows, value: rows.map(row => project(endpoint, row)), counts,
       summaryRow: envelope ? fetched[0].envelope_summary as pg.QueryResultRow : undefined,
       analyticsRow: envelope ? fetched[0].envelope_analytics as pg.QueryResultRow : undefined,
@@ -523,6 +533,13 @@ export class LargeTenantUsersReports {
 
   page(id: string, identity: SelectionIdentity, options: Parameters<LargeTenantUsersReports["rowsInRead"]>[2] = {}): Promise<ReportPage<ReportRow>> {
     return this.read(id, identity, (client, context) => this.pageInRead(client, context, options));
+  }
+  historyOptions(id: string, identity: SelectionIdentity, options: { limit?: number; cursor?: string } = {}) {
+    return this.read(id, identity, async (client, context) => {
+      if (context.endpoint !== "history") throw new SelectionError("invalid_cursor");
+      const rows = await this.rowsInRead(client, context, options);
+      return bounded({ value: rows.value, page: rows.page, counts: rows.counts, selection: context.selection, reports: context.report });
+    });
   }
   async pageInRead(client: pg.PoolClient, context: ReportReadContext, options: Parameters<LargeTenantUsersReports["rowsInRead"]>[2] = {}): Promise<ReportPage<ReportRow>> {
       const memo = this.aggregate(context, "envelope");
@@ -557,7 +574,8 @@ export class LargeTenantUsersReports {
   }
 
   facets(id: string, identity: SelectionIdentity, options: { field: "company" | "department" | "creatorType"; search?: string; limit?: number; cursor?: string }) {
-    if (!["company", "department", "creatorType"].includes(options.field) || options.search !== undefined && (typeof options.search !== "string" || options.search.length > 256)) throw new SelectionError("invalid_cursor");
+    if (!["company", "department", "creatorType"].includes(options.field)) throw new SelectionError("invalid_cursor");
+    const search = options.search === undefined ? "" : reportSearch(options.search);
     const limit = options.limit ?? 50;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new SelectionError("invalid_cursor");
     return this.read(id, identity, async (client, context) => {
@@ -568,18 +586,19 @@ export class LargeTenantUsersReports {
       const copy = { ...context, query };
       const { sql, values } = this.dataset(copy);
       const where = this.filter(copy, copy.endpoint, values, options.field === "creatorType" ? undefined : options.field);
-      values.push(options.search?.normalize("NFKC").toLowerCase() ?? "");
+      values.push(search);
       const base = `WITH dataset AS (${sql}), options AS (SELECT ${field} AS value,count(*)::text AS count FROM dataset
-        WHERE ${where} AND strpos(lower(normalize(COALESCE(${field},''),NFKC) COLLATE "default"),$${values.length})>0 GROUP BY ${field}),
+        WHERE ${where} AND strpos(${reportSearchSql(`COALESCE(${field},'')`)},$${values.length})>0 GROUP BY ${field}),
         ordered AS (SELECT *,lower(normalize(value,NFKC) COLLATE "default") AS page_key,COALESCE(value,chr(1)) AS identity FROM options)`;
       const counts = (await client.query(`${base} SELECT count(*)::text AS filtered,
         (SELECT count(*) FROM (SELECT ${field} FROM dataset GROUP BY ${field}) all_options)::text AS total FROM ordered`, values)).rows[0];
       const expected = { identity, endpoint: `facets:${options.field}`, selectionId: id, revision: context.selection.revision,
         queryHash: digest(`${context.queryHash}:${options.field}:${options.search ?? ""}`) };
       const cursor = options.cursor ? this.codec.decode(options.cursor, expected) : undefined, previous = cursor?.direction === "previous";
+      const edge = await this.cursorBoundary(client, base, values, cursor?.boundary);
       let boundary = "true";
-      if (cursor) {
-        values.push(cursor.boundary.nullRank, cursor.boundary.key ?? "", cursor.boundary.id);
+      if (edge) {
+        values.push(edge.nullRank, edge.key ?? "", edge.id);
         boundary = `((page_key IS NULL)::int ${previous ? "<" : ">"} $${values.length - 2} OR
           (page_key IS NULL)::int=$${values.length - 2} AND (COALESCE(page_key,'') COLLATE "C",identity COLLATE "C")
           ${previous ? "<" : ">"} ($${values.length - 1}::text COLLATE "C",$${values.length}::text COLLATE "C"))`;
@@ -590,8 +609,7 @@ export class LargeTenantUsersReports {
       encodeBatch(rows);
       const more = rows.length > limit, page = rows.slice(0, limit);
       if (previous) page.reverse();
-      const cursorFor = (row: pg.QueryResultRow, direction: "next" | "previous") => this.codec.encode({ ...expected, direction,
-        boundary: { key: row.page_key, id: row.identity, nullRank: row.page_key === null ? 1 : 0 } });
+      const cursorFor = (row: pg.QueryResultRow, direction: "next" | "previous") => this.rowCursor({ ...expected, direction }, row);
       return bounded({ value: page.map(row => ({ value: row.value as string | null, count: exactCount(row.count) })), selection: context.selection,
         counts: { total: exactCount(counts.total), filtered: exactCount(counts.filtered) },
         page: { limit, nextCursor: page.length && (previous ? Boolean(cursor) : more) ? cursorFor(page.at(-1)!, "next") : null,
@@ -652,7 +670,7 @@ export class LargeTenantUsersReports {
   }
 
   async captureReportIdentities(identity: SelectionIdentity) {
-    await this.history.ensure(identity.tenantId);
+    await this.prepareHistoryCapture(identity.tenantId);
     return this.selections.captureWith(identity, "directory_report_inputs", { values: {}, allowed: ["setId"] }, async (client, evaluatedAt) => {
       const report = await this.metadata(client, identity.tenantId, undefined, evaluatedAt);
       return { roots: [await this.history.root(client, identity.tenantId, evaluatedAt)], queryValues: { setId: report.setId } };
@@ -682,6 +700,16 @@ export class LargeTenantUsersReports {
   }
 }
 
+function reportSearch(value: string) {
+  if (typeof value !== "string" || value.length > 256 || /[\p{Cc}\p{Cs}]/u.test(value)) throw new SelectionError("invalid_cursor");
+  // Lowercasing can introduce decomposed sequences, so normalize again before persisting.
+  const search = value.normalize("NFKC").toLowerCase().normalize("NFKC").trim();
+  if (search.length > 256) throw new SelectionError("invalid_cursor");
+  return search;
+}
+function reportSearchSql(expression: string) {
+  return `normalize(lower(normalize(${expression},NFKC) COLLATE "default"),NFKC)`;
+}
 function sortKey(sort: NonNullable<ReportQuery["sort"]>, endpoint: ReportEndpoint) {
   const keys = { name: 'lower(normalize(name,NFKC) COLLATE "default")', upn: "upn_key", company: 'lower(normalize(company,NFKC) COLLATE "default")',
     department: 'lower(normalize(department,NFKC) COLLATE "default")', service: "service_state", appActivity: "last_activity_date::text",

@@ -12,7 +12,7 @@ import { historySet, reportPage } from "../src/test/reportDataFixture";
 import { selectedFixtureQuery, selectedFixtureWindow } from "../src/test/selectedUsageFixture";
 import { mockLayoutApi } from "./layoutFixtures";
 import { selectedCohortRead } from "./selectedCohortFixture";
-import { parseSelectedCsv, selectedImportData, selectedImportMetadata, type SelectedCsvFixture } from "./selectedImportData";
+import { parseSelectedCsv, selectedImportData, selectedImportMetadata, selectedImportPeriod, type SelectedCsvFixture } from "./selectedImportData";
 import { usageCsvFixture } from "./usageCsvFixture";
 
 export const importInstant = "2026-09-12T14:45:00.000Z";
@@ -21,11 +21,34 @@ export const retainedSetId = "99999999-9999-4999-8999-999999999999";
 const initialBundle = "22222222-2222-4222-8222-222222222222";
 const kinds = ["agents", "userAgents", "users"] as const;
 type SavedSet = { row: ReportHistorySet; files: SelectedCsvFixture[] };
-type Captured = { metadata: ReportMetadata; query: ReportQuery; files: SelectedCsvFixture[]; historyIds: string[] };
+type Captured = { path: string; metadata: ReportMetadata; query: ReportQuery; files: SelectedCsvFixture[]; historyIds: string[] };
 export type SelectedImportOptions = {
   role?: "Admin" | "Viewer"; active?: boolean; historical?: boolean; staged?: boolean; additionalSavedSets?: number;
   selectedSetId?: string; reusedExistingSet?: boolean; loseAcceptanceResponse?: boolean; stageResponseGate?: Promise<void>;
 };
+
+const normalized = (value: string) => value.trim().normalize("NFKC").toLowerCase();
+const includes = (value: string, search?: string) => !search || normalized(value).includes(normalized(search));
+const dateBefore = (date: string, days: number) => new Date(Date.parse(date) - days * 86400000).toISOString().slice(0, 10);
+const compare = (a: string | number, b: string | number) => a < b ? -1 : a > b ? 1 : 0;
+function sortRows<T>(rows: T[], query: ReportQuery, key: (row: T) => string | number | null, identity: (row: T) => string) {
+  return rows.sort((a, b) => {
+    const left = key(a), right = key(b);
+    if (left === null || right === null) return left === right ? compare(identity(a), identity(b)) : left === null ? 1 : -1;
+    return (query.order === "asc" ? 1 : -1) * compare(left, right) || compare(identity(a), identity(b));
+  });
+}
+function matchesActivity(date: string | null, query: ReportQuery, anchor: string | null) {
+  const cutoff = anchor ? dateBefore(anchor, (query.inactiveDays ?? 30) - 1) : null;
+  return (!query.startDate || Boolean(date && date >= query.startDate)) && (!query.endDate || Boolean(date && date <= query.endDate))
+    && (!query.reportActivity || query.reportActivity === "all" || query.reportActivity === "no-activity" && !date
+      || query.reportActivity === "recent" && Boolean(date && cutoff && date >= cutoff)
+      || query.reportActivity === "inactive" && Boolean(date && cutoff && date < cutoff));
+}
+function setHash(files: SelectedCsvFixture[]) {
+  return createHash("sha256").update(JSON.stringify([...files].sort((a, b) => compare(a.kind, b.kind))
+    .map(file => [file.kind, file.fileHash, file.reportingPeriod, file.sourceAsOf ?? null, file.sourceAsOfProvenance]))).digest("hex");
+}
 
 export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: string; content: string }>, options: SelectedImportOptions = {}) {
   await page.clock.setFixedTime(new Date(importInstant));
@@ -35,7 +58,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   const stages: OfficialReportPreview[] = [], stagedFiles = new Map<string, SelectedCsvFixture>(), discardedStages: string[] = [];
   const uploadBodies: string[] = [], uploadIntents: URLSearchParams[] = [], stageReads: string[] = [];
   const bundlePreviews: OfficialReportBundlePreview[] = [], acceptRequests: Array<OfficialReportBundleAcceptance & { bundleId: string }> = [];
-  const receipts = new Map<string, OfficialReportAccepted>(), setPreviews: OfficialReportConfirmation[] = [], confirmations: OfficialReportConfirmation[] = [];
+  const receipts = new Map<string, { input: OfficialReportBundleAcceptance; result: OfficialReportAccepted }>();
+  const setPreviews: OfficialReportConfirmation[] = [], confirmations: OfficialReportConfirmation[] = [];
   const agentRequests: URLSearchParams[] = [], userRequests: URLSearchParams[] = [], historyRequests: URLSearchParams[] = [];
   const metadataReads: ReportMetadata[] = [], apiRequests: string[] = [], commands: string[] = [], exportRequests: URLSearchParams[] = [];
   const exports = new Map<string, { selected: Captured; rows: ReportAgent[]; bytes: Buffer; status: OfficialReportExportStatus }>();
@@ -43,10 +67,12 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   let activeRevision = options.active ? 2 : 1, historyRevision = 1, historyEpoch = 1;
   let selectedSetId = options.selectedSetId ?? (options.active ? importedSetId : null);
   let hasHistory = Boolean(options.active || options.historical);
+  let usedImportedSetId = Boolean(options.active);
   function save(id: string, bundleId: string, files: SelectedCsvFixture[], acceptedAt = importInstant) {
-    const period = files[0].reportingPeriod;
+    const period = selectedImportPeriod(files);
+    if (!period) throw new Error("A synthetic report set requires at least one CSV.");
     sets.set(id, { row: historySet(1, { id, bundleId, acceptedAt, reportingStart: period.startDate, reportingEnd: period.endDate,
-      periodProvenance: period.provenance, contentHash: createHash("sha256").update(files.map(file => file.fileHash).join("")).digest("hex"),
+      periodProvenance: period.provenance, contentHash: setHash(files),
       active: id === selectedSetId }), files });
   }
   if (options.active) save(importedSetId, initialBundle, seeded);
@@ -60,7 +86,9 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     const files = await Promise.all(csvFiles.map((file, index) => parseSelectedCsv(Buffer.from(`${file.content.split("\r\n")[0]}\r\n${rows[index]}`))));
     save(retainedSetId, "88888888-8888-4888-8888-888888888888", files, "2026-06-02T10:00:00.000Z");
   }
-  if ((options.additionalSavedSets ?? 0) > 64) throw new Error("Synthetic retained-set fixture exceeds its 64-set bound");
+  if (!Number.isInteger(options.additionalSavedSets ?? 0) || (options.additionalSavedSets ?? 0) < 0 || (options.additionalSavedSets ?? 0) > 64) {
+    throw new Error("Synthetic retained-set fixture requires an integer count from 0 to 64");
+  }
   for (let index = 0; index < (options.additionalSavedSets ?? 0); index++) {
     save(`aaaaaaaa-aaaa-4aaa-8aaa-${String(index + 1).padStart(12, "0")}`, randomUUID(), seeded, "2026-06-02T10:00:00.000Z");
   }
@@ -71,7 +99,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       historyRevision: String(historyRevision), historyEpoch: String(historyEpoch),
       acceptedAt: saved?.row.acceptedAt ?? null, expiresAt: saved ? "2027-03-11T14:45:00.000Z" : null,
     });
-    if (!saved && hasHistory) result.availability = "deleted";
+    if (!saved) result.availability = sets.size ? "not_selected" : hasHistory ? "deleted" : "never_imported";
     return result;
   }
   function createStage(file: SelectedCsvFixture, bundleId: string, correctionOfSetId: string | null = null) {
@@ -89,30 +117,56 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   }
   if (options.staged) createStage(seeded[0], initialBundle);
   function activeStages(bundleId: string) { return stages.filter(stage => stage.bundleId === bundleId && !discardedStages.includes(stage.id)); }
+  function bundlePreview(bundleId: string): OfficialReportBundlePreview {
+    const current = activeStages(bundleId);
+    return { bundleId, expectedActiveRevision: String(activeRevision), complete: kinds.every(kind => current.some(stage => stage.kind === kind)),
+      bundleHash: createHash("sha256").update(JSON.stringify([bundleId, activeRevision, current])).digest("hex"),
+      stages: current.map(stage => ({ stagingId: stage.id, kind: stage.kind, revision: stage.revision, contentHash: stage.contentHash,
+        rowCount: stage.rowCount, reconciliation: stage.reconciliation })) };
+  }
   function captured(url: URL) {
+    const root = /^\/api\/official-usage\/(?:aggregate|agents)(?:\/|$)/.test(url.pathname) ? "/api/official-usage/aggregate"
+      : url.pathname.startsWith("/api/official-usage/history") ? "/api/official-usage/history"
+        : url.pathname.startsWith("/api/official-usage/users") ? "/api/official-usage/users" : url.pathname;
+    const input = new URL(url);
+    input.pathname = root;
+    if (url.pathname.endsWith("/facets")) { input.searchParams.delete("search"); input.searchParams.delete("field"); }
+    if (/\/(?:agents\/[^/]+\/users|users\/[^/]+\/agents)$/.test(url.pathname)) {
+      for (const key of Object.keys(selectedFixtureQuery(input.href))) input.searchParams.delete(key);
+    }
+    const query = selectedFixtureQuery(input.href);
+    if (query.search !== undefined) query.search = normalized(query.search);
+    query.lowResponseThreshold ??= 5; query.inactiveDays ??= 30; query.activityWindowDays ??= 30;
     const selectionId = url.searchParams.get("selectionId"), prior = selectionId ? selections.get(selectionId) : undefined;
-    if (selectionId && !prior) throw new Error("Unknown selected fixture context");
-    if (prior) return { selected: prior, selectionId };
+    if (selectionId && !prior) throw new AppError(409, "selection_invalidated", "Unknown selected fixture context.");
+    if (prior) {
+      if (prior.path !== root || Object.keys(query).some(key => input.searchParams.has(key)) && JSON.stringify(query) !== JSON.stringify(prior.query)) {
+        throw new AppError(400, "invalid_cursor", "Selection endpoint and filters are immutable.");
+      }
+      return { selected: prior, selectionId: selectionId! };
+    }
     if (selections.size >= 250) throw new Error("Synthetic selection fixture exceeded its bound");
-    const query = selectedFixtureQuery(url.href), reports = metadata(query.setId ?? selectedSetId);
-    const selected: Captured = { metadata: reports, query, files: reports.setId ? sets.get(reports.setId)!.files : [], historyIds: [...sets.keys()] };
+    if (query.setId && !sets.has(query.setId)) throw new AppError(404, "official_usage_set_not_found", "The exact synthetic report set is unavailable.");
+    const reports = metadata(query.setId ?? selectedSetId);
+    const selected: Captured = { path: root, metadata: reports, query, files: reports.setId ? sets.get(reports.setId)!.files : [], historyIds: [...sets.keys()] };
     const id = randomUUID(); selections.set(id, selected); return { selected, selectionId: id };
   }
   function agentRows(selected: Captured, query = selected.query) {
     const data = selectedImportData(selected.files, selected.metadata);
-    const rows = data.agents.filter(row => (!query.search || `${row.agentName} ${row.agentId}`.toLowerCase().includes(query.search.toLowerCase()))
-      && (!query.creatorType || row.creatorType === query.creatorType) && (!query.startDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc >= query.startDate))
-      && (!query.endDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc <= query.endDate)));
+    const anchor = data.agents.flatMap(row => row.lastActivityDateUtc ? [row.lastActivityDateUtc] : []).sort().at(-1) ?? null;
+    const rows = data.agents.filter(row => includes(`${row.agentName} ${row.agentId} ${row.creatorType}`, query.search)
+      && (!query.creatorType || row.creatorType === query.creatorType) && (!query.agentId || row.agentId === query.agentId)
+      && (!query.responsesOnly || row.responses > 0) && matchesActivity(row.lastActivityDateUtc, query, anchor));
     const key = (row: ReportAgent) => query.sort === "name" ? row.agentName : query.sort === "activeUsers" ? row.activeUsers
       : query.sort === "licensedUsers" ? row.licensedUserOccurrences : query.sort === "unlicensedUsers" ? row.unlicensedUserOccurrences
         : query.sort === "lastActivity" ? row.lastActivityDateUtc : row.responses;
-    rows.sort((a, b) => {
-      const left = key(a), right = key(b);
-      if (left === null || right === null) return left === right ? a.agentId.localeCompare(b.agentId) : left === null ? 1 : -1;
-      return (query.order === "asc" ? 1 : -1) * (typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right)))
-        || a.agentId.localeCompare(b.agentId);
-    });
+    sortRows(rows, query, key, row => row.agentId);
     return { data, rows };
+  }
+  function historyRows(selected: Captured) {
+    const query = selected.query;
+    return selected.historyIds.map(id => sets.get(id)!).filter(set => includes(`${set.row.id} ${set.row.acceptedAt}`, query.search))
+      .sort((a, b) => (query.order === "asc" ? 1 : -1) * (compare(a.row.acceptedAt, b.row.acceptedAt) || compare(a.row.id, b.row.id)));
   }
   const handle = async (route: Route) => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
@@ -173,26 +227,33 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     if (bundle) {
       const current = activeStages(bundle[1]);
       if (bundle[2] === "preview") {
-        const preview: OfficialReportBundlePreview = { bundleId: bundle[1], expectedActiveRevision: String(activeRevision),
-          complete: kinds.every(kind => current.some(stage => stage.kind === kind)),
-          bundleHash: createHash("sha256").update(JSON.stringify([bundle[1], activeRevision, current])).digest("hex"),
-          stages: current.map(stage => ({ stagingId: stage.id, kind: stage.kind, revision: stage.revision, contentHash: stage.contentHash,
-            rowCount: stage.rowCount, reconciliation: stage.reconciliation })) };
+        const preview = bundlePreview(bundle[1]);
         bundlePreviews.push(preview); return respond(preview);
       }
       const body: OfficialReportBundleAcceptance = request.postDataJSON(); acceptRequests.push({ bundleId: bundle[1], ...body });
-      const receipt = receipts.get(bundle[1]); if (receipt) return respond(receipt);
-      const reviewed = bundlePreviews.filter(value => value.bundleId === bundle[1]).at(-1)!;
-      expect(reviewed.complete).toBe(true); expect(body).toEqual({ bundleHash: reviewed.bundleHash, expectedActiveRevision: reviewed.expectedActiveRevision });
-      expect(body.expectedActiveRevision).toBe(String(activeRevision));
+      const receipt = receipts.get(bundle[1]), reviewed = bundlePreview(bundle[1]);
+      if (receipt) {
+        if (body.bundleHash !== receipt.input.bundleHash || body.expectedActiveRevision !== receipt.input.expectedActiveRevision) {
+          return respond({ code: "bundle_fence_mismatch", detail: "The acceptance receipt belongs to a different reviewed bundle." }, 409);
+        }
+        if (!sets.has(receipt.result.setId)) return respond({ code: "deleted_report_duplicate", detail: "This accepted report was deleted." }, 409);
+        return respond(receipt.result);
+      }
+      if (!reviewed.complete || body.bundleHash !== reviewed.bundleHash || body.expectedActiveRevision !== reviewed.expectedActiveRevision) {
+        return respond({ code: "bundle_fence_mismatch", detail: "Review the current complete bundle before accepting." }, 409);
+      }
+      const files = current.map(stage => stagedFiles.get(stage.id)!);
+      const existing = [...sets.values()].find(set => set.row.contentHash === setHash(files));
+      if (options.reusedExistingSet) expect(existing?.row.id).toBe(importedSetId);
+      const setId = existing?.row.id ?? (usedImportedSetId ? randomUUID() : importedSetId);
       for (const stage of current) stage.status = "accepted";
-      if (!options.reusedExistingSet) {
-        selectedSetId = importedSetId; activeRevision++; historyRevision++;
-        save(importedSetId, bundle[1], current.map(stage => stagedFiles.get(stage.id)!));
+      if (!existing) {
+        usedImportedSetId = true; selectedSetId = setId; activeRevision++; historyRevision++;
+        save(setId, bundle[1], files);
       }
       hasHistory = true;
-      const result: OfficialReportAccepted = { setId: importedSetId, activeRevision: String(activeRevision), complete: true };
-      receipts.set(bundle[1], result);
+      const result: OfficialReportAccepted = { setId, activeRevision: String(activeRevision), complete: true };
+      receipts.set(bundle[1], { input: body, result });
       if (options.loseAcceptanceResponse) return route.abort("failed");
       return respond(result);
     }
@@ -254,16 +315,20 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     if (!path.startsWith("/api/official-usage/") || request.method() !== "GET") return route.fallback();
     if (path === "/api/official-usage/aggregate") agentRequests.push(url.searchParams);
     if (path === "/api/official-usage/users") userRequests.push(url.searchParams);
-    const explicitSet = url.searchParams.get("setId");
-    if (explicitSet && !sets.has(explicitSet)) return respond({ code: "official_usage_set_not_found", detail: "The exact synthetic report set is unavailable." }, 404);
-    const { selected, selectionId } = captured(url);
+    let capture: ReturnType<typeof captured>;
+    try { capture = captured(url); }
+    catch (error) {
+      if (error instanceof AppError) return respond({ code: error.code, detail: error.message }, error.status);
+      throw error;
+    }
+    const { selected, selectionId } = capture;
     if (selected.metadata.historyEpoch !== String(historyEpoch)) return respond({ code: "selection_invalidated", detail: "Report history changed. Restart selection." }, 409);
-    const query: ReportQuery = { ...selected.query };
-    for (const [key, value] of Object.entries(selectedFixtureQuery(url.href))) if (url.searchParams.has(key)) Object.assign(query, { [key]: value });
+    const query = selected.query;
     const { data, rows } = agentRows(selected, query);
+    data.directory.selection = { ...data.directory.selection, id: selectionId, evaluatedAt: importInstant, expiresAt: "2026-09-12T15:15:00.000Z" };
     const base = <T>(value: T[], total = value.length): ReportPage<T> => reportPage(value, {
       reports: selected.metadata, sources: data.directory.sources, summary: data.summary, filters: query,
-      selection: { ...data.directory.selection, id: selectionId! }, counts: { total, filtered: value.length },
+      selection: data.directory.selection, counts: { total, filtered: value.length },
       analytics: { basis: "filtered_rows", rowCount: value.length, responses: null, zeroResponses: null, unknownResponses: null,
         review: null, agents: null, history: null, overview: null },
     });
@@ -273,52 +338,90 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       const anchor = data.agents.flatMap(row => row.lastActivityDateUtc ? [row.lastActivityDateUtc] : []).sort().at(-1) ?? null;
       const cutoff = anchor ? new Date(Date.parse(anchor) - ((query.activityWindowDays ?? 30) - 1) * 86400000).toISOString().slice(0, 10) : null;
       const recent = rows.filter(row => row.lastActivityDateUtc && cutoff && row.lastActivityDateUtc >= cutoff);
-      const analytics: ReportAnalytics = { ...base(rows).analytics, responses: rows.reduce((sum, row) => sum + row.responses, 0),
+      const inactiveBefore = dateBefore(importInstant, query.inactiveDays ?? 30);
+      const analytics: ReportAnalytics = { ...base(rows).analytics, responses: rows.length ? rows.reduce((sum, row) => sum + row.responses, 0) : null,
         zeroResponses: rows.filter(row => !row.responses).length, unknownResponses: 0, agents: {
-          inactive: rows.filter(row => row.lastActivityDateUtc && cutoff && row.lastActivityDateUtc < cutoff).length,
+          inactive: rows.filter(row => row.lastActivityDateUtc && row.lastActivityDateUtc < inactiveBefore).length,
           neverUsed: rows.filter(row => !row.lastActivityDateUtc).length, anchorDateUtc: anchor, windowDays: query.activityWindowDays ?? 30,
-          windowAgents: recent.length, windowResponses: recent.reduce((sum, row) => sum + row.responses, 0),
+          windowAgents: recent.length, windowResponses: recent.length ? recent.reduce((sum, row) => sum + row.responses, 0) : null,
           windowDistinctActiveUsers: new Set(data.relationships.filter(link => link.responses > 0 && recent.some(row => row.agentId === link.agentId)).map(link => link.username)).size,
-          mostResponses: [...rows].sort((a, b) => b.responses - a.responses).slice(0, 5).map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
-          leastResponses: [...rows].sort((a, b) => a.responses - b.responses).slice(0, 5).map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
+          mostResponses: sortRows([...rows], { order: "desc" }, row => row.responses, row => row.agentId).slice(0, 10).map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
+          leastResponses: sortRows([...rows], { order: "asc" }, row => row.responses, row => row.agentId).slice(0, 10).map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
         } };
       return respond(window(rows, { ...base(rows, data.agents.length), analytics }));
     }
     if (path === "/api/official-usage/aggregate/facets") {
       const candidates = agentRows(selected, { ...selected.query, creatorType: undefined }).rows;
-      const values = [...new Set(candidates.map(row => row.creatorType))].filter(value => !url.searchParams.get("search") || value.toLowerCase().includes(url.searchParams.get("search")!.toLowerCase()))
+      const values = [...new Set(candidates.map(row => row.creatorType))].filter(value => includes(value, url.searchParams.get("search") ?? undefined))
         .sort().map(value => ({ value, count: candidates.filter(row => row.creatorType === value).length }));
       const result = window(values); return respond({ value: result.value, selection: result.selection, counts: result.counts, page: result.page });
     }
-    if (path === "/api/official-usage/history") {
+    if (path === "/api/official-usage/history" || path === "/api/official-usage/history/options") {
       historyRequests.push(url.searchParams);
-      const retained = selected.historyIds.map(id => sets.get(id)!).sort((a, b) => b.row.acceptedAt.localeCompare(a.row.acceptedAt));
-      const dates = retained.flatMap(set => [set.row.reportingStart, set.row.reportingEnd]).filter((value): value is string => value !== null).sort();
-      const count = retained.reduce((sum, set) => sum + set.files.reduce((total, file) => total + file.rowCount, 0), 0);
-      const result = base(retained.map(set => ({ ...set.row, active: set.row.id === selected.metadata.activeSetId })));
-      result.analytics.history = { imports: retained.length, uniqueObservations: retained.length * 3, observationRows: count, uniquePayloads: count, repeatedRowsReused: 0,
-        earliestAcceptedAt: retained.at(-1)?.row.acceptedAt ?? null, latestAcceptedAt: retained[0]?.row.acceptedAt ?? null,
-        earliestActivityDateUtc: dates[0] ?? null, latestActivityDateUtc: dates.at(-1) ?? null, earliestReportingStart: null, latestReportingEnd: null,
-        knownWindows: 0, unknownWindows: retained.length, overlappingKnownWindows: 0, additive: false, activityRangeProvesCoverage: false };
+      const retained = historyRows(selected);
+      const result = base(retained.map(set => ({ ...set.row, active: set.row.id === selected.metadata.activeSetId })), selected.historyIds.length);
+      if (path.endsWith("/options")) {
+        const { value, page, counts, selection, reports } = window(result.value, result);
+        return respond({ value, page, counts, selection, reports });
+      }
+      const files = [...new Map(retained.flatMap(set => set.files.map(file => [file.fileHash, file] as const))).values()];
+      const observations = files.flatMap(file => file.rows.map(row => ({ kind: file.kind, row })));
+      const dates = observations.flatMap(({ row }) => row.lastActivityDateUtc ? [row.lastActivityDateUtc.slice(0, 10)] : []).sort();
+      const payloads = new Set(observations.map(({ kind, row }) => JSON.stringify([kind, row])));
+      const accepted = retained.map(set => set.row.acceptedAt).sort();
+      const known = retained.filter(({ row }) => row.periodProvenance !== "activity_range" && row.reportingStart !== null && row.reportingEnd !== null);
+      result.analytics.history = { imports: retained.length, uniqueObservations: files.length, observationRows: observations.length,
+        uniquePayloads: payloads.size, repeatedRowsReused: observations.length - payloads.size,
+        earliestAcceptedAt: accepted[0] ?? null, latestAcceptedAt: accepted.at(-1) ?? null,
+        earliestActivityDateUtc: dates[0] ?? null, latestActivityDateUtc: dates.at(-1) ?? null,
+        earliestReportingStart: known.map(set => set.row.reportingStart!).sort()[0] ?? null,
+        latestReportingEnd: known.map(set => set.row.reportingEnd!).sort().at(-1) ?? null,
+        knownWindows: known.length, unknownWindows: retained.length - known.length,
+        overlappingKnownWindows: known.filter(set => known.some(other => other !== set && other.row.reportingStart! <= set.row.reportingEnd!
+          && other.row.reportingEnd! >= set.row.reportingStart!)).length, additive: false, activityRangeProvesCoverage: false };
       return respond(window(result.value, result));
     }
     const observations = /^\/api\/official-usage\/history\/([^/]+)\/observations$/.exec(path);
     if (observations) {
-      const set = sets.get(observations[1]); if (!set) return respond({ code: "not_found", detail: "Exact report observations unavailable" }, 404);
+      const set = historyRows(selected).find(set => set.row.id === observations[1]);
+      if (!set) return respond({ code: "data_record_not_found", detail: "Record is not in the selected cohort." }, 404);
       return respond(window(selectedImportData(set.files, metadata(set.row.id)).observations));
     }
     if (path === "/api/official-usage/overview") {
-      const all = selected.historyIds.map(id => sets.get(id)!).filter(set => query.scope !== "selected" || set.row.id === selected.metadata.setId);
-      const values: ReportOverviewAgent[] = [];
-      for (const set of all) for (const agent of selectedImportData(set.files, metadata(set.row.id)).agents) {
-        if (values.some(value => value.agentId === agent.agentId)) continue;
-        values.push({ agentId: agent.agentId, agentName: agent.agentName, observationCount: 1, hasResponses: agent.responses > 0,
-          earliestActivityDateUtc: agent.lastActivityDateUtc, lastActivityDateUtc: agent.lastActivityDateUtc,
-          active30Days: Boolean(agent.lastActivityDateUtc && agent.lastActivityDateUtc >= "2026-08-14"), creatorTypeCount: 1,
-          latestSetId: set.row.id, latestAcceptedAt: set.row.acceptedAt });
+      const all = selected.historyIds.map(id => sets.get(id)!).filter(set => query.scope !== "selected" || set.row.id === selected.metadata.setId)
+        .sort((a, b) => compare(b.row.acceptedAt, a.row.acceptedAt) || compare(b.row.id, a.row.id));
+      const values = new Map<string, { row: ReportOverviewAgent; versions: Set<string>; creators: Set<string> }>();
+      const seenVersions = new Set<string>(), agentIds = new Set<string>();
+      for (const set of all) for (const file of set.files) {
+        if (file.kind === "users" || seenVersions.has(file.fileHash)) continue;
+        seenVersions.add(file.fileHash);
+        for (const row of file.rows) {
+          if (!("agentId" in row)) continue;
+          const date = row.lastActivityDateUtc?.slice(0, 10) ?? null;
+          agentIds.add(row.agentId);
+          if (!includes(`${row.agentName} ${row.agentId}`, query.search) || !matchesActivity(date, query, null)) continue;
+          let value = values.get(row.agentId);
+          if (!value) {
+            value = { versions: new Set(), creators: new Set(), row: { agentId: row.agentId, agentName: row.agentName,
+              observationCount: 0, creatorTypeCount: 0, hasResponses: false, earliestActivityDateUtc: null, lastActivityDateUtc: null,
+              active30Days: false, latestSetId: set.row.id, latestAcceptedAt: set.row.acceptedAt } };
+            values.set(row.agentId, value);
+          }
+          value.versions.add(file.fileHash); value.creators.add(row.creatorType);
+          value.row.observationCount = value.versions.size; value.row.creatorTypeCount = value.creators.size;
+          value.row.hasResponses ||= row.responsesSentToUsers > 0;
+          if (date) {
+            const dates = [value.row.earliestActivityDateUtc, value.row.lastActivityDateUtc, date]
+              .filter((date): date is string => date !== null).sort();
+            value.row.earliestActivityDateUtc = dates[0]; value.row.lastActivityDateUtc = dates.at(-1)!;
+            value.row.active30Days ||= row.responsesSentToUsers > 0 && date >= dateBefore(importInstant, 29) && date <= importInstant.slice(0, 10);
+          }
+        }
       }
-      const filtered = values.filter(row => !query.search || `${row.agentName} ${row.agentId}`.toLowerCase().includes(query.search.toLowerCase()));
-      const result = base(filtered, values.length), dates = filtered.flatMap(row => row.lastActivityDateUtc ? [row.lastActivityDateUtc] : []).sort();
+      const filtered = sortRows([...values.values()].map(value => value.row), query,
+        row => query.sort === "lastActivity" ? row.lastActivityDateUtc : row.agentName, row => row.agentId);
+      const result = base(filtered, agentIds.size), dates = filtered.flatMap(row => [row.earliestActivityDateUtc, row.lastActivityDateUtc])
+        .filter((date): date is string => date !== null).sort();
       result.analytics.overview = { retainedSets: all.length, reportedAgents: filtered.length, usedAgents: filtered.filter(row => row.hasResponses).length,
         active30Days: filtered.filter(row => row.active30Days).length, undatedAgents: filtered.filter(row => !row.lastActivityDateUtc).length,
         earliestActivityDateUtc: dates[0] ?? null, latestActivityDateUtc: dates.at(-1) ?? null, asOf: "2026-09-12", activeSinceDateUtc: "2026-08-14" };
@@ -326,13 +429,33 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     }
     const agent = /^\/api\/official-usage\/agents\/([^/]+)(?:\/(users))?$/.exec(path);
     if (agent) {
-      const id = decodeURIComponent(agent[1]), value = data.agents.find(row => row.agentId === id);
-      if (!value) return respond({ code: "not_found", detail: "Exact reported agent unavailable" }, 404);
-      if (agent[2]) return respond(window(data.relationships.filter(row => row.agentId === id && (!query.search || row.username.includes(query.search)))));
+      const id = decodeURIComponent(agent[1]), value = rows.find(row => row.agentId === id);
+      if (!value) return respond({ code: "data_record_not_found", detail: "Record is not in the selected cohort." }, 404);
+      if (agent[2]) {
+        const childQuery = selectedFixtureQuery(url.href), links = data.relationships.filter(row => row.agentId === id);
+        const anchor = links.flatMap(row => row.lastActivityDateUtc ? [row.lastActivityDateUtc] : []).sort().at(-1) ?? null;
+        const filtered = links.filter(row => includes(`${row.agentName} ${row.agentId} ${row.creatorType} ${row.username}`, childQuery.search)
+          && (!childQuery.agentId || row.agentId === childQuery.agentId) && (!childQuery.username || row.username === childQuery.username)
+          && (!childQuery.creatorType || row.creatorType === childQuery.creatorType) && (!childQuery.responsesOnly || row.responses > 0)
+          && matchesActivity(row.lastActivityDateUtc, childQuery, anchor));
+        sortRows(filtered, childQuery, row => childQuery.sort === "responses" ? row.responses : childQuery.sort === "lastActivity" ? row.lastActivityDateUtc
+          : childQuery.sort === "creatorType" ? row.creatorType : row.agentName, row => row.id);
+        return respond(window(filtered, { ...base(filtered, links.length), filters: childQuery }));
+      }
       const envelope = base([]); return respond({ value, selection: envelope.selection, reports: envelope.reports, sources: envelope.sources });
     }
-    const userData = selectedCohortRead(url.href, data);
-    if (userData) return respond(userData);
+    const userData = selectedCohortRead(url.href, data, query);
+    if (userData) {
+      if (!("summary" in userData)) return respond(userData);
+      if (path === "/api/official-usage/users") {
+        const review = userData.analytics.review;
+        if (!review) throw new Error("Reported-user fixture is missing its cohort analytics");
+        userData.analytics = { ...userData.analytics, zeroResponses: review.zero, unknownResponses: review.unknown,
+          responses: userData.analytics.rowCount === review.unknown ? null : userData.analytics.responses };
+      }
+      return respond({ ...userData, summary: data.summary });
+    }
+    if (path.startsWith("/api/official-usage/users/")) return respond({ code: "data_record_not_found", detail: "Record is not in the selected cohort." }, 404);
     unexpected.push(`Unimplemented selected import fixture: ${request.method()} ${path}`);
     return respond({ code: "not_found", detail: "Unimplemented selected import fixture" }, 404);
   };

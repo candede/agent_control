@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { AppError } from "../../backend/src/errors";
 import { streamOfficialReport, type OfficialRow, type StreamedOfficialReport } from "../../backend/src/services/officialReportStream";
 import type { OfficialUsageMetadata } from "../../backend/src/types/officialReportRecords";
 import type { UserSourceMetadata } from "../../backend/src/types/userSources";
@@ -8,10 +9,16 @@ import { reportAgent, reportPage, reportUser } from "../src/test/reportDataFixtu
 export type SelectedCsvFixture = StreamedOfficialReport & { rows: OfficialRow[] };
 export async function parseSelectedCsv(bytes: Buffer, metadata?: OfficialUsageMetadata): Promise<SelectedCsvFixture> {
   const rows: OfficialRow[] = [];
+  const identities = new Set<string>();
   const report = await streamOfficialReport(Readable.from([bytes]), metadata, new AbortController().signal, {
     async batch(_kind, batch) {
       if (rows.length + batch.length > 250 || Buffer.byteLength(JSON.stringify([...rows, ...batch])) > 1024 * 1024) {
         throw new Error("The synthetic browser CSV fixture exceeds its 250-row/1-MiB bound");
+      }
+      for (const row of batch) {
+        const identity = JSON.stringify(["agentId" in row ? row.agentId : null, "username" in row ? row.username : null]);
+        if (identities.has(identity)) throw new AppError(400, "duplicate_identity", "Report contains a duplicate natural identity.");
+        identities.add(identity);
       }
       rows.push(...batch);
     },
@@ -19,10 +26,20 @@ export async function parseSelectedCsv(bytes: Buffer, metadata?: OfficialUsageMe
   return { ...report, rows };
 }
 
+export function selectedImportPeriod(files: readonly SelectedCsvFixture[]): ReportMetadata["reportingPeriod"] {
+  const first = files[0];
+  if (!first) return null;
+  const dates = files.flatMap(file => [file.reportingPeriod.startDate, file.reportingPeriod.endDate])
+    .filter((date): date is string => date !== null).sort();
+  const startDate = dates[0] ?? null, endDate = dates.at(-1) ?? null;
+  return { startDate, endDate, days: startDate && endDate ? (Date.parse(endDate) - Date.parse(startDate)) / 86400000 + 1 : null,
+    provenance: first.reportingPeriod.provenance };
+}
+
 export function selectedImportMetadata(files: readonly SelectedCsvFixture[], context:
   Pick<ReportMetadata, "setId" | "activeSetId" | "activeRevision" | "historyRevision" | "historyEpoch" | "acceptedAt" | "expiresAt">): ReportMetadata {
   return { ...context, availability: context.setId ? "active" : "never_imported", staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: context.setId ? 0 : null,
-    reportingPeriod: files[0]?.reportingPeriod ?? null,
+    reportingPeriod: selectedImportPeriod(files),
     lineages: files.map(file => ({ kind: file.kind, versionId: `${file.fileHash.slice(0, 8)}-${file.fileHash.slice(8, 12)}-4000-8000-${file.fileHash.slice(20, 32)}`,
       contentHash: file.fileHash, rowCount: file.rowCount, sourceAsOf: file.sourceAsOf ?? null, sourceAsOfProvenance: file.sourceAsOfProvenance,
       sourceFreshness: file.sourceFreshness, periodProvenance: file.reportingPeriod.provenance })) };
@@ -36,34 +53,35 @@ export function selectedImportData(files: readonly SelectedCsvFixture[], metadat
   const rawUsers = usersFile?.rows.filter(row => "agentResponsesReceived" in row) ?? [];
   const relationships: ReportRelationship[] = rawLinks.map((row, index) => ({
     id: `synthetic-relationship-${index}`, agentId: row.agentId, agentName: row.agentName, creatorType: row.creatorType,
-    username: row.username, responses: row.responsesSentToUsers, lastActivityDateUtc: row.lastActivityDateUtc ?? null, identityStatus: "unresolved",
+    username: row.username, responses: row.responsesSentToUsers, lastActivityDateUtc: row.lastActivityDateUtc?.slice(0, 10) ?? null, identityStatus: "unresolved",
   }));
   const agentIds = [...new Set([...rawAgents.map(row => row.agentId), ...relationships.map(row => row.agentId)])];
   const agents: ReportAgent[] = agentIds.map((agentId, index) => {
     const source = rawAgents.find(row => row.agentId === agentId), links = relationships.filter(row => row.agentId === agentId);
     const bridge = links.length ? links.reduce((sum, row) => sum + row.responses, 0) : null;
-    const dates = [source?.lastActivityDateUtc, ...links.map(row => row.lastActivityDateUtc)].filter((date): date is string => Boolean(date)).sort();
+    const dates = [source?.lastActivityDateUtc?.slice(0, 10), ...links.map(row => row.lastActivityDateUtc)].filter((date): date is string => Boolean(date)).sort();
     return reportAgent(index, {
-      agentId, agentName: source?.agentName ?? links[0]?.agentName ?? agentId, creatorType: source?.creatorType ?? links[0]?.creatorType ?? "",
+      agentId, agentName: source?.agentName ?? links.map(row => row.agentName).sort()[0] ?? agentId,
+      creatorType: source?.creatorType ?? links.map(row => row.creatorType).sort()[0] ?? "",
       responses: source?.responsesSentToUsers ?? bridge ?? 0, responseSource: source ? "agents" : "userAgents",
       reportResponses: source?.responsesSentToUsers ?? null, bridgeResponses: bridge, relationshipCount: links.length,
       responseComparison: !source || bridge === null ? "not_comparable" : source.responsesSentToUsers === bridge ? "matching" : "mismatch",
       licensedUserOccurrences: source?.activeUsersLicensed ?? null, unlicensedUserOccurrences: source?.activeUsersUnlicensed ?? null,
       activeUsers: links.length ? new Set(links.filter(row => row.responses > 0).map(row => row.username)).size : null,
       activeUsersBasis: links.length ? "userAgents_distinct_identity" : "unknown",
-      lastActivityDateUtc: source ? source.lastActivityDateUtc ?? null : dates.at(-1) ?? null,
+      lastActivityDateUtc: source ? source.lastActivityDateUtc?.slice(0, 10) ?? null : dates.at(-1) ?? null,
     });
   });
   const usernames = [...new Set([...rawUsers.map(row => row.username), ...relationships.map(row => row.username)])];
   const users: ReportUser[] = usernames.map((username, index) => {
     const source = rawUsers.find(row => row.username === username), links = relationships.filter(row => row.username === username);
     const bridge = links.length ? links.reduce((sum, row) => sum + row.responses, 0) : null;
-    const dates = [source?.lastActivityDateUtc, ...links.map(row => row.lastActivityDateUtc)].filter((date): date is string => Boolean(date)).sort();
+    const dates = [source?.lastActivityDateUtc?.slice(0, 10), ...links.map(row => row.lastActivityDateUtc)].filter((date): date is string => Boolean(date)).sort();
     return reportUser(index, {
-      username, displayName: source?.displayName ?? username, objectId: null, entitlement: "unknown", company: null, department: null,
+      username, displayName: source?.displayName || username, objectId: null, entitlement: "unknown", company: null, department: null,
       reportedResponses: source?.agentResponsesReceived ?? null, reportedAgentsUsed: source?.numberOfAgentsUsed ?? null,
       bridgeResponses: bridge, relationshipCount: links.length, responseProducingAgentCount: links.filter(row => row.responses > 0).length,
-      userLastActivityDateUtc: source?.lastActivityDateUtc ?? null, lastActivityDateUtc: dates.at(-1) ?? null,
+      userLastActivityDateUtc: source?.lastActivityDateUtc?.slice(0, 10) ?? null, lastActivityDateUtc: dates.at(-1) ?? null,
       hasActivity: (source?.agentResponsesReceived ?? 0) > 0 || (bridge ?? 0) > 0, missingUserReport: !source,
       hasReportMismatch: Boolean(source && bridge !== null && (source.agentResponsesReceived !== bridge || source.numberOfAgentsUsed !== links.length)),
       reviewCohort: !source ? "unknown" : source.agentResponsesReceived === 0 ? "zero" : source.agentResponsesReceived <= 5 ? "low" : "outside",
@@ -74,7 +92,7 @@ export function selectedImportData(files: readonly SelectedCsvFixture[], metadat
   const userResponses = usersFile ? rawUsers.reduce((sum, row) => sum + row.agentResponsesReceived, 0) : null;
   const totals = [reportedResponses, bridgeResponses, userResponses].filter((value): value is number => value !== null);
   const summary: ReportSummary = {
-    checkedUsers: 0, licensedUsers: null, measuredActivityUsers: null, needsAttentionUsers: null, usingAgentsUsers: null,
+    checkedUsers: null, licensedUsers: null, measuredActivityUsers: null, needsAttentionUsers: null, usingAgentsUsers: null,
     noAgentActivityUsers: null, unknownMetricsUsers: null, unresolvedIdentities: usernames.length, activeWithoutPaidUsers: null,
     paidActiveReportUsers: null, unknownLicenseActiveReportUsers: users.filter(row => row.hasActivity).length,
     reportedResponses, bridgeResponses, userReportedResponses: userResponses,
@@ -89,10 +107,15 @@ export function selectedImportData(files: readonly SelectedCsvFixture[], metadat
     acceptedAt: metadata.acceptedAt!, sourceAsOf: lineage.sourceAsOf, sourceAsOfProvenance: lineage.sourceAsOfProvenance,
     sourceFreshness: lineage.sourceFreshness, supersedesVersionId: null,
   }));
-  const directory = reportPage([], { reports: metadata, summary, counts: { total: 0, filtered: 0 } });
-  const unavailable = (value: UserSourceMetadata): UserSourceMetadata => ({
-    ...value, state: "unavailable", generationId: null, observedAt: null, rowCount: 0, message: "Run Users sync to verify licensing.",
+  const directory = reportPage([], { reports: metadata, summary, counts: { total: 0, filtered: 0 },
+    analytics: { basis: "filtered_rows", rowCount: 0, responses: null, zeroResponses: null, unknownResponses: null,
+      review: null, agents: null, history: null, overview: null } });
+  const unavailable = (source: UserSourceMetadata["source"]): UserSourceMetadata => ({
+    source, state: "unavailable", generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
+    attemptedAt: null, attemptStatus: null, attemptObservedCount: null, errorCode: null, rowCount: null,
+    message: "Run Users sync to verify licensing.", reportRefreshDate: null,
+    period: source === "app_activity" ? "D28" : null, reportVersion: source === "app_activity" ? "v2" : null,
   });
-  directory.sources = { directory: unavailable(directory.sources.directory), app_activity: unavailable(directory.sources.app_activity) };
+  directory.sources = { directory: unavailable("directory"), app_activity: unavailable("app_activity") };
   return { agents, users, relationships, summary, observations, directory };
 }

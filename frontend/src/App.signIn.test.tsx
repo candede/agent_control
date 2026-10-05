@@ -78,8 +78,9 @@ describe("username-first sign-in", () => {
       method: "POST",
       credentials: "include",
       body: JSON.stringify({ username: "Admin+ops@Example.com", returnTo: "/permissions" }),
-      headers: expect.objectContaining({ "Content-Type": "application/json" }),
     }));
+    const loginRequest = fetchMock.mock.calls.find(([path]) => path === "/api/auth/login");
+    expect(new Headers(loginRequest?.[1]?.headers).get("Content-Type")).toBe("application/json");
     expect(screen.getByRole("button", { name: "Preparing sign-in..." })).toBeDisabled();
     expect(input).toBeDisabled();
     expect(screen.getByRole("form", { name: "Sign in" })).toHaveAttribute("aria-busy", "true");

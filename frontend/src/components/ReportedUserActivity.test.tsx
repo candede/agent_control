@@ -282,6 +282,51 @@ describe("selected active users without paid Copilot", () => {
     await userEvent.click(modal.getByRole("button", { name: "Show all this user's agents" }));
     await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.agentId).toBeUndefined());
   });
+  it("clears prior user filters when focusing an agent from details while preserving sorting and the exact report", async () => {
+    const { changed } = renderActivity({ ...initial, search: "Ada", agentId: "previous-agent", page: 3 });
+    await screen.findByRole("button", { name: "Ada" });
+    const controls = await filters();
+    await controls.findByRole("option", { name: "Contoso" });
+    await userEvent.selectOptions(controls.getByLabelText("Company"), "~string:Contoso");
+    await userEvent.selectOptions(controls.getByLabelText("Department"), "~string:Engineering");
+    await userEvent.selectOptions(controls.getByLabelText("Agent responses"), "low");
+    fireEvent.change(controls.getByLabelText("Low-response threshold"), { target: { value: "250" } });
+    await userEvent.selectOptions(controls.getByLabelText("Sort"), "name:asc");
+    await userEvent.keyboard("{Escape}");
+    const { modal } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    await userEvent.click(await modal.findByRole("button", { name: "Show all this user's agents" }));
+    await userEvent.click(await modal.findByRole("button", { name: "Researcher: active users without paid Copilot" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(changed).toHaveBeenLastCalledWith({ ...initial, agentId: "agent-1", reportSetId });
+    assertQuery({ agentId: "agent-1", setId: reportSetId, licenseCohort: "active_without_paid",
+      cohort: "all", lowResponseThreshold: 5, sort: "name", order: "asc" });
+    const query = vi.mocked(api.readReportPage).mock.calls.at(-1)![1]!;
+    for (const field of ["company", "department", "search", "cursor", "selectionId"] as const) expect(query[field]).toBeUndefined();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    const reset = await filters();
+    expect(reset.getByLabelText("Agent responses")).toHaveValue("all");
+    expect(reset.getByLabelText("Low-response threshold")).toHaveValue(5);
+  });
+  it("restarts from the first page when details focus the same agent and report without changing filters", async () => {
+    vi.mocked(api.readReportPage).mockImplementation(async path => path.endsWith("/agents") ? reportPage([relationship])
+      : page({ page: { limit: 50, nextCursor: "next", previousCursor: null } }));
+    renderActivity({ ...initial, agentId: "agent-1", reportSetId });
+    await screen.findByRole("button", { name: "Ada" });
+    fireEvent.click(screen.getByRole("button", { name: "Next users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    assertQuery({ cursor: "next", selectionId });
+    const { modal } = await open();
+    await userEvent.click(modal.getByRole("tab", { name: "Usage & agents" }));
+    await userEvent.click(await modal.findByRole("button", { name: "Researcher: active users without paid Copilot" }));
+    await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.filter(([path]) => path === "official-usage/users")).toHaveLength(3));
+    assertQuery({ agentId: "agent-1", setId: reportSetId });
+    const query = vi.mocked(api.readReportPage).mock.calls.at(-1)![1]!;
+    expect(query.cursor).toBeUndefined();
+    expect(query.selectionId).toBeUndefined();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
   it("pins a durable export to the displayed selection, never serializes page rows, and aborts its obsolete request", async () => {
     const pending = deferred<{ id: string }>(); vi.mocked(api.createReportExport).mockReturnValue(pending.promise);
     renderActivity();
@@ -295,13 +340,50 @@ describe("selected active users without paid Copilot", () => {
     expect(api.reportExportStatus).not.toHaveBeenCalled();
     expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
   });
-  it("surfaces durable export admission errors locally without fabricating a browser CSV", async () => {
-    vi.mocked(api.createReportExport).mockRejectedValue(new ApiError(409, "selection_invalidated", "Expired selection"));
+  it.each(["admission", "building", "download"] as const)("withdraws an export-invalidated selection during %s and offers a real parent restart", async phase => {
+    const invalidated = new ApiError(409, "selection_invalidated", "Expired selection");
+    const ready = { id: "export", status: "ready" as const, rows: 3, bytes: 200,
+      expiresAt: new Date(Date.now() + 60000).toISOString(), error: null, limit: null, observed: null };
+    if (phase === "admission") vi.mocked(api.createReportExport).mockRejectedValue(invalidated);
+    else {
+      vi.mocked(api.createReportExport).mockResolvedValue({ id: ready.id });
+      if (phase === "building") vi.mocked(api.reportExportStatus).mockResolvedValue({ ...ready, status: "failed", error: "selection_invalidated" });
+      else vi.mocked(api.reportExportStatus).mockResolvedValueOnce(ready).mockRejectedValueOnce(invalidated);
+    }
     renderActivity();
+    await open();
+    vi.useFakeTimers();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export users CSV" })); });
+    if (phase !== "admission") await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    if (phase === "download") await act(async () => { fireEvent.click(screen.getByRole("link", { name: "Download CSV" })); });
+    vi.useRealTimers();
+    expect(screen.getByRole("alert")).toHaveTextContent("This selection changed or expired.");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "users pages" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    if (phase === "admission") expect(api.reportExportStatus).not.toHaveBeenCalled();
+    const pending = deferred<ReportPage<ReportUser>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    const replacement = page();
+    replacement.selection = { ...replacement.selection, id: "replacement-selection" };
+    await act(async () => pending.resolve(replacement));
     await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    vi.mocked(api.createReportExport).mockRejectedValue(new Error("Export service unavailable"));
     fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Restart the selection before exporting");
-    expect(api.reportExportStatus).not.toHaveBeenCalled();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Export service unavailable");
+    expect(api.createReportExport).toHaveBeenLastCalledWith(
+      { kind: "official_users", selectionId: replacement.selection.id, ids: undefined }, expect.any(AbortSignal));
+    expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
   });
   it("clears old rows and details while a known revision loads a fresh selection", async () => {
     const pending = deferred<ReportPage<ReportUser>>();

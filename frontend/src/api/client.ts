@@ -335,6 +335,11 @@ let csrfToken: string | undefined;
 let sessionGeneration = 0;
 const sessionRevalidationListeners = new Set<(error: ApiError) => void>();
 
+export function captureRequestSession() {
+  const generation = sessionGeneration;
+  return () => assertCurrentRequest(generation);
+}
+
 export function subscribeSessionRevalidationRequired(listener: (error: ApiError) => void) {
   sessionRevalidationListeners.add(listener);
   return () => {
@@ -533,12 +538,14 @@ export async function refreshPackageIdentityDetails(
   input: { selectionId: string; ids?: string[]; recordIds?: string[] },
   options: { signal?: AbortSignal } = {},
 ) {
+  const generation = sessionGeneration;
   const job = await request<PackageRefreshJob>("/api/agents/refresh-selection", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
     signal: options.signal,
   });
+  assertCurrentRequest(generation, options.signal);
   if (job.status !== "waiting_authorization") return job;
   return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}/resume`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: job.tokenMode }),
@@ -1063,14 +1070,16 @@ function auditContextHeaders(context: AuditRequestContext | undefined) {
 }
 
 export async function request<T>(path: string, init: RequestInit = {}, options: { revalidateSession?: boolean } = {}): Promise<T> {
+  const method = init.method?.toUpperCase() ?? "GET";
+  const headers = new Headers(init.headers);
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
+  if (method !== "GET" && !headers.has("Idempotency-Key")) headers.set("Idempotency-Key", crypto.randomUUID());
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken && !headers.has("X-CSRF-Token")) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
   return requestBody(path, {
     ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init.method && init.method !== "GET" ? { "Idempotency-Key": crypto.randomUUID() } : {}),
-      ...(init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method) && csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-      ...init.headers,
-    },
+    headers,
   }, async response => {
     if (response.status === 204) return undefined as T;
     try {

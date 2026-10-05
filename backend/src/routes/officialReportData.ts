@@ -41,7 +41,7 @@ function requestQuery(endpoint: ReportEndpoint, query: Record<string, unknown>):
   for (const [key, value] of Object.entries(query)) {
     if (["selectionId", "cursor", "limit"].includes(key)) continue;
     if (!reportQueryFields.includes(key as typeof reportQueryFields[number])) throw new AppError(400, "invalid_usage_query", "Unsupported query parameter.");
-    const text = scalar(value);
+    const text = key === "creatorType" && value === "" ? "" : scalar(value);
     values[key] = ["inactiveDays", "activityWindowDays", "lowResponseThreshold"].includes(key) ? Number(text)
       : key === "responsesOnly" ? text === "true" ? true : text === "false" ? false : text
         : (key === "company" || key === "department") ? text === "~null" ? null : text.startsWith("~string:") ? text.slice(8) : text : text;
@@ -86,7 +86,12 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     const raw = { ...request.query };
     if (facet) { delete raw.search; delete raw.field; }
     if (candidate) delete raw.inventoryRevision;
-    if (child) for (const key of reportQueryFields) delete raw[key];
+    let childQuery: ReportQuery | undefined;
+    if (child) {
+      const { setId: _setId, ...filters } = raw;
+      childQuery = requestQuery("relationships", filters);
+      for (const key of reportQueryFields) if (key !== "setId") delete raw[key];
+    }
     const query = requestQuery(endpoint, raw);
     let selection = request.query.selectionId;
     if (selection === undefined && request.query.cursor !== undefined) {
@@ -97,14 +102,21 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     if (selection !== undefined) await reports.read(id, who.identity, async (_client, context) => {
       if (context.endpoint !== endpoint) throw new AppError(400, "invalid_cursor", "Selection endpoint mismatch.");
       const keys = Object.keys(raw).filter(key => reportQueryFields.includes(key as typeof reportQueryFields[number]));
-      if (keys.length && canonicalQuery(query, reportQueryFields) !== context.queryHash) throw new AppError(400, "invalid_cursor", "Selection filters are immutable.");
+      const mismatch = child
+        ? query.setId !== undefined && query.setId.toLowerCase() !== context.report.setId?.toLowerCase()
+        : keys.length > 0 && canonicalQuery(query, reportQueryFields) !== context.queryHash;
+      if (mismatch) throw new AppError(400, "invalid_cursor", "Selection filters are immutable.");
     });
-    return { ...who, id };
+    return { ...who, id, childQuery };
   }
   const lists: Array<[string, ReportEndpoint]> = [
     ["/copilot-usage/users", "copilot_users"], ["/official-usage/aggregate", "official_agents"], ["/official-usage/users", "official_users"],
     ["/official-usage/agent-users", "relationships"], ["/official-usage/history", "history"], ["/official-usage/overview", "overview"],
   ];
+  route("get", "/official-usage/history/options", "read", failSafe(async (request, response) => {
+    const context = await selected(request, "history");
+    response.json(await reports.historyOptions(context.id, context.identity, pageOptions(request.query)));
+  }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));
   }));
@@ -162,7 +174,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await reports.read(context.id, context.identity, async (client, read) => {
       await reports.exactInRead(client, read, objectId);
       return reports.pageInRead(client, read, { ...pageOptions(request.query), endpoint: "relationships",
-        child: objectId, childQuery: requestQuery("relationships", request.query) });
+        child: objectId, childQuery: context.childQuery });
     }));
   }));
   route("get", "/official-usage/history/:setId/observations", "read", failSafe(async (request, response) => {
@@ -177,7 +189,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     const child = reportIdentifier(request.params[parameter]), context = await selected(request, endpoint, false, false, true);
     await reports.exact(context.id, context.identity, child);
     response.json(await reports.page(context.id, context.identity, { ...pageOptions(request.query), endpoint: "relationships", child,
-      childQuery: requestQuery("relationships", request.query) }));
+      childQuery: context.childQuery }));
   }));
 
   route("post", "/official-usage/staging", "admin",
@@ -204,10 +216,10 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await imports.diagnostics((await options.identity(request)).identity, reportUuid(request.params.id), pageOptions(request.query), reports.codec));
   }));
   route("post", "/official-usage/sets/:id/preview", "admin", failSafe(async (request, response) => {
-    response.json(await imports.confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body.operation));
+    response.json(await imports.confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
   }));
   route("post", "/official-usage/confirmations/:id", "admin", failSafe(async (request, response) => {
-    if (request.body.id !== request.params.id) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
+    if (request.body?.id !== request.params.id) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
     response.json(await imports.confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
   }));
   route("get", "/agent-inventory/:recordId/usage", "read", failSafe(async (request, response) => {

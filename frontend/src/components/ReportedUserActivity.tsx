@@ -25,21 +25,27 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
   const [threshold, setThreshold] = useState("5");
   const [lastThreshold, setLastThreshold] = useState(5);
   const [selected, setSelected] = useState<{ username: string; selectionId: string; reportSetId?: string }>();
+  const [invalidatedSelectionId, setInvalidatedSelectionId] = useState<string>();
   const focus = useRef<HTMLInputElement>(null), valid = isValidLowResponseThreshold(threshold);
   const trigger = useRef<HTMLButtonElement>(null);
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
-  const read = useReportPage<ReportUser>("official-usage/users", { ...filters, licenseCohort: "active_without_paid",
+  const pageRead = useReportPage<ReportUser>("official-usage/users", { ...filters, licenseCohort: "active_without_paid",
     search: route.search || undefined, agentId: route.agentId, setId: route.reportSetId, lowResponseThreshold: valid ? Number(threshold) : lastThreshold }, dataRevision);
+  const read = pageRead.data && pageRead.data.selection.id === invalidatedSelectionId
+    ? { ...pageRead, data: undefined, invalidated: true } : pageRead;
   const data = read.data;
   if (selected && (!data || selected.reportSetId !== route.reportSetId || data.selection.id !== selected.selectionId)) setSelected(undefined);
-  function restartSelection() { setSelected(undefined); read.restart(); }
+  function restartSelection() { setSelected(undefined); setInvalidatedSelectionId(undefined); pageRead.restart(); }
+  function resetFilters() { setFilters({ cohort: "all", sort: filters.sort, order: filters.order }); setThreshold("5"); }
   return <section className="reported-users" aria-label="Non-paid user activity">
-    <ReportReadStatus read={read} quietLoading />
-    {data && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data unavailable.{" "}
+    <ReportReadStatus read={{ ...read, restart: restartSelection }} quietLoading />
+    {data && !read.loading && data.sources.directory.attemptStatus === "running" ? <p className="copilot-users-notice" role="status">
+      Refreshing license data. Showing the last saved data until sync completes.</p>
+      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data unavailable.{" "}
       {data.sources.directory.message ?? "Current directory verification is required."} Run Users sync to verify licensing.</p> : null}
-    {data && data.summary.unknownLicenseActiveReportUsers > 0 ? <p className="copilot-users-notice">{data.summary.unknownLicenseActiveReportUsers.toLocaleString()} active report{" "}
+    {data && !read.loading && data.sources.directory.attemptStatus !== "running" && data.summary.unknownLicenseActiveReportUsers > 0 ? <p className="copilot-users-notice">{data.summary.unknownLicenseActiveReportUsers.toLocaleString()} active report{" "}
       {data.summary.unknownLicenseActiveReportUsers === 1 ? "user needs" : "users need"} a license check. Run Users sync.</p> : null}
-    {data?.reports.availability === "stale" ? <p className="copilot-users-notice">Reports are out of date. Refresh reports in Sync.</p> : null}
+    {data && !read.loading && data.reports.availability === "stale" ? <p className="copilot-users-notice">Reports are out of date. Refresh reports in Sync.</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
       <UserActivityFilters path="official-usage/users" selectionId={data?.selection.id} onRestartSelection={restartSelection}
       values={{ company: filters.company, department: filters.department, cohort: filters.cohort ?? "all", lowResponseThreshold: threshold }}
@@ -52,8 +58,9 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
       onSearch={search => onRouteChange({ ...route, search, page: 0 })} onChange={value => {
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
       }} onSort={value => { const [sort, order] = value.split(":"); setFilters({ ...filters, sort: sort as ReportQuery["sort"], order: order as ReportQuery["order"] }); }}
-      onClear={() => { setFilters({ cohort: "all", sort: filters.sort, order: filters.order }); setThreshold("5"); onRouteChange({ ...route, search: "", agentId: undefined, page: 0 }); }}
+      onClear={() => { resetFilters(); onRouteChange({ ...route, search: "", agentId: undefined, page: 0 }); }}
       exportButton={<ReportExportButton key={data?.selection.id} kind="official_users" selectionId={data?.selection.id} label="Export users CSV"
+        onSelectionInvalidated={() => setInvalidatedSelectionId(data?.selection.id)}
         disabled={read.loading || !valid || data?.sources.directory.state !== "available" || !data?.reports.setId} />} />
       {read.loading || data?.value.length ? <div className="table-shell copilot-users-table-shell" role="region" aria-label="Reported user activity" tabIndex={0}><table className="agent-table copilot-users-table reported-users-table">
         <thead><tr><ReportSortHeading label="User" sort="name" query={filters} onChange={setFilters} />
@@ -77,7 +84,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
     {selected ? <UserDetailModal key={selected.selectionId + selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
       filters={route.agentId ? { agentId: route.agentId } : undefined}
       returnFocusTo={trigger} closeLabel="Close reported user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
-      onFocusAgent={(agentId, reportSetId) => { setSelected(undefined); onRouteChange({ ...route, agentId, reportSetId, page: 0 }); }}
+      onFocusAgent={(agentId, reportSetId) => { restartSelection(); resetFilters(); onRouteChange({ ...route, search: "", agentId, reportSetId, page: 0 }); }}
       dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection} /> : null}
   </section>;
 }

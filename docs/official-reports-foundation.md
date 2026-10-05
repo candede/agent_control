@@ -52,7 +52,7 @@ tests are replaced by the rendered-boundary storage regression in
 | --- | --- |
 | Viewer GET | `/copilot-usage/users`, `/copilot-usage/users/facets`, `/copilot-usage/users/unresolved-identities`, `/copilot-usage/users/:objectId`, `/copilot-usage/users/:objectId/service-plans`, `/copilot-usage/users/:objectId/agents` |
 | Viewer GET | `/official-usage/aggregate`, `/official-usage/aggregate/facets`, `/official-usage/users`, `/official-usage/users/facets`, `/official-usage/agent-users`, `/official-usage/agents/:agentId`, `/official-usage/agents/:agentId/users`, `/official-usage/users/:username`, `/official-usage/users/:username/directory`, `/official-usage/users/:username/service-plans`, `/official-usage/users/:username/agents` |
-| Viewer GET | `/official-usage/history`, `/official-usage/history/:setId/observations`, `/official-usage/overview` |
+| Viewer GET | `/official-usage/history`, `/official-usage/history/options`, `/official-usage/history/:setId/observations`, `/official-usage/overview` |
 | Admin | POST `/official-usage/staging`; GET `/official-usage/staging/:id` and `/official-usage/staging/:id/diagnostics`; DELETE `/official-usage/staging/:id`; POST `/official-usage/staging/:id/accept`, `/official-usage/bundles/:id/preview`, `/official-usage/bundles/:id/accept`, `/official-usage/sets/:id/preview`, `/official-usage/confirmations/:id` |
 | Agent/report boundary | Viewer GET `/agent-inventory/:recordId/usage` and `/agent-inventory/:recordId/usage-associations`; Admin GET `/agent-inventory/:recordId/usage-candidates`; Admin POST/DELETE `/agent-inventory/:recordId/usage-associations` |
 | Viewer exports | POST `/data-exports`; GET/DELETE `/data-exports/:id`; GET `/data-exports/:id/download` |
@@ -69,6 +69,20 @@ route only when the factory is explicitly constructed. No route-policy
 exception or permissive authentication injection is introduced.
 
 ### Lists, detail and cursors
+
+The compact report selector on Agents and Users reads
+`/official-usage/history/options`. It returns only
+`{value, page, selection, counts, reports}` using the same bounded history
+keysets and validated selection roots. It does not compute user summaries or
+whole-history observation analytics that the dropdown never displays.
+The full history endpoint retains its existing analytics contract. Selecting a
+report still uses the fenced Admin preview/confirmation flow and changes the
+shared active report; browsing cached cohort pages does not mutate it.
+An authorization denial keeps report options hidden and its explicit Retry
+action visible across saved-data revision changes. An uncertain confirmation
+outcome, including malformed successful JSON, warns that the selection may
+already have been saved. Retry reloads report evidence; it never replays the
+confirmation.
 
 Lists return:
 
@@ -87,6 +101,14 @@ child columns. Relationships and plans are paged, never embedded in a user.
 History observations are paged version metadata; overview creator types and
 reviewed agent associations are separate paged collections.
 
+Relationship child routes validate child filters before capturing a selection.
+Without a selection, `setId` pins the requested historical report for the parent;
+it is not a child row filter. With a selection, an explicit `setId` must match
+the pinned report, independently of the parent's row filters. Child cursors
+therefore do not require repeating `setId`, but still bind the child filters.
+Missing bodies on set preview and confirmation POSTs return 400 rather than an
+unexpected server error.
+
 `CombinedUser.userLastActivityDateUtc` is the Users-report date for that exact
 unambiguous directory match. Bridge-only activity does not supply this field;
 it stays null, independently of Office-app and agent-wide dates.
@@ -104,6 +126,9 @@ merges case-distinct report identities.
 SQL applies a 512 KiB cumulative row-byte prefix before transfer; a page can be
 shorter than its requested limit while still having `nextCursor`. Continue by
 cursor, never by `value.length===limit`. Export producers follow the same rule.
+Facet pages share the compact signed-boundary fallback for blank values and
+wide Unicode keys. The exact boundary is resolved within the same selected
+facet relation; missing or non-unique matches invalidate the selection.
 
 Users search includes normalized display name, exact-directory UPN, company,
 department and selected report-agent names/IDs. Unknown metrics stay null;
@@ -158,7 +183,9 @@ every string, including `null`, `~null`, the empty string and strings beginning
 with `~string:`. Only the untagged empty option means no filter. The selected
 raw value reaches the query serializer unchanged; exports keep that selection's
 exact server-side filter scope. Creator-type option values use these UI tags
-but still serialize as the existing raw creator-type query value.
+but still serialize as the existing raw creator-type query value, including
+`creatorType=` for a literal empty creator type; omitting the parameter means
+no creator-type filter.
 Agent usage contexts carry the same `reports` metadata, so stale/unknown
 freshness cannot be mistaken for current evidence. Select confirmations
 revalidate complete typed membership and expiry when consumed; incomplete
@@ -180,7 +207,14 @@ row cohort. `order=asc|desc`, default descending for history/official agents, as
 otherwise. `lowResponseThreshold` defaults to 5 (1..100,000,000);
 `inactiveDays` and `activityWindowDays` default to 30 (1..365). Dates are valid
 UTC `YYYY-MM-DD`; reversed ranges are rejected. Search is bounded to 256
-characters and normalized NFKC/lowercase; exact report IDs are case-sensitive,
+UTF-16 code units both before and after normalization. Queries and searched SQL
+text use NFKC, lowercase, then NFKC again to canonicalize combining sequences
+introduced by case conversion. Queries are trimmed afterward so generated
+whitespace cannot change the query hash when a saved selection is read again.
+Expanded searches over the limit return 400 `invalid_cursor` before database
+acquisition.
+Facet option searches use the same normalization and input bounds.
+Exact report IDs are case-sensitive,
 max 512. Organization matches are exact; HTTP `~null` denotes the null facet.
 
 Enums: entitlement `paid_active|paid_inactive|no_paid|unknown`; service states
@@ -195,6 +229,11 @@ option `search`, `limit`, `cursor`. Company/department apply to user lists;
 creator type applies to official agents. The facet's own selected value is
 removed while other filters stay applied. Option counts are exact matching-row
 counts; top-level counts are total distinct and filtered distinct options.
+
+Before capturing a new report selection or directory report-identity input
+selection, expired report sets are retired in bounded maintenance transactions
+until no invalid sets remain, rather than assuming a fixed batch size.
+Maintenance failures propagate before selection capture.
 
 ### Semantic goldens
 
@@ -242,7 +281,10 @@ replacement). Fields may precede or follow the file: `reportingStart`,
 `reportingEnd`, `periodProvenance`, `sourceAsOf`, `sourceAsOfProvenance`,
 `downloadedAt`. Period fields are an all-or-none operator-asserted triple;
 source-as-of requires its operator-asserted provenance. Unknown/repeated fields
-are rejected. Complete valid replacement cancels the previous draft; a failed
+are rejected. The browser upload type and restored companion metadata follow
+the same operator-only contract. Source-verified metadata belongs to its original
+file and is neither copied into companion multipart fields nor relabelled as an
+operator assertion. Complete valid replacement cancels the previous draft; a failed
 replacement leaves the valid previous preview intact. Already accepted kinds
 cannot be replaced in the same bundle.
 
@@ -382,6 +424,14 @@ runtime replacement. It expires only the current discovered job, never another
 export family's jobs through the official-report audit callback. Cancellation
 also applies after a job becomes ready. A browser checks only status metadata
 before native attachment navigation; CSV bytes are not fetched into a Blob.
+
+Browser export creation, status and cancellation retry at most twice for network
+failures, HTTP 429 or HTTP 503, with a 2/4-second minimum backoff and a maximum
+accepted `Retry-After` of 10 seconds. Creation snapshots explicit IDs and reuses
+one idempotency key for the entire attempt. Retries retain their original client
+session: logout, session replacement or a session-wide denial prevents the next
+request even without a caller-provided abort signal. Scoped provider denials do
+not invalidate unrelated export retries.
 
 Pure formula-safe CSV encoding lives in `services/csvEncoding.ts`. The separate
 `csvExport.ts` module retains session/HTTP publication for unrelated bounded

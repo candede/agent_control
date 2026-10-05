@@ -28,9 +28,238 @@ function sharedQueries() {
   };
 }
 beforeEach(() => { vi.mocked(api.readReportPage).mockResolvedValue(page("initial")); });
-afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.resetAllMocks(); });
+afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
 describe("report page selection lifetimes", () => {
+  it("renews an expired displayed selection without waiting for a focus or navigation event", async () => {
+    vi.useFakeTimers();
+    const initial = page("initial"), replacement = deferred<ReturnType<typeof page>>();
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(replacement.promise);
+    const { result } = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper: sharedQueries() });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.data?.selection.id).toBe("initial");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.loading).toBe(true);
+    expect(result.current.error).toBeNull();
+    await act(async () => { replacement.resolve(page("replacement")); await vi.advanceTimersByTimeAsync(1); });
+    expect(result.current.data?.selection.id).toBe("replacement");
+  });
+  it.each(["copilot-usage/users", "official-usage/users"])("reuses a recent first %s page on remount without another capture", async path => {
+    const wrapper = sharedQueries();
+    const first = renderHook(() => useReportPage<string>(path), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    first.unmount();
+    const returned = renderHook(() => useReportPage<string>(path), { wrapper });
+    expect(returned.result.current.data?.selection.id).toBe("initial");
+    expect(returned.result.current.loading).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledOnce();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...page("initial"), value: ["focused"] });
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(returned.result.current.data?.value).toEqual(["focused"]));
+    expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBe("initial");
+  });
+
+  it.each(["ttl", "expiry", "revision"] as const)("reloads a retained cohort after its %s boundary", async boundary => {
+    const now = Date.now(), wrapper = sharedQueries();
+    const initial = page("initial");
+    initial.selection.expiresAt = new Date(now + (boundary === "ttl" ? 60_000 : 20_000)).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial);
+    const first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    first.unmount();
+    const pending = deferred<ReturnType<typeof page>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    vi.spyOn(Date, "now").mockReturnValue(now + (boundary === "ttl" ? 31_000 : boundary === "expiry" ? 21_000 : 0));
+    const returned = renderHook(() => useReportPage<string>("copilot-usage/users", {}, boundary === "revision" ? 1 : 0), { wrapper });
+    expect(returned.result.current.loading).toBe(true);
+    expect(returned.result.current.data).toBeUndefined();
+    await act(async () => pending.resolve(page("replacement")));
+    await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("replacement"));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains a new source revision arriving during the initial read without resetting cohort filters", async () => {
+    const wrapper = sharedQueries();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(new Promise(() => {})).mockResolvedValueOnce(page("published"));
+    const first = renderHook(({ revision }) => useReportPage<string>("copilot-usage/users", { cohort: "needs_attention" }, revision),
+      { wrapper, initialProps: { revision: 0 } });
+    first.rerender({ revision: 1 });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("published"));
+    first.unmount();
+    const returned = renderHook(() => useReportPage<string>("copilot-usage/users", { cohort: "needs_attention" }, 1), { wrapper });
+    expect(returned.result.current.data?.selection.id).toBe("published");
+    expect(returned.result.current.loading).toBe(false);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not revive a retained page after an explicit restart", async () => {
+    const wrapper = sharedQueries(), first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => first.result.current.restart());
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
+    first.unmount();
+    const pending = deferred<ReturnType<typeof page>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    const returned = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    expect(returned.result.current.data).toBeUndefined();
+    expect(returned.result.current.loading).toBe(true);
+    await act(async () => pending.resolve(page("returned")));
+    await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
+  });
+
+  it("does not let another observer's pending retry hide a restarted selection or settle its retry", async () => {
+    const retry = deferred<ReturnType<typeof page>>(), restartedRetry = deferred<ReturnType<typeof page>>();
+    const { result } = renderHook(() => ({
+      first: useReportPage<string>("copilot-usage/users"),
+      second: useReportPage<string>("copilot-usage/users"),
+    }), { wrapper: sharedQueries() });
+    await waitFor(() => expect(result.current.first.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(retry.promise);
+    act(() => result.current.first.retry());
+    expect(result.current.first.data).toBeUndefined();
+    const retrySignal = vi.mocked(api.readReportPage).mock.calls.at(-1)?.[2];
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => result.current.first.restart());
+    await waitFor(() => expect(result.current.first.loading).toBe(false));
+    expect(retrySignal?.aborted).toBe(false);
+    expect(result.current.first.data?.selection.id).toBe("restarted");
+    vi.mocked(api.readReportPage).mockReturnValueOnce(restartedRetry.promise);
+    act(() => result.current.first.retry());
+    await act(async () => retry.resolve(page("initial")));
+    await waitFor(() => expect(result.current.second.loading).toBe(false));
+    expect(result.current.first.loading).toBe(true);
+    expect(result.current.first.data).toBeUndefined();
+    await act(async () => restartedRetry.resolve(page("restarted")));
+    await waitFor(() => expect(result.current.first.data?.selection.id).toBe("restarted"));
+    expect(result.current.second.data?.selection.id).toBe("initial");
+  });
+
+  it("does not let a pending retry hide an explicit selection revalidated at a new revision", async () => {
+    const pending = deferred<ReturnType<typeof page>>();
+    const { result, rerender } = renderHook(({ revision }) => ({
+      first: useReportPage<string>("official-usage/agents/agent/users", { selectionId: "initial" }, revision),
+      second: useReportPage<string>("official-usage/agents/agent/users", { selectionId: "initial" }),
+    }), { wrapper: sharedQueries(), initialProps: { revision: 0 } });
+    await waitFor(() => expect(result.current.first.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    act(() => result.current.first.retry());
+    const pendingSignal = vi.mocked(api.readReportPage).mock.calls.at(-1)?.[2];
+    vi.mocked(api.readReportPage).mockResolvedValueOnce({ ...page("initial"), value: ["revalidated"] });
+    rerender({ revision: 1 });
+    await waitFor(() => expect(result.current.first.data?.value).toEqual(["revalidated"]));
+    expect(pendingSignal?.aborted).toBe(false);
+    await act(async () => pending.resolve(page("initial")));
+    await waitFor(() => expect(result.current.second.loading).toBe(false));
+    expect(result.current.first.data?.value).toEqual(["revalidated"]);
+  });
+
+  it.each(["manual", "automatic"] as const)("does not revive a cache entry when a pending read settles after %s restart", async kind => {
+    const wrapper = sharedQueries(), pending = deferred<ReturnType<typeof page>>();
+    const first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    const second = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    act(() => second.result.current.retry());
+    const pendingSignal = vi.mocked(api.readReportPage).mock.calls.at(-1)?.[2];
+    if (kind === "automatic") vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated);
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => kind === "manual" ? first.result.current.restart() : first.result.current.next());
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
+    expect(pendingSignal?.aborted).toBe(false);
+    await act(async () => pending.resolve(page("initial")));
+    await waitFor(() => expect(second.result.current.data?.selection.id).toBe("initial"));
+    first.unmount();
+    second.unmount();
+
+    const replacement = deferred<ReturnType<typeof page>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(replacement.promise);
+    const returned = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    expect(returned.result.current.data).toBeUndefined();
+    expect(returned.result.current.loading).toBe(true);
+    await act(async () => replacement.resolve(page("returned")));
+    await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
+    returned.unmount();
+    const requests = vi.mocked(api.readReportPage).mock.calls.length;
+    const remounted = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    expect(remounted.result.current.data?.selection.id).toBe("returned");
+    expect(api.readReportPage).toHaveBeenCalledTimes(requests);
+  });
+
+  it("does not admit a retired shared response for a new observer joining its pending read", async () => {
+    const wrapper = sharedQueries(), pending = deferred<ReturnType<typeof page>>();
+    const first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    const second = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    act(() => second.result.current.retry());
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => first.result.current.restart());
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
+    const exposed: string[] = [];
+    const returned = renderHook(() => {
+      const read = useReportPage<string>("copilot-usage/users");
+      if (read.data) exposed.push(read.data.selection.id);
+      return read;
+    }, { wrapper });
+    expect(returned.result.current.data).toBeUndefined();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("returned"));
+    await act(async () => pending.resolve(page("initial")));
+    await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
+    expect(exposed).not.toContain("initial");
+    expect(first.result.current.data?.selection.id).toBe("restarted");
+    expect(second.result.current.data?.selection.id).toBe("initial");
+  });
+
+  it("does not make a retired capture reusable when a pinned peer refetches after restart", async () => {
+    const wrapper = sharedQueries();
+    const first = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    const second = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("initial"));
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("restarted"));
+    act(() => first.result.current.restart());
+    await waitFor(() => expect(first.result.current.data?.selection.id).toBe("restarted"));
+    act(() => second.result.current.retry());
+    await waitFor(() => expect(second.result.current.data?.selection.id).toBe("initial"));
+    first.unmount();
+    second.unmount();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("returned"));
+    const returned = renderHook(() => useReportPage<string>("copilot-usage/users"), { wrapper });
+    expect(returned.result.current.data).toBeUndefined();
+    await waitFor(() => expect(returned.result.current.data?.selection.id).toBe("returned"));
+  });
+
+  it("retains at most four inactive cohort pages and never retains details", async () => {
+    const wrapper = sharedQueries(), client = clients.at(-1)!;
+    for (let index = 0; index < 7; index++) {
+      const hook = renderHook(() => useReportPage<string>("copilot-usage/users", { search: String(index) }), { wrapper });
+      await waitFor(() => expect(hook.result.current.data).toBeDefined());
+      hook.unmount();
+    }
+    expect(client.getQueryCache().getAll().filter(query => query.meta?.retainReportPage)).toHaveLength(4);
+    const detail = renderHook(() => useReportPage<string>("copilot-usage/users/user/agents", { selectionId: "initial" }), { wrapper });
+    await waitFor(() => expect(detail.result.current.data).toBeDefined());
+    detail.unmount();
+    await waitFor(() => expect(client.getQueryCache().getAll()).toHaveLength(4));
+  });
+
+  it("does not expose a recoverable invalidation as an error while capturing its replacement", async () => {
+    const pending = deferred<ReturnType<typeof page>>(), errors: unknown[] = [];
+    vi.mocked(api.readReportPage).mockRejectedValueOnce(invalidated).mockReturnValueOnce(pending.promise);
+    const { result } = renderHook(() => {
+      const read = useReportPage("copilot-usage/users");
+      if (read.error) errors.push(read.error);
+      return read;
+    });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    expect(errors).toEqual([]);
+    expect(result.current.loading).toBe(true);
+    await act(async () => pending.resolve(page("replacement")));
+    await waitFor(() => expect(result.current.data?.selection.id).toBe("replacement"));
+  });
   it.each(["manual", "automatic"] as const)("does not reuse another observer's cached selection on %s restart", async kind => {
     const replacement = deferred<ReturnType<typeof page>>();
     const { result } = renderHook(() => ({

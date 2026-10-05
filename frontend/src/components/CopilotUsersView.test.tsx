@@ -65,7 +65,7 @@ beforeEach(() => {
   vi.mocked(getAgentResponsibility).mockImplementation(async query => responsibilityFixture(query?.objectId));
   detail();
 });
-afterEach(() => vi.resetAllMocks());
+afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe("record-backed paid M365 Copilot license dashboard", () => {
   it("groups report context with the summary and keeps controls, rows and pagination in one table surface", async () => {
@@ -439,6 +439,65 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false");
     expect(api.readReportPage).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.some(([path]) => path.endsWith("/unresolved-identities"))).toBe(false);
+  });
+  it.each(["admission", "building", "download"] as const)("withdraws an export-invalidated paid selection during %s and restarts its parent", async phase => {
+    const invalidated = new ApiError(409, "selection_invalidated", "Expired selection");
+    const ready = { id: "export", status: "ready" as const, rows: 4, bytes: 200,
+      expiresAt: new Date(Date.now() + 60000).toISOString(), error: null, limit: null, observed: null };
+    if (phase === "admission") vi.mocked(api.createReportExport).mockRejectedValue(invalidated);
+    else {
+      vi.mocked(api.createReportExport).mockResolvedValue({ id: ready.id });
+      if (phase === "building") vi.mocked(api.reportExportStatus).mockResolvedValue({ ...ready, status: "failed", error: "selection_invalidated" });
+      else vi.mocked(api.reportExportStatus).mockResolvedValueOnce(ready).mockRejectedValueOnce(invalidated);
+    }
+    vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")
+      ? new Promise(() => {}) : Promise.resolve(page()));
+    render(<SavedQueryProvider><CopilotUsersView /></SavedQueryProvider>);
+    await userEvent.click(await screen.findByText("Data sources and coverage"));
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const unresolvedSignal = vi.mocked(api.readReportPage).mock.calls[1][2];
+    await open();
+    vi.useFakeTimers();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Export users CSV" })); });
+    expect(api.createReportExport).toHaveBeenCalledWith({ kind: "copilot_users", selectionId, ids: undefined }, expect.any(AbortSignal));
+    if (phase !== "admission") await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    if (phase === "download") await act(async () => { fireEvent.click(screen.getByRole("link", { name: "Download CSV" })); });
+    vi.useRealTimers();
+    expect(screen.getByRole("alert")).toHaveTextContent("This selection changed or expired.");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "users pages" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Unresolved report identities", hidden: true })).not.toBeInTheDocument();
+    expect(unresolvedSignal?.aborted).toBe(true);
+    expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("Unknown");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    let finish!: (value: ReportPage<CombinedUser>) => void;
+    vi.mocked(api.readReportPage).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    assertQuery({ cohort: "licensed", sort: "responses", order: "desc", lowResponseThreshold: 5 });
+    const query = vi.mocked(api.readReportPage).mock.calls.at(-1)![1];
+    expect(query?.selectionId).toBeUndefined();
+    expect(query?.cursor).toBeUndefined();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    const replacement = page([ben], { selection: { ...page().selection, id: "replacement-selection" } });
+    await act(async () => finish(replacement));
+    await screen.findByRole("button", { name: "Ben" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Unresolved report identities", hidden: true })).not.toBeInTheDocument();
+    expect(screen.getByText("Data sources and coverage").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    vi.mocked(api.createReportExport).mockRejectedValue(new Error("Export service unavailable"));
+    fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Export service unavailable");
+    expect(api.createReportExport).toHaveBeenLastCalledWith(
+      { kind: "copilot_users", selectionId: replacement.selection.id, ids: undefined }, expect.any(AbortSignal));
+    expect(screen.getByRole("button", { name: "Ben" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
   });
   it("aborts unresolved identity reads when source coverage closes and requires explicit reopening", async () => {
     vi.mocked(api.readReportPage).mockImplementation(path => path.endsWith("/unresolved-identities")

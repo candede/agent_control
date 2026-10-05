@@ -113,6 +113,7 @@ describe("users/report route-to-client boundary", () => {
   it.each([
     ["/copilot-usage/users", "licensed_copilot_usage"],
     ["/official-usage/history", "official_usage_history"],
+    ["/official-usage/history/options", "official_usage_history"],
     ["/official-usage/overview", "official_usage_overview"],
     ["/official-usage/aggregate", "official_usage_aggregate"],
     ["/official-usage/users", "official_usage_user"],
@@ -299,13 +300,18 @@ describe("users/report route-to-client boundary", () => {
     const response = await api("/official-usage/history?limit=5");
     expect(response.status, await response.clone().text()).toBe(200);
     const first = await response.json() as ReportPage<ReportHistorySet>;
+    const options = await api(`/official-usage/history/options?limit=5&selectionId=${first.selection.id}`);
+    expect(options.status).toBe(200);
+    const lightweight = await options.json();
+    expect(Object.keys(lightweight).sort()).toEqual(["counts", "page", "reports", "selection", "value"]);
+    expect(lightweight).toEqual({ value: first.value, page: first.page, counts: first.counts, selection: first.selection, reports: first.reports });
     expect(first.counts.total).toBe(33);
     const pins = (await fixture.runtime.query("SELECT root_kind FROM data_generation_pins WHERE selection_id=$1", [first.selection.id])).rows;
     expect(pins.filter(pin => pin.root_kind === "tenant_history")).toHaveLength(1); expect(pins.length).toBeLessThanOrEqual(16);
     await acceptSet(32);
     const ids = new Set(first.value.map(set => set.id)); let cursor = first.page.nextCursor;
     while (cursor) {
-      const next = await api(`/official-usage/history${reportQueryString({ limit: 5, cursor })}`);
+      const next = await api(`/official-usage/history/options${reportQueryString({ limit: 5, cursor })}`);
       expect(next.status, await next.clone().text()).toBe(200);
       const page = await next.json() as ReportPage<ReportHistorySet>;
       expect(page.selection).toEqual(first.selection); expect(page.counts.total).toBe(33);

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSavedQueryClient, readSavedQuery, useSavedQuery } from "./savedQueries";
 import { ApiError } from "./api/client";
 import { SavedQueryProvider } from "./components/SavedQueryProvider";
+import { deferred } from "./test/deferred";
 
 const clients: ReturnType<typeof createSavedQueryClient>[] = [];
 function client() {
@@ -50,6 +51,67 @@ describe("saved server queries", () => {
     expect(requestSignal.aborted).toBe(true);
     await expect(readSavedQuery(queries, ["users"], read, controller.signal)).rejects.toMatchObject({ kind: "aborted" });
     expect(read).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { eventType: "added", cancellation: "abort" },
+    { eventType: "added", cancellation: "clear" },
+    { eventType: "observerAdded", cancellation: "abort" },
+    { eventType: "observerAdded", cancellation: "clear" },
+    { eventType: "updated", cancellation: "abort" },
+    { eventType: "updated", cancellation: "clear" },
+  ] as const)("honors $cancellation during $eventType admission without starting a request", async ({ eventType, cancellation }) => {
+    const queries = client();
+    const controller = new AbortController();
+    const read = vi.fn().mockResolvedValue("private data");
+    const unsubscribe = queries.getQueryCache().subscribe(event => {
+      if (event.type !== eventType || event.type === "updated" && event.action.type !== "fetch") return;
+      unsubscribe();
+      if (cancellation === "abort") controller.abort();
+      else queries.clear();
+    });
+    const pending = readSavedQuery(queries, ["private-users"], read, controller.signal);
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(read).not.toHaveBeenCalled();
+    if (cancellation === "clear") expect(queries.getQueryCache().getAll()).toHaveLength(0);
+    else await waitFor(() => expect(queries.getQueryCache().getAll()).toHaveLength(0));
+  });
+
+  it("preserves a peer observer when the admitting caller aborts at fetch start", async () => {
+    const queries = client();
+    const controller = new AbortController();
+    const read = vi.fn().mockResolvedValue("shared data");
+    const peer = renderHook(() => useSavedQuery({
+      queryKey: ["saved", "users"], queryFn: read, enabled: false,
+    }), {
+      wrapper: ({ children }) => <QueryClientProvider client={queries}>{children}</QueryClientProvider>,
+    });
+    const unsubscribe = queries.getQueryCache().subscribe(event => {
+      if (event.type !== "updated" || event.action.type !== "fetch") return;
+      unsubscribe();
+      controller.abort();
+    });
+    const pending = readSavedQuery(queries, ["users"], read, controller.signal);
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    await waitFor(() => expect(peer.result.current.data).toBe("shared data"));
+    expect(read).toHaveBeenCalledOnce();
+    peer.unmount();
+  });
+
+  it("cleans up cancellation triggered synchronously by the reader", async () => {
+    const queries = client();
+    const controller = new AbortController();
+    const response = deferred<string>();
+    let requestSignal!: AbortSignal;
+    const pending = readSavedQuery(queries, ["private-users"], signal => {
+      requestSignal = signal;
+      controller.abort();
+      return response.promise;
+    }, controller.signal);
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(requestSignal.aborted).toBe(true);
+    response.resolve("obsolete private data");
+    await waitFor(() => expect(queries.getQueryCache().getAll()).toHaveLength(0));
   });
 
   it("does not silently retry failures and permits an explicit fresh read", async () => {

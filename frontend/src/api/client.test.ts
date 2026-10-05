@@ -50,6 +50,7 @@ import {
   resumeDefenderHunt,
   revokeDefenderHuntingRetainedScope,
   refreshPackageIdentityDetails,
+  request,
   searchDirectoryPrincipals,
   resolveDirectoryPrincipals,
   resolveAgentPeople,
@@ -95,12 +96,55 @@ it("checks automatic refresh with an empty JSON body and the current session CSR
   await checkAutomaticRefresh({ signal: controller.signal });
   expect(fetchMock).toHaveBeenLastCalledWith("/api/data-sync/auto-refresh", expect.objectContaining({
     method: "POST", body: "{}", credentials: "include", signal: controller.signal,
-    headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "auto-csrf" }),
   }));
+  const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+  expect(headers.get("Content-Type")).toBe("application/json");
+  expect(headers.get("X-CSRF-Token")).toBe("auto-csrf");
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("request headers", () => {
+  const formats: Array<{ name: string; create: (entries: [string, string][]) => HeadersInit }> = [
+    { name: "record", create: entries => Object.fromEntries(entries) },
+    { name: "Headers", create: entries => new Headers(entries) },
+    { name: "tuples", create: entries => entries },
+  ];
+
+  it.each(formats)("preserves $name headers and case-insensitive overrides without mutating the caller", async ({ create }) => {
+    const fetchMock = mockJsonResponse({ csrfToken: "session-csrf" });
+    await getCurrentUser();
+    const headers = create([
+      ["accept", "application/problem+json"],
+      ["content-type", "application/json"],
+      ["idempotency-key", "caller-operation"],
+      ["x-csrf-token", "caller-csrf"],
+      ["x-request-context", "caller-context"],
+    ]);
+    const original = Array.from(new Headers(headers));
+
+    await request("/api/agents/refresh-jobs", { method: "POST", headers, body: "{}" });
+
+    expect(Array.from(new Headers(fetchMock.mock.lastCall?.[1]?.headers))).toEqual(original);
+    expect(Array.from(new Headers(headers))).toEqual(original);
+  });
+
+  it.each((["POST", "post", "PATCH", "patch", "DELETE", "delete", "GET", "get", "HEAD", "head", "OPTIONS", "options"] as const))(
+    "applies session headers according to the normalized %s method",
+    async method => {
+      const fetchMock = mockJsonResponse({ csrfToken: "session-csrf" });
+      await getCurrentUser();
+      await request("/api/example", { method });
+      const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+      const normalized = method.toUpperCase();
+      expect(headers.get("Accept")).toBe("application/json");
+      expect(headers.get("X-CSRF-Token")).toBe(["GET", "HEAD", "OPTIONS"].includes(normalized) ? null : "session-csrf");
+      if (normalized === "GET") expect(headers.has("Idempotency-Key")).toBe(false);
+      else expect(headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+    },
+  );
 });
 
 describe("username sign-in API client", () => {
@@ -116,8 +160,10 @@ describe("username sign-in API client", () => {
       credentials: "include",
       body: JSON.stringify(input),
       signal: controller.signal,
-      headers: expect.objectContaining({ Accept: "application/json", "Content-Type": "application/json" }),
     }));
+    const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+    expect(headers.get("Accept")).toBe("application/json");
+    expect(headers.get("Content-Type")).toBe("application/json");
   });
 
   it("omits an unspecified return path", async () => {
@@ -229,8 +275,10 @@ describe("access API client", () => {
       body: JSON.stringify({ recordId: "agent:record", ...(force ? { force: true } : {}) }),
       signal: controller.signal,
       credentials: "include",
-      headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "people-csrf" }),
     }));
+    const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("X-CSRF-Token")).toBe("people-csrf");
   });
 
   it("cancels exact person resolution through the existing protected directory endpoint", async () => {
@@ -298,8 +346,8 @@ describe("access API client", () => {
     expect(await createReportExport({ kind, selectionId, idempotencyKey }, controller.signal)).toEqual({ id: "export-id" });
     expect(fetchMock).toHaveBeenCalledWith("/api/data-exports", expect.objectContaining({
       credentials: "include", signal: controller.signal, method: "POST", body: JSON.stringify({ kind, selectionId, idempotencyKey }),
-      headers: expect.objectContaining({ "Content-Type": "application/json" }),
     }));
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("Content-Type")).toBe("application/json");
     expect(reportExportDownload("export-id")).toBe("/api/data-exports/export-id/download");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -373,7 +421,10 @@ describe("access API client", () => {
     for (const [index, method] of [[2, "POST"], [3, "DELETE"]] as const) {
       const [path, options] = fetchMock.mock.calls[index];
       expect(path).toBe("/api/agent-inventory/graph_packages%3Apackage%252Fone/usage-associations");
-      expect(options).toMatchObject({ method, credentials: "include", headers: { "X-CSRF-Token": "association-fixture-csrf", "Content-Type": "application/json" } });
+      expect(options).toMatchObject({ method, credentials: "include" });
+      const headers = new Headers(options?.headers);
+      expect(headers.get("X-CSRF-Token")).toBe("association-fixture-csrf");
+      expect(headers.get("Content-Type")).toBe("application/json");
       expect(JSON.parse(String(options?.body))).toMatchObject(common);
     }
   });
@@ -635,8 +686,8 @@ describe("access API client", () => {
     await cancelDataSyncRun("job/one", { signal: controller.signal });
     expect(fetchMock).toHaveBeenLastCalledWith("/api/data-sync/runs/job%2Fone/cancel", expect.objectContaining({
       method: "POST", credentials: "include", signal: controller.signal,
-      headers: expect.objectContaining({ "X-CSRF-Token": "cancel-csrf" }),
     }));
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("cancel-csrf");
   });
 
   it("cancels an exact Power Platform refresh without acquiring provider authorization", async () => {
@@ -646,8 +697,8 @@ describe("access API client", () => {
     await cancelInventoryRefresh("job/one");
     expect(fetchMock).toHaveBeenLastCalledWith("/api/inventory/refresh-jobs/job%2Fone/cancel", expect.objectContaining({
       method: "POST", credentials: "include",
-      headers: expect.objectContaining({ "X-CSRF-Token": "cancel-csrf" }),
     }));
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("cancel-csrf");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -657,8 +708,8 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/agents/refresh-jobs", expect.objectContaining({
       method: "POST",
       body: JSON.stringify({ mode: "delegated" }),
-      headers: expect.objectContaining({ "Idempotency-Key": "agent-identities-snapshot-one" }),
     }));
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("Idempotency-Key")).toBe("agent-identities-snapshot-one");
   });
 
   it("requests unified saved rows and explicitly refreshes selected matching details", async () => {
@@ -796,6 +847,31 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["waiting_authorization", "running"] as const)(
+    "fences a %s refresh if the session changes after staging completes",
+    async status => {
+      let replacement: Promise<unknown> | undefined;
+      const response = Response.json({});
+      response.json = async () => {
+        // Change sessions after the transport's body check, before the wrapper resumes.
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
+          replacement = getCurrentUser();
+        })));
+        return { id: "selected-refresh", status, tokenMode: "delegated", targetCount: 2 };
+      };
+      const fetchMock = vi.fn().mockResolvedValueOnce(response)
+        .mockResolvedValueOnce(Response.json({ csrfToken: "replacement-csrf" }))
+        .mockResolvedValueOnce(Response.json({ id: "selected-refresh", status: "running" }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(refreshPackageIdentityDetails({ selectionId: "selected-root" })).rejects.toMatchObject({
+        code: "request_aborted", kind: "aborted",
+      });
+      await replacement;
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/agents/refresh-selection", "/api/me"]);
+    },
+  );
+
   it("resolves canonical and exact source aliases through the unified endpoint without rewriting package targets", async () => {
     const record = {
       id: "agent:11111111-1111-4111-8111-111111111111",
@@ -832,9 +908,12 @@ describe("access API client", () => {
     const input = { kind: "unified_agents" as const, selectionId: "saved-selection", idempotencyKey: crypto.randomUUID() };
     expect(await createReportExport(input)).toEqual({ id: "selected-export" });
     expect(fetchMock).toHaveBeenLastCalledWith("/api/data-exports", expect.objectContaining({
-      method: "POST", credentials: "include", headers: expect.objectContaining({ "Content-Type": "application/json", "X-CSRF-Token": "csv-csrf" }),
+      method: "POST", credentials: "include",
       body: JSON.stringify(input),
     }));
+    const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("X-CSRF-Token")).toBe("csv-csrf");
   });
 
   it("preserves exact selected references and reports invalidation without a source-export fallback", async () => {
@@ -946,7 +1025,8 @@ describe("access API client", () => {
     await submitQuarantine({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"], confirmationHash: "c".repeat(64) }, "stable-write-key");
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/quarantine/status?snapshotId=snapshot%2Fid&nativeId=native+id&force=true", expect.objectContaining({ credentials: "include" }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/quarantine/preview", expect.objectContaining({ method: "POST", body: JSON.stringify({ action: "quarantine", snapshotId: "snapshot-a", resourceNativeIds: ["native-a"] }) }));
-    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/jobs", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": "stable-write-key" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/quarantine/jobs", expect.objectContaining({ method: "POST" }));
+    expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get("Idempotency-Key")).toBe("stable-write-key");
   });
 
   it.each(["status", "preview"] as const)("cancels an explicitly admitted quarantine %s read without changing its target", async kind => {
@@ -1014,9 +1094,11 @@ describe("investigation request cancellation", () => {
     await resolveAgentInvestigationIdentity("power_platform:env/one:agent%one");
     expect(fetchMock).toHaveBeenLastCalledWith("/api/agent-inventory/investigations/resolve", expect.objectContaining({
       method: "POST", body: JSON.stringify({ recordId: "power_platform:env/one:agent%one" }),
-      headers: expect.objectContaining({ "X-CSRF-Token": "identity-csrf", "Content-Type": "application/json" }),
       credentials: "include",
     }));
+    const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+    expect(headers.get("X-CSRF-Token")).toBe("identity-csrf");
+    expect(headers.get("Content-Type")).toBe("application/json");
   });
 
   describe.each(requests)("$name", ({ path, method, body, send }) => {
@@ -1136,7 +1218,7 @@ describe("API response failures", () => {
       readResponse.resolve(response());
       await cancelled;
       await checkCapabilities();
-      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
     });
 
     it.each([
@@ -1161,7 +1243,7 @@ describe("API response failures", () => {
       readResponse.resolve(response());
       await completedRead;
       await checkCapabilities();
-      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "retained-session-csrf");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("retained-session-csrf");
     });
 
     it("does not retire a newer session validation when the older logout finishes", async () => {
@@ -1183,7 +1265,7 @@ describe("API response failures", () => {
       readResponse.resolve(response());
       await expect(read).resolves.toMatchObject(expected);
       await checkCapabilities();
-      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "newer-session-csrf");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("newer-session-csrf");
     });
   });
 
@@ -1199,7 +1281,7 @@ describe("API response failures", () => {
     pending.resolve(Response.json({ csrfToken: "cancelled-session-csrf" }));
     await cancelled;
     await checkCapabilities();
-    expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
   });
 
   it.each(["JSON", "CSV"] as const)("rejects a late %s success from a denied session", async format => {
@@ -1275,9 +1357,9 @@ describe("API response failures", () => {
     await cancelled;
     await checkCapabilities();
     if (boundary === "new session") {
-      expect(fetchMock.mock.lastCall?.[1]?.headers).toHaveProperty("X-CSRF-Token", "current-session-csrf");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("X-CSRF-Token")).toBe("current-session-csrf");
     } else {
-      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
     }
   });
 
@@ -1411,7 +1493,7 @@ describe("API response failures", () => {
       await expect(createReportExport({ kind: "unified_agents", selectionId: "saved-selection" })).rejects.toMatchObject({ status: 401, code: "session_invalidated" });
       expect(listener).toHaveBeenCalledOnce();
       await checkCapabilities();
-      expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+      expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
     } finally {
       unsubscribe();
     }
@@ -1423,7 +1505,7 @@ describe("API response failures", () => {
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
     await expect(signOut()).resolves.toBeUndefined();
     await checkCapabilities();
-    expect(fetchMock.mock.lastCall?.[1]?.headers).not.toHaveProperty("X-CSRF-Token");
+    expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).has("X-CSRF-Token")).toBe(false);
   });
 
   it("includes the backend's cancelled package-refresh state in the client contract", () => {

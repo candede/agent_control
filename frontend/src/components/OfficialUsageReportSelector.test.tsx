@@ -44,6 +44,15 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("compact shared report-set selection", () => {
+  it("uses metadata-only options without requiring analytics or user sources", async () => {
+    const { value, page: navigation, counts, selection, reports } = page();
+    vi.mocked(api.readReportPage).mockResolvedValue({ value, page: navigation, counts, selection, reports });
+    render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={vi.fn()} />);
+    await ready();
+    expect(api.readReportPage).toHaveBeenCalledExactlyOnceWith("official-usage/history/options",
+      { sort: "acceptedAt", order: "desc", limit: 50 }, expect.any(AbortSignal));
+    expect(screen.getAllByRole("option")).toHaveLength(3);
+  });
   it("applies the chosen report through an exact fenced preview without adding a confirmation panel", async () => {
     const onChanged = vi.fn();
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
@@ -103,7 +112,7 @@ describe("compact shared report-set selection", () => {
     expect(api.readReportPage).toHaveBeenCalledOnce();
     await userEvent.selectOptions(await ready(), "older-reports");
     await waitFor(() => expect(screen.getByRole("combobox")).toContainHTML(older.id));
-    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/history", expect.objectContaining({ selectionId, cursor: "older", limit: 50 }), expect.any(AbortSignal));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/history/options", expect.objectContaining({ selectionId, cursor: "older", limit: 50 }), expect.any(AbortSignal));
     await userEvent.selectOptions(await ready(), older.id);
     await waitFor(() => expect(api.confirmReportOperation).toHaveBeenCalledOnce());
     expect(api.previewReportOperation).toHaveBeenLastCalledWith(older.id, "select", expect.any(AbortSignal));
@@ -121,10 +130,14 @@ describe("compact shared report-set selection", () => {
     await choose();
     await waitFor(() => expect(api.confirmReportOperation).toHaveBeenCalledOnce());
   });
-  it("verifies an uncertain committed selection by reading, never replaying a consumed confirmation", async () => {
+  it.each([
+    new ApiError(0, "network_error", "Connection lost"),
+    new ApiError(503, "service_unavailable", "Service unavailable"),
+    new ApiError(200, "invalid_response", "The server returned an invalid JSON response."),
+  ])("verifies an uncertain committed selection by reading, never replaying a consumed confirmation: %s", async failure => {
     vi.mocked(api.confirmReportOperation).mockImplementationOnce(async input => {
       metadata = { ...metadata, activeSetId: input.setId, activeRevision: "5" };
-      throw new ApiError(0, "network_error", "Connection lost");
+      throw failure;
     });
     const onChanged = vi.fn();
     render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
@@ -135,6 +148,34 @@ describe("compact shared report-set selection", () => {
     await waitFor(() => expect(screen.getByRole("combobox")).toHaveValue(second.id));
     expect(api.confirmReportOperation).toHaveBeenCalledOnce();
     expect(onChanged).toHaveBeenCalledExactlyOnceWith(false);
+  });
+  it.each([
+    { phase: "preview", status: 401 }, { phase: "preview", status: 403 },
+    { phase: "confirm", status: 401 }, { phase: "confirm", status: 403 },
+  ])("preserves explicit recovery after a $status $phase denial across a revision change", async ({ phase, status }) => {
+    const failure = new ApiError(status, "forbidden", "Report access denied");
+    if (phase === "preview") vi.mocked(api.previewReportOperation).mockRejectedValueOnce(failure);
+    else vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(failure);
+    const onChanged = vi.fn();
+    const view = render(<OfficialUsageReportSelector principalKey="admin" revision={0} onChanged={onChanged} />);
+    await choose();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Report access denied");
+    expect(screen.queryByRole("option", { name: /2026-01-01/ })).not.toBeInTheDocument();
+    view.rerender(<OfficialUsageReportSelector principalKey="admin" revision={1} onChanged={onChanged} />);
+    await screen.findByRole("option", { name: "Report sets unavailable" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("combobox")).toBeDisabled();
+    expect(screen.queryByRole("option", { name: /2026-01-01/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Report access denied");
+    const retry = screen.getByRole("button", { name: "Retry" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    await ready();
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(api.confirmReportOperation).toHaveBeenCalledTimes(phase === "confirm" ? 1 : 0);
+    expect(onChanged).toHaveBeenCalledExactlyOnceWith(false);
+    await choose();
+    await waitFor(() => expect(onChanged).toHaveBeenLastCalledWith(true));
   });
   it("keeps a committed selection successful even when its subsequent metadata read fails", async () => {
     const onChanged = vi.fn();

@@ -70,28 +70,35 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   const [lastThreshold, setLastThreshold] = useState(5);
   const [selected, setSelected] = useState<{ id: string; selectionId: string; reportSetId?: string }>();
   const [unresolvedSelectionId, setUnresolvedSelectionId] = useState<string>();
+  const [invalidatedSelectionId, setInvalidatedSelectionId] = useState<string>();
   const focus = useRef<HTMLInputElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const valid = isValidLowResponseThreshold(threshold);
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
-  const read = useReportPage<CombinedUser>("copilot-usage/users", { ...filters, search: route.search || undefined, setId: route.reportSetId,
+  const pageRead = useReportPage<CombinedUser>("copilot-usage/users", { ...filters, search: route.search || undefined, setId: route.reportSetId,
     lowResponseThreshold: valid ? Number(threshold) : lastThreshold }, revision);
+  const read = pageRead.data && pageRead.data.selection.id === invalidatedSelectionId
+    ? { ...pageRead, data: undefined, invalidated: true } : pageRead;
   const data = read.data;
   if (selected && (!data || selected.reportSetId !== route.reportSetId || data.selection.id !== selected.selectionId)) setSelected(undefined);
   if (unresolvedSelectionId && (!data || data.selection.id !== unresolvedSelectionId || !data.summary.unresolvedIdentities)) setUnresolvedSelectionId(undefined);
-  function restartSelection() { setSelected(undefined); setUnresolvedSelectionId(undefined); read.restart(); }
+  function restartSelection() { setSelected(undefined); setUnresolvedSelectionId(undefined); setInvalidatedSelectionId(undefined); pageRead.restart(); }
   return <>
-    <ReportReadStatus read={read} quietLoading />
+    <ReportReadStatus read={{ ...read, restart: restartSelection }} quietLoading />
       <div className="agent-overview-metrics" role="group" aria-label="M365 Copilot license summary" aria-busy={read.loading}>{cohorts.map(([value, label, metric, description]) =>
         <button key={value} type="button" className="metric agent-overview-filter" aria-label={label} aria-pressed={filters.cohort === value}
           aria-description={`${usageCount(data?.summary[metric])}. ${description}`}
           onClick={() => setFilters({ ...filters, cohort: filters.cohort === value ? "licensed" : value })}><span>{label}</span><strong>{usageCount(data?.summary[metric])}</strong>
           <small>{description}</small></button>)}{reportContext}</div>
-    {data && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data {data.sources.directory.state}. Run Users sync in Sync or review Permissions.</p> : null}
-    {data && data.reports.availability !== "active" ? <p className="copilot-users-notice" role="status">
+    {data && !read.loading && data.sources.directory.attemptStatus === "running" ? <p className="copilot-users-notice" role="status">
+      Refreshing license data. Showing the last saved data until sync completes.</p>
+      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">License data {data.sources.directory.state}. Run Users sync in Sync or review Permissions.</p> : null}
+    {data && !read.loading && data.reports.availability !== "active" ? <p className="copilot-users-notice" role="status">
       {data.reports.availability === "stale" ? "Reports are out of date." : "Agent reports unavailable."}{" "}
       <a href="/sync?reports=manage">Manage reports in Sync</a>.</p> : null}
-    {data && ["stale", "unavailable"].includes(data.sources.app_activity.state) ? <p className="copilot-users-notice" role="status">
+    {data && !read.loading && data.sources.app_activity.attemptStatus === "running" ? <p className="copilot-users-notice" role="status">
+      Refreshing Office app activity. Showing the last saved data until sync completes.</p>
+      : data && !read.loading && ["stale", "unavailable"].includes(data.sources.app_activity.state) ? <p className="copilot-users-notice" role="status">
       Office app activity {data.sources.app_activity.state === "stale" ? "is out of date. Run Users sync in Sync." : "unavailable. Review the connection in Permissions."}</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
       <UserActivityFilters path="copilot-usage/users" selectionId={data?.selection.id} onRestartSelection={restartSelection}
@@ -103,7 +110,8 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
       }} onSort={value => { const [sort, order] = value.split(":"); setFilters({ ...filters, sort: sort as ReportQuery["sort"], order: order as ReportQuery["order"] }); }}
       onClear={() => { setFilters({ cohort: "licensed", sort: filters.sort, order: filters.order }); setThreshold("5"); change({ ...route, search: "", page: 0 }); }}
-      exportButton={<ReportExportButton key={data?.selection.id} kind="copilot_users" selectionId={data?.selection.id} label="Export users CSV" disabled={read.loading || !valid} />} />
+      exportButton={<ReportExportButton key={data?.selection.id} kind="copilot_users" selectionId={data?.selection.id} label="Export users CSV"
+        onSelectionInvalidated={() => setInvalidatedSelectionId(data?.selection.id)} disabled={read.loading || !valid} />} />
       {read.loading || data?.value.length ? <div className="table-shell copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabIndex={0}>
         <table className="agent-table copilot-users-table reported-users-table"><thead><tr>{([["User", "name"], ["Agent responses", "responses"], ["Agents used", "agentsUsed"],
           ["Company", "company"], ["Department", "department"], ["Last activity", "lastActivity"]] as const).map(([label, sort]) =>

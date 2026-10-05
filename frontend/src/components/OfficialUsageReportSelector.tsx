@@ -1,5 +1,5 @@
 import { useContext, useLayoutEffect, useRef, useState } from "react";
-import type { ReportHistorySet, ReportMetadata } from "../../../backend/src/types/officialReportData";
+import type { ReportHistorySet, ReportListPage, ReportMetadata } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportConfirmation } from "../../../backend/src/types/officialReportApi";
 import { confirmReportOperation, previewReportOperation } from "../api/reportData";
 import { ApiError } from "../api/client";
@@ -22,7 +22,7 @@ function reportLabel(set: ReportHistorySet) {
   return `${set.periodProvenance === "activity_range" ? "Observed activity" : "Reporting window"}: ${dates} | ${set.id.slice(0, 8)}`;
 }
 function Selector({ revision, onChanged }: { revision: number; onChanged: (selected: boolean) => void }) {
-  const read = useReportPage<ReportHistorySet>("official-usage/history", { sort: "acceptedAt", order: "desc" }, revision);
+  const read = useReportPage<ReportHistorySet, ReportListPage<ReportHistorySet>>("official-usage/history/options", { sort: "acceptedAt", order: "desc" }, revision);
   const capability = useContext(CapabilityContext), canManage = !capability || hasRole(capability.user, "AgentControl.Admin");
   const [candidate, setCandidate] = useState("");
   const [busy, setBusy] = useState(false), [error, setError] = useState<string>();
@@ -30,7 +30,8 @@ function Selector({ revision, onChanged }: { revision: number; onChanged: (selec
   const lifetime = useRef<AbortController | undefined>(undefined);
   useLayoutEffect(() => { const controller = new AbortController(); lifetime.current = controller; return () => controller.abort(); }, [revision]);
   if (seenRevision !== revision) {
-    setSeenRevision(revision); setCandidate(""); setBusy(false); setError(undefined);
+    setSeenRevision(revision); setCandidate(""); setBusy(false);
+    if (!denied) setError(undefined);
   }
   const data = denied ? undefined : read.data, active = data?.reports.activeSetId;
   const selected = data?.value.find(set => set.id === (candidate || active));
@@ -57,7 +58,7 @@ function Selector({ revision, onChanged }: { revision: number; onChanged: (selec
       setCandidate(""); setError(undefined); read.restart(); onChanged(true);
     } catch (cause) {
       if (!abort.signal.aborted) {
-        const uncertain = confirming && (!(cause instanceof ApiError) || cause.status === 0 || cause.status >= 500);
+        const uncertain = confirming && (!(cause instanceof ApiError) || cause.status < 400 || cause.status >= 500);
         setError(`${uncertain ? "Selection may have been saved. " : ""}${cause instanceof Error ? cause.message : "Selection was not confirmed."} Retry to reload report sets before selecting again.`);
         setCandidate("");
         if (cause instanceof ApiError && [401, 403].includes(cause.status)) setDenied(true);

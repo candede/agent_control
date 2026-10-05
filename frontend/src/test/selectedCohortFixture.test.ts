@@ -59,8 +59,8 @@ describe("reported user browser fixture contracts", () => {
       .toThrow("Synthetic selection filters are immutable");
     expect(captureSelectedCohort(input, source).read(input)).toMatchObject({ value: [] });
     expect(selectedCohortExportRows(capture)).toEqual([
-      expect.objectContaining({ username: "emery@example.invalid", reportedResponsesReceived: 215, agentId: "synthetic-researcher" }),
       expect.objectContaining({ username: "emery@example.invalid", reportedResponsesReceived: 215, agentId: "helpdesk/report:2" }),
+      expect.objectContaining({ username: "emery@example.invalid", reportedResponsesReceived: 215, agentId: "synthetic-researcher" }),
     ]);
   });
 

@@ -37,7 +37,7 @@ describe("route policy declarations", () => {
       "GET /official-usage/aggregate", "GET /official-usage/aggregate/facets", "GET /official-usage/users", "GET /official-usage/users/facets",
       "GET /official-usage/agent-users", "GET /official-usage/agents/:agentId", "GET /official-usage/agents/:agentId/users",
       "GET /official-usage/users/:username/agents", "GET /official-usage/history", "GET /official-usage/overview",
-      "GET /official-usage/history/:setId/observations",
+      "GET /official-usage/history/:setId/observations", "GET /official-usage/history/options",
       "POST /official-usage/staging", "GET /official-usage/staging/:id", "GET /official-usage/staging/:id/diagnostics",
       "DELETE /official-usage/staging/:id", "POST /official-usage/staging/:id/accept",
       "POST /official-usage/bundles/:id/preview", "POST /official-usage/bundles/:id/accept",

@@ -1,5 +1,5 @@
 import type {
-  CombinedUser, ReportAgent, ReportHistorySet, ReportMetadata, ReportOverviewAgent, ReportPage, ReportQuery, ReportRelationship, ReportRow, ReportUser, UnresolvedReportIdentity,
+  CombinedUser, ReportAgent, ReportAnalytics, ReportHistorySet, ReportListPage, ReportMetadata, ReportOverviewAgent, ReportPage, ReportQuery, ReportRelationship, ReportRow, ReportUser, UnresolvedReportIdentity,
 } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail, OfficialReportFacetPage } from "../../../backend/src/types/officialReportApi";
 import type { UserSourcePlan } from "../../../backend/src/types/userSources";
@@ -61,30 +61,76 @@ const relationships: ReportRelationship[] = ([
 ] satisfies Array<[string, string, string, string, number, string]>).map(([agentId, agentName, creatorType, username, responses, lastActivityDateUtc], index) => ({
   id: `relationship-${index}`, agentId, agentName, creatorType, username, responses, lastActivityDateUtc, identityStatus: "unresolved",
 }));
+function normalized(value: string): string {
+  return value.trim().normalize("NFKC").toLowerCase();
+}
+function sortFixtureRows<T>(rows: T[], query: ReportQuery, value: (row: T) => string | number | null): T[] {
+  return rows.sort((a, b) => {
+    const left = value(a), right = value(b);
+    if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
+    return (query.order === "desc" ? -1 : 1) * (typeof left === "number" && typeof right === "number"
+      ? left - right : normalized(String(left)).localeCompare(normalized(String(right))));
+  });
+}
+function latestDate(dates: Array<string | null>): string | null {
+  return dates.reduce<string | null>((latest, date) => date && (!latest || date > latest) ? date : latest, null);
+}
+function matchesActivity(date: string | null, query: ReportQuery, anchor: string | null): boolean {
+  const day = date?.slice(0, 10);
+  if (query.startDate && (!day || day < query.startDate) || query.endDate && (!day || day > query.endDate)) return false;
+  if (!query.reportActivity || query.reportActivity === "all") return true;
+  if (query.reportActivity === "no-activity") return !day;
+  if (!day || !anchor) return false;
+  const since = new Date(Date.parse(anchor.slice(0, 10)) - ((query.inactiveDays ?? 30) - 1) * 86_400_000).toISOString().slice(0, 10);
+  return query.reportActivity === "recent" ? day >= since : day < since;
+}
+function matchesLink(row: ReportAgent | ReportRelationship, query: ReportQuery): boolean {
+  return (query.agentId === undefined || row.agentId === query.agentId)
+    && (query.creatorType === undefined || row.creatorType === query.creatorType) && (!query.responsesOnly || row.responses > 0);
+}
+function responseCohort(responses: number | null, threshold: number): ReportUser["reviewCohort"] {
+  return responses === null ? "unknown" : responses === 0 ? "zero" : responses <= threshold ? "low" : "outside";
+}
+export function responseAnalytics(values: Array<number | null>, threshold?: number):
+  Pick<ReportAnalytics, "rowCount" | "responses" | "zeroResponses" | "unknownResponses" | "review"> {
+  const zero = values.filter(value => value === 0).length, unknown = values.filter(value => value === null).length;
+  return { rowCount: values.length, responses: values.reduce<number | null>((sum, value) => value === null ? sum : (sum ?? 0) + value, null),
+    zeroResponses: zero, unknownResponses: unknown,
+    review: threshold === undefined ? null : { zero, unknown, low: values.filter(value => value !== null && value > 0 && value <= threshold).length } };
+}
 function fixturePage<T>(value: T[], query: ReportQuery = {}): ReportPage<T> {
   const result = reportPage(structuredClone(value));
   return { ...result, reports: { ...structuredClone(selectedFixtureReports), setId: query.setId ?? reportSetId }, filters: query,
     counts: { total: value.length, filtered: value.length }, summary: { ...result.summary,
       reportedResponses: 270, bridgeResponses: 267, userReportedResponses: 267, distinctActiveReportUsers: 3,
       licensedOccurrences: 4, unlicensedOccurrences: 1, activeWithoutPaidUsers: 1 },
-    analytics: { ...result.analytics, rowCount: value.length },
+    analytics: { ...result.analytics, rowCount: value.length, responses: null, zeroResponses: null, unknownResponses: null, review: null },
   };
 }
 export function selectedAgentsPage(query: ReportQuery = {}): ReportPage<ReportAgent> {
-  const search = query.search?.toLowerCase();
+  const search = normalized(query.search ?? ""), anchor = latestDate(agents.map(row => row.lastActivityDateUtc));
   const rows = agents.filter(row => (!search || `${row.agentName} ${row.agentId} ${row.creatorType}`.toLowerCase().includes(search))
-    && (!query.startDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc >= query.startDate))
-    && (!query.endDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc <= query.endDate)));
-  rows.sort((a, b) => (query.order === "asc" ? 1 : -1) * (query.sort === "name" ? a.agentName.localeCompare(b.agentName)
-    : query.sort === "activeUsers" ? (a.activeUsers ?? 0) - (b.activeUsers ?? 0)
-      : query.sort === "lastActivity" ? (a.lastActivityDateUtc ?? "").localeCompare(b.lastActivityDateUtc ?? "") : a.responses - b.responses));
+    && matchesLink(row, query) && matchesActivity(row.lastActivityDateUtc, query, anchor));
+  sortFixtureRows(rows, { ...query, order: query.order ?? "desc" }, row => query.sort === "name" ? row.agentName
+    : query.sort === "activeUsers" ? row.activeUsers : query.sort === "licensedUsers" ? row.licensedUserOccurrences
+      : query.sort === "unlicensedUsers" ? row.unlicensedUserOccurrences : query.sort === "lastActivity" ? row.lastActivityDateUtc : row.responses);
+  const window = rows.filter(row => matchesActivity(row.lastActivityDateUtc, {
+    reportActivity: "recent", inactiveDays: query.activityWindowDays ?? 30,
+  }, anchor));
+  const windowIds = new Set(window.map(row => row.agentId));
+  const inactiveBefore = new Date(selectedFixtureNow.getTime() - (query.inactiveDays ?? 30) * 86_400_000).toISOString().slice(0, 10);
+  const ranked = [...rows].sort((a, b) => b.responses - a.responses || a.agentId.localeCompare(b.agentId));
+  const rank = (values: ReportAgent[]) => values.slice(0, 10).map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses }));
   const result = fixturePage(rows, query);
   return { ...result, counts: { total: agents.length, filtered: rows.length }, analytics: { ...result.analytics,
-    responses: rows.reduce((sum, row) => sum + row.responses, 0), agents: {
-      inactive: 0, neverUsed: 0, anchorDateUtc: "2026-09-12", windowDays: query.activityWindowDays ?? 30, windowAgents: rows.length,
-      windowResponses: rows.reduce((sum, row) => sum + row.responses, 0), windowDistinctActiveUsers: 3,
-      mostResponses: rows.map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
-      leastResponses: [...rows].reverse().map(row => ({ agentId: row.agentId, name: row.agentName, responses: row.responses })),
+    ...responseAnalytics(rows.map(row => row.responses)), agents: {
+      inactive: rows.filter(row => row.lastActivityDateUtc !== null && row.lastActivityDateUtc < inactiveBefore).length,
+      neverUsed: rows.filter(row => row.lastActivityDateUtc === null).length, anchorDateUtc: anchor,
+      windowDays: query.activityWindowDays ?? 30, windowAgents: window.length,
+      windowResponses: responseAnalytics(window.map(row => row.responses)).responses,
+      windowDistinctActiveUsers: new Set(relationships.filter(row => windowIds.has(row.agentId) && row.responses > 0).map(row => row.username)).size,
+      mostResponses: rank(ranked),
+      leastResponses: rank([...rows].sort((a, b) => a.responses - b.responses || a.agentId.localeCompare(b.agentId))),
     } } };
 }
 export function selectedReportUsersPage(query: ReportQuery = {}): ReportPage<ReportUser> {
@@ -97,19 +143,40 @@ export function selectedReportUsersPage(query: ReportQuery = {}): ReportPage<Rep
       reportedAgentsUsed: Number(count), bridgeResponses: query.licenseCohort && index === 1 ? 3 : Number(responses),
       relationshipCount: Number(count), responseProducingAgentCount: Number(responses) ? Number(count) : query.licenseCohort && index === 1 ? 1 : 0,
       userLastActivityDateUtc: index === 0 ? "2026-09-09" : null, lastActivityDateUtc: index === 2 ? "2026-09-11" : "2026-09-12",
-      missingUserReport: false, hasReportMismatch: Boolean(query.licenseCohort && index === 1), reviewCohort: Number(responses) === 0 ? "zero" : "outside",
+      missingUserReport: false, hasReportMismatch: Boolean(query.licenseCohort && index === 1),
+      reviewCohort: responseCohort(Number(responses), query.lowResponseThreshold ?? 5),
       hasActivity: Boolean(Number(responses) || query.licenseCohort && index === 1) }));
-  const search = query.search?.toLowerCase();
-  const selected = rows.filter(row => (!query.licenseCohort || row.hasActivity && ["no_paid", "paid_inactive"].includes(row.entitlement ?? "unknown"))
-    && (!search || `${row.displayName} ${row.username}`.toLowerCase().includes(search))
-    && (!query.agentId || relationships.some(link => link.agentId === query.agentId && link.username === row.username)));
+  const search = normalized(query.search ?? ""), anchor = latestDate(rows.map(row => row.userLastActivityDateUtc));
+  const selected = rows.filter(row => {
+    const links = relationships.filter(link => link.username === row.username && matchesLink(link, query));
+    return (!query.licenseCohort || row.hasActivity && ["no_paid", "paid_inactive"].includes(row.entitlement ?? "unknown"))
+      && (!search || normalized(`${row.displayName} ${row.username} ${row.company ?? ""} ${row.department ?? ""} ${links.map(link => `${link.agentName} ${link.agentId}`).join(" ")}`).includes(search))
+      && (query.username === undefined || row.username === query.username)
+      && (query.company === undefined || (row.company?.trim() || null) === query.company)
+      && (query.department === undefined || (row.department?.trim() || null) === query.department)
+      && (query.entitlement === undefined || row.entitlement === query.entitlement)
+      && (!(query.agentId !== undefined || query.creatorType !== undefined || query.responsesOnly) || links.length > 0)
+      && (!query.cohort || query.cohort === "all" || query.cohort === row.reviewCohort || query.cohort === "review" && ["zero", "low"].includes(row.reviewCohort))
+      && matchesActivity(row.userLastActivityDateUtc, query, anchor);
+  });
+  sortFixtureRows(selected, query, row => query.sort === "responses" ? row.reportedResponses : query.sort === "agentsUsed" ? row.reportedAgentsUsed
+    : query.sort === "lastActivity" ? row.userLastActivityDateUtc : row.displayName);
   const result = fixturePage(selected, query);
   return { ...result, summary: { ...result.summary, activeWithoutPaidUsers: query.licenseCohort ? 2 : 1 },
-    counts: { total: rows.length, filtered: selected.length } };
+    counts: { total: rows.length, filtered: selected.length },
+    analytics: { ...result.analytics, ...responseAnalytics(selected.map(row => row.reportedResponses), query.lowResponseThreshold ?? 5) } };
 }
 export function selectedRelationshipsPage(query: ReportQuery = {}): ReportPage<ReportRelationship> {
-  return fixturePage(relationships.filter(row => (!query.agentId || row.agentId === query.agentId)
-    && (!query.username || row.username === query.username) && (!query.search || row.username.toLowerCase().includes(query.search.toLowerCase()))), query);
+  const scoped = relationships.filter(row => (query.agentId === undefined || row.agentId === query.agentId)
+    && (query.username === undefined || row.username === query.username));
+  const search = normalized(query.search ?? ""), anchor = latestDate(scoped.map(row => row.lastActivityDateUtc));
+  const rows = scoped.filter(row => matchesLink(row, query) && matchesActivity(row.lastActivityDateUtc, query, anchor)
+    && (!search || normalized(`${row.agentName} ${row.agentId} ${row.creatorType} ${row.username}`).includes(search)));
+  sortFixtureRows(rows, query, row => query.sort === "responses" ? row.responses : query.sort === "lastActivity" ? row.lastActivityDateUtc
+    : query.sort === "creatorType" ? row.creatorType : row.agentName);
+  const result = fixturePage(rows, query);
+  return { ...result, counts: { total: scoped.length, filtered: rows.length },
+    analytics: { ...result.analytics, ...responseAnalytics(rows.map(row => row.responses)) } };
 }
 export function selectedAgentDetail(agentId = agents[0].agentId): OfficialReportDetail<ReportAgent> {
   const value = agents.find(row => row.agentId === agentId);
@@ -118,15 +185,18 @@ export function selectedAgentDetail(agentId = agents[0].agentId): OfficialReport
   return { value: structuredClone(value), selection: page.selection, reports: page.reports, sources: page.sources };
 }
 export function selectedOverviewPage(query: ReportQuery = {}): ReportPage<ReportOverviewAgent> {
-  const selected = selectedAgentsPage(query);
+  const selected = selectedAgentsPage({ ...query, sort: query.sort ?? "name", order: query.order ?? "asc" });
   const result = fixturePage(selected.value.map((row, index) => overviewAgent(index + 1, {
     agentId: row.agentId, agentName: row.agentName, observationCount: 2, creatorTypeCount: 1,
     earliestActivityDateUtc: row.lastActivityDateUtc, lastActivityDateUtc: row.lastActivityDateUtc,
     latestSetId: reportSetId, latestAcceptedAt: selectedFixtureReports.acceptedAt!,
   })), query);
+  const dates = result.value.map(row => row.lastActivityDateUtc).filter((date): date is string => date !== null).sort();
   return { ...result, counts: selected.counts, analytics: { ...result.analytics, overview: {
-    retainedSets: 1, reportedAgents: 2, usedAgents: 2, active30Days: 2, undatedAgents: 0,
-    earliestActivityDateUtc: "2026-09-11", latestActivityDateUtc: "2026-09-12", asOf: selectedFixtureNow.toISOString(), activeSinceDateUtc: "2026-08-20",
+    retainedSets: 1, reportedAgents: result.value.length, usedAgents: result.value.filter(row => row.hasResponses).length,
+    active30Days: result.value.filter(row => row.active30Days).length, undatedAgents: result.value.length - dates.length,
+    earliestActivityDateUtc: dates[0] ?? null, latestActivityDateUtc: dates.at(-1) ?? null,
+    asOf: selectedFixtureNow.toISOString(), activeSinceDateUtc: "2026-08-20",
   } } };
 }
 export function selectedHistoryPage(sets: ReportHistorySet[] = [historySet(1, {
@@ -144,7 +214,9 @@ export function selectedHistoryPage(sets: ReportHistorySet[] = [historySet(1, {
 }
 
 export function selectedFixtureQuery(input: string): ReportQuery {
-  const params = new URL(input, "http://localhost").searchParams;
+  const url = new URL(input, "http://localhost"), params = url.searchParams;
+  const history = url.pathname === "/api/official-usage/history" || url.pathname === "/api/official-usage/history/options";
+  const aggregate = url.pathname === "/api/official-usage/aggregate";
   function organization(field: "company" | "department") {
     const value = params.get(field);
     if (value === null) return undefined;
@@ -155,98 +227,129 @@ export function selectedFixtureQuery(input: string): ReportQuery {
   return { setId: params.get("setId") ?? undefined, search: params.get("search") ?? undefined,
     scope: params.get("scope") === "history" ? "history" : params.get("scope") === "selected" ? "selected" : undefined,
     company: organization("company"), department: organization("department"),
-    creatorType: params.get("creatorType") ?? undefined, responsesOnly: params.get("responsesOnly") === "true" || undefined,
+    entitlement: (["paid_active", "paid_inactive", "no_paid", "unknown"] as const).find(value => value === params.get("entitlement")),
+    serviceState: (["enabled", "warning", "partially_enabled", "disabled", "suspended", "locked_out", "unknown"] as const).find(value => value === params.get("serviceState")),
+    appActivity: (["active", "inactive", "unknown"] as const).find(value => value === params.get("appActivity")),
+    creatorType: params.get("creatorType") ?? undefined,
+    responsesOnly: params.has("responsesOnly") ? params.get("responsesOnly") === "true" : undefined,
     startDate: params.get("startDate") ?? undefined, endDate: params.get("endDate") ?? undefined,
     agentId: params.get("agentId") ?? undefined, username: params.get("username") ?? undefined,
     licenseCohort: params.get("licenseCohort") === "active_without_paid" ? "active_without_paid" : undefined,
     cohort: (["all", "zero", "low", "review", "licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"] as const).find(value => value === params.get("cohort")),
     reportActivity: (["all", "recent", "inactive", "no-activity"] as const).find(value => value === params.get("reportActivity")),
     lowResponseThreshold: params.has("lowResponseThreshold") ? Number(params.get("lowResponseThreshold")) : undefined,
+    inactiveDays: params.has("inactiveDays") ? Number(params.get("inactiveDays")) : undefined,
     activityWindowDays: params.has("activityWindowDays") ? Number(params.get("activityWindowDays")) : undefined,
-    sort: (["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity", "creatorType", "activeUsers", "licensedUsers", "unlicensedUsers", "acceptedAt"] as const).find(value => value === params.get("sort")),
-    order: params.get("order") === "asc" ? "asc" : "desc",
+    sort: (["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity", "creatorType", "activeUsers", "licensedUsers", "unlicensedUsers", "acceptedAt"] as const).find(value => value === params.get("sort"))
+      ?? (history ? "acceptedAt" : aggregate ? "responses" : "name"),
+    order: params.get("order") === "asc" ? "asc" : params.get("order") === "desc" ? "desc" : history || aggregate ? "desc" : "asc",
   };
 }
 export function selectedFixtureWindow<T>(input: string, rows: T[], base: ReportPage<T>): ReportPage<T> {
   const params = new URL(input, "http://localhost").searchParams;
-  const cursor = params.get("cursor"), start = cursor ? Number(cursor.replace(/^fixture:/, "")) : 0;
-  const limit = Math.min(100, Number(params.get("limit") ?? 50));
-  if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid synthetic cursor page");
+  const cursor = params.get("cursor"), text = params.get("limit") ?? "50";
+  const start = cursor === null ? 0 : Number(cursor.slice("fixture:".length)), limit = Number(text);
+  if (cursor !== null && !/^fixture:\d+$/.test(cursor) || !/^\d{1,3}$/.test(text)
+    || !Number.isSafeInteger(start) || start < 0 || limit < 1 || limit > 100) throw new Error("Invalid synthetic cursor page");
   return { ...base, value: rows.slice(start, start + limit), counts: { ...base.counts, filtered: rows.length },
     selection: { ...base.selection, id: params.get("selectionId") ?? base.selection.id },
     page: { limit, nextCursor: start + limit < rows.length ? `fixture:${start + limit}` : null,
       previousCursor: start > 0 ? `fixture:${Math.max(0, start - limit)}` : null } };
 }
 export function selectedFixtureLicensedRows(directory: ReportPage<CombinedUser>, query: ReportQuery): CombinedUser[] {
-  const threshold = query.lowResponseThreshold ?? 5;
-  const value = directory.value.filter(row => row.entitlement === "paid_active"
-    && (!query.search || `${row.directory.displayName} ${row.directory.userPrincipalName} ${relationships.filter(link =>
-      link.username === row.directory.userPrincipalName).map(link => `${link.agentName} ${link.agentId}`).join(" ")}`.toLowerCase().includes(query.search.toLowerCase()))
-    && (query.company === undefined || (row.directory.companyName?.trim() || null) === query.company)
-    && (query.department === undefined || (row.directory.department?.trim() || null) === query.department)
-    && (!query.cohort || ["all", "licensed"].includes(query.cohort)
-      || query.cohort === "using_agents" && row.agentActivityState === "active"
-      || query.cohort === "no_agent_activity" && row.agentActivityState === "none"
-      || query.cohort === "needs_attention" && directory.sources.directory.state === "available" && (
-        row.reportedResponses !== null && row.reportedResponses <= threshold || ["warning", "partially_enabled"].includes(row.copilotServiceState))
-      || query.cohort === "unknown_metrics" && row.agentActivityState === "unknown"));
-  const sortValue = (row: CombinedUser) => query.sort === "name" ? row.directory.displayName : query.sort === "company" ? row.directory.companyName
-    : query.sort === "department" ? row.directory.department : query.sort === "service" ? row.copilotServiceState
-      : query.sort === "agentsUsed" ? row.reportedAgentsUsed : query.sort === "lastActivity" ? row.userLastActivityDateUtc : row.reportedResponses;
-  return value.sort((a, b) => {
-    const left = sortValue(a), right = sortValue(b);
-    if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1;
-    return (query.order === "asc" ? 1 : -1) * (typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right)));
+  const threshold = query.lowResponseThreshold ?? 5, search = normalized(query.search ?? "");
+  const anchor = latestDate(directory.value.map(row => row.userLastActivityDateUtc));
+  const value = directory.value.filter(row => {
+    const links = relationships.filter(link => row.reportMatch === "matched" && link.username === row.reportedUsername && matchesLink(link, query));
+    const review = responseCohort(row.reportedResponses, threshold);
+    return row.entitlement === "paid_active"
+      && (!search || normalized(`${row.directory.displayName ?? ""} ${row.directory.userPrincipalName ?? ""} ${row.directory.companyName ?? ""} ${row.directory.department ?? ""} ${links.map(link => `${link.agentName} ${link.agentId}`).join(" ")}`).includes(search))
+      && (query.company === undefined || (row.directory.companyName?.trim() || null) === query.company)
+      && (query.department === undefined || (row.directory.department?.trim() || null) === query.department)
+      && (query.entitlement === undefined || row.entitlement === query.entitlement)
+      && (query.serviceState === undefined || row.copilotServiceState === query.serviceState)
+      && (query.appActivity === undefined || row.activityState === query.appActivity)
+      && (query.username === undefined || row.reportedUsername === query.username)
+      && (!query.licenseCohort)
+      && (!(query.agentId !== undefined || query.creatorType !== undefined || query.responsesOnly) || links.length > 0)
+      && matchesActivity(row.userLastActivityDateUtc, query, anchor)
+      && (!query.cohort || ["all", "licensed"].includes(query.cohort) || query.cohort === review
+        || query.cohort === "review" && ["zero", "low"].includes(review)
+        || query.cohort === "using_agents" && row.agentActivityState === "active"
+        || query.cohort === "no_agent_activity" && row.agentActivityState === "none"
+        || query.cohort === "needs_attention" && directory.sources.directory.state === "available" && (
+          row.agentActivityState === "none" || row.agentActivityState === "active" && review === "low"
+          || row.activityState === "inactive" || row.copilotServiceState !== "enabled")
+        || query.cohort === "unknown_metrics" && (row.agentActivityState === "unknown" || row.activityState === "unknown"));
   });
+  const sortValue = (row: CombinedUser) => query.sort === "upn" ? row.directory.userPrincipalName : query.sort === "company" ? row.directory.companyName
+    : query.sort === "department" ? row.directory.department : query.sort === "service" ? row.copilotServiceState
+      : query.sort === "agentsUsed" ? row.reportedAgentsUsed : query.sort === "lastActivity" ? row.userLastActivityDateUtc
+        : query.sort === "appActivity" ? row.appActivity?.lastActivityDate ?? null : query.sort === "responses" ? row.reportedResponses : row.directory.displayName;
+  return sortFixtureRows(value, query, sortValue);
 }
 export function selectedFixtureRead(input: string, directory = selectedUsersPage()):
-  ReportPage<ReportRow> | OfficialReportDetail<CombinedUser | ReportUser | ReportAgent> | OfficialReportFacetPage | undefined {
+  ReportListPage<ReportRow> | OfficialReportDetail<CombinedUser | ReportUser | ReportAgent> | OfficialReportFacetPage | undefined {
   const url = new URL(input, "http://localhost"), query = selectedFixtureQuery(input), path = url.pathname;
   const selectedReports = { ...structuredClone(directory.reports), setId: query.setId ?? directory.reports.setId };
   const selection = { ...directory.selection, id: url.searchParams.get("selectionId") ?? directory.selection.id };
-  const selected = <T>(page: ReportPage<T>): ReportPage<T> => ({ ...page, selection, reports: selectedReports, sources: directory.sources });
+  const selected = <T>(page: ReportPage<T>): ReportPage<T> => selectedFixtureWindow(input, page.value,
+    { ...page, selection, reports: selectedReports, sources: directory.sources });
   if (path.endsWith("/facets") && ["/api/copilot-usage/users/facets", "/api/official-usage/users/facets", "/api/official-usage/aggregate/facets"].includes(path)) {
-    const field = url.searchParams.get("field");
-    if (path === "/api/copilot-usage/users/facets") {
-      const values = new Map<string | null, number>(), search = url.searchParams.get("search")?.toLowerCase();
-      for (const row of directory.value.filter(row => row.entitlement === "paid_active")) {
-        const value = (field === "company" ? row.directory.companyName : row.directory.department)?.trim() || null;
-        if (!search || (value ?? "").toLowerCase().includes(search)) values.set(value, (values.get(value) ?? 0) + 1);
-      }
-      const rows = [...values].sort(([a], [b]) => a === null ? 1 : b === null ? -1 : a.localeCompare(b)).map(([value, count]) => ({ value, count }));
-      const page = selectedFixtureWindow(input, rows, reportPage(rows, { counts: { total: rows.length, filtered: rows.length } }));
-      return { value: page.value, counts: page.counts, page: page.page, selection };
+    const field = url.searchParams.get("field"), aggregate = path === "/api/official-usage/aggregate/facets";
+    if (aggregate ? field !== "creatorType" : field !== "company" && field !== "department") throw new Error("Unexpected selected fixture facet");
+    if (field !== "company" && field !== "department" && field !== "creatorType") throw new Error("Unexpected selected fixture facet");
+    const facetQuery = { ...query, search: undefined };
+    delete facetQuery[field];
+    const options = field === "creatorType" ? selectedAgentsPage(facetQuery).value.map(row => row.creatorType)
+      : path === "/api/copilot-usage/users/facets" ? selectedFixtureLicensedRows(directory, facetQuery)
+        .map(row => field === "company" ? row.directory.companyName : row.directory.department)
+        : selectedReportUsersPage(facetQuery).value.map(row => row[field]);
+    const values = new Map<string | null, number>(), search = normalized(query.search ?? "");
+    for (const option of options) {
+      const value = option?.trim() || null;
+      if (!search || normalized(value ?? "").includes(search)) values.set(value, (values.get(value) ?? 0) + 1);
     }
-    return { value: [{ value: field === "company" ? "Contoso Health" : field === "department" ? "Operations" : "Microsoft", count: 4 }],
-      selection, counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } };
+    const rows = [...values].sort(([a], [b]) => a === null ? 1 : b === null ? -1 : a.localeCompare(b)).map(([value, count]) => ({ value, count }));
+    const page = selectedFixtureWindow(input, rows, reportPage(rows, { counts: { total: rows.length, filtered: rows.length } }));
+    return { value: page.value, counts: page.counts, page: page.page, selection };
   }
   if (path === "/api/copilot-usage/users") {
     const value = selectedFixtureLicensedRows(directory, query);
-    return selected(selectedFixtureWindow(input, value, { ...directory, filters: query }));
+    return selected({ ...directory, value, filters: query,
+      analytics: { ...directory.analytics, ...responseAnalytics(value.map(row => row.reportedResponses), query.lowResponseThreshold ?? 5) } });
   }
   if (path === "/api/copilot-usage/users/unresolved-identities") return selected(fixturePage<UnresolvedReportIdentity>([{
     username: "hidden-identity", reason: "not_found", responses: 12, hasActivity: true,
   }]));
   if (path.startsWith("/api/copilot-usage/users/")) {
-    const [objectId, child] = path.slice("/api/copilot-usage/users/".length).split("/");
+    const [objectId, child, extra] = path.slice("/api/copilot-usage/users/".length).split("/");
+    if (extra !== undefined) return undefined;
     const row = directory.value.find(user => user.directory.objectId === decodeURIComponent(objectId));
     if (!row) return undefined;
     if (child === "service-plans") return selected(row.servicePlanCount ? selectedPlansPage()
       : reportPage<UserSourcePlan>([], { counts: { total: 0, filtered: 0 } }));
-    if (child === "agents") return selected(selectedRelationshipsPage({ ...query, username: row.directory.userPrincipalName ?? undefined }));
+    if (child === "agents") return selected(row.reportMatch === "matched" && row.reportedUsername !== null
+      ? selectedRelationshipsPage({ ...query, username: row.reportedUsername }) : fixturePage<ReportRelationship>([], query));
     if (!child) return { value: row, selection, reports: selectedReports, sources: directory.sources };
   }
   if (path === "/api/official-usage/history") return selected(selectedHistoryPage());
+  if (path === "/api/official-usage/history/options") {
+    const { value, page, counts, selection, reports } = selected(selectedHistoryPage());
+    return { value, page, counts, selection, reports };
+  }
   if (path === "/api/official-usage/overview") return selected(selectedOverviewPage(query));
   if (path === "/api/official-usage/aggregate") return selected(selectedAgentsPage(query));
   if (path === "/api/official-usage/users") return selected(selectedReportUsersPage(query));
   if (path.startsWith("/api/official-usage/agents/")) {
-    const [encodedId, child] = path.slice("/api/official-usage/agents/".length).split("/"), agentId = decodeURIComponent(encodedId);
+    const [encodedId, child, extra] = path.slice("/api/official-usage/agents/".length).split("/"), agentId = decodeURIComponent(encodedId);
+    if (extra !== undefined || !agents.some(row => row.agentId === agentId)) return undefined;
     if (child === "users") return selected(selectedRelationshipsPage({ ...query, agentId }));
-    if (!child) return { ...selectedAgentDetail(agentId), selection, reports: selectedReports };
+    if (!child) return { ...selectedAgentDetail(agentId), selection, reports: selectedReports, sources: directory.sources };
   }
   if (path.startsWith("/api/official-usage/users/")) {
-    const [encodedId, child] = path.slice("/api/official-usage/users/".length).split("/"), username = decodeURIComponent(encodedId);
+    const [encodedId, child, extra] = path.slice("/api/official-usage/users/".length).split("/"), username = decodeURIComponent(encodedId);
+    if (extra !== undefined || !selectedReportUsersPage().value.some(row => row.username === username)) return undefined;
     if (child === "agents") return selected(selectedRelationshipsPage({ ...query, username }));
     const value = selectedReportUsersPage(query).value.find(row => row.username === username);
     if (child === "service-plans" && value?.objectId) {

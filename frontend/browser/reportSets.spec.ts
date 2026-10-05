@@ -35,6 +35,10 @@ async function mockReportSelection(page: Page) {
   await page.route("**/api/official-usage/history?*", route => route.fulfill({
     json: { ...selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected), reports: metadata() },
   }));
+  await page.route("**/api/official-usage/history/options?*", route => {
+    const { value, page, counts, selection } = selectedHistoryPage([first, second].map(set => ({ ...set, active: set.id === selected })), selected);
+    return route.fulfill({ json: { value, page, counts, selection, reports: metadata() } });
+  });
   await page.route("**/api/official-usage/overview?*", route => {
     overviewScopes.push(new URL(route.request().url()).searchParams.get("scope"));
     const query = selectedFixtureQuery(route.request().url()), data = selectedOverviewPage(query);

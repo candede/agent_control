@@ -148,6 +148,18 @@ CSV export pins the displayed `activeSet.id`, includes `licenseCohort=active_wit
 
 CSV retains a row for matching people without relationships. Absent Users metrics have `userMetricSource=unknown`; absent relationship response totals are `Unknown`, not inferred zero. Saved-user refreshes invalidate verified entitlement labels and opened details even when the revision returns to an earlier value. Switching Users subviews also closes licensed-user details rather than reopening them on browser-history return.
 
+The signed-in workbench retains at most four inactive first-page cohort reads
+in memory for 30 seconds. Returning to a recently loaded paid/nonpaid cohort
+can reuse that page without another capture or aggregate calculation. Cache
+keys include account/tenant/roles, report, filters and data revision; selection
+expiry, source/report revision changes, explicit restart and session teardown
+prevent reuse. Focus revalidates the selected evidence. Continuations and detail
+pages are not retained by this cache, and filter changes still start a fresh
+selection. Nothing is saved to browser storage. During a replacement read,
+old source-freshness notices are withheld; genuine stale/unavailable results
+and persistent read errors remain visible after the read settles. An in-progress
+source sync is labeled as refreshing rather than prompting another sync.
+
 Canonical links use `/users?view=activity`; old `view=matrix` links are still accepted and preserve exact agent, search, page and snapshot values. New links emit `view=activity`. Users owns licensing and reported-user activity; Agents owns current agent usage. Collection belongs to **Sync**, and manual imports to **Sync > Import reports** (`/sync?reports=import`); history and selection belong to **Sync > Manage reports** (`/sync?reports=manage`). Exact retained source links open its read-only snapshot inspector (`/sync?reports=snapshot&snapshot=ID`), not a standalone Official usage page. Old Official usage bookmarks migrate without deleting source data. Connection recovery belongs to **Permissions**. Users has no duplicate generic body or modal links to these pages. Timestamped event investigation is separately available through **Audit** in the top navigation under the existing `AuditLogsQuery.Read.All` prerequisites; audit metadata is not an official usage counter and does not expose prompt/response content.
 
 ## Agent responsibility is separate

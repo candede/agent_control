@@ -1,10 +1,10 @@
-import type { Page } from "@playwright/test";
+import type { Page, Route } from "@playwright/test";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import { workbenchActions, workbenchViews } from "../../backend/src/services/workbenchMetadata";
 import { defenderHuntingTemplates } from "../../backend/src/types/defenderHunting";
 import { purviewAuditPresets } from "../../backend/src/types/purviewAudit";
-import { selectedFixtureQuery, selectedFixtureRead, selectedFixtureReports, selectedHistoryPage, selectedLicensedUser, selectedOverviewPage, selectedUsersPage } from "../src/test/selectedUsageFixture";
+import { responseAnalytics, selectedFixtureQuery, selectedFixtureRead, selectedFixtureReports, selectedFixtureWindow, selectedHistoryPage, selectedLicensedUser, selectedUsersPage } from "../src/test/selectedUsageFixture";
 import { historySet, overviewAgent, reportAgent, reportPage, reportUser } from "../src/test/reportDataFixture";
 import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, ReportUser } from "../../backend/src/types/officialReportData";
 import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
@@ -100,16 +100,28 @@ export const inventoryFacetFixtures = { environments: [] as Array<{ value: strin
   hosts: ["Teams", "Microsoft 365"].map(value => ({ value, label: value })),
   availability: ["some", "none"].map(value => ({ value, label: value })) };
 
-export async function mockInventoryFacets(page: Page, values: Partial<Record<string, Array<{ value: string; label: string }>>>) {
-  await page.route(url => url.pathname === "/api/agent-inventory/facets", route => {
-    const query = new URL(route.request().url()).searchParams;
-    if (!Object.hasOwn(values, query.get("field") ?? "")) return route.fallback();
-    const options = values[query.get("field") ?? ""] ?? [];
-    const search = (query.get("search") ?? "").toLowerCase();
-    const selected = query.get("selected") === "true" ? inventoryFixtureQuery(route).get(query.get("field")!) : undefined;
-    const filtered = options.filter(option => selected !== undefined
-      ? encodeInventoryFacet(option.value) === selected : `${option.value} ${option.label}`.toLowerCase().includes(search));
-    return route.fulfill({ json: { value: filtered.slice(0, 50), total: filtered.length, nextCursor: null } });
+function isLocalFixtureUrl(url: URL) {
+  return ["localhost", "127.0.0.1"].includes(url.hostname);
+}
+
+type InventoryFacetOptions = Partial<Record<string, Array<{ value: string; label: string }>>>;
+function inventoryFacetResponse(route: Route, values: InventoryFacetOptions) {
+  const input = route.request().url(), query = new URL(input).searchParams, field = query.get("field") ?? "";
+  const options = values[field];
+  if (!Object.hasOwn(values, field) || !options) return undefined;
+  const search = (query.get("search") ?? "").toLowerCase();
+  const selected = query.get("selected") === "true" ? inventoryFixtureQuery(route).get(field) : undefined;
+  const filtered = options.filter(option => selected !== undefined
+    ? encodeInventoryFacet(option.value) === selected : `${option.value} ${option.label}`.toLowerCase().includes(search));
+  const result = selectedFixtureWindow(input, filtered, reportPage(filtered));
+  return { value: result.value, total: result.counts.filtered, nextCursor: result.page.nextCursor };
+}
+
+export async function mockInventoryFacets(page: Page, values: InventoryFacetOptions) {
+  await page.route(url => isLocalFixtureUrl(url) && url.pathname === "/api/agent-inventory/facets", route => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const response = inventoryFacetResponse(route, values);
+    return response ? route.fulfill({ json: response }) : route.fallback();
   });
 }
 
@@ -273,10 +285,14 @@ const jobs: WorkbenchJobsResponse = {
 
 export async function mockLayoutApi(page: Page) {
   const unexpectedRequests: string[] = [];
-  await page.context().route(url => !["localhost", "127.0.0.1"].includes(url.hostname), route => {
+  await page.context().route(url => !isLocalFixtureUrl(url), route => {
     unexpectedRequests.push(`External request: ${route.request().url()}`);
     return route.abort();
   });
+  function unexpectedRequest(route: Route) {
+    unexpectedRequests.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
+    return route.fulfill({ status: 501, json: { error: "Unexpected layout fixture request" } });
+  }
   const responses: Record<string, unknown> = {
     "/api/auth/status": { authConfigured: true, callback: new URL("/api/auth/callback", process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3001").href },
     "/api/me": { user: actor, csrfToken: "layout-csrf", roleAssignmentRequired: false },
@@ -312,10 +328,14 @@ export async function mockLayoutApi(page: Page) {
     [`/api/hunting/jobs/${huntingJob.id}`]: huntingJob, [`/api/hunting/jobs/${huntingJob.id}/rows`]: huntingRows,
     "/api/workbench/jobs": jobs,
   };
-  await page.route("**/api/**", route => {
-    const path = new URL(route.request().url()).pathname;
+  await page.route(url => isLocalFixtureUrl(url) && url.pathname.startsWith("/api/"), route => {
+    const path = new URL(route.request().url()).pathname, method = route.request().method();
     if (path === "/api/agent-inventory/selections") return captureInventorySelection(route, unifiedAgents.selection);
     if (path === "/api/agents/selections") return captureInventorySelection(route, packages.selection);
+    if (isAutomaticRefreshRequest(route.request())) {
+      return route.fulfill({ json: automaticRefreshFixture({ users: observedAt, graph_packages: observedAt, power_platform: observedAt }) });
+    }
+    if (method !== "GET" && !(method === "POST" && path === "/api/capabilities/check")) return unexpectedRequest(route);
     if (path === "/api/agents" && route.request().method() === "GET") {
       const query = inventoryFixtureQuery(route);
       const recordId = query.get("recordId");
@@ -327,17 +347,13 @@ export async function mockLayoutApi(page: Page) {
     if (detail) return fulfillInventoryDetail(route, decodeURIComponent(detail[1]));
     const members = /^\/api\/agent-inventory\/([^/]+)\/members$/.exec(path);
     if (members) return fulfillInventoryMembers(route, decodeURIComponent(members[1]));
-    if (isAutomaticRefreshRequest(route.request())) {
-      return route.fulfill({ json: automaticRefreshFixture({ users: observedAt, graph_packages: observedAt, power_platform: observedAt }) });
-    }
     if (path === "/api/agent-inventory/facets") {
-      const query = new URL(route.request().url()).searchParams, field = query.get("field");
-      const options = field === "type" ? inventoryFacetFixtures.types
-        : field === "platform" ? inventoryFacetFixtures.platforms
-        : field === "publisher" ? inventoryFacetFixtures.publishers
-        : field === "host" ? inventoryFacetFixtures.hosts
-        : field === "availableTo" ? inventoryFacetFixtures.availability : inventoryFacetFixtures.environments;
-      return route.fulfill({ json: { value: options, total: options.length, nextCursor: null } });
+      const response = inventoryFacetResponse(route, {
+        type: inventoryFacetFixtures.types, platform: inventoryFacetFixtures.platforms,
+        publisher: inventoryFacetFixtures.publishers, host: inventoryFacetFixtures.hosts,
+        availableTo: inventoryFacetFixtures.availability, environmentId: inventoryFacetFixtures.environments,
+      });
+      return response ? route.fulfill({ json: response }) : unexpectedRequest(route);
     }
     if (path === "/api/agent-inventory" && route.request().method() === "GET") {
       const recordId = inventoryFixtureQuery(route).get("recordId");
@@ -366,34 +382,56 @@ export async function mockLayoutApi(page: Page) {
         .map((row, index) => overviewAgent(index + 1, { agentId: row.agentId, agentName: row.agentName, observationCount: 1, creatorTypeCount: 1,
           earliestActivityDateUtc: row.lastActivityDateUtc, lastActivityDateUtc: row.lastActivityDateUtc,
           latestSetId: activeSet.id, latestAcceptedAt: observedAt }));
-      const data = selectedOverviewPage(query);
-      return route.fulfill({ json: { ...data, value, counts: { total: 2, filtered: value.length },
+      const data = reportPage(value);
+      return route.fulfill({ json: selectedFixtureWindow(route.request().url(), value, { ...data, value, counts: { total: 2, filtered: value.length },
+        selection: { ...data.selection, evaluatedAt: layoutTime },
         reports: { ...layoutReports, setId: query.setId ?? layoutReports.setId }, sources: directory.sources,
-        analytics: { ...data.analytics, rowCount: value.length, overview: { ...data.analytics.overview!,
-          earliestActivityDateUtc: "2026-08-30", latestActivityDateUtc: "2026-08-30" } } } });
+        summary: aggregate.summary,
+        analytics: { ...data.analytics, rowCount: value.length, responses: null, zeroResponses: null, unknownResponses: null, review: null,
+          overview: { retainedSets: 1, reportedAgents: value.length, usedAgents: value.filter(row => row.hasResponses).length,
+            active30Days: value.filter(row => row.active30Days).length, undatedAgents: value.filter(row => !row.lastActivityDateUtc).length,
+            earliestActivityDateUtc: value.length ? "2026-08-30" : null, latestActivityDateUtc: value.length ? "2026-08-30" : null,
+            asOf: layoutTime, activeSinceDateUtc: new Date(Date.parse(layoutTime) - 29 * 86400000).toISOString().slice(0, 10) } } }) });
     }
     if (route.request().method() === "GET" && path.startsWith("/api/official-usage/")) {
       const url = new URL(route.request().url()), query = selectedFixtureQuery(url.href);
       const selection = { ...aggregate.selection, id: url.searchParams.get("selectionId") ?? aggregate.selection.id };
       const reports = { ...layoutReports, setId: query.setId ?? layoutReports.setId };
-      const selected = <T>(page: ReportPage<T>) => ({ ...page, selection, reports });
+      const selected = <T>(page: ReportPage<T>) => selectedFixtureWindow(url.href, page.value, { ...page, selection, reports });
       if (path === "/api/official-usage/aggregate/facets" || path === "/api/official-usage/users/facets") {
-        return route.fulfill({ json: { value: [{ value: url.searchParams.get("field") === "creatorType" ? "Your org" : null, count: 2 }],
-          selection, counts: { total: 1, filtered: 1 }, page: { limit: 50, nextCursor: null, previousCursor: null } } });
+        const field = url.searchParams.get("field");
+        if (path === "/api/official-usage/aggregate/facets" ? field !== "creatorType" : field !== "company" && field !== "department") {
+          throw new Error("Unexpected selected fixture facet");
+        }
+        const options = [{ value: field === "creatorType" ? "Your org" : null, count: 2 }]
+          .filter(option => !query.search || (option.value ?? "").toLowerCase().includes(query.search.trim().toLowerCase()));
+        const { value, counts, page } = selected(reportPage(options, { counts: { total: options.length, filtered: options.length } }));
+        return route.fulfill({ json: { value, selection, counts, page } });
       }
       if (path === "/api/official-usage/aggregate") {
         const value = aggregate.value.filter(row => (!query.search || row.agentName.toLowerCase().includes(query.search.toLowerCase()))
           && (!query.startDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc >= query.startDate))
           && (!query.endDate || Boolean(row.lastActivityDateUtc && row.lastActivityDateUtc <= query.endDate)));
+        const analytics = responseAnalytics(value.map(row => row.responses));
+        const ids = new Set(value.map(row => row.agentId));
+        const filteredRankings = rankings.filter(row => ids.has(row.agentId));
         return route.fulfill({ json: selected({ ...aggregate, value, counts: { total: aggregate.counts.total, filtered: value.length },
-          analytics: { ...aggregate.analytics, rowCount: value.length, responses: value.reduce((sum, row) => sum + row.responses, 0),
-            agents: { ...aggregate.analytics.agents!, windowDays: query.activityWindowDays ?? 30 } } }) });
+          analytics: { ...aggregate.analytics, ...analytics,
+            agents: { ...aggregate.analytics.agents!, windowDays: query.activityWindowDays ?? 30,
+              windowAgents: value.length, windowResponses: analytics.responses,
+              windowDistinctActiveUsers: new Set(relationshipRows.filter(row => ids.has(row.agentId) && row.responses > 0).map(row => row.username)).size,
+              mostResponses: filteredRankings, leastResponses: [...filteredRankings].reverse() } } }) });
       }
       if (path === "/api/official-usage/users") {
         const value = users.value.filter(row => !query.search || `${row.displayName} ${row.username}`.toLowerCase().includes(query.search.toLowerCase()));
-        return route.fulfill({ json: selected({ ...users, value, counts: { total: users.counts.total, filtered: value.length } }) });
+        return route.fulfill({ json: selected({ ...users, value, counts: { total: users.counts.total, filtered: value.length },
+          analytics: { ...users.analytics, ...responseAnalytics(value.map(row => row.reportedResponses), query.lowResponseThreshold ?? 5) } }) });
       }
       if (path === "/api/official-usage/history") return route.fulfill({ json: selected(usageHistory) });
+      if (path === "/api/official-usage/history/options") {
+        const { value, page, counts, selection, reports } = selected(usageHistory);
+        return route.fulfill({ json: { value, page, counts, selection, reports } });
+      }
       const agent = /^\/api\/official-usage\/agents\/([^/]+)(?:\/(users))?$/.exec(path);
       const person = /^\/api\/official-usage\/users\/([^/]+)(?:\/(agents|directory))?$/.exec(path);
       if (agent || person) {
@@ -403,7 +441,8 @@ export async function mockLayoutApi(page: Page) {
           if (value) return route.fulfill({ json: { value, selection, reports, sources: directory.sources } });
         } else if (child) {
           const value = relationshipRows.filter(row => agent ? row.agentId === id : row.username === id);
-          return route.fulfill({ json: selected(reportPage(value, { sources: directory.sources, counts: { total: value.length, filtered: value.length } })) });
+          return route.fulfill({ json: selected(reportPage(value, { sources: directory.sources, counts: { total: value.length, filtered: value.length },
+            summary: aggregate.summary, analytics: { ...aggregate.analytics, ...responseAnalytics(value.map(row => row.responses)), agents: null } })) });
         }
         const value = agent ? aggregate.value.find(row => row.agentId === id) : users.value.find(row => row.username === id);
         if (value) return route.fulfill({ json: { value, selection, reports, sources: directory.sources } });
@@ -414,13 +453,10 @@ export async function mockLayoutApi(page: Page) {
         : { ...directory, value: [...directory.value, ...unpaidPeople] });
       if (read) return route.fulfill({ json: read });
     }
-    if (!path.startsWith("/api/")) return route.fallback();
-    const method = route.request().method();
     if ((method === "GET" || (method === "POST" && path === "/api/capabilities/check")) && path in responses) {
       return route.fulfill({ json: responses[path] });
     }
-    unexpectedRequests.push(`${method} ${path}`);
-    return route.fulfill({ status: 501, json: { error: "Unexpected layout fixture request" } });
+    return unexpectedRequest(route);
   });
   return unexpectedRequests;
 }

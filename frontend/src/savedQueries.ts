@@ -11,7 +11,7 @@ import {
 import { ApiError } from "./api/client";
 
 export function createSavedQueryClient() {
-  return new QueryClient({
+  const client = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -23,6 +23,14 @@ export function createSavedQueryClient() {
       },
     },
   });
+  client.getQueryCache().subscribe(event => {
+    if (event.type !== "observerRemoved" || !event.query.meta?.retainReportPage) return;
+    const idle = client.getQueryCache().getAll()
+      .filter(query => query.meta?.retainReportPage && query.getObserversCount() === 0)
+      .sort((left, right) => right.state.dataUpdatedAt - left.state.dataUpdatedAt);
+    for (const query of idle.slice(4)) client.removeQueries({ queryKey: query.queryKey, exact: true });
+  });
+  return client;
 }
 
 function useSavedQueryClient() {
@@ -51,15 +59,23 @@ export function readSavedQuery<T>(
 ): Promise<T> {
   if (signal.aborted) return Promise.reject(abortedRead());
   return new Promise<T>((resolve, reject) => {
+    const cache = client.getQueryCache();
+    let settled = false;
     const observer = new QueryObserver<T, Error>(client, {
       queryKey: ["saved", ...queryKey],
-      queryFn: context => read(context.signal),
-      enabled: true,
+      queryFn: context => {
+        const query = observer.getCurrentQuery();
+        // Fetch notifications run before TanStack wires up request cancellation.
+        if (settled && (query.getObserversCount() === 0 || cache.get(query.queryHash) !== query)) {
+          return Promise.reject(abortedRead());
+        }
+        return read(context.signal);
+      },
+      enabled: () => !settled,
       staleTime: 0,
       refetchOnMount: "always",
     });
     let unsubscribe = () => observer.destroy();
-    let settled = false;
     const finish = (complete: () => void) => {
       if (settled) return;
       settled = true;
@@ -70,10 +86,16 @@ export function readSavedQuery<T>(
       complete();
     };
     const cancel = () => finish(() => reject(abortedRead()));
-    const unsubscribeCache = client.getQueryCache().subscribe(event => {
+    const unsubscribeCache = cache.subscribe(event => {
       if (event.type === "removed" && event.query === observer.getCurrentQuery()) cancel();
     });
     signal.addEventListener("abort", cancel, { once: true });
+    // Query construction notifies cache subscribers before our listeners exist.
+    const query = observer.getCurrentQuery();
+    if (signal.aborted || cache.get(query.queryHash) !== query) {
+      cancel();
+      return;
+    }
     unsubscribe = observer.subscribe(() => {});
     if (settled) {
       unsubscribe();

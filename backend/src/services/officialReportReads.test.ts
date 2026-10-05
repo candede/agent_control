@@ -68,6 +68,25 @@ describe("native history/overview snapshot execution", () => {
     const release = vi.spyOn(client, "release"), connect = vi.spyOn(fixture.runtime, "connect").mockResolvedValue(client);
     return { client, statements, release, connect, restore: () => { connect.mockRestore(); query.mockRestore(); release.mockRestore(); } };
   }
+  it("reads selector options without user joins or whole-history row analytics, while retaining selection fences", async () => {
+    const { identity, selection } = await selected("history");
+    const full = await reports.page(selection.id, identity);
+    const tape = await instrument();
+    try {
+      const options = await reports.historyOptions(selection.id, identity);
+      expect(Object.keys(options).sort()).toEqual(["counts", "page", "reports", "selection", "value"]);
+      expect(options).toEqual({ value: full.value, page: full.page, counts: full.counts, selection: full.selection, reports: full.reports });
+      expect(tape.statements.some(sql => /directory_user_rows|official_usage_row_facts|envelope_summary/.test(sql))).toBe(false);
+      expect(tape.connect).toHaveBeenCalledOnce();
+      expect(tape.statements[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      expect(tape.statements.at(-1)).toBe("COMMIT");
+    } finally { tape.restore(); }
+    await expect(reports.historyOptions(selection.id, { ...identity, principalId: "other" })).rejects.toMatchObject({ code: "selection_invalidated" });
+    const overview = await reports.capture(identity, "delegated", "overview");
+    await expect(reports.historyOptions(overview.id, identity)).rejects.toMatchObject({ code: "invalid_cursor" });
+    await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [selection.id]);
+    await expect(reports.historyOptions(selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
+  });
   it.each(["history", "overview"] as const)("returns %s rows, counts and analytics on one client and repeatable-read snapshot", async endpoint => {
     const { identity, selection } = await selected(endpoint), tape = await instrument();
     try {

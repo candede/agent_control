@@ -67,6 +67,43 @@ async function mockReportedUsers(page: Page, source: SelectedCohortData = select
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+test("warm cohort switches reuse bounded pages and the selector never loads full history analytics", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  await mockSelectedPaidUsers(page, selectedUsersPage());
+  await mockReportedUsers(page);
+  const reads = { paid: 0, nonpaid: 0, history: 0, options: 0 };
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/copilot-usage/users") reads.paid++;
+    if (path === "/api/official-usage/users") reads.nonpaid++;
+    if (path === "/api/official-usage/history") reads.history++;
+    if (path === "/api/official-usage/history/options") reads.options++;
+  });
+  await page.route(url => ["/api/copilot-usage/users", "/api/official-usage/users"].includes(url.pathname), async route => {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await route.fallback();
+  });
+  await page.goto("/users");
+  const cohort = page.getByRole("combobox", { name: "User cohort", exact: true });
+  await expect(page.getByRole("button", { name: "Ada", exact: true })).toBeVisible();
+  await cohort.selectOption("activity");
+  await expect(page.getByRole("button", { name: "Emery", exact: true })).toBeVisible();
+  const coldReads = { ...reads }, switchMs: number[] = [];
+  for (const view of ["licenses", "activity", "licenses"]) {
+    const started = performance.now();
+    await cohort.selectOption(view);
+    await expect(page.getByRole("button", { name: view === "licenses" ? "Ada" : "Emery", exact: true })).toBeVisible({ timeout: 750 });
+    switchMs.push(performance.now() - started);
+    expect(switchMs.at(-1)).toBeLessThan(750);
+  }
+  expect(reads.paid).toBe(coldReads.paid);
+  expect(reads.nonpaid).toBe(coldReads.nonpaid);
+  expect(reads.history).toBe(0);
+  expect(reads.options).toBeGreaterThan(0);
+  expect(unexpected).toEqual([]);
+  await info.attach("cohort-switch-measurements", { body: JSON.stringify({ coldReads, finalReads: reads, switchMs }), contentType: "application/json" });
+});
+
 test("users reuse the Agents summary strip and integrated table design at every breakpoint", async ({ page }, info) => {
   test.setTimeout(60_000);
   const unexpected = await mockLayoutApi(page);

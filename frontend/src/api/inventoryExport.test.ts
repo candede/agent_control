@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getInventoryRefreshJobs, getInventoryRefreshJob, getUnifiedAgentDetail, subscribeSessionRevalidationRequired } from "./client";
-import { createReportExport } from "./reportData";
+import { getCurrentUser, getInventoryRefreshJobs, getInventoryRefreshJob, getUnifiedAgentDetail, signOut, subscribeSessionRevalidationRequired } from "./client";
+import { cancelReportExport, createReportExport, reportExportStatus } from "./reportData";
 import { createSavedQueryClient, readSavedQuery } from "../savedQueries";
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable inventory export request contract", () => {
   it("forwards cancellation and only the pinned selection, without resending filters or paging", async () => {
@@ -18,6 +18,53 @@ describe("durable inventory export request contract", () => {
     );
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       kind: "power_platform_agents", selectionId: "saved-selection", idempotencyKey: expect.stringMatching(/^[a-f0-9-]{36}$/),
+    });
+  });
+
+  describe.each([
+    { name: "creation", send: () => createReportExport({ kind: "unified_agents", selectionId: "saved-selection" }) },
+    { name: "status", send: () => reportExportStatus("export-id") },
+    { name: "cancellation", send: () => cancelReportExport("export-id") },
+  ])("export $name retry session boundary", ({ send }) => {
+    it.each(["new session", "logout", "session denial"] as const)("does not resend old work after %s during backoff", async boundary => {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ code: "data_snapshot_conflict" }, { status: 503 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const outcome = Promise.allSettled([send()]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      if (boundary === "new session") {
+        fetchMock.mockResolvedValueOnce(Response.json({ csrfToken: "replacement-session" }));
+        await getCurrentUser();
+      } else if (boundary === "logout") {
+        fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+        await signOut();
+      } else {
+        fetchMock.mockResolvedValueOnce(Response.json({ code: "unauthorized" }, { status: 401 }));
+        await expect(getInventoryRefreshJobs()).rejects.toMatchObject({ code: "unauthorized" });
+      }
+      fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await outcome).toMatchObject([{ status: "rejected", reason: { code: "request_aborted", kind: "aborted" } }]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("continues the same-session retry after a scoped provider denial", async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ code: "data_snapshot_conflict" }, { status: 503 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const pending = send();
+      await vi.advanceTimersByTimeAsync(1);
+      fetchMock.mockResolvedValueOnce(Response.json({ code: "interaction_required" }, { status: 401 }));
+      await expect(getInventoryRefreshJobs()).rejects.toMatchObject({ code: "interaction_required" });
+      fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+      await vi.advanceTimersByTimeAsync(1999);
+      await pending;
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2][0]).toBe(fetchMock.mock.calls[0][0]);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 

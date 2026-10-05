@@ -1,5 +1,5 @@
-import { ApiError, request } from "./client";
-import type { ReportQuery, CombinedUser, ReportUser, ReportAgent, ReportHistorySet, ReportOverviewAgent, ReportPage } from "../../../backend/src/types/officialReportData";
+import { ApiError, captureRequestSession, request } from "./client";
+import type { ReportQuery, CombinedUser, ReportUser, ReportAgent, ReportHistorySet, ReportOverviewAgent, ReportListPage, ReportPage } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail, OfficialReportExportRequest, OfficialReportExportStatus, OfficialReportFacetPage,
   OfficialReportImportIntent, OfficialReportPreview, OfficialReportBundlePreview, OfficialReportBundleAcceptance, OfficialReportAccepted,
   OfficialReportConfirmation, OfficialReportConfirmed, OfficialReportDiagnostics,
@@ -19,8 +19,8 @@ export function reportQueryString(query: ReportPageRequest): string {
   return params.size ? `?${params}` : "";
 }
 
-export function readReportPage<T>(path: string, query: ReportPageRequest = {}, signal?: AbortSignal) {
-  return request<ReportPage<T>>(`/api/${path}${reportQueryString(query)}`, { signal });
+export function readReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>(path: string, query: ReportPageRequest = {}, signal?: AbortSignal) {
+  return request<Page>(`/api/${path}${reportQueryString(query)}`, { signal });
 }
 export const reportPages = {
   users: (query: ReportPageRequest, signal?: AbortSignal) => readReportPage<CombinedUser>("copilot-usage/users", query, signal),
@@ -40,7 +40,7 @@ export function readReportFacet(path: string, selectionId: string, field: "compa
   return request<OfficialReportFacetPage>(`/api/${path}/facets?${params}`, { signal: options.signal });
 }
 export function createReportExport(input: OfficialReportExportRequest, signal?: AbortSignal) {
-  const intent = { ...input, idempotencyKey: input.idempotencyKey ?? crypto.randomUUID() };
+  const intent = { ...input, ids: input.ids?.slice(), idempotencyKey: input.idempotencyKey ?? crypto.randomUUID() };
   return retryExportSetup(() => post<{ id: string }>("/api/data-exports", intent, signal), signal);
 }
 export function reportExportStatus(id: string, signal?: AbortSignal) {
@@ -50,8 +50,10 @@ export function cancelReportExport(id: string, signal?: AbortSignal) {
   return retryExportSetup(() => request<void>(`/api/data-exports/${encodeURIComponent(id)}`, { method: "DELETE", signal }), signal);
 }
 async function retryExportSetup<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const assertCurrentSession = captureRequestSession();
   const aborted = () => new ApiError(0, "request_aborted", "The request was cancelled.", { kind: "aborted" });
   for (let attempt = 0; ; attempt++) {
+    assertCurrentSession();
     if (signal?.aborted) throw aborted();
     try { return await operation(); }
     catch (error) {
@@ -90,8 +92,8 @@ export function mutateAgentReportAssociation(recordId: string, input: CandidateA
 function post<T>(path: string, input: unknown, signal?: AbortSignal) {
   return request<T>(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal });
 }
-export type ReportUploadMetadata = { reportingStart?: string; reportingEnd?: string; periodProvenance?: "operator_asserted" | "source_metadata";
-  sourceAsOf?: string; sourceAsOfProvenance?: "operator_asserted" | "source_metadata"; downloadedAt?: string };
+export type ReportUploadMetadata = { reportingStart?: string; reportingEnd?: string; periodProvenance?: "operator_asserted";
+  sourceAsOf?: string; sourceAsOfProvenance?: "operator_asserted"; downloadedAt?: string };
 export function stageReport(file: File, intent: OfficialReportImportIntent, metadata: ReportUploadMetadata, signal?: AbortSignal) {
   const query = new URLSearchParams({ bundleId: intent.bundleId });
   if (intent.correctionOfSetId) query.set("correctionOfSetId", intent.correctionOfSetId);
